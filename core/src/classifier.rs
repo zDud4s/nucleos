@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 9;
+pub const CLASSIFIER_VERSION: u32 = 10;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -34,6 +34,18 @@ const SELF_GOVERNING_FILES: &[&str] = &[
     // next page from that host would arrive unmediated. Same shape as `gate_command` and
     // `stt_command` above: what makes the file dangerous is that its CONTENTS are the policy.
     ".ai/web.yaml",
+    // Holds the browser pillar's ceilings and its enabled switch. It does NOT hold the site lists —
+    // those live in `browser_sites`, and spec §5.2 lets them grow only by a person logging in — but
+    // it does hold `enabled`, and a run that could turn the pillar on would be granting itself a
+    // browser. Same shape as the three above: what makes the file dangerous is that its CONTENTS are
+    // the policy.
+    ".ai/browser.yaml",
+    // Holds the two lists that decide which `gh` invocations run with nobody watching. Same shape as
+    // the four above and the most literal instance of it yet: the file does not configure a policy,
+    // its CONTENTS ARE the policy, and every entry the ceilings admit is an action a run performs
+    // without asking. A run that could append a line here would be signing its own permission slip,
+    // and the next line would execute unseen.
+    ".ai/github.yaml",
     ".claude/settings.json",
     ".claude/settings.local.json",
 ];
@@ -294,7 +306,32 @@ pub fn only_reads(tool_name: &str) -> bool {
     READ_LOCAL_TOOLS.contains(&tool_name)
 }
 
-pub fn classify(tool_name: &str, tool_input: &Value, cwd: Option<&Path>) -> Classification {
+/// PURE: tool name + input (+ cwd) (+ the owner's GitHub policy) in, a verdict out. No I/O, no
+/// database, no knowledge of run state.
+///
+/// That purity was stated in a caller (`runs.rs`) and nowhere in this file, and it is what lets a
+/// resume re-derive an action class instead of carrying it: *"`classify` is pure and `wt_path` is
+/// the very cwd the hook will hand it when the resume attempts the action - the same inputs, so the
+/// same answer, with nothing to keep in step."* The contract is written here now because `policy`
+/// made the signature carry weight, and a fourth argument is exactly where somebody would otherwise
+/// reach for a file read.
+///
+/// **The contract of `policy`: BORROWED, ALREADY NARROWED, and it does no I/O.** It is built once at
+/// startup from `.ai/github.yaml` intersected with `github.rs`'s compiled ceilings, and all three
+/// production callers must be handed the SAME one - `hooks.rs` twice and `runs.rs` once. A caller
+/// left holding an empty policy while the others hold a real one would make the hook and the resume
+/// disagree about one command line, which is the divergence the paragraph above exists to make
+/// impossible.
+///
+/// It is the only argument whose value comes from a file a person edits, and it can only ever turn a
+/// `pending_approval` into an `allow` for a read this file would otherwise not recognise. It cannot
+/// lift a `deny`, cannot reach the approval list, and is consulted last.
+pub fn classify(
+    tool_name: &str,
+    tool_input: &Value,
+    cwd: Option<&Path>,
+    policy: &crate::github::Policy,
+) -> Classification {
     if WRITE_TOOLS.contains(&tool_name) && writes_outside_cwd(tool_input, cwd) {
         return classification(
             "deny",
@@ -357,10 +394,15 @@ pub fn classify(tool_name: &str, tool_input: &Value, cwd: Option<&Path>) -> Clas
             .and_then(Value::as_str)
             .unwrap_or(""),
         cwd,
+        policy,
     )
 }
 
-fn classify_shell_command(command: &str, cwd: Option<&Path>) -> Classification {
+fn classify_shell_command(
+    command: &str,
+    cwd: Option<&Path>,
+    policy: &crate::github::Policy,
+) -> Classification {
     let normalized = normalize_command(command);
 
     if matches_any_phrase(&normalized, DESTRUCTIVE_COMMAND_PATTERNS)
@@ -407,8 +449,9 @@ fn classify_shell_command(command: &str, cwd: Option<&Path>) -> Classification {
     }
 
     let mut touches_vcs = false;
+    let mut touches_github = false;
     for segment in segments {
-        match classify_segment(segment, cwd) {
+        match classify_segment(segment, cwd, policy) {
             Segment::Unrecognized => {
                 return classification(
                     "pending_approval",
@@ -417,12 +460,25 @@ fn classify_shell_command(command: &str, cwd: Option<&Path>) -> Classification {
                 );
             }
             Segment::VcsLocal => touches_vcs = true,
+            Segment::GithubRead => touches_github = true,
             Segment::ReadLocal => {}
         }
     }
 
-    // The stronger of the two classes the line earned. A line that stages a commit is a line that
+    // The strongest of the three classes the line earned. A line that stages a commit is a line that
     // stages a commit, whatever it also did on the way, and the scoreboard reads this.
+    //
+    // `github-read` is checked FIRST, ahead of a class that was here before it, and the ordering is
+    // an argument rather than an accident: a line that reached GitHub reached the network, and a
+    // line that also ran `git add` reached this disk. Of the two facts, the one worth recording on a
+    // scoreboard about autonomy is the one that left the machine.
+    if touches_github {
+        return classification(
+            "allow",
+            "github-read",
+            "structural GitHub reads on the owner's autonomy list are allowed",
+        );
+    }
     if touches_vcs {
         return classification(
             "allow",
@@ -441,10 +497,14 @@ fn classify_shell_command(command: &str, cwd: Option<&Path>) -> Classification {
 enum Segment {
     ReadLocal,
     VcsLocal,
+    /// A `gh` read the OWNER put on the autonomy list. The only variant whose membership is decided
+    /// outside this file, which is why it is named rather than folded into `ReadLocal`: a scoreboard
+    /// that could not tell the two apart could not tell a compiled policy from an edited one.
+    GithubRead,
     Unrecognized,
 }
 
-fn classify_segment(segment: &str, cwd: Option<&Path>) -> Segment {
+fn classify_segment(segment: &str, cwd: Option<&Path>, policy: &crate::github::Policy) -> Segment {
     // Redirection is a property of ONE command, which is why it is judged here rather than over the
     // whole line. `2>&1` glues itself to whatever separator follows it — `ls x 2>&1; echo y` puts
     // `2>&1;` in a single whitespace token — so a line-level scan cannot tell the stream join from
@@ -471,6 +531,18 @@ fn classify_segment(segment: &str, cwd: Option<&Path>) -> Segment {
     }
     if is_safe_command(&normalized) {
         return Segment::ReadLocal;
+    }
+    // Consulted LAST, and only after the same shape guards every other read has to clear. Everything
+    // above is a judgement this file makes on its own; this is the one place where a line in a
+    // gitignored YAML changes an answer, so it gets the narrowest reach there is - it can turn a
+    // `pending_approval` into an `allow` and it can do nothing else.
+    //
+    // `policy` reads the RAW segment while the guards read the normalized one, and the split is
+    // deliberate for the reason `lands_inside_the_workspace` gives about `cd` targets:
+    // `normalize_command` lowercases, and `-L` is `gh`'s short `--limit` while `-l` is its short
+    // `--label`.
+    if shell_form_is_readable(&normalized) && policy.read_is_autonomous(segment) {
+        return Segment::GithubRead;
     }
     Segment::Unrecognized
 }
@@ -882,18 +954,30 @@ fn has_shell_control(command: &str) -> bool {
 }
 
 fn is_safe_command(command: &str) -> bool {
+    shell_form_is_readable(command)
+        && (SAFE_EXACT_COMMANDS.contains(&command)
+            || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
+}
+
+/// The guards a command has to clear before ANY list may say yes to it, separated from the lists
+/// themselves.
+///
+/// Split out when the GitHub policy became a second list, and the split is the point: a command
+/// named in `.ai/github.yaml` clears exactly the same shape guards a compiled entry does. Had that
+/// path grown its own conjunction the two would have drifted, and the one an owner edits is the one
+/// that would have ended up shorter.
+///
+/// Every clause only ever REFUSES, so an overlap between them costs a redundant check and a gap
+/// costs an allowed `-exec` - which is why `find_executes_or_writes` sits beside the two flag guards
+/// rather than inside them.
+fn shell_form_is_readable(command: &str) -> bool {
     !has_shell_control(command)
         && !command.split_whitespace().any(|token| token == "--fix")
         && !writes_an_output_file(command)
         && !forces_external_diff_or_textconv(command)
         && !runs_a_helper_command(command)
         && !uses_a_flag_its_program_makes_dangerous(command)
-        // Kept beside the two above rather than folded into them: both branches grew a guard for
-        // `find`, and they do not cover the same flags. Every one of these three only ever REFUSES,
-        // so an overlap costs a redundant check and a gap costs an allowed `-exec`.
         && !find_executes_or_writes(command)
-        && (SAFE_EXACT_COMMANDS.contains(&command)
-            || matches_command_prefix(command, SAFE_COMMAND_PREFIXES))
 }
 
 /// `--output=<file>` is a *diff* option, so every history command in the safe set (`git log`,
@@ -1088,7 +1172,13 @@ fn delete_targets<'a>(program: &str, arguments: &'a [String]) -> Vec<&'a str> {
         .collect()
 }
 
-fn shell_words(command: &str) -> Vec<String> {
+/// PURE: a shell line's words, with quotes stripped.
+///
+/// `pub(crate)` for `github::Policy::read_is_autonomous`, which compares `gh` flags against
+/// these tokens. Shared rather than copied on purpose: a second tokenizer would drift from this
+/// one, and the two would disagree about the same command line — which is the class of bug this
+/// file exists to keep out.
+pub(crate) fn shell_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -1181,6 +1271,42 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::Path;
+
+    /// The three-argument shape `classify` had before the policy became an argument, forwarding an
+    /// EMPTY policy.
+    ///
+    /// It shadows the glob-imported `super::classify`, and that is the regression guarantee itself
+    /// rather than a convenience: every assertion in this module goes on reading exactly as it did,
+    /// and each one now also asserts that a daemon with no `.ai/github.yaml` answers precisely what
+    /// it answered before the argument existed. Rewriting ninety-odd call sites by hand would have
+    /// been ninety chances to change a verdict while claiming to preserve one.
+    ///
+    /// A test that wants a real policy calls `classify_under` below and says so.
+    fn classify(
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        cwd: Option<&Path>,
+    ) -> Classification {
+        super::classify(tool_name, tool_input, cwd, &crate::github::Policy::empty())
+    }
+
+    /// The four-argument shape, for the tests that are about the policy.
+    fn classify_under(policy: &crate::github::Policy, command: &str) -> Classification {
+        super::classify("Bash", &json!({ "command": command }), None, policy)
+    }
+
+    /// The one an owner would plausibly write: structural reads, and nothing else.
+    fn owner_policy() -> crate::github::Policy {
+        crate::github::Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: vec![
+                "gh run list".to_owned(),
+                "gh run view".to_owned(),
+                "gh pr list".to_owned(),
+            ],
+            autonomous_actions: Vec::new(),
+        })
+    }
 
     fn assert_classification(classification: Classification, decision: &str, action_class: &str) {
         assert_eq!(classification.decision.decision, decision);
@@ -2919,13 +3045,24 @@ mod tests {
     /// Bumped once per policy change: 3 widened the allow list, 4 made the classifier read a line
     /// as the sequence it is, 5 stopped counting a stream join as a file write and let `echo`/`test`
     /// through, 6 let `mkdir` place a directory inside the workspace, 7 let the agent read a skill
-    /// and stopped it writing one, 8 took the git subcommands that cannot mutate as a group. The
+    /// and stopped it writing one, 8 took the git subcommands that cannot mutate as a group, 9
+    /// stopped counting output thrown at the null device as a file write, 10 gave the classifier
+    /// a fourth argument and a class to go with it — `github-read`, the first verdict in this
+    /// file that a person's own file decides. The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
     /// night of 2026-08-08 and everything after it look alike.
+    ///
+    /// **9 went unnarrated for a release**, which is how a list that exists to be read fails: the
+    /// constant moved, the test moved with it, and the sentence saying what moved did not. It is
+    /// written above now, a version late.
+    ///
+    /// And from 10 the number stops being enough on its own. Two machines on version 10 can decide
+    /// a `gh` line differently, because that policy lives in a file — which is what
+    /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 9);
+        assert_eq!(CLASSIFIER_VERSION, 10);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -2945,6 +3082,200 @@ mod tests {
                     .decision
                     .decision,
                 "allow",
+                "{command}"
+            );
+        }
+    }
+
+    /// The net under the ~1100 assertions above, stated once explicitly as well.
+    ///
+    /// The `classify` shim already runs every one of them against an empty policy, so this test is
+    /// not what carries the guarantee — it is what a reader finds when they go looking for it, and
+    /// it names the verdicts that would be most expensive to move by accident.
+    #[test]
+    fn classify_with_an_empty_policy_answers_exactly_as_before() {
+        let empty = crate::github::Policy::empty();
+        for (command, decision, class) in [
+            ("ls -la", "allow", "read-local"),
+            ("cargo test", "allow", "read-local"),
+            ("git add -A", "allow", "vcs-local"),
+            (
+                "git push origin master",
+                "pending_approval",
+                "push-merge-deploy",
+            ),
+            ("rm -rf /", "deny", "destructive"),
+            ("gh run list", "pending_approval", "unrecognized"),
+            ("gh pr view 42", "pending_approval", "unrecognized"),
+        ] {
+            let got = classify_under(&empty, command);
+            assert_eq!(
+                (got.decision.decision.as_str(), got.action_class),
+                (decision, class),
+                "{command}"
+            );
+        }
+    }
+
+    /// The CONTENTS of this file are the policy, so writing it is granting autonomy — and a run that
+    /// could append a line would be signing its own permission slip.
+    ///
+    /// The three spellings the sibling tests use, and the cwd they use with them. Written first with
+    /// a POSIX cwd and a Windows path in the same list, which is a `deny` for being outside the
+    /// workspace before this branch is ever reached — a containment failure wearing a governance
+    /// test's name.
+    #[test]
+    fn writing_ai_github_yaml_asks_for_approval() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for path in [
+            ".ai/github.yaml",
+            r".ai\github.yaml",
+            r"C:\work\repo\.ai\github.yaml",
+            r"C:\work\repo\src\..\.ai\github.yaml",
+        ] {
+            assert_classification(
+                classify("Write", &json!({ "file_path": path }), cwd),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
+    }
+
+    /// A read the owner listed passes, and it is recorded under its own class rather than as one
+    /// more `read-local`: a scoreboard that could not tell them apart could not tell a compiled
+    /// policy from an edited one.
+    #[test]
+    fn a_read_on_the_owners_list_is_allowed_and_named() {
+        let policy = owner_policy();
+        for command in [
+            "gh run list",
+            "gh run list --branch main",
+            "gh run view 12345",
+            "gh pr list --state open --author octocat",
+        ] {
+            assert_classification(classify_under(&policy, command), "allow", "github-read");
+        }
+    }
+
+    /// Off the list is not denied — it asks. That is the whole reading of this feature: capability
+    /// is total, and what the file limits is autonomy.
+    #[test]
+    fn a_read_off_the_list_still_asks() {
+        let policy = owner_policy();
+        for command in [
+            "gh workflow list",
+            "gh pr view 42",
+            "gh issue view 42",
+            "gh api repos/o/r",
+            "gh auth token",
+            "gh secret list",
+        ] {
+            assert_classification(
+                classify_under(&policy, command),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    /// The prefix matches and the allow has to fall anyway. It is the same case `github.rs` tests
+    /// against `Policy` directly, asserted here through the whole classifier, because that is where
+    /// a wiring mistake would show and a unit test would not.
+    #[test]
+    fn a_refused_flag_takes_the_allow_away_through_the_classifier() {
+        let policy = owner_policy();
+        for command in [
+            "gh run view 123 --log",
+            "gh run view 123 --log-failed",
+            "gh pr list --json body",
+            "gh pr list --json=body",
+            "gh pr list -q .[].body",
+            "gh pr list --search 'in:body secret'",
+            "gh pr list --limit 1000",
+            "gh pr list -L 1000",
+        ] {
+            assert_classification(
+                classify_under(&policy, command),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    /// `shell_segments` already closed this; the test fixes that the new policy does not reopen it.
+    /// The second half is on the approval list, and the approval list is matched over the WHOLE
+    /// line, before any of this.
+    #[test]
+    fn a_write_hidden_behind_a_read_prefix_still_asks() {
+        let policy = owner_policy();
+        assert_classification(
+            classify_under(&policy, "gh run list && gh pr merge 42"),
+            "pending_approval",
+            "push-merge-deploy",
+        );
+        // And one whose second half is merely unrecognised rather than on the approval list: each
+        // piece has to earn its own verdict, so the line loses.
+        assert_classification(
+            classify_under(&policy, "gh run list && gh pr view 42"),
+            "pending_approval",
+            "unrecognized",
+        );
+    }
+
+    /// Of the two facts a mixed line records, the one worth a scoreboard row is the one that left
+    /// the machine.
+    #[test]
+    fn a_github_read_beats_vcs_local_on_the_same_line() {
+        let policy = owner_policy();
+        assert_classification(
+            classify_under(&policy, "git add -A && gh run list"),
+            "allow",
+            "github-read",
+        );
+    }
+
+    /// The policy can turn a `pending_approval` into an `allow` and can do nothing else. A file a
+    /// person edits may not reach the destructive list or the approval list.
+    #[test]
+    fn the_policy_cannot_lift_a_deny_or_reach_the_approval_list() {
+        let wide = crate::github::Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: crate::github::READ_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            autonomous_actions: crate::github::ACTION_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+        });
+        assert_classification(classify_under(&wide, "rm -rf /"), "deny", "destructive");
+        assert_classification(
+            classify_under(&wide, "gh pr merge 42"),
+            "pending_approval",
+            "push-merge-deploy",
+        );
+        assert_classification(
+            classify_under(&wide, "git push origin master"),
+            "pending_approval",
+            "push-merge-deploy",
+        );
+    }
+
+    /// A listed read still has to clear every shape guard a compiled read clears. Redirection,
+    /// substitution and a helper spelling are refused whatever the owner's file says — which is what
+    /// `shell_form_is_readable` was split out to keep true in both paths at once.
+    #[test]
+    fn a_listed_read_still_clears_every_shape_guard() {
+        let policy = owner_policy();
+        for command in [
+            "gh run list > out.txt",
+            "gh run list $(whoami)",
+            "gh run list `whoami`",
+        ] {
+            assert_eq!(
+                classify_under(&policy, command).decision.decision,
+                "pending_approval",
                 "{command}"
             );
         }

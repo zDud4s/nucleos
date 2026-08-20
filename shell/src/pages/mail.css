@@ -1,0 +1,388 @@
+/**
+ * The Mail slice: configuration, the triage button, the queue and the sync
+ * cursor, `mail-` throughout — as `runs-` is for the run index and `feed-`
+ * for the feed.
+ *
+ * The rule this file lives under: **no class appears in `Mail.tsx` that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing. Grep the component against
+ * this file before calling the page done.
+ */
+
+/* ================================================================ shared == */
+
+.mail-note,
+.mail-loading,
+.mail-absence {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.mail-loading {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.mail-absence code {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+/* The queue panel's aside — untriaged count, or nothing at all until the
+   queue has answered once (`ui/nav.ts`'s badge rule, restated here). */
+.mail-count {
+  padding: 0.1em var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--tone-pending-bg);
+  color: var(--tone-pending-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- triage -- */
+
+/**
+ * What the daemon said about the batch, after asking. `role="status"` in the
+ * markup and a quiet informational rule here — never the danger colour, since
+ * a `reason` here is a value the daemon sent on purpose, not a fault.
+ */
+.mail-outcome {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--tone-info-border);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/* ----------------------------------------------------------------- search -- */
+
+.mail-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.mail-search-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.mail-search-field input {
+  min-width: 18rem;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+}
+
+/* ------------------------------------------------------------------ list -- */
+
+.mail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  overflow: hidden;
+}
+
+/* One message. Hairline-separated, like the feed: read by scanning down it,
+   not by picking out cards. */
+.mail-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+}
+
+.mail-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.mail-row-head > .ui-reading-time {
+  margin-left: auto;
+}
+
+.mail-row-from {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.mail-attachment {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.mail-verdict {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+/* A pin is a standing decision to keep seeing this sender in full; a mute is
+   the opposite. Warm and quiet, in the same vocabulary as the state tones,
+   without claiming either one is a `StateBadge` domain of its own. */
+.mail-verdict-pin {
+  background: var(--tone-active-bg);
+  color: var(--tone-active-fg);
+}
+
+.mail-verdict-mute {
+  background: var(--tone-off-bg);
+  color: var(--tone-off-fg);
+}
+
+/* A link to `/mail/$emailId` — block and undecorated so it reads as the row's
+   subject line first and a link second, the same posture `.runs-row-link`
+   takes for a run id. */
+.mail-row-subject {
+  display: block;
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  text-decoration: none;
+}
+
+.mail-row-subject:hover {
+  text-decoration: underline;
+}
+
+.mail-row-summary {
+  margin: 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+/* -------------------------------------------------------------- ceiling -- */
+
+.mail-ceiling {
+  margin: var(--space-3) 0 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+}
+
+/* --------------------------------------------------------- configuration -- */
+
+.mail-config {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.mail-config-fact {
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.mail-config-fact dt {
+  flex: 0 0 8rem;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.mail-config-fact dd {
+  margin: 0;
+  color: var(--text);
+}
+
+/* ======================================================= message detail == */
+
+/* -------------------------------------------------------------- facts -- */
+
+.mail-detail-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.mail-detail-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.mail-detail-fact dd {
+  margin: var(--space-1) 0 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.mail-detail-address {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* A pruned body or a pruned-therefore-unrequeueable message — quiet, not the
+   danger tone: retention doing its job is not a fault. */
+.mail-detail-pruned {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------- body -- */
+
+/**
+ * A message body is text a sender wrote, not markup — this page renders it in
+ * a `pre` and nowhere does it reach `dangerouslySetInnerHTML`. `pre-wrap` so a
+ * long line wraps instead of forcing the panel to scroll sideways.
+ */
+.mail-detail-body {
+  max-height: 28rem;
+  overflow: auto;
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* --------------------------------------------------------- attachments -- */
+
+.mail-detail-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mail-detail-attachment {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.mail-detail-attachment-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.mail-detail-attachment-name {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.mail-detail-attachment-meta {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.mail-detail-attachment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* -------------------------------------------------------------- sender -- */
+
+.mail-detail-verdict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+/* ---------------------------------------------------------------- reply -- */
+
+.mail-detail-reply {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.mail-detail-reply-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.mail-detail-reply-field input,
+.mail-detail-reply-field textarea {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.mail-detail-reply-field textarea {
+  resize: vertical;
+  line-height: var(--leading-snug);
+}
+
+.mail-detail-reply-field input:focus-visible,
+.mail-detail-reply-field textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}

@@ -1,0 +1,880 @@
+/**
+ * The Chats slice: the master-detail page at `/chats` and `/chats/$chatId`,
+ * `chats-` throughout — as `runs-` is for the runs and `waiting-` for the
+ * queue.
+ *
+ * The rule this file lives under: **no class appears in `Chats.tsx` that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing. Grep the component against
+ * this file before calling the page done.
+ */
+
+/* =============================================================== the page == */
+
+.chats-layout {
+  display: grid;
+  grid-template-columns: 20rem minmax(0, 1fr);
+  gap: var(--space-5);
+  align-items: start;
+}
+
+@media (max-width: 60rem) {
+  .chats-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.chats-detail {
+  min-width: 0;
+}
+
+.chats-loading,
+.chats-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+/* A field label over its own input — the composer, the new-conversation form
+   and the title editor all share it. */
+.chats-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.chats-field input,
+.chats-field select,
+.chats-field textarea {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.chats-field textarea {
+  resize: vertical;
+  line-height: var(--leading-snug);
+}
+
+.chats-field input:focus-visible,
+.chats-field select:focus-visible,
+.chats-field textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* =================================================================== list == */
+
+.chats-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chats-row {
+  margin: 0;
+}
+
+.chats-row-link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.chats-row-active .chats-row-link {
+  border-color: var(--accent);
+  background: var(--accent-quiet);
+}
+
+.chats-row-title {
+  flex: 1 1 8rem;
+  min-width: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chats-row-cwd {
+  flex-basis: 100%;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.chats-row-live {
+  font-size: var(--text-xs);
+  color: var(--tone-info-fg);
+}
+
+.chats-row-unread {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--tone-pending-bg);
+  color: var(--tone-pending-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------ new conversation == */
+
+.chats-new {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px dashed var(--border);
+}
+
+.chats-new-brain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.chats-new-brain legend {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/*
+ * What a session would NOT be able to do, said before it is picked up.
+ *
+ * `paused` and not `danger`: nothing is broken and nothing is about to go wrong. It is a session
+ * that will continue with less than you would expect, and the button beside it is the fix.
+ */
+.chats-new-notools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+}
+
+.chats-new-warning {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--tone-paused-fg);
+}
+
+/* ================================================================= detail == */
+
+.chats-detail-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.chats-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.chats-title-input {
+  flex: 1 1 10rem;
+  min-width: 0;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+}
+
+.chats-title-input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.chats-brain,
+.chats-archive {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* ========================================================== picked up == */
+
+/* What was said in the editor, above the turns the daemon ran. Quieter than a
+   turn and visibly not one: none of it was a run, and none of it was billed. */
+.chats-said {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-said-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.chats-said-owner {
+  border-left-color: var(--tone-info-fg);
+}
+
+.chats-said-who {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.chats-said-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chats-picked-up-cut {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.chats-picked-up-unread {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--tone-paused-fg);
+}
+
+/* =============================================================== turns == */
+
+.chats-turns {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-turn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.chats-turn-asked {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-snug);
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/*
+ * The answer as it is being written.
+ *
+ * The same type as a finished answer, deliberately: these ARE the words, not a preview of them, and
+ * restyling them would make the turn appear to change its mind about what it said when the run
+ * lands. The line below it is what says it is not finished.
+ */
+.chats-turn-writing {
+  border-left: 2px solid var(--border);
+  padding-left: var(--space-2);
+}
+
+/*
+ * What the turn ran. Quiet on purpose: it is evidence for the answer above it, not the answer.
+ */
+.chats-turn-did {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-turn-did li {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  min-width: 0;
+}
+
+.chats-turn-did-name {
+  flex: none;
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
+}
+
+.chats-turn-did-detail {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chats-turn-live {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--tone-info-fg);
+}
+
+.chats-turn-answer {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.chats-turn-answer-empty {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.chats-turn-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.chats-turn-id {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* A mark sits above the turn it precedes, quieter than a note: nothing went
+   wrong, the model on the far side of it simply changed. */
+.chats-mark {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.chats-mark-restart {
+  color: var(--tone-paused-fg);
+}
+
+.chats-mark-brain {
+  color: var(--tone-info-fg);
+}
+
+/* ============================================================= composer == */
+
+.chats-composer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.chats-composer-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ----------------------------------------------- picked up from the editor -- */
+
+.chats-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.chats-editor-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  max-height: 18rem;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.chats-editor-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chats-editor-row:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.chats-editor-row-open {
+  border-color: var(--accent);
+  background: var(--accent-quiet);
+}
+
+.chats-editor-title {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chats-editor-where {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.chats-editor-chosen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+/* Bounded, and scrolling inside itself. Nothing in this column may grow with the length of a
+   conversation: the panel is beside the list, not instead of it. */
+.chats-sample {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  max-height: 14rem;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.chats-sample-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.chats-sample-text {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  /* Three lines of each, and no more: this is for recognising a conversation. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.chats-sample-aside .chats-sample-text {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* ------------------------------------------ who said it, and how it reads -- */
+
+.chats-turn-who {
+  margin: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.chats-prose {
+  display: flex;
+  flex-direction: column;
+}
+
+.chats-rich-line,
+.chats-rich-bullet,
+.chats-rich-heading {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chats-rich-heading {
+  margin-top: var(--space-2);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.chats-rich-heading-1 {
+  font-size: var(--text-md);
+}
+
+.chats-rich-bullet {
+  display: flex;
+  gap: var(--space-2);
+  padding-left: var(--space-2);
+}
+
+.chats-prose code,
+.chats-said-text code {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* A block of code keeps its own lines: this is the one place on the page where wrapping would
+   change what is written, so it scrolls sideways instead of folding. */
+.chats-code {
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  white-space: pre;
+}
+
+.chats-code code {
+  padding: 0;
+  background: none;
+}
+
+/* The anchor the transcript scrolls to. Nothing to see: it is the bottom. */
+.chats-turns-end {
+  height: 1px;
+}
+
+.chats-turn-fill {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-turn-fill-near {
+  color: var(--tone-warn-fg);
+}
+
+/* ------------------------------------------------------------- the plan -- */
+
+.chats-plan {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--border);
+  list-style: none;
+}
+
+.chats-plan-item {
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-plan-mark {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+}
+
+/* Done is quieter, not louder: the eye should land on the line being worked. */
+.chats-plan-completed .chats-plan-text {
+  text-decoration: line-through;
+}
+
+.chats-plan-in_progress {
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+/* A note, not a bubble: no speaker, no ground of its own, and quieter than either side. */
+.chats-said-aside {
+  border-left-color: transparent;
+  background: none;
+  padding-top: 0;
+  padding-bottom: 0;
+  font-style: italic;
+}
+
+.chats-said-aside .chats-said-text {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+.chats-carries {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-faint);
+}
+
+.chats-carries-over {
+  color: var(--tone-warn-fg);
+}
+
+/* What the model thought, folded shut.
+ *
+ * Quieter than the answer and set off by a rule down its side: this is working, not a conclusion,
+ * and it should read as something you can look into rather than something the turn is claiming. */
+.chats-thought {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-2);
+}
+
+/* Stated, not offered: there is nothing behind it to open. */
+.chats-thought-line {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+  letter-spacing: var(--tracking-wide);
+}
+
+.chats-thought-toggle {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+  letter-spacing: var(--tracking-wide);
+  cursor: pointer;
+}
+
+.chats-thought-toggle:hover {
+  color: var(--text-muted);
+}
+
+/* Verbatim, so its own line breaks are kept. It was drafted, not composed. */
+.chats-thought-text {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--border);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* What a conversation was handed when its session was too large to resume.
+ *
+ * Marked rather than whispered: everything above it is a conversation the model does NOT have, and
+ * a page that drew the two with no seam was claiming otherwise. */
+.chats-handed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--tone-warn-fg);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.chats-handed-line {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+.chats-handed-toggle {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  cursor: pointer;
+}
+
+.chats-handed-toggle:hover {
+  color: var(--text-muted);
+}
+
+.chats-handed-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chats-handed-pair {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* The names an @ offers.
+ *
+ * Above the box, because the box is at the bottom of the panel and a list under it opens off the
+ * edge. Bounded and scrolling: forty names is a list, forty names at full height is a page. */
+.chats-mentions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 14rem;
+  margin: 0 0 var(--space-2);
+  padding: var(--space-1);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  list-style: none;
+}
+
+.chats-mention {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chats-mention:hover {
+  background: var(--surface);
+}
+
+/* The keyboard's position, which must read as strongly as a hover or arrowing through the list
+ * looks like nothing is happening. */
+.chats-mention-on {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.chats-mention-name {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-weight: var(--weight-medium);
+}
+
+/* The path is context, not the thing being chosen: quieter, and it gives way first when narrow. */
+.chats-mention-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chats-mentions-cut,
+.chats-mentions-none {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.chats-mentions-cut {
+  margin: 0;
+  background: none;
+}

@@ -1,0 +1,471 @@
+/**
+ * The Waiting slice: one queue, ten sections, `waiting-` throughout — as
+ * `runs-` is for the runs and `fleet-` for the fleet.
+ *
+ * The rule this file lives under: **no class appears in `Waiting.tsx` that is
+ * not defined below.** `tsc` and vitest both pass happily on a class no
+ * stylesheet has ever heard of, and the defect shows up only as something
+ * looking wrong on a screen nobody is testing. The Calendar tab shipped exactly
+ * that once; grep the component against this file before calling the page done.
+ *
+ * The whole page is one column and not a grid. A decision queue is read top to
+ * bottom in the order the design put the sections in, and a two-column layout
+ * would put half the decisions where a person scanning downwards never looks.
+ */
+
+/* =============================================================== the page == */
+
+.waiting-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 60rem;
+}
+
+/* The count in a panel's heading corner. Tabular, so a column of them is a
+   column rather than a wobble. */
+.waiting-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+/* What this section is for, said once above its list. */
+.waiting-note {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/**
+ * A section the shell cannot build, saying so.
+ *
+ * Quieter than a note and quieter than a refusal — nothing is wrong, and the
+ * sentence is a fact about the núcleo rather than a warning about this page. It
+ * sits inside a `dim` panel, so the recessed surface does the rest.
+ */
+.waiting-absence {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
+}
+
+.waiting-empty,
+.waiting-loading {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+/* A heading inside a panel, under the first list. */
+.waiting-subhead {
+  margin: var(--space-4) 0 var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* =================================================================== lists == */
+
+.waiting-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/**
+ * Above three items the section is being *worked*, not read.
+ *
+ * The gap and the padding come in, and the reasoning is clamped to three lines:
+ * ten cards at reading width is a page of scrolling before the tenth decision is
+ * even visible, and a queue you cannot see the end of is a queue that gets
+ * abandoned halfway.
+ */
+.waiting-list-dense {
+  gap: var(--space-2);
+}
+
+.waiting-list-dense .waiting-card {
+  padding: var(--space-2) var(--space-3);
+}
+
+.waiting-list-dense .waiting-reasoning {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
+/* =================================================================== cards == */
+
+.waiting-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.waiting-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.waiting-card-id {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+/* The verb: which tool, which pair of jobs. The one word on the card that says
+   what the decision is about. */
+.waiting-card-title {
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.waiting-meta {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+/* Why the agent says it wants this. A model wrote it, so it is rendered as text
+   and never as markup — there is no `dangerouslySetInnerHTML` in this slice. */
+.waiting-reasoning {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* A run's prompt, on a row rather than a card. */
+.waiting-excerpt {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ================================================================== facts == */
+
+.waiting-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+}
+
+.waiting-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.waiting-fact dd {
+  margin: var(--space-1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/**
+ * An origin, exactly as the daemon recorded it.
+ *
+ * Monospace and `anywhere` because these are read *character by character*:
+ * a punycode host is only distinguishable from the name it imitates if every
+ * character is legible and none of them is dropped into an ellipsis. Nothing
+ * here truncates.
+ */
+.waiting-url {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* ============================================================= tool input == */
+
+/**
+ * What the action is about to do, field by field.
+ *
+ * A two-column list rather than a code block, because this is the part of the
+ * card the decision actually turns on. JSON braces and quotes here would be
+ * punctuation standing between a person and the one thing they have to read.
+ */
+.waiting-input {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.waiting-input-line {
+  display: grid;
+  grid-template-columns: minmax(4rem, 8rem) minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
+.waiting-input-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.waiting-input-value {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/**
+ * A payload that could not be parsed a second time, shown rather than hidden.
+ *
+ * The daemon's own re-serialisation should always parse; this is the fallback
+ * for the case where it does not, so it is deliberately plain — no attempt to
+ * make unreadable data look structured.
+ */
+.waiting-payload-raw {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The files an exclusion request named. Recorded by the núcleo, not acted on. */
+.waiting-paths {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+/* ================================================================ merges == */
+
+.waiting-merge {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: var(--space-3);
+}
+
+.waiting-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+/* Which of the two survives. The whole point of showing both sides is that the
+   merge is not symmetrical. */
+.waiting-side-role {
+  margin: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.waiting-side-name {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* Addresses read character by character too, for the same reason origins do. */
+.waiting-addresses {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.waiting-verdict {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/**
+ * The refusal this card can see coming.
+ *
+ * Warm rather than red: nothing has failed, and nothing will fail if the person
+ * settles one of the two decisions first. It is the card saying what would
+ * happen, which is the opposite of an error.
+ */
+.waiting-conflict {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-sm);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/* =============================================================== decisions == */
+
+.waiting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* What the last decision did. Green-ish and quiet: it is a receipt, not a state
+   of the machine. */
+.waiting-outcome {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--tone-active-fg);
+}
+
+/* ========================================================= recruitment form == */
+
+/**
+ * The one card in this queue that is a form, because the recruitment approval
+ * is editable at the moment of decision — the corrections travel with it.
+ */
+.waiting-recruit-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.waiting-recruit-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.waiting-recruit-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.waiting-recruit-input,
+.waiting-recruit-textarea {
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+}
+
+.waiting-recruit-textarea {
+  min-height: 4rem;
+  resize: vertical;
+}
+
+/* The two fields a director gets wrong most often — said once, above them. */
+.waiting-recruit-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-faint);
+}
+
+/* ==================================================================== rows == */
+
+/**
+ * A row, for the two sections that are lists of *things* rather than of
+ * decisions — the git queue and the parked runs. Flatter than a card, because
+ * nothing on it is going to be pressed.
+ */
+.waiting-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.waiting-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.waiting-row-link {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--accent);
+}
+
+/**
+ * The git queue's cap, stated without alarm.
+ *
+ * Nothing prunes that table, so a full listing means the daemon has been running
+ * a while. Faint and small on purpose — drawn as a warning it would send
+ * somebody looking for a backlog that does not exist.
+ */
+.waiting-ceiling {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-faint);
+}

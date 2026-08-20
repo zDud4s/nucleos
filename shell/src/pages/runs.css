@@ -1,0 +1,498 @@
+/**
+ * The Runs slice: the index, the new-run form, the presets rail and the run
+ * detail. `runs-` throughout, as `fleet-` is for the fleet.
+ *
+ * The rule this file lives under: **no class appears in a component that is not
+ * defined below.** `tsc` and vitest both pass happily on a class no stylesheet
+ * has ever heard of, and the defect shows up only as something looking wrong on
+ * a screen nobody is testing.
+ *
+ * ONE EXCEPTION, marked below and deliberate. `src/ui/readings.tsx` is a design
+ * system primitive and its rules belong in `src/ui.css` with the rest of the
+ * `ui-` prefix. That file is outside this packet, so the three formatters' rules
+ * are housed here for now — under their own heading, so moving them is a cut and
+ * a paste rather than an archaeology. They are the only `ui-` rules in this file.
+ */
+
+/* ================================================== design system (on loan) == */
+
+/* A relative time. Tabular figures so a column of them does not jitter as the
+   seconds tick over. */
+.ui-reading-time,
+.ui-reading-raw {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A timestamp we could not parse is shown as itself, and marked as unusual. */
+.ui-reading-raw {
+  color: var(--tone-info-fg);
+}
+
+.ui-cost {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-cost-money {
+  color: var(--text);
+}
+
+.ui-cost-tokens {
+  color: var(--text-faint);
+}
+
+.ui-meter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+}
+
+/**
+ * The bar.
+ *
+ * `position: relative` because the handoff mark is placed against it — the mark
+ * is at a fixed fraction of the track and not at a fraction of the fill, which
+ * is the whole reason it says anything.
+ */
+.ui-meter-track {
+  position: relative;
+  display: block;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.ui-meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--tone-info-fg);
+}
+
+/* Past four fifths the run is about to be handed off, which is a fact about
+   what happens next rather than a fault — the warm tone, not the red one. */
+.ui-meter-past .ui-meter-fill {
+  background: var(--tone-paused-fg);
+}
+
+.ui-meter-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--text);
+  opacity: 0.7;
+}
+
+.ui-meter-text,
+.ui-meter-absent {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ================================================================ filters == */
+
+.runs-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.runs-filter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* The one field that grows: a prompt search is a phrase, the rest are words
+   chosen from a list. */
+.runs-filter-text {
+  flex: 1 1 14rem;
+}
+
+.runs-filter select,
+.runs-filter input {
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.runs-filter select:focus-visible,
+.runs-filter input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* =================================================================== body == */
+
+/**
+ * The index and the two things that create runs, side by side.
+ *
+ * The list is the page and the forms are the margin — `minmax(0, 1fr)` on the
+ * first column so a long prompt excerpt wraps instead of pushing the rail off
+ * the screen.
+ */
+.runs-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 22rem;
+  gap: var(--space-5);
+  align-items: start;
+}
+
+@media (max-width: 68rem) {
+  .runs-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.runs-main {
+  min-width: 0;
+}
+
+.runs-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.runs-loading {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+/* =================================================================== list == */
+
+.runs-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.runs-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.runs-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.runs-row-link {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--accent);
+}
+
+.runs-row-mode,
+.runs-row-project,
+.runs-row-cost {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* The money is the one figure worth reading down the column, so it sits at the
+   end of the row rather than in the middle of the words. */
+.runs-row-cost {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.runs-row-excerpt {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* A list that arrived at the ceiling may have been cut, and says so rather than
+   letting the reader believe they have seen everything. */
+.runs-ceiling {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ================================================================ new run == */
+
+.runs-new,
+.runs-save,
+.runs-steer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* The save-a-preset half is a second gesture on the same draft, not a second
+   form about something else — the rule is what says so. */
+.runs-save {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px dashed var(--border);
+}
+
+.runs-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.runs-field input,
+.runs-field select,
+.runs-field textarea {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.runs-field textarea {
+  resize: vertical;
+  line-height: var(--leading-snug);
+}
+
+.runs-prompt {
+  min-height: 5rem;
+}
+
+.runs-field input:focus-visible,
+.runs-field select:focus-visible,
+.runs-field textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.runs-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.runs-new-actions,
+.runs-steer-actions,
+.runs-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* ================================================================ presets == */
+
+.runs-presets {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.runs-preset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.runs-preset-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.runs-preset-name {
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.runs-preset-mode,
+.runs-preset-project {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* Two lines of the prompt, then an ellipsis: the rail is for choosing between
+   presets, not for reading one. */
+.runs-preset-prompt {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.runs-preset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* ================================================================= detail == */
+
+.runs-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.runs-fact dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.runs-fact dd {
+  margin: var(--space-1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.runs-successor {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.runs-gate-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.runs-gate-exit {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* "No gate configured" is not a warning and is not drawn as one. */
+.runs-gate-note {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/**
+ * Every stream on this page.
+ *
+ * A model wrote this text, so it is rendered as text and never as markup —
+ * there is no `dangerouslySetInnerHTML` anywhere in this slice. `pre-wrap`
+ * rather than `pre`: a run's output has no maximum line length, and a page that
+ * scrolls sideways to read one is a page nobody reads.
+ */
+.runs-pre {
+  max-height: 24rem;
+  overflow: auto;
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The live one is taller and reads as the thing that is happening. */
+.runs-tail {
+  max-height: 32rem;
+  color: var(--text);
+}
+
+.runs-tail-note {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+.runs-stream-title {
+  margin: var(--space-4) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}

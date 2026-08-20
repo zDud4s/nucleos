@@ -14,6 +14,13 @@ pub struct ShadowDecision {
     pub reason: Option<String>,
     pub action_class: String,
     pub classifier_version: i64,
+    /// The configuration the decision was taken under, beside the code version above.
+    ///
+    /// `Option` because every row written before migration 0089 has none, and because that gap is
+    /// harmless by the choice of reader — `shadow_readiness` COUNTS distinct digests and does not
+    /// group by them, so a null-digest row goes on counting toward review and agreement exactly as
+    /// it always did.
+    pub policy_digest: Option<String>,
     pub human_verdict: Option<String>,
     pub reviewed_at: Option<String>,
     pub created_at: String,
@@ -32,19 +39,32 @@ pub struct ClassTally {
     pub disagree: i64,
 }
 
+/// Records what the classifier WOULD have done, and under which code and which configuration.
+///
+/// **Two identifiers and not one, and they mean different things.** `classifier_version` is the
+/// CODE — bumped by hand once per policy change, and stamped here so two differently-classified
+/// decisions can be told apart after the fact. `policy_digest` is the CONFIGURATION, and it exists
+/// because from version 10 the code stopped being the whole answer: part of the policy is
+/// `.ai/github.yaml`, which is gitignored and travels with nobody, so two machines on the same
+/// version can decide one `gh` line differently.
+///
+/// The digest is passed in rather than read here, because this function does no I/O beyond its own
+/// INSERT and the policy is `AppState`'s — the same one `classify` was handed for this very
+/// decision, which is what keeps the row describing the answer it actually recorded.
 pub async fn record_decision(
     pool: &SqlitePool,
     run_id: i64,
     tool_name: &str,
     tool_input: &Value,
     classification: &Classification,
+    policy_digest: &str,
 ) -> sqlx::Result<i64> {
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO shadow_decisions
          (run_id, tool_name, tool_input, decision, reason, action_class,
-          classifier_version, human_verdict, reviewed_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+          classifier_version, policy_digest, human_verdict, reviewed_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
     )
     .bind(run_id)
     .bind(tool_name)
@@ -53,6 +73,7 @@ pub async fn record_decision(
     .bind(&classification.reason)
     .bind(classification.action_class)
     .bind(classifier::CLASSIFIER_VERSION as i64)
+    .bind(policy_digest)
     .bind(created_at)
     .execute(pool)
     .await?;
@@ -253,7 +274,8 @@ pub async fn shadow_readiness(
                  ELSE 0
              END) AS withheld,
              {REVIEWED_DISTINCT} AS reviewed,
-             {AGREE_DISTINCT} AS agree
+             {AGREE_DISTINCT} AS agree,
+             COUNT(DISTINCT shadow_decisions.policy_digest) AS policies
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.mode = 'shadow'
@@ -261,13 +283,33 @@ pub async fn shadow_readiness(
     );
 
     // Same `AssertSqlSafe` reasoning as `scoreboard`: the only interpolation is `AGREE_CASE`.
-    let rows: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    let rows: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
         .await?;
 
     let mut readiness: std::collections::HashMap<String, (i64, i64, i64)> =
         std::collections::HashMap::new();
-    for (project_id, action_class, withheld, reviewed, agree) in rows {
+    for (project_id, action_class, withheld, reviewed, agree, policies) in rows {
+        // A count and NOT a `GROUP BY`, and the tempting change is the wrong one. This function's
+        // contract above is that each action class contributes exactly one row, "even when
+        // historical classifier versions recorded different decisions for it" — grouping by digest
+        // would fragment the sample, and with `READINESS_MIN_REVIEWED = 10` every edit of
+        // `.ai/github.yaml` would restart ten reviews of progress toward promotion. Whoever tuned
+        // their policy more often would be permanently further from being allowed to use it.
+        //
+        // It goes into a WARNING and not into the tuple, deliberately. `shadow_readiness` returns
+        // `(i64, i64, i64)` and the shell reads those computed numbers off the daemon "so the button
+        // the user sees and the bar the product enforces can never gate on different numbers" — a
+        // fourth number changes the signature and every consumer, and the shell is out of scope.
+        // Putting it on screen is one line in another delivery, alongside the shell change it forces.
+        if policies > 1 {
+            tracing::warn!(
+                project_id = %project_id,
+                action_class = %action_class,
+                policies,
+                "shadow evidence for one action class spans more than one github policy"
+            );
+        }
         let entry = readiness.entry(project_id).or_insert((0, 0, 0));
         entry.1 += 1;
         if class_ready(reviewed, agree) {
@@ -427,6 +469,7 @@ mod tests {
             "Bash",
             &tool_input,
             &classification("allow", "read-local"),
+            "0123456789abcdef",
         )
         .await
         .unwrap();
@@ -446,6 +489,10 @@ mod tests {
         assert_eq!(row.reason.as_deref(), Some("classified reason"));
         assert_eq!(row.action_class, "read-local");
         assert_eq!(row.classifier_version, CLASSIFIER_VERSION as i64);
+        // Both identifiers, because they mean different things: the version is the CODE, and the
+        // digest is the configuration a person edits. A row carrying only the first cannot tell two
+        // machines on the same version that decided the same `gh` line differently apart.
+        assert_eq!(row.policy_digest.as_deref(), Some("0123456789abcdef"));
         assert_eq!(row.human_verdict, None);
         assert_eq!(row.reviewed_at, None);
         chrono::DateTime::parse_from_rfc3339(&row.created_at).unwrap();
@@ -971,6 +1018,32 @@ mod tests {
 
         // 10 distinct actions reviewed, 9 agreed = 90%, under the 95% bar.
         assert_eq!(readiness.get("project-a").copied(), Some((0, 1, 0)));
+    }
+
+    /// The window between the classifier change and the migration, and the reason it is harmless.
+    ///
+    /// Rows written before `policy_digest` existed carry NULL, and the reader counts distinct
+    /// digests rather than grouping by them — so those rows go on counting toward review and
+    /// agreement exactly as they always did. Under a `GROUP BY` they would have formed an orphan
+    /// pocket that never reaches ten reviews and never promotes anything, which is the shape of the
+    /// bug this test exists to keep out.
+    #[tokio::test]
+    async fn rows_with_no_digest_still_count_toward_promotion() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+
+        assert_eq!(
+            shadow_readiness(&pool)
+                .await
+                .unwrap()
+                .get("project-a")
+                .copied(),
+            Some((1, 1, 0)),
+            "a class whose evidence predates the column must still be able to become ready"
+        );
     }
 
     #[tokio::test]

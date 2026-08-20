@@ -5,22 +5,29 @@ mod auth;
 mod autopilot;
 mod autostart;
 mod backup;
+mod browser;
+mod browser_client;
+mod browser_policy;
+mod browser_wheel;
 mod budget;
 mod calendar;
 mod chats;
 mod classifier;
 mod collision;
+mod commands;
 mod concurrency;
 mod config;
 mod contacts;
 mod council;
 mod daemon_client;
 mod email;
+mod errands;
 mod exclusion;
 mod feed;
 mod files;
 mod gate;
 mod git_exec;
+mod github;
 mod handoff;
 mod health;
 mod hooks;
@@ -31,6 +38,7 @@ mod local_agent;
 mod logging;
 mod mailsend;
 mod mcp_tools;
+mod mentions;
 mod notes;
 mod notify;
 mod pii_shadow;
@@ -40,7 +48,9 @@ mod process_tree;
 mod proposals;
 mod recurrence;
 mod redact;
+mod refine;
 mod repo_trigger;
+mod resolver;
 mod runner;
 mod runs;
 mod scheduler;
@@ -51,6 +61,8 @@ mod shadow;
 mod sidecar;
 mod state;
 mod storage;
+mod team;
+mod team_trigger;
 mod token_efficiency;
 mod transcribe;
 mod triage;
@@ -118,6 +130,63 @@ async fn main() {
         return;
     }
 
+    // `nucleos-core --land`, run from inside a worktree: "I am finished, take this branch."
+    //
+    // A subcommand rather than a documented `curl`, for the reason `--print-token` is one: the
+    // token lives in Credential Manager, and the alternative is teaching every session how to
+    // fetch the master key in order to ask a question about itself. Here the binary reads it, and
+    // the session runs one word.
+    //
+    // It asks; it does not wait. The queue decides when, and the ticket is how to follow it —
+    // printing the id and returning is the honest shape for a request whose whole point is that
+    // somebody else schedules it.
+    if std::env::args().any(|a| a == "--land") {
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!("no daemon token stored yet — start the daemon once to generate one");
+                std::process::exit(1);
+            }
+        };
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let body = serde_json::json!({ "cwd": cwd }).to_string();
+        let response = reqwest::Client::new()
+            .post("http://127.0.0.1:8791/vcs/land")
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("{text}");
+                    // Said at the moment of asking, because that is the last moment the asker is
+                    // listening. A conflict arrives later and reads like a failure to fix; whoever
+                    // read this already knows it is not theirs.
+                    eprintln!(
+                        "asked. the queue decides when — one operation per repository, in order.\n\
+                         watch it with GET /vcs/requests/<id>/wait.\n\
+                         if it conflicts, nothing is published and no copy is left conflicted: \
+                         that is the queue's to report, not yours to resolve from here."
+                    );
+                } else {
+                    eprintln!("the queue refused: {text}");
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("the daemon is not reachable: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if std::env::args().any(|a| a == "--set-telegram-token") {
         match read_secret_from_stdin("paste the bot token, then press Enter:") {
             Some(value) => match secrets::store_secret(TELEGRAM_TOKEN_KEY, &value) {
@@ -129,6 +198,38 @@ async fn main() {
             },
             None => {
                 eprintln!("no bot token was read from stdin");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // The door the `github-token` comes in by. `secrets.rs` has always exposed store/load/delete and
+    // nothing put this key there, so the pillar could be configured, enabled and credential-less with
+    // no way to fix it that did not involve writing a second program.
+    //
+    // Stdin and never an argument, exactly like its two neighbours: a token on a command line is in
+    // the shell's history and in every process listing on the machine for as long as this runs.
+    if std::env::args().any(|a| a == "--set-github-token") {
+        match read_secret_from_stdin(
+            "paste the GitHub token (a fine-grained PAT or a classic one), then press Enter:",
+        ) {
+            Some(value) => match secrets::store_secret(github::TOKEN_KEY, &value) {
+                Ok(()) => {
+                    println!("github token stored in Credential Manager");
+                    // Said here because this is the last moment the person is listening, and the
+                    // alternative is discovering it from a health row that says permission-denied.
+                    eprintln!(
+                        "a `gh auth login` on this machine is NOT a substitute and never was: that                          login writes into the interactive session's keyring, and the daemon runs                          as a scheduled task."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("failed to store github token: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("no github token was read from stdin");
                 std::process::exit(1);
             }
         }
@@ -153,7 +254,18 @@ async fn main() {
     }
 
     if std::env::args().any(|a| a == "--mcp-tools") {
-        if let Err(e) = mcp_tools::run_stdio().await {
+        // `--box errand --errand <id>` narrows what this process serves. Refused rather than
+        // ignored when the box is not one this server knows: a launcher that misspells it would
+        // otherwise get the FULL tool set, in a Telegram topic, with nothing saying so.
+        let args: Vec<String> = std::env::args().collect();
+        let served = match mcp_tools::box_from_args(&args) {
+            Ok(served) => served,
+            Err(e) => {
+                eprintln!("mcp-tools failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = mcp_tools::run_stdio(served).await {
             eprintln!("mcp-tools failed: {e}");
             std::process::exit(1);
         }
@@ -354,16 +466,16 @@ async fn main() {
         tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
     }
 
-    // The folder a person arranges their files in — uploads of their own, and the mail they filed.
-    // Created whether or not the email pillar is enabled, for the same reason as the sandbox: a
-    // directory that always exists is one less thing to go wrong the day email is switched on, and
-    // this one is now reachable from its own tab with the pillar off. An empty path means every
-    // route under it refuses, which is the right answer when the directory could not be made.
+    // The folder a person arranges their files in — uploads of their own, the mail they filed, and
+    // now a workspace per team run. Created whether or not the email pillar is enabled, for the same
+    // reason as the sandbox: a directory that always exists is one less thing to go wrong the day
+    // email is switched on, and this one is reachable from its own tab with the pillar off. `None`
+    // means every route under it refuses, which is the right answer when it could not be made.
     let files_root = match files::ensure_root(dirs.data_local_dir()) {
-        Ok(root) => root,
+        Ok(root) => Some(root),
         Err(error) => {
             tracing::warn!(%error, "could not create the files folder — the Files tab will be unavailable");
-            std::path::PathBuf::new()
+            None
         }
     };
 
@@ -372,6 +484,18 @@ async fn main() {
     let voice_config = config::load_voice_config(std::path::Path::new(".ai/voice.yaml"));
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
+    let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
+    // The path is named once and reused, because two facts come off it: what the file SAYS
+    // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
+    // `GithubRuntime::configured` — and deriving it from a second literal is how the two would come
+    // to disagree about which file they mean.
+    let github_path = std::path::Path::new(".ai/github.yaml");
+    let github_config = config::load_github_config(github_path);
+    let github_configured = github_path.exists();
+    // Resolved here and carried on the runtime, so the daemon and the health probe can never end up
+    // asking about two different programs — the mistake `cli_probe` names when it says to use "the
+    // resolved path, not the configured name".
+    let github_binary = std::env::var("NUCLEOS_GH_BIN").unwrap_or_else(|_| "gh".to_owned());
     // The web sidecar's own shared secret, minted per boot and never persisted.
     //
     // NOT the control token, and not for the reason the email sidecar has its own: this traffic
@@ -380,6 +504,10 @@ async fn main() {
     // per-boot random value is therefore strictly better than a long-lived one — there is nothing
     // to leak and nothing to rotate.
     let web_sidecar_token = auth::generate_token();
+    // The browser sidecar's, minted the same way and for the same reason. It matters more here: the
+    // process it authenticates drives browsers holding the owner's logged-in profiles, so a secret
+    // that leaked would hand those sessions to anything on the machine that can open a socket.
+    let browser_sidecar_token = auth::generate_token();
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -559,10 +687,10 @@ async fn main() {
         triage_runner,
         local_triage_disabled,
         local_assistant,
+        files_root,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,
-            files_root,
             email_sidecar_token,
         )),
         voice: Arc::new(voice::VoiceRuntime::from_config(
@@ -571,6 +699,18 @@ async fn main() {
         )),
         calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
         council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
+        github: Arc::new(github::GithubRuntime::from_config(
+            &github_config,
+            github_configured,
+            github_binary,
+        )),
+        browser: Arc::new(browser::BrowserRuntime {
+            enabled: browser_config.enabled,
+            client: browser_client::BrowserClient::new(
+                sidecar::BROWSER_ADDR,
+                browser_sidecar_token.clone(),
+            ),
+        }),
         web: Arc::new(web::WebRuntime {
             enabled: web_config.enabled,
             trusted_hosts: web_config.trusted_hosts.clone(),
@@ -609,6 +749,38 @@ async fn main() {
         sidecar_path,
         vec![],
     ));
+
+    // The browser sidecar. Started only when the pillar is on, like the web one beside it.
+    //
+    // Before it starts, every session this database still calls open is retired. Spec §9.1: the
+    // adapter is the parent of the browsers, so a daemon restart takes every live session with it —
+    // and a row saying "open" about a browser that no longer exists is worse than no row at all,
+    // because the shell would offer to take the wheel of it.
+    if browser_config.enabled {
+        match browser::retire_open_sessions(&state.pool, &chrono::Utc::now().to_rfc3339()).await {
+            Ok(retired) if retired > 0 => {
+                tracing::warn!("retired {retired} browsing session(s) left open by a previous run")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "could not retire open browsing sessions"),
+        }
+
+        let path = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("browser-sidecar.exe");
+        let env = sidecar::browser_env(
+            "http://127.0.0.1:8791",
+            &browser_sidecar_token,
+            &browser_config,
+        );
+        tokio::spawn(sidecar::supervise(sidecar::BROWSER.to_string(), path, env));
+        tracing::info!(
+            max_sessions = browser_config.max_sessions,
+            "browser sidecar supervised"
+        );
+    }
 
     // The web sidecar. Started only when the pillar is on: an unstarted one means `/web/*` answers
     // 502, which is the honest reading of "there is nothing to ask".
@@ -693,6 +865,24 @@ async fn main() {
     // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
     // one project's test suite.
     tokio::spawn(job::run_job_loop(state.clone()));
+    // AFTER `runs::reconcile_orphaned_runs`, which ran near the top of this function and is what
+    // marks the abandoned subprocesses `interrupted` — the ordering this depends on, and the same
+    // one `job::reconcile_orphaned_jobs` respects. Awaited rather than spawned, so the loop below
+    // never meets a half-reconciled run.
+    if let Err(error) = team::reconcile_orphaned_team_runs(&state).await {
+        tracing::warn!(%error, "could not reconcile the team runs a previous daemon left behind");
+    }
+    // Its own loop again, and for this pillar's own reason rather than the job's: a team pass
+    // launches up to `max_parallel` subprocesses and writes files at a cadence nothing else in the
+    // house shares. It runs no gate, so the argument above does not transfer — this one stands on
+    // its own.
+    tokio::spawn(team::run_team_loop(state.clone()));
+    tokio::spawn(team::run_workspace_gc_loop(state.clone()));
+    // A third loop and not a branch in either of the two above. What DECIDES that a department
+    // starts is a different question from how it runs — the same separation `scheduler.rs` has from
+    // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
+    // and a department has no project, no root and no HEAD.
+    tokio::spawn(team_trigger::run_team_trigger_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
     // The worktree GC's counterpart inside the database. It collects the directories a finished run
@@ -705,6 +895,11 @@ async fn main() {
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor::default()),
     ));
+    // Its own loop and not a step inside the queue worker's, for the reason `resolver.rs` opens
+    // with: the worker holds a pool and a repository lock, and starting an agent needs an
+    // `AppState` and the time an agent takes. The queue escalates and lets go; this picks the
+    // conflict up afterwards.
+    tokio::spawn(resolver::run_resolution_loop(state.clone()));
     // Only when a local model is already configured, and reusing the triage one rather than adding
     // a key: this reads mail-derived text, which is the text that model was chosen for, and
     // `web.rs` sets the precedent of one local model pinned in one place serving more than one

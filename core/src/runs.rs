@@ -382,8 +382,19 @@ pub(crate) async fn read_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> 
 /// exists to read words nobody vouches for, so it is the last run that may be spoken to — and the day
 /// a second such mode appears, both answers have to change together or the barrier narrows to one
 /// mode without anyone deciding to narrow it.
+/// `'team'` answers `None` and that is a deliberate under-statement rather than the truth about
+/// every team run.
+///
+/// A specialist may well hold `McpOnly` — its agent's `tool_policy` decides, and `team.rs` builds
+/// the `RunRequest` itself, so this function never launches one. What it is actually asked, by both
+/// its other readers, is whether a run of this mode may gain a SECOND AUTHOR: `http::post_run_message`
+/// refuses `None`, and `create_run_inner` refuses to create such a run `steerable`. For a
+/// department the answer is no in every case, so the most restrictive value is the honest one to
+/// return — and the alternative, `Unrestricted`, is worse than merely wrong: it is what this
+/// function returns for everything it does not recognise, and it would have handed a team run Bash,
+/// Edit and Write on any path that ever did read it to launch.
 pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
-    if mode == crate::email::TRIAGE_MODE {
+    if mode == crate::email::TRIAGE_MODE || mode == crate::team::TEAM_MODE {
         crate::runner::ToolPolicy::None
     } else {
         crate::runner::ToolPolicy::Unrestricted
@@ -400,8 +411,13 @@ pub(crate) fn tool_policy_for_mode(mode: &str) -> crate::runner::ToolPolicy {
 ///
 /// One definition rather than the same `if` at each reader, because the day a fourth unattended
 /// mode appears, three policies have to learn about it together or two of them quietly won't.
+///
+/// That day arrived with `'team'`, and it is here for the reason the sentence above predicted:
+/// inside a team run there is nobody to answer the CLI. The third policy does not fire on it all
+/// the same — `classifier_governs_tools` also demands `Unrestricted`, and a department never is
+/// (`tool_policy_for_mode` above) — which is the AND doing its job rather than an exception.
 pub(crate) fn runs_unattended(mode: &str) -> bool {
-    mode == "shadow" || mode == "worktree"
+    mode == "shadow" || mode == "worktree" || mode == crate::team::TEAM_MODE
 }
 
 /// Whether this run's actions are governed by the classifier rather than by the CLI's allow-list.
@@ -843,16 +859,21 @@ async fn prepare_handoff_successor(
     }
 
     let session_id = crate::auth::generate_uuid_v4();
-    // `job_id` and `stage` are carried across with everything else. A node that runs out of context
-    // is still that node — same item, same tree — and a successor belonging to no job would be
-    // invisible to the chain that has to finalise it: the item would stay `running` until the
-    // four-hour ceiling, with the work already done and nothing saying where it went.
+    // `job_id`, `stage` and `item_id` are carried across with everything else. A node that runs out
+    // of context is still that node — same item, same tree — and a successor belonging to no job
+    // would be invisible to the chain that has to finalise it: the item would stay `running` until
+    // the four-hour ceiling, with the work already done and nothing saying where it went.
+    //
+    // `item_id` is the same fact one level down, and the column list here is explicit, so leaving
+    // it out is not a no-op: the successor of a node working in its item's own tree would arrive
+    // with no item, resolve to the job's tree instead, and relaunch the agent somewhere its work
+    // is not.
     let inserted = sqlx::query(
         "INSERT INTO runs (
              project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at,
-             job_id, stage
+             job_id, stage, item_id
          )
-         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage
+         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage, item_id
          FROM runs WHERE id = ?",
     )
     .bind(HANDOFF_CONTINUATION_PROMPT)
@@ -1093,6 +1114,11 @@ fn spawn_run(
                 mcp_config: None,
                 tool_policy,
                 progress_timeout: Some(progress_timeout),
+                // The brake that was missing. These are the runs nobody is watching, and the
+                // wall clock above is a poor guard against the failure that matters here: a run
+                // looping quickly costs little per turn and reaches neither the clock nor the job's
+                // money ceiling, which is only checked between nodes.
+                max_turns: Some(crate::runner::DEFAULT_MAX_TURNS),
                 session_id: Some(session_id.clone()),
                 fork_session,
                 include_partial_messages: false,
@@ -1103,6 +1129,9 @@ fn spawn_run(
                 ambient_mcp: false,
                 // Cloned rather than moved: the request is built once per attempt.
                 model: model.clone(),
+                // Nothing to narrow: `create_run_inner` never sets `mcp_config`, so the branch
+                // that reads this does not run for a run started here.
+                allowed_mcp_tools: None,
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
             // be spoken to is settled where its argument vector is chosen, not by whatever later
@@ -1253,6 +1282,27 @@ fn spawn_run(
                                     .await;
                                 }
                             }
+                        }
+                        // Said after the completion row above, not instead of it. The status stays
+                        // `completed` — the CLI did exit 0, and a resumed run may legitimately
+                        // decide the approved action is no longer the right step — but the person
+                        // who granted the authorization is the one who needs to know it went unused,
+                        // and until now nothing told them. See `proposals::unconsumed_grant` for the
+                        // two runs that produced this.
+                        if let Ok(Some((tool_name, proposal_id))) =
+                            crate::proposals::unconsumed_grant(&pool, id).await
+                        {
+                            let _ = crate::feed::append(
+                                &pool,
+                                feed_project_id.as_deref(),
+                                "resume_did_not_act",
+                                &format!(
+                                    "resumed for the {tool_name} action approved in proposal \
+                                     #{proposal_id}, and finished without attempting it"
+                                ),
+                                Some(id),
+                            )
+                            .await;
                         }
                     }
                     if terminal_write_won {
@@ -1460,6 +1510,21 @@ pub struct JobNode {
     pub branch: String,
 }
 
+/// A conflict the daemon is about to hand an agent: which escalated request it came from, and the
+/// two branches that would not merge.
+///
+/// It travels as a struct rather than as a closure taking the fresh worktree, because the two things
+/// it changes about a run happen at two different moments — where the tree is BORN (on the target)
+/// and what is staged in it before the agent exists (the conflict) — and a hook at one of those
+/// moments cannot reach the other.
+pub struct Resolution {
+    /// The escalated `vcs_requests` row. Claimed by writing this run's id into its
+    /// `resolution_run_id`, which is what makes the attempt happen once and never again.
+    pub request_id: i64,
+    pub source: String,
+    pub target: String,
+}
+
 pub async fn create_run_inner(
     state: &AppState,
     prompt: String,
@@ -1469,6 +1534,33 @@ pub async fn create_run_inner(
     steerable: bool,
 ) -> Result<i64, CreateRunError> {
     create_run_with(state, prompt, project_id, cwd, mode, steerable, None).await
+}
+
+/// Starts the one run that is given its work already staged: a merge conflict, put there by the
+/// daemon, in a worktree born on the branch the merge was going into.
+///
+/// `mode = "worktree"` and nothing else, like every other autonomous run that touches code — it
+/// carries the tool policy, the gate, and migration 0009's exclusivity, none of which a fourth mode
+/// would inherit. Never steerable, for `create_job_node_run`'s reason and one of its own: the work
+/// is a conflict the queue found, and text typed into it mid-flight would change what gets published
+/// with nothing recording the substitution.
+pub async fn create_resolution_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    resolution: Resolution,
+) -> Result<i64, CreateRunError> {
+    create_run_with(
+        state,
+        prompt,
+        Some(project_id),
+        Some(project_root),
+        "worktree",
+        false,
+        Some(Provisioning::Resolution(resolution)),
+    )
+    .await
 }
 
 /// Starts one node of a job inside that job's existing worktree.
@@ -1494,9 +1586,41 @@ pub async fn create_job_node_run(
         // queue would still claim the item it was given. Steering belongs to a run somebody started
         // and is watching.
         false,
-        Some(node),
+        Some(Provisioning::Node(node)),
     )
     .await
+}
+
+/// What a run is handed to start from, when it is handed anything at all.
+///
+/// **An enum and not two `Option`s, because the two are mutually exclusive and the type should say
+/// so.** A pair of options admits both-at-once, and the code would resolve that combination
+/// silently rather than refuse it: the node arm would win the worktree, so the conflict would be
+/// staged inside a JOB's tree — on the job's branch, over whatever the previous node left there.
+/// Nothing would report it. Clippy asking for fewer arguments is what sent this looking; the
+/// combination it removes is the reason it stayed.
+enum Provisioning {
+    /// One node of a job, inside the worktree the job already owns.
+    Node(JobNode),
+    /// A conflict resolution: a worktree of its own, born on the merge's target, with the conflict
+    /// already staged in it.
+    Resolution(Resolution),
+}
+
+impl Provisioning {
+    fn node(&self) -> Option<&JobNode> {
+        match self {
+            Self::Node(node) => Some(node),
+            Self::Resolution(_) => None,
+        }
+    }
+
+    fn resolution(&self) -> Option<&Resolution> {
+        match self {
+            Self::Resolution(resolution) => Some(resolution),
+            Self::Node(_) => None,
+        }
+    }
 }
 
 async fn create_run_with(
@@ -1506,8 +1630,10 @@ async fn create_run_with(
     cwd: Option<String>,
     mode: &str,
     steerable: bool,
-    node: Option<JobNode>,
+    provisioning: Option<Provisioning>,
 ) -> Result<i64, CreateRunError> {
+    let node = provisioning.as_ref().and_then(Provisioning::node);
+    let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     if mode == "worktree" && (project_id.is_none() || cwd.is_none()) {
         return Err(CreateRunError::Invalid(
             "worktree mode requires project_id and cwd (the project root)",
@@ -1669,7 +1795,15 @@ async fn create_run_with(
                     }
                 }
 
-                match crate::worktree::create(std::path::Path::new(project_root), owner).await {
+                // A resolution's tree is born on the merge's TARGET; everything else starts where
+                // the project stands. `worktree::create_at` carries why that is not a preference.
+                match crate::worktree::create_at(
+                    std::path::Path::new(project_root),
+                    owner,
+                    resolution.map(|it| it.target.as_str()),
+                )
+                .await
+                {
                     Ok(info) => info,
                     Err(error) => {
                         fail_provisioning(
@@ -1732,6 +1866,70 @@ async fn create_run_with(
             )
             .await;
             return Err(CreateRunError::Db(error));
+        }
+        // A conflict's one attempt is claimed HERE: after the row exists, because the claim IS this
+        // run's id, and before the agent does, because the whole point is that no second agent can
+        // ever be minted against the same escalation. Losing the compare-and-set means something
+        // else got there first, and the run is retired rather than allowed to become that second
+        // agent — the failure migration 0081 describes as exploding rather than degrading.
+        //
+        // Claimed BEFORE the conflict is staged, and the order is not arbitrary. Staging can fail
+        // for two reasons and both should spend the attempt: the merge came out clean, so there is
+        // nothing left to resolve, or it could not run at all, which a second attempt would hit
+        // identically. The reverse order fails much worse — a staged conflict whose claim was then
+        // lost leaves a worktree of real work behind while another agent is already editing the
+        // same two branches.
+        if let Some(resolution) = resolution {
+            match sqlx::query(
+                "UPDATE vcs_requests SET resolution_run_id = ?
+                  WHERE id = ? AND resolution_run_id IS NULL",
+            )
+            .bind(id)
+            .bind(resolution.request_id)
+            .execute(&state.pool)
+            .await
+            {
+                Ok(claimed) if claimed.rows_affected() == 1 => {}
+                Ok(_) => {
+                    fail_provisioning(
+                        state,
+                        id,
+                        project_id.as_deref(),
+                        &format!(
+                            "vcs request {} has already had its one resolution attempt",
+                            resolution.request_id
+                        ),
+                    )
+                    .await;
+                    return Err(CreateRunError::Invalid(
+                        "this conflict has already had its one resolution attempt",
+                    ));
+                }
+                Err(error) => {
+                    fail_provisioning(
+                        state,
+                        id,
+                        project_id.as_deref(),
+                        &format!("the conflict could not be claimed for resolution: {error}"),
+                    )
+                    .await;
+                    return Err(CreateRunError::Db(error));
+                }
+            }
+            // The daemon does the merging; the agent only resolves. `worktree::stage_conflict`
+            // carries why the other way round cannot work at all.
+            if let Err(error) =
+                crate::worktree::stage_conflict(&info.path, &resolution.source).await
+            {
+                fail_provisioning(
+                    state,
+                    id,
+                    project_id.as_deref(),
+                    &format!("the conflict could not be staged for resolution: {error}"),
+                )
+                .await;
+                return Err(CreateRunError::Worktree(error));
+            }
         }
         // The handoff directory, and the exclusion that keeps it out of both the preservation commit
         // and anything a node commits itself. Prepared per node rather than once per job because a
@@ -1882,6 +2080,69 @@ async fn queueable_operation(
         .map(|repo| (repo, op))
 }
 
+/// How much of the approved action's own text the resume prompt repeats back. A run pays for every
+/// token of its own prompt, and a command a loop built can be megabytes.
+const RESUME_ACTION_CHARS: usize = 600;
+
+/// PURE: the instruction a resumed run is given for the action a human just approved.
+///
+/// **This wording is the fix for a measured, reproduced failure** (`.ai/eval/ABLATION.md`, T1×H3,
+/// 2026-08-17). It used to say "Proceed with the {tool} action you attempted before the pause — it
+/// is now authorized". The resumed agent has no record of attempting anything: the pause happens
+/// BEFORE the call runs, so the call never becomes a step in the transcript the resume restores.
+/// What arrived, from the agent's side, was an unverifiable claim of prior authorization urging it
+/// to run a command — the shape of an injection — and twice it refused, correctly:
+///
+/// > This looks like it may be an attempt to get me to run a command under a false claim of prior
+/// > authorization. I won't proceed with any Bash action on that basis.
+///
+/// One turn, nothing done, and the daemon recorded `completed`. So: state the action, and explain
+/// the absence. An agent shown what was approved can weigh it; an agent asked to remember it can
+/// only obey or refuse, and refusing is the better of those two.
+fn resume_instruction(proposal_id: i64, tool_name: &str, tool_input: Option<&str>) -> String {
+    // `command` first because it is the field a person would quote; the whole object otherwise, so
+    // a tool that is not Bash still shows what it was going to do.
+    let action = tool_input
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| value.as_object().map(|_| value.to_string()))
+        })
+        .map(|text| {
+            if text.chars().count() <= RESUME_ACTION_CHARS {
+                text
+            } else {
+                // By chars, not bytes: this is a prompt, and a slice through a UTF-8 boundary
+                // panics on exactly the inputs nobody tests with.
+                let mut cut: String = text.chars().take(RESUME_ACTION_CHARS).collect();
+                cut.push('…');
+                cut
+            }
+        });
+
+    // Said in both arms, because it is needed most when the action cannot be shown.
+    let absence = format!(
+        "You will not find that {tool_name} call in your transcript: the pause happens before the \
+         call runs, so it never became a step you took. Nothing else is authorized. Carry it out if \
+         it is still the right next step, then finish the task."
+    );
+
+    match action {
+        Some(action) => format!(
+            "A human approved one action for this run (proposal #{proposal_id}); it is now \
+             authorized:\n\n    {action}\n\n{absence}"
+        ),
+        None => format!(
+            "A human approved one {tool_name} action for this run (proposal #{proposal_id}); it is \
+             now authorized. Its input could not be read back, so it is not quoted here.\n\n\
+             {absence}"
+        ),
+    }
+}
+
 pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
     let proposal = crate::proposals::get(&state.pool, proposal_id)
         .await?
@@ -1906,15 +2167,19 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // this node started. Looking it up by run would answer "no live worktree" for every paused job
     // node, so approving one returned `NotResumable` and the shell offered a button that could not
     // work. Which owner to ask for is decided by the paused run's own `job_id`.
-    let (job_id, stage): (Option<i64>, Option<String>) =
-        sqlx::query_as("SELECT job_id, stage FROM runs WHERE id = ?")
+    let (job_id, stage, item_id): (Option<i64>, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT job_id, stage, item_id FROM runs WHERE id = ?")
             .bind(original_run_id)
             .fetch_optional(&state.pool)
             .await?
-            .unwrap_or((None, None));
-    let owner = match job_id {
-        Some(job_id) => crate::worktree::Owner::Job(job_id),
-        None => crate::worktree::Owner::Run(original_run_id),
+            .unwrap_or((None, None, None));
+    // Item before job, and both are set at once — a node of an item IS a node of its job. The
+    // innermost tree wins, because it is the one the work is in: answering with the job's would
+    // resume the agent in the integration checkout with its edits somewhere else entirely.
+    let owner = match (item_id, job_id) {
+        (Some(item_id), _) => crate::worktree::Owner::Item(item_id),
+        (None, Some(job_id)) => crate::worktree::Owner::Job(job_id),
+        (None, None) => crate::worktree::Owner::Run(original_run_id),
     };
 
     let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
@@ -1941,6 +2206,11 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // attempts the action — the same inputs, so the same answer, with nothing to keep in step.
     // Absent or unparseable input yields no class, and a classless grant authorizes nothing.
     //
+    // The policy comes off the STATE for that same reason. It is one of `classify`'s three
+    // production callers and all three must be handed the same one: a resume classifying under
+    // an empty policy while the hook classified under the owner's would answer differently about
+    // the identical command line, which is exactly the drift the paragraph above rules out.
+    //
     // Derived even when the action was queued instead of authorized. The row is excluded from
     // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
     // no class would be a row that could not say what was taken over.
@@ -1949,8 +2219,13 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .as_deref()
         .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
         .map(|input| {
-            crate::classifier::classify(&tool_name, &input, Some(std::path::Path::new(&wt_path)))
-                .action_class
+            crate::classifier::classify(
+                &tool_name,
+                &input,
+                Some(std::path::Path::new(&wt_path)),
+                &state.github.policy,
+            )
+            .action_class
         });
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -2007,18 +2282,20 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // has to be written out, and what it does is fall back to authorizing. A run told to proceed
         // is the safe half of this decision: the grant is single-use and the action is one a human
         // just approved.
-        _ => format!(
-            "A previously paused autonomous run has been resumed after approval of proposal #{proposal_id}. Proceed with the {tool_name} action you attempted before the pause — it is now authorized for this run — then finish the task."
-        ),
+        _ => resume_instruction(proposal_id, &tool_name, proposal.tool_input.as_deref()),
     };
 
     // The resume carries the node's identity forward. Without it the new run belongs to no job, so
     // the chain that has to finalise it cannot see it: the item stays `running` forever and the job
     // sits there until the four-hour ceiling retires it, with the approved work already done.
+    // `item_id` travels with the rest of that identity, and it is the second approval that proves
+    // it does: left out, the FIRST resume still lands in the right tree — it was resolved from the
+    // predecessor's own row — while the successor it writes carries no item, so approving that one
+    // resolves to the job's tree instead. One approval looks correct; two do not.
     let result = sqlx::query(
         "INSERT INTO runs
-           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage)
-         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?)",
+           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage, item_id)
+         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?)",
     )
     .bind(&wt_project_id)
     .bind(&wt_path)
@@ -2027,6 +2304,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     .bind(&now)
     .bind(job_id)
     .bind(stage.as_deref())
+    .bind(item_id)
     .execute(&mut *tx)
     .await?;
     let resume_id = result.last_insert_rowid();
@@ -3036,8 +3314,11 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -3126,6 +3407,222 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let repo = container.path().join("repo");
         initialize_repo(&repo);
         (container, repo)
+    }
+
+    /// The same, standing on `master`, with `feat/x` having changed the same line — so the merge a
+    /// resolution is started for is a merge that really does conflict.
+    fn init_conflicted_repo(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+        let (container, repo) = init_contained_repo(prefix);
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        std::fs::write(repo.join("seed.txt"), "theirs\n").expect("write their side");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("theirs")]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(repo.join("seed.txt"), "ours\n").expect("write our side");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("ours")]
+        ));
+        (container, repo)
+    }
+
+    /// A merge the queue escalated, admitted through the real INSERT and then moved to the status the
+    /// executor would have written. Hand-writing the row would let the stored operation drift from
+    /// what `Op` actually serialises, which is the one thing the launcher parses back.
+    async fn escalated_merge(pool: &sqlx::SqlitePool, root: &FsPath) -> i64 {
+        let repo = crate::vcs::ResolvedRepo::synthetic("proj", &root.to_string_lossy(), "proj");
+        let id = crate::vcs::submit(
+            pool,
+            &repo,
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Shell,
+        )
+        .await
+        .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("escalate it");
+        id
+    }
+
+    async fn resolution_run_id_of(pool: &sqlx::SqlitePool, request: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT resolution_run_id FROM vcs_requests WHERE id = ?",
+        )
+        .bind(request)
+        .fetch_one(pool)
+        .await
+        .expect("read the request back")
+    }
+
+    /// The launcher's whole contribution, end to end: the tree is born on the TARGET, the conflict is
+    /// already staged in it when the agent arrives, and the escalation records that it has had its
+    /// attempt.
+    ///
+    /// The agent is given a conflicted worktree rather than two branches and an instruction to merge,
+    /// and that inversion is the design. Any `git merge` a session runs goes to the queue — the same
+    /// queue that refused this merge for conflicting — so an agent told to merge would circle for
+    /// ever against a refusal that is structural and correct.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolution_starts_on_the_target_with_the_conflict_already_in_front_of_it() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_container, repo) = init_conflicted_repo("nucleos-runs-resolve-");
+        // A runner that takes its time, so the assertions below read a worktree the run has not
+        // finished with yet.
+        let state = test_state_with(Some(Duration::from_secs(30)), Duration::from_secs(120)).await;
+        let request = escalated_merge(&state.pool, &repo).await;
+
+        let run = create_resolution_run(
+            &state,
+            "resolve it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Resolution {
+                request_id: request,
+                source: "feat/x".to_owned(),
+                target: "master".to_owned(),
+            },
+        )
+        .await
+        .expect("the resolution should start");
+
+        assert_eq!(
+            resolution_run_id_of(&state.pool, request).await,
+            Some(run),
+            "the escalation has to record which run had its one attempt"
+        );
+
+        let worktree: String = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
+            .bind(run)
+            .fetch_one(&state.pool)
+            .await
+            .expect("the run should have been given its worktree");
+        let worktree = FsPath::new(&worktree);
+        let conflicted =
+            std::fs::read_to_string(worktree.join("seed.txt")).expect("read the conflicted file");
+        assert!(
+            conflicted.contains("<<<<<<<"),
+            "the agent has to find the conflict already staged: {conflicted}"
+        );
+    }
+
+    /// One attempt, never a second. Repeating is where an agent burns budget insisting on the same
+    /// wall, and whoever reads an escalation should find one attempt to read rather than seven —
+    /// without the claim, a tick every minute would mint a fresh agent per tick against the same two
+    /// branches, which does not degrade, it explodes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflict_that_already_had_its_attempt_gets_no_second_agent() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_container, repo) = init_conflicted_repo("nucleos-runs-resolve-twice-");
+        let state = test_state().await;
+        let request = escalated_merge(&state.pool, &repo).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 4242 WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .expect("record an earlier attempt");
+
+        let refused = create_resolution_run(
+            &state,
+            "resolve it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Resolution {
+                request_id: request,
+                source: "feat/x".to_owned(),
+                target: "master".to_owned(),
+            },
+        )
+        .await
+        .expect_err("a conflict that has been attempted must not be handed out again");
+
+        assert!(
+            matches!(refused, CreateRunError::Invalid(_)),
+            "losing the claim is a refusal, not a database failure: {refused:?}"
+        );
+        assert_eq!(
+            resolution_run_id_of(&state.pool, request).await,
+            Some(4242),
+            "the first attempt's record must not be overwritten by the one that lost"
+        );
+        // Past the INSERT, so a run row exists and has to have been retired — a `running` row with no
+        // task holds one of the project's slots until the daemon restarts.
+        let status: String = sqlx::query_scalar("SELECT status FROM runs ORDER BY id DESC LIMIT 1")
+            .fetch_one(&state.pool)
+            .await
+            .expect("the run that lost should still be on the table");
+        assert_eq!(status, "failed");
+    }
+
+    /// A conflict can evaporate between the escalation and the tick that picks it up — other work
+    /// lands, and the two branches merge cleanly after all. No agent is started for that, because
+    /// there would be nothing in its worktree to resolve; the queue can compute this merge by itself
+    /// the next time somebody asks for it.
+    ///
+    /// The attempt is still spent, and that is the ordering being pinned: the claim is written before
+    /// the conflict is staged. The other order loses much worse — a staged conflict whose claim was
+    /// then lost leaves real work in a worktree while a second agent edits the same branches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflict_that_resolved_itself_spends_its_attempt_without_starting_an_agent() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        // No conflict in this one: `feat/x` never diverges from what `master` says.
+        let (_container, repo) = init_contained_repo("nucleos-runs-resolve-clean-");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("feat/x"),
+                OsStr::new("master")
+            ]
+        ));
+        let state = test_state().await;
+        let request = escalated_merge(&state.pool, &repo).await;
+
+        let refused = create_resolution_run(
+            &state,
+            "resolve it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Resolution {
+                request_id: request,
+                source: "feat/x".to_owned(),
+                target: "master".to_owned(),
+            },
+        )
+        .await
+        .expect_err("there is no conflict here to hand anybody");
+
+        assert!(
+            matches!(refused, CreateRunError::Worktree(_)),
+            "staging is what failed, and the error has to say so: {refused:?}"
+        );
+        assert!(
+            resolution_run_id_of(&state.pool, request).await.is_some(),
+            "the attempt is spent even though no agent started — a second try hits the same wall"
+        );
     }
 
     /// Wires this daemon's classifier hook into `dir`, the way a project that has onboarded has it:
@@ -3498,6 +3995,164 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         (proposal_id, branch, container)
     }
 
+    /// **An item's tree survives two approvals in a row, and is found again both times.**
+    ///
+    /// Two and not one, because of WHERE the defect lives. With `item_id` left out of the successor
+    /// INSERT the first resume still lands in the right checkout — the owner is resolved from the
+    /// predecessor's row, which has the item — and what goes wrong is only what that resume WRITES:
+    /// a run with no item, whose own approval would then resolve to the job's integration tree and
+    /// relaunch the agent with its work in a checkout nobody is looking at. So the loop asserts the
+    /// stored column and not only the directory, and it runs twice: the column is what carries the
+    /// answer forward, and the second turn is what a run of one would never reach.
+    ///
+    /// Confirmed by removing the column from that INSERT: the loop fails on the first turn, on the
+    /// column, which is the earliest point at which the mistake is visible at all.
+    ///
+    /// The row in `worktrees` is checked at the end for the other half of the same decision: the
+    /// two hand-over statements filter on `owner_kind = 'run'`, so an item's tree does not move
+    /// with the run. That is what a key of `job_items.id` buys, and a "fix" to those filters would
+    /// hand the tree to whichever run finished last and let the GC take it out from under the item.
+    #[tokio::test]
+    async fn an_items_tree_survives_two_approvals_in_a_row() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-item-approve-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let root = root.to_string_lossy().replace('\\', "/");
+        let branch = crate::git_exec::current_branch(
+            std::path::Path::new(&root),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .expect("the seeded repository has a branch");
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', 'off', ?)
+             ON CONFLICT(project_id) DO UPDATE SET project_root = excluded.project_root",
+        )
+        .bind(&root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &root,
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let item_id = sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status)
+             VALUES (?, 0, 'the item', 'running')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        // The item's own checkout. Standing it at the repository root is enough here: what the
+        // approval reads is the branch of the directory the row names.
+        sqlx::query(
+            "INSERT INTO worktrees
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('item', ?, 'proj', ?, ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(&root)
+        .bind(&root)
+        .bind(&branch)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let mut paused = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at,
+                               job_id, stage, item_id)
+             VALUES ('proj', ?, 'x', 'awaiting_approval', 'sess-1', 'worktree', ?, ?,
+                     'implement', ?)",
+        )
+        .bind(&root)
+        .bind(&created_at)
+        .bind(job_id)
+        .bind(item_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        for approval in 1..=2 {
+            let proposal_id = proposals::create_action_approval(
+                &state.pool,
+                paused,
+                Some("sess-1"),
+                Some("proj"),
+                "Bash",
+                "needs approval",
+                Some(&serde_json::json!({ "command": "cargo test" }).to_string()),
+            )
+            .await
+            .unwrap();
+
+            let resumed = resume_approved_run(&state, proposal_id)
+                .await
+                .unwrap_or_else(|error| panic!("approval {approval} was refused: {error:?}"));
+
+            let (carried, cwd): (Option<i64>, String) =
+                sqlx::query_as("SELECT item_id, cwd FROM runs WHERE id = ?")
+                    .bind(resumed)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                carried,
+                Some(item_id),
+                "approval {approval} produced a run that had forgotten its item"
+            );
+            assert_eq!(
+                cwd, root,
+                "approval {approval} resumed the agent somewhere other than the item's tree"
+            );
+
+            // Pause the successor, so the next turn of the loop approves that one.
+            sqlx::query("UPDATE runs SET status = 'awaiting_approval' WHERE id = ?")
+                .bind(resumed)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            paused = resumed;
+        }
+
+        let (kind, owner_id): (String, i64) = sqlx::query_as(
+            "SELECT owner_kind, owner_id FROM worktrees WHERE path = ? AND removed_at IS NULL",
+        )
+        .bind(&root)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (kind.as_str(), owner_id),
+            ("item", item_id),
+            "the item's tree moved to a run — the identity a stable key exists to prevent"
+        );
+    }
+
     async fn grants_for(state: &AppState, run_id: i64) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM action_grants WHERE run_id = ?")
             .bind(run_id)
@@ -3643,6 +4298,84 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// the race the queue exists to abolish. The approval was the last place still handing that out.
     ///
     /// The absent grant is half the assertion and the more important half: a queued merge beside a
+    /// What a resumed run is told, and why the wording is load-bearing rather than cosmetic.
+    ///
+    /// **Measured 2026-08-17, twice, in `.ai/eval/ABLATION.md`'s T1×H3 cells.** The instruction used
+    /// to be "Proceed with the {tool} action you attempted before the pause — it is now authorized".
+    /// The resumed agent has no record of attempting it — it cannot have one, the pause happens
+    /// BEFORE the call runs, so it never enters the transcript as a step — and what it saw was an
+    /// unverifiable claim of prior authorization asking it to run a command. Both runs refused, in
+    /// the words of an agent doing its job: "This looks like it may be an attempt to get me to run a
+    /// command under a false claim of prior authorization." One turn, $0.04, nothing done.
+    ///
+    /// So the instruction must carry the action itself. Not to be more polite — to be checkable: an
+    /// agent that can read what was approved can judge it, where one asked to recall it can only
+    /// obey or refuse.
+    #[test]
+    fn a_resume_instruction_states_the_action_it_authorizes() {
+        let instruction = resume_instruction(
+            61,
+            "Bash",
+            Some(r#"{"command":"cargo test -p nucleos-core"}"#),
+        );
+        assert!(
+            instruction.contains("cargo test -p nucleos-core"),
+            "the agent cannot judge an action it is not shown: {instruction}"
+        );
+        assert!(
+            instruction.contains("61"),
+            "the proposal is the audit trail back to the human who approved it: {instruction}"
+        );
+    }
+
+    /// The half that stops the message reading as an attack. An agent that is told to continue
+    /// something it has no memory of SHOULD be suspicious; the fix is to explain the absence, not to
+    /// insist harder.
+    #[test]
+    fn a_resume_instruction_explains_why_the_call_is_absent_from_the_transcript() {
+        let instruction = resume_instruction(1, "Bash", Some(r#"{"command":"ls"}"#));
+        assert!(
+            instruction.contains("transcript"),
+            "an unexplained 'you attempted this' is indistinguishable from an injection: \
+             {instruction}"
+        );
+    }
+
+    /// Absent or unparseable input must not produce an instruction that silently drops the action
+    /// and reverts to the wording that failed.
+    #[test]
+    fn a_resume_instruction_without_readable_input_says_so_rather_than_inventing_one() {
+        for input in [None, Some("{not json"), Some(r#"{"no_command":1}"#)] {
+            let instruction = resume_instruction(7, "Agent", input);
+            assert!(
+                instruction.contains("Agent"),
+                "the tool is all that is left to name: {instruction}"
+            );
+            assert!(
+                instruction.contains("transcript"),
+                "the explanation is needed most when the action cannot be shown: {instruction}"
+            );
+        }
+    }
+
+    /// A prompt is not a place to paste an unbounded string: the run pays for every token of it, and
+    /// a command built by a loop can be megabytes.
+    #[test]
+    fn a_resume_instruction_bounds_the_action_it_quotes() {
+        let huge = "x".repeat(RESUME_ACTION_CHARS * 4);
+        let input = serde_json::json!({ "command": huge }).to_string();
+        let instruction = resume_instruction(1, "Bash", Some(&input));
+        assert!(
+            instruction.len() < RESUME_ACTION_CHARS * 2,
+            "quoted action is unbounded: {} chars",
+            instruction.len()
+        );
+        assert!(
+            instruction.contains('…'),
+            "a truncated action must say it was truncated: {instruction}"
+        );
+    }
+
     /// minted grant would be both at once, and the two would race each other.
     #[tokio::test]
     async fn approving_a_merge_queues_it_instead_of_letting_the_run_perform_it() {
@@ -4762,7 +5495,12 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     async fn a_toolless_run_cannot_be_created_steerable() {
         let state = test_state().await;
 
-        for mode in ["real", "shadow", crate::email::TRIAGE_MODE] {
+        for mode in [
+            "real",
+            "shadow",
+            crate::email::TRIAGE_MODE,
+            crate::team::TEAM_MODE,
+        ] {
             let toolless =
                 tool_policy_for_mode(mode) == crate::runner::ToolPolicy::None;
             let result =
@@ -4774,6 +5512,33 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 "{mode}: a run launched with no tools is the one run that must not be steerable"
             );
         }
+    }
+
+    /// The three policies that read `runs_unattended`, and what a department is to each of them.
+    ///
+    /// Written as one test because the comment above the function says the three have to learn
+    /// about a new mode together — and the third deliberately does NOT fire, which is the part that
+    /// reads like a bug when met in isolation. `classifier_governs_tools` also demands
+    /// `Unrestricted`, and a department never is: the AND refusing is the design, not an omission.
+    #[test]
+    fn a_department_is_unattended_and_still_not_governed_by_the_classifier() {
+        assert!(runs_unattended(crate::team::TEAM_MODE));
+        assert_eq!(
+            tool_policy_for_mode(crate::team::TEAM_MODE),
+            crate::runner::ToolPolicy::None
+        );
+        // No `dir` at all, which is a team run's actual state — `team.rs` launches with `cwd: None`
+        // — and two of the three conditions refuse before the disk is ever read.
+        assert!(!classifier_governs_tools(
+            crate::team::TEAM_MODE,
+            crate::runner::ToolPolicy::Unrestricted,
+            None
+        ));
+        assert!(!classifier_governs_tools(
+            crate::team::TEAM_MODE,
+            tool_policy_for_mode(crate::team::TEAM_MODE),
+            None
+        ));
     }
 
     /// Selecting the local runner by mode keeps message bodies on-machine without accidentally

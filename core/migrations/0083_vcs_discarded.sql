@@ -1,0 +1,21 @@
+-- What a published resolution left behind, computed rather than reported.
+--
+-- The gate protects against "it broke" and never against "it threw work away", and
+-- `git_exec::verify_resolution` only closes the two shapes that CANNOT be right -- a flattened merge
+-- and committed conflict markers. Neither can tell a good resolution from one that quietly kept one
+-- side and dropped the other: that one compiles, passes every test, and looks perfect. So the
+-- difference is computed from the commits after the fact and written here.
+--
+-- **Computed, never reported.** An agent that loses work and says it did not is precisely the case
+-- this exists to catch, so nothing an agent wrote goes in this column.
+--
+-- Three states, and the third is why this is TEXT and not a count:
+--   NULL      -- not worked out yet. The resolver's loop looks for these.
+--   'nothing' -- worked out, and every line the incoming branch added is in what was published.
+--   <text>    -- worked out, and this is what is missing, by file.
+--
+-- NULL rather than an `analysed_at` beside it, because the question this answers is "what was lost",
+-- and "we have not looked" is an answer to it. A row that is never analysed -- a resolution whose
+-- repository moved away, a daemon that was down -- stays NULL and reads as unexamined, which is
+-- true, rather than as clean, which would be a claim nobody made.
+ALTER TABLE vcs_requests ADD COLUMN discarded TEXT;

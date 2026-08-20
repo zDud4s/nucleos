@@ -19,6 +19,7 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
+use crate::auth::Scope;
 use crate::state::AppState;
 use crate::trust::{Decision, Requester, Trust};
 use crate::web_client::{WebClient, WebError};
@@ -408,9 +409,39 @@ pub async fn post_search(
     }
 }
 
+/// PURE: who is asking, and the one scope that never gets to be the owner.
+///
+/// The requester is derived here and never read from the request body, because both the shell and
+/// an agent authenticate with the same token and a `requester` field on the wire would be a
+/// permission the caller grants itself. Owner presence was the best proxy available while that was
+/// true of every caller.
+///
+/// It stopped being true of every caller. `Scope::TeamRun` is the first scope that NAMES the
+/// caller, so for that one the answer comes from who is asking instead of from who is at the
+/// screen — still not a field the caller supplies, and still not a permission it grants itself.
+///
+/// Without this, a department reading a page while the owner happened to be at the screen would
+/// receive a stranger's prose UNQUARANTINED: `trust::decide` returns `Raw` only to
+/// `Requester::Owner`. That is the exact laundering the teams design classifies `read_team_file` as
+/// `ReadsUntrusted` to prevent, walking in through the side door.
+fn requester_for(scope: &Scope, owner_is_present: bool) -> Requester {
+    if matches!(scope, Scope::TeamRun(_)) {
+        return Requester::Autonomous;
+    }
+    if owner_is_present {
+        Requester::Owner
+    } else {
+        Requester::Autonomous
+    }
+}
+
 /// `POST /web/read`.
 pub async fn post_read(
     State(state): State<AppState>,
+    // Required and not `Option`, for the reason `hooks::pretooluse_decision` states beside its own:
+    // only `require_token` puts a `Scope` here, so a router assembled without that layer must break
+    // loudly rather than quietly fall back to deciding trust by who is at the screen.
+    axum::Extension(scope): axum::Extension<Scope>,
     axum::Json(request): axum::Json<ReadRequest>,
 ) -> axum::response::Response {
     if !state.web.enabled {
@@ -418,14 +449,10 @@ pub async fn post_read(
     }
     let now = chrono::Utc::now();
 
-    // The requester is derived from owner presence, never from the request body. Both the shell and
-    // an agent authenticate with the same token, so a `requester` field on the wire would be a
-    // permission the caller grants itself.
-    let requester = if crate::attention::owner_is_present(&state.pool, now).await {
-        Requester::Owner
-    } else {
-        Requester::Autonomous
-    };
+    let requester = requester_for(
+        &scope,
+        crate::attention::owner_is_present(&state.pool, now).await,
+    );
 
     // A cache hit still gets a fresh decision (spec §10.4) — `deliver` is the only door, and it
     // ignores whatever the row was stored under.
@@ -718,8 +745,46 @@ fn db_error(error: sqlx::Error) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::ApiTokenLevel;
     use crate::storage::TempDb;
     use crate::trust::{RULE_AUTONOMOUS, RULE_OWNER_ALLOWLISTED};
+
+    /// The hole this closes, stated as an assertion: a department reading the web while the owner
+    /// is at the screen must not be handed raw prose.
+    ///
+    /// `trust::decide` grants `Raw` only to `Requester::Owner`, and before this the requester came
+    /// from owner presence alone — so the quarantine that the whole teams design leans on would
+    /// have been off for exactly as long as somebody was using the machine. Intermittent, and
+    /// therefore the kind of hole that is found in production and not in a suite.
+    #[test]
+    fn a_team_run_is_autonomous_even_with_the_owner_at_the_screen() {
+        let team = Scope::TeamRun("run-1".to_owned());
+        assert_eq!(requester_for(&team, true), Requester::Autonomous);
+        assert_eq!(requester_for(&team, false), Requester::Autonomous);
+    }
+
+    /// And every other caller keeps the behaviour it had, which is what makes the change above a
+    /// correction rather than a policy shift: the shell still reads the web as the owner.
+    #[test]
+    fn every_other_scope_still_asks_whether_the_owner_is_present() {
+        for scope in [
+            Scope::Control,
+            Scope::Run(7),
+            Scope::Service(crate::auth::Service::Email),
+            Scope::ApiToken(ApiTokenLevel::Admin),
+        ] {
+            assert_eq!(
+                requester_for(&scope, true),
+                Requester::Owner,
+                "{scope:?} at the screen is the owner reading"
+            );
+            assert_eq!(
+                requester_for(&scope, false),
+                Requester::Autonomous,
+                "{scope:?} with nobody there is autonomous"
+            );
+        }
+    }
 
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()

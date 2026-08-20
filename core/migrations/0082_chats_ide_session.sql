@@ -1,0 +1,16 @@
+-- Which conversation had in the editor this one was picked up from.
+--
+-- NULL means it was opened here and came from nowhere, which is what every conversation before this
+-- column is. It is written once, when the chat is opened, and never again.
+--
+-- Deliberately NOT read back off `assistant_sessions`. That table holds the session the NEXT turn
+-- resumes, and the daemon replaces it whenever a context rotates past its ceiling or a turn reads
+-- third-party text -- so a message or two into a picked-up conversation it names a session the CLI
+-- minted here, and the one the conversation came FROM is gone. The two are different facts that
+-- happen to be equal for one turn, and only one of them can answer "what was already said in this
+-- conversation" every time the chat is opened.
+--
+-- It is also what keeps the picker honest. A session already picked up is left out of the list --
+-- two threads on one context show up in the window as unrelated conversations -- and that filter
+-- read `assistant_sessions` alone, so a rotated conversation put its origin back on offer.
+ALTER TABLE chats ADD COLUMN ide_session_id TEXT;

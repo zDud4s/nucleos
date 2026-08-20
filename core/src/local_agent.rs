@@ -142,6 +142,34 @@ pub struct Turn {
 pub const NO_ANSWER: &str =
     "I could not finish working that out. Try asking for one thing at a time.";
 
+/// An empty tool box, for the turns that have none.
+///
+/// It lives beside the trait rather than in either of its two callers, because both a council's
+/// silent phases and a team agent declared `tool_policy: none` want exactly this and a second copy
+/// would be a second answer to "what does an unoffered tool call do".
+///
+/// A type rather than an `Option` threaded through `run_turn`, because "no tools" and "tools that
+/// are all refused" are different things to a model: an empty schema list means it is never offered
+/// one, and never offered is never called.
+pub struct NoTools;
+
+#[async_trait::async_trait]
+impl ToolBox for NoTools {
+    fn schemas(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    /// `ToolAnswer::own`, and it is not a formality: an empty box advertises nothing, so the only
+    /// way to reach this is a name the model invented — and an invented name brings no stranger's
+    /// words into the turn, because no tool ran.
+    async fn call(&self, name: &str, _arguments: &serde_json::Value) -> ToolAnswer {
+        ToolAnswer::own(
+            serde_json::json!({"error": format!("{name} is not a tool this turn can use")})
+                .to_string(),
+        )
+    }
+}
+
 /// Drives one local turn to an answer.
 ///
 /// `system` is separated from `prompt` because a local model needs to be told what it is far more
@@ -302,6 +330,26 @@ pub struct LocalAssistant {
 impl LocalAssistant {
     pub fn new(chat: Box<dyn LocalChat>, tools: Box<dyn ToolBox>) -> Self {
         Self { chat, tools }
+    }
+
+    /// One question, one answer, and NO TOOLS.
+    ///
+    /// This is what "a separate verifier" comes to in code. `answer` hands the model a toolbox and a
+    /// chat's history; this hands it a prompt and nothing else — it cannot search, cannot read a
+    /// file, cannot write one, and cannot start anything. A judge that could do the work is not a
+    /// judge, and a judge that could act on what it read is the injection barrier reopened at the
+    /// one point where the text it is reading was written by a turn that had been reading strangers.
+    ///
+    /// No taint flag either, and that is the same argument from the other side: nothing here can
+    /// carry what it read anywhere. The text goes in, one line comes out, and the caller decides.
+    pub async fn verdict(&self, prompt: &str) -> std::io::Result<String> {
+        let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
+        let reply = self.chat.exchange(messages, None).await?;
+        Ok(reply
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
     }
 
     /// `taint` is the caller's, for the reason `run_turn` gives: the two endings that lose a return

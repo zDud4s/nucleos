@@ -1,0 +1,31 @@
+-- The configuration a shadow decision was taken under, beside the code version already there.
+--
+-- `classifier_version` says WHICH CODE decided; from version 10 that stopped being enough on its
+-- own, because part of the policy now lives in `.ai/github.yaml` — a gitignored, per-developer file.
+-- Two machines both on version 10 can classify the same `gh` line differently, and a scoreboard
+-- that could not tell them apart would be comparing decisions that are not comparable.
+--
+-- The value is a short hash of the EFFECTIVE policy: already narrowed by the compiled ceilings,
+-- sorted and deduplicated. Normalised before hashed, so editing a comment or reordering two lines
+-- does not break the scoreboard — which is the whole reason it is a digest of the policy rather
+-- than of the file.
+--
+-- NULL for every row written before this column existed, and for every row written between the
+-- classifier change and this migration. That gap is harmless BY THE CHOICE OF READER: the
+-- readiness query counts distinct digests and does not group by them, so null-digest rows go on
+-- counting toward review and agreement exactly as they always did and form no group of their own.
+-- Grouping would have made them an orphan pocket that never reaches ten reviews and never promotes.
+--
+-- 0090, on the second attempt, and the second attempt is the lesson.
+--
+-- This was cut as 0089: master's last migration was 0087, and an uncommitted
+-- `0088_refinements.sql` sat in a sibling checkout, so 0089 was the first number nobody could
+-- be seen to hold. By the time the branch caught up, master had landed BOTH 0088 and an 0089 of
+-- its own -- whose commit message reads "move tools_used to 0089, 0088 is taken on master": the
+-- same accident, one number along, to somebody who had also checked.
+--
+-- So the rule is not "look harder before cutting". A number claimed on a branch is claimed
+-- nowhere anybody else can see, and checking at cut time cannot see a branch that has not
+-- merged yet. **Re-read the ceiling at MERGE time**, which is the only moment the other claims
+-- are visible. That is what caught this one.
+ALTER TABLE shadow_decisions ADD COLUMN policy_digest TEXT;

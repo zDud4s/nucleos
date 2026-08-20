@@ -15,6 +15,7 @@ pub const ECHO: &str = "echo";
 pub const TELEGRAM: &str = "telegram";
 pub const EMAIL: &str = "email";
 pub const WEB: &str = "web";
+pub const BROWSER: &str = "browser";
 
 /// The two values [`SidecarState::state`] takes, written once because it is serialized to the shell.
 const RUNNING: &str = "running";
@@ -56,6 +57,21 @@ fn next_delay(lived: Duration, current: Duration) -> Duration {
 /// like a quiet mailbox — the same thing an empty inbox looks like.
 static SIDECARS: LazyLock<Mutex<BTreeMap<String, SidecarState>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Every sidecar this daemon has spawned, held by the kernel so that they die when it does.
+///
+/// `kill_on_drop` below covers the orderly shutdown and covers nothing else: `TerminateProcess` —
+/// which is what Stop-Process, Task Manager and a crash all are — runs no destructor. MEASURED,
+/// 2026-08-20: two days of daemon restarts had left 31 orphaned sidecars alive, and because an
+/// orphan keeps its loopback port, every freshly spawned replacement died at `bind` and was
+/// "restarted" forever. The browser sidecar the app was actually talking to was two days old and
+/// would have stayed that way through any number of restarts, with `/sidecars` reporting `running`
+/// — which was true, and was about the wrong process.
+///
+/// Process-wide for the same reason `SIDECARS` is: there is one set of sidecars per daemon. See
+/// [`crate::process_tree::Litter`] for the primitive and for what it does not promise off Windows.
+static LITTER: LazyLock<crate::process_tree::Litter> =
+    LazyLock::new(crate::process_tree::Litter::new);
 
 /// What the supervisor last observed, reduced to what a readiness row needs to grade it.
 ///
@@ -265,7 +281,8 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
             cmd.env(k, v);
         }
         // A sidecar's environment holds the daemon token, and for email the IMAP password too.
-        // Without this, shutting the daemon down left the process running with both.
+        // Without this, shutting the daemon down left the process running with both. It is the
+        // orderly half only — see LITTER for the half that survives being terminated.
         cmd.kill_on_drop(true);
         // Piped rather than inherited, which is what it was. Inheriting sent every sidecar's output
         // to the daemon's own console and nowhere else: not the log file, not `/sidecars`, not the
@@ -276,6 +293,11 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         cmd.stderr(std::process::Stdio::piped());
         match cmd.spawn() {
             Ok(mut child) => {
+                // Adopted before anything else is done with it, and while the `Child` is still held
+                // — which is what stops Windows reusing the pid between the spawn and the adoption.
+                if let Some(pid) = child.id() {
+                    LITTER.adopt(pid);
+                }
                 // Taken before `wait()`, which needs the child mutably and would otherwise hold the
                 // handles for as long as the process lives.
                 if let Some(stdout) = child.stdout.take() {
@@ -376,6 +398,56 @@ pub const EMAIL_FETCH_ADDR: &str = "127.0.0.1:8793";
 /// because a process that fetches arbitrary URLs and listens off-machine is an open proxy with the
 /// owner's address on it.
 pub const WEB_ADDR: &str = "127.0.0.1:8794";
+
+/// Where the browser sidecar answers the núcleo. 8795 follows the web sidecar (8794).
+///
+/// A constant for the same reason the two above are, with the stake raised: this process drives
+/// browsers holding the owner's logged-in profiles, so `requireLoopback` on the Go side refuses to
+/// bind anything else. A listener off this machine would hand those sessions to whoever asked.
+pub const BROWSER_ADDR: &str = "127.0.0.1:8795";
+
+/// The browser sidecar's environment (spec §8).
+///
+/// The site lists are deliberately ABSENT, exactly as the trust allowlist is absent from
+/// [`web_env`] and for a sharper version of the same reason. The sidecar enforces a fence per
+/// session, against the list the núcleo sends WITH that session — so there is one list, in one
+/// place, read at the moment it is used. A copy in the environment would be a second allowlist that
+/// only changes when the process restarts, and the one that drifts is always the one nobody reads.
+pub fn browser_env(
+    daemon_url: &str,
+    daemon_token: &str,
+    config: &crate::config::BrowserConfig,
+) -> Vec<(String, String)> {
+    vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), daemon_token.to_string()),
+        ("BROWSER_ADDR".to_string(), BROWSER_ADDR.to_string()),
+        // The real driver. "fake" is what the sidecar defaults to, and a browser pillar that ran on
+        // the fake would answer every question with an invented page — so the daemon names the one
+        // it means rather than relying on a default it did not choose.
+        ("BROWSER_DRIVER".to_string(), "chrome".to_string()),
+        (
+            "BROWSER_MAX_SESSIONS".to_string(),
+            config.max_sessions.to_string(),
+        ),
+        (
+            "BROWSER_CACHE_MB".to_string(),
+            config.cache_size_mb.to_string(),
+        ),
+        (
+            "BROWSER_MAX_PROFILES".to_string(),
+            config.max_profiles.to_string(),
+        ),
+        (
+            "BROWSER_DISK_BUDGET_MB".to_string(),
+            config.disk_budget_mb.to_string(),
+        ),
+        (
+            "BROWSER_OPEN_TIMEOUT_SECS".to_string(),
+            config.load_timeout_seconds.to_string(),
+        ),
+    ]
+}
 
 /// The web sidecar's environment (spec §3.4).
 ///

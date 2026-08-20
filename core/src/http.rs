@@ -3,7 +3,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
@@ -102,6 +102,62 @@ pub fn build_router(state: AppState) -> Router {
             "/agents/{id}",
             get(get_agent).put(update_agent).delete(delete_agent),
         )
+        // The teams pillar. Everything here is the owner's except the last line: `/team-files/read`
+        // is the only one a team run's own key opens, and which folder it reads is decided by that
+        // key and never by the body — see `team::post_read_file`. `auth::TEAM_ROUTES` is where that
+        // split is actually enforced; this is only where the names appear.
+        .route(
+            "/teams",
+            get(crate::team::list_teams).post(crate::team::create_team),
+        )
+        .route(
+            "/teams/{id}",
+            get(crate::team::get_team)
+                .put(crate::team::update_team)
+                .delete(crate::team::delete_team),
+        )
+        .route("/teams/{id}/runs", post(crate::team::post_team_run))
+        .route("/team-runs", get(crate::team::list_team_runs))
+        .route(
+            "/team-runs/{id}",
+            get(crate::team::get_team_run).delete(crate::team::delete_team_run),
+        )
+        .route(
+            "/team-runs/{id}/cancel",
+            post(crate::team::post_team_run_cancel),
+        )
+        .route(
+            "/team-runs/{id}/actions",
+            get(crate::team::list_team_run_actions),
+        )
+        .route("/team-files/read", post(crate::team::post_read_file))
+        // Two callers, two methods, two scopes. A department POSTs what it would like done; only
+        // the owner reads the queue of them. `auth::TEAM_ROUTES` lists the POST and not the GET, and
+        // that pair is the whole of a department's authority to act.
+        .route(
+            "/team-actions",
+            post(crate::team::post_team_action).get(crate::team::list_open_actions),
+        )
+        .route("/team-recruits", post(crate::team::post_team_recruit))
+        // All Control, and NONE of them in `auth::TEAM_ROUTES`. A department neither arms nor fires
+        // a rule, and that is not an oversight: it is what stops a chain feeding itself underneath
+        // the graph the cycle check walks.
+        .route(
+            "/team-triggers",
+            get(crate::team_trigger::list_triggers).post(crate::team_trigger::create_trigger),
+        )
+        .route(
+            "/team-triggers/{id}",
+            axum::routing::delete(crate::team_trigger::delete_trigger),
+        )
+        .route(
+            "/team-triggers/{id}/enable",
+            post(crate::team_trigger::post_trigger_enable),
+        )
+        .route(
+            "/team-triggers/{id}/next",
+            get(crate::team_trigger::get_trigger_next),
+        )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
@@ -129,11 +185,34 @@ pub fn build_router(state: AppState) -> Router {
         // Speaking to a job that is already running. Scoped like `POST /runs/{id}/message` and
         // deliberately NOT like the `POST /jobs` one segment above it — see `post_job_note`.
         .route("/jobs/{id}/notes", post(post_job_note))
+        // What earlier work learned, and the two things a person does with it. Owner-scoped like
+        // the notes above and for a stronger reason: this is the layer that decides what every
+        // later run is told, so a token that could write here could rewrite the agent's mind for
+        // every project on the machine. **How a RUN declares one is deliberately not here** — that
+        // is an agent writing into what agents are told, which is the governance question
+        // `notes.rs` refuses in its own words, and it is the owner's to answer rather than mine.
+        .route("/refinements", get(list_refinements).post(post_refinement))
+        .route("/refinements/{id}", get(get_refinement))
+        .route("/refinements/{id}/revert", post(revert_refinement))
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
         .route("/assistant/local-model", get(get_local_model))
         .route("/assistant/ide-sessions", get(list_ide_sessions))
+        // The conversation behind one of them. A GET on the session itself rather than a
+        // `/messages` under it: what a session IS, to anything outside this daemon, is what was
+        // said in it — the id and the directory are how it is found, not what it holds.
+        .route(
+            "/assistant/ide-sessions/{session_id}",
+            get(read_ide_session),
+        )
+        // Writing this daemon's classifier hook into the project a session was had in. POST
+        // because it changes that project, and under the session because the session is what says
+        // WHICH project — the request never names a directory.
+        .route(
+            "/assistant/ide-sessions/{session_id}/tools",
+            post(wire_ide_session_tools),
+        )
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -141,14 +220,60 @@ pub fn build_router(state: AppState) -> Router {
                 .patch(patch_chat)
                 .delete(delete_chat),
         )
+        // The names an `@` in the composer completes against. A segment deeper than the chat
+        // itself, and rooted at that chat's own directory rather than at anything the caller sends.
+        .route("/assistant/chats/{chat_id}/files", get(get_chat_files))
+        // And the commands a `/` completes against. Beside `/files` because it is the same gesture
+        // at the same place, answered from a different part of the same directory.
+        .route(
+            "/assistant/chats/{chat_id}/commands",
+            get(get_chat_commands),
+        )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
+        // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
+        // the two cannot shadow each other whatever a turn id looks like.
+        .route("/assistant/{turn_id}/live", get(get_assistant_live))
+        // An errand is standing work on a Telegram topic, and these are the four moves the chat
+        // routes above already make: open one, list them, change one, end it. DELETE ends the
+        // asking and removes nothing — `errands::close` says why.
+        .route("/errands", get(list_errands).post(create_errand))
+        .route("/errands/{id}", patch(patch_errand).delete(close_errand))
+        // The errand's folder and its notebook, over HTTP because that is the only door the MCP
+        // process has: it runs beside the daemon and never touches the pool.
+        //
+        // `{*path}` is a wildcard and not a `{name}` because a note may sit in a subdirectory of the
+        // folder, and a segment parameter stops at the first slash. Nothing here joins that path
+        // itself — every one of the three goes through `errands::file_path`, which is what puts a
+        // path chosen by a model that has been reading the open web through
+        // `files::resolve_within`, the one function in the daemon that decides what is reachable.
+        .route("/errands/{id}/files", get(list_errand_files))
+        .route(
+            "/errands/{id}/files/{*path}",
+            get(read_errand_file).put(write_errand_file),
+        )
+        .route("/errands/{id}/notebook", get(read_errand_notebook))
+        // What makes an errand STANDING work rather than a topic somebody has to keep typing into.
+        // A project keeps its schedule in `.ai/autopilot.yaml` inside its repository; an errand has
+        // no repository, so the rules live in the database and this is the only door to them.
+        //
+        // The rule id is scoped under the errand id on purpose. Both come out of the path, so
+        // nothing about a request pairs them correctly — `errands::delete_rule` keys on both, and a
+        // mismatched pair matches no row instead of reaching another errand's schedule.
+        .route(
+            "/errands/{id}/rules",
+            get(list_errand_rules).post(create_errand_rule),
+        )
+        .route("/errands/{id}/rules/{rule_id}", delete(delete_errand_rule))
         .route("/proposals", get(get_proposals))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
         // that `/runs/awaiting-approval` raises does not arise here.
         .route("/proposals/skipped-items", get(get_skipped_items))
+        .route("/proposals/team-actions", get(get_team_action_proposals))
+        .route("/proposals/recruits", get(get_recruit_proposals))
+        .route("/proposals/refused-actions", get(get_refused_actions))
         .route("/proposals/{id}/approve", post(post_proposal_approve))
         .route("/proposals/{id}/reject", post(post_proposal_reject))
         .route("/proposals/{id}/dismiss", post(post_proposal_dismiss))
@@ -156,11 +281,24 @@ pub fn build_router(state: AppState) -> Router {
             "/vcs/requests",
             post(submit_vcs_request).get(list_vcs_requests),
         )
+        // Beside `/vcs/requests` because it admits one, and apart from it because the caller knows
+        // something different: a worktree knows where it is standing and nothing else, while
+        // `/vcs/requests` is for a caller that already names a project and an operation.
+        .route("/vcs/land", post(land_worktree))
         // Two spellings of one read, separated only by how long the caller is willing to hold the
         // line. `/wait` blocks up to `vcs::DEFAULT_WAIT`; the bare route is the same read with a
         // zero deadline, which `wait_for` answers from its first look at the row.
         .route("/vcs/requests/{id}", get(get_vcs_request))
         .route("/vcs/requests/{id}/wait", get(wait_vcs_request))
+        // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
+        // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
+        // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
+        //
+        // ONE route for both tools, and what makes that safe is exactly the line above: it is
+        // unreachable by a `Scope::Run`, so it is not a second door for the agent the tools serve.
+        // The partition between reading and acting is held by the parameter TYPES at the tool
+        // boundary, never by the transport, which takes an `Op` and executes it.
+        .route("/github/requests", post(submit_github_request))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
@@ -223,6 +361,40 @@ pub fn build_router(state: AppState) -> Router {
         .route("/web/read", post(crate::web::post_read))
         .route("/web/pages", get(crate::web::list_pages))
         .route("/web/pages/{id}", get(crate::web::get_page))
+        // The browser pillar. Every one of these needs Admin — none is in `auth.rs`'s read-only
+        // table, including the two GETs, because the list of hosts a project has logged into is a
+        // map of where its owner has accounts.
+        //
+        // There is no `/browser/grant`, and its absence is the pillar's central invariant rather
+        // than an omission: the site list grows when a person finishes a login and hands the wheel
+        // back (spec §5.2), never by asking for a host to be added.
+        .route("/browser/open", post(crate::browser::post_open))
+        .route("/browser/snapshot", post(crate::browser::post_snapshot))
+        .route("/browser/act", post(crate::browser::post_act))
+        .route("/browser/screenshot", post(crate::browser::post_screenshot))
+        .route("/browser/close", post(crate::browser::post_close))
+        .route("/browser/revoke", post(crate::browser::post_revoke))
+        .route("/browser/forget", post(crate::browser::post_forget))
+        // The wheel (spec §4.4). `/handoff` is the agent asking; there is deliberately no route that
+        // ACCEPTS — accepting is `POST /proposals/{id}/approve`, the same door every other decision
+        // goes through, so the compare-and-set that settles a concurrent approve is also the write
+        // that moves the session out of the agent's hands (rule 1).
+        //
+        // `/keep` is the closest thing to a grant on this surface, and it names no host: it answers
+        // yes or no to a chain a browser recorded under a person's own hands.
+        .route("/browser/handoff", post(crate::browser_wheel::post_handoff))
+        // A window a person opens for themselves. It skips the proposal that `/handoff` raises,
+        // because the dialogue there defends against an AGENT having chosen the destination and here
+        // nobody did — and it refuses outright when nobody is at the machine, which is the check that
+        // stops it being a route any run could use to open a browser over the owner's live cookies.
+        .route("/browser/window", post(crate::browser_wheel::post_window))
+        .route("/browser/return", post(crate::browser_wheel::post_return))
+        .route("/browser/keep", post(crate::browser_wheel::post_keep))
+        .route("/browser/sessions", get(crate::browser::list_open_sessions))
+        .route(
+            "/browser/sites/{project_id}",
+            get(crate::browser::get_sites),
+        )
         .route("/voice/config", get(crate::voice::get_config))
         .route("/voice/memos", get(crate::voice::list_memos))
         // Read by hand for prompt tuning, not by the shell — see voice.rs's `list_dictations`.
@@ -531,6 +703,10 @@ struct ProjectQuery {
 #[derive(Deserialize)]
 struct FeedQuery {
     project_id: Option<String>,
+    /// The other owner a feed line can have. Beside `project_id` and never combined with it: an
+    /// errand has no project, so a request carrying both is asking for rows that cannot exist —
+    /// `get_feed` takes the errand as the narrower fact and says so there.
+    errand_id: Option<i64>,
     scope: Option<String>,
     q: Option<String>,
     kind: Option<String>,
@@ -843,6 +1019,42 @@ async fn get_contacts(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "reading the contact roster failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The things departments have asked for and nobody has answered yet.
+///
+/// A door of its own rather than a slice of `/proposals`, which filters to `action-approval` and
+/// would need widening — and widening it would put two decisions with the same button next to each
+/// other: one resumes a paused run holding a worktree, the other authorises an email from a
+/// department that finished hours ago. `list_skipped_items` split off for exactly this reason.
+async fn get_team_action_proposals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_pending_team_actions(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading pending team actions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The specialists directors asked for and nobody has answered.
+///
+/// A fourth door, and separate for the reason the third is: the button says "Hire", not "Approve",
+/// because what it does is different from the rest of the queue — and unlike every other proposal
+/// in the house, this one is EDITABLE at the moment of decision. Sharing a list with things that
+/// are not editable would mean one form that pretends the fields are read-only half the time.
+async fn get_recruit_proposals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_pending_recruits(&state.pool, None)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading pending recruitments failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -1264,11 +1476,16 @@ fn folder_status(error: crate::files::PathError) -> StatusCode {
 }
 
 /// The folder root, or a refusal when startup could not create it.
-fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
-    if state.email.files_root.as_os_str().is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    Ok(&state.email.files_root)
+///
+/// `pub(crate)` because a second pillar with a loop of its own now reads the same root, and the one
+/// thing worth sharing is the 503: an installation with no files folder must answer the same way
+/// whichever route asked. The field itself lives on `AppState` rather than in any one pillar's
+/// runtime — see the doc there for why it stopped being the mail pillar's.
+pub(crate) fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
+    state
+        .files_root
+        .as_deref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 #[derive(Deserialize)]
@@ -1632,10 +1849,27 @@ async fn post_email_requeue(
         })
 }
 
+/// A refusal, named so the caller can answer it.
+///
+/// The status code is the coarse signal and stays honest for anything between here and the caller;
+/// the slug is the fine one, because this route has more refusals than HTTP has codes that fit
+/// them. Four, against three — 403 is spent by `auth.rs` on token level and would read as a
+/// rejected token, which is the one thing this never is.
+///
+/// A slug and not the sentence, for the reason `assistant.rs` records around `NO_LOCAL_MODEL`: a
+/// refusal recognised by its prose stops being recognised the day somebody improves the wording,
+/// and it fails silently — a deliberate refusal starts reading as a crash. And the sentence is not
+/// this crate's to write anyway. What undoes a paused errand is `/retomar`, a Telegram command; the
+/// núcleo says which refusal happened and whoever is talking to the person says what to do about
+/// it, in the language they are being spoken to in.
+fn refusal(status: StatusCode, name: &'static str) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "refusal": name })))
+}
+
 async fn post_assistant_message(
     State(state): State<AppState>,
     Json(body): Json<AssistantMessageRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Uncancellable for the same reason `create_run` is: `send_message` writes the turn's `running`
     // row and only then spawns the task that will finish it. A client that disconnects mid-request
     // drops this future exactly the way `abort()` drops a run's, and a drop landing between those
@@ -1646,16 +1880,39 @@ async fn post_assistant_message(
         let origin = crate::assistant::Origin::from_wire(body.origin.as_deref());
         crate::assistant::send_message(&state, &body.chat_id, &body.text, origin).await
     })
-    .await?;
+    .await
+    .map_err(|status| refusal(status, "internal"))?;
 
     match outcome {
         Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
-        Err(msg) if msg.contains("already in progress") => Err(StatusCode::CONFLICT),
+        // Clears by waiting, which is what makes it the one refusal here that needs no gesture from
+        // anybody — and what makes it dangerous to confuse with the one below.
+        Err(msg) if msg == crate::assistant::TURN_IN_PROGRESS => {
+            Err(refusal(StatusCode::CONFLICT, "turn_in_progress"))
+        }
         // Not a 500: nothing broke. The conversation asked to be answered on this machine and this
         // machine has nothing that can — a fact about how it is configured, which the caller can
         // act on by choosing the other model. A 500 would send them looking for a crash.
-        Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => Err(StatusCode::SERVICE_UNAVAILABLE),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => {
+            Err(refusal(StatusCode::SERVICE_UNAVAILABLE, "no_local_model"))
+        }
+        // Also not a 500, and for the same reason: the topic has an errand somebody paused or
+        // closed. That is a state this request conflicts with, which is what 409 already means here
+        // for a chat that is mid-turn — and it is what lets the sidecar answer "that topic is on
+        // hold" instead of reporting a fault that did not happen. The slug is what keeps it from
+        // being READ as the other 409: this one never clears on its own.
+        Err(msg) if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
+            Err(refusal(StatusCode::CONFLICT, "errand_not_answering"))
+        }
+        // 423 and not a third 409, because 409 already carries two meanings on this route — a chat
+        // mid-turn and an errand on hold — and this is a third with a different undoing. A topic
+        // that has gone quiet is answered with `/retomar` when it is paused and `/kill off` when it
+        // is this, and one number for both leaves the sidecar to guess. Locked is the accurate word:
+        // the errand is active and conflicts with nothing; a decision taken elsewhere holds it shut.
+        Err(msg) if msg == crate::assistant::KILL_ENGAGED => {
+            Err(refusal(StatusCode::LOCKED, "kill_switch"))
+        }
+        Err(_) => Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")),
     }
 }
 
@@ -2404,6 +2661,8 @@ async fn get_feed(
     if !has_search_filters {
         let entries = if query.scope.as_deref() == Some("all") {
             feed::list_all(&state.pool, 50).await
+        } else if let Some(errand_id) = query.errand_id {
+            feed::list_errand_feed(&state.pool, errand_id, 50).await
         } else {
             feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
         };
@@ -2412,8 +2671,15 @@ async fn get_feed(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    // The errand is read before the project on purpose. They are two different owners and a row has
+    // at most one, so a request naming both is asking for rows that cannot exist; taking the errand
+    // gives that request the answer nearest to what it asked for instead of the empty list an `AND`
+    // of the two would produce. Both branches fall through to `Global`, which since the errand
+    // arrived means the machine's own lines and nothing else's.
     let scope = if query.scope.as_deref() == Some("all") {
         feed::FeedScope::All
+    } else if let Some(errand_id) = query.errand_id {
+        feed::FeedScope::Errand(errand_id)
     } else if let Some(project_id) = query.project_id {
         feed::FeedScope::Project(project_id)
     } else {
@@ -2506,14 +2772,20 @@ struct VcsRequestBody {
 ///
 /// `Run` cannot reach this route today — a run token opens exactly one route, the safety gate — but
 /// mapping it costs nothing and is what the MCP tools will need once a run can submit directly.
-/// `Service` and the lesser API levels are refused rather than guessed at: `permits` should already
-/// have turned them away, so a scope arriving here unaccounted for is a routing bug, and defaulting
-/// it would mean guessing about approval.
+/// `Service`, `TeamRun` and the lesser API levels are refused rather than guessed at: `permits`
+/// should already have turned them away, so a scope arriving here unaccounted for is a routing bug,
+/// and defaulting it would mean guessing about approval.
+///
+/// `TeamRun` is the sharpest of the three. A department has no `vcs::Origin` because it is not
+/// allowed to want one: queueing a merge is the act that makes work survive on a branch other
+/// people build on, and the teams design gives a department no authority to act at all. When that
+/// authority arrives it arrives as its own spec, with a value here chosen on purpose — which is
+/// exactly what a default would have taken away.
 fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
     match scope {
         Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(vcs::Origin::Human),
         Scope::Run(id) => Ok(vcs::Origin::Run(*id)),
-        Scope::Service(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
+        Scope::Service(_) | Scope::TeamRun(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
     }
 }
 
@@ -2534,6 +2806,121 @@ fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
 /// proposal, which is what the approval chunk adds. A disconnect between them would leave a request
 /// that can never be approved. Whoever writes that second write moves this through `uncancellable`
 /// at the same time.
+#[derive(serde::Deserialize)]
+struct LandBody {
+    /// Anywhere inside the worktree that is asking. Resolved to its root, so a session standing
+    /// in a subdirectory asks the same question as one standing at the top.
+    cwd: String,
+}
+
+/// "I am finished — take this branch." The one request a worktree could not previously express.
+///
+/// **A session can only ever have asked for merges INTO its own branch**, because
+/// `merge_from_command` takes the target from the worktree it is standing in and there is no other
+/// branch it could name. The reverse — landing the work — has no git spelling from inside the
+/// worktree at all: you would have to check out the integration branch, which is the isolation
+/// violation a worktree session must not commit, and which its harness blocks outright. So this is
+/// not a command to be intercepted; it is a request, and it needed a door of its own.
+///
+/// **Asking is authorisation; it is not scheduling.** The session's own completion is the decision
+/// that the work is ready — a person commanding it, or the agent when it has finished — so the row
+/// enters `queued` rather than `awaiting_approval`, and no second approval is invented for a
+/// judgement that has already been made. What stays with the queue is WHEN, which is the part a
+/// session cannot know: one operation per repository, in order, against a repository that may have
+/// moved since the asking.
+///
+/// **Re-evaluation is not added here because it is already how the queue works.** The merge is
+/// computed fresh in the integration worktree at the moment of execution, not at the moment of
+/// asking, so a branch that has diverged or a merge that has come to conflict aborts before
+/// publishing and the row records `failed` with git's own output. A request that can no longer land
+/// says so and stops, which is the behaviour wanted rather than a new mechanism.
+///
+/// The target is the branch the project's MAIN worktree has open, not a configured name. It is the
+/// branch the project is standing on, which is what "land it" means to whoever asks, and it is read
+/// rather than assumed so a project that works on something other than `master` needs no setting.
+async fn land_worktree(
+    State(state): State<AppState>,
+    Json(body): Json<LandBody>,
+) -> Result<Json<vcs::Ticket>, (StatusCode, String)> {
+    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let refuse = |code: StatusCode, reason: String| (code, reason);
+
+    let root = crate::git_exec::toplevel(std::path::Path::new(&body.cwd), deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    let source = crate::git_exec::current_branch(&root, deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    if source.trim() == "HEAD" {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this worktree is on a detached HEAD, so there is no branch to land".to_owned(),
+        ));
+    }
+
+    let project_id = crate::vcs::project_for_worktree(&state.pool, &root, deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::NOT_FOUND, reason))?;
+    let repo = crate::vcs::resolve_repo(&state.pool, &project_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(project_id, ?error, "land: could not resolve the repository");
+            refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{project_id}'s repository could not be resolved"),
+            )
+        })?;
+
+    let target = crate::git_exec::current_branch(std::path::Path::new(repo.root()), deadline)
+        .await
+        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+    // Standing on the integration branch itself. Refused rather than admitted as a no-op, because
+    // the request means "take my work" and there is no separate work to take — and `Merge` with one
+    // branch named twice is a shape the executor should never be handed.
+    if source.trim() == target.trim() {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("this worktree is already on {target}, which is where work lands"),
+        ));
+    }
+
+    let op = crate::vcs::Op::Merge {
+        source: crate::vcs::Branch::new(source.trim())
+            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
+        target: crate::vcs::Branch::new(target.trim())
+            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
+    };
+    // **A landing that came out of a conflict resolution is marked as it is admitted**, and the mark
+    // is what makes the queue verify it before publishing — a two-parent tip, no conflict markers.
+    // Asked here rather than at execution time because the answer is only reliable now: it is read
+    // from the worktree the asker is standing in, which exists precisely because they are standing
+    // in it.
+    let from_resolution =
+        crate::resolver::landing_is_a_resolution(&state.pool, repo.project_id(), source.trim())
+            .await;
+    let admitted = if from_resolution {
+        crate::vcs::submit_resolution(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
+    } else {
+        crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
+    };
+    let id = admitted.map_err(|error| {
+        tracing::warn!(%error, "land: admitting the request failed");
+        refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the request could not be admitted".to_owned(),
+        )
+    })?;
+
+    vcs_ticket(&state, id, std::time::Duration::ZERO)
+        .await
+        .map_err(|code| {
+            refuse(
+                code,
+                "the request was admitted but could not be read back".to_owned(),
+            )
+        })
+}
+
 async fn submit_vcs_request(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -2572,6 +2959,95 @@ async fn get_vcs_request(
     Path(id): Path<i64>,
 ) -> Result<Json<vcs::Ticket>, StatusCode> {
     vcs_ticket(&state, id, std::time::Duration::ZERO).await
+}
+
+#[derive(Deserialize)]
+struct GithubRequestBody {
+    /// The operation, as data. Deserialized through `github`'s validating node types, so a dashed
+    /// string is refused HERE rather than reaching an argv.
+    op: crate::github::Op,
+}
+
+/// A second refusal of a call `auth.rs` has already refused, and deliberately so.
+///
+/// `POST /github/requests` is absent from both scope tables, so `permits` lets only the control
+/// token and an Admin key reach this at all. This is not that boundary and must not be read as one
+/// — it is the second of two independent refusals at a place that leaves the machine, which is what
+/// `hooks.rs` says one wants at a boundary.
+fn github_caller_is_allowed(scope: &Scope) -> Result<(), StatusCode> {
+    match scope {
+        Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(()),
+        Scope::Run(_) | Scope::Service(_) | Scope::TeamRun(_) | Scope::ApiToken(_) => {
+            Err(StatusCode::FORBIDDEN)
+        }
+    }
+}
+
+/// The one door both GitHub tools come through.
+///
+/// **Inside `uncancellable`, and by instruction rather than by precaution.** `submit_vcs_request`'s
+/// doc names the exact condition that makes it necessary — "it stops being benign the moment
+/// submitting becomes two writes … whoever writes that second write moves this through
+/// `uncancellable` at the same time" — and this handler is that second write: it publishes to GitHub
+/// and then records a proposal, or it records a proposal that a person will later act on. A client
+/// disconnecting between the two would leave a comment posted and nothing saying so.
+///
+/// The cost is real and not a wrapper for free: `uncancellable` is `tokio::spawn`, so the work must
+/// be `Send + 'static` and this body OWNS everything it touches. And it covers DISCONNECTION, not
+/// panic — a panicking task becomes a 500 with the task gone, which for a path that has already
+/// posted a comment is the same silence it protects against in the other case. Said here so nobody
+/// reads the protection as larger than it is.
+async fn submit_github_request(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(body): Json<GithubRequestBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    github_caller_is_allowed(&scope).map_err(|status| {
+        (
+            status,
+            "reaching GitHub is the owner's, not a run's".to_owned(),
+        )
+    })?;
+    let submitted =
+        uncancellable(
+            async move { crate::github::submit(&state.pool, &state.github, body.op).await },
+        )
+        .await
+        .map_err(|status| (status, "the github task did not finish".to_owned()))?;
+
+    match submitted {
+        Ok(crate::github::Submitted::Ran(outcome)) => Ok(Json(serde_json::json!({
+            "status": "ran",
+            "operation": outcome.kind,
+            "exit_code": outcome.exit_code,
+            "stdout": outcome.stdout,
+            "output_tail": outcome.output_tail,
+        }))),
+        // 200 and not 202: the turn is not waiting for this and there is nothing to poll. What the
+        // caller needs is the number a person will see beside it.
+        Ok(crate::github::Submitted::Filed { proposal_id, kind }) => Ok(Json(serde_json::json!({
+            "status": "filed_for_approval",
+            "operation": kind,
+            "proposal_id": proposal_id,
+            "detail": format!("filed for approval as #{proposal_id}; the turn continues"),
+        }))),
+        Err(failure) => Err((github_failure_status(&failure), failure.to_string())),
+    }
+}
+
+/// Each failure gets the status that sends a reader to the right place.
+///
+/// A switched-off pillar and an absent `gh` are 503: the request was fine and this machine cannot
+/// serve it. A missing token is 403, because somebody has to paste a credential. A timeout is 504.
+fn github_failure_status(failure: &crate::github::Failure) -> StatusCode {
+    match failure {
+        crate::github::Failure::NotConfigured | crate::github::Failure::MissingCli => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        crate::github::Failure::MissingToken => StatusCode::FORBIDDEN,
+        crate::github::Failure::TimedOut => StatusCode::GATEWAY_TIMEOUT,
+        crate::github::Failure::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[derive(Deserialize)]
@@ -2937,10 +3413,197 @@ struct AssistantTurn {
     /// looks like one unbroken conversation, which is the one thing it is not.
     session_id: Option<String>,
     created_at: String,
+    /// How much context this turn ran with, as an absolute token count. Null on a turn whose stream
+    /// never reported one -- a turn that failed before the CLI said anything, and every turn from
+    /// before the column existed.
+    context_fill: Option<i64>,
+    /// What the turn ran, as the JSON `tools_used` holds. Not serialized: the window is given the
+    /// parsed list below, so the shape of the column is this daemon's business and not a format
+    /// two codebases have to agree on.
+    #[serde(skip)]
+    tools_used: Option<String>,
+    /// What the turn thought, as the JSON `thought` holds. Not serialized, for the reason above it.
+    #[serde(skip)]
+    thought: Option<String>,
+    /// Roughly how many tokens the turn spent thinking, or null when it did not think and on every
+    /// turn from before the column. Serialized as it stands: it is a number, not a private shape.
+    thought_tokens: Option<i64>,
+}
+
+/// One turn as the window receives it: the row, plus what the turn did.
+///
+/// The parse happens here rather than in the window for the reason it happens in `runner.rs` at
+/// all: the column holds a serialisation this daemon chose, and a client re-deriving it would be a
+/// second reader of a private shape. A column that will not parse reads as an empty list — the turn
+/// is real and its reply is worth showing, and one unreadable field is not worth losing it over.
+#[derive(serde::Serialize)]
+struct AssistantTurnOut {
+    #[serde(flatten)]
+    turn: AssistantTurn,
+    did: Vec<crate::runner::ToolCall>,
+    /// What the turn thought before it answered, oldest first.
+    ///
+    /// Empty both for a turn that thought nothing and for a turn from before the column. The two
+    /// are different facts and the row keeps them apart, but a window cannot act on the difference:
+    /// either way there is nothing to draw.
+    thought: Vec<String>,
+    /// The token count past which this daemon stops resuming and mints a fresh session.
+    ///
+    /// The same number on every row, because it is a property of the daemon and not of the turn.
+    /// It rides here so the window never keeps its own copy of a rule this side owns: a constant
+    /// duplicated across two codebases is one that drifts silently the day one of them changes it.
+    context_rotates_at: i64,
+}
+
+/// A conversation as it is read back: its turns, and whatever it was handed before the first one.
+///
+/// An object rather than the bare array this used to be, because a transcript is not only its
+/// turns. A chat picked up from a session too large to resume begins with the verbatim tail of that
+/// session in front of it, the model answers from that tail — and nothing in the window said so.
+/// You asked, it replied knowing a past it never lived, and the reason sat in a column.
+///
+/// `handoff.rs` states the rule this serves: context pressure must leave an auditable record rather
+/// than quietly erase how work continued. A compaction that is stored and never shown is still an
+/// erasure from where the person is standing.
+#[derive(serde::Serialize)]
+struct TranscriptOut {
+    /// The exchanges this conversation was handed, oldest first. Empty for an ordinary chat, which
+    /// is most of them, and empty rather than absent so a reader never has to branch on missing.
+    handed: Vec<(String, String)>,
+    turns: Vec<AssistantTurnOut>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
 const ASSISTANT_TRANSCRIPT_LIMIT: i64 = 100;
+
+/// The longest query the name completion will act on.
+///
+/// Not a safety limit — `mentions::matching` walks the same tree whatever it is given. It is a
+/// statement about what the field is for: past this, what arrived is not somebody typing a filename
+/// and answering it as though it were would be answering the wrong question slowly.
+const MENTION_QUERY_LIMIT: usize = 100;
+
+#[derive(serde::Deserialize)]
+struct MentionQuery {
+    /// What has been typed after the `@`. Absent or empty asks for the top level.
+    #[serde(default)]
+    q: String,
+}
+
+/// The names a conversation offers, and whether it had anywhere to look at all.
+///
+/// `rooted` is the distinction an empty list cannot draw: "nothing here matches what you typed" and
+/// "this conversation has no directory" look identical to a caller and are entirely different
+/// facts. Only the second is worth a sentence in the window.
+#[derive(serde::Serialize)]
+struct MentionsOut {
+    rooted: bool,
+    #[serde(flatten)]
+    found: crate::mentions::Found,
+}
+
+/// What a conversation offers for a `/`.
+///
+/// No `rooted` here, unlike the file route beside it, and the difference is real: a conversation
+/// with no directory still has the person's own commands and every installed plugin's. Nowhere to
+/// look is a thing that can only be true of files.
+#[derive(serde::Serialize)]
+struct CommandsOut {
+    commands: Vec<crate::commands::Command>,
+}
+
+/// The slash commands this conversation can run.
+///
+/// Three sources, read on the request rather than cached: a command is a file somebody just wrote,
+/// and a picker that needed a daemon restart to notice it would be a picker people stop trusting.
+/// Measured on this machine at about 7ms for the whole sweep, which is a keystroke's worth.
+async fn get_chat_commands(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<MentionQuery>,
+) -> Result<Json<CommandsOut>, StatusCode> {
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading where a conversation runs failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let typed: String = query.q.chars().take(MENTION_QUERY_LIMIT).collect();
+    // Off the async runtime, as the file walk is: this reads several directories and every command
+    // file's front matter, which is short but is still disk on a request thread.
+    let commands = tokio::task::spawn_blocking(move || {
+        let available = crate::commands::available(
+            cwd.as_deref().map(std::path::Path::new),
+            crate::commands::home().as_deref(),
+        );
+        crate::commands::matching(&available, &typed)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(CommandsOut { commands }))
+}
+
+/// Names under this conversation's own working directory, for completing an `@`.
+///
+/// The root comes from the chat's row and never from the caller. A route that took a directory
+/// would be a route that reads any directory — and there is nothing to gain by it: the only
+/// defensible root is where this conversation's turns already run, because the model can open those
+/// files anyway and naming them discloses nothing it could not read.
+///
+/// A directory that is gone reads as `rooted: false` rather than as an empty search. It is the same
+/// fact as having none: there is nowhere to look, and saying "no matches" would send somebody
+/// hunting for a spelling mistake.
+async fn get_chat_files(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<MentionQuery>,
+) -> Result<Json<MentionsOut>, StatusCode> {
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading where a conversation runs failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let Some(cwd) = cwd else {
+        return Ok(Json(MentionsOut {
+            rooted: false,
+            found: crate::mentions::Found {
+                hits: Vec::new(),
+                truncated: false,
+            },
+        }));
+    };
+
+    let typed: String = query.q.chars().take(MENTION_QUERY_LIMIT).collect();
+    // Off the async runtime: this is a directory walk on a keystroke, and holding a runtime thread
+    // for it would stall every other request sharing that thread.
+    let answered = tokio::task::spawn_blocking(move || {
+        let root = std::path::Path::new(&cwd);
+        root.is_dir()
+            .then(|| crate::mentions::matching(root, &typed))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(match answered {
+        Some(found) => MentionsOut {
+            rooted: true,
+            found,
+        },
+        None => MentionsOut {
+            rooted: false,
+            found: crate::mentions::Found {
+                hits: Vec::new(),
+                truncated: false,
+            },
+        },
+    }))
+}
 
 /// A chat's turns, oldest first.
 ///
@@ -2956,10 +3619,11 @@ const ASSISTANT_TRANSCRIPT_LIMIT: i64 = 100;
 async fn get_assistant_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
-) -> Result<Json<Vec<AssistantTurn>>, StatusCode> {
+) -> Result<Json<TranscriptOut>, StatusCode> {
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                answered_by, session_id, created_at
+                answered_by, session_id, created_at, context_fill, tools_used, thought,
+                thought_tokens
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -2974,7 +3638,58 @@ async fn get_assistant_chat(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     turns.reverse();
-    Ok(Json(turns))
+    // Read through `assistant::handed_over` rather than parsed here: that function is already the
+    // one reader of the column's shape, and a second one is a second thing to change the day the
+    // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
+    // every ordinary conversation.
+    let handed = crate::assistant::handed_over(&state.pool, &chat_id).await;
+    Ok(Json(TranscriptOut {
+        handed,
+        turns: turns
+            .into_iter()
+            .map(|turn| {
+                let did = turn
+                    .tools_used
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                let thought = turn
+                    .thought
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                AssistantTurnOut {
+                    turn,
+                    did,
+                    thought,
+                    context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+                }
+            })
+            .collect(),
+    }))
+}
+
+/// A turn while it is still being written: what has been said, and what is being done.
+///
+/// The distilling happens in `runner.rs` beside `extract_reply`, because knowing the CLI's stream
+/// format is that module's job — and this route exists rather than pointing the window at
+/// `/runs/{id}/tail` for the same reason: the tail is the raw stream, and a chat bubble is not the
+/// place to learn what a `content_block_delta` is.
+///
+/// Read from byte zero on every poll, not from a cursor. What comes back is not a chunk to append
+/// but the turn's whole state — text superseded by completed messages, a tool that has since
+/// returned — and that can only be recomputed from the beginning. A turn's stream is small; a job's
+/// is not, which is why `/runs/{id}/tail` keeps its cursor.
+///
+/// `204` when nothing is writing. That is the run having ended or this daemon never having started
+/// it, and it is emphatically not "the turn said nothing" — see `read_tail`.
+async fn get_assistant_live(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<Json<crate::runner::LiveTurn>, StatusCode> {
+    let stream =
+        crate::runs::read_tail(&state.run_tails, turn_id, 0).ok_or(StatusCode::NO_CONTENT)?;
+    Ok(Json(crate::runner::live_from_stream(&stream)))
 }
 
 /// Whether this machine has a model that can answer a conversation.
@@ -3022,18 +3737,36 @@ struct CreateChatRequest {
     continue_session: Option<String>,
 }
 
+/// One session as it is OFFERED: what it is, plus what continuing it would be able to do.
+///
+/// The second half is not decoration. A conversation continued in a directory with no classifier
+/// hook runs on the MCP server alone — no `Read`, no `Edit`, no `Bash` — so picking up a coding
+/// session there gets a model that cannot open the file being discussed. That was invisible until
+/// the first turn came back empty-handed, and it is the single thing that made continuing a
+/// session feel like nothing had happened.
+#[derive(serde::Serialize)]
+struct OfferedSession {
+    #[serde(flatten)]
+    session: crate::sessions::IdeSession,
+    /// Whether a turn continued here would get the project's tools.
+    ///
+    /// Answered by asking `tool_policy_for` — the same function the turn itself asks — rather than
+    /// by restating the rule here. A second opinion about this would be a window promising tools
+    /// the turn then does not get.
+    tools: bool,
+}
+
 /// The conversations already had in the IDE that this daemon could continue.
 ///
 /// Ones already continued are dropped: a second conversation resuming the same session would put
 /// two threads on one context, and the window would show them as unrelated.
 async fn list_ide_sessions(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::sessions::IdeSession>>, StatusCode> {
+) -> Result<Json<Vec<OfferedSession>>, StatusCode> {
     let Some(root) = crate::sessions::default_root() else {
         return Ok(Json(Vec::new()));
     };
-    let taken: Vec<String> = sqlx::query_scalar("SELECT session_id FROM assistant_sessions")
-        .fetch_all(&state.pool)
+    let taken = crate::chats::picked_up(&state.pool)
         .await
         .map_err(|error| {
             tracing::warn!(%error, "listing the sessions already continued failed");
@@ -3046,6 +3779,22 @@ async fn list_ide_sessions(
         crate::sessions::discover(&root, IDE_SESSIONS_SHOWN)
             .into_iter()
             .filter(|session| !taken.contains(&session.session_id))
+            .map(|session| {
+                // Read here and never cached: the hook can be wired between two openings of this
+                // list, including by the route below, and a stale `false` would go on offering to
+                // fix what is already fixed.
+                let wired =
+                    crate::autopilot::classifier_hook_is_wired(std::path::Path::new(&session.cwd));
+                let policy = crate::assistant::tool_policy_for(
+                    Some(session.cwd.as_str()),
+                    crate::assistant::Origin::Shell,
+                    wired,
+                );
+                OfferedSession {
+                    session,
+                    tools: policy == crate::runner::ToolPolicy::Unrestricted,
+                }
+            })
             .collect::<Vec<_>>()
     })
     .await
@@ -3053,6 +3802,93 @@ async fn list_ide_sessions(
 
     Ok(Json(found))
 }
+
+/// Puts this daemon's classifier hook into the project a session was had in.
+///
+/// The most consequential thing this daemon does to a directory it does not own: afterwards every
+/// session had there — this one, and the ones opened in the editor — has its tool calls routed
+/// through the classifier, and conversations continued there get the CLI's whole tool surface
+/// instead of the MCP server alone. So it is a POST somebody presses, never something inferred
+/// from picking a session up.
+///
+/// The directory comes from the transcript by way of `sessions::find`, exactly as `create_chat`
+/// gets it and for a sharper version of the same reason: a caller that could name the directory
+/// could have this daemon write an executable hook into any folder on the machine.
+///
+/// A 409 for a settings file this cannot parse. That is not the daemon failing — it is the project
+/// saying no — and the one thing the caller can do about it is go and look at that file.
+async fn wire_ide_session_tools(Path(session_id): Path<String>) -> Result<StatusCode, StatusCode> {
+    let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
+    let session = tokio::task::spawn_blocking(move || crate::sessions::find(&root, &session_id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let dir = std::path::PathBuf::from(&session.cwd);
+    tokio::task::spawn_blocking(move || crate::autopilot::wire_classifier_hook(&dir))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            tracing::warn!(%error, cwd = %session.cwd, "could not wire the classifier hook");
+            StatusCode::CONFLICT
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What was said in one conversation had in the editor, oldest first.
+///
+/// Read off disk on the request, like the list above and for the same reason: the store is the
+/// CLI's and changes whenever a session is typed into, so anything kept here would be a second copy
+/// of somebody else's truth. This one reads a whole file rather than its head, which is why it is
+/// on the blocking pool.
+///
+/// Not behind a chat id, though the window only ever asks about sessions it holds one for. The
+/// session is the thing that has a conversation in it; a chat merely points at one, and two routes
+/// for the same bytes would be two places for the bounds to differ.
+///
+/// A transcript this machine does not have is a 404. An empty conversation is a 200 with nothing in
+/// it, and the window says different things about the two — "nothing was said here" is a claim, and
+/// it must not be made about a file that was never found.
+async fn read_ide_session(
+    Path(session_id): Path<String>,
+) -> Result<Json<IdeConversationOut>, StatusCode> {
+    let root = crate::sessions::default_root().ok_or(StatusCode::NOT_FOUND)?;
+    let found =
+        tokio::task::spawn_blocking(move || crate::sessions::conversation(&root, &session_id))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    found
+        .map(|conversation| {
+            Json(IdeConversationOut {
+                conversation,
+                context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+            })
+        })
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// A conversation had in the editor, and the line past which this daemon will not resume one.
+///
+/// The ceiling rides with it for the reason it rides with a turn: it is a property of this daemon
+/// and not of the session, and the window keeping its own copy of a rule this side owns is a second
+/// source of truth that drifts silently the day the constant changes. Here it also answers the
+/// question the estimate is being asked for — whether picking this up resumes it or starts fresh.
+#[derive(serde::Serialize)]
+struct IdeConversationOut {
+    #[serde(flatten)]
+    conversation: crate::sessions::Conversation,
+    context_rotates_at: i64,
+}
+
+/// How many exchanges a conversation too large to resume is handed.
+///
+/// The same count `recent_exchanges` replays for a rotated conversation, and deliberately: this is
+/// the rotation's mechanism reaching a conversation whose past happens to live in somebody else's
+/// file rather than in our runs. A different number here would be a second policy about the same
+/// question.
+const HANDOVER_EXCHANGES: usize = 6;
 
 /// How many past sessions the list offers.
 ///
@@ -3085,36 +3921,72 @@ async fn create_chat(
         }
     };
 
-    let chat_id = crate::chats::create(
-        &state.pool,
-        brain,
-        continued.as_ref().map(|session| session.cwd.as_str()),
-    )
-    .await
-    .map_err(|error| {
-        tracing::warn!(%error, "opening a chat failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Written after the chat exists, because it is what `get_session` reads to decide the first
-    // turn resumes rather than starts clean. A failure here is not a failed request: the
-    // conversation is real and usable, it simply begins a context of its own — so it is logged as
-    // the thing it is rather than rolled back into a 500 the caller cannot act on.
-    if let Some(session) = &continued
-        && let Err(error) = crate::assistant::upsert_session(
-            &state.pool,
-            &chat_id,
-            &session.session_id,
-            &chrono::Utc::now().to_rfc3339(),
-        )
+    let chat_id = crate::chats::create(&state.pool, brain, continued.as_ref())
         .await
-    {
-        tracing::warn!(
-            %error,
-            chat_id = %chat_id,
-            session_id = %session.session_id,
-            "the conversation was opened but could not be attached to its session; it will start clean"
-        );
+        .map_err(|error| {
+            tracing::warn!(%error, "opening a chat failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Measured once, here, where the file is read anyway and where the answer can still change
+    // what happens. The ceiling `get_session` enforces reads `runs.context_fill` — the daemon's OWN
+    // prior turns — and a session picked up from the editor has none, so until this every pick-up
+    // resumed whatever it found however large. One did: about 180k of context, re-sent uncached as
+    // fresh input, $1.72 for a one-word answer.
+    if let Some(session) = &continued {
+        let read = {
+            let session_id = session.session_id.clone();
+            match crate::sessions::default_root() {
+                Some(root) => tokio::task::spawn_blocking(move || {
+                    crate::sessions::conversation(&root, &session_id)
+                })
+                .await
+                .ok()
+                .flatten(),
+                None => None,
+            }
+        };
+        let carries = read.as_ref().and_then(|read| read.context_estimate);
+        let resumable =
+            carries.is_none_or(|carries| carries <= crate::assistant::CONTEXT_ROTATION_TOKENS);
+
+        if resumable {
+            // Written after the chat exists, because it is what `get_session` reads to decide the
+            // first turn resumes rather than starts clean. A failure here is not a failed request:
+            // the conversation is real and usable, it simply begins a context of its own — so it is
+            // logged as the thing it is rather than rolled back into a 500 nobody can act on.
+            if let Err(error) = crate::assistant::upsert_session(
+                &state.pool,
+                &chat_id,
+                &session.session_id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    %error,
+                    chat_id = %chat_id,
+                    session_id = %session.session_id,
+                    "the conversation was opened but could not be attached to its session; it will start clean"
+                );
+            }
+        } else if let Some(read) = &read {
+            // Too large to resume, so it is handed the tail instead — the rotation's own answer,
+            // and never a summary. Stored rather than re-read: the file can be tens of megabytes,
+            // the turn path must not go near it, and a compaction that lives in a row is one
+            // somebody can read afterwards.
+            let tail = crate::sessions::exchanges(&read.said, HANDOVER_EXCHANGES);
+            if !tail.is_empty()
+                && let Ok(stored) = serde_json::to_string(&tail)
+                && let Err(error) = crate::chats::set_handover(&state.pool, &chat_id, &stored).await
+            {
+                tracing::warn!(
+                    %error,
+                    chat_id = %chat_id,
+                    "the conversation was opened but could not be handed its predecessor's tail"
+                );
+            }
+        }
     }
 
     Ok(Json(serde_json::json!({ "chat_id": chat_id })))
@@ -3326,6 +4198,389 @@ async fn delete_chat(
         })
 }
 
+/// The errands, newest first, and the closed ones with them.
+///
+/// Unlike `list_chats`, which hides what was archived. Closing an errand is not archiving it: the
+/// row is the record of work already done, and this list is read to find that work again as much as
+/// to find what is still moving.
+async fn list_errands(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::errands::Errand>>, StatusCode> {
+    crate::errands::list(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing errands failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct CreateErrandRequest {
+    name: String,
+    /// `<chat_id>:<thread_id>`, composed by the sidecar. Opaque here and never parsed — this route
+    /// knows a chat key the way `errands.rs` does: as a string it was handed.
+    chat_key: String,
+}
+
+/// Opens an errand on a topic, and answers with the id it was given.
+///
+/// The id is why there is a body at all: the folder is minted from it and every other route here is
+/// keyed by it. The folder itself is not created — `errands::folder_path` makes it on first use, so
+/// an errand nothing was ever written into leaves no empty directory behind.
+async fn create_errand(
+    State(state): State<AppState>,
+    Json(body): Json<CreateErrandRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    crate::errands::create(&state.pool, &body.name, &body.chat_key)
+        .await
+        .map(|errand_id| Json(serde_json::json!({ "errand_id": errand_id })))
+        .map_err(|error| {
+            // One topic holds one errand: `chat_key` is UNIQUE, and `errands::create` leans on that
+            // rather than reading first, so a second POST on a topic that already has one arrives
+            // here as a constraint violation. 500 would tell the caller this daemon is broken and
+            // invite a retry that can never work; 409 names the one thing that is actually wrong.
+            //
+            // Asked of the typed database error, the way `presets.rs` asks it — never of the
+            // message's text, which belongs to the driver and changes with it.
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation())
+            {
+                return StatusCode::CONFLICT;
+            }
+            tracing::warn!(%error, "opening an errand failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The errand this id names, or the refusal every route keyed by one owes its caller.
+///
+/// Written once because six routes need the same two steps: the row, and a 404 when there is no
+/// row. The `Errand` it hands back is not a formality — `read_file`, `write_file`, `list_files` and
+/// `read_notebook` all take one, and the folder they resolve against comes from it. So this is also
+/// the only place a route learns which directory it is allowed to touch.
+async fn errand_by_id(state: &AppState, id: i64) -> Result<crate::errands::Errand, StatusCode> {
+    crate::errands::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, id, "reading an errand failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(serde::Deserialize)]
+struct PatchErrandRequest {
+    status: Option<String>,
+    brain: Option<String>,
+    /// When this errand is finished, in the owner's words, and how many turns it may take on its
+    /// own getting there. Both or neither: see `errands::set_investigation` for why they are one
+    /// decision and not two fields.
+    done_when: Option<String>,
+    windows: Option<i64>,
+}
+
+/// Pauses or resumes an errand, moves it between the local model and the cloud, or both at once —
+/// the shape `patch_chat` has a few blocks up.
+///
+/// Both fields go through `from_wire`, which cannot fail: a spelling nobody recognises becomes the
+/// conservative value — `paused`, which does not act, and `local`, which does not spend — rather
+/// than a 400. No string from this body reaches SQL; what reaches it is an enum, which is the only
+/// thing the column's CHECK constraint accepts.
+async fn patch_errand(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<PatchErrandRequest>,
+) -> Result<StatusCode, StatusCode> {
+    // Answered before anything is written, for the reason `patch_chat` gives further up: `204` over
+    // an UPDATE that matched no row is the API saying "done" about something it did not do, and a
+    // client that believes it carries on with an errand that was never there.
+    //
+    // Kept, not discarded, because the criterion below is a field this request may leave out while
+    // changing the windows beside it — "give it three more goes at the same thing" — and answering
+    // that needs the criterion it already has.
+    let errand = errand_by_id(&state, id).await?;
+
+    if let Some(status) = body.status.as_deref() {
+        crate::errands::set_status(&state.pool, id, crate::errands::Status::from_wire(status))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "pausing or resuming an errand failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(brain) = body.brain.as_deref() {
+        crate::errands::set_brain(&state.pool, id, crate::errands::Brain::from_wire(brain))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing an errand's model failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // Written together, and only when at least one of them was asked for, so a PATCH that merely
+    // pauses an errand does not silently call off an investigation it never mentioned. `windows`
+    // alone means "give it more of the same criterion"; `done_when` alone means "this, once", which
+    // is one window and not zero — zero would store a criterion nothing will ever act on.
+    if body.done_when.is_some() || body.windows.is_some() {
+        let criterion = body.done_when.as_deref().or(errand.done_when.as_deref());
+        let windows = body.windows.unwrap_or(1);
+        crate::errands::set_investigation(&state.pool, id, criterion, windows)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "setting an errand's criterion failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends an errand, and deletes nothing.
+///
+/// DELETE is the verb a client already has for "I am done with this", and here it means what `/fim`
+/// means in the topic: the asking stops, the row stays, and the folder keeps what was found. The
+/// neighbouring `delete_chat` archives for the same reason — the record of work already done is not
+/// the client's to destroy by asking for a shorter list.
+async fn close_errand(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    // Checked first for the reason `patch_errand` gives, and it applies harder to this one: closing
+    // is the move a client makes once and then stops watching, so a `204` about an errand that does
+    // not exist is a report nobody ever goes back to check.
+    errand_by_id(&state, id).await?;
+
+    crate::errands::close(&state.pool, id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            tracing::warn!(%error, "closing an errand failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// This errand's standing instructions, by name.
+///
+/// The errand is looked up first even though the query would answer an empty list on its own: an
+/// empty list about an errand that does not exist reads as "this errand has no rules", and a caller
+/// that mistyped an id would go on believing it disarmed something.
+async fn list_errand_rules(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::errands::Rule>>, StatusCode> {
+    errand_by_id(&state, id).await?;
+
+    crate::errands::list_rules(&state.pool, id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, id, "listing an errand's rules failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct CreateRuleRequest {
+    name: String,
+    cron: String,
+    prompt: String,
+    /// Absent means UTC, the same as `ScheduleRule.timezone`. A name nobody recognises is refused
+    /// rather than read as UTC — `scheduler.rs:62-67` gives the reason and it does not change here.
+    timezone: Option<String>,
+}
+
+/// Arms a standing instruction on this errand, answering with the id it was given.
+///
+/// Three refusals, and they are three different sentences on purpose. `404`: no such errand. `400`:
+/// the rule as written will never fire, and the body carries the reason. `409`: this errand already
+/// has a rule of that name.
+///
+/// The `400` is what an errand's rules have that a project's do not. `scheduler.rs` meets a project
+/// rule long after whoever wrote the YAML has gone, so an unreadable one is armed anyway and
+/// announced once to the feed; this one arrives with somebody still at the keyboard, and telling
+/// them now costs a status code.
+///
+/// The reason goes out as free text under `error` rather than as one of the `refusal` slugs the
+/// assistant route uses. A slug exists so a client can look up a sentence it already knows, and the
+/// set of ways a cron can be wrong is not a set anybody can enumerate in advance — here the reason
+/// IS the sentence, and it names the word that was wrong.
+async fn create_errand_rule(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let status_only = |status: StatusCode| (status, Json(serde_json::json!({})));
+
+    errand_by_id(&state, id).await.map_err(status_only)?;
+
+    match crate::errands::create_rule(
+        &state.pool,
+        id,
+        &body.name,
+        &body.cron,
+        &body.prompt,
+        body.timezone.as_deref(),
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(rule_id) => Ok(Json(serde_json::json!({ "rule_id": rule_id }))),
+        Err(crate::errands::RuleError::Unreadable(reason)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": reason })),
+        )),
+        Err(crate::errands::RuleError::Duplicate) => Err(status_only(StatusCode::CONFLICT)),
+        Err(error) => {
+            tracing::warn!(%error, id, "arming an errand's rule failed");
+            Err(status_only(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+    }
+}
+
+/// Disarms one rule of this errand.
+///
+/// `404` when nothing matched, which covers both an unknown rule and one belonging to a different
+/// errand — and the two are deliberately the same answer, because distinguishing them would confirm
+/// to a caller that some other errand holds that id. A `204` over a delete that matched nothing is
+/// the worse failure by far: it is the daemon agreeing that a rule is disarmed while it goes on
+/// firing.
+async fn delete_errand_rule(
+    State(state): State<AppState>,
+    Path((id, rule_id)): Path<(i64, i64)>,
+) -> Result<StatusCode, StatusCode> {
+    errand_by_id(&state, id).await?;
+
+    match crate::errands::delete_rule(&state.pool, id, rule_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, id, rule_id, "disarming an errand's rule failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// What the errand's file surface answers when a path is refused or missing.
+///
+/// `InvalidInput` is the kind that carries the decision: `errands::file_path` wraps every refusal
+/// from `files::resolve_within` in it, so a path naming somewhere outside this errand's folder
+/// arrives here and leaves as `400` — the caller's mistake, said to the caller. A `500` would blame
+/// the daemon for it and invite the same request again.
+///
+/// `NotFound` is a file that is not there, which is a different sentence and a different fix.
+/// Everything else is this machine's problem: a disk that would not read, a name the platform
+/// refused. The path itself is never echoed back — it came from whoever wrote it.
+fn errand_file_status(error: &std::io::Error) -> StatusCode {
+    match error.kind() {
+        std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// What is in this errand's folder, and nothing else's.
+///
+/// The scoping is `errands::list_files`'s and is deliberately not restated here: there is one files
+/// root and many errands under it, so a listing taken at the root would hand every errand every
+/// other errand's investigation.
+async fn list_errand_files(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::list_files(&root, &errand)
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, id, "listing an errand's folder failed");
+            errand_file_status(&error)
+        })
+}
+
+/// One file of this errand, read back by name.
+///
+/// The name arrives from a model that has been reading the open web, so `..` in it is the expected
+/// request and not a hypothetical one. Nothing is joined here: `errands::read_file` resolves it
+/// through `files::resolve_within`, which refuses a `..` component before any canonicalisation
+/// happens. A path built in this handler would inherit none of that.
+async fn read_errand_file(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(i64, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::read_file(&root, &errand, &path)
+        .map(|contents| Json(serde_json::json!({ "contents": contents })))
+        .map_err(|error| {
+            tracing::warn!(%error, id, "reading an errand's file failed");
+            errand_file_status(&error)
+        })
+}
+
+#[derive(serde::Deserialize)]
+struct WriteErrandFileRequest {
+    contents: String,
+}
+
+/// Writes a file into this errand's folder, and marks it in the same breath.
+///
+/// The mark is `errands::write_file`'s to make and cannot be forgotten here, which is why the write
+/// goes through it rather than through `std::fs`. It is recorded as TAINTED, and that is not
+/// pessimism about the caller: this route is how the MCP process writes, the MCP process is driven
+/// by a model that reads the open web, and nothing in this request says what that model had read
+/// before it composed these bytes. `artifact_tainted` treats "cannot say" as tainted already — a
+/// route claiming otherwise would be vouching for something it cannot see.
+async fn write_errand_file(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(i64, String)>,
+    Json(body): Json<WriteErrandFileRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::write_file(
+        &state.pool,
+        &root,
+        &errand,
+        &path,
+        &body.contents,
+        true,
+        None,
+    )
+    .await
+    .map(|()| StatusCode::NO_CONTENT)
+    .map_err(|error| {
+        tracing::warn!(%error, id, "writing an errand's file failed");
+        errand_file_status(&error)
+    })
+}
+
+/// The errand's notebook, which is its memory across turns.
+///
+/// A notebook that has never been written reads back as `200` with an empty string, because
+/// `errands::read_notebook` answers a missing file that way and this route does not put a `404` on
+/// top of it. The two say different things to a client: "this errand is not there" would send it
+/// looking for a bug, when what happened is that nothing has been written yet.
+async fn read_errand_notebook(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let root = files_root(&state)?.to_path_buf();
+    let errand = errand_by_id(&state, id).await?;
+
+    crate::errands::read_notebook(&root, &errand)
+        .map(|contents| Json(serde_json::json!({ "contents": contents })))
+        .map_err(|error| {
+            tracing::warn!(%error, id, "reading an errand's notebook failed");
+            errand_file_status(&error)
+        })
+}
+
 async fn get_proposals(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
@@ -3350,6 +4605,25 @@ async fn get_skipped_items(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "listing skipped items failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// What the injection barrier refused, and what it was going to do.
+///
+/// The same shape as the listing above and for the same reason: neither kind can be approved into
+/// happening, so neither belongs on `/proposals`, whose two buttons answer 409 for anything but an
+/// `action-approval`. Its own route rather than sharing `/proposals/skipped-items`, because those
+/// are a job's items and the shell renders them inside a job graph — an errand's refused email has
+/// no graph to sit in and would arrive there as an orphan.
+async fn get_refused_actions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::proposals::Proposal>>, StatusCode> {
+    crate::proposals::list_refused_actions(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing refused actions failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -3430,10 +4704,27 @@ fn merge_decision_response(
 /// The case that made it worth doing is real rather than hypothetical: `mode: "real"` is the API's
 /// DEFAULT and creates no worktree, so approving a merge in such a run is refused by a mechanism
 /// nobody can see, and the refusal is indistinguishable from a button that did not fire.
+/// The body `approve` accepts, and the only kind that reads one.
+///
+/// `Option` and last in the argument list, so every existing caller — which sends no body at all —
+/// is unaffected. A recruitment is a SUGGESTION: the director knows the name, the speciality and
+/// the prompt well, and knows the engine, the model and the tool policy badly, because those are
+/// what cost money per turn and what widen a surface. So the person approving may correct them, and
+/// `agent::validate` runs over the correction.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ApproveBody {
+    hire: Option<crate::agent::AgentRequest>,
+}
+
 async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    // Last, because axum requires a body extractor to be — and optional, because four of the five
+    // kinds through this door send nothing.
+    body: Option<Json<ApproveBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let edited = body.and_then(|Json(body)| body.hire);
     // Two kinds of proposal share this table and this door, and they are decided by entirely
     // different machinery: an action approval resumes a paused run, a contact merge joins two
     // people and touches no run at all. Reading the kind first is only a dispatch — the kind never
@@ -3459,6 +4750,30 @@ async fn post_proposal_approve(
                 .await
                 .map_err(|status| (status, "the merge task did not finish".to_owned()))?;
         return merge_decision_response(outcome);
+    }
+    if kind == "refinement" {
+        // Fifth kind through this door, and the third that starts no run: approving activates the
+        // refinement and decides the proposal in one transaction. Uncancellable for the reason the
+        // others give — a dropped request must not leave the proposal and the layer disagreeing
+        // about whether the agent was allowed to learn something.
+        let state = state.clone();
+        let activated = uncancellable(async move { crate::refine::approve(&state.pool, id).await })
+            .await
+            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match activated {
+            Ok(refinement_id) => Ok(Json(serde_json::json!({ "refinement_id": refinement_id }))),
+            Err(crate::refine::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::refine::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::refine::DecisionError::Malformed) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this proposal does not name a refinement".to_owned(),
+            )),
+        };
     }
     if kind == "calendar-event" {
         // Third kind through this door, and the second that starts no run: approving writes the
@@ -3501,9 +4816,68 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "github-action" {
+        // The kind through this door that ACTS on approval, where `team-action` waits for a tick.
+        // A pillar answering synchronously has no later pass to be picked up on, so without this the
+        // button would approve nothing.
+        //
+        // Uncancellable for the reason all of its neighbours are, and here it carries more: the work
+        // between the claim and the note is a live call to GitHub, and a request dropped across it
+        // would leave a comment published and the row saying only that somebody said yes.
+        let state = state.clone();
+        let ran = uncancellable(async move {
+            crate::github::approve_proposed_operation(&state.pool, &state.github, id).await
+        })
+        .await
+        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match ran {
+            Ok(outcome) => Ok(Json(serde_json::json!({
+                "operation": outcome.kind,
+                "exit_code": outcome.exit_code,
+                "stdout": outcome.stdout,
+                "output_tail": outcome.output_tail,
+            }))),
+            Err(crate::github::DecisionError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::github::DecisionError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::github::DecisionError::Malformed) => {
+                tracing::warn!(
+                    proposal_id = id,
+                    "a github proposal carried no usable operation"
+                );
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "this proposal carries no usable operation, so there is nothing to run"
+                        .to_owned(),
+                ))
+            }
+            // The proposal is already `approved` and the note beneath it says what happened. The
+            // status is the failure's own, so a missing token does not read as a broken daemon.
+            Err(crate::github::DecisionError::Failed(failure)) => Err((
+                github_failure_status(&failure),
+                format!("approved, and it did not run: {failure}"),
+            )),
+            Err(crate::github::DecisionError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "approving a github proposal failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the decision could not be recorded".to_owned(),
+                ))
+            }
+        };
+    }
+
+    if kind == "browser-wheel" {
+        return approve_browser_wheel(state, id).await;
+    }
+
     if kind == "fleet-exclusion" {
-        // Fourth kind through this door, third that starts no run. Uncancellable for the reason the
-        // other three are: the rule and the decision that authorised it commit together, and a
+        // Fifth kind through this door, fourth that starts no run. Uncancellable for the reason the
+        // others are: the rule and the decision that authorised it commit together, and a
         // request dropped mid-flight must not leave a job parked by a rule whose proposal still
         // reads `pending` beside it.
         let state = state.clone();
@@ -3549,6 +4923,81 @@ async fn post_proposal_approve(
         };
     }
 
+    if kind == "agent-recruit" {
+        // The sixth kind, and the only one that grows the house rather than releasing something:
+        // approving writes an `agents` row and a `team_members` row in one transaction with the
+        // decision. Uncancellable for the reason all of them are — a dropped request must not leave
+        // an agent hired into a team nobody agreed to.
+        let state = state.clone();
+        let hired =
+            uncancellable(
+                async move { crate::team::approve_recruit(&state.pool, id, edited).await },
+            )
+            .await
+            .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match hired {
+            Ok(agent_id) => Ok(Json(serde_json::json!({ "agent_id": agent_id }))),
+            Err(crate::team::HireError::NotFound) => {
+                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
+            }
+            Err(crate::team::HireError::NotPending) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(crate::team::HireError::Malformed) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this request does not describe an agent this daemon can create".to_owned(),
+            )),
+            // 409 and a sentence: the team went away while the request waited, and the person can
+            // still dismiss the proposal or recreate the team. Neither is obvious from a bare code.
+            Err(crate::team::HireError::NoSuchTeam(team_id)) => Err((
+                StatusCode::CONFLICT,
+                format!("`{team_id}` no longer exists, so there is no team to hire them into"),
+            )),
+            Err(crate::team::HireError::Refused(why)) => Err((StatusCode::CONFLICT, why)),
+            Err(crate::team::HireError::Db(error)) => {
+                tracing::warn!(proposal_id = id, %error, "hiring an agent failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the agent could not be written".to_owned(),
+                ))
+            }
+        };
+    }
+
+    if kind == "team-action" {
+        // Fifth kind through this door, and the only one where approving DOES NOTHING but say yes.
+        // The action is carried out by `team::execute_due_actions` on the next tick, and that is the
+        // design rather than an omission: an HTTP handler that sends an email holds the connection
+        // open while a slow SMTP thinks, and a daemon restarted in the middle loses the action with
+        // no trace. A `pending` row survives a restart; an `await` in a handler does not.
+        //
+        // Uncancellable all the same, for the reason the four above are: the decision commits.
+        let state = state.clone();
+        let decided = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "approved", "approved by user").await
+        })
+        .await
+        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        return match decided {
+            Ok(true) => Ok(Json(serde_json::json!({
+                "queued": "the department's action will be carried out shortly",
+            }))),
+            // The compare-and-set lost: somebody decided this while the request was in flight.
+            Ok(false) => Err((
+                StatusCode::CONFLICT,
+                "this proposal has already been decided".to_owned(),
+            )),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "approving a team action failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the approval could not be recorded".to_owned(),
+                ))
+            }
+        };
+    }
+
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await })
@@ -3587,6 +5036,104 @@ async fn post_proposal_approve(
     }
 }
 
+/// A person took the wheel (spec §4.4, rules 1 and 3).
+///
+/// The `transition` below is the load-bearing line, and its position is the argument: it is a
+/// compare-and-set on `status = 'pending'`, so exactly one of two concurrent approvals wins — and the
+/// one that wins is the one that then hands over the browser. Handing over first and recording
+/// afterwards would let both callers open a window; recording without handing over would leave a
+/// proposal saying a person is driving something that was never started.
+///
+/// Uncancellable for the same reason as the three arms above: a request dropped in between would
+/// leave the decision recorded and the window unopened.
+async fn approve_browser_wheel(
+    state: AppState,
+    id: i64,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a wheel request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the proposal could not be read".to_owned(),
+            )
+        })?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(serde_json::Value::as_i64))
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this wheel request names no session".to_owned(),
+            )
+        })?;
+
+    let transitioned = crate::proposals::transition(&state.pool, id, "approved", "wheel accepted")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "accepting a wheel request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the decision could not be recorded".to_owned(),
+            )
+        })?;
+    if !transitioned {
+        return Err((
+            StatusCode::CONFLICT,
+            "this proposal has already been decided".to_owned(),
+        ));
+    }
+
+    let handover = state.clone();
+    match uncancellable(async move { crate::browser_wheel::accept(&handover, session_id).await })
+        .await
+        .map_err(|status| (status, "the handover task did not finish".to_owned()))?
+    {
+        Ok(row) => Ok(Json(serde_json::json!({ "session": row }))),
+        Err(crate::browser_wheel::WheelError::NoSuchSession) => Err((
+            StatusCode::NOT_FOUND,
+            "the session this wheel was asked for is gone".to_owned(),
+        )),
+        // The window did not open (spec §4.4a). The session is recorded as a failed delivery and the
+        // proposal carries the reason; it does NOT go back to the agent.
+        Err(error) => Err((StatusCode::BAD_GATEWAY, error.to_string())),
+    }
+}
+
+/// The wheel was not given (spec §4.4), and the session goes with the refusal.
+///
+/// Spec §4.4's diagram draws an arrow back to `agente_conduz`, and this is deliberately narrower —
+/// `browser_wheel`'s module comment carries the reasoning. In short: the wall that caused the request
+/// is still there, §4.5 already says the run continues without that page, and giving the wheel back
+/// would need a second place where the two processes can disagree about who is driving.
+async fn reject_browser_wheel(state: AppState, id: i64) -> Result<StatusCode, StatusCode> {
+    let session_id = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(serde_json::Value::as_i64));
+
+    if !crate::proposals::transition(&state.pool, id, "rejected", "wheel refused")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "rejecting a wheel request failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    if let Some(session_id) = session_id
+        && let Err(error) = crate::browser_wheel::refuse(&state, session_id).await
+    {
+        // Logged and not returned. The refusal is recorded and that is the part the person asked
+        // for; a session left open by a sidecar that did not answer is retired on its next restart.
+        tracing::warn!(session = session_id, error = %error, "closing a refused wheel's session failed");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn post_proposal_reject(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -3599,6 +5146,9 @@ async fn post_proposal_reject(
         })?
         .ok_or(StatusCode::NOT_FOUND)?
         .kind;
+    if kind == "browser-wheel" {
+        return reject_browser_wheel(state, id).await;
+    }
     if kind == "contact-merge" {
         // `reject_merge` records the refused pair in the same transaction as the status, which is
         // what stops the heuristic asking the identical question forever. Wiring the approval
@@ -3617,6 +5167,22 @@ async fn post_proposal_reject(
                 tracing::warn!(proposal_id = id, %error, "rejecting a contact merge failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
+        };
+    }
+
+    if kind == "refinement" {
+        // Unlike the calendar's refusal below, this one leaves a row: `refine::reject` marks the
+        // refinement `rejected` rather than dropping it, because what the agent kept trying to
+        // learn and was told no to is the record the layer's history exists to keep.
+        let state = state.clone();
+        let refused = uncancellable(async move { crate::refine::reject(&state.pool, id).await })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return match refused {
+            Ok(_) => Ok(StatusCode::NO_CONTENT),
+            Err(crate::refine::DecisionError::NotFound) => Err(StatusCode::NOT_FOUND),
+            Err(crate::refine::DecisionError::NotPending) => Err(StatusCode::CONFLICT),
+            Err(crate::refine::DecisionError::Malformed) => Err(StatusCode::UNPROCESSABLE_ENTITY),
         };
     }
 
@@ -3657,6 +5223,52 @@ async fn post_proposal_reject(
             }
             Err(crate::exclusion::DecisionError::Db(error)) => {
                 tracing::warn!(proposal_id = id, %error, "rejecting an exclusion failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "agent-recruit" {
+        // Refusing leaves nothing behind, because nothing was created: no agent, no roster row, no
+        // run held. And it is deliberately not a permanent no — the NEXT run of that department
+        // meets the same gap and may ask again, which is right. Nobody said the director should
+        // stop asking; they said not this one.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "rejected", "not hired").await
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "refusing a recruitment failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
+    if kind == "team-action" {
+        // Refusing closes the action as well as the proposal, in that order: the proposal is the
+        // decision and the action is what is left to do about it, and leaving the second `pending`
+        // would keep it in the department's queue ceiling forever, blocking the next request over a
+        // question already answered.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            let decided =
+                crate::proposals::transition(&state.pool, id, "rejected", "rejected by user")
+                    .await?;
+            if decided {
+                crate::team::refuse_action(&state.pool, id).await?;
+            }
+            Ok::<bool, sqlx::Error>(decided)
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "rejecting a team action failed");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
@@ -3873,6 +5485,153 @@ struct LeaveNoteResponse {
     note_id: i64,
 }
 
+#[derive(serde::Deserialize)]
+struct ProposeRefinementRequest {
+    project_id: Option<String>,
+    kind: String,
+    title: String,
+    body: String,
+    /// Why this is worth telling every later run. Carried onto the proposal, because a person
+    /// deciding at a glance needs the argument beside the text and not a screen away from it.
+    reasoning: Option<String>,
+    /// The refinement this one replaces, if it is a correction of something already in force.
+    ///
+    /// Optional, and the difference matters: without it the layer only grows, and the answer to
+    /// "this note is wrong now" is a second note contradicting the first with both still in force.
+    supersedes: Option<i64>,
+}
+
+/// The owner writing into the layer directly, which is the door that exists today.
+///
+/// It still goes through the proposal, rather than inserting an `active` row: the review trail is
+/// what makes the layer safe to have at all, and a second way in that skipped it would be the way
+/// everything eventually got written. The owner simply approves their own in the next call.
+async fn post_refinement(
+    State(state): State<AppState>,
+    Json(request): Json<ProposeRefinementRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let kind = crate::refine::Kind::parse(request.kind.trim()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "kind must be one of prompt, memory, skill, subagent".to_owned(),
+    ))?;
+    let title = request.title.trim();
+    let body = request.body.trim();
+    // A refinement with no words is an empty heading in every later prompt, for ever.
+    if title.is_empty() || body.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a refinement needs both a title and a body".to_owned(),
+        ));
+    }
+    let (refinement_id, proposal_id) = crate::refine::propose(
+        &state.pool,
+        crate::refine::Declaration {
+            project_id: request.project_id.as_deref(),
+            origin_run_id: None,
+            kind,
+            title,
+            body,
+            reasoning: request
+                .reasoning
+                .as_deref()
+                .unwrap_or("written by the owner"),
+            supersedes: request.supersedes,
+        },
+    )
+    .await
+    // Which precondition failed, rather than a bare status: a caller told only "409" has to guess
+    // between "that id is not there" and "that id is not yours", and the two have different fixes.
+    .map_err(|error| match error {
+        crate::refine::ProposeError::UnknownPredecessor(_) => {
+            (StatusCode::NOT_FOUND, error.to_string())
+        }
+        crate::refine::ProposeError::ForeignPredecessor(_) => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        crate::refine::ProposeError::Db(error) => {
+            tracing::warn!(%error, "proposing a refinement failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the refinement could not be written".to_owned(),
+            )
+        }
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "refinement_id": refinement_id,
+            "proposal_id": proposal_id,
+        })),
+    ))
+}
+
+/// Everything the layer holds, in every status.
+///
+/// Not filtered to `active`, deliberately: the reviewable history IS the feature, and a screen that
+/// showed only what is in force could not answer "what did it try to learn that I said no to".
+async fn list_refinements(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::refine::Refinement>>, StatusCode> {
+    sqlx::query_as::<_, crate::refine::Refinement>(
+        "SELECT id, project_id, kind, title, body, status, proposal_id, supersedes, origin_run_id,
+                created_at, activated_at, ended_at
+           FROM refinements ORDER BY id DESC LIMIT 500",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map(Json)
+    .map_err(|error| {
+        tracing::warn!(%error, "listing refinements failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// One refinement, read the way a person decides about it: the text, every decision it has been
+/// through, what it replaced, and what replaced it.
+///
+/// The chain is the half `GET /refinements` cannot give you. A list answers "what is in force";
+/// this answers "what did it say before I changed it, and would I want that back" — which is the
+/// question somebody asks at the moment they are considering a revert.
+async fn get_refinement(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::refine::History>, StatusCode> {
+    match crate::refine::history(&state.pool, id).await {
+        Ok(Some(history)) => Ok(Json(history)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(refinement_id = id, %error, "reading a refinement's history failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Taking one back. The half that makes approving safe to do at all.
+async fn revert_refinement(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<RevertRefinementRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let note = request
+        .note
+        .unwrap_or_else(|| "reverted by the owner".to_owned());
+    match crate::refine::revert(&state.pool, id, &note).await {
+        // 409 and not 404: the row may well exist and simply not be active, which is a different
+        // thing for the caller to do about it.
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(refinement_id = id, %error, "reverting a refinement failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RevertRefinementRequest {
+    note: Option<String>,
+}
+
 /// `POST /jobs/{id}/notes` — leaves words for whichever of this job's nodes comes next.
 ///
 /// **Admin, by being in no scope table at all.** `auth::permits` is default-deny, so a route nobody
@@ -4065,8 +5824,11 @@ mod tests {
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
+                files_root: None,
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+                browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+                github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
                 web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
                 calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
                 council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -4219,6 +5981,93 @@ mod tests {
         );
 
         db.close().await;
+    }
+
+    /// **The target is read, never assumed.** A constant `master` would be wrong for any project
+    /// working on something else, and wrong silently — it would queue a merge into a branch nobody
+    /// asked about. So the test builds a repository whose integration branch is deliberately NOT
+    /// called master, and the landed request has to name it.
+    ///
+    /// It also pins the direction, which is the whole point of this route existing: a session could
+    /// already ask for merges INTO its own branch, and this is the only way it can ask for the
+    /// reverse.
+    #[tokio::test]
+    async fn landing_a_worktree_queues_its_branch_into_the_branch_the_project_is_on() {
+        let (state, _db) = file_test_state().await;
+        let container = crate::git_exec::tests::space_free_tempdir("http-land-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        // Not `master`, on purpose — see the doc comment.
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
+        assert!(git_in(&repo, &["branch", "feature"]));
+        let worktree = container.path().join("wt");
+        assert!(git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "feature"
+            ]
+        ));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let landed = land_worktree(
+            State(state.clone()),
+            Json(LandBody {
+                cwd: worktree.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .expect("a worktree on its own branch can land");
+        assert_eq!(landed.0.status, "queued");
+
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(landed.0.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let op: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(op["op"], "merge");
+        assert_eq!(
+            op["source"], "feature",
+            "the worktree's own branch is what lands"
+        );
+        assert_eq!(
+            op["target"], "trunk",
+            "the target is the branch the project's main checkout is on, not a constant"
+        );
+
+        // Standing on the integration branch, there is no separate work to take. Refused rather
+        // than admitted as a merge naming one branch twice.
+        let refused = land_worktree(
+            State(state),
+            Json(LandBody {
+                cwd: repo.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .expect_err("the main checkout has nothing to land");
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("already on trunk"), "{}", refused.1);
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start")
+            .success()
     }
 
     /// A request submitted over HTTP comes back as a ticket, and the same ticket is readable after.
@@ -4558,8 +6407,11 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -5613,10 +7465,8 @@ mod tests {
     }
 
     fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
-        let mut email = (*state.email).clone();
-        email.files_root = root;
         AppState {
-            email: std::sync::Arc::new(email),
+            files_root: Some(root),
             ..state
         }
     }
@@ -6565,7 +8415,6 @@ mod tests {
                 ..Default::default()
             },
             std::path::PathBuf::new(),
-            std::path::PathBuf::new(),
             None,
         ));
 
@@ -6667,7 +8516,7 @@ mod tests {
             .unwrap();
         let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        let asked: Vec<&str> = turns
+        let asked: Vec<&str> = turns["turns"]
             .as_array()
             .unwrap()
             .iter()
@@ -6675,6 +8524,51 @@ mod tests {
             .collect();
         // Oldest first, so the conversation reads downwards the way it was had.
         assert_eq!(asked, vec!["first", "second"]);
+    }
+
+    /// How full the context is, and the line past which this daemon will not resume.
+    ///
+    /// The rotation was invisible from the window: a conversation ran, crossed 140k, and the next
+    /// turn began remembering nothing -- and the first anybody heard of it was the restart mark
+    /// drawn after the fact. The number the daemon already records travels now, so the ceiling can
+    /// be seen coming instead of explained afterwards.
+    ///
+    /// The ceiling rides on every turn although it is the same on all of them. It is a property of
+    /// this daemon and not of any turn, and the alternative is the window keeping its own copy of a
+    /// rule this side owns -- which is a second source of truth that drifts silently the day the
+    /// constant here changes.
+    #[tokio::test]
+    async fn a_turn_says_how_full_its_context_was_and_where_the_daemon_rotates() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, context_fill, created_at)
+             VALUES ('hello', 'completed', 'assistant', 's', 'shell', 96000, '2026-07-30T10:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/shell")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(turns["turns"][0]["context_fill"], serde_json::json!(96000));
+        assert_eq!(
+            turns["turns"][0]["context_rotates_at"],
+            serde_json::json!(crate::assistant::CONTEXT_ROTATION_TOKENS)
+        );
     }
 
     /// A chat named like a number must not be read as a turn id. Static segments win in matchit,
@@ -6705,8 +8599,9 @@ mod tests {
             .await
             .unwrap();
         let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // An array, not the single run object `/assistant/{turn_id}` would have answered with.
-        assert_eq!(turns.as_array().unwrap().len(), 1);
+        // A transcript, not the single run object `/assistant/{turn_id}` would have answered
+        // with — and one whose `turns` is this chat's own.
+        assert_eq!(turns["turns"].as_array().unwrap().len(), 1);
     }
 
     /// Reads a response body as JSON, which every chat-route test below needs.
@@ -6875,6 +8770,194 @@ mod tests {
         assert!(json_body(listed).await.is_array());
     }
 
+    /// A session this machine does not have is a 404 and not an empty conversation.
+    ///
+    /// The two are different answers and the window shows them differently: nothing was said in
+    /// this conversation, versus this conversation is not on this machine. Collapsing them would
+    /// have the window claim the first about a transcript it never found.
+    #[tokio::test]
+    async fn a_session_this_machine_does_not_have_has_no_conversation_to_read() {
+        let state = test_state().await;
+        let read = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(read.status(), StatusCode::NOT_FOUND);
+
+        // And the 404 above is the transcript's absence rather than the route's. A path nothing
+        // routes answers 404 as well, so without this line the assertion would hold just as firmly
+        // with no route at all — which is the state it was written in.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// It is behind the token like everything else. These are the owner's conversations, and the
+    /// route reads them off disk rather than out of the database — which is exactly the kind of
+    /// route that gets added without one.
+    #[tokio::test]
+    async fn a_conversation_had_in_the_editor_is_not_readable_without_the_token() {
+        let state = test_state().await;
+        let read = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions/anything-at-all")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(read.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Tools cannot be granted to a session this machine does not have.
+    ///
+    /// The directory the hook would be written into comes from the transcript, never from the
+    /// request — so an id that names nothing has nowhere to write, and that is a 404 rather than a
+    /// path built out of whatever was sent.
+    #[tokio::test]
+    async fn a_session_this_machine_does_not_have_cannot_be_given_tools() {
+        let state = test_state().await;
+        let refused = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere/tools")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        // The 404 above is the session's absence and not the route's — a path nothing routes
+        // answers 404 just as readily. A method this route does not serve tells them apart.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/ide-sessions/no-such-session-anywhere/tools")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Writing into a project's `.claude/` is the most consequential thing this daemon offers over
+    /// HTTP: it is what opens the CLI's whole tool surface for every session had there afterwards.
+    /// It is behind the token, and this is the test that says so out loud.
+    #[tokio::test]
+    async fn granting_tools_to_a_project_is_not_possible_without_the_token() {
+        let state = test_state().await;
+        let refused = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/ide-sessions/anything-at-all/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A turn nothing is writing has nothing to watch, and that is `204` rather than an empty
+    /// answer.
+    ///
+    /// The difference is the one `read_tail` is written around: no live tail means the turn ended,
+    /// or this daemon never started it — never that the turn produced nothing. A window told
+    /// "" would draw an answer of no words over a turn that may have written pages.
+    #[tokio::test]
+    async fn a_turn_nothing_is_writing_has_nothing_to_watch() {
+        let state = test_state().await;
+        let quiet = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/4321/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(quiet.status(), StatusCode::NO_CONTENT);
+
+        // And that is the tail's absence, not the route's — a path nothing routes answers 404, but
+        // so would a missing route asked with the right method.
+        let wrong_method = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/4321/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// What a turn in flight is watched with: the stream distilled, not the stream.
+    #[tokio::test]
+    async fn a_turn_in_flight_is_watched_as_words_and_not_as_a_stream() {
+        let state = test_state().await;
+        state.run_tails.lock().unwrap().insert(
+            77,
+            std::sync::Arc::new(std::sync::Mutex::new(
+                [
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"deixa ver"}]}}"#,
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+                ]
+                .join("
+"),
+            )),
+        );
+
+        let watched = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/77/live")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(watched.status(), StatusCode::OK);
+        let body = json_body(watched).await;
+        assert_eq!(body["text"], "deixa ver");
+        assert_eq!(body["doing"], "Read");
+    }
+
     /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.
     ///
     /// Parked rather than slow, for the reason `LiveContextFillRunner` gives further down: a delay
@@ -6942,6 +9025,178 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// A paused errand is a decision somebody made, not a daemon that broke. The sidecar has to be
+    /// able to say "that topic is on hold" rather than "something went wrong", and a 500 is exactly
+    /// the answer that sends a reader looking for a crash that did not happen.
+    #[tokio::test]
+    async fn a_message_to_a_paused_errand_is_refused_without_looking_like_a_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = with_files_root(test_state().await, dir.path().to_path_buf());
+        let errand = crate::errands::create(&state.pool, "carros", "-1:99")
+            .await
+            .unwrap();
+        crate::errands::set_status(&state.pool, errand, crate::errands::Status::Paused)
+            .await
+            .unwrap();
+
+        let (status, _) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": "-1:99", "text": "procura", "origin": "telegram"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// A record nobody can reach is the same as no record. This is the door.
+    ///
+    /// Dismiss and not approve or reject: nothing is held, so there is nothing to release and
+    /// nothing to let through. The person has read it, and a list that cannot be cleared stops
+    /// being read — which is the same outcome as having no route, arrived at more slowly.
+    #[tokio::test]
+    async fn a_refused_action_can_be_read_and_then_put_away() {
+        let state = test_state().await;
+        let id = crate::proposals::create_refused_action(
+            &state.pool,
+            7,
+            None,
+            None,
+            "send_email",
+            "this turn has read third-party content and can no longer act",
+            Some(r#"{"to":"stand@example"}"#),
+        )
+        .await
+        .unwrap();
+
+        let (status, listed) = call(state.clone(), "GET", "/proposals/refused-actions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["tool_name"], "send_email");
+
+        let (dismissed, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{id}/dismiss"),
+            None,
+        )
+        .await;
+        assert_eq!(dismissed, StatusCode::NO_CONTENT);
+
+        let (_, after) = call(state, "GET", "/proposals/refused-actions", None).await;
+        assert!(after.as_array().unwrap().is_empty());
+    }
+
+    /// The guard on the widened dismissal. An `action-approval` holds a paused run and a worktree;
+    /// putting one away here would drop both on the floor with no record of a decision, and the
+    /// person who meant to press reject would see a 204 and believe they had.
+    #[tokio::test]
+    async fn an_action_approval_still_cannot_be_dismissed() {
+        let state = test_state().await;
+        let id = crate::proposals::create_action_approval(
+            &state.pool,
+            7,
+            None,
+            Some("proj"),
+            "Bash",
+            "push needs approval",
+            Some(r#"{"command":"git push"}"#),
+        )
+        .await
+        .unwrap();
+
+        let (status, _) = call(state, "POST", &format!("/proposals/{id}/dismiss"), None).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// The emergency stop gets a code of its own, and 409 is why. A topic that has gone quiet has
+    /// two undoings — `/retomar` for a pause, `/kill off` for the stop — and both refusals arriving
+    /// as the same number leaves the sidecar guessing which sentence to say. 423 because the errand
+    /// is not in conflict with anything: it exists, it is active, and it is locked by a decision
+    /// taken elsewhere.
+    #[tokio::test]
+    async fn the_emergency_stop_is_not_the_same_refusal_as_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = with_files_root(test_state().await, dir.path().to_path_buf());
+        crate::errands::create(&state.pool, "carros", "-1:98")
+            .await
+            .unwrap();
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": "-1:98", "text": "procura", "origin": "telegram"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+    }
+
+    /// The two 409s on this route are not one answer, and the caller cannot tell them apart.
+    ///
+    /// A chat mid-turn clears by waiting. A paused errand clears by somebody resuming it, and never
+    /// on its own — so a sidecar that guesses "still working, hold on" leaves a topic silent
+    /// forever with an explanation that was never true. The status code cannot carry the
+    /// difference: this route now has four refusals and HTTP has three honest codes for them, with
+    /// 403 already spent by `auth.rs` on token level. So the body names which refusal it was.
+    ///
+    /// A slug and not the sentence, for the reason `NO_LOCAL_MODEL` already records one file over:
+    /// prose stops being recognised the day somebody improves it, silently. And the sentence is not
+    /// the núcleo's to write — the remedy is `/retomar`, a Telegram command this crate must not
+    /// know.
+    #[tokio::test]
+    async fn the_two_conflicts_on_this_route_do_not_read_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = with_files_root(test_state().await, dir.path().to_path_buf());
+        state.runner = Arc::new(ParkedRunner);
+        let errand = crate::errands::create(&state.pool, "carros", "-1:97")
+            .await
+            .unwrap();
+        crate::errands::set_status(&state.pool, errand, crate::errands::Status::Paused)
+            .await
+            .unwrap();
+
+        let (paused_status, paused) = call(
+            state.clone(),
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": "-1:97", "text": "procura", "origin": "telegram"})),
+        )
+        .await;
+
+        // A chat whose turn is genuinely still running, which is the other 409.
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &chat,
+            "take your time",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+        let (busy_status, busy) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({"chat_id": chat, "text": "again", "origin": "shell"})),
+        )
+        .await;
+
+        assert_eq!(paused_status, StatusCode::CONFLICT);
+        assert_eq!(busy_status, StatusCode::CONFLICT);
+        assert_eq!(paused["refusal"], "errand_not_answering");
+        assert_eq!(busy["refusal"], "turn_in_progress");
     }
 
     #[tokio::test]
@@ -7131,6 +9386,272 @@ mod tests {
         assert!(listed.iter().all(|chat| chat.chat_id != id));
     }
 
+    /// The names a conversation can mention are the ones under its OWN directory.
+    ///
+    /// An `@` in the composer has to complete against something, and the only defensible something
+    /// is where this conversation's turns already run: the model can open those files, so naming
+    /// them discloses nothing it could not read anyway. The root comes from the chat's row and
+    /// never from the caller — a route that took a directory would be a route that reads any
+    /// directory.
+    #[tokio::test]
+    async fn a_conversation_completes_names_from_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/parser.rs"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/parser.d"), "x").unwrap();
+
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES ('rooted', 'cloud', '2026-08-20T10:00:00Z', ?)",
+        )
+        .bind(dir.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/rooted/files?q=parser")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["rooted"], true);
+        let paths: Vec<&str> = body["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["core/src/parser.rs"]);
+    }
+
+    /// A conversation with no directory says so, rather than answering with an empty list.
+    ///
+    /// The two look identical to a caller and are entirely different facts: one is "nothing here
+    /// matches what you typed", the other is "there is nowhere to look". Only the second is worth
+    /// a sentence in the window, and a bare empty list cannot say it.
+    #[tokio::test]
+    async fn a_conversation_with_nowhere_to_look_says_so_rather_than_finding_nothing() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}/files?q=parser"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["rooted"], false);
+        assert_eq!(body["hits"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// A conversation nobody opened is a 404, not an empty answer about a directory it does not
+    /// have. The distinction is the same one the route above draws, one level up.
+    #[tokio::test]
+    async fn completing_names_for_a_conversation_that_does_not_exist_says_so() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/never-opened/files?q=parser")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A conversation offers the commands in its own directory, by the name they are typed as.
+    ///
+    /// Asked of the CLI before any of it was built: `claude -p "/thing"` EXPANDS the command rather
+    /// than passing it through as text — the run answers `Launching skill: thing` and the file's
+    /// body arrives as the prompt. Without that this picker would be inserting text the model reads
+    /// literally, which is a feature that looks right and does nothing.
+    #[tokio::test]
+    async fn a_conversation_offers_the_commands_in_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/commands/commit.md"),
+            "---\ndescription: Ship it\nargument-hint: [message]\n---\n\nCommit and push.\n",
+        )
+        .unwrap();
+
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES ('with-commands', 'cloud', '2026-08-20T10:00:00Z', ?)",
+        )
+        .bind(dir.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/with-commands/commands?q=comm")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let mine = body["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["source"] == "project")
+            .expect("the project's own command was not offered");
+        assert_eq!(mine["name"], "commit");
+        assert_eq!(mine["description"], "Ship it");
+        assert_eq!(mine["hint"], "[message]");
+    }
+
+    /// A conversation nobody opened is a 404 here too, and for the same reason as its files.
+    #[tokio::test]
+    async fn offering_commands_for_a_conversation_that_does_not_exist_says_so() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/never-opened/commands?q=")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A conversation says what it was handed, because otherwise it silently pretends to remember.
+    ///
+    /// A session too large to resume is picked up with the verbatim tail of its predecessor in
+    /// front of it, and the model answers from that tail. Nothing in the window said so — you asked
+    /// something, it replied knowing the past, and the reason lived in a column nobody could see.
+    ///
+    /// `handoff.rs` states the position this asserts: context pressure must leave an auditable
+    /// record rather than erase how work continued. A compaction stored and never shown is still an
+    /// erasure from where the person is standing.
+    #[tokio::test]
+    async fn a_transcript_says_what_the_conversation_was_handed() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, ide_session_id, handover)
+             VALUES ('handed', 'cloud', '2026-08-19T10:00:00Z', 'aaaa-1111', ?)",
+        )
+        .bind(r#"[["arranja o parser","arranjado, o mês vinha antes do dia"]]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+             VALUES ('e agora os testes', 'completed', 'assistant', 'handed', 'feitos', '2026-08-19T10:01:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/handed")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["handed"][0][0], "arranja o parser");
+        assert_eq!(body["handed"][0][1], "arranjado, o mês vinha antes do dia");
+        // And the turns are still there, under their own name rather than as the whole body.
+        assert_eq!(body["turns"][0]["asked"], "e agora os testes");
+    }
+
+    /// A conversation nobody handed anything says so as an empty list, not as a missing field.
+    ///
+    /// The window draws a mark when there is something to draw. `null` and `[]` would both work by
+    /// accident today and diverge the first time anything counts them.
+    #[tokio::test]
+    async fn a_transcript_of_an_ordinary_conversation_was_handed_nothing() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["handed"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// The measurement reaches the window, or the column that stores it is write-only.
+    #[tokio::test]
+    async fn a_transcript_carries_how_much_each_turn_thought() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, thought, thought_tokens, created_at)
+             VALUES ('arranja', 'completed', 'assistant', 'thoughtful', 'feito', '[]', 177, '2026-08-19T10:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/thoughtful")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["turns"][0]["thought_tokens"], 177);
+        // And no words are claimed, because the CLI sent none — see 0093.
+        assert_eq!(
+            body["turns"][0]["thought"].as_array().map(Vec::len),
+            Some(0)
+        );
+    }
+
     /// Without this column on the way out, the window has no way to see that a conversation changed
     /// model, and the mark it draws to say so simply never appears. The failure is silent, which is
     /// why it is asserted here rather than left to the page's own tests.
@@ -7161,7 +9682,7 @@ mod tests {
             .unwrap();
 
         let body = json_body(response).await;
-        let by: Vec<&str> = body
+        let by: Vec<&str> = body["turns"]
             .as_array()
             .unwrap()
             .iter()
@@ -7179,22 +9700,16 @@ mod tests {
             .await
             .unwrap();
 
-        let response = build_router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/assistant/message")
-                    .header("Authorization", "Bearer test-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "chat_id": id, "text": "olá" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({ "chat_id": id, "text": "olá" })),
+        )
+        .await;
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["refusal"], "no_local_model");
     }
 
     #[tokio::test]
@@ -7681,8 +10196,11 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -10329,6 +12847,658 @@ mod tests {
         assert_eq!(promotion_feed_rows(&pool).await, 0);
     }
 
+    /// A state with somewhere for an errand's folder to be, which the chat routes never needed: a
+    /// chat is rows and an errand is rows plus a directory.
+    ///
+    /// The root comes from `files::ensure_root` rather than from `tempdir()` directly, for the
+    /// reason that function's own comment gives — it canonicalises, and every containment check
+    /// downstream compares against the root it was handed. The `TempDir` is returned rather than
+    /// dropped here, because dropping it takes the directory with it.
+    async fn errand_state() -> (AppState, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(temp.path()).unwrap();
+        (with_files_root(test_state().await, root), temp)
+    }
+
+    /// The id comes back from the POST because there is no other way for the caller to learn it:
+    /// the folder is minted from it and every later route is keyed by it. Resolving by the chat key
+    /// afterwards is the half that matters — a row that exists but does not answer to its topic is
+    /// an errand nobody in Telegram can reach.
+    #[tokio::test]
+    async fn posting_an_errand_creates_one_that_its_topic_then_resolves() {
+        let (state, _temp) = errand_state().await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "carros para importar",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let errand_id = body["errand_id"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("the route did not answer with an id: {body}"));
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .expect("the errand the route created does not resolve by its topic");
+        assert_eq!(found.id, errand_id);
+    }
+
+    /// A rule written through the route comes back through the route.
+    ///
+    /// The round trip is the whole of piece 4's first half: a project keeps its schedule in a file
+    /// inside its repository and an errand has no repository, so if this does not survive a POST and
+    /// a GET there is nowhere for an errand's standing work to live.
+    #[tokio::test]
+    async fn a_rule_posted_to_an_errand_comes_back_in_its_list() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+
+        let (status, created) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(serde_json::json!({
+                "name": "manhã",
+                "cron": "0 8 * * *",
+                "prompt": "vê se apareceram anúncios novos",
+                "timezone": "Europe/Lisbon"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+
+        let (status, listed) = call(state, "GET", &format!("/errands/{errand}/rules"), None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let rules = listed.as_array().expect("the list is an array");
+        assert_eq!(rules.len(), 1, "{listed}");
+        assert_eq!(rules[0]["name"], "manhã");
+        assert_eq!(rules[0]["cron"], "0 8 * * *");
+        assert_eq!(rules[0]["prompt"], "vê se apareceram anúncios novos");
+        assert_eq!(rules[0]["timezone"], "Europe/Lisbon");
+    }
+
+    /// A cron nobody can read is the caller's mistake, said to the caller.
+    ///
+    /// `400` and not `500`, and the reason travels in the body. This is the one advantage an
+    /// errand's rules have over a project's: `.ai/autopilot.yaml` is read long after whoever wrote
+    /// it walked away, so `scheduler.rs` arms the broken rule and announces it once to the feed. A
+    /// rule arriving over a route can be refused to somebody's face, and a refusal that does not
+    /// quote the word that was wrong cannot be acted on from a phone.
+    #[tokio::test]
+    async fn a_cron_nobody_can_read_is_the_callers_mistake_and_not_the_daemons() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(serde_json::json!({
+                "name": "manhã",
+                "cron": "todas as manhãs",
+                "prompt": "vê os anúncios"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("todas as manhãs")),
+            "the refusal has to quote what was written: {body}"
+        );
+
+        let (_, listed) = call(state, "GET", &format!("/errands/{errand}/rules"), None).await;
+        assert!(listed.as_array().is_some_and(|rules| rules.is_empty()));
+    }
+
+    /// A name already in use is a conflict, not a fault.
+    ///
+    /// `409` is the same answer `POST /errands` gives a topic that already has one, and it means the
+    /// same thing: nothing is broken, the caller is asking for a state that is already occupied and
+    /// can pick another name. A `500` would invite them to retry the request unchanged, for ever.
+    #[tokio::test]
+    async fn a_second_rule_of_one_name_is_a_conflict_and_not_a_fault() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+        let rule = serde_json::json!({
+            "name": "manhã",
+            "cron": "0 8 * * *",
+            "prompt": "vê os anúncios"
+        });
+
+        let (first, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(rule.clone()),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+
+        let (second, _) = call(
+            state,
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(rule),
+        )
+        .await;
+
+        assert_eq!(second, StatusCode::CONFLICT);
+    }
+
+    /// A rule for an errand that does not exist is a `404`, and no row is written.
+    ///
+    /// The errand id arrives in the path, so nothing about the request proves the errand is there.
+    /// Without this check the insert would decide it — and with foreign keys on it would decide it
+    /// as a `500`, blaming the daemon for a path the caller made up.
+    ///
+    /// The same body goes to a real errand first, and that half is not decoration: an unrouted path
+    /// answers `404` all by itself, so without it this test passes against a daemon that has no such
+    /// route at all.
+    #[tokio::test]
+    async fn a_rule_for_an_errand_that_is_not_there_is_a_404() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros", "-1001234:7").await.id;
+        let rule = serde_json::json!({
+            "name": "manhã",
+            "cron": "0 8 * * *",
+            "prompt": "vê os anúncios"
+        });
+
+        let (real, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{errand}/rules"),
+            Some(rule.clone()),
+        )
+        .await;
+        assert_eq!(real, StatusCode::OK, "the route itself has to exist");
+
+        let (invented, _) = call(state, "POST", "/errands/4321/rules", Some(rule)).await;
+
+        assert_eq!(invented, StatusCode::NOT_FOUND);
+    }
+
+    /// Deleting a rule that is not this errand's deletes nothing and says so.
+    ///
+    /// Both ids come out of the path, so a caller can pair any errand with any rule. `errands::
+    /// delete_rule` keys on both and the route turns "no row matched" into a `404` — the difference
+    /// between that and a `204` is the difference between finding out your rule is still armed and
+    /// believing you disarmed it.
+    #[tokio::test]
+    async fn deleting_another_errands_rule_deletes_nothing_and_says_so() {
+        let (state, _temp) = errand_state().await;
+        let carros = an_errand(&state, "carros", "-1001234:7").await.id;
+        let casa = an_errand(&state, "casa", "-1001234:9").await.id;
+
+        let (_, created) = call(
+            state.clone(),
+            "POST",
+            &format!("/errands/{carros}/rules"),
+            Some(serde_json::json!({
+                "name": "manhã",
+                "cron": "0 8 * * *",
+                "prompt": "vê os anúncios"
+            })),
+        )
+        .await;
+        let rule = created["rule_id"].as_i64().unwrap();
+
+        let (status, _) = call(
+            state.clone(),
+            "DELETE",
+            &format!("/errands/{casa}/rules/{rule}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (_, still_there) = call(
+            state.clone(),
+            "GET",
+            &format!("/errands/{carros}/rules"),
+            None,
+        )
+        .await;
+        assert_eq!(still_there.as_array().unwrap().len(), 1);
+
+        let (status, _) = call(
+            state,
+            "DELETE",
+            &format!("/errands/{carros}/rules/{rule}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// The list is what `/assuntos` reads. An errand appears in it from the moment it is opened and
+    /// not from its first turn — the same property `posting_a_chat_creates_one_the_list_then_returns`
+    /// asserts one route over, and for the same reason: a thing you opened and cannot see listed
+    /// looks like a thing that was not opened.
+    #[tokio::test]
+    async fn listing_errands_returns_what_was_created() {
+        let (state, _temp) = errand_state().await;
+        call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "carros para importar",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+
+        let (status, listed) = call(state, "GET", "/errands", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        // An array, and the errand is in it under the name a person typed — `folder` is the
+        // núcleo's derivation of that name and is not what a list is read for.
+        let names: Vec<&str> = listed
+            .as_array()
+            .expect("the list route did not answer with an array")
+            .iter()
+            .map(|errand| errand["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["carros para importar"]);
+    }
+
+    /// The two fields a client may move, in one PATCH, the way `patch_chat` takes a title and a
+    /// brain together. Both are asserted through `resolve` rather than through the response,
+    /// because the response says what the route thinks it did and the row says what happened.
+    #[tokio::test]
+    async fn patching_an_errand_moves_its_status_and_its_model() {
+        let (state, _temp) = errand_state().await;
+        let id = crate::errands::create(&state.pool, "carros para importar", "-1001234:7")
+            .await
+            .unwrap();
+
+        let (status, _) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/errands/{id}"),
+            Some(serde_json::json!({"status": "paused", "brain": "cloud"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, crate::errands::Status::Paused);
+        assert_eq!(found.brain, crate::errands::Brain::Cloud);
+    }
+
+    /// Closing over HTTP is `/fim` by another door, and it removes nothing — the row stays, and so
+    /// does the folder with what the errand found in it. `delete_chat` archives for the neighbouring
+    /// reason: the record of work already done is not the client's to destroy by asking for a
+    /// cleaner list. So the closed errand is still listed, and still says it is done.
+    #[tokio::test]
+    async fn closing_an_errand_over_http_leaves_it_findable() {
+        let (state, _temp) = errand_state().await;
+        let id = crate::errands::create(&state.pool, "carros para importar", "-1001234:7")
+            .await
+            .unwrap();
+
+        let (status, _) = call(state.clone(), "DELETE", &format!("/errands/{id}"), None).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .expect("closing an errand over HTTP removed the row");
+        assert_eq!(found.status, crate::errands::Status::Done);
+
+        let (_, listed) = call(state, "GET", "/errands", None).await;
+        assert_eq!(listed.as_array().unwrap()[0]["status"], "done");
+    }
+
+    /// The errand as the domain functions want it, which is not what the routes hand out: a route
+    /// answers with an id and `read_file`, `list_files` and `append_notebook` all take an `Errand`.
+    /// Written once because every file and notebook test below needs both halves of that.
+    async fn an_errand(state: &AppState, name: &str, chat_key: &str) -> crate::errands::Errand {
+        crate::errands::create(&state.pool, name, chat_key)
+            .await
+            .unwrap();
+        crate::errands::resolve(&state.pool, chat_key)
+            .await
+            .unwrap()
+            .expect("the errand that was just created does not resolve by its topic")
+    }
+
+    /// A file read straight off the wire, because `call` parses the body as JSON and falls back to
+    /// `Null` — which would turn "the body did not carry the secret" into a claim about a value that
+    /// was thrown away before the assertion could look at it. The path goes in exactly as given, so
+    /// a caller can hand this an escape spelling of its own.
+    async fn get_errand_file(state: AppState, id: i64, path: &str) -> (StatusCode, String) {
+        let response = raw(
+            state,
+            "GET",
+            &format!("/errands/{id}/files/{path}"),
+            Body::empty(),
+        )
+        .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The MCP tools in the stdio process reach the folder over HTTP and by no other door — they
+    /// never touch the pool. So a file the domain can write and the wire cannot read is a file the
+    /// model cannot use, however well `errands::read_file` works in isolation.
+    #[tokio::test]
+    async fn reading_an_errand_file_over_http_returns_its_contents() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+        crate::errands::write_file(
+            &state.pool,
+            state.files_root.as_deref().unwrap(),
+            &errand,
+            "nota.txt",
+            "215 cv, 2019, 84 mil km",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = get_errand_file(state, errand.id, "nota.txt").await;
+
+        assert_eq!(status, StatusCode::OK);
+        // `contains` and not `==`: what is asserted is that the bytes reached the caller, which
+        // holds whether the route hands the text back raw or wrapped in a JSON envelope.
+        assert!(
+            body.contains("215 cv, 2019, 84 mil km"),
+            "the file's contents did not come back: {body}"
+        );
+    }
+
+    /// The other direction, and the one that matters more: an errand that can only read is an
+    /// errand that cannot record what it found. Asserted through the domain rather than through a
+    /// second HTTP read, because a route that stored the bytes somewhere only it knows about would
+    /// pass a round trip through itself and still have written to the wrong place.
+    #[tokio::test]
+    async fn writing_an_errand_file_over_http_lands_it_in_the_folder() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+
+        let (status, _) = call(
+            state.clone(),
+            "PUT",
+            &format!("/errands/{}/files/nota.txt", errand.id),
+            Some(serde_json::json!({ "contents": "215 cv, 2019, 84 mil km" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::errands::read_file(state.files_root.as_deref().unwrap(), &errand, "nota.txt")
+                .unwrap(),
+            "215 cv, 2019, 84 mil km"
+        );
+    }
+
+    /// There is one files root and many errands under it, so a listing taken at the root instead of
+    /// at the folder would hand every errand every other errand's investigation. That is the mistake
+    /// this route is in a position to make, and the only one worth a test here — which is why the
+    /// assertion is about the neighbour's file being absent as much as about this one's being there.
+    #[tokio::test]
+    async fn listing_an_errand_files_over_http_names_only_its_own() {
+        let (state, _temp) = errand_state().await;
+        let mine = an_errand(&state, "carros para importar", "-1001234:7").await;
+        let neighbour = an_errand(&state, "obras na casa", "-1001234:9").await;
+        for (errand, name) in [(&mine, "carros.md"), (&neighbour, "casa.md")] {
+            crate::errands::write_file(
+                &state.pool,
+                state.files_root.as_deref().unwrap(),
+                errand,
+                name,
+                "o que foi encontrado",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (status, listed) =
+            call(state, "GET", &format!("/errands/{}/files", mine.id), None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = listed
+            .as_array()
+            .unwrap_or_else(|| panic!("the listing route did not answer with an array: {listed}"))
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a listed path is not a string: {entry}"))
+            })
+            .collect();
+        assert!(names.contains(&"carros.md"), "got: {names:?}");
+        assert!(
+            !names.contains(&"casa.md"),
+            "the listing leaked the neighbouring errand's file: {names:?}"
+        );
+    }
+
+    /// The path arrives from a model that has been reading the open web, so `..` in it is the
+    /// expected attack and not a hypothetical one.
+    ///
+    /// The escape target is created first and holds real text: a refusal that is only a refusal
+    /// because the file was not there proves nothing about the guard. It sits at the files root —
+    /// outside this errand's FOLDER, which is what `errands::file_path` resolves within, and the
+    /// neighbouring errands' folders are its siblings.
+    ///
+    /// The legitimate read at the top is the control. Without it a route that does not exist answers
+    /// 404 to everything, and 404 is a client error, so the whole test would pass against nothing.
+    #[tokio::test]
+    async fn an_errand_file_path_that_escapes_is_refused() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+        crate::errands::write_file(
+            &state.pool,
+            state.files_root.as_deref().unwrap(),
+            &errand,
+            "nota.txt",
+            "215 cv, 2019, 84 mil km",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            state.files_root.as_deref().unwrap().join("segredo.txt"),
+            "a senha do wifi e batatas",
+        )
+        .unwrap();
+
+        let (status, body) = get_errand_file(state.clone(), errand.id, "nota.txt").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the control read failed, so nothing below is evidence about escapes: {body}"
+        );
+        assert!(body.contains("215 cv, 2019, 84 mil km"), "got: {body}");
+
+        // Both spellings, because the wildcard segment is percent-decoded on its way to the handler
+        // and a guard applied on the wrong side of that decoding sees only one of them.
+        for escape in ["../segredo.txt", &urlencode("../segredo.txt")] {
+            let (status, body) = get_errand_file(state.clone(), errand.id, escape).await;
+            assert!(
+                status.is_client_error(),
+                "{escape:?} was not refused: {status}"
+            );
+            assert!(
+                !body.contains("a senha do wifi e batatas"),
+                "{escape:?} handed back a file outside the errand's folder: {body}"
+            );
+        }
+    }
+
+    /// A file on disk with no row reads back as `None` from `artifact_tainted` — "cannot say", which
+    /// every caller treats as tainted. So a route that writes the bytes and forgets the mark does not
+    /// fail loudly: it quietly makes everything the model wrote through HTTP indistinguishable from a
+    /// file somebody dropped in the folder by hand, and the taint barrier stops carrying information.
+    #[tokio::test]
+    async fn writing_an_errand_file_over_http_records_its_artifact() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+
+        let (status, _) = call(
+            state.clone(),
+            "PUT",
+            &format!("/errands/{}/files/nota.txt", errand.id),
+            Some(serde_json::json!({ "contents": "215 cv, 2019, 84 mil km" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // `Some(_)` and not `Some(false)`: whether the route calls this write tainted is its own
+        // decision, and what is asserted is that it made one at all.
+        assert!(
+            crate::errands::artifact_tainted(&state.pool, errand.id, "nota.txt")
+                .await
+                .is_some(),
+            "the write left no mark, so the file reads back as unknown"
+        );
+    }
+
+    /// The notebook is the errand's memory across turns, and the model reads it back through this
+    /// route before it decides anything. A notebook the núcleo can append to and the wire cannot read
+    /// is an errand that writes its memory down and never consults it.
+    #[tokio::test]
+    async fn reading_the_notebook_over_http_returns_it() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+        crate::errands::append_notebook(
+            state.files_root.as_deref().unwrap(),
+            &errand,
+            42,
+            "encontrei tres anuncios abaixo de 12 mil",
+        )
+        .unwrap();
+
+        let (status, body) = call(
+            state,
+            "GET",
+            &format!("/errands/{}/notebook", errand.id),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let contents = body["contents"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the notebook route did not answer with contents: {body}"));
+        assert!(
+            contents.contains("encontrei tres anuncios abaixo de 12 mil"),
+            "got: {contents}"
+        );
+    }
+
+    /// A freshly opened errand has never answered anything, and that is the normal case rather than
+    /// an error — `read_notebook` says so already, and this asserts the route did not put a 404 back
+    /// on top of it. The difference matters to the caller: 404 reads as "this errand is not there",
+    /// which would send a client looking for a bug in the errand instead of writing the first entry.
+    #[tokio::test]
+    async fn the_notebook_of_a_fresh_errand_is_empty_not_missing() {
+        let (state, _temp) = errand_state().await;
+        let errand = an_errand(&state, "carros para importar", "-1001234:7").await;
+
+        let (status, body) = call(
+            state,
+            "GET",
+            &format!("/errands/{}/notebook", errand.id),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["contents"], "");
+    }
+
+    /// `patch_chat` a few blocks up checks existence before it writes, and its comment says why: 204
+    /// over an UPDATE that matched no row is the API saying "done" about something it did not do.
+    /// Both errand routes take an id straight into an UPDATE, so both can say it, and a client that
+    /// believes them carries on with an errand that was never there.
+    #[tokio::test]
+    async fn patching_an_errand_that_does_not_exist_is_a_404() {
+        let (state, _temp) = errand_state().await;
+        // No errand was ever created, so no id is real — 4242 least of all.
+        let missing = 4242;
+
+        let (patched, _) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/errands/{missing}"),
+            Some(serde_json::json!({"status": "paused", "brain": "cloud"})),
+        )
+        .await;
+        assert_eq!(patched, StatusCode::NOT_FOUND);
+
+        let (deleted, _) = call(state, "DELETE", &format!("/errands/{missing}"), None).await;
+        assert_eq!(deleted, StatusCode::NOT_FOUND);
+    }
+
+    /// One topic holds one errand — `chat_key` is UNIQUE, and `errands::create` leans on that instead
+    /// of reading first, so two callers racing lose on the key rather than on a read that was true a
+    /// moment ago. What the route does with that loss is the question here: 500 tells the caller the
+    /// daemon is broken and invites a retry that cannot ever work, while 409 names the one thing that
+    /// is actually wrong. `presets.rs` maps the same violation the same way.
+    ///
+    /// The first errand is checked afterwards because the failure that matters is not the status
+    /// code: a second `create` that half-applied would have moved the name out from under a running
+    /// errand.
+    #[tokio::test]
+    async fn posting_a_second_errand_on_one_topic_is_a_409() {
+        let (state, _temp) = errand_state().await;
+        let (first, body) = call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "carros para importar",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+        let errand_id = body["errand_id"].as_i64().unwrap();
+
+        let (second, _) = call(
+            state.clone(),
+            "POST",
+            "/errands",
+            Some(serde_json::json!({
+                "name": "obras na casa",
+                "chat_key": "-1001234:7"
+            })),
+        )
+        .await;
+
+        assert_eq!(second, StatusCode::CONFLICT);
+        let found = crate::errands::resolve(&state.pool, "-1001234:7")
+            .await
+            .unwrap()
+            .expect("the refused second POST took the first errand with it");
+        assert_eq!(found.id, errand_id);
+        assert_eq!(found.name, "carros para importar");
+    }
     /// The sentence an owner would leave, kept in one place so both note tests say the same thing.
     const A_NOTE: &str = "when you get to item 3, update the docs too";
 

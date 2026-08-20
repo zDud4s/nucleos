@@ -1,4 +1,4 @@
-# CI reruns the four `scripts/gates.sh` targets for each push and pull request.
+# CI reruns the five `scripts/gates.sh` targets for each push and pull request.
 #
 # windows-latest is not a preference. The núcleo is Windows-only by construction: `keyring` builds
 # with the windows-native-keyring-store backend, autostart shells out to `schtasks`, and the run
@@ -9,10 +9,14 @@
 # claiming "green" managed to coexist; copying them here would recreate the same split, one file
 # further away.
 #
-# Four jobs rather than one `gates.sh all`: `all` covers the three hermetic stack targets, while the
+# One job per target rather than one `gates.sh all`: `all` covers the hermetic targets, while the
 # separate security target is deliberately outside it. The script still runs every stack after one
 # fails — the useful property locally, where you want all three stack answers in one pass. In CI the
 # jobs give the same completeness in parallel, and name which target broke without reading a log.
+#
+# That per-target listing is also a trap, and it caught the `hooks` target on the day it was added:
+# a new target inside `all` does NOT start running here, because nothing here runs `all`. A target
+# added to the script has to be added to this file too, or it is covered locally and nowhere else.
 
 name: gates
 
@@ -38,14 +42,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No toolchain is named here on purpose: `rust-toolchain.toml` pins
-      # stable-x86_64-pc-windows-gnu, and `rustup show` is what installs it from that file rather
-      # than assuming a later command will. The components are then added explicitly, because the
-      # pin does not list them and a default-profile install is a convention, not a guarantee.
+      # The toolchain is READ out of rust-toolchain.toml and passed as an ARGUMENT, rather than
+      # left for rustup to take from the file itself. A bare `rustup toolchain install` is what this
+      # said until the second run answered it, and it fails here with:
+      #
+      #     error: target tuple in channel name '1.97.1-x86_64-pc-windows-gnu'
+      #
+      # rustup refuses to INSTALL from a toolchain file whose channel carries a target tuple, and
+      # this repo's channel carries one deliberately — the pin is to the GNU host, for the reason
+      # rust-toolchain.toml's own comment gives. The same name is accepted as an argument; only the
+      # file-reading path validates it. That asymmetry is why the failure cannot be seen on a
+      # developer's machine, where the toolchain is already installed and nothing ever installs it
+      # from the file. Not a version difference either: runner and workstation both run rustup
+      # 1.29.0, and the error reproduces on the workstation the moment the toolchain is absent.
+      #
+      # Read rather than retyped, so the version stays in one place — a second copy here is a pin
+      # that drifts in silence. The components ARE retyped, because the file's `components` apply
+      # only on the path this step no longer takes.
       - name: Install the pinned toolchain
         run: |
-          rustup show
-          rustup component add clippy rustfmt
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
       # The workspace root is the repo root (`Cargo.toml` has `members = ["core"]`), which is this
       # action's default — `shell/src-tauri` is deliberately excluded from it and keeps its own
@@ -53,6 +70,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: bash scripts/gates.sh core
+
+  # The Python this repo ships — chiefly `.claude/hooks/ask_daemon.py`, which `core/src/triage.rs`
+  # compiles INTO the daemon and which decides what a person's git commands may do. No Rust, no Go,
+  # no Node, so this job installs none of them.
+  hooks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned and installed rather than trusting the image's own Python. windows-latest also ships
+      # an App Execution Alias named `python3` that is not an interpreter — it prints "Python was
+      # not found", points at the Microsoft Store, and exits 49 — and `gates.sh` probes past it by
+      # running the candidate rather than locating it. setup-python puts a real one first either
+      # way, so the two guards are independent.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: bash scripts/gates.sh hooks
 
   security:
     runs-on: windows-latest
@@ -63,10 +99,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # `rustup show` installs the pinned GNU toolchain from rust-toolchain.toml before cargo-audit
-      # is compiled, just as the core job does for its Rust commands.
+      # The pinned GNU toolchain, installed before cargo-audit is compiled — same command and same
+      # reason as the core job, whose comment carries the detail.
       - name: Install the pinned toolchain
-        run: rustup show
+        run: |
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -112,5 +150,19 @@ jobs:
       - name: Install shell dependencies
         working-directory: shell
         run: npm ci
+
+      # `tauri::generate_context!()` embeds shell/dist at COMPILE time, and dist is gitignored — no
+      # checkout ever carries one. `gates.sh shell` refuses its three src-tauri legs without it, so
+      # until this step existed the job reported "frontend not built" and never reached them.
+      - name: Build the frontend
+        working-directory: shell
+        run: npm run build
+
+      # Those three legs are cargo commands, governed by the repo-root rust-toolchain.toml like
+      # every other one. Same install as the core job, for the reason its comment gives.
+      - name: Install the pinned toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
       - run: bash scripts/gates.sh shell

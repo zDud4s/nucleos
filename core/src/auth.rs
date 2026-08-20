@@ -74,6 +74,17 @@ pub enum Scope {
     Run(i64),
     /// A sidecar's key, good for the routes that sidecar's pillar owns and nothing else.
     Service(Service),
+    /// One team run's key, good for `TEAM_ROUTES` and dead once the run stops being live.
+    ///
+    /// It looks like `Run` and behaves like `Service`, and the reason is the one difference between
+    /// a department and a council. `Service` would have been the exact sibling — the enum
+    /// enumerates "a subprocess of ours that must not hold the controls", and a team run qualifies
+    /// — except that `mint_service_token` stores one row per NAME, minted at startup and shared by
+    /// every seat, because a seat needs no identity of its own. A team run does: `read_team_file`
+    /// has to resolve WHICH folder, and a token shared by every run names none of them.
+    ///
+    /// `String` and not `i64` because `team_runs.id` is TEXT.
+    TeamRun(String),
     /// A durable caller key, limited to the access level chosen when it was minted.
     ApiToken(ApiTokenLevel),
 }
@@ -237,6 +248,16 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// on, and like a sent message it is the one thing in its pillar its owner cannot undo. That it is
 /// spelled `POST` and mentions a repository makes it look like a sibling of `/runs`; it is a sibling
 /// of `/email/send`. Queueing is Admin's.
+///
+/// `POST /github/requests` inherits that question and its answer without alteration, and it is the
+/// clearer instance of the two: a queued merge at least leaves the machine only at the end, and this
+/// route IS the leaving. It is absent from both tables, so a read-only key cannot reach it and a run
+/// that tried to speak to the API directly cannot either.
+///
+/// **That absence is what makes ONE route safe for two tools.** The reading half and the acting half
+/// share this door, and the partition between them is held by the parameter TYPES at the tool
+/// boundary rather than by the transport. A transport-level partition would be worth having if this
+/// were reachable by the agent the tools serve; it is not, because of the line above.
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     // A job is several runs over one worktree, so it belongs to the scope that buys runs rather
@@ -257,12 +278,19 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 /// One table rather than a capability declared beside each route: this is a safety boundary, and a
 /// boundary you have to reconstruct by reading forty route definitions is one nobody audits. A new
 /// route is unreachable by a scoped key until someone adds it here on purpose.
-fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
+///
+/// Visible to the crate's tests so a module that ADDS routes can assert its own absence from a
+/// scope's table where those routes are written — `team_trigger` does exactly that. The boundary is
+/// still decided only here; being readable from a test is what makes forgetting to add a route
+/// fail somewhere other than production.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     match scope {
         Scope::Control => true,
         Scope::Run(_) => method == Method::POST && path == HOOK_ROUTE,
         Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
         Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
+        Scope::TeamRun(_) => route_is_listed(TEAM_ROUTES, method, path),
         Scope::ApiToken(ApiTokenLevel::ReadOnly) => route_is_listed(READ_ONLY_ROUTES, method, path),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
             route_is_listed(READ_ONLY_ROUTES, method, path)
@@ -346,6 +374,81 @@ const COUNCIL_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/files"),
 ];
 
+/// Every route a team agent's tools reach, and nothing else.
+///
+/// The argument is `COUNCIL_ROUTES`', repeated because the position is the same: `team.rs` launches
+/// with `cwd: None`, so no `.claude/settings.json` of the owner's resolves and the `PreToolUse`
+/// hook may never fire. This table is the answer to "what if the hook never fires" — with this key,
+/// `POST /runs` is 403 whatever the model decided. Complete by construction, not by inspection.
+///
+/// It is pairs and not paths, and that is load-bearing: `http.rs` registers
+/// `.route("/files", get(get_files).delete(delete_file))`, so a list of paths alone would hand a
+/// department the deleting of the owner's folder along with the listing of it.
+///
+/// **Three deliberate differences from the council's list.**
+///
+/// `POST /web/search` and `POST /web/read` are here and are not there. A council answers from the
+/// state of the machine; a department investigates the world, and one that cannot open a page
+/// answers from what it half-remembers. The warning above `RUN_CREATING_ROUTES` — that a read
+/// "pulls a stranger's prose into this machine's store and index, where later callers will meet it"
+/// — is accepted rather than waved away, and it is what `web.rs` forcing `Requester::Autonomous`
+/// for this scope pays for: what a department plants arrives quarantined.
+///
+/// `GET /autopilot/budget` and `GET /autopilot/kill` are there and are not here. The council's
+/// reason — "what a council costs and whether autonomy is switched off are two of the things a
+/// person convenes one to ask about" — does not transfer: a department is not convened to answer
+/// about the machine, it is put to work in a domain.
+///
+/// `GET /projects`, `GET /runs/{id}` and `GET /proposals` are absent for that same reason. They are
+/// the state of the house, which is a council's subject and not a marketing department's.
+///
+/// And one thing that is absent from BOTH, deliberately: `POST /hooks/pretooluse-decision`.
+/// Including it would be worse than useless — `hooks::pretooluse_decision` checks the body's
+/// `run_id` against the token only for `Scope::Run`, so a new scope on that route could name
+/// somebody else's run, and every branch below reads that id's `mode`.
+///
+/// The list is NOT derived from `ToolEffect`. `ReadsOwn`/`ReadsUntrusted` answer "what does this do
+/// to the turn that called it"; `permits` answers "what does this key reach". Deriving one from the
+/// other would hand a department more reach than `ApiTokenLevel::ReadOnly` has — the kill switch,
+/// the budget and the blocking `wait` would all arrive.
+const TEAM_ROUTES: &[(Method, &str)] = &[
+    // The run's own folder, and the only route of the teams design that this scope opens. Which
+    // folder is decided by the token, never by an argument — see `team.rs`.
+    (Method::POST, "/team-files/read"),
+    // **The only route in this table that is not a read, and the only one there will ever be.** It
+    // does not perform anything: it records what the department asked for, and the core acts later
+    // if a human agrees (`team::propose_action`). That is what keeps this table from growing one
+    // entry per action a department might want — a `POST /email/send` here would have been the
+    // first of six, and by the sixth this scope would no longer be describable in a sentence.
+    //
+    // Its GET twin, which lists the queue, is deliberately absent: a department may ask, and may not
+    // read what every other department has asked for.
+    (Method::POST, "/team-actions"),
+    // The second and last. Like the one above it, it records a request rather than performing one:
+    // nobody joins the catalogue until a person says so. Unlike it, the daemon answers differently
+    // depending on WHICH NODE of the run is calling — a specialist is refused — and that is decided
+    // inside the handler against `team_runs.director_run_id`, because `permits` answers about keys
+    // and a key belongs to the run rather than to a node.
+    (Method::POST, "/team-recruits"),
+    (Method::GET, "/email/queue"),
+    (Method::GET, "/email/{id}"),
+    (Method::GET, "/files"),
+    (Method::POST, "/web/search"),
+    (Method::POST, "/web/read"),
+];
+
+/// A team run's key and the secret to store for it: `team:<team_run_id>.<secret>`.
+///
+/// The prefix is not decoration. `resolve` picks the table by prefix — `api:` for durable keys, a
+/// service name for sidecars, and anything numeric for a run — and a TEXT team-run id would either
+/// collide with the numeric branch or resolve nowhere. `team:` follows the shape `api:` already
+/// established, so the comment saying the prefix "picks the table without a second marker" now
+/// names four families instead of three.
+pub fn mint_team_token(team_run_id: &str) -> (String, String) {
+    let secret = generate_token();
+    (format!("team:{team_run_id}.{secret}"), secret)
+}
+
 /// A process the daemon launches and hands a key of its own, rather than the control token.
 ///
 /// The telegram sidecar deliberately keeps the control token: it is the user's remote control — it
@@ -424,6 +527,28 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
         let level = ApiTokenLevel::from_str(&level)?;
         return bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
             .then_some(Scope::ApiToken(level));
+    }
+
+    // `team:<id>` contains a colon for the same reason `api:<name>` does, and the id is TEXT, so
+    // without the prefix it would either be read as a service name or fail the integer parse below.
+    if let Some(team_run_id) = prefix.strip_prefix("team:") {
+        let (stored, run_state) = sqlx::query_as::<_, (String, String)>(
+            "SELECT token, state FROM team_runs WHERE id = ?",
+        )
+        .bind(team_run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()??;
+
+        // A team token dies with its run, for the reason the run branch below gives and more so: it
+        // lives for hours and crosses dozens of subprocesses, which makes it the longest-lived key
+        // in the house and the one that most needs the rule. `team::is_live` rather than a fourth
+        // copy of the state list.
+        if !crate::team::is_live(&run_state) {
+            return None;
+        }
+        return bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
+            .then_some(Scope::TeamRun(team_run_id.to_owned()));
     }
 
     // A service name never parses as an integer and a run id always does, so the remaining prefix
@@ -550,8 +675,11 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -601,6 +729,21 @@ mod tests {
             .route("/email/incoming", post(|| async { "" }))
             .route("/email/triage", post(|| async {}))
             .route("/email/{id}/attachments", get(|| async {}))
+            // The three a team run reaches beside `/files`, plus the one it must never reach.
+            // `/email/{id}` sits beside `/email/{id}/attachments` on purpose: the table is matched
+            // segment by segment, so a scope holding the shorter pattern must not inherit the
+            // longer one.
+            .route("/email/queue", get(|| async {}))
+            .route("/email/{id}", get(|| async {}))
+            .route("/email/send", post(|| async {}))
+            .route("/web/search", post(|| async {}))
+            .route("/web/read", post(|| async {}))
+            .route("/team-files/read", post(|| async {}))
+            // Registered with both methods, so the negative assertion below — a department may POST
+            // an action and may not LIST the queue — is answered by `permits` rather than by the
+            // router not knowing the path.
+            .route("/team-actions", post(|| async {}).get(|| async {}))
+            .route("/team-recruits", post(|| async {}).get(|| async {}))
             .route("/files", get(|| async {}).delete(|| async {}))
             .route("/files/folder", post(|| async {}))
             .route("/files/download", get(|| async {}))
@@ -609,6 +752,18 @@ mod tests {
             .route("/files/move", post(|| async {}))
             .route("/api-tokens", get(|| async {}).post(|| async {}))
             .route("/api-tokens/{name}", axum::routing::delete(|| async {}))
+            // The browser pillar, mounted so the refusals below are refusals of a route that
+            // exists. Without these the assertions would pass against a 404 that never reached the
+            // classifier, which is the shape of a test that stops noticing.
+            .route("/browser/open", post(|| async {}))
+            .route("/browser/act", post(|| async {}))
+            .route("/browser/revoke", post(|| async {}))
+            .route("/browser/forget", post(|| async {}))
+            .route("/browser/handoff", post(|| async {}))
+            .route("/browser/return", post(|| async {}))
+            .route("/browser/keep", post(|| async {}))
+            .route("/browser/sessions", get(|| async {}))
+            .route("/browser/sites/{project_id}", get(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -636,6 +791,49 @@ mod tests {
             .await
             .unwrap();
         (id, token)
+    }
+
+    /// A team run in the state a real one is in while its specialists work, with the whole chain
+    /// above it — agent, team, run — written out rather than faked.
+    ///
+    /// The chain is spelled in full even though this pool has foreign keys off, so that the day
+    /// somebody turns them on here these tests do not become the ones that mysteriously fail.
+    /// Returns what a specialist's CLI would find in its environment.
+    async fn live_team_run_with_token(state: &AppState, id: &str) -> String {
+        sqlx::query(
+            "INSERT OR IGNORE INTO agents
+                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
+             VALUES ('director', 'Director', 'plans', 'p', 'claude', NULL, 'mcp_only',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR IGNORE INTO teams
+                 (id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                  created_at, updated_at)
+             VALUES ('marketing', 'Marketing', 'sell', 'director', 3, 2, NULL,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (token, secret) = mint_team_token(id);
+        sqlx::query(
+            "INSERT INTO team_runs
+                 (id, team_id, request, workspace, token, state, created_at, updated_at)
+             VALUES (?, 'marketing', 'write the launch post', ?, ?, 'working',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(format!("teams/marketing/{id}"))
+        .bind(&secret)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        token
     }
 
     async fn stored_api_token(state: &AppState, name: &str, level: ApiTokenLevel) -> String {
@@ -1124,6 +1322,22 @@ mod tests {
             ("POST", "/files/upload"),
             ("POST", "/files/move"),
             ("DELETE", "/files"),
+            // The browser, all of it, including the two reads. `GET /web/pages` beside it IS an
+            // allowlisted read, and the difference is what these routes disclose: the pages a
+            // machine has fetched, against the list of hosts a person has accounts on and the
+            // sessions currently open in their name.
+            ("POST", "/browser/open"),
+            ("POST", "/browser/act"),
+            ("POST", "/browser/revoke"),
+            // The wheel. `/keep` is the one that grows the allowlist, and a read-only key reaching
+            // it would be a read-only key granting a host permanent access to the profile that
+            // holds the owner's logins.
+            ("POST", "/browser/forget"),
+            ("POST", "/browser/handoff"),
+            ("POST", "/browser/return"),
+            ("POST", "/browser/keep"),
+            ("GET", "/browser/sessions"),
+            ("GET", "/browser/sites/demo"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,
@@ -1300,10 +1514,12 @@ mod tests {
             ("POST", "/proposals/7/approve"),
             ("POST", "/autopilot/kill"),
             ("POST", "/vcs/requests"),
+            ("POST", "/github/requests"),
             ("POST", "/email/send"),
             ("POST", "/email/triage"),
             ("POST", "/web/read"),
             ("POST", "/web/search"),
+            ("POST", "/browser/open"),
             ("DELETE", "/files"),
         ] {
             assert_eq!(
@@ -1397,6 +1613,310 @@ mod tests {
                 "{method} {uri}"
             );
         }
+    }
+
+    /// The whole of `TEAM_ROUTES`, asserted entry by entry.
+    ///
+    /// Entry-by-entry and not a spot check, for the reason `COUNCIL_ROUTES` and `EMAIL_ROUTES` are
+    /// asserted the same way: the table IS the boundary, so any future addition to it has to walk
+    /// past this test on purpose. The negatives below are complement and not guard — "no team route
+    /// is a run-creating route" covers six entries and would not catch a `POST /email/send`.
+    #[tokio::test]
+    async fn a_team_token_reaches_exactly_its_route_table() {
+        let state = test_state("control-token").await;
+        let token = live_team_run_with_token(&state, "run-1").await;
+        let app = protected_router(state);
+
+        for (method, pattern) in TEAM_ROUTES {
+            let path = pattern.replace("{id}", "7");
+            assert_eq!(
+                status_of(&app, method.as_str(), &path, &token).await,
+                StatusCode::OK,
+                "{method} {path} is on the team's list"
+            );
+        }
+    }
+
+    /// Everything a department must not reach, named one by one.
+    ///
+    /// Three groups, and each is a decision rather than an oversight. The acts — starting a run,
+    /// starting a job, sending mail, queueing a merge, deleting the owner's folder. The council's
+    /// two that deliberately did not transfer — the budget and the kill switch, because a
+    /// department is not convened to answer about the machine. And the gate, which is absent from
+    /// both scopes' tables because `hooks::pretooluse_decision` validates the body's `run_id`
+    /// against the token only for `Scope::Run`, so a second scope on that route could name somebody
+    /// else's run.
+    #[tokio::test]
+    async fn a_team_token_reaches_nothing_outside_its_table() {
+        let state = test_state("control-token").await;
+        let token = live_team_run_with_token(&state, "run-1").await;
+        let app = protected_router(state);
+
+        for (method, path) in [
+            ("POST", "/runs"),
+            ("POST", "/jobs"),
+            ("POST", "/email/send"),
+            ("POST", "/vcs/requests"),
+            ("POST", "/github/requests"),
+            // The reason `TEAM_ROUTES` is a list of PAIRS. `/files` is registered with both a GET
+            // and a DELETE on the same path, so a table of paths alone would have handed a
+            // department the deleting of the owner's folder along with the listing of it.
+            ("DELETE", "/files"),
+            // A department asks for an action and does not read the queue of them. Same path, other
+            // method — the pair-shaped table again.
+            ("GET", "/team-actions"),
+            ("GET", "/team-recruits"),
+            ("GET", "/autopilot/budget"),
+            ("GET", "/autopilot/kill"),
+            ("GET", "/projects"),
+            ("GET", "/runs/7"),
+            ("GET", "/proposals"),
+            ("GET", "/vcs/requests/7/wait"),
+            ("POST", HOOK_ROUTE),
+        ] {
+            assert_eq!(
+                status_of(&app, method, path, &token).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path} must be out of a department's reach"
+            );
+        }
+    }
+
+    /// The route that leaves the machine is in NEITHER table, asserted as membership rather than
+    /// through a request, so that adding it to one of them fails here instead of in production.
+    ///
+    /// Its sibling `POST /vcs/requests` is asserted beside it, because the argument is one argument
+    /// and a test that made it about only the new route would let somebody "fix" the old one.
+    #[test]
+    fn the_routes_that_leave_the_machine_are_in_no_scope_table() {
+        for (method, path) in [
+            (Method::POST, "/github/requests"),
+            (Method::POST, "/vcs/requests"),
+            (Method::POST, "/email/send"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, path)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, path)
+                    && !route_is_listed(TEAM_ROUTES, &method, path)
+                    && !route_is_listed(EMAIL_ROUTES, &method, path)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, path),
+                "{method} {path} must stay out of every scope table"
+            );
+            assert!(
+                !permits(&Scope::Run(7), &method, path),
+                "{method} {path} must be unreachable by a run"
+            );
+            assert!(
+                !permits(&Scope::ApiToken(ApiTokenLevel::RunCreating), &method, path),
+                "{method} {path} must be unreachable by a run-creating key"
+            );
+            assert!(
+                permits(&Scope::Control, &method, path),
+                "{method} {path} must stay reachable by the control token"
+            );
+        }
+    }
+
+    /// The complement of the table, asserted as membership so that an edit to either list fails
+    /// here rather than in production.
+    #[test]
+    fn no_team_route_starts_work_and_none_is_the_gate() {
+        for (method, pattern) in TEAM_ROUTES {
+            assert!(
+                !RUN_CREATING_ROUTES
+                    .iter()
+                    .any(|(other, path)| other == method && path == pattern),
+                "{method} {pattern} starts work and must not be a department's to call"
+            );
+            assert_ne!(
+                *pattern, HOOK_ROUTE,
+                "the gate answers runs, not departments"
+            );
+        }
+    }
+
+    /// The economy and the boundary must cover the same set, and here is where they are held to it.
+    ///
+    /// `mcp_tools::TEAM_TOOLS` narrows what the model is offered; `TEAM_ROUTES` decides what the key
+    /// reaches. Divergence is silent in both directions and expensive in both: a tool offered and
+    /// refused is a rain of 403s nobody traces to its cause, and a tool refused but permitted is a
+    /// boundary nobody is exercising.
+    ///
+    /// The map is written out here because there is no tool→route mapping anywhere in the crate to
+    /// derive it from — the correspondence lives inside the bodies of `daemon_client.rs`, and for
+    /// `vcs_ticket` it is not even a function of the name (`ticket_path(id, wait)` yields two
+    /// different routes, one permitted and one refused on purpose). A hand-written map has to be
+    /// maintained; the two assertions below are what make forgetting to fail loudly.
+    #[test]
+    fn every_team_tool_has_a_route_and_every_team_route_has_a_tool() {
+        const TOOL_ROUTES: &[(&str, Method, &str)] = &[
+            ("get_email", Method::GET, "/email/{id}"),
+            ("get_email_queue", Method::GET, "/email/queue"),
+            ("list_files", Method::GET, "/files"),
+            ("propose_action", Method::POST, "/team-actions"),
+            ("propose_teammate", Method::POST, "/team-recruits"),
+            ("read_team_file", Method::POST, "/team-files/read"),
+            ("web_read", Method::POST, "/web/read"),
+            ("web_search", Method::POST, "/web/search"),
+        ];
+
+        for (tool, method, path) in TOOL_ROUTES {
+            assert!(
+                crate::mcp_tools::TEAM_TOOLS.contains(tool),
+                "{tool} is mapped here and is not offered to a department"
+            );
+            assert!(
+                permits(&Scope::TeamRun("run-1".to_owned()), method, path),
+                "{tool} is offered to a department and its route is refused to one"
+            );
+        }
+
+        for tool in crate::mcp_tools::TEAM_TOOLS {
+            assert!(
+                TOOL_ROUTES.iter().any(|(mapped, ..)| mapped == tool),
+                "{tool} is offered to a department and this map does not say which route it calls"
+            );
+        }
+        for (method, pattern) in TEAM_ROUTES {
+            assert!(
+                TOOL_ROUTES
+                    .iter()
+                    .any(|(_, mapped, path)| mapped == method && path == pattern),
+                "{method} {pattern} is reachable by a department and no tool it holds calls it — \
+                 either the tool list is short or the route table is long"
+            );
+        }
+    }
+
+    /// The pin that says this scope did not widen the run token.
+    ///
+    /// `Scope::Run`'s doc claims it is "good for exactly one route", and three comments in this file
+    /// lean on that being true. A new scope is exactly the change that makes somebody widen the old
+    /// one by accident.
+    #[test]
+    fn a_run_token_still_reaches_exactly_the_hook_route() {
+        let run = Scope::Run(1);
+        assert!(permits(&run, &Method::POST, HOOK_ROUTE));
+
+        for (method, pattern) in TEAM_ROUTES {
+            assert!(
+                !permits(&run, method, pattern),
+                "a run token must not have inherited {method} {pattern}"
+            );
+        }
+        for (method, pattern) in READ_ONLY_ROUTES {
+            assert!(!permits(&run, method, pattern));
+        }
+    }
+
+    /// A department's key lives for hours and crosses dozens of subprocesses, which makes it the
+    /// longest-lived key in the house and the one that most needs the death rule.
+    #[tokio::test]
+    async fn a_team_token_stops_working_when_its_run_stops_being_live() {
+        let state = test_state("control-token").await;
+        let token = live_team_run_with_token(&state, "run-1").await;
+        let app = protected_router(state.clone());
+
+        for live in crate::team::LIVE_STATES {
+            sqlx::query("UPDATE team_runs SET state = ? WHERE id = 'run-1'")
+                .bind(live)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                status_of(&app, "GET", "/files", &token).await,
+                StatusCode::OK,
+                "a {live} run's specialists still need their key"
+            );
+        }
+
+        for terminal in crate::team::TERMINAL_STATES {
+            sqlx::query("UPDATE team_runs SET state = ? WHERE id = 'run-1'")
+                .bind(terminal)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                status_of(&app, "GET", "/files", &token).await,
+                StatusCode::UNAUTHORIZED,
+                "a {terminal} run's token must not still open anything"
+            );
+        }
+    }
+
+    /// Four credential families now share one `resolve`, and the prefix is all that separates them.
+    /// A secret from one family presented under another's shape must authenticate nothing.
+    #[tokio::test]
+    async fn the_four_token_families_do_not_cross_over() {
+        let state = test_state("control-token").await;
+        let team_token = live_team_run_with_token(&state, "run-1").await;
+        let (run_id, run_token) = running_run_with_token(&state).await;
+        let api_token = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let service_token = mint_service_token(&state.pool, Service::Email)
+            .await
+            .unwrap();
+
+        let team_secret = team_token.split_once('.').unwrap().1.to_owned();
+        let run_secret = run_token.split_once('.').unwrap().1.to_owned();
+        let api_secret = api_token.split_once('.').unwrap().1.to_owned();
+        let service_secret = service_token.split_once('.').unwrap().1.to_owned();
+        let app = protected_router(state);
+
+        for forged in [
+            // The team's own secret worn as each of the other three shapes.
+            format!("{run_id}.{team_secret}"),
+            format!("api:reader.{team_secret}"),
+            format!("email.{team_secret}"),
+            // And each of the other three worn as the team's.
+            format!("team:run-1.{run_secret}"),
+            format!("team:run-1.{api_secret}"),
+            format!("team:run-1.{service_secret}"),
+            // A team id that exists is not enough, and one that does not is not a way in either.
+            "team:run-1.".to_owned(),
+            "team:nope.secret".to_owned(),
+            "team:.secret".to_owned(),
+        ] {
+            assert_eq!(
+                status_of(&app, "GET", "/files", &forged).await,
+                StatusCode::UNAUTHORIZED,
+                "{forged:?} must not authenticate"
+            );
+        }
+
+        // And the real one still does, so the loop above is refusing forgeries rather than
+        // everything.
+        assert_eq!(
+            status_of(&app, "GET", "/files", &team_token).await,
+            StatusCode::OK
+        );
+    }
+
+    /// One department's key must not open another's, even though both are live and both are teams.
+    #[tokio::test]
+    async fn one_team_runs_token_does_not_become_anothers() {
+        let state = test_state("control-token").await;
+        let first = live_team_run_with_token(&state, "run-1").await;
+        live_team_run_with_token(&state, "run-2").await;
+
+        let forged = format!("team:run-2.{}", first.split_once('.').unwrap().1);
+        let app = protected_router(state);
+        assert_eq!(
+            status_of(&app, "GET", "/files", &forged).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The scope names the caller, and that is the property `web.rs` leans on for #15a. Asserted
+    /// here because it is the thing that distinguishes this scope from `Service`, and the
+    /// distinction is the whole argument for adding a fourth family rather than a fifth service.
+    #[tokio::test]
+    async fn the_scope_carries_which_run_is_calling() {
+        let state = test_state("control-token").await;
+        let token = live_team_run_with_token(&state, "run-1").await;
+        assert_eq!(
+            resolve(&state, &token).await,
+            Some(Scope::TeamRun("run-1".to_owned()))
+        );
     }
 
     #[tokio::test]

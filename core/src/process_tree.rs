@@ -125,6 +125,67 @@ impl Drop for TreeKiller {
     }
 }
 
+/// A set of processes that dies when THIS process dies, however this process dies.
+///
+/// [`TreeKiller`] is the other shape of the same problem and does not cover this one. It kills on
+/// `Drop`, and a drop is a thing that happens in a program that is still running: `TerminateProcess`
+/// — which is what `Stop-Process`, Task Manager and a crash all do — runs no destructor, unwinds
+/// nothing, and leaves every child alive.
+///
+/// MEASURED, 2026-08-20: the sidecar supervisor set `kill_on_drop(true)` for exactly this reason and
+/// it was inert against the case that actually happens. Two days of daemon restarts had left 31
+/// orphaned sidecars — fourteen `email`, fourteen `telegram`, one each of the rest — and because an
+/// orphan keeps the loopback port, every freshly spawned sidecar died at `bind` and was "restarted"
+/// forever. The browser sidecar the app was talking to was two days old and would have stayed that
+/// way through any number of restarts. The daemon was reporting `running`, and it was true, and it
+/// was about the wrong process.
+///
+/// The Windows primitive for this is a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The
+/// kernel holds the set, so the promise is kept by the OS rather than by our code getting the chance
+/// to run — which is the whole point, since the case being covered is the one where it does not.
+///
+/// This is the same primitive [`TreeKiller`] uses and the OPPOSITE flag, deliberately. There, closing
+/// the handle must not kill, because `disarm()` exists to say "these are yours now". Here, closing
+/// the handle is the only signal that will still be delivered.
+///
+/// Off Windows this adopts nothing and says so rather than pretending: `kill_on_drop` still covers
+/// the orderly shutdown, and a hard kill still orphans. Naming the gap is better than a no-op that
+/// reads like a guarantee.
+pub struct Litter {
+    #[cfg(windows)]
+    job: Option<windows::Job>,
+}
+
+impl Litter {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            job: windows::Job::create(true),
+        }
+    }
+
+    /// Puts a process, and everything it goes on to spawn, into the set.
+    ///
+    /// Best effort and silent about refusal, because the caller's alternative is not to spawn the
+    /// sidecar at all — a supervisor that refused to start a child it could not adopt would trade a
+    /// leak for an outage. The lifetime rule is the same as [`TreeKiller`]'s: the pid must belong to
+    /// a child the caller still holds, or Windows may have reused it.
+    pub fn adopt(&self, pid: u32) {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.adopt(pid);
+        }
+        #[cfg(not(windows))]
+        let _ = pid;
+    }
+}
+
+impl Default for Litter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Best effort by definition: this can run while a future is being dropped, so it cannot await and
 /// cannot report. `/T` is the whole point (such tree as it can see), `/F` because a cancelled run is
 /// not being asked politely.
@@ -153,7 +214,9 @@ fn kill_process_group(pid: u32) {
 mod windows {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
@@ -179,35 +242,66 @@ mod windows {
     unsafe impl Sync for Job {}
 
     impl Job {
-        /// `None` whenever the OS declines, which the caller treats as "fall back to `taskkill`"
-        /// rather than as "nothing to kill".
-        pub fn capture(pid: u32) -> Option<Self> {
-            // SAFETY: every handle is checked before use and released on every path out. The pid is
-            // one whose `Child` the caller still holds, which is what stops Windows reusing it
-            // between the spawn and this `OpenProcess` — the invariant `TreeKiller` documents.
+        /// An empty job. `kill_on_close` decides what the kernel does when the last handle to it
+        /// goes — which, for a process that was terminated rather than shut down, is the only thing
+        /// that still happens. See [`super::Litter`] and [`super::TreeKiller`]: they want opposite
+        /// answers, and the difference is this one flag.
+        pub fn create(kill_on_close: bool) -> Option<Self> {
+            // SAFETY: the handle is checked before use and released on every path out.
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if job.is_null() {
                     return None;
                 }
+                if kill_on_close {
+                    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    let set = SetInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformation,
+                        (&raw const limits).cast(),
+                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    );
+                    if set == 0 {
+                        // Refused: a job whose members outlive it is not the thing being asked for,
+                        // and handing one back would be a guarantee that is not held.
+                        CloseHandle(job);
+                        return None;
+                    }
+                }
+                Some(Self(job))
+            }
+        }
+
+        /// Puts one process, and from this moment everything it spawns, into the job.
+        pub fn adopt(&self, pid: u32) -> bool {
+            // SAFETY: `self.0` is a job handle this type created and has not closed. The pid is one
+            // whose `Child` the caller still holds, which is what stops Windows reusing it between
+            // the spawn and this `OpenProcess`.
+            unsafe {
                 // The two rights this needs and no more: assigning costs a quota change, and
                 // terminating the job terminates its members.
                 let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
                 if process.is_null() {
-                    CloseHandle(job);
-                    return None;
+                    return false;
                 }
-                let assigned = AssignProcessToJobObject(job, process);
-                // The process handle has done its job the moment the assignment is recorded; the JOB
-                // handle is the one worth keeping. Closing this does not remove the process from the
-                // job.
+                let assigned = AssignProcessToJobObject(self.0, process);
+                // The process handle has done its work the moment the assignment is recorded; the
+                // JOB handle is the one worth keeping. Closing this does not remove the process
+                // from the job.
                 CloseHandle(process);
-                if assigned == 0 {
-                    CloseHandle(job);
-                    return None;
-                }
-                Some(Self(job))
+                assigned != 0
             }
+        }
+
+        /// `None` whenever the OS declines, which the caller treats as "fall back to `taskkill`"
+        /// rather than as "nothing to kill".
+        pub fn capture(pid: u32) -> Option<Self> {
+            let job = Self::create(false)?;
+            if !job.adopt(pid) {
+                return None;
+            }
+            Some(job)
         }
 
         pub fn terminate(&self) {
@@ -248,6 +342,48 @@ mod tests {
             .kill_on_drop(true);
         spawn_in_own_group(&mut command);
         command
+    }
+
+    /// The case `kill_on_drop` and `TreeKiller` both miss, and the one that actually happens.
+    ///
+    /// Both of those kill from a destructor, and a destructor is a thing that runs in a program that
+    /// is still running. `TerminateProcess` — Stop-Process, Task Manager, a crash — runs none, so
+    /// the promise has to be held by the kernel instead. Dropping the `Litter` closes the last
+    /// handle to the job, which is the signal that is still delivered when nothing of ours is.
+    ///
+    /// Not a hypothetical: 31 orphaned sidecars from two days of daemon restarts, an orphan holding
+    /// each loopback port, and every replacement dying at `bind` and being "restarted" forever.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_process_in_a_litter_does_not_outlive_it() {
+        let mut child = long_sleep().spawn().expect("`sleep` must be on PATH");
+        let litter = Litter::new();
+        litter.adopt(child.id().expect("a live child has a pid"));
+
+        drop(litter);
+
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("the child outlived the job that was holding it")
+            .expect("waiting on the child must succeed");
+    }
+
+    /// The control, and it is not a formality: without it the test above passes just as well against
+    /// a `sleep` that was never going to last, and would prove nothing about the job at all.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_process_outside_a_litter_is_left_alone() {
+        let mut child = long_sleep().spawn().expect("`sleep` must be on PATH");
+        let litter = Litter::new();
+
+        drop(litter);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .is_err(),
+            "the child ended on its own, so the other test measures nothing"
+        );
     }
 
     #[tokio::test]

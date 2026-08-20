@@ -114,7 +114,17 @@ pub async fn session_git_decision(
                 .or_else(|| crate::vcs::rebase_from_command(segment, &branch))
         })
     else {
-        return no_opinion();
+        // Declined by the queue is not the same sentence as fine to run by hand, and reading them
+        // as one left `git push --force` passing. A spelling that still writes something other
+        // sessions share is refused with NOTHING queued — there is nothing to queue, because the
+        // queue cannot perform that spelling either. Per segment, for the reason above.
+        return match crate::vcs::shell_segments(command)
+            .into_iter()
+            .find_map(crate::vcs::unqueueable_but_shared)
+        {
+            Some(reason) => Json(deny_with(&reason)),
+            None => no_opinion(),
+        };
     };
 
     // From here the command IS one the queue performs, so every remaining failure refuses rather
@@ -302,10 +312,24 @@ pub async fn pretooluse_decision(
         return council_decision(&state, &payload).await;
     }
 
+    // A department is in the same position as a seat, and this branch is the SECOND layer rather
+    // than the first. `team.rs` launches with `cwd: None`, so no `.claude/settings.json` of the
+    // owner's resolves and this hook may never fire at all — which is why `auth::TEAM_ROUTES` is
+    // the barrier that has to hold alone, and does.
+    //
+    // It is kept anyway for a reason of its own: it is the layer that carries "having read
+    // untrusted text, act no more" for the day a department is given something to act with. Today
+    // there is no `Acts` on `TEAM_TOOLS` for that rule to bite on, and two independent refusals of
+    // the same call is what one wants at a boundary.
+    if mode == crate::team::TEAM_MODE {
+        return team_decision(&payload);
+    }
+
     let classification = classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         cwd.as_deref().map(Path::new),
+        &state.github.policy,
     );
     tracing::info!(
         tool_name = %payload.tool_name,
@@ -326,6 +350,7 @@ pub async fn pretooluse_decision(
                 &payload.tool_name,
                 &payload.tool_input,
                 &classification,
+                state.github.policy.digest(),
             )
             .await
         {
@@ -359,6 +384,7 @@ pub async fn pretooluse_decision(
             &payload.tool_name,
             &payload.tool_input,
             &classification,
+            state.github.policy.digest(),
         )
         .await
     {
@@ -512,6 +538,16 @@ pub async fn pretooluse_decision(
 pub const UNTRUSTED_CONTEXT_DENY_REASON: &str =
     "this turn has read third-party content and can no longer act";
 
+/// The reason an errand's turn is refused a tool that would act.
+///
+/// Its own constant beside `UNTRUSTED_CONTEXT_DENY_REASON` and not a reuse of it, because the two
+/// say different things to the model and only one of them is true here. "You have read third-party
+/// content" is a statement about this turn that a clean first message would find simply false, and
+/// a model told something false about itself will try to work around it. This one is a standing
+/// rule it cannot satisfy by behaving differently, which is what stops it trying.
+pub const ERRAND_MAY_NOT_ACT: &str =
+    "an errand does not act on its own; this was written down for a person to decide on";
+
 /// The orchestrator turn's decision, and the only barrier standing between a mail body and the
 /// daemon's controls.
 ///
@@ -579,6 +615,7 @@ async fn rooted_decision(
         &payload.tool_name,
         &payload.tool_input,
         Some(Path::new(root)),
+        &state.github.policy,
     );
     if classification.decision.decision == "deny" {
         return Json(Decision {
@@ -659,7 +696,14 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
     // The `get_run`-names-a-triage-run rule lives in `mcp_tools::effect_of_call` rather than here,
     // because a second dispatcher needed the same answer and got a different one from the bare
     // table. One implementation is the only way two callers cannot disagree.
-    let effect = crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input).await;
+    //
+    // The errand is passed rather than read out of `tool_input`, so a call cannot say whose folder
+    // it is asking about; `errand_of_run` answers `None` for every run that has none and for every
+    // resolution that fails, which `effect_of_call` reads as "cannot say" and classifies as a
+    // stranger's words.
+    let errand = errand_of_run(&state.pool, payload.run_id).await;
+    let effect =
+        crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input, errand).await;
 
     match effect {
         crate::mcp_tools::ToolEffect::ReadsUntrusted => {
@@ -687,6 +731,27 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             })
         }
         crate::mcp_tools::ToolEffect::Acts => {
+            // An errand never acts on its own, and this is asked BEFORE the barrier because it is a
+            // different rule: the barrier is about what the turn has READ, and this is about whose
+            // work it is. An errand is a Telegram topic. Its first message is a turn that has read
+            // nothing, so the barrier would allow it — and the acting tools are the daemon's
+            // controls and, one day, an email nobody can unsend.
+            //
+            // What this buys is that the errand's box is safe to widen. Until now the box was safe
+            // because it happened to contain nothing that acts, and that property leaves the moment
+            // somebody adds a tool. This one does not.
+            if errand.is_some() {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool,
+                    "pretooluse-decision: an errand may not act without a person"
+                );
+                record_refused_action(state, payload, tool, errand).await;
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: ERRAND_MAY_NOT_ACT.to_owned(),
+                });
+            }
             match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
                 Ok(false) => Json(Decision {
                     decision: "allow".to_owned(),
@@ -702,6 +767,11 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                         tool,
                         "pretooluse-decision: refused an action in a turn that has read third-party content"
                     );
+                    // The errand this arm already resolved, rather than a second walk: the two
+                    // could disagree only by being asked at different moments, and a record naming
+                    // a different errand than the one the barrier judged is worse than an unnamed
+                    // one.
+                    record_refused_action(state, payload, tool, errand).await;
                     Json(Decision {
                         decision: "deny".to_owned(),
                         reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
@@ -722,11 +792,98 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                 }
             }
         }
-        crate::mcp_tools::ToolEffect::ReadsOwn => Json(Decision {
-            decision: "allow".to_owned(),
-            reason: "orchestrator NucleOS tool".to_owned(),
-        }),
+        // `WritesOwn` sits with `ReadsOwn` and not with `Acts`, which is the entire reason the
+        // variant exists. An errand reads the web first and writes down what it found afterwards, so
+        // its every turn is already past the barrier by the time it records anything; refusing the
+        // write here would mean an errand that never records anything at all. It reaches no network,
+        // starts no work and lifts no approval, and the file it writes is marked with what the
+        // writing turn had read — so the words do not launder by passing through the disk.
+        crate::mcp_tools::ToolEffect::ReadsOwn | crate::mcp_tools::ToolEffect::WritesOwn => {
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "orchestrator NucleOS tool".to_owned(),
+            })
+        }
     }
+}
+
+/// Writes down an action the barrier just refused, so somebody finds out it was wanted.
+///
+/// **Best-effort, and deliberately after the decision is already made.** Every failure here is
+/// swallowed: the refusal is the security property and this is the courtesy beside it, so a full
+/// disk or a lost race must never be able to turn a `deny` into anything else. The one failure that
+/// is expected rather than exceptional is the unique violation — a run that reaches a second time
+/// already has its row — and it is not worth a warning, which is why the log line says how many
+/// rather than complaining.
+///
+/// The reasoning is the same sentence the model was given, because the person reading this in the
+/// morning is answering a different question from the model's: not "may I", but "should I do this
+/// myself". The tool input travels with it for the same reason — an errand asking to email a dealer
+/// is a decision nobody can take from the tool name alone.
+async fn record_refused_action(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    tool: &str,
+    errand: Option<i64>,
+) {
+    let session_id =
+        sqlx::query_scalar::<_, Option<String>>("SELECT session_id FROM runs WHERE id = ?")
+            .bind(payload.run_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+
+    match crate::proposals::create_refused_action(
+        &state.pool,
+        payload.run_id,
+        session_id.as_deref(),
+        errand,
+        tool,
+        UNTRUSTED_CONTEXT_DENY_REASON,
+        Some(&payload.tool_input.to_string()),
+    )
+    .await
+    {
+        Ok(proposal_id) => tracing::info!(
+            run_id = payload.run_id,
+            proposal_id,
+            tool,
+            "pretooluse-decision: the refused action was written down for a person to read"
+        ),
+        Err(error) => tracing::debug!(
+            run_id = payload.run_id,
+            tool,
+            %error,
+            "pretooluse-decision: this run already has a refused action on record, or it could not be written"
+        ),
+    }
+}
+
+/// The errand behind the run making this call, or `None`.
+///
+/// A run records the chat it answers in `chat_id`, and an errand's `chat_key` IS that same string —
+/// `errands::resolve` is keyed by it. Nothing guesses an errand from the shape of a chat key; the
+/// row is the answer, and its absence is the common one, because almost no run is an errand's.
+///
+/// Every failure — a run with no chat, a chat with no errand, a database that will not answer —
+/// answers `None`, which `effect_of_call` treats as "cannot say" and classifies as a stranger's
+/// words. That is the fail-closed direction: the alternative would let an unresolvable errand make
+/// an unrecorded file read as the owner's own notes.
+async fn errand_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Option<i64> {
+    let chat_id = sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()?;
+    crate::errands::resolve(pool, &chat_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|errand| errand.id)
 }
 
 /// What a council seat may call: the named list, and nothing else.
@@ -784,6 +941,42 @@ async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json
     Json(Decision {
         decision: "deny".to_owned(),
         reason: "a council seat may only read NucleOS state".to_owned(),
+    })
+}
+
+/// PURE: what a team agent may call, by name alone.
+///
+/// Narrower than the council's sibling and simpler for it: `TEAM_TOOLS` carries no `Acts`, so there
+/// is no ordering rule to apply, and there is no `get_run` on the list to ask a second question
+/// about. What a specialist may read of its own run's folder is decided by the key it holds, in
+/// `team::post_read_file`, and not here — so this branch has nothing stateful left to get wrong.
+///
+/// Whole segment and not a prefix, for the reason `assistant_decision` records: an MCP server named
+/// `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test and is not this server.
+fn team_decision(payload: &PreToolUsePayload) -> Json<Decision> {
+    let permitted = payload
+        .tool_name
+        .strip_prefix("mcp__nucleos__")
+        .filter(|tool| !tool.contains("__"))
+        .is_some_and(|tool| crate::mcp_tools::TEAM_TOOLS.contains(&tool));
+
+    if permitted {
+        return Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "team agents may read".to_owned(),
+        });
+    }
+
+    // Debug and not warn, for the reason the council's branch gives: a specialist reaching for
+    // `create_run` is a model being a model, not a symptom of anything.
+    tracing::debug!(
+        run_id = payload.run_id,
+        tool = %payload.tool_name,
+        "pretooluse-decision: refused a tool a team agent may not call"
+    );
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: "a team agent may only read".to_owned(),
     })
 }
 
@@ -1185,17 +1378,17 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
     // to that footing would discard the checkpoint of the job's final item — the very work the
     // review was there to read. A node that changes nothing by design has nothing to put back.
     if had_an_item {
-        let footing = crate::job::footing_for_run(&state.pool, job_id, run_id).await;
-        match (
-            crate::job::job_worktree_path(&state.pool, job_id).await,
-            footing,
-        ) {
-            (Some(worktree), Some(sha)) => {
+        // One call and not two. The tree and the sha are a pair — reverting a checkout to a footing
+        // taken from a different one is worse than reverting nothing — and asking for them together
+        // is what keeps them from being resolved off different keys, which is how a node working in
+        // its item's own tree came to have the job's reverted instead.
+        match crate::job::revert_target(&state.pool, job_id, run_id).await {
+            Some((worktree, sha)) => {
                 if let Err(error) = crate::worktree::revert_to(&worktree, &sha).await {
                     tracing::warn!(run_id, job_id, %error, "pretooluse-decision: could not revert a skipped item");
                 }
             }
-            _ => tracing::warn!(
+            None => tracing::warn!(
                 run_id,
                 job_id,
                 "pretooluse-decision: no worktree or no footing to revert a skipped item to"
@@ -1268,8 +1461,11 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -1792,7 +1988,8 @@ mod tests {
     #[tokio::test]
     async fn pends_unrecognized_command() {
         let tool_input = serde_json::json!({"command": "frobnicate --hard"});
-        let classification = classifier::classify("Bash", &tool_input, None);
+        let classification =
+            classifier::classify("Bash", &tool_input, None, &crate::github::Policy::empty());
         assert_eq!(classification.action_class, "unrecognized");
 
         let app = test_router(test_state().await);
@@ -2583,9 +2780,13 @@ mod tests {
     /// An in-flight turn of a conversation ROOTED in `root` — one continuing a session had in the
     /// IDE. Returns the run id.
     async fn rooted_turn_run(state: &AppState, root: &str) -> i64 {
-        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, Some(root))
-            .await
-            .unwrap();
+        let chat_id = crate::chats::create(
+            &state.pool,
+            crate::chats::Brain::Cloud,
+            Some(&crate::sessions::had_in(root, "had-in-the-ide")),
+        )
+        .await
+        .unwrap();
         let run_id = in_flight_run(state, "assistant", None, None, None).await;
         sqlx::query("UPDATE runs SET chat_id = ? WHERE id = ?")
             .bind(&chat_id)
@@ -2783,6 +2984,416 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Every acting tool this server has, refused to a department one by one — bar the one it holds
+    /// on purpose.
+    ///
+    /// Enumerated from `TOOL_EFFECTS` rather than listed, so a tool classified `Acts` in future is
+    /// covered the day it is added instead of the day somebody remembers this test. The second
+    /// layer only — `auth::TEAM_ROUTES` refuses these without anybody's cooperation, and this hook
+    /// may never fire at all, since a team run launches with no working directory to resolve a
+    /// `.claude/settings.json` from.
+    #[tokio::test]
+    async fn a_team_agent_is_refused_every_acting_tool() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        let mut acting = 0;
+        for tool in crate::mcp_tools::every_tool_name() {
+            if crate::mcp_tools::tool_effect(&tool) != crate::mcp_tools::ToolEffect::Acts {
+                continue;
+            }
+            // The single exception, named rather than filtered by a predicate so a second one has
+            // to be typed out by whoever adds it. Calling `propose_action` performs nothing — it
+            // records a request the core carries out later if a human agrees — and its `Acts`
+            // grading exists so the taint rule closes it once the turn has read a stranger's words.
+            if tool == "propose_action" || tool == "propose_teammate" {
+                continue;
+            }
+            acting += 1;
+            let decision = orchestrator_tool(&app, run_id, &tool, serde_json::json!({})).await;
+            assert_eq!(decision.decision, "deny", "a department reached {tool}");
+        }
+        assert!(acting >= 7, "only {acting} acting tools were exercised");
+
+        // And the reads it exists to do are allowed, so the loop above is refusing the actions
+        // rather than the whole server.
+        for tool in crate::mcp_tools::TEAM_TOOLS {
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            assert_eq!(
+                decision.decision, "allow",
+                "a department was refused {tool}"
+            );
+        }
+    }
+
+    /// The refusals that are not about `Acts` at all: a tool of another server whose name passes a
+    /// prefix test, and a NucleOS tool a department is simply not offered.
+    #[tokio::test]
+    async fn a_team_agent_is_refused_a_lookalike_server_and_an_unoffered_read() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+
+        for tool_name in [
+            // `nucleos__x` is a different server, and `mcp__nucleos__x__list_files` is what it
+            // produces — which passes a prefix test and must not pass this one.
+            "mcp__nucleos__x__list_files",
+            "mcp__other__list_files",
+            "Bash",
+            "Write",
+            // Classified `ReadsOwn`, on no `Acts` list, and still not a department's business.
+            "mcp__nucleos__list_projects",
+            "mcp__nucleos__get_budget",
+        ] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": tool_name,
+                    "tool_input": {}
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(
+                decision.decision, "deny",
+                "a department reached {tool_name}"
+            );
+        }
+    }
+
+    /// An assistant run answering an errand's topic: the errand row, and a run whose `chat_id` is
+    /// the key that row is registered under.
+    ///
+    /// Nothing on the run says "errand" — the join is the chat key and only the chat key, which is
+    /// the walk `errand_of_run` has to make on every single tool call an errand's turn produces.
+    ///
+    /// Returns `(errand_id, run_id)`.
+    async fn errand_bound_run(state: &AppState, chat_key: &str) -> (i64, i64) {
+        let errand_id = crate::errands::create(&state.pool, "carros", chat_key)
+            .await
+            .unwrap();
+        let run_id = in_flight_run(state, "assistant", None, None, None).await;
+        sqlx::query("UPDATE runs SET chat_id = ? WHERE id = ?")
+            .bind(chat_key)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        (errand_id, run_id)
+    }
+
+    /// `WritesOwn` on the far side of the barrier, which is the whole reason the variant exists.
+    ///
+    /// The order here is the order every errand actually runs in: read its own notes, read the open
+    /// web, write down what it found. The web read drops the barrier — `create_run` at the end
+    /// proves the barrier is genuinely down and not merely untested — and the write still has to go
+    /// through, because an errand that researches and can never record is not an errand.
+    ///
+    /// If `errand_files_write` were ever moved to `Acts`, or the `WritesOwn` arm folded into the
+    /// `Acts` arm, this test is what says so: the third assertion flips and nothing else does.
+    #[tokio::test]
+    async fn an_errand_still_writes_its_own_notes_after_reading_the_web() {
+        let state = test_state().await;
+        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:7").await;
+        let app = test_router(state.clone());
+
+        // A file this errand recorded, written by a turn that had read nothing third-party: the one
+        // shape `errand_file_read_effect` lets back as own.
+        crate::errands::record_artifact(&state.pool, errand_id, "notas.md", false, None)
+            .await
+            .unwrap();
+        let own = orchestrator_tool(
+            &app,
+            run_id,
+            "errand_files_read",
+            serde_json::json!({"path": "notas.md"}),
+        )
+        .await;
+        assert_eq!(own.decision, "allow");
+        assert!(
+            !crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "reading back a file this errand itself wrote clean is not reading a stranger"
+        );
+
+        let web = orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        assert_eq!(
+            web.decision, "allow",
+            "reading the web is what an errand is for"
+        );
+        assert!(
+            crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "the turn now has a stranger's words in it and must be on record as having them"
+        );
+
+        let write = orchestrator_tool(
+            &app,
+            run_id,
+            "errand_files_write",
+            serde_json::json!({"path": "notas.md", "content": "1998 Golf, 3200 EUR"}),
+        )
+        .await;
+        assert_eq!(
+            write.decision, "allow",
+            "an errand that cannot record what it found is not an errand"
+        );
+
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+        assert_eq!(
+            act.decision, "deny",
+            "the allow above must be WritesOwn passing the barrier, not a barrier that never closed"
+        );
+    }
+
+    /// A run with no chat has no errand, and `errand_of_run` says so rather than guessing.
+    ///
+    /// The path asked for is a real one, recorded clean under a real errand — so if this walk ever
+    /// answered `Some` for a run that names no chat, the read would come back `ReadsOwn` and the
+    /// turn would stay unmarked. That is the laundering direction: one errand's marks vouching for
+    /// a turn that was never that errand's. `None` is read as "cannot say", and cannot-say is a
+    /// stranger.
+    #[tokio::test]
+    async fn a_run_with_no_chat_borrows_no_errands_marks() {
+        let state = test_state().await;
+        let errand_id = crate::errands::create(&state.pool, "carros", "-1002003004:7")
+            .await
+            .unwrap();
+        crate::errands::record_artifact(&state.pool, errand_id, "notas.md", false, None)
+            .await
+            .unwrap();
+
+        // Same mode, same tool, same path as the test above — the only difference is the missing
+        // `chat_id`, so that is the only thing the different outcome can be attributed to.
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state.clone());
+
+        let read = orchestrator_tool(
+            &app,
+            run_id,
+            "errand_files_read",
+            serde_json::json!({"path": "notas.md"}),
+        )
+        .await;
+        assert_eq!(read.decision, "allow", "the read itself is not the refusal");
+        assert!(
+            crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "a file classified against an errand this run does not belong to must count as a stranger's words"
+        );
+    }
+
+    /// The barrier gets a door, and the door is a person.
+    ///
+    /// §6 refuses an action once a turn has read a stranger's words, and for an errand that is
+    /// every turn that did any research — which is all of them. Until now the refusal was the end
+    /// of the line: the model was stopped and the owner never learned what it had wanted to do. So
+    /// the errand that spends an afternoon finding the right car cannot tell anyone it found it.
+    ///
+    /// The refusal does not move. What changes is that it is written down where somebody can read
+    /// it, decide, and act — or ask the errand again in a fresh turn, which starts clean and may
+    /// act. That is the whole of piece 5: the refusal keeps a record instead of a silence.
+    #[tokio::test]
+    async fn an_action_refused_after_the_web_is_written_down_for_a_person() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:8").await;
+        let app = test_router(state.clone());
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "deny", "the barrier does not bend");
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(refused.len(), 1, "and the person gets to know about it");
+        assert_eq!(refused[0].tool_name.as_deref(), Some("create_run"));
+        assert!(
+            refused[0]
+                .tool_input
+                .as_deref()
+                .unwrap()
+                .contains("encomendar o Golf"),
+            "with enough of it to decide on: {:?}",
+            refused[0].tool_input
+        );
+    }
+
+    /// A record that does not say which errand it came from is a record nobody can decide on.
+    ///
+    /// "Approve: send_email" tells a person the verb and nothing else. Approving it anyway is what
+    /// turns an approval step into a formality, which is the worst thing an approval step can be —
+    /// it costs the interruption and buys none of the safety. The errand is the missing half: what
+    /// this is about, and therefore whether the answer is yes.
+    ///
+    /// The name and not only the id, because an id is a thing to go and look up, and a step that
+    /// requires a lookup before it can be answered is a step that gets answered without one.
+    #[tokio::test]
+    async fn a_refused_action_says_which_errand_wanted_it() {
+        let state = test_state().await;
+        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:11").await;
+        let app = test_router(state.clone());
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
+        )
+        .await;
+
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(refused[0].errand_id, Some(errand_id));
+        assert_eq!(refused[0].errand_name.as_deref(), Some("carros"));
+    }
+
+    /// The guard. If this fails, piece 5 has put a human step in front of everything that worked
+    /// before it — which is the failure mode of every approval mechanism ever added to anything.
+    ///
+    /// On a run that is NOT an errand's, which is the population this protects. An ordinary
+    /// orchestrator turn asked to start a run starts it, exactly as before errands existed.
+    #[tokio::test]
+    async fn an_action_in_an_ordinary_clean_turn_still_goes_straight_through() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state.clone());
+
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "allow");
+        assert!(
+            crate::proposals::list_refused_actions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing was refused, so there is nothing to ask anybody about"
+        );
+    }
+
+    /// An errand never acts on its own, whatever is in its box and whatever it has read.
+    ///
+    /// Until now the refusal came from the injection barrier, which is a rule about ORDER: read a
+    /// stranger's words and the acting tools shut. That made the errand's box safe by coincidence —
+    /// nothing in it acts, so the barrier never had to bite — and it left one gap that the day
+    /// somebody widens the box walks straight into: a turn that has read nothing yet is clean, and
+    /// a clean turn acts unconditionally. The first message in a topic is exactly that turn.
+    ///
+    /// So the rule here is about WHOSE work it is rather than what it has read. An errand is a
+    /// Telegram topic; the acting tools are the daemon's controls and, one day, an email nobody can
+    /// unsend. A person is between them, always, and the record from piece 5 is how they hear about
+    /// it. That is what makes the box safe to widen — the safety stops depending on the box being
+    /// empty of actions.
+    #[tokio::test]
+    async fn an_errand_cannot_act_even_in_a_turn_that_has_read_nothing() {
+        let state = test_state().await;
+        let (errand_id, run_id) = errand_bound_run(&state, "-1002003004:12").await;
+        let app = test_router(state.clone());
+
+        assert!(
+            !crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "this turn has read nothing, which is the whole point of the test"
+        );
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "deny");
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(refused.len(), 1, "and the person hears about it");
+        assert_eq!(refused[0].errand_id, Some(errand_id));
+    }
+
+    /// A turn that keeps reaching leaves ONE record, not one per attempt.
+    ///
+    /// The same shape the git queue already uses for the same problem: a model told no will often
+    /// try again, and a person who opens their phone to eleven copies of one question stops reading
+    /// the list — which costs more than the feature was worth. Enforced by a partial unique index
+    /// rather than a check-then-insert, so two attempts racing cannot both find nothing there.
+    #[tokio::test]
+    async fn a_turn_that_keeps_reaching_leaves_one_record_not_many() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:10").await;
+        let app = test_router(state.clone());
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        for prompt in ["primeira", "segunda", "terceira"] {
+            let act = orchestrator_tool(
+                &app,
+                run_id,
+                "create_run",
+                serde_json::json!({"project_id": "proj", "prompt": prompt}),
+            )
+            .await;
+            assert_eq!(act.decision, "deny", "every one of them is still refused");
+        }
+
+        assert_eq!(
+            crate::proposals::list_refused_actions(&state.pool)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -3501,10 +4112,55 @@ mod tests {
         }
     }
 
+    /// The worst spelling of the verb this queue most exists for, and it used to pass.
+    ///
+    /// "Declined by the queue" and "fine to run by hand" were read as one sentence. That reading is
+    /// right for `--squash`, which is a different operation touching only the caller's index, and
+    /// wrong for `--force`, which is the same operation in a worse spelling. Measured against the
+    /// live gate before the fix: all three of these came back `allow`.
+    ///
+    /// Refused, and NOTHING queued — the queue cannot perform these spellings either, so there is
+    /// nothing to admit. The refusal names the spelling it does know.
+    #[tokio::test]
+    async fn a_spelling_that_still_writes_what_others_share_is_refused_without_queueing() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-shared").await;
+
+        for command in [
+            "git push --force origin master",
+            "git push",
+            "git pull origin master",
+            "git branch -D stale",
+            "cd somewhere && git push --force origin master",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+        }
+
+        // And a MENTION is not a command. This refused its own commit message once: segments split
+        // on newlines, so a line of prose naming the spelling looked exactly like one being run.
+        for narrated in [
+            "git commit -m \"git push --force was allowed\"",
+            "echo remember to git push later",
+            "grep -rn \"git pull\" docs",
+        ] {
+            let decision = session_decision(&state, narrated, repo.path()).await;
+            assert_eq!(
+                decision.decision, "allow",
+                "a mention is not a command: {narrated} -> {}",
+                decision.reason
+            );
+        }
+        assert!(
+            queued_rows(&state).await.is_empty(),
+            "a refusal is not an admission: there is nothing the queue could perform here"
+        );
+    }
+
     /// The difference between a gate and a wall. The classifier sends everything not provably
     /// read-only for approval; refusing on THAT would stop a session at its second command. And a
-    /// spelling the queue declines has to keep working directly, or it becomes impossible rather
-    /// than governed — `--squash` does not merge, and no queue row would ever perform it.
+    /// spelling that touches only the caller's own index has to keep working directly, or it becomes
+    /// impossible rather than governed — `--squash` does not merge, it stages.
     #[tokio::test]
     async fn what_the_queue_will_not_perform_is_left_alone_rather_than_made_impossible() {
         let state = test_state().await;
@@ -3514,7 +4170,7 @@ mod tests {
             "cargo test",
             "git status",
             "git merge --squash feature",
-            "git branch -D stale",
+            "git merge --abort",
             "git log --oneline",
         ] {
             let decision = session_decision(&state, command, repo.path()).await;

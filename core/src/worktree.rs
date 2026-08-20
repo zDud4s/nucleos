@@ -71,6 +71,14 @@ pub(crate) fn git() -> tokio::process::Command {
 pub enum Owner {
     Run(i64),
     Job(i64),
+    /// One item of a job, working in a tree of its own rather than in the job's.
+    ///
+    /// Keyed on `job_items.id` and never on the run — `spawn_node` rewrites `job_items.run_id` on
+    /// every start, so a tree named after a run is renamed by the first retry and the retry then
+    /// cannot find the tree it was meant to continue in. The item's id is written once and is the
+    /// same name for the life of the item, which is what lets a retry, a resolution and a resume
+    /// all arrive back at the same checkout.
+    Item(i64),
 }
 
 impl Owner {
@@ -78,12 +86,13 @@ impl Owner {
         match self {
             Owner::Run(_) => "run",
             Owner::Job(_) => "job",
+            Owner::Item(_) => "item",
         }
     }
 
     pub fn id(self) -> i64 {
         match self {
-            Owner::Run(id) | Owner::Job(id) => id,
+            Owner::Run(id) | Owner::Job(id) | Owner::Item(id) => id,
         }
     }
 
@@ -103,12 +112,59 @@ impl Owner {
     pub fn feed_run_id(self) -> Option<i64> {
         match self {
             Owner::Run(id) => Some(id),
-            Owner::Job(_) => None,
+            Owner::Job(_) | Owner::Item(_) => None,
         }
+    }
+
+    /// The branch `create` opens for this owner's worktree.
+    pub fn branch_name(self) -> String {
+        format!("{BRANCH_PREFIX}{}", self.dir_name())
     }
 }
 
+/// The prefix every worktree branch this daemon creates carries. One constant because two callers
+/// read the name apart: `create_at` writes it, and `run_behind_branch` takes it back off.
+const BRANCH_PREFIX: &str = "nucleos/";
+
+/// The run a worktree branch was opened for, if this daemon opened it.
+///
+/// **The branch name outlives the row that records who owns the tree, and that is why this exists
+/// rather than a join.** A run that pauses for approval and resumes hands its worktree to a NEW run
+/// id, and the `worktrees` row is rewritten to the successor — so anything that identified the tree
+/// by its current owner loses the link to the run that created it. The branch is opened once, is
+/// never renamed, and names that run for as long as the branch is around. Measured the hard way: a
+/// conflict resolution whose inspection command was held for approval landed unmarked, so nothing
+/// verified it before it was published.
+///
+/// A name an agent could write by hand is accepted, and the direction that fails in is the safe one:
+/// claiming to be a resolution buys stricter checking, never less.
+pub fn run_behind_branch(branch: &str) -> Option<i64> {
+    branch
+        .strip_prefix(BRANCH_PREFIX)?
+        .strip_prefix("run-")?
+        .parse()
+        .ok()
+}
+
 pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInfo> {
+    create_at(project_root, owner, None).await
+}
+
+/// `create`, on a named starting point instead of wherever the project's checkout happens to stand.
+///
+/// **One caller needs this and the reason is not convenience.** A conflict resolver's tree has to be
+/// born on the merge's TARGET, and two things follow from that which follow from nothing else: the
+/// conflict staged in it is exactly the one the queue met — a tree born on some other commit would
+/// present a different conflict, or none — and the branch the resolver produces has the target's tip
+/// as an ancestor, so landing it does not reopen the question it was made to settle.
+///
+/// `None` keeps git's own default, which is the project checkout's HEAD, and that is what every
+/// other run wants: work starts from where the project is.
+pub async fn create_at(
+    project_root: &Path,
+    owner: Owner,
+    base: Option<&str>,
+) -> io::Result<WorktreeInfo> {
     let root = worktree_root(project_root);
     if root.to_string_lossy().contains(' ') {
         return Err(io::Error::new(
@@ -132,20 +188,25 @@ pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInf
     }
 
     let name = owner.dir_name();
-    let branch = format!("nucleos/{name}");
+    let branch = owner.branch_name();
     let path = root.join(&name);
     tokio::fs::create_dir_all(&root).await?;
 
-    let output = git()
+    let mut command = git();
+    command
         .arg("-C")
         .arg(project_root)
         .arg("worktree")
         .arg("add")
         .arg("-b")
         .arg(&branch)
-        .arg(&path)
-        .output()
-        .await?;
+        .arg(&path);
+    // Last, because that is where `worktree add` takes its commit-ish, and only when one was asked
+    // for — an empty argument here is not "the default", it is a ref that does not resolve.
+    if let Some(base) = base {
+        command.arg(base);
+    }
+    let output = command.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
@@ -168,6 +229,62 @@ pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInf
         branch,
         base_sha,
     })
+}
+
+/// Leaves `source` merged half-way into this worktree: markers in the files, MERGE_HEAD set.
+///
+/// **This is the inversion the resolver design turns on: the daemon stages the conflict, the agent
+/// only resolves it.** The obvious shape — hand the agent the two branches and let it merge — cannot
+/// work here, because any `git merge` an agent runs goes to the queue, and the queue is what just
+/// refused that merge for conflicting. It would circle, and no wording in a prompt gets it out,
+/// because the refusal is structural and correct. With the merge already staged, the agent does only
+/// what any agent does: edits files and commits. No exception to the gate, and therefore no exception
+/// for anybody to abuse.
+///
+/// It also buys the resolution's two-parent tip for free — a plain `git commit` on top of a staged
+/// merge carries both parents, so the resolver cannot flatten the merge by accident, and
+/// `git_exec::verify_resolution` refuses the deliberate ones.
+///
+/// **A clean merge is an error here, not a success.** It means the conflict was gone by the time the
+/// resolver looked — other work landed in between — and there is nothing for an agent to resolve.
+/// Launching one anyway would spend a session to produce a merge the queue can compute by itself.
+///
+/// Conflicted is told apart from broken by `ls-files --unmerged` rather than by the exit code, which
+/// is 1 for both. A merge refused before it started — an unknown ref, a dirty tree — leaves no
+/// unmerged paths, and staging nothing while reporting a staged conflict would put an agent in a
+/// worktree with no work in it and no way to tell.
+pub async fn stage_conflict(worktree: &Path, source: &str) -> io::Result<()> {
+    let merged = git()
+        .arg("-C")
+        .arg(worktree)
+        .arg("merge")
+        // Never an editor: this runs with no terminal, and on the clean-merge path git would
+        // otherwise wait for one that is never coming.
+        .arg("--no-edit")
+        .arg(source)
+        .output()
+        .await?;
+    if merged.status.success() {
+        return Err(io::Error::other(format!(
+            "{source} merged cleanly, so there is no conflict left to resolve — \
+             the repository moved between the escalation and now"
+        )));
+    }
+
+    let unmerged = git()
+        .arg("-C")
+        .arg(worktree)
+        .arg("ls-files")
+        .arg("--unmerged")
+        .output()
+        .await?;
+    if !unmerged.status.success() || unmerged.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&merged.stderr);
+        return Err(io::Error::other(format!(
+            "merging {source} left no conflicted paths to resolve: {stderr}"
+        )));
+    }
+    Ok(())
 }
 
 /// Where a job's nodes hand work to each other, relative to the worktree they share.
@@ -864,6 +981,7 @@ impl WorktreeRow {
         match self.owner_kind.as_str() {
             "run" => Some(Owner::Run(self.owner_id)),
             "job" => Some(Owner::Job(self.owner_id)),
+            "item" => Some(Owner::Item(self.owner_id)),
             _ => None,
         }
     }
@@ -1080,6 +1198,16 @@ pub(crate) const GC_CANDIDATES_SQL: &str =
            AND j.status IN ('completed','failed','gate_failed','gate_errored','expired','stopped',
                             'cancelled','interrupted')
            AND COALESCE(j.completed_at, w.created_at) <= ?
+         UNION ALL
+         SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
+         FROM worktrees w
+         JOIN job_items i ON i.id = w.owner_id
+         JOIN jobs j ON j.id = i.job_id
+         WHERE w.owner_kind = 'item'
+           AND w.removed_at IS NULL
+           AND j.status IN ('completed','failed','gate_failed','gate_errored','expired','stopped',
+                            'cancelled','interrupted')
+           AND COALESCE(j.completed_at, w.created_at) <= ?
          ORDER BY 1, 2";
 
 pub async fn gc_candidates(
@@ -1089,6 +1217,7 @@ pub async fn gc_candidates(
 ) -> sqlx::Result<Vec<WorktreeRow>> {
     let cutoff = (now - retention).to_rfc3339();
     sqlx::query_as(GC_CANDIDATES_SQL)
+        .bind(&cutoff)
         .bind(&cutoff)
         .bind(&cutoff)
         .fetch_all(pool)
@@ -1234,6 +1363,11 @@ fn owner_from_dir_name(name: &str) -> Option<Owner> {
     }
     if let Some(rest) = name.strip_prefix("job-") {
         return rest.parse::<i64>().ok().map(Owner::Job);
+    }
+    // Without this arm an item's checkout — the biggest directory this daemon creates, since it
+    // carries a `target/` of its own — is invisible to the orphan sweep for ever.
+    if let Some(rest) = name.strip_prefix("item-") {
+        return rest.parse::<i64>().ok().map(Owner::Item);
     }
     None
 }
@@ -1430,6 +1564,71 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
+
+    /// Every owner kind, for the tests that have to say something about all of them.
+    const EVERY_OWNER: [Owner; 3] = [Owner::Run(7), Owner::Job(7), Owner::Item(7)];
+
+    /// The names on disk, spelled out rather than derived.
+    ///
+    /// Derived, this test would pass on any renaming scheme including one that broke every checkout
+    /// already on disk. `run-`/`job-` are byte-identical to what they always were — a directory
+    /// that stopped being recognisable would be uncollectable for ever — and `item-7` is the new
+    /// one. The same id in all three is on purpose: the three sequences are independent, so a
+    /// scheme that dropped the kind would collide silently.
+    #[test]
+    fn each_owner_kind_names_its_own_directory_and_branch() {
+        assert_eq!(Owner::Run(7).dir_name(), "run-7");
+        assert_eq!(Owner::Job(7).dir_name(), "job-7");
+        assert_eq!(Owner::Item(7).dir_name(), "item-7");
+        assert_eq!(Owner::Item(7).branch_name(), "nucleos/item-7");
+    }
+
+    /// The round trip through the directory name, for every kind.
+    ///
+    /// `owner_from_dir_name` is what the orphan sweep sees a directory WITH: a kind missing from it
+    /// is a checkout the sweep walks past for ever, and an item's checkout is the largest thing
+    /// this daemon creates because it carries a `target/` of its own.
+    #[test]
+    fn every_owner_survives_the_round_trip_through_its_directory_name() {
+        for owner in EVERY_OWNER {
+            assert_eq!(
+                owner_from_dir_name(&owner.dir_name()),
+                Some(owner),
+                "{owner:?} does not come back from its own directory name"
+            );
+        }
+        assert_eq!(owner_from_dir_name("something-else"), None);
+    }
+
+    /// And the round trip through the two stored columns, which is the other direction the same
+    /// fact travels — a row the database accepts but `WorktreeRow::owner` answers `None` for is a
+    /// checkout nothing will ever touch again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_owner_survives_the_round_trip_through_its_row() {
+        let pool = test_pool().await;
+        for owner in EVERY_OWNER {
+            record(
+                &pool,
+                owner,
+                "proj",
+                "/repo",
+                &format!("/trees/{}", owner.dir_name()),
+                &owner.branch_name(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows: Vec<WorktreeRow> = sqlx::query_as("SELECT * FROM worktrees")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+        let mut found: Vec<Owner> = rows.iter().filter_map(|row| row.owner()).collect();
+        found.sort_by_key(|owner| owner.kind());
+        assert_eq!(found, vec![Owner::Item(7), Owner::Job(7), Owner::Run(7)]);
+    }
 
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -3751,6 +3950,173 @@ mod tests {
         assert_eq!(
             registration(repo.path(), &info.path).await.unwrap(),
             Registration::Absent
+        );
+    }
+
+    /// A repository standing on `master`, where `feat/x` has changed the same line. Merging either
+    /// way conflicts.
+    fn repo_with_a_conflict() -> tempfile::TempDir {
+        let repo = init_space_free_repo();
+        let path = repo.path();
+        assert!(git_ok(
+            path,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        std::fs::write(path.join("seed.txt"), "theirs\n").expect("write their side");
+        assert!(git_ok(
+            path,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-am"),
+                OsStr::new("theirs")
+            ]
+        ));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(path.join("seed.txt"), "ours\n").expect("write our side");
+        assert!(git_ok(
+            path,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("ours")]
+        ));
+        repo
+    }
+
+    /// The base is the whole reason `create_at` exists: a resolution's tree has to be born on the
+    /// branch the merge was going INTO, and the project is by definition standing somewhere else —
+    /// it is standing on whatever the person using it is working on.
+    #[tokio::test]
+    async fn a_worktree_can_be_born_on_a_branch_the_project_is_not_standing_on() {
+        let _lock = env_lock();
+        let repo = repo_with_a_conflict();
+        let roots = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(roots.path()));
+
+        let info = create_at(repo.path(), Owner::Run(41), Some("feat/x"))
+            .await
+            .expect("create the worktree on a named base");
+
+        assert_eq!(
+            git_stdout(&info.path, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]),
+            git_stdout(
+                repo.path(),
+                &[OsStr::new("rev-parse"), OsStr::new("feat/x")]
+            ),
+            "the tree has to be born where it was told, not where the project happens to stand"
+        );
+    }
+
+    /// **The claim `git_exec::verify_resolution` is built on**: a resolver that does nothing but edit
+    /// the conflicted files and commit produces a two-parent merge commit, with no step of its own to
+    /// earn it. That is what makes "one parent means the merge was thrown away" a safe thing to
+    /// refuse on — if the resolver had to do something special for the second parent, refusing would
+    /// punish forgetting rather than catch discarding.
+    #[tokio::test]
+    async fn a_staged_conflict_commits_with_both_parents_and_the_resolver_does_nothing_to_earn_it()
+    {
+        let _lock = env_lock();
+        let repo = repo_with_a_conflict();
+        let roots = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(roots.path()));
+
+        let info = create_at(repo.path(), Owner::Run(42), Some("master"))
+            .await
+            .expect("create the worktree on the target");
+        stage_conflict(&info.path, "feat/x")
+            .await
+            .expect("a conflicting merge is what this stages");
+
+        let conflicted = std::fs::read_to_string(info.path.join("seed.txt")).expect("read");
+        assert!(
+            conflicted.contains("<<<<<<<") && conflicted.contains(">>>>>>>"),
+            "both sides have to be in front of whoever resolves them: {conflicted}"
+        );
+        assert_eq!(
+            git_stdout(
+                &info.path,
+                &[OsStr::new("rev-parse"), OsStr::new("MERGE_HEAD")]
+            ),
+            git_stdout(
+                repo.path(),
+                &[OsStr::new("rev-parse"), OsStr::new("feat/x")]
+            ),
+            "the half-finished merge has to name the branch that was being brought in"
+        );
+
+        // Exactly what a resolver does and nothing more: edit the file, add, commit.
+        std::fs::write(info.path.join("seed.txt"), "ours and theirs\n").expect("resolve");
+        assert!(git_ok(&info.path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &info.path,
+            &[OsStr::new("commit"), OsStr::new("--no-edit")]
+        ));
+
+        let parents = git_stdout(
+            &info.path,
+            &[
+                OsStr::new("rev-list"),
+                OsStr::new("--parents"),
+                OsStr::new("-1"),
+                OsStr::new("HEAD"),
+            ],
+        );
+        assert_eq!(
+            parents.split_whitespace().count(),
+            3,
+            "the commit itself plus two parents: {parents}"
+        );
+    }
+
+    /// A conflict that has evaporated is not work, and an agent started against one would be asked to
+    /// resolve an empty worktree. The queue can compute this merge by itself; whoever wants it
+    /// published asks again.
+    #[tokio::test]
+    async fn a_merge_that_comes_out_clean_is_refused_rather_than_handed_to_an_agent() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let path = repo.path();
+        assert!(git_ok(
+            path,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/elsewhere")
+            ]
+        ));
+        std::fs::write(path.join("theirs.txt"), "theirs\n").expect("write their file");
+        assert!(git_ok(path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("theirs")]
+        ));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(path.join("ours.txt"), "ours\n").expect("write our file");
+        assert!(git_ok(path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            path,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("ours")]
+        ));
+
+        let roots = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(roots.path()));
+        let info = create_at(path, Owner::Run(43), Some("master"))
+            .await
+            .expect("create the worktree on the target");
+
+        let refused = stage_conflict(&info.path, "feat/elsewhere")
+            .await
+            .expect_err("a clean merge is not a conflict to resolve");
+        assert!(
+            refused.to_string().contains("merged cleanly"),
+            "the refusal has to say the conflict was gone, not that staging broke: {refused}"
         );
     }
 }

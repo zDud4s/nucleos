@@ -1,0 +1,36 @@
+# Findings gitleaks reports that are not secrets. Every one was read before it was listed here.
+#
+# All six are FIXTURES: values that exist so a test can prove `redact_secrets` removes them. Listing
+# them is not silencing the scanner. It is the only way `scripts/gates.sh security` can ever be
+# green, and a gate nobody can make green is a gate nobody runs -- which is how the six sat unread
+# from 2026-08-08 until somebody finally ran the leg.
+#
+# A fingerprint is `commit:file:rule:line`, pinned to the commit that INTRODUCED the line. That is
+# the safety property and not an accident: edit one of these fixtures in a future commit and
+# gitleaks reports a NEW fingerprint and goes red again, wanting a fresh pair of eyes. This file
+# forgives the past. It cannot forgive the future.
+#
+# To re-read them:
+#   gitleaks detect --redact --no-banner --report-format json --report-path leaks.json
+
+# The literal `Sec-WebSocket-Key` from RFC 6455, section 1.3 -- base64 of the words "the sample
+# nonce". It is printed in the specification and in every handshake example ever written, and it
+# authenticates nothing: the header is a framing check against caching proxies, not a credential.
+d235a7b427a48c5dccb25978d97f7deb2c0719e1:sidecars/browser/fence/proxy_test.go:generic-api-key:120
+
+# Three PEM blocks whose body is one letter repeated -- `MIIEowIBAAKCAQEAaaaaaaaa...`. No modulus,
+# no key material, nothing that decrypts anything. Each is the INPUT to a test asserting the block
+# comes back redacted, and the last two exist because of bugs found in the real redactor: an
+# encrypted key's RFC 1421 headers used to end the body early, leaving the whole key in the text
+# under a marker saying it had been removed; and a footerless key used to borrow the footer of an
+# unrelated block further down, swallowing a message between them.
+a7cc876c57b786db9ddc7c0cd6582a596ccee025:core/src/mcp_tools.rs:private-key:627
+a7cc876c57b786db9ddc7c0cd6582a596ccee025:core/src/redact.rs:private-key:884
+a7cc876c57b786db9ddc7c0cd6582a596ccee025:core/src/redact.rs:private-key:909
+
+# The canonical jwt.io example token (`sub: 1234567890`), with its signature truncated on top of
+# that. Twice, because two different tests need it: one that a JWT ending a sentence is still
+# redacted (a full stop is not part of a token, and the detector used to be defeated by one), and
+# one that three dotted words -- `read.the.manual` -- are NOT a token.
+c9fb1541066017314be860777604b2b4f40c4051:core/src/redact.rs:jwt:648
+8e18efcb9cb302274a4f38703ef64513ed097b63:core/src/redact.rs:jwt:482

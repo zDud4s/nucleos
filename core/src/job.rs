@@ -154,7 +154,56 @@ pub enum ItemState {
     /// proposal carries what would be needed to pick it up. `next_step` walks past it the way it
     /// walks past `Passed`, because the queue owes it nothing more.
     Skipped,
+    /// The item's own branch is being merged into the job's branch.
+    ///
+    /// Arrives from `Implemented`; leaves for `Passed` (merged and gated green), `Conflicted`
+    /// (git refused) or `Reverted` (merged and gated red). Not terminal, and nothing writes it
+    /// yet — the merge step that does is a later slice of this design, and the state exists ahead
+    /// of it so that `item_state_from` cannot read the row it will write as "still to do".
+    Merging,
+    /// The merge stopped on a conflict, and the conflict is staged in the item's own tree.
+    ///
+    /// Leaves for `Running` — the resolution node, in that same tree — and from there back to
+    /// `Merging`. The item is put down rather than failed: a conflict is a question about two
+    /// pieces of work, not a verdict on either.
+    Conflicted,
+    /// The merge landed, the gate went red, and the job's branch has been reset back to where it
+    /// stood before the merge.
+    ///
+    /// Leaves for `GateRetriable` if the item still has an attempt to spend, `GateFailed` if it
+    /// does not. Apart from `GateFailed` because the branch state differs and a reader needs to
+    /// know it: the rejected work is off the job's branch and still on the item's.
+    Reverted,
+    /// Never attempted, because something it depended on ended badly.
+    ///
+    /// **Terminal**, and the only new terminal here. Distinct from `Skipped`, which is work a
+    /// person was asked to decide about; nobody is being asked anything about an orphan, and the
+    /// thing that broke is already in the queue saying so.
+    Orphaned,
 }
+
+/// Every variant of [`ItemState`], for the tests that have to say something about all of them.
+///
+/// A hand-kept list, held to the enum by `every_item_state_covers_the_enum`. The alternative is a
+/// derive macro for the sake of one array, and the alternative to both — tests that enumerate the
+/// states inline — is what lets a new variant be born untested everywhere at once.
+#[cfg(test)]
+const EVERY_ITEM_STATE: [ItemState; 14] = [
+    ItemState::Pending,
+    ItemState::Running,
+    ItemState::Implemented,
+    ItemState::Passed,
+    ItemState::Failed,
+    ItemState::Cancelled,
+    ItemState::GateFailed,
+    ItemState::GateRetriable,
+    ItemState::GateErrored,
+    ItemState::Skipped,
+    ItemState::Merging,
+    ItemState::Conflicted,
+    ItemState::Reverted,
+    ItemState::Orphaned,
+];
 
 /// Whether the job still owes a review node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +343,16 @@ pub struct JobView {
     pub items: Vec<ItemState>,
     pub review: ReviewState,
     pub rounds: RoundState,
+    /// Whether a team directs this job — `jobs.team_id` being set, and nothing more.
+    ///
+    /// A boolean and not the id: this struct is what the decision below needs to see and nothing
+    /// else, and no decision below is about WHICH team.
+    ///
+    /// What it buys is one thing, and it is the whole of this slice: a job whose items work in
+    /// trees of their own can lose an item without losing the queue. Without a team the items
+    /// share one tree, so an item that broke leaves edits nothing measured where the next item
+    /// would build on them — which is why `false` still stops the job at the first failure.
+    pub has_team: bool,
 }
 
 /// Decides a job's next move from what is observable about it.
@@ -317,11 +376,24 @@ pub fn next_step(job: &JobView) -> Next {
     // non-zero exit is a verdict about the code; a gate that would not run is silence. Continuing
     // past a verdict is a judgement call this change makes; continuing past silence would be
     // building on work nothing has measured, which is what the gate exists to prevent.
+    // The guards are what makes a team job different, and they are guards rather than a separate
+    // block so that a job WITHOUT one keeps this loop exactly as it was — same arms, same order,
+    // so the same item decides when more than one of them is unhappy.
+    //
+    // What earns them is not the wish for parallelism: it is that a team's items each work in a
+    // tree of their own. The reason a lone failure stops the sequential job — the shared tree now
+    // holds edits nothing has measured, and the next item would build on them — is a statement
+    // about ONE tree, and it stops being true when the broken item's edits are on a branch that
+    // was never merged. `ending()` still reports the job `failed`; only the moment of the report
+    // moves, from the first bad item to the end of the queue.
+    //
+    // `Cancelled` keeps no guard, in either kind of job. It is not a claim about trees — it is a
+    // person having stopped this, and carrying on would be answering them.
     for item in &job.items {
         match item {
-            ItemState::Failed => return Next::Finish(Outcome::Failed),
+            ItemState::Failed if !job.has_team => return Next::Finish(Outcome::Failed),
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
-            ItemState::GateErrored => return Next::Finish(Outcome::GateErrored),
+            ItemState::GateErrored if !job.has_team => return Next::Finish(Outcome::GateErrored),
             _ => {}
         }
     }
@@ -339,7 +411,18 @@ pub fn next_step(job: &JobView) -> Next {
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
-    if job.items.contains(&ItemState::Running) {
+    // `Merging`, `Conflicted` and `Reverted` wait alongside `Running`, and none of them is
+    // reachable yet — nothing writes those rows until the merge step of a later slice. They are
+    // here because the alternative is worse than being early: a non-terminal state this search
+    // walked past would be read as finished by every check after it, which is the one direction
+    // `item_state_from` already refuses to err in. A later slice gives `Conflicted` a step of its
+    // own and takes it back out of this list.
+    if job.items.iter().any(|item| {
+        matches!(
+            item,
+            ItemState::Running | ItemState::Merging | ItemState::Conflicted | ItemState::Reverted
+        )
+    }) {
         return Next::Wait;
     }
     // Gate before starting the next item: on a shared worktree, letting item i+1 build on unmeasured
@@ -393,11 +476,15 @@ fn close_the_round(job: &JobView) -> Next {
     if job.rounds.max_rounds <= 1 {
         return Next::Finish(ending(job));
     }
-    // A red gate ends the job whatever the rounds say. The branch carries work the gate rejected,
-    // and another round would build on top of it — which is the one thing the per-item revert exists
-    // to stop happening WITHIN a round, and it does not stop being true across them.
-    if job.items.contains(&ItemState::GateFailed) {
-        return Next::Finish(Outcome::GateFailed);
+    // An unhappy ending ends the job whatever the rounds say. The branch carries work the gate
+    // rejected, and another round would build on top of it — which is the one thing the per-item
+    // revert exists to stop happening WITHIN a round, and it does not stop being true across them.
+    //
+    // Asked of `failed_ending` rather than spelled out, because this used to name `GateFailed` and
+    // nothing else and was right only because the short-circuit at the top of `next_step` reached
+    // `Failed` and `GateErrored` first. A team job has no such short-circuit.
+    if let Some(outcome) = failed_ending(job) {
+        return Next::Finish(outcome);
     }
 
     // (1) The replan declared itself done. The cheapest ending there is, and the most trustworthy:
@@ -423,19 +510,57 @@ fn close_the_round(job: &JobView) -> Next {
 
 /// PURE: how a job that ran its whole queue ended.
 ///
-/// One red gate anywhere makes the job `gate_failed`, however many items passed after it. The
-/// verdict is about the branch that is handed back, and a branch carrying an item the gate rejected
-/// is not one somebody should be told is complete.
+/// One bad item anywhere decides it, however many passed after it — which one, and why that one,
+/// is [`failed_ending`]. The verdict is about the branch that is handed back, and a branch carrying
+/// an item the gate rejected is not one somebody should be told is complete.
 ///
 /// Skipped items deliberately do NOT show up here. They are work that was never attempted, recorded
 /// as proposals for a person to decide on; a job that ran everything it was allowed to run did what
 /// was asked of it, and reporting that as a failure would teach the reader to ignore the word.
+/// `Orphaned` is the state that looks like `Skipped` and is not: nobody is being asked anything
+/// about an orphan, and something did break upstream of it.
 fn ending(job: &JobView) -> Outcome {
-    if job.items.contains(&ItemState::GateFailed) {
-        Outcome::GateFailed
-    } else {
-        Outcome::Completed
+    failed_ending(job).unwrap_or(Outcome::Completed)
+}
+
+/// PURE: the unhappy ending this queue carries, or `None` if it carries none.
+///
+/// **The one place the precedence between them is written**, which is the whole reason it exists.
+/// `ending` and `close_the_round` both knew `GateFailed` and nothing else, and they agreed with
+/// each other and with `next_step` only because the short-circuit at the top of `next_step` got to
+/// `Failed` and `GateErrored` before either of them was ever called. A team job removes that net —
+/// all three arrive at the end of the queue together — and two copies of one rule agree until the
+/// day somebody edits one of them.
+///
+/// The order, worst first:
+///
+/// 1. `GateErrored`. Silence beats a verdict. A gate that would not start measured NOTHING, so
+///    every other reading in this queue is in doubt, and it is a fact about the machine rather
+///    than about the code — which makes it the one to act on first.
+/// 2. `Failed`. The work broke.
+/// 3. `GateFailed`. The gate looked and said no.
+/// 4. `Orphaned`, and it never decides. An orphan exists only beside a dependency that ended
+///    badly, and a chain of orphans has a real failure at its root, so one of the three above is
+///    always present with it. The arm is here to make the table total: if it ever does decide,
+///    that invariant has broken, and `failed` is the honest reading of a job that did not do what
+///    it was asked with nobody having stopped it.
+///
+/// `Cancelled` is deliberately absent. It stops the job at the short-circuit, team or no team, and
+/// never reaches here.
+fn failed_ending(job: &JobView) -> Option<Outcome> {
+    if job.items.contains(&ItemState::GateErrored) {
+        return Some(Outcome::GateErrored);
     }
+    if job.items.contains(&ItemState::Failed) {
+        return Some(Outcome::Failed);
+    }
+    if job.items.contains(&ItemState::GateFailed) {
+        return Some(Outcome::GateFailed);
+    }
+    if job.items.contains(&ItemState::Orphaned) {
+        return Some(Outcome::Failed);
+    }
+    None
 }
 
 impl Outcome {
@@ -476,6 +601,13 @@ fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemS
         "gate_failed" => ItemState::GateFailed,
         "gate_errored" => ItemState::GateErrored,
         STATUS_SKIPPED => ItemState::Skipped,
+        // The four states of parallel items. Nothing writes these rows yet, and they are read
+        // ahead of the writer on purpose: the `_ =>` below would take any of them for `pending`
+        // and hand the item back to the queue as work nobody had started.
+        "merging" => ItemState::Merging,
+        "conflicted" => ItemState::Conflicted,
+        "reverted" => ItemState::Reverted,
+        "orphaned" => ItemState::Orphaned,
         // An unrecognised item status is treated as still to do rather than as done. Erring toward
         // "not finished" costs a repeated item; erring the other way silently skips work the job
         // was created to perform and reports it complete.
@@ -504,6 +636,13 @@ impl ItemState {
         match self {
             ItemState::Pending => Some("pending"),
             ItemState::GateRetriable => Some("gate_failed"),
+            // The resolution node's claim. Its caller arrives with the merge step, in a later
+            // slice; the arm is written here because this function is one half of a pair kept
+            // against the other half, and deferring it is the same edit with a chance of being
+            // forgotten in between.
+            ItemState::Conflicted => Some("conflicted"),
+            // `Merging` and `Reverted` are steps the driver takes, not nodes anybody spawns, and
+            // `Orphaned` is terminal.
             ItemState::Running
             | ItemState::Implemented
             | ItemState::Passed
@@ -511,7 +650,10 @@ impl ItemState {
             | ItemState::Cancelled
             | ItemState::GateFailed
             | ItemState::GateErrored
-            | ItemState::Skipped => None,
+            | ItemState::Skipped
+            | ItemState::Merging
+            | ItemState::Reverted
+            | ItemState::Orphaned => None,
         }
     }
 }
@@ -553,11 +695,18 @@ pub const STATUS_AWAITING_APPROVAL: &str = "awaiting_approval";
 
 /// Assembles what `next_step` needs from the two tables.
 pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> {
-    let (status, resume_status, review_wanted, gate_retries): (String, Option<String>, i64, i64) =
-        sqlx::query_as("SELECT status, resume_status, review, gate_retries FROM jobs WHERE id = ?")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await?;
+    let (status, resume_status, review_wanted, gate_retries, team_id): (
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status, resume_status, review, gate_retries, team_id FROM jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
     let stage = effective_status(&status, resume_status.as_deref());
 
     let (round, dry_rounds, max_rounds, replan_done, opened_by): (
@@ -685,6 +834,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
                 Replan::NotYet
             },
         },
+        has_team: team_id.is_some(),
     })
 }
 
@@ -1191,6 +1341,31 @@ pub const LIVE_STATUSES: [&str; 6] = [
     "reviewing",
     "awaiting_approval",
     "waiting",
+];
+
+/// The `job_items.status` values that mean an item may still run, and therefore that anything it
+/// holds — a worktree, a concurrency slot — has to be left alone.
+///
+/// The sweep in `concurrency.rs` reads these words out of a SQL literal — sqlx refuses SQL built at
+/// run time — so this is the list that literal is held against, by
+/// `every_unfinished_state_is_a_status_the_sweep_spares` here and
+/// `every_live_status_is_a_status_the_sweep_spares` there. Test-only for that reason: it is the
+/// second copy that makes the first one checkable, the same shape `EVERY_ITEM_STATE` has.
+///
+/// `gate_failed` is in the list although it is sometimes over, and that asymmetry is deliberate. It
+/// means `GateRetriable` or `GateFailed` depending on `gate_attempts` weighed against the job's
+/// budget — arithmetic [`item_state_from`] owns — and restating it in SQL would be the same rule in
+/// a second dialect. Sparing it costs a slot held until the job ends; getting it wrong the other way
+/// deletes a tree out from under work that was going to continue in it.
+#[cfg(test)]
+pub const LIVE_ITEM_STATUSES: [&str; 7] = [
+    "pending",
+    "running",
+    "implemented",
+    "merging",
+    "conflicted",
+    "reverted",
+    "gate_failed",
 ];
 
 /// A job's own row, as the executor needs it.
@@ -1997,6 +2172,24 @@ async fn spawn_node(
         prompt.push_str(&block);
     }
 
+    // What earlier work on this project learned, appended at the same seam and for the same reason:
+    // this is the one place every node kind passes through, and a lesson that only reached implement
+    // nodes would be a lesson the planner keeps rediscovering. After the notes deliberately — a note
+    // is what the owner is saying NOW about this job, and it should be the last thing read.
+    //
+    // Best-effort, like the notes above: a layer that cannot be read is a reason to say so, never a
+    // reason to refuse to start the node.
+    let learned = match crate::refine::active_for(pool, Some(job.project_id.as_str())).await {
+        Ok(learned) => learned,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read the refinement layer");
+            Vec::new()
+        }
+    };
+    if let Some(block) = crate::refine::render(&learned) {
+        prompt.push_str(&block);
+    }
+
     let created = crate::runs::create_job_node_run(
         state,
         prompt,
@@ -2232,7 +2425,7 @@ async fn footing_for(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<
 /// `hooks.rs` knows a `run_id` and nothing else — it is answering a tool call, not walking a queue —
 /// so it cannot supply the ordinal [`footing_for`] wants. This resolves it, and deliberately reuses
 /// the same query rather than growing a second answer to "what does this item fall back to".
-pub async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Option<String> {
+async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Option<String> {
     let ordinal: i64 =
         sqlx::query_scalar("SELECT ordinal FROM job_items WHERE job_id = ? AND run_id = ?")
             .bind(job_id)
@@ -2247,12 +2440,63 @@ pub async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Opt
 }
 
 /// The job's worktree path, for callers outside this module that hold no `JobRow`.
-pub async fn job_worktree_path(pool: &SqlitePool, job_id: i64) -> Option<PathBuf> {
+async fn job_worktree_path(pool: &SqlitePool, job_id: i64) -> Option<PathBuf> {
     job_worktree(pool, job_id)
         .await
         .ok()
         .flatten()
         .map(|(path, _)| path)
+}
+
+/// Where a node's half-written edits are, and what to put that tree back to.
+///
+/// **One question and one answer, because the two halves have to agree.** They used to be asked
+/// separately — `job_worktree_path` for the tree, `footing_for_run` for the sha — and separately is
+/// how they came to disagree: the first always answered with the JOB's checkout, and a node working
+/// in a tree of its own would have had that tree reverted to a checkpoint it never wrote, while its
+/// own edits stayed exactly where they were. Reverting the wrong tree is worse than reverting none.
+///
+/// For a node with an item of its own the answer is that item's checkout and the commit it was born
+/// on — `worktrees.base_sha`, which migration 0062 defines as *"where the worktree branched from"*,
+/// and where an item that never got started belongs. `None` if that base was never recorded, and
+/// **deliberately not a fallback to the job's tree**: a missing base is a tree this cannot put
+/// right, which the caller reports and leaves alone.
+pub async fn revert_target(
+    pool: &SqlitePool,
+    job_id: i64,
+    run_id: i64,
+) -> Option<(PathBuf, String)> {
+    // `Option<i64>` is named as the scalar type rather than left to inference, and it is not
+    // style. Inferred as `i64`, a NULL `item_id` does not come back as `None` — it comes back as a
+    // run that claims to be working on item 0, and this then answers `None` because no worktree
+    // belongs to that item. Every node that exists before this column did has a NULL here, so the
+    // wrong spelling turns "revert the item's tree" into "revert nothing" for all of them.
+    let item_id: Option<i64> =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT item_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+
+    if let Some(item_id) = item_id {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT path, base_sha FROM worktrees
+             WHERE owner_kind = 'item' AND owner_id = ? AND removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        let (path, base_sha) = row?;
+        return Some((PathBuf::from(path), base_sha?));
+    }
+
+    let path = job_worktree_path(pool, job_id).await?;
+    let sha = footing_for_run(pool, job_id, run_id).await?;
+    Some((path, sha))
 }
 
 /// How much of a red gate's output is kept for the node that has to answer it.
@@ -3389,8 +3633,11 @@ mod tests {
             run_messages: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            files_root: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
             web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
             calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
@@ -3488,6 +3735,7 @@ mod tests {
             items: items.to_vec(),
             review,
             rounds: RoundState::default(),
+            has_team: false,
         }
     }
 
@@ -3499,6 +3747,20 @@ mod tests {
             items: items.to_vec(),
             review,
             rounds,
+            has_team: false,
+        }
+    }
+
+    /// A job a team directs.
+    ///
+    /// Separate from `view` rather than a fourth parameter on it, and that is deliberate: every
+    /// test written before this slice describes the job of today, and it should keep saying so
+    /// without an edit. The pair of helpers is what makes "did this change the job of today?" a
+    /// question the diff answers.
+    fn view_with_team(items: &[ItemState], review: ReviewState) -> JobView {
+        JobView {
+            has_team: true,
+            ..view(true, items, review)
         }
     }
 
@@ -3681,6 +3943,144 @@ mod tests {
         );
     }
 
+    /// The precedence between unhappy endings, as a table — because it is a decision, and not a
+    /// side effect of the order somebody happened to write the `if`s in.
+    #[test]
+    fn the_precedence_between_unhappy_endings() {
+        use ItemState::*;
+        for (items, expected) in [
+            (vec![Passed, Passed], None),
+            (vec![Passed, GateFailed], Some(Outcome::GateFailed)),
+            (vec![Failed, Passed], Some(Outcome::Failed)),
+            (vec![GateErrored, Passed], Some(Outcome::GateErrored)),
+            // Silence beats a verdict, both ways round: a gate that would not start measured
+            // nothing, so every other reading in this queue is in doubt.
+            (vec![GateFailed, GateErrored], Some(Outcome::GateErrored)),
+            (vec![Failed, GateErrored], Some(Outcome::GateErrored)),
+            (vec![Failed, GateFailed], Some(Outcome::Failed)),
+            // An orphan alone is impossible — it comes from a dependency that ended badly, and a
+            // chain of orphans has a real failure at its root. The arm exists so the table is
+            // total; if it ever decides, that invariant broke.
+            (vec![Orphaned], Some(Outcome::Failed)),
+            (vec![Orphaned, GateFailed], Some(Outcome::GateFailed)),
+        ] {
+            assert_eq!(
+                failed_ending(&view_with_team(&items, ReviewState::NotWanted)),
+                expected,
+                "{items:?}"
+            );
+        }
+    }
+
+    /// **The regression that matters most in this slice: a job without a team is the job of
+    /// today.**
+    ///
+    /// One row per item state, frozen. If one of these values changes, the change is a change of
+    /// behaviour for every job that exists, and it has to be somebody's decision rather than a
+    /// side effect of an edit to `failed_ending` or to the short-circuit above it.
+    #[test]
+    fn without_a_team_every_state_decides_exactly_as_it_did() {
+        use ItemState::*;
+        for (state, expected) in [
+            (Pending, Next::SpawnImplement { ordinal: 0 }),
+            (Running, Next::Wait),
+            (Implemented, Next::RunGate { ordinal: 0 }),
+            (Passed, Next::SpawnReview),
+            (Failed, Next::Finish(Outcome::Failed)),
+            (Cancelled, Next::Finish(Outcome::Cancelled)),
+            (GateFailed, Next::SpawnReview),
+            (GateRetriable, Next::SpawnImplement { ordinal: 0 }),
+            (GateErrored, Next::Finish(Outcome::GateErrored)),
+            (Skipped, Next::SpawnReview),
+        ] {
+            assert_eq!(
+                next_step(&view(true, &[state], ReviewState::Pending)),
+                expected,
+                "{state:?} without a team"
+            );
+        }
+    }
+
+    /// With a team, a broken item is an item and not the end of the queue — and a cancelled one
+    /// still is the end.
+    ///
+    /// The asymmetry is the point. `Failed` and `GateErrored` stopped the job because the shared
+    /// tree held unmeasured edits the next item would have built on; a team's items each have a
+    /// tree, so that reason is gone. `Cancelled` was never about trees.
+    #[test]
+    fn with_a_team_a_broken_item_does_not_stop_the_queue_but_a_cancelled_one_does() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view_with_team(&[Failed, Pending], ReviewState::NotWanted)),
+            Next::SpawnImplement { ordinal: 1 }
+        );
+        assert_eq!(
+            next_step(&view_with_team(
+                &[GateErrored, Pending],
+                ReviewState::NotWanted
+            )),
+            Next::SpawnImplement { ordinal: 1 }
+        );
+        assert_eq!(
+            next_step(&view_with_team(
+                &[Cancelled, Pending],
+                ReviewState::NotWanted
+            )),
+            Next::Finish(Outcome::Cancelled)
+        );
+    }
+
+    /// And what carrying on must not cost: the job still ends badly.
+    ///
+    /// Without this, "a broken item does not stop the queue" quietly becomes "a broken item is not
+    /// reported", which is the one way this slice could be worse than not doing it at all. Both
+    /// doors are checked, because there are two — `ending` for a job of one round, and
+    /// `close_the_round` for a job that had rounds left and must not open another over a failure.
+    #[test]
+    fn with_a_team_the_broken_item_still_decides_the_ending() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view_with_team(&[Failed, Passed], ReviewState::NotWanted)),
+            Next::Finish(Outcome::Failed),
+            "through ending()"
+        );
+
+        let with_rounds = JobView {
+            has_team: true,
+            ..view_in_round(
+                &[Failed, Passed],
+                ReviewState::NotWanted,
+                RoundState {
+                    max_rounds: 5,
+                    ..RoundState::default()
+                },
+            )
+        };
+        assert_eq!(
+            next_step(&with_rounds),
+            Next::Finish(Outcome::Failed),
+            "and through close_the_round(), which must not open another round over it"
+        );
+    }
+
+    /// The three non-terminal newcomers are waited for, not walked past.
+    ///
+    /// None of them is reachable in this slice — nothing writes those rows yet — and that is
+    /// exactly why the assertion is worth having: it is the behaviour the merge step will inherit,
+    /// written while it is still cheap to write. Walking past a non-terminal state is how an item
+    /// gets reported finished with its work still in flight.
+    #[test]
+    fn an_item_mid_merge_is_work_in_flight() {
+        use ItemState::*;
+        for state in [Merging, Conflicted, Reverted] {
+            assert_eq!(
+                next_step(&view_with_team(&[state, Pending], ReviewState::NotWanted)),
+                Next::Wait,
+                "{state:?} must not let the queue move on"
+            );
+        }
+    }
+
     /// A red gate that still has a retry left has not finished with its item.
     ///
     /// The three numbers are read together or not at all. `gate_attempts` counts how many times this
@@ -3714,6 +4114,144 @@ mod tests {
     #[test]
     fn zero_retries_is_todays_behaviour() {
         assert_eq!(item_state_from("gate_failed", 1, 0), ItemState::GateFailed);
+    }
+
+    /// `EVERY_ITEM_STATE` covers the enum.
+    ///
+    /// Two halves, and both are needed. The exhaustive `match` makes the compiler speak when a
+    /// variant is born; the length makes the LIST speak when somebody adds the variant and leaves
+    /// the array alone — without which every test that walks the array quietly tests less than it
+    /// says it does.
+    #[test]
+    fn every_item_state_covers_the_enum() {
+        for state in EVERY_ITEM_STATE {
+            let _: () = match state {
+                ItemState::Pending
+                | ItemState::Running
+                | ItemState::Implemented
+                | ItemState::Passed
+                | ItemState::Failed
+                | ItemState::Cancelled
+                | ItemState::GateFailed
+                | ItemState::GateRetriable
+                | ItemState::GateErrored
+                | ItemState::Skipped
+                | ItemState::Merging
+                | ItemState::Conflicted
+                | ItemState::Reverted
+                | ItemState::Orphaned => (),
+            };
+        }
+    }
+
+    /// `LIVE_ITEM_STATUSES` is exactly the set of stored statuses that mean an item may still run.
+    ///
+    /// The slot sweep reads that list, so a state missing from it is a checkout and a slot freed out
+    /// from under work still in flight, and a state wrongly in it is a slot held for ever. The
+    /// classification below is an exhaustive `match`, which is what forces a new variant to be
+    /// judged rather than defaulted.
+    ///
+    /// `gate_failed` is stored by two states — `GateRetriable`, which may still run, and
+    /// `GateFailed`, which is over — so it belongs in the list on the strength of the first. That is
+    /// the one place the list is deliberately generous, and the doc on the constant says why.
+    #[test]
+    fn every_unfinished_state_is_a_status_the_sweep_spares() {
+        fn may_still_run(state: ItemState) -> bool {
+            match state {
+                ItemState::Pending
+                | ItemState::Running
+                | ItemState::Implemented
+                | ItemState::GateRetriable
+                | ItemState::Merging
+                | ItemState::Conflicted
+                | ItemState::Reverted => true,
+                ItemState::Passed
+                | ItemState::Failed
+                | ItemState::Cancelled
+                | ItemState::GateFailed
+                | ItemState::GateErrored
+                | ItemState::Skipped
+                | ItemState::Orphaned => false,
+            }
+        }
+
+        // Read `(0, 1)` — an unspent retry — so that `gate_failed` shows up as the state that may
+        // still run, which is why it is on the list.
+        let mut spared: Vec<&str> = LIVE_ITEM_STATUSES
+            .into_iter()
+            .filter(|status| may_still_run(item_state_from(status, 0, 1)))
+            .collect();
+        spared.sort_unstable();
+        let mut listed: Vec<&str> = LIVE_ITEM_STATUSES.into_iter().collect();
+        listed.sort_unstable();
+        assert_eq!(
+            spared, listed,
+            "the sweep spares a status that means the item is over"
+        );
+
+        // And nothing that may still run is left off it. Both halves are needed: the check above
+        // catches a status that should not be spared, this one catches a state nothing spares.
+        for state in EVERY_ITEM_STATE {
+            if !may_still_run(state) {
+                continue;
+            }
+            let stored = match state {
+                ItemState::Pending => "pending",
+                ItemState::Running => "running",
+                ItemState::Implemented => "implemented",
+                ItemState::GateRetriable => "gate_failed",
+                ItemState::Merging => "merging",
+                ItemState::Conflicted => "conflicted",
+                ItemState::Reverted => "reverted",
+                other => unreachable!("{other:?} does not still run"),
+            };
+            assert!(
+                LIVE_ITEM_STATUSES.contains(&stored),
+                "{state:?} is stored as `{stored}`, which the sweep would collect"
+            );
+        }
+    }
+
+    /// The round trip between `claimable_as` and `item_state_from`, over every state that names a
+    /// status at all.
+    ///
+    /// This is the pair `claimable_as` documents itself as being kept against, made into something
+    /// that fails. `(0, 1)` — no attempt spent, one retry allowed — is the reading under which
+    /// `gate_failed` means `GateRetriable`, which is the state that actually names that string.
+    #[test]
+    fn every_claimable_state_reads_back_as_itself() {
+        for state in EVERY_ITEM_STATE {
+            let Some(status) = state.claimable_as() else {
+                continue;
+            };
+            assert_eq!(
+                item_state_from(status, 0, 1),
+                state,
+                "{state:?} claims itself as `{status}`, which reads back as something else"
+            );
+        }
+    }
+
+    /// The other half, and the expensive one: a state whose stored status nobody taught
+    /// `item_state_from` falls into the `_ =>` and is handed back to the queue as `Pending`.
+    ///
+    /// The item then restarts, in a tree that already holds its work, with nothing anywhere saying
+    /// why. That is the failure this repository chose when it made the fallback "not finished", and
+    /// it is only the right choice while the list of statuses is complete.
+    #[test]
+    fn no_parallel_state_is_read_as_pending() {
+        for (status, expected) in [
+            ("merging", ItemState::Merging),
+            ("conflicted", ItemState::Conflicted),
+            ("reverted", ItemState::Reverted),
+            ("orphaned", ItemState::Orphaned),
+        ] {
+            assert_eq!(
+                item_state_from(status, 0, 0),
+                expected,
+                "`{status}` fell through to the `_ =>` arm"
+            );
+        }
     }
 
     /// A retriable item is work to do, and the work is the SAME item.
@@ -4089,6 +4627,113 @@ mod tests {
         }
     }
 
+    /// Undoing a skipped node happens in the tree that node wrote in, and nowhere else.
+    ///
+    /// Three cases, and the third is the one worth the test. A node with an item of its own is put
+    /// back to where ITS tree began; a node without one keeps the answer it always had; and a node
+    /// whose item tree has no recorded base gets `None` — **never** the job's tree as a fallback.
+    /// That last arm is the whole reason these two questions were joined into one: reverting a
+    /// checkout to a footing taken from a different checkout is worse than reverting nothing, and
+    /// it is exactly what two separately-resolved answers produced.
+    #[tokio::test]
+    async fn a_skipped_node_is_undone_in_the_tree_it_wrote_in() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["running", "running"]).await;
+        let items: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        // The job's own tree and a checkpoint to fall back to, which is what a node without an item
+        // of its own is answered with.
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Job(job_id),
+            "project-a",
+            "/repo",
+            "/trees/job",
+            "nucleos/job",
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET head_sha = 'head0' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Item 0 has a tree with a base; item 1 has a tree that was never measured.
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Item(items[0]),
+            "project-a",
+            "/repo",
+            "/trees/item-a",
+            "nucleos/item-a",
+            Some("base0"),
+        )
+        .await
+        .unwrap();
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Item(items[1]),
+            "project-a",
+            "/repo",
+            "/trees/item-b",
+            "nucleos/item-b",
+            None,
+        )
+        .await
+        .unwrap();
+
+        async fn run(pool: &sqlx::SqlitePool, job_id: i64, item: Option<i64>) -> i64 {
+            sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, item_id)
+                 VALUES ('project-a', 'x', 'running', 'worktree', '2026-01-01T00:00:00Z', ?, ?)",
+            )
+            .bind(job_id)
+            .bind(item)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+        }
+
+        let with_base = run(&pool, job_id, Some(items[0])).await;
+        assert_eq!(
+            revert_target(&pool, job_id, with_base).await,
+            Some((PathBuf::from("/trees/item-a"), "base0".to_owned())),
+            "an item is put back to where its own tree began"
+        );
+
+        // Today's link between a node and its item is `job_items.run_id`, and it is what
+        // `footing_for_run` walks. The run below carries no `item_id` precisely because that is
+        // every node that exists before this slice.
+        let no_item = run(&pool, job_id, None).await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE id = ?")
+            .bind(no_item)
+            .bind(items[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            revert_target(&pool, job_id, no_item).await,
+            Some((PathBuf::from("/trees/job"), "head0".to_owned())),
+            "a node without an item keeps the answer it always had"
+        );
+
+        let unmeasured = run(&pool, job_id, Some(items[1])).await;
+        assert_eq!(
+            revert_target(&pool, job_id, unmeasured).await,
+            None,
+            "an unmeasured item tree answers nothing — reverting the job's would be worse"
+        );
+    }
+
     #[tokio::test]
     async fn a_job_still_planning_has_no_queue_yet() {
         let pool = test_pool().await;
@@ -4111,6 +4756,97 @@ mod tests {
 
         assert!(view.planned);
         assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+    }
+
+    /// The column reaches `next_step`, or everything decided about teams is a decision no real job
+    /// ever takes.
+    ///
+    /// The seeding is not ceremony: `storage.rs` runs with `foreign_keys` on, so a job cannot name
+    /// a team out of thin air, and a team cannot name a director out of thin air either. The
+    /// `UPDATE` is how a job acquires one for now — the director that writes it at creation is a
+    /// later slice, and this slice deliberately leaves every production path writing NULL.
+    #[tokio::test]
+    async fn a_job_carries_whether_a_team_directs_it() {
+        let pool = test_pool().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES ('crew', 'Crew', 'ship it', 'dir', 3, 2, ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let alone = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let directed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(directed)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(!load_view(&pool, alone).await.unwrap().has_team);
+        assert!(load_view(&pool, directed).await.unwrap().has_team);
+    }
+
+    /// And the two halves joined: a directed job with a failed item keeps going, an undirected one
+    /// with the same queue stops. Same rows, same loader, one column apart.
+    #[tokio::test]
+    async fn the_team_column_is_what_decides_whether_a_failure_ends_the_queue() {
+        let pool = test_pool().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES ('crew', 'Crew', 'ship it', 'dir', 3, 2, ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let alone = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, alone, &["failed", "pending"]).await;
+        let directed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        seed_items(&pool, directed, &["failed", "pending"]).await;
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(directed)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            next_step(&load_view(&pool, alone).await.unwrap()),
+            Next::Finish(Outcome::Failed)
+        );
+        assert_eq!(
+            next_step(&load_view(&pool, directed).await.unwrap()),
+            Next::SpawnImplement { ordinal: 1 }
+        );
     }
 
     #[tokio::test]

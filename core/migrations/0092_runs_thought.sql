@@ -1,0 +1,19 @@
+-- What a turn thought before it answered.
+--
+-- The editor shows reasoning; this window dropped it. `live_from_stream` kept `text` blocks and
+-- nothing else, so a turn whose thinking WAS the work arrived as its conclusion alone -- and a
+-- conclusion with nothing visible behind it is the one thing a reader cannot check.
+--
+-- Stored beside `tools_used` and for the same reason: the live stream is discarded the instant the
+-- turn ends, so without a column the reasoning is visible while the turn runs and gone for ever
+-- afterwards. Serialised rather than kept as rows, because it is only ever read with the turn it
+-- belongs to.
+--
+-- Deliberately NOT folded into `stdout`. That column is the reply -- what the conversation records,
+-- what a replay quotes back to the model, what a person reads as the answer. Thinking is working,
+-- frequently wrong on the way to being right, and joining the two would make every one of those
+-- readers quote it as speech.
+--
+-- JSON: an array of strings, oldest first. `[]` means the turn thought nothing out loud. NULL means
+-- a turn from before this column, which is a different fact and must stay tellable from `[]`.
+ALTER TABLE runs ADD COLUMN thought TEXT;

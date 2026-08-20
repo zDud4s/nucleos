@@ -103,6 +103,27 @@ func (c *Client) GetProposals() ([]map[string]any, error) {
 	return proposals, nil
 }
 
+// GetRefusedActions reads what the injection barrier turned away and nobody has put away yet.
+//
+// Its own route rather than a filter on `/proposals`: that list feeds approve and reject, and both
+// answer 409 for anything that is not an action-approval. A refused action was never held — the
+// turn was denied and carried on — so there is nothing to let through and nothing to release.
+func (c *Client) GetRefusedActions() ([]map[string]any, error) {
+	body, status, err := c.do(http.MethodGet, "/proposals/refused-actions", nil)
+	if err != nil {
+		return nil, fmt.Errorf("get refused actions: %w", err)
+	}
+	if err := statusError("get refused actions", status, body); err != nil {
+		return nil, err
+	}
+
+	var refused []map[string]any
+	if err := json.Unmarshal(body, &refused); err != nil {
+		return nil, fmt.Errorf("parse refused actions response: %w", err)
+	}
+	return refused, nil
+}
+
 func (c *Client) GetProjects() ([]map[string]any, error) {
 	body, status, err := c.do(http.MethodGet, "/projects", nil)
 	if err != nil {
@@ -246,11 +267,45 @@ func (c *Client) postNoContent(operation, path string, request any) error {
 	return statusError(operation, status, body)
 }
 
+// StatusError is a refusal the núcleo stated, kept as data rather than folded into a sentence.
+//
+// Refusal is the núcleo's own name for what it refused, and it exists because the status code is
+// not enough: `/assistant/message` alone refuses four different ways across three codes, and two of
+// them are 409. A chat mid-turn clears by waiting; a paused errand never clears on its own. A
+// caller holding only the number has to guess, and the cheap guess leaves a topic silent with an
+// explanation that was never true.
+//
+// It is empty for any refusal that arrived without one — an older núcleo, a route that does not
+// name them, an HTML error page from something in between. That is a normal answer and not a parse
+// failure: the caller falls back to reporting what it has. Turning a stated refusal into a broken
+// client would be strictly worse than saying less about it.
+type StatusError struct {
+	Operation string
+	Status    int
+	Refusal   string
+	Body      string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("%s: status code %d: %s", e.Operation, e.Status, e.Body)
+}
+
 func statusError(operation string, status int, body []byte) error {
 	if status >= http.StatusOK && status < http.StatusMultipleChoices {
 		return nil
 	}
-	return fmt.Errorf("%s: status code %d: %s", operation, status, bytes.TrimSpace(body))
+	// Decoded best-effort and never checked: see the type's note on why an unnamed refusal is an
+	// answer. A body that is not JSON leaves Refusal empty, which is exactly the fallback.
+	var named struct {
+		Refusal string `json:"refusal"`
+	}
+	_ = json.Unmarshal(body, &named)
+	return &StatusError{
+		Operation: operation,
+		Status:    status,
+		Refusal:   named.Refusal,
+		Body:      string(bytes.TrimSpace(body)),
+	}
 }
 
 // VoiceTranscriber is the daemon's voice pillar, when it is armed.
@@ -315,4 +370,102 @@ func (c *Client) VoiceCapture(audio []byte, format string, durationMs int64) (st
 		return "", true, fmt.Errorf("decode voice capture answer: %w", err)
 	}
 	return answer.Text, true, nil
+}
+
+// Errand is one topic that became a place to work, as the daemon reports it.
+//
+// A struct and not a map[string]any like the other list endpoints here, because every field is
+// read by name and typed: a `/pausa` that silently no-oped on a status read out of an `any` would
+// look exactly like a `/pausa` that worked.
+type Errand struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	// ChatKey is the topic it sits on, and the handle the sidecar has: a command typed in a topic
+	// knows its key and nothing else.
+	ChatKey string `json:"chat_key"`
+	Brain   string `json:"brain"`
+	Folder  string `json:"folder"`
+	Status  string `json:"status"`
+}
+
+func (c *Client) ListErrands() ([]Errand, error) {
+	body, status, err := c.do(http.MethodGet, "/errands", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list errands: %w", err)
+	}
+	if err := statusError("list errands", status, body); err != nil {
+		return nil, err
+	}
+	var errands []Errand
+	if err := json.Unmarshal(body, &errands); err != nil {
+		return nil, fmt.Errorf("parse list errands response: %w", err)
+	}
+	return errands, nil
+}
+
+// ErrandOfChat is the errand on one topic, and whether there is one.
+//
+// A list filtered here rather than a route that takes a key, because the daemon's errand routes are
+// keyed by id and the sidecar never holds one — it holds the chat key it is standing in. The list
+// is short by construction: it is one person's errands, not a queue.
+//
+// Not-found is `(_, false, nil)` and never an error. Almost no topic has an errand, so the absence
+// is the ordinary answer, and reporting it as a failure would put "couldn't reach the daemon" in
+// front of somebody who typed `/pausa` in the wrong place.
+func (c *Client) ErrandOfChat(chatKey string) (Errand, bool, error) {
+	errands, err := c.ListErrands()
+	if err != nil {
+		return Errand{}, false, err
+	}
+	for _, errand := range errands {
+		if errand.ChatKey == chatKey {
+			return errand, true, nil
+		}
+	}
+	return Errand{}, false, nil
+}
+
+func (c *Client) CreateErrand(name, chatKey string) (int64, error) {
+	response, err := c.postObject("open errand", "/errands", map[string]string{
+		"name":     name,
+		"chat_key": chatKey,
+	})
+	if err != nil {
+		return 0, err
+	}
+	id, _ := response["errand_id"].(float64)
+	return int64(id), nil
+}
+
+// SetErrandStatus pauses or resumes one errand.
+//
+// The body carries `status` alone. The daemon's PATCH takes both fields optionally, and sending
+// both would mean `/pausa` also restating the brain — a command about one thing quietly rewriting
+// another, with the rewrite invisible because it usually restates what was already true.
+func (c *Client) SetErrandStatus(id int64, status string) error {
+	return c.patchNoContent("set errand status", errandPath(id), map[string]string{"status": status})
+}
+
+func (c *Client) SetErrandBrain(id int64, brain string) error {
+	return c.patchNoContent("set errand brain", errandPath(id), map[string]string{"brain": brain})
+}
+
+func (c *Client) CloseErrand(id int64) error {
+	body, status, err := c.do(http.MethodDelete, errandPath(id), nil)
+	if err != nil {
+		return fmt.Errorf("close errand: %w", err)
+	}
+	return statusError("close errand", status, body)
+}
+
+func errandPath(id int64) string {
+	return "/errands/" + strconv.FormatInt(id, 10)
+}
+
+func (c *Client) patchNoContent(operation, path string, request any) error {
+	body, status, err := c.do(http.MethodPatch, path, request)
+	if err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return statusError(operation, status, body)
 }

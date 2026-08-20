@@ -13,13 +13,13 @@
 # Every stack runs even when an earlier one fails — a summary of three real failures beats
 # stopping at the first and re-running twice to discover the other two.
 #
-# Usage: scripts/gates.sh [core|sidecars|shell|security|all]   (default: all)
+# Usage: scripts/gates.sh [core|sidecars|shell|hooks|security|all]   (default: all)
 set -uo pipefail
 
 target="${1:-all}"
 case "$target" in
-  core|sidecars|shell|security|all) ;;
-  *) echo "usage: $0 [core|sidecars|shell|security|all]" >&2; exit 2 ;;
+  core|sidecars|shell|hooks|security|all) ;;
+  *) echo "usage: $0 [core|sidecars|shell|hooks|security|all]" >&2; exit 2 ;;
 esac
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -109,6 +109,39 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
     run "shell/src-tauri: fmt"    shell/src-tauri cargo fmt --all -- --check
     run "shell/src-tauri: clippy" shell/src-tauri cargo clippy --all-targets -- -D warnings
     run "shell/src-tauri: test"   shell/src-tauri cargo test
+  fi
+fi
+
+# The Python this repo ships. In `all`, unlike `security`, because it is offline and hermetic and
+# because being outside the everyday command is exactly how it went uncovered.
+#
+# `.claude/hooks/ask_daemon.py` is not a helper script: `core/src/triage.rs` does `include_str!` on
+# it, so it is compiled INTO the daemon, and its filter decides whether a git operation a person
+# types is refused and sent to the queue. It shipped with a hole that a `cd` walked through — the
+# filter read only the first two tokens of the command — and nothing here would have noticed,
+# because nothing here ran it. Found by accident, in use.
+if [ "$target" = hooks ] || [ "$target" = all ]; then
+  # `python3` first: it is the name on CI images and on Linux, while Windows installs generally
+  # answer to `python`.
+  #
+  # RUN, don't locate. Windows ships an App Execution Alias at
+  # `AppData/Local/Microsoft/WindowsApps/python3` that is not an interpreter: it prints "Python was
+  # not found" and exits 49. `command -v` finds it, so a check that only looks for the name picks
+  # the stub over the real Python installed beside it and the whole leg fails with a message about
+  # the Microsoft Store. Measured on this machine, first run of this gate.
+  py=""
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
+      py="$candidate"
+      break
+    fi
+  done
+  if [ -z "$py" ]; then
+    echo "python missing — the hook filter and eval approver tests need it (scripts/doctor.sh reports this)" >&2
+    failures="$failures  hooks: python not installed"$'\n'
+  else
+    run "hooks: filter"   . "$py" scripts/test-hook-filter.py
+    run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
   fi
 fi
 

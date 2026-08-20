@@ -16,6 +16,58 @@ pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// from an ordinary CLI failure without treating already-started work as a retryable launch error.
 pub const PROGRESS_TIMEOUT_EXIT_CODE: i32 = i32::MIN;
 
+/// Internal outcome code for a process terminated for taking more turns than it was allowed.
+///
+/// Its own value beside the deadline above, and for the same reason that one exists: the two are
+/// different diagnoses. A run that went silent stopped producing; a run that hit this was producing
+/// the whole time and getting nowhere, which is the failure a wall clock is worst at catching —
+/// a fast model in a tight loop reaches neither the clock nor the job's money check.
+pub const TURN_CEILING_EXIT_CODE: i32 = i32::MIN + 1;
+
+/// How many model responses one run may take before the daemon stops it.
+///
+/// **Generous on purpose, and the number has a basis.** The ablation in `.ai/eval/ABLATION.md`
+/// measured 19 real cells of this repository's own work; the largest legitimate run took 94 turns
+/// (T3xH1). A ceiling below that would stop work that was going to finish, which is the way a brake
+/// like this gets switched off for good. Twice the largest thing ever measured is a limit only a
+/// run that is not converging can reach.
+///
+/// A ceiling, not a target: nothing is expected to approach it, and a run that does is a result
+/// worth reading rather than a quota to spend.
+pub const DEFAULT_MAX_TURNS: i64 = 200;
+
+/// PURE: how many model responses this stream has carried, folded one line at a time.
+///
+/// One function for both CLIs. Claude says `assistant` once per completed model message; `codex
+/// exec` says `turn.completed`. Neither name appears in the other's stream, so a single fold cannot
+/// double-count — and the alternative, a counter per CLI, is how a ceiling ends up enforced on one
+/// path and quietly absent on the other, which is worse than no ceiling because somebody will
+/// believe it is there.
+///
+/// Counted from the transcript rather than asked of the CLI: measured against CLI 2.1.198, there is
+/// no `--max-turns` flag to delegate this to. `--max-budget-usd` exists and is a different brake —
+/// money, which the job already has, rather than motion, which nothing had.
+pub(crate) fn turns_from_line(line: &str, current: i64) -> i64 {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return current;
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("assistant") | Some("turn.completed") => current.saturating_add(1),
+        _ => current,
+    }
+}
+
+/// PURE: whether a run has used up the turns it was given.
+///
+/// `None` is no ceiling and stays no ceiling — every caller that has not chosen one keeps exactly
+/// today's behaviour. A ceiling of zero or less is read as no ceiling too, and that is a decision
+/// rather than an oversight: a misconfiguration that silently stops every run before its first
+/// answer is worse than one that silently disables the brake, because the first looks like the
+/// daemon being broken and the second looks like the daemon it already was.
+pub(crate) fn over_turn_ceiling(turns: i64, ceiling: Option<i64>) -> bool {
+    matches!(ceiling, Some(ceiling) if ceiling > 0 && turns >= ceiling)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunUsage {
     pub input_tokens: Option<i64>,
@@ -80,6 +132,16 @@ pub struct RunRequest {
     pub mcp_config: Option<PathBuf>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
+    /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
+    ///
+    /// The brake the daemon did not have. A run had a wall clock and its job had a money ceiling
+    /// checked BETWEEN nodes — so a single node looping quickly reached neither: fast turns cost
+    /// little each and the clock is generous precisely because real work is slow. This counts the
+    /// thing that actually runs away.
+    ///
+    /// Enforced by counting the transcript, in both runner bodies, because the CLI has no flag for
+    /// it (2.1.198).
+    pub max_turns: Option<i64>,
     pub session_id: Option<String>,
     pub fork_session: bool,
     pub include_partial_messages: bool,
@@ -121,6 +183,23 @@ pub struct RunRequest {
     pub ambient_mcp: bool,
     /// Per-run override of the runner's configured model. `None` keeps it.
     pub model: Option<String>,
+    /// Which of this server's tools this run is offered, when it is offered any at all.
+    ///
+    /// `None` — every caller but one — keeps the wildcard: `--allowedTools mcp__nucleos__*`, the
+    /// whole server. `Some(names)` narrows it to those names, prefixed here so the caller states
+    /// tool names and not CLI syntax.
+    ///
+    /// **Economy, not a boundary, and the distinction is worth keeping straight.** What a run may
+    /// actually reach is decided by the scope of the key in its environment, in `auth::permits`; a
+    /// run handed the wildcard and a narrow key is already safe. What it is not is workable: the
+    /// model sees a tool, calls it, takes a 403 and burns its turns achieving nothing while still
+    /// exiting 0 — the failure this file documents measuring at $1.47 for zero files touched, by a
+    /// different cause.
+    ///
+    /// Only read when `mcp_config` is `Some`, because that is the only branch that writes
+    /// `--allowedTools` at all. A narrowing passed without an MCP config narrows nothing, which is
+    /// the harmless direction.
+    pub allowed_mcp_tools: Option<&'static [&'static str]>,
 }
 
 /// One line of `--input-format stream-json` stdin: a single user turn.
@@ -319,7 +398,14 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().into_owned());
         args.push("--allowedTools".to_string());
-        args.push("mcp__nucleos__*".to_string());
+        args.push(match request.allowed_mcp_tools {
+            None => "mcp__nucleos__*".to_string(),
+            Some(names) => names
+                .iter()
+                .map(|name| format!("mcp__nucleos__{name}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        });
     }
     match request.tool_policy {
         // No tool denial — the classifier governs what an autopilot run may call — but the ambient
@@ -381,6 +467,315 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
     reply
 }
 
+/// A turn as it stands PART WAY THROUGH: what has been written, and what is being done.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LiveTurn {
+    /// The answer so far. Empty means nothing has been said yet, which on a live turn is not the
+    /// same claim as a turn that answered with nothing.
+    pub text: String,
+    /// The tool being run right now, or `None` when the model is writing rather than acting.
+    pub doing: Option<String>,
+    /// Roughly how many tokens the model spent thinking, or `None` when it did not think or the
+    /// stream never said.
+    ///
+    /// The only thing about a thought that this machine can actually have. The CLI emits the
+    /// signature and a running `thinking_tokens` estimate and WITHHOLDS the text: asked of a real
+    /// interactive session, 610 thinking blocks, every one of them `thinking: ""`. So a window that
+    /// offered to show the reasoning would be offering something nothing here holds — and this is
+    /// what it says instead, which is true.
+    ///
+    /// An estimate, and named one. It is the CLI's own running count, and what it has to be right
+    /// about is whether the model deliberated and roughly how hard.
+    pub thought_tokens: Option<i64>,
+    /// What the model thought before it answered, oldest first.
+    ///
+    /// Empty in practice on every stream this daemon has seen, for the reason above — the parse is
+    /// here so that the day the CLI stops withholding the words, they arrive. Empty is therefore
+    /// the ordinary case and not a failure, and nothing downstream may read it as one.
+    ///
+    /// Apart from `text` and never joined to it. Thinking is not the reply: it is working, often
+    /// wrong on the way to being right, and a window that concatenated the two would record the
+    /// model's private reasoning as the thing it said — which is then what a replay quotes back to
+    /// it, and what a person reads as its answer.
+    pub thought: Vec<String>,
+    /// Every tool the turn ran, oldest first.
+    ///
+    /// Beside the text and not folded into it: a turn that read four files and ran the tests
+    /// answered with more than its last paragraph, and the paragraph on its own reads as an opinion
+    /// rather than as work. It is also the only place a turn's actions are visible at all — the
+    /// window shows the reply, and nothing else ever said what produced it.
+    pub did: Vec<ToolCall>,
+}
+
+/// One tool call, as much of it as is worth showing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub name: String,
+    /// The one argument that says what this call was about, or `None` when none of them does.
+    ///
+    /// A path, a command, a pattern, a URL — deliberately not the whole input. A `Write` carries
+    /// the file it is writing, and a chat that printed that argument would print the file.
+    pub detail: Option<String>,
+    /// The plan this call wrote, when the call was one that writes plans. Empty for every other.
+    ///
+    /// The exception to "the one argument": a `TodoWrite` carries no path and no command, so
+    /// `detail_of` finds nothing and the call used to arrive as a bare name with nothing beside it
+    /// — while what it actually carried was the whole plan. A model working through a list is the
+    /// shape of most real work, and none of it reached the page.
+    ///
+    /// Defaulted on the way in. `tools_used` is stored JSON and every turn already recorded is a
+    /// row without this field; a row that predates the plan reads as a call that wrote none, which
+    /// is exactly what it was.
+    #[serde(default)]
+    pub todos: Vec<Todo>,
+}
+
+/// One line of a plan.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Todo {
+    pub text: String,
+    /// As the CLI words it: `pending`, `in_progress`, `completed`. Kept as it arrives rather than
+    /// mapped to something of this daemon's own — a fourth state invented upstream would otherwise
+    /// silently become one of the three here.
+    pub status: String,
+}
+
+/// The plan inside a `TodoWrite` input, or nothing at all for every other tool.
+///
+/// Anything shaped wrong is skipped rather than guessed at: a plan drawn from a half-understood
+/// input is a list of work nobody planned.
+fn plan_of(name: &str, input: Option<&serde_json::Value>) -> Vec<Todo> {
+    if name != "TodoWrite" {
+        return Vec::new();
+    }
+    let Some(items) = input
+        .and_then(|input| input.get("todos"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("content").and_then(|v| v.as_str())?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(Todo {
+                text: cut_detail(text),
+                status: item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pending")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The longest detail kept. A command line can be a heredoc.
+const DETAIL_LIMIT: usize = 120;
+
+/// The argument of a tool call worth showing beside its name.
+///
+/// A fixed list of keys tried in order, rather than "the first string in the object": the input
+/// keys belong to the tools, and an unknown tool would otherwise contribute whichever field
+/// happened to be ordered first — a different answer between two runs of the same call.
+fn detail_of(input: &serde_json::Value) -> Option<String> {
+    // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
+    // and a tool that also says where it acted must answer with that instead. A key ordered above
+    // it would make the sentence a model wrote win over the file it opened.
+    const KEYS: [&str; 7] = [
+        "file_path",
+        "path",
+        "command",
+        "pattern",
+        "url",
+        "query",
+        "description",
+    ];
+    let found = KEYS
+        .iter()
+        .find_map(|key| input.get(key).and_then(|value| value.as_str()))?;
+    let trimmed = found.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(cut_detail(trimmed))
+}
+
+/// The same ceiling for a detail and for a line of a plan: both are one line beside a tool's name,
+/// and a plan item can be a paragraph somebody pasted.
+fn cut_detail(text: &str) -> String {
+    let mut out: String = text.chars().take(DETAIL_LIMIT).collect();
+    if text.chars().count() > DETAIL_LIMIT {
+        out.push('…');
+    }
+    out
+}
+
+/// Distils a stream still being written into the two things worth showing while it is.
+///
+/// Beside `extract_reply`, and for the same stated reason: knowing the CLI's output format is this
+/// module's job. The alternative was to teach the window these shapes, which would put a format the
+/// app does not own — and which changes without asking — into the one place that cannot be tested
+/// against the real thing.
+///
+/// The two sources of the same words are the whole difficulty. With `--include-partial-messages`
+/// the text arrives twice: once as `text_delta`s while it is typed, and again in the completed
+/// `assistant` message. So the deltas fill a buffer, and a completed message REPLACES that buffer
+/// with what it says — which is also what makes this correct when no partials arrive at all.
+///
+/// Completed messages accumulate rather than replace each other: text, a tool call, then more text
+/// is one answer with a gap in it, and keeping only the newest message would silently drop
+/// everything the model said before it reached for anything.
+pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
+    let mut finished: Vec<String> = Vec::new();
+    let mut writing = String::new();
+    let mut thought: Vec<String> = Vec::new();
+    let mut thought_tokens: Option<i64> = None;
+    let mut pondering = String::new();
+    let mut doing: Option<String> = None;
+    let mut did: Vec<ToolCall> = Vec::new();
+
+    for line in stream.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()) {
+            // Only `text_delta` carries a `text`. A tool call's arguments stream as
+            // `input_json_delta` under `partial_json`, and reading that as speech would put a
+            // half-written JSON object in the middle of a sentence.
+            Some("stream_event") => {
+                if let Some(text) = value.pointer("/event/delta/text").and_then(|t| t.as_str()) {
+                    writing.push_str(text);
+                }
+                // Thinking streams on the same channel under its own key — and arrives EMPTY.
+                // The CLI sends `thinking_delta`s carrying `"thinking": ""` and a token estimate,
+                // never the words. Read anyway, so the day it stops withholding them they appear;
+                // measured below, because the measurement is the part that exists.
+                if let Some(text) = value
+                    .pointer("/event/delta/thinking")
+                    .and_then(|t| t.as_str())
+                {
+                    pondering.push_str(text);
+                }
+                thought_tokens = larger(
+                    thought_tokens,
+                    value.pointer("/event/delta/estimated_tokens"),
+                );
+            }
+            // The one line that says anything real about a thought. A running total, and it arrives
+            // even on the turns whose thinking block came through with its text stripped out —
+            // which, so far, is all of them.
+            Some("system")
+                if value.get("subtype").and_then(|s| s.as_str()) == Some("thinking_tokens") =>
+            {
+                thought_tokens = larger(thought_tokens, value.get("estimated_tokens"));
+            }
+            Some("assistant") => {
+                let blocks = value
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let text = blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+
+",
+                    );
+                if !text.trim().is_empty() {
+                    finished.push(text);
+                }
+                thought.extend(
+                    blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(|t| t.as_str()) == Some("thinking")
+                        })
+                        .filter_map(|block| block.get("thinking").and_then(|t| t.as_str()))
+                        .filter(|text| !text.trim().is_empty())
+                        .map(str::to_string),
+                );
+                for block in blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                {
+                    let Some(name) = block.get("name").and_then(|n| n.as_str()) else {
+                        continue;
+                    };
+                    did.push(ToolCall {
+                        name: name.to_string(),
+                        detail: block.get("input").and_then(detail_of),
+                        todos: plan_of(name, block.get("input")),
+                    });
+                    doing = Some(name.to_string());
+                }
+                // The message that just completed is the one those deltas were writing — both
+                // kinds of them. The CLI sends one `assistant` event per API message carrying every
+                // block of it, so a message that ended a thought carries that thought, and keeping
+                // the buffer as well would show it twice.
+                writing.clear();
+                pondering.clear();
+            }
+            // A tool answering is the only thing that ends a tool call. Clearing this anywhere else
+            // would show the model as writing while a command is still running.
+            Some("user") => {
+                let returned = value
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                    });
+                if returned {
+                    doing = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !writing.trim().is_empty() {
+        finished.push(writing);
+    }
+    // A thought still being written when the stream was read is worth showing — that is most of
+    // what a live turn IS while it is hard.
+    if !pondering.trim().is_empty() {
+        thought.push(pondering);
+    }
+
+    LiveTurn {
+        text: finished.join(
+            "
+
+",
+        ),
+        thought_tokens,
+        thought,
+        doing,
+        did,
+    }
+}
+
+/// The larger of what is known and what a line claims, ignoring a line that claims nothing.
+///
+/// `estimated_tokens` is a RUNNING total and arrives on two different kinds of line, one of which
+/// sometimes sends it null. Taking the largest is what makes a stream read at any point report the
+/// whole thought so far rather than whichever line happened to come last.
+fn larger(known: Option<i64>, claimed: Option<&serde_json::Value>) -> Option<i64> {
+    match claimed.and_then(serde_json::Value::as_i64) {
+        Some(seen) => Some(known.map_or(seen, |known| known.max(seen))),
+        None => known,
+    }
+}
+
 /// Context occupied while a Claude `stream-json` run is still alive.
 ///
 /// This is deliberately separate from `extract_usage`: assistant events describe current context
@@ -407,16 +802,11 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
         }
     }
 
-    if current.is_none()
-        && value.get("type").and_then(serde_json::Value::as_str) == Some("system")
-        && value.get("subtype").and_then(serde_json::Value::as_str) == Some("thinking_tokens")
-    {
-        return value
-            .get("estimated_tokens")
-            .and_then(serde_json::Value::as_i64)
-            .or(current);
-    }
-
+    // `system`/`thinking_tokens` is deliberately NOT read here, although it is the only other line
+    // carrying a token count. It measures what the model spent reasoning, not how full its window
+    // is, and against a real stream the two are out by two orders of magnitude — 177 of thinking on
+    // a turn carrying 48,733 of context. It is read by `live_from_stream` instead, under its own
+    // name, where it says the thing it actually means.
     current
 }
 
@@ -1164,6 +1554,8 @@ impl CommandRunner for ClaudeCliRunner {
         let mut policy_violation: Option<String> = None;
         let mut init_seen = false;
         let mut progress_timeout_elapsed: Option<Duration> = None;
+        let mut turns: i64 = 0;
+        let mut turns_exceeded: Option<i64> = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -1196,6 +1588,14 @@ impl CommandRunner for ClaudeCliRunner {
             running_context_fill = context_fill_from_line(&line, running_context_fill);
             if let Ok(mut shared) = context_fill.lock() {
                 *shared = running_context_fill;
+            }
+            // After the line is accumulated and mirrored, never before: a run stopped here still has
+            // to leave the transcript of the turn that stopped it, or the evidence for why it was
+            // stopped is the one thing missing from the record.
+            turns = turns_from_line(&line, turns);
+            if over_turn_ceiling(turns, request.max_turns) {
+                turns_exceeded = Some(turns);
+                break;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if !cli_session_seen && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
@@ -1241,7 +1641,10 @@ impl CommandRunner for ClaudeCliRunner {
             policy_violation = policy_unverified_after_stream(request.tool_policy, init_seen);
         }
 
-        if policy_violation.is_some() || progress_timeout_elapsed.is_some() {
+        if policy_violation.is_some()
+            || progress_timeout_elapsed.is_some()
+            || turns_exceeded.is_some()
+        {
             // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -1281,20 +1684,36 @@ impl CommandRunner for ClaudeCliRunner {
                 "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
             ));
         }
+        if let Some(reached) = turns_exceeded {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            // Says what was reached AND what the limit was. "stopped at 200" alone leaves the reader
+            // unable to tell a ceiling that is too low from a run that was never going to finish.
+            stderr_str.push_str(&format!(
+                "nucleos: stopped after {reached} turns; this run's ceiling was {}\n",
+                request.max_turns.unwrap_or_default()
+            ));
+        }
         let exit_code = match (
             progress_timeout_elapsed,
+            turns_exceeded,
             &policy_violation,
             &post_launch_error,
         ) {
-            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
-            (None, Some(_), _) => -1,
+            (Some(_), _, _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            // After the deadline and before the rest: a run killed for looping may well also be a
+            // run whose stream then stopped, and the ceiling is the diagnosis that explains the
+            // other rather than the other way round.
+            (None, Some(_), _, _) => TURN_CEILING_EXIT_CODE,
+            (None, None, Some(_), _) => -1,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            (None, None, Some(error)) => {
+            (None, None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         Ok(RunOutcome {
@@ -1540,6 +1959,8 @@ impl CommandRunner for CodexCliRunner {
         let mut stdout_acc = String::new();
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut progress_timeout_elapsed: Option<Duration> = None;
+        let mut turns: i64 = 0;
+        let mut turns_exceeded: Option<i64> = None;
 
         loop {
             let next_line = match request.progress_timeout {
@@ -1568,9 +1989,17 @@ impl CommandRunner for CodexCliRunner {
                 shared.push_str(&line);
                 shared.push('\n');
             }
+            // The same brake as the Claude body above, counting `turn.completed` instead of
+            // `assistant` — `turns_from_line` knows both, so this path cannot drift out of step
+            // with the other by being edited on its own.
+            turns = turns_from_line(&line, turns);
+            if over_turn_ceiling(turns, request.max_turns) {
+                turns_exceeded = Some(turns);
+                break;
+            }
         }
 
-        if progress_timeout_elapsed.is_some() {
+        if progress_timeout_elapsed.is_some() || turns_exceeded.is_some() {
             // Kill the whole tree first, so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -1597,15 +2026,25 @@ impl CommandRunner for CodexCliRunner {
                 "nucleos: run went silent for {deadline:?}; progress deadline expired\n"
             ));
         }
-        let exit_code = match (progress_timeout_elapsed, &post_launch_error) {
-            (Some(_), _) => PROGRESS_TIMEOUT_EXIT_CODE,
+        if let Some(reached) = turns_exceeded {
+            if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
+                stderr_str.push('\n');
+            }
+            stderr_str.push_str(&format!(
+                "nucleos: stopped after {reached} turns; this run's ceiling was {}\n",
+                request.max_turns.unwrap_or_default()
+            ));
+        }
+        let exit_code = match (progress_timeout_elapsed, turns_exceeded, &post_launch_error) {
+            (Some(_), _, _) => PROGRESS_TIMEOUT_EXIT_CODE,
+            (None, Some(_), _) => TURN_CEILING_EXIT_CODE,
             // A stream that failed mid-run is a failed run, never a zero exit: the transcript is
             // incomplete, so "succeeded" is a claim this cannot make.
-            (None, Some(error)) => {
+            (None, None, Some(error)) => {
                 stderr_str.push_str(&format!("\nnucleos: stream failed after launch: {error}\n"));
                 -1
             }
-            (None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
         };
 
         let usage = codex_extract_usage(&stdout_acc);
@@ -1640,6 +2079,10 @@ pub struct FakeCommandRunner {
     // Set by Task 4's cancellation/timeout tests to simulate a slow/hung run.
     pub delay: std::sync::Mutex<Option<std::time::Duration>>,
     pub last_plan_only: std::sync::Mutex<Option<bool>>,
+    /// The prompt the launch was handed. Recorded because a turn's prompt is not always the text
+    /// the person typed — an errand's notebook is prepended to it — so what the CLI actually
+    /// received is the only place that injection can be observed.
+    pub last_prompt: std::sync::Mutex<Option<String>>,
     pub last_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_resume: std::sync::Mutex<Option<String>>,
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
@@ -1707,6 +2150,7 @@ impl CommandRunner for FakeCommandRunner {
             std::fs::write(std::path::Path::new(artifacts).join("plan.json"), plan)
                 .expect("the plan node writes its queue");
         }
+        *self.last_prompt.lock().unwrap() = Some(request.prompt.clone());
         *self.last_cwd.lock().unwrap() = request.cwd.clone();
         *self.last_plan_only.lock().unwrap() = Some(request.plan_only);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
@@ -2024,6 +2468,47 @@ mod tests {
         );
     }
 
+    /// The wildcard is what every caller but a department gets, and a department gets exactly its
+    /// own list — prefixed here, so callers name tools rather than CLI syntax.
+    #[test]
+    fn a_narrowed_request_advertises_only_the_tools_it_names() {
+        let mut request = baseline_run_request();
+        request.mcp_config = Some(PathBuf::from("mcp.json"));
+
+        let wide = cli_args(&request, "claude-sonnet-5");
+        let flag = wide.windows(2).find(|w| w[0] == "--allowedTools").unwrap();
+        assert_eq!(flag[1], "mcp__nucleos__*");
+
+        request.allowed_mcp_tools = Some(&["list_files", "read_team_file"]);
+        let narrow = cli_args(&request, "claude-sonnet-5");
+        let flag = narrow
+            .windows(2)
+            .find(|w| w[0] == "--allowedTools")
+            .unwrap();
+        assert_eq!(
+            flag[1],
+            "mcp__nucleos__list_files,mcp__nucleos__read_team_file"
+        );
+        assert!(
+            !narrow.iter().any(|arg| arg == "mcp__nucleos__*"),
+            "the wildcard must be replaced, not accompanied — one of the two would win and it \
+             would not be obvious which"
+        );
+    }
+
+    /// Narrowing without an MCP config narrows nothing, which is the harmless direction and worth
+    /// pinning: the flag is only ever written inside the `mcp_config` branch.
+    #[test]
+    fn narrowing_a_request_with_no_mcp_server_adds_no_flag() {
+        let mut request = baseline_run_request();
+        request.allowed_mcp_tools = Some(&["list_files"]);
+        assert!(
+            !cli_args(&request, "claude-sonnet-5")
+                .iter()
+                .any(|a| a == "--allowedTools")
+        );
+    }
+
     fn baseline_run_request() -> RunRequest {
         RunRequest {
             prompt: "test prompt".to_string(),
@@ -2034,6 +2519,7 @@ mod tests {
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
+            max_turns: None,
             session_id: Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
             fork_session: false,
             include_partial_messages: false,
@@ -2042,6 +2528,7 @@ mod tests {
             ambient_mcp: false,
             model: None,
             messages: None,
+            allowed_mcp_tools: None,
         }
     }
 
@@ -2055,6 +2542,7 @@ mod tests {
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
+            max_turns: None,
             session_id: None,
             fork_session: false,
             include_partial_messages: false,
@@ -2063,6 +2551,7 @@ mod tests {
             ambient_mcp: false,
             model: None,
             messages: None,
+            allowed_mcp_tools: None,
         }
     }
 
@@ -2190,6 +2679,366 @@ mod tests {
         );
     }
 
+    /// The plan, which the window had as the word `TodoWrite` and nothing else.
+    ///
+    /// A turn that writes a plan and then works through it is the shape of most real work, and none
+    /// of it reached the page: `detail_of` looks for a path or a command, a `TodoWrite` carries
+    /// neither, so the call arrived as a bare name. Watching a model tick items off is half of what
+    /// a person is looking at when they look at the editor.
+    #[test]
+    fn a_plan_is_carried_beside_the_call_that_wrote_it() {
+        let stream = [message(serde_json::json!([{
+            "type": "tool_use", "name": "TodoWrite",
+            "input": {"todos": [
+                {"content": "ler o parser", "status": "completed"},
+                {"content": "arranjar as datas", "status": "in_progress"},
+                {"content": "correr os testes", "status": "pending"},
+            ]}
+        }]))]
+        .join("\n");
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did.len(), 1);
+        assert_eq!(
+            did[0].todos,
+            vec![
+                Todo {
+                    text: "ler o parser".into(),
+                    status: "completed".into()
+                },
+                Todo {
+                    text: "arranjar as datas".into(),
+                    status: "in_progress".into()
+                },
+                Todo {
+                    text: "correr os testes".into(),
+                    status: "pending".into()
+                },
+            ]
+        );
+    }
+
+    /// Every other tool carries no plan, and says so with an empty list rather than with a shape
+    /// the window has to test for.
+    #[test]
+    fn a_call_that_is_not_a_plan_carries_no_plan() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Read", "input": {"file_path": "C:/x.rs"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert!(did[0].todos.is_empty());
+        assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
+    }
+
+    /// A row written before this existed deserialises, and reads as a call that wrote no plan.
+    /// `tools_used` is stored JSON: every turn already recorded is a row without the field.
+    #[test]
+    fn a_call_stored_before_plans_existed_still_reads() {
+        let old: ToolCall =
+            serde_json::from_str(r#"{"name":"Bash","detail":"cargo test"}"#).unwrap();
+
+        assert_eq!(old.name, "Bash");
+        assert!(old.todos.is_empty());
+    }
+
+    /// A subagent's call said `Task` and nothing else, which is the one call where the name alone
+    /// says least: every `Task` looks like every other, and what distinguishes them is the sentence
+    /// the model wrote to describe the work. It carries no path and no command, so the fixed list
+    /// of keys walked straight past it.
+    #[test]
+    fn a_subagent_call_says_what_it_was_sent_to_do() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Task",
+            "input": {"description": "rever o diff", "prompt": "olha para tudo", "subagent_type": "reviewer"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did[0].detail.as_deref(), Some("rever o diff"));
+    }
+
+    /// Ordered, not searched: a tool carrying both keeps the one that says where it acted. The
+    /// description is the last resort, never the preferred answer.
+    #[test]
+    fn a_description_never_wins_over_the_thing_that_was_acted_on() {
+        let stream = message(serde_json::json!([{
+            "type": "tool_use", "name": "Edit",
+            "input": {"file_path": "C:/x.rs", "description": "arranjar isto"}
+        }]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
+    }
+
+    /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.
+    fn delta(text: &str) -> String {
+        serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": text}}
+        })
+        .to_string()
+    }
+
+    /// A whole assistant message, which is what arrives with or without partials.
+    fn message(blocks: serde_json::Value) -> String {
+        serde_json::json!({"type": "assistant", "message": {"content": blocks}}).to_string()
+    }
+
+    fn said(text: &str) -> serde_json::Value {
+        serde_json::json!([{"type": "text", "text": text}])
+    }
+
+    #[test]
+    fn a_stream_in_flight_reads_back_as_what_has_been_written_so_far() {
+        let stream = [delta("está"), delta(" quase")].join(
+            "
+",
+        );
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.text, "está quase");
+        assert_eq!(live.doing, None);
+    }
+
+    /// The deltas and the completed message describe the SAME words, and a reader that took both
+    /// would show every sentence twice — which is what a naive concatenation does, and it looks like
+    /// the model stuttering rather than like a parsing bug.
+    #[test]
+    fn a_completed_message_supersedes_the_deltas_it_was_written_from() {
+        let stream = [delta("está"), delta(" quase"), message(said("está quase"))].join(
+            "
+",
+        );
+
+        assert_eq!(live_from_stream(&stream).text, "está quase");
+    }
+
+    /// One line of a partial stream: a slice of THINKING as it is typed.
+    ///
+    /// A separate delta type from `text_delta`, and that is the whole point: the two arrive
+    /// interleaved on the same stream, and a reader that took `delta.text` alone would find nothing
+    /// here and show a model that sat silent through the part worth watching.
+    fn pondered(text: &str) -> String {
+        serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "thinking_delta", "thinking": text}}
+        })
+        .to_string()
+    }
+
+    /// What the model thought is carried BESIDE what it said, never folded into it.
+    ///
+    /// The editor shows thinking; this window dropped it on the floor. `live_from_stream` kept only
+    /// `text` blocks, so an answer whose reasoning WAS the work arrived as its conclusion alone —
+    /// and a conclusion with nothing visible behind it is exactly the thing a reader cannot check.
+    ///
+    /// Beside, and not concatenated: thinking is not the reply. Joining them would put the model's
+    /// working into the answer this conversation records, into the replay built from that answer,
+    /// and into every place downstream that treats `text` as the thing that was said.
+    #[test]
+    fn what_the_model_thought_is_carried_beside_what_it_said() {
+        let stream = message(serde_json::json!([
+            {"type": "thinking", "thinking": "o mês vem antes do dia neste formato"},
+            {"type": "text", "text": "é o parser de datas"}
+        ]));
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.thought, vec!["o mês vem antes do dia neste formato"]);
+        assert_eq!(live.text, "é o parser de datas");
+    }
+
+    /// Thinking streams before it completes, exactly as text does.
+    ///
+    /// Without this the window shows nothing at all for the longest stretch of a hard turn, and
+    /// then the whole of the reasoning at once, after it has stopped being interesting.
+    #[test]
+    fn thinking_in_flight_reads_back_before_its_block_completes() {
+        let stream = [pondered("o mês"), pondered(" vem antes")].join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.thought, vec!["o mês vem antes"]);
+        // And it did not leak into the reply: nothing has been SAID yet.
+        assert_eq!(live.text, "");
+    }
+
+    /// The deltas and the completed block are the SAME thought, and a reader that took both would
+    /// show it twice — the identical bug `a_completed_message_supersedes_the_deltas` guards for
+    /// speech, on the channel beside it.
+    #[test]
+    fn a_completed_thought_supersedes_the_deltas_it_was_written_from() {
+        let stream = [
+            pondered("o mês"),
+            pondered(" vem antes"),
+            message(serde_json::json!([{"type": "thinking", "thinking": "o mês vem antes"}])),
+        ]
+        .join("\n");
+
+        assert_eq!(live_from_stream(&stream).thought, vec!["o mês vem antes"]);
+    }
+
+    /// A real stream carries the SIZE of a thought and never its words.
+    ///
+    /// Built from a stream this machine actually produced, because the synthetic ones above are
+    /// what let a feature be written that could never draw anything. Asked of the CLI directly:
+    /// every `thinking` block arrives with `thinking: ""` -- 610 of them across one interactive
+    /// session, not one with a word in it. Claude Code emits the signature and a running
+    /// `thinking_tokens` estimate and withholds the text.
+    ///
+    /// So this is the honest claim a window can make about a thought, and it is the only one.
+    #[test]
+    fn a_thought_is_measured_because_the_cli_withholds_its_words() {
+        let stream = [
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50}"#.to_string(),
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":177,"estimated_tokens_delta":27}"#.to_string(),
+            message(serde_json::json!([{"type": "thinking", "thinking": "", "signature": "ErwFCqUB"}])),
+            message(said("17 x 23 = 391")),
+        ]
+        .join("
+");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.thought_tokens, Some(177));
+        // And nothing is claimed to have been said in it, because nothing was.
+        assert!(live.thought.is_empty());
+        assert_eq!(live.text, "17 x 23 = 391");
+    }
+
+    /// A turn that did not think says so as nothing, never as zero.
+    #[test]
+    fn a_turn_that_did_not_think_reports_no_measurement_at_all() {
+        assert_eq!(live_from_stream(&message(said("ola"))).thought_tokens, None);
+    }
+
+    /// Text, a tool, then more text is ONE answer with a gap in the middle. Keeping only the last
+    /// message would throw away everything said before the model reached for anything.
+    #[test]
+    fn text_written_before_and_after_a_tool_call_is_one_answer() {
+        let stream = [
+            message(said("deixa ver o ficheiro")),
+            message(serde_json::json!([{"type": "tool_use", "name": "Read", "input": {}}])),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "content": "ok"}]}
+            })
+            .to_string(),
+            message(said("é o parser de datas")),
+        ]
+        .join(
+            "
+",
+        );
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(
+            live.text,
+            "deixa ver o ficheiro
+
+é o parser de datas"
+        );
+        assert_eq!(live.doing, None);
+    }
+
+    /// What it is doing right now, which is the half a spinner cannot say.
+    /// What the turn DID, kept beside what it said. A turn that read four files and ran the tests
+    /// answered with more than its last paragraph, and the paragraph alone reads as an opinion.
+    #[test]
+    fn a_stream_reads_back_the_tools_it_ran_in_the_order_it_ran_them() {
+        let stream = [
+            message(serde_json::json!([
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "core/src/parser.rs"}}
+            ])),
+            message(serde_json::json!([
+                {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test parser"}}
+            ])),
+        ]
+        .join(
+            "
+",
+        );
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did.len(), 2);
+        assert_eq!(did[0].name, "Read");
+        assert_eq!(did[0].detail.as_deref(), Some("core/src/parser.rs"));
+        assert_eq!(did[1].name, "Bash");
+        assert_eq!(did[1].detail.as_deref(), Some("cargo test parser"));
+    }
+
+    /// A tool whose arguments this does not recognise is still a tool that ran. Naming it with no
+    /// detail says less than the truth; leaving it out says something false.
+    #[test]
+    fn a_tool_with_no_argument_worth_showing_is_still_recorded() {
+        let stream = message(serde_json::json!([
+            {"type": "tool_use", "name": "TodoWrite", "input": {"todos": []}}
+        ]));
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did.len(), 1);
+        assert_eq!(did[0].name, "TodoWrite");
+        assert_eq!(did[0].detail, None);
+    }
+
+    #[test]
+    fn a_stream_says_which_tool_is_running_until_that_tool_returns() {
+        let calling = [
+            message(said("deixa ver")),
+            message(serde_json::json!([{"type": "tool_use", "name": "Bash", "input": {}}])),
+        ]
+        .join(
+            "
+",
+        );
+
+        assert_eq!(live_from_stream(&calling).doing.as_deref(), Some("Bash"));
+
+        let returned = [
+            calling,
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "content": "ok"}]}
+            })
+            .to_string(),
+        ]
+        .join(
+            "
+",
+        );
+
+        assert_eq!(live_from_stream(&returned).doing, None);
+    }
+
+    /// A turn that has only just started has said nothing, and that is not the same as a turn that
+    /// answered with nothing — the caller is asking about a run still in flight.
+    #[test]
+    fn a_stream_carrying_only_transport_reads_back_empty() {
+        let stream = [
+            serde_json::json!({"type": "system", "subtype": "init", "session_id": "s"}).to_string(),
+            "not json at all".to_string(),
+        ]
+        .join(
+            "
+",
+        );
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.text, "");
+        assert_eq!(live.doing, None);
+    }
+
     #[test]
     fn extract_reply_pulls_the_result_text() {
         let stdout = r#"{"type":"system","subtype":"init","session_id":"s"}
@@ -2262,6 +3111,64 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, None);
     }
 
+    /// One fold for both CLIs, because their per-turn events cannot appear in the same stream.
+    ///
+    /// Claude says `assistant` once per completed model message; `codex exec` says `turn.completed`.
+    /// Counting both in one function is what keeps the ceiling from being a Claude-only brake — a
+    /// limit that silently does not apply on one of the two paths is worse than no limit, because
+    /// somebody will believe it is there.
+    #[test]
+    fn a_turn_is_counted_once_per_model_response_on_either_cli() {
+        let claude = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let codex = r#"{"type":"turn.completed","usage":{"input_tokens":10}}"#;
+
+        assert_eq!(turns_from_line(claude, 0), 1);
+        assert_eq!(turns_from_line(codex, 4), 5);
+
+        // Everything else in either stream is not a turn. `stream_event` in particular arrives by
+        // the hundred for a single message — counting it would trip a ceiling of 200 inside one
+        // paragraph of the model's first answer.
+        for quiet in [
+            r#"{"type":"stream_event","event":{"delta":{"text":"tok"}}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#,
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","num_turns":9}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(turns_from_line(quiet, 7), 7, "counted a turn for: {quiet}");
+        }
+    }
+
+    /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
+    #[test]
+    fn the_ceiling_trips_at_the_number_it_names_and_never_without_one() {
+        assert!(!over_turn_ceiling(199, Some(200)));
+        assert!(over_turn_ceiling(200, Some(200)));
+        assert!(over_turn_ceiling(201, Some(200)));
+
+        // `None` is no ceiling, and it must stay no ceiling however long the run goes. Every caller
+        // that has not chosen a limit keeps exactly today's behaviour.
+        assert!(!over_turn_ceiling(1, None));
+        assert!(!over_turn_ceiling(1_000_000, None));
+
+        // A ceiling of zero or less would stop a run before its first answer. Refused as "no
+        // ceiling" rather than honoured, because a misconfiguration that silently disables every
+        // run is worse than one that disables the brake.
+        assert!(!over_turn_ceiling(1, Some(0)));
+        assert!(!over_turn_ceiling(5, Some(-3)));
+    }
+
+    /// A run the daemon stopped has not succeeded, and must not be readable as either of the other
+    /// two ways a run can end without doing its work.
+    #[test]
+    fn a_run_stopped_by_the_ceiling_cannot_be_read_as_a_success_or_as_a_timeout() {
+        assert_ne!(TURN_CEILING_EXIT_CODE, 0);
+        assert_ne!(TURN_CEILING_EXIT_CODE, -1);
+        assert_ne!(TURN_CEILING_EXIT_CODE, PROGRESS_TIMEOUT_EXIT_CODE);
+    }
+
     #[test]
     fn context_fill_reads_usage_from_an_assistant_event() {
         let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":9000}}}"#;
@@ -2272,16 +3179,27 @@ mod tests {
         );
     }
 
+    /// Thinking tokens are not context, and a run with no usage line knows nothing.
+    ///
+    /// This read `thinking_tokens` as a fallback, and the two numbers are not the same kind of
+    /// thing: one is what the model spent reasoning, the other is how full its window is. Measured
+    /// against a real stream they are not even close — 177 tokens of thinking on a turn carrying
+    /// 48,733 of context, out by two hundred and fifty times.
+    ///
+    /// It matters because of what reads this column. `get_session` refuses to resume past
+    /// `CONTEXT_ROTATION_TOKENS`, and the window draws "x of 140k" under every turn: a run that
+    /// recorded 177 was a run claiming to be nearly empty while it was a third full. Unknown is the
+    /// honest answer, and the one the ceiling already handles — a NULL fill has never tripped it,
+    /// and neither did the wrong number.
     #[test]
-    fn context_fill_falls_back_to_thinking_tokens_when_usage_is_absent() {
+    fn thinking_tokens_are_not_read_as_context_because_they_are_not_context() {
         let thinking = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":125}"#;
-        let unrelated = r#"{"type":"assistant","message":{"content":[]}}"#;
 
-        let current = crate::runner::context_fill_from_line(thinking, None);
-        assert_eq!(current, Some(125));
+        assert_eq!(crate::runner::context_fill_from_line(thinking, None), None);
+        // And it does not overwrite a real reading that arrived before it, either.
         assert_eq!(
-            crate::runner::context_fill_from_line(unrelated, current),
-            Some(125)
+            crate::runner::context_fill_from_line(thinking, Some(48_733)),
+            Some(48_733)
         );
     }
 
