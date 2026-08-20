@@ -103,3 +103,53 @@ func TestAClickThatStartsNothingCostsOnlyTheReactionWindow(t *testing.T) {
 		t.Fatalf("three clicks that started nothing took %v", spent)
 	}
 }
+
+// TestAClickThatRedrawsIsFinishedBeforeTheActReturns.
+//
+// The other half of the same wait, and the half the ferry could never see: a click that asks for
+// nothing, navigates nowhere, and simply draws. There is no request to count and no lifecycle event
+// to hear, so before the page's own MutationObserver there was no signal at all — the act returned
+// on the CDP round trip, and the next reading was of the page as it stood before the click.
+//
+// ONE snapshot, no polling, for the same reason as its neighbour: polling proves the content turns
+// up eventually, which is not the claim.
+func TestAClickThatRedrawsIsFinishedBeforeTheActReturns(t *testing.T) {
+	site := newSite(t)
+	driver, _ := fenced(t, admitting(site))
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: site.origin() + "/click-render"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	before, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if hasName(before, "Revenue fell") {
+		t.Fatal("the page had the detail before anything was pressed; this proves nothing")
+	}
+
+	result, err := driver.Act(ctx, session.ID, browser.Action{
+		Kind: browser.ActionClick,
+		Ref:  refFor(t, before, "Show the detail"),
+	})
+	if err != nil {
+		t.Fatalf("click: %v", err)
+	}
+	if result.Navigated {
+		t.Fatal("this page does not navigate; the wait being measured is the other one")
+	}
+
+	after, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if hasName(after, "Loading the detail") {
+		t.Fatal("the act returned on the placeholder: the wait stopped at the reaction window")
+	}
+	if !hasName(after, "Revenue fell") {
+		t.Fatalf("the act returned before the page had finished drawing: %+v", after.Elements)
+	}
+}

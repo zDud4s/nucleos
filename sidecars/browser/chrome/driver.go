@@ -67,6 +67,8 @@ type Driver struct {
 	// anything. Paid once per such act, so a test that asserts the negative case asserts it against
 	// a short one rather than adding a third of a second to every click in the suite.
 	settleWithin time.Duration
+	// movingWithin caps how long a page may hold that wait by redrawing. See movingBound.
+	movingWithin time.Duration
 }
 
 type session struct {
@@ -80,6 +82,10 @@ type session struct {
 	// frameID is this target's top frame, kept so a wait for "the page is ready" can ignore the
 	// lifecycle of every subframe. A page whose advertisement finished loading has not finished.
 	frameID string
+	// changedAt is when the page last told us it redrew itself, which is the only signal there is
+	// for an act that changes a page without asking us for anything — a menu opening, a route
+	// rendering from data already in memory, a list filtering itself.
+	changedAt time.Time
 	// reportedUpTo is how far into the refusal record this session has already been told. It is what
 	// makes a refusal that lands after an act's settle window arrive on the NEXT act instead of being
 	// lost — no fixed window can catch every one, and silence is the wrong failure.
@@ -199,6 +205,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		readyWithin:  readyDeadline,
 		idleGrace:    idleGrace,
 		settleWithin: settleGrace,
+		movingWithin: movingBound,
 	}
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)

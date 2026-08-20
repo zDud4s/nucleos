@@ -229,6 +229,32 @@ func newSite(t *testing.T) *site {
 			});
 			</script>`)
 	})
+	// A click that changes the page and asks for NOTHING, which is the half the ferry cannot see: no
+	// request, no navigation, just the page redrawing itself. A menu opening, a route rendering from
+	// data already in memory, a list filtering. The delay is short and real — a framework does not
+	// paint inside the click handler.
+	mux.HandleFunc("/click-render", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>click-render</title><body>
+			<h1>Filters</h1>
+			<button id=show>Show the detail</button>
+			<div id=app></div>
+			<script>
+			// In two steps, and the timings are the whole point. The first lands INSIDE the reaction
+			// window, so the wait has something to see; the last lands well outside it, so a wait
+			// that only counted the window would return with the placeholder on screen and the test
+			// would pass without measuring anything.
+			document.getElementById('show').addEventListener('click', () => {
+				const app = document.getElementById('app');
+				setTimeout(() => { app.innerHTML = '<p>Loading the detail...</p>'; }, 80);
+				setTimeout(() => {
+					app.innerHTML =
+						'<p>Revenue fell by eleven percent, which nobody had forecast.</p>';
+				}, 600);
+			});
+			</script>`)
+	})
 	mux.HandleFunc("/content", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

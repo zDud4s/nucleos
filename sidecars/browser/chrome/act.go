@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp"
@@ -92,6 +93,9 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	// can do to a page.
 	moved := d.watchPage(pageSession, frameID)
 	defer moved.stop()
+	// Stamped before the act, because the wait afterwards has to tell what this act caused from
+	// what the page was already doing.
+	began := time.Now()
 
 	// Where the act lands. An element carries its own document with it, because a cross-site frame
 	// is a separate target and a key dispatched at the page would arrive in the wrong one.
@@ -134,7 +138,7 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		// Still through afterAct: the verb declined, but a page can have moved for its own reasons
 		// while the act was in flight, and the agent's refs are stale either way. A verb that
 		// declined ran no page code, so there is nothing for it to have started.
-		return d.afterAct(ctx, entry, moved, false,
+		return d.afterAct(ctx, entry, moved, false, began,
 			browser.Refused(refusal.Consequence, refusal.Detail)), nil
 	}
 
@@ -150,7 +154,7 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	// Both, and in this order: an act can be refused AND move the page. A click that navigates and
 	// also fires a blocked beacon is one act with two things worth saying about it, and reporting
 	// only the first would leave the agent holding refs to a document that is gone.
-	return d.afterAct(ctx, entry, moved, ranPageCode(action.Kind), result), nil
+	return d.afterAct(ctx, entry, moved, ranPageCode(action.Kind), began, result), nil
 }
 
 // ranPageCode says whether this verb handed control to the page's own scripts.
@@ -188,10 +192,10 @@ func needsRef(kind browser.ActionKind) bool {
 // return the instant the CDP call came back, which is before the page had anything to show. See
 // [Driver.awaitSettled]: the wait is a short reaction window that costs nothing when nothing
 // started, and turns into a real wait when something did.
-func (d *Driver) afterAct(ctx context.Context, entry *session, moved *watcher, ranCode bool, result browser.ActResult) browser.ActResult {
+func (d *Driver) afterAct(ctx context.Context, entry *session, moved *watcher, ranCode bool, began time.Time, result browser.ActResult) browser.ActResult {
 	if !moved.sawNavigation() {
 		if ranCode {
-			result.StillLoading = d.awaitSettled(ctx, entry)
+			result.StillLoading = d.awaitSettled(ctx, entry, began)
 		}
 		return result
 	}

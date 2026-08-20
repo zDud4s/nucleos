@@ -213,10 +213,36 @@ func (d *Driver) ferryState(entry *session) (asked, carrying int) {
 // settleGrace is how long an act that ran the page's own code is given to start something.
 //
 // It is a REACTION window and not a wait: it is spent only when the act set nothing in motion, and
-// the moment the page asks the ferry for anything the wait switches to draining that instead. So a
-// click on a link that does nothing costs this once, and a click that fetches costs what the fetch
-// costs.
+// the moment the page asks the ferry for anything, or redraws itself, the wait switches to that
+// instead. So a click on a link that does nothing costs this once, and a click that fetches costs
+// what the fetch costs.
 const settleGrace = 300 * time.Millisecond
+
+// changeDebounce is how long the page's own observer coalesces before it tells us anything.
+//
+// A MutationObserver on a document fires per node, and this report crosses a socket: undebounced, a
+// page rendering a list would send thousands of messages to say one thing.
+//
+// It is SPENT OUT OF settleGrace, which is what keeps it short. The window is a bound on how late a
+// redraw still counts as caused by the act, and every millisecond the observer sits on the news is a
+// millisecond of that bound gone before we hear it. At 100ms a page that drew at 250 was reported at
+// 350 and missed; the debounce is the part of that we control.
+const changeDebounce = 40 * time.Millisecond
+
+// The reaction window is a bound on how late a redraw still counts as CAUSED by the act, and it is a
+// judgement rather than a measurement: an interface that has not begun to respond within it is not
+// one a person would call responsive either. A page that renders half a second after a click is read
+// as it stood before — which is why the next reading says `still_loading` when it is, and why taking
+// another one is cheap.
+
+// movingBound caps how long a page may hold an act by changing.
+//
+// A page that never stops changing is ORDINARY — a clock, a carousel, a spinner — and waiting it out
+// would make every act on it cost the full deadline. Reaching this bound is not "still loading"
+// either: the document is there and the agent can read it. What it costs is that an act on a page
+// with something ticking on it pays this much, which is the price of not returning before a click
+// has drawn anything.
+const movingBound = 1500 * time.Millisecond
 
 // awaitSettled waits for what an act set in motion WITHOUT replacing the document.
 //
@@ -229,46 +255,53 @@ const settleGrace = 300 * time.Millisecond
 //
 // A page that goes on asking is not waited on forever: the overall bound is the same one Open uses,
 // and reaching it is reported as still loading rather than passed off as finished.
-func (d *Driver) awaitSettled(ctx context.Context, entry *session) (stillLoading bool) {
+func (d *Driver) awaitSettled(ctx context.Context, entry *session, since time.Time) (stillLoading bool) {
 	overall := time.NewTimer(d.readyWithin)
 	defer overall.Stop()
-	reaction := time.NewTimer(d.settleWithin)
-	defer reaction.Stop()
-	reactionC := reaction.C
-	// Polled, because nothing the watcher hears fires when a ferried request starts or finishes:
-	// that happens on this side of the connection.
+	moving := time.NewTimer(d.movingWithin)
+	defer moving.Stop()
+	// Polled, because neither signal is one the page watcher hears: a ferried request starts and
+	// finishes on this side of the connection, and a redraw arrives as a binding call.
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 
-	asked := false
-	var render *time.Timer
-	var renderC <-chan time.Time
-	stopRender := func() {
-		if render != nil {
-			render.Stop()
-			render, renderC = nil, nil
-		}
-	}
-	defer stopRender()
+	reactionEnds := time.Now().Add(d.settleWithin)
+	started := false
 
 	for {
-		if _, carrying := d.ferryState(entry); carrying > 0 {
-			// It asked. The reaction window has served its purpose and must not fire — it would
-			// answer "nothing started" about a page that is mid-request.
-			asked, reactionC = true, nil
-			stopRender()
-		} else if asked && render == nil {
-			render = time.NewTimer(renderGrace)
-			renderC = render.C
+		_, carrying := d.ferryState(entry)
+		changed := d.changedAt(entry)
+		// A redraw from before this act is somebody else's news. Only what happened after it began
+		// is evidence that it began anything.
+		busy := carrying > 0
+		drawing := !changed.Before(since) && time.Since(changed) < renderGrace
+		if busy || drawing {
+			started = true
+		}
+
+		switch {
+		case busy || drawing:
+			// Still going. Nothing to decide yet.
+		case started:
+			// It started something and that something has gone quiet.
+			return false
+		case time.Now().After(reactionEnds):
+			// The act touched the page and the page did nothing. There is nothing to wait for, and
+			// waiting anyway is how a cheap verb stops being cheap.
+			return false
+		}
+
+		// While a request of ours is in flight the moving bound must not fire: it would answer
+		// "done" about a page that is mid-request, which is the one thing this wait exists to stop.
+		movingC := moving.C
+		if busy {
+			movingC = nil
 		}
 
 		select {
 		case <-tick.C:
-		case <-renderC:
-			return false
-		case <-reactionC:
-			// The act touched the page and the page asked for nothing. There is nothing to wait for,
-			// and waiting anyway is how a cheap verb stops being cheap.
+		case <-movingC:
+			// A page that never settles is ordinary, and it is not unfinished — see movingBound.
 			return false
 		case <-overall.C:
 			return true
@@ -276,6 +309,32 @@ func (d *Driver) awaitSettled(ctx context.Context, entry *session) (stillLoading
 			return true
 		}
 	}
+}
+
+// noteChange records that a page said it redrew itself.
+//
+// A timestamp and not a count: what the wait needs to know is when the changes STOPPED, and a
+// counter would answer a different question at the same cost.
+func (d *Driver) noteChange(on cdp.SessionID) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	owner, known := d.cdpToSession[on]
+	if !known {
+		return
+	}
+	if entry, live := d.sessions[owner]; live {
+		entry.changedAt = time.Now()
+	}
+}
+
+// changedAt is when this session's page last said it redrew.
+func (d *Driver) changedAt(entry *session) time.Time {
+	if entry == nil {
+		return time.Time{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return entry.changedAt
 }
 
 // mainFrameOf asks which frame is the top one, so the watcher can ignore everything else.
@@ -322,4 +381,6 @@ func (d *Driver) forgetRefs(entry *session) {
 	entry.blockedLast = browser.Refusal{}
 	entry.ferried = 0
 	entry.carrying = 0
+	// A redraw of the document that is gone is not news about the one that replaced it.
+	entry.changedAt = time.Time{}
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -67,6 +68,17 @@ const (
 	ferryBinding = "__nucleosFerry"
 	// ferryReply is how the answer gets back in.
 	ferryReply = "__nucleosFerryReply"
+	// changeBinding is the page saying it just redrew itself.
+	//
+	// The ferry told us when the page asked for something and never when it DID something with the
+	// answer — and plenty of acts change a page without asking us for anything at all: a menu that
+	// opens, a route that renders from data already in memory, a list that filters. For those the
+	// wait after an act had nothing to watch.
+	changeBinding = "__nucleosChanged"
+	// changeBudget stops a page that never settles from talking to us forever. Reached, the observer
+	// disconnects: at one report per changeDebounce that is about a minute of continuous change, by
+	// which point nothing more is being learned.
+	changeBudget = 1500
 	// ferryBudget bounds how many requests one document may ask us to make. A page that polls would
 	// otherwise have us carrying its traffic forever; past the bound it is refused, and the refusal
 	// is counted where the agent will see it.
@@ -83,8 +95,37 @@ const (
 // It replaces `fetch` wholesale and `XMLHttpRequest` only where it can be honest — see the package
 // comment. `Response` is built from the real constructor, so a page that inspects what it got sees
 // the type it expects rather than a shape we invented.
-const ferryShim = `(() => {
+// The two numbers the observer above needs, rendered once so the JavaScript cannot drift from the
+// Go constants that document them. A literal in the script and a constant in the file would be two
+// values that only ever agree by somebody remembering.
+var (
+	changeBudgetJS   = strconv.Itoa(changeBudget)
+	changeDebounceJS = strconv.Itoa(int(changeDebounce / time.Millisecond))
+)
+
+var ferryShim = `(() => {
   if (globalThis.` + ferryReply + `) { return; }
+
+  // The page telling us it changed. Debounced hard and budgeted, because a MutationObserver on a
+  // whole document fires per node on a render and this crosses a socket: undebounced, a page that
+  // draws a list would send thousands of these to say one thing.
+  let reported = 0, waiting = false;
+  const changed = () => {
+    if (waiting || reported >= ` + changeBudgetJS + `) { return; }
+    waiting = true;
+    setTimeout(() => {
+      waiting = false;
+      reported++;
+      try { ` + changeBinding + `(''); } catch (e) {}
+      if (reported >= ` + changeBudgetJS + `) { watcher.disconnect(); }
+    }, ` + changeDebounceJS + `);
+  };
+  // On the document object and not on documentElement: this runs before the document has one.
+  const watcher = new MutationObserver(changed);
+  try {
+    watcher.observe(document, {childList: true, subtree: true, characterData: true});
+  } catch (e) {}
+
   const pending = new Map();
   let next = 0;
   globalThis.` + ferryReply + ` = (answer) => {
@@ -197,6 +238,9 @@ func (d *Driver) armFerry(ctx context.Context, on cdp.SessionID) {
 	if _, err := d.conn.Call(ctx, on, "Runtime.addBinding", map[string]any{"name": ferryBinding}); err != nil {
 		return
 	}
+	// Best effort, and separately: without it the page loses the wait after an act that redraws
+	// without fetching, which is a worse reading rather than a weaker fence.
+	_, _ = d.conn.Call(ctx, on, "Runtime.addBinding", map[string]any{"name": changeBinding})
 	_, _ = d.conn.Call(ctx, on, "Page.addScriptToEvaluateOnNewDocument", map[string]any{
 		"source": ferryShim,
 	})
@@ -240,13 +284,19 @@ func (d *Driver) onRuntimeEvent(event cdp.Event) {
 			Payload   string `json:"payload"`
 			ContextID int64  `json:"executionContextId"`
 		}
-		if err := json.Unmarshal(event.Params, &params); err != nil || params.Name != ferryBinding {
+		if err := json.Unmarshal(event.Params, &params); err != nil {
 			return
 		}
-		// On a goroutine, always. Handlers run in order on one dispatch loop, so carrying a request
-		// inline would hold up every refusal, navigation and lifecycle event behind it for as long
-		// as the network takes.
-		go d.serveFerry(event.Session, params.ContextID, params.Payload)
+		switch params.Name {
+		case changeBinding:
+			// Inline, because it is a timestamp. Anything heavier here would be paid per redraw.
+			d.noteChange(event.Session)
+		case ferryBinding:
+			// On a goroutine, always. Handlers run in order on one dispatch loop, so carrying a
+			// request inline would hold up every refusal, navigation and lifecycle event behind it
+			// for as long as the network takes.
+			go d.serveFerry(event.Session, params.ContextID, params.Payload)
+		}
 	}
 }
 
