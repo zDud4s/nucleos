@@ -4783,6 +4783,167 @@ mod tests {
         );
     }
 
+    /// The seam: this file's own code driving the REAL CLI, and a second turn served by the process
+    /// the first one started.
+    ///
+    /// `#[ignore]` because it needs the Claude Code CLI installed, an authenticated session, and
+    /// about forty cents.
+    ///
+    /// Everything else about a living conversation is tested against `FakeCommandRunner` — which
+    /// proves the wiring, and which this month proved it against a double that could not do the
+    /// thing being wired: it had no `run_prompt_with_turns`, so every rooted turn in the suite took
+    /// a path that could not work and every assertion still passed. `runner.rs` asks the real CLI
+    /// whether it serves a second turn down one stdin. This asks whether THIS code does, which is
+    /// the half in between and the half nothing covered.
+    ///
+    /// No daemon, no HTTP, no port: the daemon's database is the operator's own and its port is
+    /// whatever is already listening on this machine. What is under test is `serve_turn` and what it
+    /// keeps, so that is what is called.
+    #[tokio::test]
+    #[ignore = "spawns the real Claude CLI and spends money; run with --include-ignored"]
+    async fn the_real_cli_serves_a_conversations_second_turn_through_serve_turn() {
+        /// The real runner with a tally, because "one process served both" is a claim about
+        /// LAUNCHES and the real runner keeps no count of its own.
+        struct Counting {
+            inner: crate::runner::ClaudeCliRunner,
+            launches: Mutex<u32>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::runner::CommandRunner for Counting {
+            async fn run_prompt(
+                &self,
+                request: crate::runner::RunRequest,
+                session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+                transcript: std::sync::Arc<Mutex<String>>,
+            ) -> std::io::Result<crate::runner::RunOutcome> {
+                *self.launches.lock().unwrap() += 1;
+                self.inner.run_prompt(request, session_tx, transcript).await
+            }
+
+            async fn run_prompt_with_turns(
+                &self,
+                request: crate::runner::RunRequest,
+                session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+                transcript: std::sync::Arc<Mutex<String>>,
+                context_fill: std::sync::Arc<Mutex<Option<i64>>>,
+                turn_events: Option<tokio::sync::mpsc::UnboundedSender<crate::runner::TurnEvent>>,
+            ) -> std::io::Result<crate::runner::RunOutcome> {
+                *self.launches.lock().unwrap() += 1;
+                self.inner
+                    .run_prompt_with_turns(
+                        request,
+                        session_tx,
+                        transcript,
+                        context_fill,
+                        turn_events,
+                    )
+                    .await
+            }
+        }
+
+        // Held typed as well as behind the trait object, so the tally can actually be read. A
+        // counter nobody asserts on is the shape of a test that passes for the wrong reason, which
+        // is the failure this whole test exists to rule out.
+        let counting = std::sync::Arc::new(Counting {
+            inner: crate::runner::ClaudeCliRunner {
+                model: "sonnet".to_owned(),
+                plan_model: None,
+                review_model: None,
+            },
+            launches: Mutex::new(0),
+        });
+        let runner: std::sync::Arc<dyn crate::runner::CommandRunner> = counting.clone();
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = "the-seam";
+
+        // Turn one: no session to resume, so it starts a process and keeps it.
+        let first = std::sync::Arc::new(Mutex::new(String::new()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let opening = serve_turn(
+            &runner,
+            seam_request("Reply with the single word one.", root.path(), None),
+            tx,
+            &first,
+            chat_id,
+            std::time::Duration::from_secs(180),
+            true,
+        )
+        .await
+        .expect("the turn should not have timed out")
+        .expect("the CLI should have run");
+
+        let session = opening
+            .session_id
+            .clone()
+            .expect("a turn announces its session");
+        assert!(opening.stdout.contains("\"type\":\"result\""));
+
+        // Turn two, down the process turn one left standing. The session it names is the one that
+        // process is on, which is what the guard in `serve_turn` requires before it will speak to it.
+        let second_said = std::sync::Arc::new(Mutex::new(String::new()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let second = serve_turn(
+            &runner,
+            seam_request(
+                "Reply with the single word two.",
+                root.path(),
+                Some(session.clone()),
+            ),
+            tx,
+            &second_said,
+            chat_id,
+            std::time::Duration::from_secs(180),
+            true,
+        )
+        .await
+        .expect("the second turn should not have timed out")
+        .expect("the CLI should still have been there");
+
+        // Taken out before any assertion can fail, or a panic leaves a real CLI running.
+        evict_live(chat_id);
+
+        assert_eq!(
+            *counting.launches.lock().unwrap(),
+            1,
+            "the second turn started a second CLI instead of speaking to the first"
+        );
+        assert_eq!(second.session_id.as_deref(), Some(session.as_str()));
+        // The boundary, against a real stream: turn two got ITS answer and not turn one's as well.
+        assert_eq!(second.stdout.matches("\"type\":\"result\"").count(), 1);
+        assert!(!second.stdout.contains("single word one"));
+    }
+
+    /// One turn of a rooted conversation, in the shape `send_message_with` builds.
+    #[cfg(test)]
+    fn seam_request(
+        prompt: &str,
+        cwd: &std::path::Path,
+        resume: Option<String>,
+    ) -> crate::runner::RunRequest {
+        crate::runner::RunRequest {
+            prompt: prompt.to_owned(),
+            env: Vec::new(),
+            cwd: Some(cwd.to_path_buf()),
+            plan_only: false,
+            resume_session_id: resume,
+            mcp_config: None,
+            tool_policy: crate::runner::ToolPolicy::Unrestricted,
+            progress_timeout: None,
+            max_turns: None,
+            session_id: Some(crate::auth::generate_uuid_v4()),
+            fork_session: false,
+            include_partial_messages: true,
+            images: Vec::new(),
+            steerable: false,
+            classifier_governs_tools: false,
+            messages: None,
+            ambient_mcp: false,
+            model: Some("sonnet".to_owned()),
+            allowed_mcp_tools: None,
+        }
+    }
+
     /// A conversation with no tools keeps no process, and the reason is not caution.
     ///
     /// A rooted turn carries a key scoped to its conversation, which stays true as the turns change
