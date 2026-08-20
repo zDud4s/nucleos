@@ -454,3 +454,66 @@ func TestShutdownStopsEveryBrowserAndSweepsTheProfiles(t *testing.T) {
 		t.Errorf("shutdown took a project profile: %v", err)
 	}
 }
+
+// TestAProfileIsChasedUntilTheHandlesGo.
+//
+// The failure this guards is not a slow disk. Stop() issues `taskkill /T /F` and then waits on the
+// launcher's pid, which spec §9.3 says is not the browser — so the renderers it killed can still be
+// exiting, still holding handles into the profile, when RemoveAll walks it. On Windows an open handle
+// is enough to make a file undeletable. The removal used to be one call with the error thrown away,
+// so spec §5.1's promise that an ephemeral profile dies with its run stopped holding and nothing
+// anywhere said so.
+//
+// Two failures then a success is the shape measured against the gate: the window is short, because
+// what closes it is a handful of processes finishing.
+func TestAProfileIsChasedUntilTheHandlesGo(t *testing.T) {
+	tries := 0
+	err := chase(func() error {
+		tries++
+		if tries < 3 {
+			return errors.New("the directory is not empty")
+		}
+		return nil
+	}, time.Second, time.Millisecond)
+
+	if err != nil {
+		t.Fatalf("the profile survived a window that was long enough: %v", err)
+	}
+	if tries != 3 {
+		t.Errorf("it asked %d times; asking once is the bug this replaced", tries)
+	}
+}
+
+// TestChasingAProfileGivesUpRatherThanHanging.
+//
+// The other half, and the one that matters more. A directory something holds open FOREVER is a
+// different fault — a browser that did not die, a handle nobody owns — and a chase with no bound
+// would wear this one's clothes while hanging the session that closed.
+func TestChasingAProfileGivesUpRatherThanHanging(t *testing.T) {
+	held := errors.New("something still has it open")
+	tries := 0
+	began := time.Now()
+	err := chase(func() error { tries++; return held }, 50*time.Millisecond, time.Millisecond)
+
+	if !errors.Is(err, held) {
+		t.Fatalf("giving up reported %v rather than what actually went wrong", err)
+	}
+	if tries < 2 {
+		t.Errorf("it gave up after %d attempt(s), so the window bought nothing", tries)
+	}
+	if elapsed := time.Since(began); elapsed > time.Second {
+		t.Errorf("it held the caller for %s; the bound is what stops this being a hang", elapsed)
+	}
+}
+
+// TestAnAttemptIsMadeEvenWithNoWindowToChaseIn. A caller that passed no window meant "try", not
+// "do nothing" — and a zero here would otherwise silently stop deleting profiles altogether.
+func TestAnAttemptIsMadeEvenWithNoWindowToChaseIn(t *testing.T) {
+	tries := 0
+	if err := chase(func() error { tries++; return nil }, 0, time.Millisecond); err != nil {
+		t.Fatalf("the one attempt failed: %v", err)
+	}
+	if tries != 1 {
+		t.Errorf("a zero window produced %d attempts", tries)
+	}
+}

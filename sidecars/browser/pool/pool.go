@@ -28,10 +28,22 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/fence"
 	"nucleosbrowser/profile"
+)
+
+const (
+	// discardWithin bounds how long an ephemeral profile's directory is chased. Generous against a
+	// slow machine and free against a person, because nothing is waiting on it: release runs after
+	// the caller already has its answer. What it must not do is wait for ever, and see discard for
+	// why a directory held open for ever is a different fault wearing this one's clothes.
+	discardWithin = 5 * time.Second
+	// discardRetry is the gap between attempts. Short, because what it waits out is a handful of
+	// processes finishing their exit, not an interval anybody chose.
+	discardRetry = 100 * time.Millisecond
 )
 
 // Instance is one running browser: a driver, plus the ability to be shut down gracefully.
@@ -394,11 +406,50 @@ func (p *Pool) release(ctx context.Context, holder *entry, id browser.SessionID)
 
 // discard removes an ephemeral profile from disk. A project profile is left alone by
 // profile.Store.Discard itself, which is where that refusal belongs.
+//
+// # Why it chases instead of asking once
+//
+// It used to be one call with the error thrown away, and the promise underneath it — spec §5.1, an
+// ephemeral profile dies with its run — quietly did not hold. The removal RACES the browser's own
+// death. Stop() issues `taskkill /T /F` and then waits on the launcher's pid, which spec §9.3 says
+// is not the browser: the renderers it just killed can still be exiting, still holding handles into
+// the profile directory, when RemoveAll walks it. On Windows an open handle is enough to make a file
+// undeletable, so the call fails, and `_ =` meant nothing anywhere said so.
+//
+// MEASURED against the gate: the assertion that the directory is gone the instant the last session
+// closes fails intermittently and passes in isolation, which is the shape of a race and not of a
+// slow machine. The window is short — the handles go as the processes finish — so this asks again
+// rather than waiting once for a guessed interval, and the total is bounded because a profile that
+// something is holding open FOREVER is a different fault and must not become a hang here.
+//
+// The final failure is still swallowed, and that is a decision rather than an oversight: this
+// package has nowhere to report to, and Store.SweepEphemeral takes the leftovers at the next start.
+// It is a backstop and not a fix — until that start, a profile the spec says is gone is on disk.
 func (p *Pool) discard(ref profile.Ref) {
 	if ref.Persistent() {
 		return
 	}
-	_ = p.store.Discard(ref)
+	_ = chase(func() error { return p.store.Discard(ref) }, discardWithin, discardRetry)
+}
+
+// chase repeats an attempt until it succeeds or the window closes, and hands back the last error.
+//
+// A free function taking the attempt rather than a loop inside discard, because the thing worth
+// testing is the chasing and the caller it exists for cannot be made to fail on demand: profile.Store
+// is a concrete type over a real directory, so a test that went in through discard would be a test of
+// the filesystem's mood on the day it ran.
+//
+// It always attempts at least once, including when the window is zero or negative. A caller that
+// passed no window meant "try", not "do nothing".
+func chase(attempt func() error, within, gap time.Duration) error {
+	deadline := time.Now().Add(within)
+	for {
+		err := attempt()
+		if err == nil || !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(gap)
+	}
 }
 
 func (p *Pool) lookup(id browser.SessionID) (placed, error) {
