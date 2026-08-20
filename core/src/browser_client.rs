@@ -209,6 +209,23 @@ pub struct Snapshot {
     /// nothing at all. There is no `wait` verb on purpose, so the reading has to carry it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub still_loading: bool,
+    /// Questions the page put to a PERSON, and the answers it was given instead.
+    ///
+    /// `alert`, `confirm`, `prompt` and `beforeunload` freeze the renderer until the attached
+    /// debugger answers them, and the sidecar answers no — accepting would be a decision taken on
+    /// somebody's behalf, on a surface the page controls. Carried here because otherwise the agent
+    /// reads a page where its click did nothing and concludes the button is broken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dialogs: Vec<Dialog>,
+}
+
+/// One question the page asked a person, and the answer given on their behalf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dialog {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    pub answer: String,
 }
 
 /// What the injected CSP stopped: how many, and the most recent one.

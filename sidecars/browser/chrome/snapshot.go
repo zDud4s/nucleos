@@ -71,6 +71,7 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 		Blocked:      d.blockedSoFar(entry),
 		StillLoading: stillLoading,
 		Unread:       facts.Unread,
+		Dialogs:      d.dialogsSoFar(entry),
 	}, nil
 }
 

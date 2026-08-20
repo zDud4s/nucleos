@@ -229,6 +229,15 @@ type Snapshot struct {
 	// have to spend a turn asking for. So the reading itself carries whether the page has settled,
 	// and an agent told "not finished" can take another one and be told it now is.
 	StillLoading bool `json:"still_loading,omitempty"`
+	// Dialogs are the questions this page put to a PERSON, and the answers it was given instead.
+	//
+	// alert, confirm, prompt and beforeunload freeze the renderer until something answers them, and
+	// with the Page domain enabled that something is this driver rather than Chromium. It answers
+	// no. So a page CAN have asked "Delete everything?", been told no, and carried on — and without
+	// this the agent reads a page where its click did nothing and concludes the button is broken.
+	//
+	// On the reading rather than on the act, for the same reason Blocked is: the act did happen.
+	Dialogs []Dialog `json:"dialogs,omitempty"`
 }
 
 // Unread is one kind of thing on the page that the accessibility tree does not carry.
@@ -238,6 +247,17 @@ type Snapshot struct {
 type Unread struct {
 	Kind  string `json:"kind"`
 	Count int    `json:"count"`
+}
+
+// Dialog is one question the page asked a person, and the answer the driver gave on their behalf.
+//
+// Answer is "dismissed" for everything but beforeunload, which is "accepted" — see chrome/dialog.go
+// for why those two and not one rule. "unanswered" means the answer itself failed to land, which is
+// the one case where the page may still be frozen.
+type Dialog struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message,omitempty"`
+	Answer  string `json:"answer"`
 }
 
 // ActionKind is the verb. The set is small and closed on purpose (spec §6.2, "consequence-free in

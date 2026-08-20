@@ -394,6 +394,8 @@ func (d *Driver) forgetRefs(entry *session) {
 	entry.blockedLast = browser.Refusal{}
 	entry.ferried = 0
 	entry.carrying = 0
+	// A question the document that is gone asked is not one this one is asking.
+	entry.dialogs = nil
 	// A redraw of the document that is gone is not news about the one that replaced it.
 	entry.changedAt = time.Time{}
 }

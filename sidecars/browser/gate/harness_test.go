@@ -103,6 +103,19 @@ func newSite(t *testing.T) *site {
 		s.note(r)
 		fmt.Fprint(w, "ok")
 	})
+	// A page that asks the PERSON a question, which is a thing the agent is not. confirm() blocks the
+	// renderer until somebody answers the dialog, and with Page.enable on (chrome/driver.go) that
+	// somebody has to be this driver: Chromium hands the dialog to the attached client and waits.
+	//
+	// The title says which way it was answered, because "the dialog went away" is not the fact worth
+	// measuring — WHICH answer the page received is, and a wrong one confirms deletions.
+	mux.HandleFunc("/dialog", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>dialog</title><body>
+			<h1>Settings</h1>
+			<button id=go onclick="document.title = confirm('Delete everything?') ? 'accepted' : 'dismissed'">Delete</button>`)
+	})
 	// The other half of the same rule: a search box. Same page shape as /form, same button, and the
 	// only difference is the one the fence is supposed to care about. It carries a filled field
 	// rather than an empty form because what has to arrive at the server is the FIELD — a submission

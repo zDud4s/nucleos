@@ -536,6 +536,11 @@ impl NucleosTools {
                        If `still_loading` is there the page had not finished arriving \
                        when this was read: take another snapshot rather than concluding \
                        anything from what is missing. \
+                       If `dialogs` is there the page asked a person a question - a confirm, \
+                       an alert - and it was answered NO on their behalf, so whatever was \
+                       behind that confirmation did not happen. The button is not broken: it \
+                       wanted a decision nobody here can take. Read the `message`, and if the \
+                       answer needed to be yes, ask a person with browser_handoff. \
                        Cheap enough to call between actions, and you \
                        should: a ref only names something a snapshot actually showed you."
     )]

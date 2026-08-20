@@ -122,6 +122,10 @@ type session struct {
 	// browser's network stack, so `networkAlmostIdle` fires while it is still on its way.
 	ferried  int
 	carrying int
+	// dialogs are the questions THIS document put to a person and the answers it was given in their
+	// place. Per document and reset with the rest: "the page asked me to confirm something" is a fact
+	// about the page being read, not about the one before it.
+	dialogs []browser.Dialog
 }
 
 // contextKey names one execution context. The id is unique within a target and not across them, so
@@ -211,6 +215,10 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	conn.OnEvent(driver.onFetchPaused)
 	conn.OnEvent(driver.onLogEntry)
 	conn.OnEvent(driver.onRuntimeEvent)
+	// Subscribed here, with the others, and not when a page opens: a dialog that arrives with nobody
+	// listening leaves the renderer frozen for the life of the session, and there is no later moment
+	// from which that can be recovered.
+	conn.OnEvent(driver.onDialog)
 	driver.startSweep()
 	return driver, nil
 }
