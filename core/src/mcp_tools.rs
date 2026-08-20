@@ -582,6 +582,12 @@ impl NucleosTools {
                        rather than as a link. type PASTES - it fires no keystroke - so a \
                        box that submits on Enter needs a press after it. \
                        select works on a real dropdown and says so when the thing is not one. \
+                       click moves a real pointer onto the element before pressing, so a menu \
+                       that opens on hover is already open in your next snapshot. It can refuse: \
+                       if something is ON TOP of the element it says what, and the move is to \
+                       deal with that first - dismiss the banner, close the overlay - not to \
+                       click again; if the element has no size it is hidden or collapsed and \
+                       something has to open it first. \
                        If the answer carries `navigated`, the page changed underneath you and \
                        EVERY ref you hold is dead: take a fresh snapshot before acting again. \
                        Actions with a consequence outside this machine - any non-GET request, a \

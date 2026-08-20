@@ -361,7 +361,7 @@ func TestActReportsWhatTheFenceStopped(t *testing.T) {
 	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) {
 		// The click causes the request, exactly as a real one would.
 		go pauseRequest(fake, "S1", requestStage("https://example.org/delete", "DELETE", "XHR", nil))
-		return map[string]any{}, nil
+		return reachable(), nil
 	})
 
 	driver, err := Connect(context.Background(), conn, projectPolicy())
@@ -399,6 +399,9 @@ func TestAnActThatCausesNothingIsDone(t *testing.T) {
 	fake.Handle("DOM.resolveNode", func(cdptest.Call) (any, error) {
 		return map[string]any{"object": map[string]any{"objectId": "O1"}}, nil
 	})
+	// Builds its own driver rather than going through connected(t), so it needs the answer a click
+	// asks the page for before it presses anything.
+	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) { return reachable(), nil })
 
 	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {

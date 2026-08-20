@@ -103,6 +103,54 @@ func newSite(t *testing.T) *site {
 		s.note(r)
 		fmt.Fprint(w, "ok")
 	})
+	// A menu that opens on pointerdown and on nothing else, which is how a great many real components
+	// are built: it is what makes them feel immediate. Under a click synthesised by calling
+	// element.click() this menu never opened, and the act still said done.
+	mux.HandleFunc("/pointer", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>pointer</title><body>
+			<h1>Messages</h1>
+			<button id=go>Actions</button>
+			<div id=menu></div>
+			<script>
+			document.getElementById('go').addEventListener('pointerdown', () => {
+				document.getElementById('menu').innerHTML = '<button id=item>Archive</button>';
+			});
+			</script>`)
+	})
+
+	// A menu that opens on hover and on nothing else. There is no hover verb, and this page is the
+	// reason one is not needed: moving the pointer onto the parent before pressing it is part of
+	// clicking it, so the submenu is open by the time the next reading is taken.
+	mux.HandleFunc("/hover", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>hover</title><body>
+			<h1>Documents</h1>
+			<button id=parent>File</button>
+			<div id=menu></div>
+			<script>
+			document.getElementById('parent').addEventListener('mouseover', () => {
+				document.getElementById('menu').innerHTML = '<button id=item>Export</button>';
+			});
+			</script>`)
+	})
+
+	// A button under a consent banner. The accessibility tree carries the button either way — an
+	// overlay is a painting decision and the tree is not about painting — so the reading shows a
+	// button the agent cannot actually reach.
+	mux.HandleFunc("/covered", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>covered</title><body>
+			<h1>Settings</h1>
+			<button id=go onclick="document.title = 'saved'">Save</button>
+			<div id=banner style="position:fixed; inset:0; background:rgba(0,0,0,0.6); color:white">
+				We use cookies
+			</div>`)
+	})
+
 	// A 404 that looks like a page, because that is what a 404 IS. A heading, a sentence, a search
 	// box — nothing about the reading of it says the request failed, which is the entire reason the
 	// status has to be carried separately.

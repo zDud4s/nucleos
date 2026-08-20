@@ -144,7 +144,9 @@ func TestAFormTheCSPStoppedReachesTheActThatCausedIt(t *testing.T) {
 	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) {
 		fake.Emit("S1", "Log.entryAdded",
 			refusedBy("send form data to", "blob:https://example.org/9f2c", formActionDirective()))
-		return map[string]any{}, nil
+		// reachable, not an empty result: the click asks the page where the element is before it
+		// presses, and a page that answers nothing fails the act before this test's subject runs.
+		return reachable(), nil
 	})
 
 	result := act(t, driver, id, browser.Action{Kind: browser.ActionClick, Ref: "e1"})
@@ -181,7 +183,7 @@ func TestWhatTheLastPageBlockedIsNotCountedAgainstThisOne(t *testing.T) {
 	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) {
 		fake.Emit("S1", "Page.frameNavigated", map[string]any{"frame": map[string]any{"id": "F1"}})
 		fake.Emit("S1", "Page.lifecycleEvent", map[string]any{"name": "networkAlmostIdle"})
-		return map[string]any{}, nil
+		return reachable(), nil
 	})
 	if result := act(t, driver, id, browser.Action{Kind: browser.ActionClick, Ref: "e1"}); !result.Navigated {
 		t.Fatal("the act did not navigate, so this proves nothing")
