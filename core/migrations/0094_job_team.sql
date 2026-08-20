@@ -1,0 +1,15 @@
+-- Which team directs this job, and NULL is the information: "the job of today".
+--
+-- Null by default and null in everything that exists, which is what makes this migration silent. A
+-- job without a team runs the same sequence it always ran and ends the same way it always ended;
+-- the column only starts meaning anything when somebody fills it, and nothing fills it yet.
+--
+-- TEXT and not INTEGER: `teams.id` is a slug (0071), not an autoincrement. The foreign key is real
+-- and `storage.rs` has `foreign_keys` on, so a job cannot name a team that was never created.
+--
+-- It arrives four slices before the director that writes it, because what reads it is the state
+-- machine, and every proof after this one needs a job that has a team to be observable at all.
+-- What it buys immediately: a team's items work in trees of their own, so an item that breaks no
+-- longer has to end the queue — the reason it did was the shared tree, and that reason is gone.
+-- `next_step` reads this column to know which of the two jobs it is looking at.
+ALTER TABLE jobs ADD COLUMN team_id TEXT REFERENCES teams(id);
