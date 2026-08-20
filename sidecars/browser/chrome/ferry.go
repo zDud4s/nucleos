@@ -45,9 +45,14 @@ import (
 //
 // # What it deliberately does not do
 //
-//   - Cross-origin. Same-origin only, which is the `/api/...` case and is nearly all of it. It opens
-//     no host the page could not already reach, and the response comes from a server the page
-//     already is.
+//   - Cross-origin beyond what a browser without any of this would already allow. `app.example.com`
+//     rendering itself from `api.example.com` is not an edge case, it is how a large part of the web
+//     is built, and same-origin-only left every one of those pages blank. So the rule became the
+//     BROWSER'S rule, applied by us: the target must be a site this profile admits at all, and the
+//     response must carry the `Access-Control-Allow-*` headers a real browser would demand before
+//     letting a page read it — with credentials only where the request asked for them and the server
+//     agreed, which is the exact pair CORS is specified in terms of. This grants nothing an unfenced
+//     Chromium would refuse; a server that does not opt in is not read, and the refusal says so.
 //   - Anything but GET and HEAD. A write is the consequence §6.2 exists to refuse, and the ferry is
 //     not a way around the method rule.
 //   - Sockets. There is no ferry for WebSocket and there will not be one: a socket is a channel, and
@@ -88,11 +93,11 @@ const ferryShim = `(() => {
     pending.delete(answer.id);
     waiting(answer);
   };
-  const ask = (url, method) => new Promise((resolve) => {
+  const ask = (url, method, credentials) => new Promise((resolve) => {
     const id = ++next;
     pending.set(id, resolve);
     try {
-      ` + ferryBinding + `(JSON.stringify({id: id, url: String(url), method: String(method || 'GET')}));
+      ` + ferryBinding + `(JSON.stringify({id: id, url: String(url), method: String(method || 'GET'), credentials: String(credentials || 'same-origin')}));
     } catch (e) {
       pending.delete(id);
       resolve({id: id, ok: false, detail: String(e)});
@@ -100,10 +105,17 @@ const ferryShim = `(() => {
   });
 
   globalThis.fetch = function (input, init) {
-    let url = input, method = 'GET';
-    if (input && typeof input === 'object' && 'url' in input) { url = input.url; method = input.method || 'GET'; }
+    // 'same-origin' is fetch's own default, and it is what decides whether the profile's cookies
+    // are spent. Read from the call rather than assumed, so a cross-origin request the page made
+    // without credentials is carried without them.
+    let url = input, method = 'GET', credentials = 'same-origin';
+    if (input && typeof input === 'object' && 'url' in input) {
+      url = input.url; method = input.method || 'GET';
+      if (input.credentials) { credentials = input.credentials; }
+    }
     if (init && init.method) { method = init.method; }
-    return ask(url, method).then((answer) => {
+    if (init && init.credentials) { credentials = init.credentials; }
+    return ask(url, method, credentials).then((answer) => {
       if (!answer.ok) { throw new TypeError('Failed to fetch: ' + (answer.detail || 'refused')); }
       return new Response(answer.body, {status: answer.status, headers: answer.headers || {}});
     });
@@ -115,7 +127,7 @@ const ferryShim = `(() => {
     this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = '';
     this.response = ''; this.responseURL = ''; this.responseType = '';
     this.onreadystatechange = null; this.onload = null; this.onerror = null; this.onloadend = null;
-    this._listeners = {}; this._headers = '';
+    this._listeners = {}; this._headers = ''; this.withCredentials = false;
   }
   Ferried.prototype.open = function (method, url, isAsync) {
     this._method = String(method || 'GET').toUpperCase();
@@ -149,7 +161,7 @@ const ferryShim = `(() => {
       real.send();
       return;
     }
-    ask(this._url, this._method).then((answer) => {
+    ask(this._url, this._method, this.withCredentials ? 'include' : 'same-origin').then((answer) => {
       if (!answer.ok) { this.readyState = 4; this._fire('readystatechange'); this._fire('error'); this._fire('loadend'); return; }
       this.status = answer.status; this.statusText = '';
       this.responseText = answer.body || '';
@@ -243,6 +255,11 @@ type ferryAsk struct {
 	ID     int64  `json:"id"`
 	URL    string `json:"url"`
 	Method string `json:"method"`
+	// Credentials is fetch's own vocabulary — "omit", "same-origin", "include" — and it has to come
+	// from the call because CORS is specified in terms of it: a server may open a resource to
+	// everyone OR to one origin with cookies, and never to everyone with cookies. Deciding it here
+	// rather than after the response is not a detail, it is the order the rule is written in.
+	Credentials string `json:"credentials"`
 }
 
 // ferryAnswer is what goes back.
@@ -320,17 +337,39 @@ func (d *Driver) serveFerry(on cdp.SessionID, contextID int64, payload string) {
 		}
 		target = base.ResolveReference(target)
 	}
-	if origin := target.Scheme + "://" + target.Host; !strings.EqualFold(origin, context.origin) {
-		// Same-origin, and the origin is the one Chromium reports for the calling world, never the
-		// one the page claims. This opens no host the page could not already reach.
-		refuse(fmt.Sprintf("the fence carries requests to %s and not to %s", context.origin, origin))
-		return
+	// The origin is the one Chromium reports for the calling world, never the one the page claims:
+	// a restriction the restricted thing gets to describe is not one.
+	origin := target.Scheme + "://" + target.Host
+	sameOrigin := strings.EqualFold(origin, context.origin)
+	if !sameOrigin {
+		// Off the page's own origin, the profile's own allowlist answers first — the same list, and
+		// the same question, that decides whether a document from there may load at all. A site this
+		// profile would not open is not one it will read from either.
+		if verdict := fence.Decide(d.policy, fence.Request{
+			Method:       "GET",
+			URL:          target.String(),
+			ResourceType: "Document",
+		}); !verdict.Allow {
+			refuse(fmt.Sprintf("this profile does not admit %s", origin))
+			return
+		}
+	}
+
+	// Whether the profile's cookies are spent. Same-origin they are, unless the call said otherwise;
+	// cross-origin they are not, unless the call asked — which is fetch's own default, and the half
+	// of CORS that decides which answer the server has to give.
+	credentialed := sameOrigin
+	switch strings.ToLower(strings.TrimSpace(ask.Credentials)) {
+	case "omit":
+		credentialed = false
+	case "include":
+		credentialed = true
 	}
 
 	ctx, cancel := context2(ferryTimeout)
 	defer cancel()
 
-	status, body, headers, err := d.carry(ctx, on, context.origin, target.String())
+	status, body, headers, err := d.carry(ctx, on, context.origin, target.String(), credentialed, !sameOrigin)
 	if err != nil {
 		refuse(err.Error())
 		return
@@ -375,10 +414,11 @@ func context2(within time.Duration) (context.Context, context.CancelFunc) {
 //
 // The fence's own rules, run by the fence's own code. `fence.Decide` is the same function the CDP
 // interception calls on every request the browser makes, and it is called here on the same shape of
-// request. On top of it sits the ferry's same-origin rule, which is stricter than anything Decide
-// says — and stricter in the way that matters, since the page's own origin is by construction one
-// this profile already admitted when the document loaded.
-func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target string) (int, string, map[string]string, error) {
+// request. Above it, [Driver.serveFerry] has already answered the origin question; below it, a
+// response from another origin has to pass the check a browser would apply before letting a page
+// read it. That check is the whole of what CORS is, and implementing it rather than substituting
+// same-origin for it is what makes the ferry match an unfenced browser instead of guessing at one.
+func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target string, credentialed, crossOrigin bool) (int, string, map[string]string, error) {
 	verdict := fence.Decide(d.policy, fence.Request{
 		Method:       "GET",
 		URL:          target,
@@ -394,20 +434,42 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 	}
 	request.Header.Set("Accept", "*/*")
 	request.Header.Set("Referer", origin+"/")
-	if jar := d.cookiesFor(ctx, on, target); jar != "" {
-		request.Header.Set("Cookie", jar)
+	if crossOrigin {
+		// Sent because the server computes its answer from it. Without an Origin header a correctly
+		// configured API returns no Access-Control-Allow-Origin at all, and the refusal below would
+		// then be ours reporting a rule the server was never asked to apply.
+		request.Header.Set("Origin", origin)
+	}
+	if credentialed {
+		if jar := d.cookiesFor(ctx, on, target); jar != "" {
+			request.Header.Set("Cookie", jar)
+		}
 	}
 
+	// A redirect that leaves the page's origin makes this a cross-origin read whatever it started
+	// as, so the check below applies from that point on. Written by CheckRedirect and read after Do
+	// returns, which is safe because CheckRedirect runs on this goroutine, inside the call.
+	strayed := false
 	client := &http.Client{
 		Timeout: ferryTimeout,
-		// A redirect is a new request and gets the same rule. Following one off the origin is how a
-		// same-origin promise turns into a cross-origin fetch without anybody deciding to.
+		// A redirect is a new request and gets the same rule: the page's own origin, or a site this
+		// profile admits. Go strips the Cookie header on a cross-domain hop by itself, which is the
+		// behaviour we would otherwise have had to write.
 		CheckRedirect: func(hop *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
 			}
-			if hopOrigin := hop.URL.Scheme + "://" + hop.URL.Host; !strings.EqualFold(hopOrigin, origin) {
-				return fmt.Errorf("it redirected to %s, which is not where the page is", hopOrigin)
+			hopOrigin := hop.URL.Scheme + "://" + hop.URL.Host
+			if strings.EqualFold(hopOrigin, origin) {
+				return nil
+			}
+			strayed = true
+			if verdict := fence.Decide(d.policy, fence.Request{
+				Method:       "GET",
+				URL:          hop.URL.String(),
+				ResourceType: "Document",
+			}); !verdict.Allow {
+				return fmt.Errorf("it redirected to %s, which this profile does not admit", hopOrigin)
 			}
 			return nil
 		},
@@ -417,6 +479,12 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 		return 0, "", nil, fmt.Errorf("the request did not complete: %w", err)
 	}
 	defer response.Body.Close()
+
+	if crossOrigin || strayed {
+		if err := corsAllows(response.Header, origin, credentialed); err != nil {
+			return 0, "", nil, err
+		}
+	}
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, ferryBodyCap+1))
 	if err != nil {
@@ -438,6 +506,47 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 		headers[name] = response.Header.Get(name)
 	}
 	return response.StatusCode, string(body), headers, nil
+}
+
+// corsAllows is the browser's own rule for whether a page may READ a cross-origin response.
+//
+// Not an approximation of it — the rule, in the order the specification states it. A resource open
+// to everyone answers with a wildcard and is read without credentials; a resource open to one origin
+// names that origin and may be read with them if it also says so. The pair that does not exist is a
+// wildcard together with credentials, and it does not exist because it would mean "any page may read
+// this with the visitor's cookies", which is the shape of every credentialed-CORS hole there has
+// been.
+//
+// The refusals name what was missing rather than saying "blocked", because the difference between a
+// server that has not opted in and one that opted in for a different origin is the difference
+// between "this cannot work" and "the page asked wrong".
+func corsAllows(header http.Header, origin string, credentialed bool) error {
+	allowed := strings.TrimSpace(header.Get("Access-Control-Allow-Origin"))
+	if allowed == "" {
+		return fmt.Errorf("%s does not let another origin read this: no Access-Control-Allow-Origin", hostOf(origin))
+	}
+	if credentialed {
+		if !strings.EqualFold(strings.TrimSpace(header.Get("Access-Control-Allow-Credentials")), "true") {
+			return fmt.Errorf("%s does not allow a credentialed read: no Access-Control-Allow-Credentials", hostOf(origin))
+		}
+		if allowed == "*" {
+			// A browser refuses this too. A wildcard answers "anyone", and it cannot be the answer
+			// to "anyone, holding this person's session".
+			return fmt.Errorf("a wildcard Access-Control-Allow-Origin cannot admit a credentialed read")
+		}
+	}
+	if allowed != "*" && !strings.EqualFold(allowed, origin) {
+		return fmt.Errorf("this is readable by %s and the page is %s", allowed, origin)
+	}
+	return nil
+}
+
+// hostOf is an origin without its scheme, for a refusal a person reads.
+func hostOf(origin string) string {
+	if parsed, err := url.Parse(origin); err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	return origin
 }
 
 // cookiesFor asks the BROWSER what it would have sent, which is the only place that knows.
@@ -484,6 +593,13 @@ func (d *Driver) keepCookies(ctx context.Context, on cdp.SessionID, target strin
 			"httpOnly": cookie.HttpOnly,
 			"secure":   cookie.Secure,
 		}
+		// SameSite, or the profile quietly stops agreeing with the server about its own cookies.
+		// Chromium treats an unspecified one as Lax, so a cookie the server issued as SameSite=None
+		// came back narrower than it was sent — and the symptom arrives much later and somewhere
+		// else, as a cross-site request that stops carrying a session nobody logged out of.
+		if same := sameSiteName(cookie.SameSite); same != "" {
+			entry["sameSite"] = same
+		}
 		if cookie.Path != "" {
 			entry["path"] = cookie.Path
 		}
@@ -496,6 +612,22 @@ func (d *Driver) keepCookies(ctx context.Context, on cdp.SessionID, target strin
 		entries = append(entries, entry)
 	}
 	_, _ = d.conn.Call(ctx, on, "Network.setCookies", map[string]any{"cookies": entries})
+}
+
+// sameSiteName is Go's parse of the attribute in the word CDP expects, or "" when the server did
+// not state one — which is not the same as stating a default, and is left to Chromium to mean what
+// Chromium means by it.
+func sameSiteName(mode http.SameSite) string {
+	switch mode {
+	case http.SameSiteLaxMode:
+		return "Lax"
+	case http.SameSiteStrictMode:
+		return "Strict"
+	case http.SameSiteNoneMode:
+		return "None"
+	default:
+		return ""
+	}
 }
 
 // answerFerry resolves the promise the shim is holding.

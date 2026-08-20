@@ -97,11 +97,14 @@ func TestTheFerryCarriesOnlyGetAndHead(t *testing.T) {
 	}
 }
 
-// TestTheFerryWillNotFetchFromAnotherOrigin.
+// TestTheFerryWillNotFetchFromAHostTheProfileDoesNotAdmit.
 //
-// The rule that makes this a service and not a hole. Same-origin opens no host the page could not
-// already reach, and the answer comes from a server the page already IS.
-func TestTheFerryWillNotFetchFromAnotherOrigin(t *testing.T) {
+// The floor under the CORS rule, and the reason widening past same-origin is not a hole. CORS is the
+// SERVER's answer to "may this page read me", so on its own it would let a page pull from anywhere
+// willing to say yes. The profile's own list decides which hosts are in play at all, it is the same
+// list that decides whether a document from there may load, and it answers first — before the
+// request is made, which for a host nobody admitted is the whole of what matters.
+func TestTheFerryWillNotFetchFromAHostTheProfileDoesNotAdmit(t *testing.T) {
 	fake, driver, id := ferrying(t)
 
 	asks(fake, 7, 1, "GET", "https://elsewhere.example.net/secrets")

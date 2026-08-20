@@ -236,6 +236,22 @@ func newSite(t *testing.T) *site {
 			<button id=ok>Approve the write-down</button>`)
 	})
 
+	// A neighbouring service, which is what the modern web actually looks like: the page is
+	// app.example.com and its data is at api.example.com. What it answers with is decided by the
+	// query, because the whole question here is whether the SERVER opted in — the ferry applies the
+	// browser's own rule, so a service that says nothing is not read and one that names the page is.
+	mux.HandleFunc("/cors", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		if allow := r.URL.Query().Get("allow"); allow != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allow)
+		}
+		if r.URL.Query().Get("credentials") == "true" {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<p>The neighbouring service answered.</p>`)
+	})
+
 	// A table, because the accessibility tree HAS the grid and the question is only what Chromium
 	// calls its parts. Three roles are assumed by the snapshot — row, cell, columnheader — and an
 	// assumption about role names is exactly the kind this repository has got wrong three times
@@ -460,6 +476,17 @@ func (u *udpSink) gotPacket(within time.Duration) bool {
 
 // admitting is the policy a gate test runs under: a project profile whose only local admission is
 // this site. Everything else on loopback — including the browser's own debugging port — stays shut.
+// admittingBoth is a profile with business at two addresses, which is the ordinary case for anything
+// with an API on its own host. Both go in Loopback, because the gate's sites are http on 127.0.0.1
+// and Origins is https-only by design (see fence.Policy).
+func admittingBoth(a, b *site) fence.Policy {
+	return fence.Policy{
+		Profile:  fence.Project,
+		Origins:  []string{"https://nucleos.invalid"},
+		Loopback: []string{a.origin(), b.origin()},
+	}
+}
+
 func admitting(s *site) fence.Policy {
 	return fence.Policy{
 		Profile:  fence.Project,
