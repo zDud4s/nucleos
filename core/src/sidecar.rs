@@ -58,6 +58,21 @@ fn next_delay(lived: Duration, current: Duration) -> Duration {
 static SIDECARS: LazyLock<Mutex<BTreeMap<String, SidecarState>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+/// Every sidecar this daemon has spawned, held by the kernel so that they die when it does.
+///
+/// `kill_on_drop` below covers the orderly shutdown and covers nothing else: `TerminateProcess` —
+/// which is what Stop-Process, Task Manager and a crash all are — runs no destructor. MEASURED,
+/// 2026-08-20: two days of daemon restarts had left 31 orphaned sidecars alive, and because an
+/// orphan keeps its loopback port, every freshly spawned replacement died at `bind` and was
+/// "restarted" forever. The browser sidecar the app was actually talking to was two days old and
+/// would have stayed that way through any number of restarts, with `/sidecars` reporting `running`
+/// — which was true, and was about the wrong process.
+///
+/// Process-wide for the same reason `SIDECARS` is: there is one set of sidecars per daemon. See
+/// [`crate::process_tree::Litter`] for the primitive and for what it does not promise off Windows.
+static LITTER: LazyLock<crate::process_tree::Litter> =
+    LazyLock::new(crate::process_tree::Litter::new);
+
 /// What the supervisor last observed, reduced to what a readiness row needs to grade it.
 ///
 /// Carries `io::ErrorKind` rather than a `health::FailureCategory` deliberately: this module reports
@@ -266,7 +281,8 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
             cmd.env(k, v);
         }
         // A sidecar's environment holds the daemon token, and for email the IMAP password too.
-        // Without this, shutting the daemon down left the process running with both.
+        // Without this, shutting the daemon down left the process running with both. It is the
+        // orderly half only — see LITTER for the half that survives being terminated.
         cmd.kill_on_drop(true);
         // Piped rather than inherited, which is what it was. Inheriting sent every sidecar's output
         // to the daemon's own console and nowhere else: not the log file, not `/sidecars`, not the
@@ -277,6 +293,11 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         cmd.stderr(std::process::Stdio::piped());
         match cmd.spawn() {
             Ok(mut child) => {
+                // Adopted before anything else is done with it, and while the `Child` is still held
+                // — which is what stops Windows reusing the pid between the spawn and the adoption.
+                if let Some(pid) = child.id() {
+                    LITTER.adopt(pid);
+                }
                 // Taken before `wait()`, which needs the child mutably and would otherwise hold the
                 // handles for as long as the process lives.
                 if let Some(stdout) = child.stdout.take() {
