@@ -503,6 +503,27 @@ pub async fn mint_service_token(
     Ok(format!("{}.{secret}", service.name()))
 }
 
+/// Mints a conversation's key and stores it, retiring whatever the process before it was given.
+///
+/// Async and storing, like `mint_service_token` and unlike `mint_run_token`, because there is no row
+/// of its own to hang the secret on: a conversation outlives every one of its turns, and the turn
+/// rows come and go underneath it.
+///
+/// Called before the CLI is spawned. A key stored afterwards would 401 whatever the process did
+/// first, and the first thing a rooted turn does is ask the gate about its first tool call.
+pub async fn mint_chat_token(
+    pool: &sqlx::SqlitePool,
+    chat_id: &str,
+) -> Result<String, sqlx::Error> {
+    let secret = generate_token();
+    sqlx::query("INSERT OR REPLACE INTO chat_tokens (chat_id, token) VALUES (?, ?)")
+        .bind(chat_id)
+        .bind(&secret)
+        .execute(pool)
+        .await?;
+    Ok(format!("chat:{chat_id}.{secret}"))
+}
+
 /// Resolves a presented bearer to a scope, or `None` if it authenticates nothing.
 async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
     // Constant-time compare: `==` on the token short-circuits at the first differing byte, timing
@@ -510,6 +531,42 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
     // mismatch, and the length is not the secret.
     if bool::from(presented.as_bytes().ct_eq(state.token.0.as_bytes())) {
         return Some(Scope::Control);
+    }
+
+    // Read whole, before the split every other family shares, and split from the RIGHT. The
+    // others take everything before the FIRST dot as their prefix, which is safe for a fixed
+    // service name and for an integer, and is not safe for a conversation id: ids are UUIDs today,
+    // but a dotted one would silently become somebody else's lookup rather than a failed one. The
+    // secret is `generate_token`'s alphanumerics and can never hold a dot, so the last one is
+    // always the separator.
+    if let Some(rest) = presented.strip_prefix("chat:") {
+        let (chat_id, secret) = rest.rsplit_once('.')?;
+        let stored: String = sqlx::query_scalar("SELECT token FROM chat_tokens WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()??;
+        // The secret first, and the conversation's state only after it matches. Resolving the run
+        // first would answer a caller holding no secret at all — whether this conversation is
+        // busy — by how long the refusal took.
+        if !bool::from(secret.as_bytes().ct_eq(stored.as_bytes())) {
+            return None;
+        }
+        // Resolved when presented rather than when minted, which is the whole reason this family
+        // exists. A CLI kept alive across turns is handed its environment once, at spawn, so a key
+        // naming the turn that spawned it would still name that turn five turns later — wrong
+        // attribution, and a run key that never dies.
+        //
+        // Nothing running means nothing to name. That is the rule `runs.token` already follows,
+        // kept rather than weakened: between turns this opens no door.
+        return sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM runs WHERE chat_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+        )
+        .bind(chat_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()?
+        .map(Scope::Run);
     }
 
     let (prefix, secret) = presented.split_once('.')?;
@@ -1100,6 +1157,137 @@ mod tests {
                 "a {status} run's token must not still open the gate"
             );
         }
+    }
+
+    /// A turn of this conversation, running, the way one is while its CLI is alive.
+    async fn running_turn_of(state: &AppState, chat_id: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('x', 'running', 'assistant', ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(chat_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A CLI kept alive across turns is handed its environment once, at spawn, so a key naming the
+    /// turn that spawned it would still be presented five turns later. This key names the
+    /// CONVERSATION and is resolved, when presented, to whatever turn of it is running — so what
+    /// the gate is told is what is actually happening, not what was happening at spawn.
+    #[tokio::test]
+    async fn a_chat_key_names_whichever_turn_of_that_conversation_is_running() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "c-1").await.unwrap();
+
+        let first = running_turn_of(&state, "c-1").await;
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(first)));
+
+        // The first turn ends and a second begins, down the same living process, presenting the
+        // same key. It must now name the second turn — that is the whole point of the family.
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let second = running_turn_of(&state, "c-1").await;
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(second)));
+    }
+
+    /// The rule `runs.token` follows, kept rather than weakened: between turns there is nothing for
+    /// this key to name, so it authenticates nothing. A living process idling between turns holds a
+    /// key that opens no door until somebody speaks to it again.
+    #[tokio::test]
+    async fn a_chat_key_authenticates_nothing_between_turns() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "c-1").await.unwrap();
+
+        assert_eq!(resolve(&state, &key).await, None);
+
+        let turn = running_turn_of(&state, "c-1").await;
+        assert!(resolve(&state, &key).await.is_some());
+
+        sqlx::query("UPDATE runs SET status = 'cancelled' WHERE id = ?")
+            .bind(turn)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(resolve(&state, &key).await, None);
+    }
+
+    /// Two conversations answering at once is the ordinary case, not the exotic one. A key that
+    /// resolved to "some running assistant turn" would let either of them act as the other.
+    #[tokio::test]
+    async fn a_chat_key_cannot_reach_another_conversations_turn() {
+        let state = test_state("control-token").await;
+        let mine = mint_chat_token(&state.pool, "mine").await.unwrap();
+
+        let theirs = running_turn_of(&state, "theirs").await;
+
+        assert_eq!(resolve(&state, &mine).await, None);
+
+        let ours = running_turn_of(&state, "mine").await;
+        assert_eq!(resolve(&state, &mine).await, Some(Scope::Run(ours)));
+        assert_ne!(ours, theirs);
+    }
+
+    /// A process that died leaves its secret in whatever outlived it. The successor's spawn must
+    /// take that key out of service, which is why minting replaces rather than adds.
+    #[tokio::test]
+    async fn minting_a_conversations_key_again_retires_the_one_before_it() {
+        let state = test_state("control-token").await;
+        let first = mint_chat_token(&state.pool, "c-1").await.unwrap();
+        let second = mint_chat_token(&state.pool, "c-1").await.unwrap();
+        running_turn_of(&state, "c-1").await;
+
+        assert_ne!(first, second);
+        assert_eq!(resolve(&state, &first).await, None);
+        assert!(resolve(&state, &second).await.is_some());
+    }
+
+    /// Every other family takes what is before the FIRST dot as its prefix. A conversation id is
+    /// the one prefix a person could one day choose, so this family splits from the right — and a
+    /// dotted id must resolve to itself rather than to a truncated stranger.
+    #[tokio::test]
+    async fn a_chat_key_survives_a_conversation_id_with_a_dot_in_it() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "notes.v2").await.unwrap();
+        let turn = running_turn_of(&state, "notes.v2").await;
+
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
+
+        // And the truncation itself must not be a way in: a turn of the conversation the naive
+        // split WOULD have named cannot be reached with this key.
+        running_turn_of(&state, "notes").await;
+        let truncated = format!("chat:notes.{}", key.rsplit_once('.').unwrap().1);
+        assert_eq!(resolve(&state, &truncated).await, None);
+    }
+
+    /// It resolves to `Scope::Run`, so it inherits that scope's one route and nothing else. Asserted
+    /// rather than assumed: this key is carried by turns that DO have Bash, Read and Write, which is
+    /// exactly the population that could look at its own environment and try the rest of the house.
+    #[tokio::test]
+    async fn a_chat_key_opens_the_gate_route_and_nothing_else() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "c-1").await.unwrap();
+        running_turn_of(&state, "c-1").await;
+        let app = protected_router(state.clone());
+
+        assert_eq!(
+            status_of(&app, "POST", HOOK_ROUTE, &key).await,
+            StatusCode::OK
+        );
+        // 403 and not 401, for the reason the run token's own test gives: it authenticated. Which
+        // is the point being asserted — it authenticates as a RUN, and a run may not approve.
+        assert_eq!(
+            status_of(&app, "POST", "/proposals/7/approve", &key).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_of(&app, "GET", "/jobs", &key).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     /// Every `runs` row written before migration 0022 has a NULL token, and so does every

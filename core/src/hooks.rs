@@ -191,33 +191,31 @@ pub async fn pretooluse_decision(
     Extension(scope): Extension<Scope>,
     Json(payload): Json<PreToolUsePayload>,
 ) -> Json<Decision> {
-    // `run_id` arrives in the body, which makes it a claim the caller makes about itself. With a
-    // scoped key the daemon can check that claim against something the caller cannot choose: a run
-    // token names its own run. Without this, a run could ask for a decision under another run's id
-    // — a `shadow` run borrowing a `worktree` run's rules, or an in-flight run's id being used to
-    // terminate it — and every branch below reads `mode` from exactly that id.
-    if let Scope::Run(id) = scope
-        && id != payload.run_id
-    {
-        tracing::warn!(
-            token_run_id = id,
-            claimed_run_id = payload.run_id,
-            "pretooluse-decision: a run asked for a decision under another run's id"
-        );
-        return Json(Decision {
-            decision: "deny".to_owned(),
-            reason: "a run may only ask about itself".to_owned(),
-        });
-    }
+    // `run_id` arrives in the body, which makes it a claim the caller makes about itself, and every
+    // branch below reads `mode` from it. A scoped key names its own run, and the daemon resolved
+    // that name from its own state rather than from anything the caller chose — so the key decides
+    // and the claim is dropped. A run cannot borrow another run's rules, or spend another run's
+    // denial allowance to have it stopped, because it has no way to say which run it is.
+    //
+    // Dropped rather than compared-and-refused, which is what this was. The guarantee is the same
+    // one, kept by construction instead of by inspection; the difference is that a stale claim is
+    // now irrelevant instead of fatal. A CLI kept alive across turns is handed its environment once,
+    // at spawn, and `ask_daemon.py` echoes `NUCLEOS_RUN_ID` out of it — so from the second turn on,
+    // a comparison would refuse every tool call the conversation made.
+    //
+    // A key that names no run — the control token an orchestrator turn carries, which it can hold
+    // because `ToolPolicy::McpOnly` leaves it no way to read its own environment — leaves the claim
+    // as the only identifier there is. Hence the fallback, and hence no `deny` here: the claim is
+    // still the truth for exactly the callers that cannot usefully lie about it.
+    let run_id = match scope {
+        Scope::Run(id) => id,
+        _ => payload.run_id,
+    };
 
     // Validate run_id against runs actually in flight before trusting anything derived from it (spec
     // §3.4 — the hook's environment sits inside the same cooperative trust model as the token, so the
     // core never blindly trusts what the hook sends).
-    let is_in_flight = state
-        .run_handles
-        .lock()
-        .unwrap()
-        .contains_key(&payload.run_id);
+    let is_in_flight = state.run_handles.lock().unwrap().contains_key(&run_id);
 
     // `mode` is resolved for EVERY request, in flight or not, because it decides WHICH set of rules
     // applies — and a run that has left `run_handles` is exactly when defaulting to `real` is most
@@ -228,7 +226,7 @@ pub async fn pretooluse_decision(
     let (cwd, mode) = match sqlx::query_as::<_, (Option<String>, String)>(
         "SELECT cwd, mode FROM runs WHERE id = ?",
     )
-    .bind(payload.run_id)
+    .bind(run_id)
     .fetch_optional(&state.pool)
     .await
     {
@@ -242,7 +240,7 @@ pub async fn pretooluse_decision(
         // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
         Err(error) => {
             tracing::warn!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 %error,
                 "pretooluse-decision: failed to resolve the run's mode — failing closed"
             );
@@ -266,13 +264,13 @@ pub async fn pretooluse_decision(
         // single boot — and an alarm that cries wolf at startup is one nobody reads when it matters.
         if is_in_flight {
             tracing::warn!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 tool = %payload.tool_name,
                 "pretooluse-decision: a triage run attempted a tool — barrier 1 is not in force"
             );
         } else {
             tracing::debug!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 tool = %payload.tool_name,
                 "pretooluse-decision: denied a tool for a triage run that is not in flight"
             );
@@ -294,7 +292,7 @@ pub async fn pretooluse_decision(
         // `ToolPolicy::Unrestricted` precisely so it can touch the code the conversation is about,
         // and the branch below would deny every one of those calls — leaving it holding tools it can
         // never use, which is worse than not having them.
-        if let Some(root) = rooted_turn(&state, payload.run_id).await {
+        if let Some(root) = rooted_turn(&state, run_id).await {
             return rooted_decision(&state, &payload, &root).await;
         }
         return assistant_decision(&state, &payload).await;
@@ -346,7 +344,7 @@ pub async fn pretooluse_decision(
         if is_in_flight
             && let Err(error) = shadow::record_decision(
                 &state.pool,
-                payload.run_id,
+                run_id,
                 &payload.tool_name,
                 &payload.tool_input,
                 &classification,
@@ -355,7 +353,7 @@ pub async fn pretooluse_decision(
             .await
         {
             tracing::warn!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 %error,
                 "pretooluse-decision: failed to record shadow decision"
             );
@@ -380,7 +378,7 @@ pub async fn pretooluse_decision(
         && is_in_flight
         && let Err(error) = shadow::record_decision(
             &state.pool,
-            payload.run_id,
+            run_id,
             &payload.tool_name,
             &payload.tool_input,
             &classification,
@@ -389,7 +387,7 @@ pub async fn pretooluse_decision(
         .await
     {
         tracing::warn!(
-            run_id = payload.run_id,
+            run_id = run_id,
             %error,
             "pretooluse-decision: failed to record shadow decision"
         );
@@ -417,7 +415,7 @@ pub async fn pretooluse_decision(
         // message spends none of it.
         match crate::proposals::matching_queued_request(
             &state.pool,
-            payload.run_id,
+            run_id,
             &payload.tool_name,
             &payload.tool_input.to_string(),
         )
@@ -425,11 +423,11 @@ pub async fn pretooluse_decision(
         {
             Ok(Some(request_id)) => {
                 tracing::info!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     request_id,
                     "pretooluse-decision: the action is already queued — refusing the retry"
                 );
-                count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+                count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
                 return Json(Decision {
                     decision: "deny".to_owned(),
                     reason: format!(
@@ -444,23 +442,19 @@ pub async fn pretooluse_decision(
             // a pause and a question for a person, which is what happened before any of this.
             Err(error) => {
                 tracing::warn!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     %error,
                     "pretooluse-decision: could not tell whether this action is already queued"
                 );
             }
         }
 
-        match crate::proposals::grant_covers_class(
-            &state.pool,
-            payload.run_id,
-            classification.action_class,
-        )
-        .await
+        match crate::proposals::grant_covers_class(&state.pool, run_id, classification.action_class)
+            .await
         {
             Ok(true) => {
                 tracing::info!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     tool = %payload.tool_name,
                     action_class = classification.action_class,
                     "pretooluse-decision: a grant covers this action class — authorizing the action"
@@ -471,9 +465,9 @@ pub async fn pretooluse_decision(
                     "action_authorized",
                     &format!(
                         "authorized approved {} action for run {}",
-                        payload.tool_name, payload.run_id
+                        payload.tool_name, run_id
                     ),
-                    Some(payload.run_id),
+                    Some(run_id),
                 )
                 .await;
                 return Json(Decision {
@@ -487,7 +481,7 @@ pub async fn pretooluse_decision(
             Ok(false) => {}
             Err(error) => {
                 tracing::warn!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     %error,
                     "pretooluse-decision: grant lookup failed; falling back to the classifier decision"
                 );
@@ -501,7 +495,7 @@ pub async fn pretooluse_decision(
     // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
     // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
     if classification.decision.decision == "deny" && is_in_flight {
-        count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+        count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
     }
 
     if classification.decision.decision == "pending_approval" {
@@ -515,7 +509,7 @@ pub async fn pretooluse_decision(
             // detaches its task, so the pause still gets recorded when the request goes away.
             let _ = tokio::spawn(pause_for_approval(
                 state.clone(),
-                payload.run_id,
+                run_id,
                 payload.tool_name.clone(),
                 payload.tool_input.to_string(),
                 classification.reason.clone(),
@@ -524,7 +518,7 @@ pub async fn pretooluse_decision(
         } else {
             tracing::warn!(
                 "pretooluse-decision: pending_approval for unknown/finished run_id {} — not terminating",
-                payload.run_id
+                run_id
             );
         }
     }
@@ -1633,33 +1627,61 @@ mod tests {
     /// `run_id` comes from the request body, so it is a claim the caller makes about itself. Every
     /// branch in this handler reads `mode` from that id, so a run able to name another run's id
     /// picks which rules it is judged by — a `shadow` run could ask under a `worktree` run's id and
-    /// be handed the worktree ruleset, and an in-flight run's id could be used to terminate it.
+    /// be handed the worktree ruleset — and could spend another run's denial allowance to have it
+    /// stopped.
+    ///
+    /// So the key decides and the claim is ignored, rather than the two being compared and a
+    /// mismatch refused. The guarantee is the same one, kept by construction instead of by
+    /// inspection; what changes is that a stale claim is now merely irrelevant rather than fatal,
+    /// which is what a CLI kept alive across turns needs — it is handed its environment once, at
+    /// spawn, and would echo the first turn's id for the rest of the conversation.
     #[tokio::test]
-    async fn a_run_may_only_ask_the_gate_about_itself() {
+    async fn the_gate_judges_a_turn_by_its_key_and_not_by_the_id_it_claims() {
         let state = test_state().await;
-        let mine = in_flight_run(&state, "shadow", None, None, None).await;
-        let other = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        // A `worktree` run borrowing a `shadow` run's id, because that is the direction with
+        // something to gain: shadow's whole premise is that it records what it WOULD have done and
+        // is never stopped for it, so a real run judged by shadow's rules would be a run that can
+        // probe the classifier forever.
+        let mine = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let other = in_flight_run(&state, "shadow", None, None, None).await;
         let my_key = key_for(&state, mine).await;
         let app = test_router(state.clone());
 
-        let decision = decide_as(
+        // Naming the shadow run does not buy shadow's ruleset: the answer is the one this run's own
+        // mode earns, whichever id it wrote down.
+        let claimed = decide_as(
             &app,
             &my_key,
             &format!(r#"{{"run_id":{other},"tool_name":"Read","tool_input":{{}}}}"#),
         )
         .await;
-        assert_eq!(decision.decision, "deny");
-        assert_eq!(decision.reason, "a run may only ask about itself");
-
-        // And the same key asking about its own run is answered normally — the check is about the
-        // id, not about run tokens being second-class.
         let own = decide_as(
             &app,
             &my_key,
             &format!(r#"{{"run_id":{mine},"tool_name":"Read","tool_input":{{}}}}"#),
         )
         .await;
+        assert_eq!(claimed.decision, own.decision);
         assert_eq!(own.decision, "allow");
+
+        // And the denials it spends are its own — counted against the run that actually made them,
+        // not against the one it named. Otherwise borrowing an id would be a way to stop any run in
+        // the house from behind a key that governs one.
+        let probe = format!(
+            r#"{{"run_id":{other},"tool_name":"Bash","tool_input":{{"command":"rm -rf /"}}}}"#
+        );
+        for _ in 0..DENIAL_LIMIT {
+            assert_eq!(decide_as(&app, &my_key, &probe).await.decision, "deny");
+        }
+        let handles = state.run_handles.lock().unwrap();
+        assert!(
+            !handles.contains_key(&mine),
+            "the prober's own run is stopped"
+        );
+        assert!(
+            handles.contains_key(&other),
+            "the run whose id it borrowed is untouched"
+        );
     }
 
     /// A `deny` used to cost the run nothing, so a lexical classifier could be searched: try a

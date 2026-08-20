@@ -1371,9 +1371,37 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // to disengage the brake. That is the right thing to lose: it is `Origin::Shell` that earned
         // it the tools, which means the person asking is sitting at this machine, in front of the
         // window where both of those are one click away.
+        //
+        // Scoped to the CONVERSATION and not to this turn, which is the one difference from a
+        // `worktree` run and the reason `chat_tokens` exists. A CLI is handed its environment once,
+        // at spawn; a key naming this turn is therefore a key the process still presents on turn
+        // five, and a process that cannot outlive its turn pays the whole cost of starting again —
+        // measured at 5.8s to `init` and 26.4s to a first shell command, against 1.5s and 6.7s down
+        // a stdin that is already open. `auth::resolve` reads a `chat:` key against whatever turn of
+        // the conversation is running, so the key stays true as the turns change under it, and names
+        // nothing at all in between.
         let env = match tool_policy {
             crate::runner::ToolPolicy::Unrestricted => {
-                crate::runs::run_env(&crate::runs::mint_run_token(&pool, id).await, id, None)
+                let key = match crate::auth::mint_chat_token(&pool, &turn.slot.chat_id).await {
+                    Ok(key) => key,
+                    Err(error) => {
+                        tracing::warn!(
+                            chat_id = %turn.slot.chat_id,
+                            %error,
+                            "could not store the conversation's key — this turn's tool calls will be refused"
+                        );
+                        // Nothing was stored, so nothing can match, so the turn is refused rather
+                        // than ungoverned. `runs::mint_run_token` fails in the same direction, and
+                        // for the same reason: of the two ways to be wrong here, only one of them
+                        // leaves a run acting with nobody watching.
+                        format!(
+                            "chat:{}.{}",
+                            turn.slot.chat_id,
+                            crate::auth::generate_token()
+                        )
+                    }
+                };
+                crate::runs::run_env(&key, id, None)
             }
             _ => crate::runs::run_env(&control_token, id, None),
         };
@@ -3927,6 +3955,60 @@ mod tests {
             Some(true),
             "a turn with a picture must go by stdin"
         );
+    }
+
+    /// A rooted turn carries a key scoped to the CONVERSATION, not to the turn.
+    ///
+    /// The turn is what gets a `runs` row, so a key naming the run is the obvious thing and is what
+    /// this handed out until now. It is also the single reason a CLI process cannot outlive its
+    /// turn: a process is given its environment once, at spawn, so on turn two it would still be
+    /// presenting turn one's key — which `auth::resolve` has by then retired, and which would name
+    /// the wrong turn if it had not.
+    ///
+    /// Measured before it was built, on the real CLI: a second turn fed down a live process's stdin
+    /// reaches `init` in 1.5s against 5.8s for a fresh spawn that resumes, runs its first shell
+    /// command at 6.7s against 26.4s, and finishes in 12.0s against 26-32s. None of it is cost —
+    /// turn two's price was inside the noise of a resumed spawn's, because the prompt cache lives at
+    /// the API and not in the process.
+    #[tokio::test]
+    async fn a_rooted_turn_carries_a_key_scoped_to_its_conversation() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+
+        // A directory AND a wired classifier hook, because `tool_policy_for` grants tools only when
+        // both are there. Without them this turn is `McpOnly` and carries the control token, which
+        // is a different rule entirely and would pass a weaker version of this test.
+        let root = tempfile::TempDir::new().unwrap();
+        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES ('keyed-chat', 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let id = send_message(&state, "keyed-chat", "arranja o parser", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let env = fake.last_env.lock().unwrap().clone().unwrap_or_default();
+        let key = env
+            .iter()
+            .find(|(name, _)| name == "NUCLEOS_DAEMON_TOKEN")
+            .map(|(_, value)| value.clone())
+            .expect("a rooted turn is given a key");
+
+        assert!(
+            key.starts_with("chat:keyed-chat."),
+            "expected a key naming the conversation, got {key}"
+        );
+        // The thing this key exists to not be. A rooted turn has Bash, Read and Write, so it can
+        // read its own environment — which is exactly why it must not find the control token there.
+        assert_ne!(key, state.token.0);
     }
 
     /// A turn carrying nothing keeps the argument vector it has always used.
