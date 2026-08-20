@@ -47,6 +47,11 @@ type Fake struct {
 	Opened    []OpenRequest
 	Actions   []Action
 	Snapshots []SessionID
+	// Asked is the SnapshotRequest each of those carried, and it is recorded because the ONE thing
+	// a wire shape can get wrong silently is dropping a field: the caller sends it, the JSON decoder
+	// finds no home for it, and the answer is a correct reading of a request nobody made. That is
+	// how `controls_from` was accepted, ignored, and answered with page one for two days.
+	Asked     []SnapshotRequest
 	Closed    []SessionID
 	Wheels    []WheelRequest
 	Handed    []SessionID
@@ -89,10 +94,11 @@ func (f *Fake) Open(_ context.Context, req OpenRequest) (Session, error) {
 	return session, nil
 }
 
-func (f *Fake) Snapshot(_ context.Context, id SessionID, _ SnapshotRequest) (Snapshot, error) {
+func (f *Fake) Snapshot(_ context.Context, id SessionID, req SnapshotRequest) (Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Snapshots = append(f.Snapshots, id)
+	f.Asked = append(f.Asked, req)
 	if _, ok := f.sessions[id]; !ok {
 		return Snapshot{}, ErrNoSuchSession
 	}

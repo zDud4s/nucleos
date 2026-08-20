@@ -140,6 +140,17 @@ type SnapshotRequest struct {
 	// them together would mean a long article costing a page its buttons — which is the rule this
 	// whole design started from.
 	ControlsFrom int
+	// Find keeps only the lines that say this, matched case-insensitively against a control's role,
+	// name and value and against a paragraph's or a row's text.
+	//
+	// Paging is not searching. TextFrom and ControlsFrom make a long page READABLE, in order, at a
+	// cost proportional to the page; finding one link in a directory of two thousand still meant
+	// carrying the two thousand. That is the difference between a page an agent can read and a page
+	// it can use, and on anything catalogue-shaped it was the whole turn.
+	//
+	// It filters what is REPORTED and never what is read: refs are still minted for everything on
+	// the page, so an act on something an earlier snapshot showed is not turned stale by a search.
+	Find string
 }
 
 // Blocked is what the page tried to do for itself and the fence stopped, since this document loaded.
@@ -178,8 +189,8 @@ type Snapshot struct {
 	// a changes-only read, where it is the half that omission cannot express: a full snapshot says
 	// an element is gone by not containing it, and a partial one cannot say anything by silence.
 	Gone []string `json:"gone,omitempty"`
-	// Partial says this snapshot is the difference since the last one rather than the whole page —
-	// so an agent that skipped the previous one does not read a short list as a short page.
+	// Partial says this snapshot is not the whole page — the difference since the last one, or what
+	// matched a Find — so an agent does not read a short list as a short page.
 	Partial bool `json:"partial,omitempty"`
 	// Blocked is the fence's third layer speaking. The CSP stops things inside the renderer, where
 	// no request is ever made and there is nothing for the other two layers to report, so a page

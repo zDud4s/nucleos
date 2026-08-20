@@ -87,6 +87,18 @@ type SessionRequest struct {
 	// TextFrom resumes a page's prose where the last snapshot stopped. Absent means the beginning,
 	// which is where an agent that has not been cut off yet always is.
 	TextFrom int `json:"text_from,omitempty"`
+	// ControlsFrom resumes the actionable elements the same way.
+	//
+	// Its absence here was not a missing feature, it was a broken promise. The driver bounded
+	// controls and offered `controls_next` to read on; the núcleo sent `controls_from` back; and
+	// this struct had no field for it, so `encoding/json` dropped it and the snapshot restarted at
+	// the first control every time. An agent following the offer got page one, forever, with
+	// nothing anywhere reporting a problem — the offer was real, the answer was real, and only the
+	// relation between them was missing.
+	ControlsFrom int `json:"controls_from,omitempty"`
+	// Find keeps only what says this, and is how a large page stops costing a whole turn to search.
+	// Absent means the whole page.
+	Find string `json:"find,omitempty"`
 }
 
 // ActRequest is one action against a session.
@@ -143,8 +155,10 @@ func snapshotHandler(driver browser.Driver) http.HandlerFunc {
 			return
 		}
 		snapshot, err := driver.Snapshot(r.Context(), browser.SessionID(request.SessionID), browser.SnapshotRequest{
-			ChangesOnly: request.ChangesOnly,
-			TextFrom:    request.TextFrom,
+			ChangesOnly:  request.ChangesOnly,
+			TextFrom:     request.TextFrom,
+			ControlsFrom: request.ControlsFrom,
+			Find:         request.Find,
 		})
 		if err != nil {
 			writeDriverError(w, "snapshot", err)
