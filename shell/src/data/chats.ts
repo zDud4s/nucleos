@@ -147,6 +147,15 @@ export type Exchange = [string, string];
 export interface Transcript {
   handed: Exchange[];
   turns: Turn[];
+  /**
+   * What was said to this conversation while it was busy and has not been sent
+   * yet, oldest first.
+   *
+   * Not turns and never drawn as ones: nothing has run, nothing is billed, and
+   * a bubble that looked like a turn would be claiming a run that does not
+   * exist. They leave this list by becoming turns, on their own.
+   */
+  queued: string[];
 }
 
 /** One name a conversation offers for an `@`, relative to its own directory. */
@@ -242,7 +251,11 @@ export function useChatTranscript(chatId: string | null) {
   return useQuery({
     queryKey,
     queryFn: async ({ client }): Promise<Transcript> => {
-      const read = await apiFetch<{ handed: Exchange[]; turns: AssistantTurnRow[] }>(
+      const read = await apiFetch<{
+        handed: Exchange[];
+        turns: AssistantTurnRow[];
+        queued: string[];
+      }>(
         `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
       );
       const fresh = read.turns.map(turnFromRow);
@@ -250,7 +263,11 @@ export function useChatTranscript(chatId: string | null) {
       // Defaulted rather than trusted, exactly as the turn fields are: a daemon older than the
       // column answers with turns and no `handed`, and a conversation that will not draw over a
       // missing field is a worse answer than one that draws without the note.
-      return { handed: read.handed ?? [], turns: merge(fresh, local) };
+      return {
+        handed: read.handed ?? [],
+        queued: read.queued ?? [],
+        turns: merge(fresh, local),
+      };
     },
     enabled: chatId !== null,
     refetchInterval: (query) => (anyTurnLive(query.state.data?.turns) ? POLL.turn : POLL.fast),
@@ -319,12 +336,24 @@ export function useSendMessage(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (text: string) =>
-      apiFetch<{ turn_id: number }>("/assistant/message", {
+      // `wait_if_busy` is what turns the old 409 into a place in the queue. A person looking at the
+      // window would rather their words were kept than be told no and handed back an empty box —
+      // the Telegram sidecar, which gives up on a turn after a timeout, would rather be refused,
+      // and so it does not ask.
+      apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",
-        body: JSON.stringify({ chat_id: chatId, text }),
+        body: JSON.stringify({ chat_id: chatId, text, wait_if_busy: true }),
       }),
     retry: false,
     onSuccess: (result, text) => {
+      // Kept rather than sent: there is no turn to draw, and inventing one would put a bubble on
+      // screen for a run that does not exist. The transcript's own read carries what is waiting, so
+      // asking for it again is the whole of what this side has to do.
+      if (result.turn_id === undefined) {
+        void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+        void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+        return;
+      }
       const optimistic: Turn = {
         id: result.turn_id,
         asked: text,
@@ -344,9 +373,16 @@ export function useSendMessage(chatId: string) {
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],
       };
-      queryClient.setQueryData<Turn[]>(keys.chats.detail(chatId), (current) =>
-        merge(current ?? [], [optimistic]),
-      );
+      // A `Transcript`, because that is what this key holds. It used to hold a bare array, and
+      // writing the old shape here does not fail a type check — `setQueryData` is TOLD the type —
+      // it fails at runtime inside `merge`, on the one gesture the page exists for. What is handed
+      // and what is queued are carried through untouched: neither is this write's business, and
+      // dropping them would blank the notes above and below the transcript on every send.
+      queryClient.setQueryData<Transcript>(keys.chats.detail(chatId), (current) => ({
+        handed: current?.handed ?? [],
+        queued: current?.queued ?? [],
+        turns: merge(current?.turns ?? [], [optimistic]),
+      }));
       // The list's "thinking…" reading and its `waiting` count both depend on
       // this conversation's state, and a person who just sent a message is
       // looking straight at it — a three-second wait for the badge to agree

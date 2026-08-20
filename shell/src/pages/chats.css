@@ -878,3 +878,40 @@
   margin: 0;
   background: none;
 }
+
+/* What was said while it was busy and has not been sent yet.
+ *
+ * Deliberately unlike a turn: no ground of its own, dashed down the side, and quieter than either
+ * speaker. A turn is a run — it has an id and a cost — and these have neither. */
+.chats-waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-waiting-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border-left: 2px dashed var(--border);
+}
+
+.chats-waiting-who {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.chats-waiting-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}

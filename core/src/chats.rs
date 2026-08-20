@@ -135,6 +135,56 @@ pub async fn cwd_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<Str
     opened_in(pool, chat_id).await.map(Option::flatten)
 }
 
+/// What is waiting to be said to this conversation, oldest first.
+///
+/// Ordered by `id` and never by `created_at`: two messages typed in the same second must not swap
+/// places, and a queue that reorders itself is one nobody can predict.
+pub async fn queued(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT text FROM chat_queue WHERE chat_id = ? ORDER BY id")
+        .bind(chat_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// Keeps a message until this conversation has a turn free for it.
+pub async fn enqueue(
+    pool: &SqlitePool,
+    chat_id: &str,
+    text: &str,
+    origin: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO chat_queue (chat_id, text, origin, created_at) VALUES (?, ?, ?, ?)")
+        .bind(chat_id)
+        .bind(text)
+        .bind(origin)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Takes the oldest waiting message off this conversation's queue, or `None` when there is none.
+///
+/// Deleted as it is read, in one statement, rather than read and then deleted after it has been
+/// sent. Two drains racing the same row is the failure that matters here — the same words sent
+/// twice, billed twice — and `RETURNING` makes the row belong to exactly one of them. The other
+/// order would be safer against a message lost to a crash mid-send, and that is the wrong trade:
+/// one lost message is a person retyping a sentence, one duplicated message is a turn nobody asked
+/// for acting on a conversation twice.
+pub async fn take_queued(
+    pool: &SqlitePool,
+    chat_id: &str,
+) -> sqlx::Result<Option<(String, Option<String>)>> {
+    sqlx::query_as(
+        "DELETE FROM chat_queue
+          WHERE id = (SELECT id FROM chat_queue WHERE chat_id = ? ORDER BY id LIMIT 1)
+      RETURNING text, origin",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Where this conversation runs, keeping "no such conversation" apart from "no directory".
 ///
 /// `cwd_of` flattens the two into one `None` because the turn path cannot act on the difference: a

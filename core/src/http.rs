@@ -751,6 +751,14 @@ struct AssistantMessageRequest {
     /// existed means too.
     #[serde(default)]
     origin: Option<String>,
+    /// Whether this caller would rather wait than be refused while a turn is already running.
+    ///
+    /// Opted into, never assumed. The Telegram sidecar gives up on a turn after a timeout and would
+    /// rather be told no than be answered ten minutes late into a conversation that has moved on;
+    /// the window in front of a person would rather keep the words. Absent means refuse, which is
+    /// what every caller written before this field existed expects.
+    #[serde(default)]
+    wait_if_busy: bool,
 }
 
 #[derive(Deserialize)]
@@ -1876,15 +1884,29 @@ async fn post_assistant_message(
     // two leaves a `running` assistant row with no task and no abort handle — `/assistant/{id}`
     // reports it running forever and `/cancel` answers 404. The Telegram sidecar is the caller, and
     // it gives up on a turn after a timeout, so the disconnect is routine rather than theoretical.
+    let wait = body.wait_if_busy;
     let outcome = uncancellable(async move {
         let origin = crate::assistant::Origin::from_wire(body.origin.as_deref());
-        crate::assistant::send_message(&state, &body.chat_id, &body.text, origin).await
+        match wait {
+            true => {
+                crate::assistant::send_or_queue(&state, &body.chat_id, &body.text, origin).await
+            }
+            false => crate::assistant::send_message(&state, &body.chat_id, &body.text, origin)
+                .await
+                .map(crate::assistant::Sent::Turn),
+        }
     })
     .await
     .map_err(|status| refusal(status, "internal"))?;
 
     match outcome {
-        Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
+        Ok(crate::assistant::Sent::Turn(turn_id)) => {
+            Ok(Json(serde_json::json!({ "turn_id": turn_id })))
+        }
+        // Not a turn id and not a refusal: the words were kept and will be sent without anybody
+        // pressing anything again. `queued` rather than a null id, because a caller has something
+        // different to do about each and a null says neither.
+        Ok(crate::assistant::Sent::Queued) => Ok(Json(serde_json::json!({ "queued": true }))),
         // Clears by waiting, which is what makes it the one refusal here that needs no gesture from
         // anybody — and what makes it dangerous to confuse with the one below.
         Err(msg) if msg == crate::assistant::TURN_IN_PROGRESS => {
@@ -3471,6 +3493,11 @@ struct TranscriptOut {
     /// is most of them, and empty rather than absent so a reader never has to branch on missing.
     handed: Vec<(String, String)>,
     turns: Vec<AssistantTurnOut>,
+    /// What was said to this conversation while it was busy, and has not been sent yet.
+    ///
+    /// Here rather than on its own route because it belongs to the same picture and moves on the
+    /// same poll: the window draws it under the last turn, where the answer will land.
+    queued: Vec<String>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3643,8 +3670,15 @@ async fn get_assistant_chat(
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
     // every ordinary conversation.
     let handed = crate::assistant::handed_over(&state.pool, &chat_id).await;
+    // Empty on a failure rather than a 500: the transcript is the point of this request, and a
+    // conversation nobody can read because its queue would not load is a worse answer than one
+    // drawn without a note about what is waiting.
+    let queued = crate::chats::queued(&state.pool, &chat_id)
+        .await
+        .unwrap_or_default();
     Ok(Json(TranscriptOut {
         handed,
+        queued,
         turns: turns
             .into_iter()
             .map(|turn| {
@@ -9479,6 +9513,107 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Typing while it works keeps the words, for a caller that said it could wait.
+    #[tokio::test]
+    async fn a_message_sent_to_a_busy_conversation_is_kept_when_the_caller_can_wait() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &chat_id,
+            "arranja o parser",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "chat_id": chat_id,
+                            "text": "e os testes tambem",
+                            "wait_if_busy": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["queued"], true);
+        // And no turn id was invented for something that is not a turn yet.
+        assert!(body["turn_id"].is_null());
+    }
+
+    /// A caller that said nothing about waiting is still refused, exactly as it was.
+    #[tokio::test]
+    async fn a_message_sent_to_a_busy_conversation_is_refused_when_nobody_asked_to_wait() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &chat_id,
+            "arranja o parser",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "chat_id": chat_id, "text": "e os testes" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// What waits reaches the window, or nothing on screen says the words were kept.
+    #[tokio::test]
+    async fn a_transcript_carries_what_is_still_waiting_to_be_said() {
+        let state = test_state().await;
+        crate::chats::enqueue(&state.pool, "waiting", "e os testes tambem", "shell")
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/waiting")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["queued"][0], "e os testes tambem");
     }
 
     /// A conversation offers the commands in its own directory, by the name they are typed as.

@@ -210,6 +210,18 @@ impl Origin {
             _ => Self::Shell,
         }
     }
+
+    /// How this origin is written down, so a message that waits is sent as the thing it was.
+    ///
+    /// The inverse of `from_wire` and asserted against it: a queued message carries its origin
+    /// through the database, and an origin that did not survive the round trip would route a
+    /// Telegram turn back into the shell.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Telegram => "telegram",
+            Self::Shell => "shell",
+        }
+    }
 }
 
 /// Why a turn was refused before it cost anything: the chat says `local` and this machine has none.
@@ -293,6 +305,79 @@ impl ErrandTurn {
         }
         prompt.push_str(text);
         prompt
+    }
+}
+
+/// What became of a message somebody sent: a turn, or a place in the queue.
+///
+/// Two outcomes rather than an `Option<i64>`, because the caller has something different to say
+/// about each and a null id says neither. A turn is answered by watching it; a queued message is
+/// answered by showing it waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    Turn(i64),
+    Queued,
+}
+
+/// Sends a message, or keeps it until the conversation has a turn free.
+///
+/// The wall this removes: a second message used to take `TURN_IN_PROGRESS` and vanish, so a person
+/// who had already thought of the next thing to say got a red note and an empty box.
+///
+/// Opted into rather than imposed, because waiting is not always better than being told no. The
+/// Telegram sidecar gives up on a turn after a timeout and would rather refuse than answer ten
+/// minutes late into a conversation that has moved on — so only a caller that can wait asks to.
+///
+/// Written as a try-then-queue rather than a check-then-send: `is_busy` between the two would be a
+/// window in which the turn ends and the message queues behind nothing, waiting for a drain that
+/// has already run. Letting `send_message` refuse is what makes the two steps one decision.
+pub async fn send_or_queue(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    origin: Origin,
+) -> Result<Sent, String> {
+    match send_message(state, chat_id, text, origin).await {
+        Ok(id) => Ok(Sent::Turn(id)),
+        Err(refusal) if refusal == TURN_IN_PROGRESS => {
+            crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire())
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Sent::Queued)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Sends whatever waited, once the conversation has a turn free for it.
+///
+/// Called at the very end of a finished turn's task, AFTER its guard has fallen: the drain goes back
+/// through `send_message`, which takes the same chat slot the finished turn is still holding until
+/// then. One line earlier and the drain refuses itself, silently, and the message waits for ever.
+///
+/// One message per turn, not the whole queue: each drained message becomes a turn that will drain
+/// again when it ends. Sending them all at once would only refuse every one after the first.
+///
+/// Boxed because this and `send_message` call each other — a real cycle, and the compiler needs the
+/// indirection to size the future. Nothing is retried: a message that cannot be sent has been taken
+/// off the queue by `take_queued` and is gone, which is the trade that file documents.
+async fn drain_queued(state: &crate::state::AppState, chat_id: &str) {
+    let taken = match crate::chats::take_queued(&state.pool, chat_id).await {
+        Ok(Some(taken)) => taken,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "could not read what was waiting for this conversation");
+            return;
+        }
+    };
+    let (text, origin) = taken;
+    let origin = Origin::from_wire(origin.as_deref());
+    if let Err(refusal) = Box::pin(send_message(state, chat_id, &text, origin)).await {
+        tracing::warn!(
+            %refusal,
+            chat_id,
+            "a message that had been waiting could not be sent"
+        );
     }
 }
 
@@ -1077,6 +1162,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
     let turn = TurnGuard { slot, mcp_path };
+    // Kept for after the turn: draining what waited needs the whole state, and `spawn_registered`
+    // takes ownership of it. The chat id is copied for the same reason — it lives on the guard,
+    // which has to be dropped before the drain can take the slot back.
+    let after = state.clone();
+    let drained_chat = turn.slot.chat_id.clone();
 
     // The turn's stream, mirrored as the CLI writes it and published under the turn's own id — a
     // turn IS a run, so `GET /runs/{id}/tail` already serves this and needed nothing new.
@@ -1365,7 +1455,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             }
         }
 
-        // No cleanup here on purpose: `turn` drops it, on every path including an abort.
+        // Dropped HERE rather than at the end of the block, and that is the whole of it: the drain
+        // below goes back through `send_message`, which takes the same chat slot this guard is
+        // holding. One line later and it refuses itself, silently, and what waited waits for ever.
+        drop(turn);
+        drain_queued(&after, &drained_chat).await;
     });
 }
 
@@ -3482,6 +3576,139 @@ mod tests {
         assert_eq!(did.len(), 1);
         assert_eq!(did[0].name, "Read");
         assert_eq!(did[0].detail.as_deref(), Some("core/src/parser.rs"));
+    }
+
+    /// Typing while it works keeps the words instead of refusing them.
+    ///
+    /// A second message used to take `TURN_IN_PROGRESS` and vanish: the chat's one turn slot was
+    /// held, the route answered 409, and the window put a red note under the box. That is the wall
+    /// this removes — and it is a wall, not a safeguard, because the thing on the other side of it
+    /// is a person who has already thought of the next thing to say.
+    ///
+    /// Only for a caller that asked to wait. The Telegram sidecar gives up on a turn after a
+    /// timeout and would rather be told no than be answered ten minutes later into a conversation
+    /// that has moved on, so waiting is opted into rather than imposed.
+    #[tokio::test]
+    async fn a_message_sent_while_a_turn_runs_is_kept_when_the_caller_asked_to_wait() {
+        let state = test_state().await;
+        let chat_id = "queue-chat";
+        let _first = send_message(&state, chat_id, "arranja o parser", Origin::Shell)
+            .await
+            .unwrap();
+
+        let outcome = send_or_queue(&state, chat_id, "e os testes tambem", Origin::Shell).await;
+
+        assert_eq!(outcome, Ok(Sent::Queued));
+        assert_eq!(
+            crate::chats::queued(&state.pool, chat_id).await.unwrap(),
+            vec!["e os testes tambem".to_string()]
+        );
+    }
+
+    /// A caller that did not ask to wait is still refused, exactly as before.
+    #[tokio::test]
+    async fn a_caller_that_cannot_wait_is_still_refused_rather_than_quietly_queued() {
+        let state = test_state().await;
+        let chat_id = "no-wait-chat";
+        let _first = send_message(&state, chat_id, "arranja o parser", Origin::Shell)
+            .await
+            .unwrap();
+
+        let refused = send_message(&state, chat_id, "e os testes", Origin::Telegram).await;
+
+        assert_eq!(refused, Err(TURN_IN_PROGRESS.to_string()));
+        assert!(
+            crate::chats::queued(&state.pool, chat_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The whole point: what waited is sent, without anybody pressing anything again.
+    ///
+    /// Drained after the turn guard falls rather than before it, because the drain goes back through
+    /// `send_message` and that takes the same slot the finished turn is still holding. A drain one
+    /// line earlier refuses itself and the message waits for ever.
+    #[tokio::test]
+    async fn what_waited_becomes_the_next_turn_once_the_slot_is_free() {
+        let state = test_state().await;
+        let chat_id = "drain-chat";
+        let first = send_message(&state, chat_id, "arranja o parser", Origin::Shell)
+            .await
+            .unwrap();
+        send_or_queue(&state, chat_id, "e os testes tambem", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        // The drain runs at the very end of the finished turn's task, so the second turn appears a
+        // moment later rather than in the same breath.
+        let mut asked: Vec<String> = Vec::new();
+        for _ in 0..200 {
+            asked = sqlx::query_scalar(
+                "SELECT prompt FROM runs WHERE chat_id = ? AND mode = 'assistant' ORDER BY id",
+            )
+            .bind(chat_id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+            if asked.len() > 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert_eq!(asked.len(), 2, "what waited was never sent: {asked:?}");
+        assert!(asked[1].contains("e os testes tambem"), "{asked:?}");
+        // And it is off the queue: a message drained and still listed would be sent twice.
+        assert!(
+            crate::chats::queued(&state.pool, chat_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Two messages typed in the same second must not swap places.
+    #[tokio::test]
+    async fn what_waits_is_kept_in_the_order_it_was_typed() {
+        let state = test_state().await;
+        let chat_id = "order-chat";
+        let _first = send_message(&state, chat_id, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        send_or_queue(&state, chat_id, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        send_or_queue(&state, chat_id, "terceiro", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::chats::queued(&state.pool, chat_id).await.unwrap(),
+            vec!["segundo".to_string(), "terceiro".to_string()]
+        );
+    }
+
+    /// With nothing in flight there is nothing to wait for, and asking to wait must not make a
+    /// message wait anyway — it is sent, and the caller is handed the turn it became.
+    #[tokio::test]
+    async fn asking_to_wait_still_sends_immediately_when_nothing_is_running() {
+        let state = test_state().await;
+
+        let outcome = send_or_queue(&state, "idle-chat", "arranja isso", Origin::Shell).await;
+
+        assert!(matches!(outcome, Ok(Sent::Turn(_))), "{outcome:?}");
+    }
+
+    /// An origin has to survive being written down, or a queued Telegram turn comes back as the
+    /// shell's and is answered into the wrong place.
+    #[test]
+    fn an_origin_written_down_reads_back_as_itself() {
+        for origin in [Origin::Shell, Origin::Telegram] {
+            assert_eq!(Origin::from_wire(Some(origin.as_wire())), origin);
+        }
     }
 
     /// How much a turn THOUGHT outlives the stream it thought it in, as what it did does.

@@ -571,6 +571,9 @@ function ChatDetail({
           chatId={chatId}
         />
       )}
+      {/* Below the transcript and above the box, which is where these words are in time: said
+          after everything above them, and not yet said at all. */}
+      <Waiting queued={transcript.data?.queued ?? []} />
 
       <Composer chatId={chatId} />
     </Panel>
@@ -850,6 +853,35 @@ function HowItContinued({
         </ul>
       )}
     </div>
+  );
+}
+
+/**
+ * What was said to this conversation while it was busy, and has not been sent yet.
+ *
+ * Outside the transcript, deliberately. A turn is a run: it has an id, it has a cost, and it is in
+ * the history for ever. These have none of that — nothing has been spawned, nothing is billed, and
+ * a bubble that looked like a turn would be claiming one that does not exist. They leave this list
+ * by becoming turns, on their own, the moment the conversation has a slot free.
+ *
+ * No control to cancel one, and that is a gap rather than a decision: the daemon can drop a queued
+ * message, nothing here asks it to yet.
+ */
+function Waiting({ queued }: { queued: string[] }) {
+  if (queued.length === 0) return null;
+  return (
+    <ul className="chats-waiting" aria-label="Waiting to be sent">
+      {queued.map((text, index) => (
+        // Keyed by position: this is a stored list, in the order it was typed, and nothing here
+        // reorders or removes from it. Two identical messages are two real entries.
+        <li key={`waiting-${index}`} className="chats-waiting-line">
+          <span className="chats-waiting-who">you · waiting</span>
+          {/* Verbatim, and not through `Rich`: it is what a person typed, and a message redrawn
+              as bold is a message they did not write. */}
+          <p className="chats-waiting-text">{text}</p>
+        </li>
+      ))}
+    </ul>
   );
 }
 

@@ -115,6 +115,8 @@ function chatsFetch(
     files?: Record<string, Mention[]>;
     /** The slash commands each conversation offers, by chat id. */
     commands?: Record<string, Command[]>;
+    /** What is waiting to be said to each conversation, by chat id. */
+    queued?: Record<string, string[]>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -175,7 +177,11 @@ function chatsFetch(
     }
     const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
     if (match !== null) {
-      return { handed: opts.handed?.[match[1]] ?? [], turns: transcripts[match[1]] ?? [] };
+      return {
+        handed: opts.handed?.[match[1]] ?? [],
+        queued: opts.queued?.[match[1]] ?? [],
+        turns: transcripts[match[1]] ?? [],
+      };
     }
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
     return undefined;
@@ -781,6 +787,81 @@ describe("where a subagent worked", () => {
     const row = note.closest("li") as HTMLElement;
     expect(within(row).queryByText("núcleo")).toBeNull();
     expect(row.className).toContain("aside");
+  });
+});
+
+/* --------------------------------------------------------------- sending -- */
+
+describe("sending a message from a conversation already on screen", () => {
+  // The optimistic write lands in the transcript's cache, and that cache stopped holding a bare
+  // array the day it started carrying what the conversation was handed. Writing the old shape into
+  // it does not fail a type check -- `setQueryData` is TOLD the shape -- it throws at runtime
+  // inside `merge`, on the one gesture the page exists for, and the message never appears.
+  //
+  // What this does NOT hold: that the write keeps the turns already drawn. Dropping them is
+  // repaired by the next poll, so it costs a flicker only a person sees. The assertion below is a
+  // cheap guard, not proof — checked by breaking it and watching this test stay green.
+  it("shows a message that was just sent, under the turns already drawn", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "arranja o parser", answer: "arranjado" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    // The transcript is on screen before anything is sent: this is the state the bug needs.
+    const turns = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(turns).getByText("arranja o parser")).toBeTruthy();
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "e os testes tambem", selectionStart: 18 } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(
+        daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/message"),
+      ).toBe(true);
+    });
+    // Both of them: the one that was there, and the one just sent.
+    const after = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(after).getByText("arranja o parser")).toBeTruthy();
+    await waitFor(() => {
+      expect(within(after).getByText("e os testes tambem")).toBeTruthy();
+    });
+  });
+});
+
+describe("what is waiting to be said", () => {
+  it("is drawn under the turns, marked as not sent yet", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, asked: "arranja o parser", status: "running", answer: null })] },
+        { queued: { "c-1": ["e os testes tambem"] } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const waiting = await screen.findByRole("list", { name: "Waiting to be sent" });
+    expect(within(waiting).getByText("e os testes tambem")).toBeTruthy();
+    // Not a turn: no run exists, nothing is billed, and a bubble that looked like one would be
+    // claiming a turn nobody has paid for. It lives outside the transcript for exactly that reason.
+    const turns = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(turns).queryByText("e os testes tambem")).toBeNull();
+  });
+
+  it("says nothing at all when nothing is waiting", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByRole("list", { name: "Waiting to be sent" })).toBeNull();
   });
 });
 
