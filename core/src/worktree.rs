@@ -1198,6 +1198,16 @@ pub(crate) const GC_CANDIDATES_SQL: &str =
            AND j.status IN ('completed','failed','gate_failed','gate_errored','expired','stopped',
                             'cancelled','interrupted')
            AND COALESCE(j.completed_at, w.created_at) <= ?
+         UNION ALL
+         SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
+         FROM worktrees w
+         JOIN job_items i ON i.id = w.owner_id
+         JOIN jobs j ON j.id = i.job_id
+         WHERE w.owner_kind = 'item'
+           AND w.removed_at IS NULL
+           AND j.status IN ('completed','failed','gate_failed','gate_errored','expired','stopped',
+                            'cancelled','interrupted')
+           AND COALESCE(j.completed_at, w.created_at) <= ?
          ORDER BY 1, 2";
 
 pub async fn gc_candidates(
@@ -1207,6 +1217,7 @@ pub async fn gc_candidates(
 ) -> sqlx::Result<Vec<WorktreeRow>> {
     let cutoff = (now - retention).to_rfc3339();
     sqlx::query_as(GC_CANDIDATES_SQL)
+        .bind(&cutoff)
         .bind(&cutoff)
         .bind(&cutoff)
         .fetch_all(pool)

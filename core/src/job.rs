@@ -1343,6 +1343,31 @@ pub const LIVE_STATUSES: [&str; 6] = [
     "waiting",
 ];
 
+/// The `job_items.status` values that mean an item may still run, and therefore that anything it
+/// holds — a worktree, a concurrency slot — has to be left alone.
+///
+/// The sweep in `concurrency.rs` reads these words out of a SQL literal — sqlx refuses SQL built at
+/// run time — so this is the list that literal is held against, by
+/// `every_unfinished_state_is_a_status_the_sweep_spares` here and
+/// `every_live_status_is_a_status_the_sweep_spares` there. Test-only for that reason: it is the
+/// second copy that makes the first one checkable, the same shape `EVERY_ITEM_STATE` has.
+///
+/// `gate_failed` is in the list although it is sometimes over, and that asymmetry is deliberate. It
+/// means `GateRetriable` or `GateFailed` depending on `gate_attempts` weighed against the job's
+/// budget — arithmetic [`item_state_from`] owns — and restating it in SQL would be the same rule in
+/// a second dialect. Sparing it costs a slot held until the job ends; getting it wrong the other way
+/// deletes a tree out from under work that was going to continue in it.
+#[cfg(test)]
+pub const LIVE_ITEM_STATUSES: [&str; 7] = [
+    "pending",
+    "running",
+    "implemented",
+    "merging",
+    "conflicted",
+    "reverted",
+    "gate_failed",
+];
+
 /// A job's own row, as the executor needs it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct JobRow {
@@ -4116,6 +4141,74 @@ mod tests {
                 | ItemState::Reverted
                 | ItemState::Orphaned => (),
             };
+        }
+    }
+
+    /// `LIVE_ITEM_STATUSES` is exactly the set of stored statuses that mean an item may still run.
+    ///
+    /// The slot sweep reads that list, so a state missing from it is a checkout and a slot freed out
+    /// from under work still in flight, and a state wrongly in it is a slot held for ever. The
+    /// classification below is an exhaustive `match`, which is what forces a new variant to be
+    /// judged rather than defaulted.
+    ///
+    /// `gate_failed` is stored by two states — `GateRetriable`, which may still run, and
+    /// `GateFailed`, which is over — so it belongs in the list on the strength of the first. That is
+    /// the one place the list is deliberately generous, and the doc on the constant says why.
+    #[test]
+    fn every_unfinished_state_is_a_status_the_sweep_spares() {
+        fn may_still_run(state: ItemState) -> bool {
+            match state {
+                ItemState::Pending
+                | ItemState::Running
+                | ItemState::Implemented
+                | ItemState::GateRetriable
+                | ItemState::Merging
+                | ItemState::Conflicted
+                | ItemState::Reverted => true,
+                ItemState::Passed
+                | ItemState::Failed
+                | ItemState::Cancelled
+                | ItemState::GateFailed
+                | ItemState::GateErrored
+                | ItemState::Skipped
+                | ItemState::Orphaned => false,
+            }
+        }
+
+        // Read `(0, 1)` — an unspent retry — so that `gate_failed` shows up as the state that may
+        // still run, which is why it is on the list.
+        let mut spared: Vec<&str> = LIVE_ITEM_STATUSES
+            .into_iter()
+            .filter(|status| may_still_run(item_state_from(status, 0, 1)))
+            .collect();
+        spared.sort_unstable();
+        let mut listed: Vec<&str> = LIVE_ITEM_STATUSES.into_iter().collect();
+        listed.sort_unstable();
+        assert_eq!(
+            spared, listed,
+            "the sweep spares a status that means the item is over"
+        );
+
+        // And nothing that may still run is left off it. Both halves are needed: the check above
+        // catches a status that should not be spared, this one catches a state nothing spares.
+        for state in EVERY_ITEM_STATE {
+            if !may_still_run(state) {
+                continue;
+            }
+            let stored = match state {
+                ItemState::Pending => "pending",
+                ItemState::Running => "running",
+                ItemState::Implemented => "implemented",
+                ItemState::GateRetriable => "gate_failed",
+                ItemState::Merging => "merging",
+                ItemState::Conflicted => "conflicted",
+                ItemState::Reverted => "reverted",
+                other => unreachable!("{other:?} does not still run"),
+            };
+            assert!(
+                LIVE_ITEM_STATUSES.contains(&stored),
+                "{state:?} is stored as `{stored}`, which the sweep would collect"
+            );
         }
     }
 

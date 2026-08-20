@@ -248,6 +248,19 @@ pub async fn reconcile_orphaned_slots(pool: &SqlitePool) -> sqlx::Result<u64> {
 /// prevent; a leaked slot is visible in `project_slots` and costs a lower ceiling. Adding a third
 /// owner kind means teaching this pass, and `Owner` being an enum is what makes that a compile-time
 /// conversation rather than a silent one.
+///
+/// **The item arm takes TWO conditions, and the pair is the whole of it.** An item's own status is
+/// what frees its slot mid-job — otherwise a five-item job would hold five slots to the end and
+/// parallelism would be worth nothing — and its job's status is what frees it in the end. Neither
+/// alone is enough: item liveness alone would hold a slot forever for an item that ran out of gate
+/// retries, and job liveness alone would hold every item's slot until the last one landed.
+///
+/// `gate_failed` is spared deliberately, and it is the one status here that may be either thing. A
+/// red gate with a retry left is an item that WILL run again, and telling that from an item that is
+/// over needs `gate_attempts` weighed against `jobs.gate_retries` — a rule `job::item_state_from`
+/// owns, and one this repository has three times been bitten by writing out a second time. Sparing
+/// it costs a slot held until the job ends; getting the arithmetic wrong here costs a tree deleted
+/// out from under work that was going to continue in it.
 const ORPHANED_SLOTS_SQL: &str = "DELETE FROM project_slots
      WHERE (owner_kind = 'run'
             AND NOT EXISTS (SELECT 1 FROM runs
@@ -256,6 +269,14 @@ const ORPHANED_SLOTS_SQL: &str = "DELETE FROM project_slots
         OR (owner_kind = 'job'
             AND NOT EXISTS (SELECT 1 FROM jobs
                             WHERE jobs.id = project_slots.owner_id
+                              AND jobs.status IN ('planning','implementing','gating','reviewing',
+                                                  'awaiting_approval','waiting')))
+        OR (owner_kind = 'item'
+            AND NOT EXISTS (SELECT 1 FROM job_items
+                            JOIN jobs ON jobs.id = job_items.job_id
+                            WHERE job_items.id = project_slots.owner_id
+                              AND job_items.status IN ('pending','running','implemented','merging',
+                                                       'conflicted','reverted','gate_failed')
                               AND jobs.status IN ('planning','implementing','gating','reviewing',
                                                   'awaiting_approval','waiting')))";
 
@@ -598,6 +619,67 @@ mod tests {
         assert_eq!(reconcile_orphaned_slots(&pool).await.unwrap(), 1);
     }
 
+    /// An item's slot is freed on TWO conditions, and the test walks both because either alone is a
+    /// defect with a different shape.
+    ///
+    /// A running item inside a live job keeps its slot — the ordinary case, and the one a sweep that
+    /// judged by the job alone would still get right. A finished item inside a LIVE job gives its
+    /// slot back mid-flight, which is the whole of what parallelism buys: without it a five-item job
+    /// would hold five slots until its last item landed. And an item still reading `gate_failed`,
+    /// which may or may not be over, gives its slot back when the job around it ends — the arm that
+    /// keeps the deliberate generosity about that status from leaking a slot for ever.
+    #[tokio::test]
+    async fn an_items_slot_is_freed_by_its_own_ending_or_by_its_jobs() {
+        async fn seed(pool: &SqlitePool, job_status: &str, item_status: &str) -> i64 {
+            let job_id = sqlx::query(
+                "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+                 VALUES ('project-a', '/repo', ?, 5, '2026-01-01T00:00:00Z')",
+            )
+            .bind(job_status)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO job_items (job_id, ordinal, description, status)
+                 VALUES (?, 0, 'an item', ?)",
+            )
+            .bind(job_id)
+            .bind(item_status)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+        }
+
+        for (job_status, item_status, survives) in [
+            ("implementing", "running", true),
+            ("implementing", "gate_failed", true),
+            ("implementing", "passed", false),
+            ("implementing", "orphaned", false),
+            ("completed", "running", false),
+            ("completed", "gate_failed", false),
+        ] {
+            let pool = test_pool().await;
+            set_limits(&pool, 5, 9).await;
+            let item_id = seed(&pool, job_status, item_status).await;
+            claim(&pool, "project-a", Owner::Item(item_id))
+                .await
+                .unwrap();
+
+            reconcile_orphaned_slots(&pool).await.unwrap();
+
+            assert_eq!(
+                slot_of(&pool, Owner::Item(item_id))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                survives,
+                "job `{job_status}` with item `{item_status}`"
+            );
+        }
+    }
+
     /// The guard on the hand-written SQL: every status either constant calls live must appear in the
     /// sweep's spare-list, or a restart would free a slot out from under something still working.
     #[test]
@@ -614,8 +696,18 @@ mod tests {
                 "the sweep does not spare live job status `{status}`"
             );
         }
+        for status in crate::job::LIVE_ITEM_STATUSES {
+            assert!(
+                ORPHANED_SLOTS_SQL.contains(&format!("'{status}'")),
+                "the sweep does not spare live item status `{status}`"
+            );
+        }
         // And the other direction, which is the one that leaks: a status the sweep spares but no
         // pass drives is a slot held forever by a job nothing will ever move.
+        //
+        // The job statuses are counted TWICE: the item arm asks the same question of the item's job
+        // that the job arm asks of the job itself, because an item's slot has to be freed both when
+        // the item is over and when the job around it is.
         let spared = ORPHANED_SLOTS_SQL
             .split('\'')
             .skip(1)
@@ -624,7 +716,10 @@ mod tests {
             .count();
         assert_eq!(
             spared,
-            LIVE_RUN_STATUSES.len() + crate::job::LIVE_STATUSES.len() + 2,
+            LIVE_RUN_STATUSES.len()
+                + crate::job::LIVE_STATUSES.len() * 2
+                + crate::job::LIVE_ITEM_STATUSES.len()
+                + 3,
             "the sweep spares a status nothing drives, or names an owner kind it cannot judge"
         );
     }
