@@ -877,6 +877,56 @@ pub struct TurnOutcome {
     pub usage: RunUsage,
 }
 
+/// What one line of a live process's stream means to whoever is recording turns.
+///
+/// A process that serves one turn needs none of this — its stream IS the turn, and `RunOutcome`
+/// describes it. A process that serves several needs somebody to say where one answer ends and the
+/// next begins, because the CLI itself only says so in passing, with a `result` line that looks like
+/// any other line until it is parsed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnEvent {
+    /// One line belonging to the turn that has not ended yet.
+    Line(String),
+    /// The turn that was in flight has ended, with its own numbers.
+    Ended(TurnOutcome),
+}
+
+/// Splits one process's stdout into turns, a line at a time.
+///
+/// It exists so the rule lives in one place that a test can reach without a subprocess: `execute`
+/// feeds it every line and reads back both what to forward and what the turn cost, and nothing else
+/// in the daemon has to know that a `result` is a boundary or that the cost on it is cumulative.
+pub(crate) struct TurnSplitter {
+    spent: f64,
+}
+
+impl TurnSplitter {
+    pub(crate) fn new() -> Self {
+        Self { spent: 0.0 }
+    }
+
+    /// The events this line produces, in the order a consumer must see them.
+    ///
+    /// A `result` line produces BOTH — it is the last line of the turn it ends, and it carries the
+    /// answer, so a consumer told the turn had ended before being given that line would close every
+    /// turn one line short of what it said.
+    pub(crate) fn line(&mut self, line: String) -> Vec<TurnEvent> {
+        match turn_from_result(&line, self.spent) {
+            Some((turn, total)) => {
+                self.spent = total;
+                vec![TurnEvent::Line(line), TurnEvent::Ended(turn)]
+            }
+            None => vec![TurnEvent::Line(line)],
+        }
+    }
+
+    /// Everything the process has reported spending so far, which is what bills the PROCESS rather
+    /// than any one turn inside it.
+    pub(crate) fn spent(&self) -> f64 {
+        self.spent
+    }
+}
+
 /// What one `result` line added, given what the process has already reported spending — and the new
 /// running total to carry into the next one. `None` for every line that does not end a turn.
 ///
@@ -1135,6 +1185,26 @@ pub trait CommandRunner: Send + Sync {
         _context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
     ) -> std::io::Result<RunOutcome> {
         self.run_prompt(request, session_tx, transcript).await
+    }
+
+    /// Runs a prompt while also reporting where one turn ends and the next begins.
+    ///
+    /// Only ever `Some` for a process meant to serve more than one turn. Everything else keeps the
+    /// default and never learns that turns exist, which is right: for a process that answers once,
+    /// the turn and the process are the same thing and `RunOutcome` already describes it.
+    ///
+    /// A channel rather than a return value because a caller has to act on a turn while the process
+    /// it belongs to is still running — that is the entire point of keeping it running.
+    async fn run_prompt_with_turns(
+        &self,
+        request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+        _turns: Option<UnboundedSender<TurnEvent>>,
+    ) -> std::io::Result<RunOutcome> {
+        self.run_prompt_with_context_fill(request, session_tx, transcript, context_fill)
+            .await
     }
 
     /// The per-role model for a job node's stage, or `None` for the runner's own model.
@@ -1539,10 +1609,23 @@ impl CommandRunner for ClaudeCliRunner {
 
     async fn run_prompt_with_context_fill(
         &self,
+        request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    ) -> std::io::Result<RunOutcome> {
+        // Nobody listening for turns, which is every caller but a conversation keeping its process.
+        self.run_prompt_with_turns(request, session_tx, transcript, context_fill, None)
+            .await
+    }
+
+    async fn run_prompt_with_turns(
+        &self,
         mut request: RunRequest,
         session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
         context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+        turn_events: Option<UnboundedSender<TurnEvent>>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
         // npm-installed `claude` is a `.cmd` shim that Rust's `Command` can't spawn by name — the
@@ -1651,9 +1734,9 @@ impl CommandRunner for ClaudeCliRunner {
             .or_else(|| request.resume_session_id.clone());
         let mut cli_session_seen = false;
         let mut cost_usd: Option<f64> = None;
-        // What the process has reported spending so far, so each `result` can be read as what its
-        // own turn added rather than as the running total the CLI actually writes.
-        let mut spent = 0.0_f64;
+        // Where one answer ends and the next begins. Held across the whole stream because that is
+        // the only place the running total lives.
+        let mut splitter = TurnSplitter::new();
         let mut usage = RunUsage::default();
         let mut running_context_fill: Option<i64> = None;
 
@@ -1725,18 +1808,25 @@ impl CommandRunner for ClaudeCliRunner {
                     }
                 }
                 // Every `result` is the end of a TURN, which is the same thing as the end of the
-                // process only while a process serves one. `turn_from_result` is where that
-                // distinction is written down — the cost a result carries is a running total and
-                // the counts beside it are not — so reading it here keeps one account of the
-                // semantics rather than two that can drift apart.
+                // process only while a process serves one. `TurnSplitter` is where that distinction
+                // is written down — the cost a result carries is a running total and the counts
+                // beside it are not — so it is read here even when nobody is listening for turns,
+                // rather than kept as a second account that can drift from this one.
                 //
-                // What this loop reports is unchanged: `cost_usd` is still the process's whole
-                // bill, and `usage` still describes the turn that ended last.
-                if let Some((turn, total)) = turn_from_result(&line, spent) {
-                    spent = total;
-                    usage = turn.usage;
-                    if turn.cost_usd.is_some() {
-                        cost_usd = Some(spent);
+                // What this loop reports is unchanged: `cost_usd` is still the process's whole bill,
+                // and `usage` still describes the turn that ended last.
+                for event in splitter.line(line.clone()) {
+                    if let TurnEvent::Ended(turn) = &event {
+                        usage = turn.usage;
+                        if turn.cost_usd.is_some() {
+                            cost_usd = Some(splitter.spent());
+                        }
+                    }
+                    // Best-effort, like `session_tx` above it: a listener that has gone away is a
+                    // conversation that stopped caring, and this stream has a process to keep
+                    // draining either way.
+                    if let Some(turn_events) = &turn_events {
+                        let _ = turn_events.send(event);
                     }
                 }
             }
@@ -3253,6 +3343,56 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(500));
         assert_eq!(usage.cache_read_tokens, None);
         assert_eq!(usage.num_turns, Some(12));
+    }
+
+    /// A turn's own lines must arrive before the word that it ended.
+    ///
+    /// The order is the whole contract. A consumer builds each turn's transcript out of the lines
+    /// and closes it on `Ended`, so an end delivered before its own `result` line would close every
+    /// turn one line short of what it actually said — and that line is the one carrying the answer.
+    #[test]
+    fn a_turns_lines_arrive_before_the_word_that_it_ended() {
+        let mut splitter = TurnSplitter::new();
+        let mut events = Vec::new();
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.10}"#,
+        ] {
+            events.extend(splitter.line(line.to_string()));
+        }
+
+        assert!(matches!(events[0], TurnEvent::Line(_)));
+        assert!(matches!(events[1], TurnEvent::Line(_)));
+        // The result line belongs to the turn it ends, so it is a `Line` too — and only then `Ended`.
+        assert!(matches!(events[2], TurnEvent::Line(_)));
+        assert!(matches!(events[3], TurnEvent::Ended(_)));
+        assert_eq!(events.len(), 4);
+    }
+
+    /// One process, two answers, two turns — and the second one billed for what it added rather than
+    /// for everything the process had spent by then.
+    #[test]
+    fn two_answers_down_one_process_are_two_turns() {
+        let mut splitter = TurnSplitter::new();
+        let mut ended = Vec::new();
+        for line in [
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1046}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.2024}"#,
+        ] {
+            for event in splitter.line(line.to_string()) {
+                if let TurnEvent::Ended(turn) = event {
+                    ended.push(turn);
+                }
+            }
+        }
+
+        assert_eq!(ended.len(), 2);
+        assert_eq!(ended[0].cost_usd, Some(0.1046));
+        assert!((ended[1].cost_usd.unwrap() - 0.0978).abs() < 1e-9);
+        // And the process's own total is still available to whoever is billing the process.
+        assert!((splitter.spent() - 0.2024).abs() < 1e-9);
     }
 
     /// A process that answers twice reports what it has spent in total, not what the last turn
