@@ -475,6 +475,29 @@ pub struct LiveTurn {
     pub text: String,
     /// The tool being run right now, or `None` when the model is writing rather than acting.
     pub doing: Option<String>,
+    /// Roughly how many tokens the model spent thinking, or `None` when it did not think or the
+    /// stream never said.
+    ///
+    /// The only thing about a thought that this machine can actually have. The CLI emits the
+    /// signature and a running `thinking_tokens` estimate and WITHHOLDS the text: asked of a real
+    /// interactive session, 610 thinking blocks, every one of them `thinking: ""`. So a window that
+    /// offered to show the reasoning would be offering something nothing here holds — and this is
+    /// what it says instead, which is true.
+    ///
+    /// An estimate, and named one. It is the CLI's own running count, and what it has to be right
+    /// about is whether the model deliberated and roughly how hard.
+    pub thought_tokens: Option<i64>,
+    /// What the model thought before it answered, oldest first.
+    ///
+    /// Empty in practice on every stream this daemon has seen, for the reason above — the parse is
+    /// here so that the day the CLI stops withholding the words, they arrive. Empty is therefore
+    /// the ordinary case and not a failure, and nothing downstream may read it as one.
+    ///
+    /// Apart from `text` and never joined to it. Thinking is not the reply: it is working, often
+    /// wrong on the way to being right, and a window that concatenated the two would record the
+    /// model's private reasoning as the thing it said — which is then what a replay quotes back to
+    /// it, and what a person reads as its answer.
+    pub thought: Vec<String>,
     /// Every tool the turn ran, oldest first.
     ///
     /// Beside the text and not folded into it: a turn that read four files and ran the tests
@@ -609,6 +632,9 @@ fn cut_detail(text: &str) -> String {
 pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
     let mut finished: Vec<String> = Vec::new();
     let mut writing = String::new();
+    let mut thought: Vec<String> = Vec::new();
+    let mut thought_tokens: Option<i64> = None;
+    let mut pondering = String::new();
     let mut doing: Option<String> = None;
     let mut did: Vec<ToolCall> = Vec::new();
 
@@ -624,6 +650,28 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                 if let Some(text) = value.pointer("/event/delta/text").and_then(|t| t.as_str()) {
                     writing.push_str(text);
                 }
+                // Thinking streams on the same channel under its own key — and arrives EMPTY.
+                // The CLI sends `thinking_delta`s carrying `"thinking": ""` and a token estimate,
+                // never the words. Read anyway, so the day it stops withholding them they appear;
+                // measured below, because the measurement is the part that exists.
+                if let Some(text) = value
+                    .pointer("/event/delta/thinking")
+                    .and_then(|t| t.as_str())
+                {
+                    pondering.push_str(text);
+                }
+                thought_tokens = larger(
+                    thought_tokens,
+                    value.pointer("/event/delta/estimated_tokens"),
+                );
+            }
+            // The one line that says anything real about a thought. A running total, and it arrives
+            // even on the turns whose thinking block came through with its text stripped out —
+            // which, so far, is all of them.
+            Some("system")
+                if value.get("subtype").and_then(|s| s.as_str()) == Some("thinking_tokens") =>
+            {
+                thought_tokens = larger(thought_tokens, value.get("estimated_tokens"));
             }
             Some("assistant") => {
                 let blocks = value
@@ -644,6 +692,16 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                 if !text.trim().is_empty() {
                     finished.push(text);
                 }
+                thought.extend(
+                    blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(|t| t.as_str()) == Some("thinking")
+                        })
+                        .filter_map(|block| block.get("thinking").and_then(|t| t.as_str()))
+                        .filter(|text| !text.trim().is_empty())
+                        .map(str::to_string),
+                );
                 for block in blocks
                     .iter()
                     .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
@@ -658,8 +716,12 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                     });
                     doing = Some(name.to_string());
                 }
-                // The message that just completed is the one those deltas were writing.
+                // The message that just completed is the one those deltas were writing — both
+                // kinds of them. The CLI sends one `assistant` event per API message carrying every
+                // block of it, so a message that ended a thought carries that thought, and keeping
+                // the buffer as well would show it twice.
                 writing.clear();
+                pondering.clear();
             }
             // A tool answering is the only thing that ends a tool call. Clearing this anywhere else
             // would show the model as writing while a command is still running.
@@ -683,6 +745,11 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
     if !writing.trim().is_empty() {
         finished.push(writing);
     }
+    // A thought still being written when the stream was read is worth showing — that is most of
+    // what a live turn IS while it is hard.
+    if !pondering.trim().is_empty() {
+        thought.push(pondering);
+    }
 
     LiveTurn {
         text: finished.join(
@@ -690,8 +757,22 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
 
 ",
         ),
+        thought_tokens,
+        thought,
         doing,
         did,
+    }
+}
+
+/// The larger of what is known and what a line claims, ignoring a line that claims nothing.
+///
+/// `estimated_tokens` is a RUNNING total and arrives on two different kinds of line, one of which
+/// sometimes sends it null. Taking the largest is what makes a stream read at any point report the
+/// whole thought so far rather than whichever line happened to come last.
+fn larger(known: Option<i64>, claimed: Option<&serde_json::Value>) -> Option<i64> {
+    match claimed.and_then(serde_json::Value::as_i64) {
+        Some(seen) => Some(known.map_or(seen, |known| known.max(seen))),
+        None => known,
     }
 }
 
@@ -2741,6 +2822,106 @@ mod tests {
         );
 
         assert_eq!(live_from_stream(&stream).text, "está quase");
+    }
+
+    /// One line of a partial stream: a slice of THINKING as it is typed.
+    ///
+    /// A separate delta type from `text_delta`, and that is the whole point: the two arrive
+    /// interleaved on the same stream, and a reader that took `delta.text` alone would find nothing
+    /// here and show a model that sat silent through the part worth watching.
+    fn pondered(text: &str) -> String {
+        serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "thinking_delta", "thinking": text}}
+        })
+        .to_string()
+    }
+
+    /// What the model thought is carried BESIDE what it said, never folded into it.
+    ///
+    /// The editor shows thinking; this window dropped it on the floor. `live_from_stream` kept only
+    /// `text` blocks, so an answer whose reasoning WAS the work arrived as its conclusion alone —
+    /// and a conclusion with nothing visible behind it is exactly the thing a reader cannot check.
+    ///
+    /// Beside, and not concatenated: thinking is not the reply. Joining them would put the model's
+    /// working into the answer this conversation records, into the replay built from that answer,
+    /// and into every place downstream that treats `text` as the thing that was said.
+    #[test]
+    fn what_the_model_thought_is_carried_beside_what_it_said() {
+        let stream = message(serde_json::json!([
+            {"type": "thinking", "thinking": "o mês vem antes do dia neste formato"},
+            {"type": "text", "text": "é o parser de datas"}
+        ]));
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.thought, vec!["o mês vem antes do dia neste formato"]);
+        assert_eq!(live.text, "é o parser de datas");
+    }
+
+    /// Thinking streams before it completes, exactly as text does.
+    ///
+    /// Without this the window shows nothing at all for the longest stretch of a hard turn, and
+    /// then the whole of the reasoning at once, after it has stopped being interesting.
+    #[test]
+    fn thinking_in_flight_reads_back_before_its_block_completes() {
+        let stream = [pondered("o mês"), pondered(" vem antes")].join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.thought, vec!["o mês vem antes"]);
+        // And it did not leak into the reply: nothing has been SAID yet.
+        assert_eq!(live.text, "");
+    }
+
+    /// The deltas and the completed block are the SAME thought, and a reader that took both would
+    /// show it twice — the identical bug `a_completed_message_supersedes_the_deltas` guards for
+    /// speech, on the channel beside it.
+    #[test]
+    fn a_completed_thought_supersedes_the_deltas_it_was_written_from() {
+        let stream = [
+            pondered("o mês"),
+            pondered(" vem antes"),
+            message(serde_json::json!([{"type": "thinking", "thinking": "o mês vem antes"}])),
+        ]
+        .join("\n");
+
+        assert_eq!(live_from_stream(&stream).thought, vec!["o mês vem antes"]);
+    }
+
+    /// A real stream carries the SIZE of a thought and never its words.
+    ///
+    /// Built from a stream this machine actually produced, because the synthetic ones above are
+    /// what let a feature be written that could never draw anything. Asked of the CLI directly:
+    /// every `thinking` block arrives with `thinking: ""` -- 610 of them across one interactive
+    /// session, not one with a word in it. Claude Code emits the signature and a running
+    /// `thinking_tokens` estimate and withholds the text.
+    ///
+    /// So this is the honest claim a window can make about a thought, and it is the only one.
+    #[test]
+    fn a_thought_is_measured_because_the_cli_withholds_its_words() {
+        let stream = [
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50}"#.to_string(),
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":177,"estimated_tokens_delta":27}"#.to_string(),
+            message(serde_json::json!([{"type": "thinking", "thinking": "", "signature": "ErwFCqUB"}])),
+            message(said("17 x 23 = 391")),
+        ]
+        .join("
+");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.thought_tokens, Some(177));
+        // And nothing is claimed to have been said in it, because nothing was.
+        assert!(live.thought.is_empty());
+        assert_eq!(live.text, "17 x 23 = 391");
+    }
+
+    /// A turn that did not think says so as nothing, never as zero.
+    #[test]
+    fn a_turn_that_did_not_think_reports_no_measurement_at_all() {
+        assert_eq!(live_from_stream(&message(said("ola"))).thought_tokens, None);
     }
 
     /// Text, a tool, then more text is ONE answer with a gap in the middle. Keeping only the last

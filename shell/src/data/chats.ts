@@ -82,6 +82,13 @@ export interface LiveTurn {
   doing: string | null;
   /** What it has run so far, oldest first. */
   did: ToolCall[];
+  /**
+   * What it has thought so far — and empty on every stream so far. See
+   * `AssistantTurnRow.thought`: the CLI withholds the words.
+   */
+  thought: string[];
+  /** Roughly how many tokens it has spent thinking, or null if it has not. */
+  thought_tokens: number | null;
 }
 
 /** One thing said in a conversation had in the editor. */
@@ -118,6 +125,28 @@ export interface Conversation {
   context_estimate: number | null;
   /** The count past which the daemon stops resuming and starts a fresh context. */
   context_rotates_at: number;
+}
+
+/**
+ * One exchange a conversation was handed: what was asked, and what was answered.
+ *
+ * A pair rather than two `Said`s, because that is the unit the daemon carries — an unanswered
+ * question is not part of a tail, and a tuple is the shape that cannot hold half of one.
+ */
+export type Exchange = [string, string];
+
+/**
+ * A conversation as it is read back: its turns, and whatever it was handed before the first one.
+ *
+ * `handed` is empty for every ordinary chat. It is non-empty only where a session picked up from
+ * the editor was too large to resume: the daemon started a fresh context and put the verbatim tail
+ * of the old one in front of it. Without this the window showed the whole editor conversation and
+ * said nothing about how much of it the model actually has — which reads as "it remembers all of
+ * this" and is false.
+ */
+export interface Transcript {
+  handed: Exchange[];
+  turns: Turn[];
 }
 
 /** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */
@@ -175,16 +204,19 @@ export function useChatTranscript(chatId: string | null) {
   const queryKey = keys.chats.detail(chatId ?? "");
   return useQuery({
     queryKey,
-    queryFn: async ({ client }): Promise<Turn[]> => {
-      const rows = await apiFetch<AssistantTurnRow[]>(
+    queryFn: async ({ client }): Promise<Transcript> => {
+      const read = await apiFetch<{ handed: Exchange[]; turns: AssistantTurnRow[] }>(
         `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
       );
-      const fresh = rows.map(turnFromRow);
-      const local = client.getQueryData<Turn[]>(queryKey) ?? [];
-      return merge(fresh, local);
+      const fresh = read.turns.map(turnFromRow);
+      const local = client.getQueryData<Transcript>(queryKey)?.turns ?? [];
+      // Defaulted rather than trusted, exactly as the turn fields are: a daemon older than the
+      // column answers with turns and no `handed`, and a conversation that will not draw over a
+      // missing field is a worse answer than one that draws without the note.
+      return { handed: read.handed ?? [], turns: merge(fresh, local) };
     },
     enabled: chatId !== null,
-    refetchInterval: (query) => (anyTurnLive(query.state.data) ? POLL.turn : POLL.fast),
+    refetchInterval: (query) => (anyTurnLive(query.state.data?.turns) ? POLL.turn : POLL.fast),
   });
 }
 
@@ -264,6 +296,9 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // Nothing has run and nothing has been thought: this turn has not started.
+        thought: [],
+        thoughtTokens: null,
         // Nothing has been sent, so nothing has been measured. The daemon's reading arrives with
         // the turn it belongs to; inventing one here would draw a number this side made up.
         contextFill: null,

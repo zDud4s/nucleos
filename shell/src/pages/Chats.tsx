@@ -18,6 +18,7 @@ import {
   useStopTurn,
   type Brain,
   type ChatSummary,
+  type Exchange,
   type IdeSession,
   type ToolCall,
   type Turn,
@@ -72,7 +73,7 @@ export function Chats() {
 
   const rows = chats.data ?? [];
   const stale = chats.isError && chats.data !== undefined;
-  const selectedLive = chatId !== null && anyTurnLive(transcript.data);
+  const selectedLive = chatId !== null && anyTurnLive(transcript.data?.turns);
   const summary = chatId === null ? undefined : rows.find((row) => row.chat_id === chatId);
 
   return (
@@ -550,7 +551,9 @@ function ChatDetail({
 
       {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
-      {summary !== undefined && summary.ide_session_id !== null && <PickedUp view={pickedUp} />}
+      {summary !== undefined && summary.ide_session_id !== null && (
+        <PickedUp view={pickedUp} handed={transcript.data?.handed ?? []} />
+      )}
 
       {transcript.isError && transcript.data === undefined && <TranscriptError error={transcript.error} />}
       {!transcript.isError && transcript.data === undefined && (
@@ -558,7 +561,7 @@ function ChatDetail({
       )}
       {transcript.data !== undefined && (
         <Transcript
-          turns={transcript.data}
+          turns={transcript.data.turns}
           precededBy={(pickedUp.data?.said ?? []).length > 0}
           chatId={chatId}
         />
@@ -700,7 +703,13 @@ function ArchiveRefusal({ error }: { error: unknown }) {
  * answer, a conversation nobody spoke in, and that one is said out loud. Collapsing the
  * two would tell somebody their conversation was empty because a file moved.
  */
-function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
+function PickedUp({
+  view,
+  handed,
+}: {
+  view: ReturnType<typeof useIdeConversation>;
+  handed: Exchange[];
+}) {
   if (view.data === undefined && !view.isError) {
     return <p className="chats-loading">reading what was said in the editor…</p>;
   }
@@ -762,7 +771,80 @@ function PickedUp({ view }: { view: ReturnType<typeof useIdeConversation> }) {
         picked up here — everything above was said in the editor and read back out of its
         own file. None of it was a run, and none of it was billed here.
       </p>
+      <HowItContinued
+        handed={handed}
+        carries={view.data.context_estimate}
+        rotatesAt={view.data.context_rotates_at}
+      />
     </>
+  );
+}
+
+/**
+ * Whether the model REMEMBERS what is drawn above this, or was only handed the end of it.
+ *
+ * The window drew somebody's whole editor conversation and then a fresh turn under it, with no
+ * seam. That reads as one continuous thing the model has all of — and for a session past the
+ * daemon's ceiling it is false: that session is not resumed at all, and what the model was given
+ * is the last few exchanges, verbatim, in front of an empty context.
+ *
+ * `handoff.rs` states the rule this pays: context pressure must leave an auditable record rather
+ * than quietly erase how work continued. A compaction stored in a column and never shown is still
+ * an erasure from where the person is standing — hence the disclosure, which is the audit.
+ *
+ * Three cases and not two, because the third is real: an empty `handed` on a session that IS over
+ * the ceiling means it was picked up before any of this existed, or the tail could not be taken.
+ * Neither "resumed" nor "handed" is true of it, so it is told nothing rather than told wrong.
+ */
+function HowItContinued({
+  handed,
+  carries,
+  rotatesAt,
+}: {
+  handed: Exchange[];
+  carries: number | null;
+  rotatesAt: number;
+}) {
+  const [open, setOpen] = useState(false);
+
+  if (handed.length === 0) {
+    if (carries === null || carries > rotatesAt) return null;
+    return (
+      <p className="chats-picked-up-cut">
+        this session was resumed, so the model has all of the above in its context.
+      </p>
+    );
+  }
+  return (
+    <div className="chats-handed">
+      <p className="chats-handed-line">
+        this session was too large to resume, so it was not. The model was handed the last{" "}
+        {handed.length === 1 ? "exchange" : `${handed.length} exchanges`} of it, word for word, in
+        front of an empty context — everything above them is here for you to read, not something it
+        remembers.
+      </p>
+      <button
+        type="button"
+        className="chats-handed-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        {open ? "hide what it was handed" : "show what it was handed"}
+      </button>
+      {open && (
+        <ul className="chats-handed-list" aria-label="What the model was handed">
+          {handed.map(([asked, answered], index) => (
+            // Keyed by position: this is a stored list nothing here reorders or removes from.
+            <li key={`handed-${index}`} className="chats-handed-pair">
+              <span className="chats-said-who">you</span>
+              <p className="chats-said-text">{asked}</p>
+              <span className="chats-said-who">núcleo</span>
+              <p className="chats-said-text">{answered}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -839,6 +921,7 @@ function TurnBlock({
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
+      {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} />}
       {!live && turn.answer !== null && (
@@ -989,6 +1072,7 @@ function LiveAnswer({ turnId }: { turnId: number }) {
 
   return (
     <>
+      <Thought thought={live.data?.thought ?? []} tokens={live.data?.thought_tokens ?? null} />
       {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
       <Plan todos={planOf(live.data?.did ?? [])} />
       <WhatItDid did={live.data?.did ?? []} />
@@ -996,6 +1080,47 @@ function LiveAnswer({ turnId }: { turnId: number }) {
         {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
       </p>
     </>
+  );
+}
+
+/**
+ * That the model thought, and how much — because what it thought cannot be had.
+ *
+ * This began as "show the reasoning, folded shut", which is what the editor does. Asked of the CLI
+ * directly, it cannot be done by anybody: every `thinking` block arrives as
+ * `{"type":"thinking","thinking":"","signature":"…"}`, in the stream and in Claude Code's own
+ * transcript files alike — 610 of them across one real session, not one with a word in it. What
+ * does arrive is a running `thinking_tokens` estimate, and that is what this says.
+ *
+ * So the honest shape is a statement, not a disclosure: there is nothing to open. A toggle here
+ * would promise reasoning this machine will never hold, which is worse than saying less. If the
+ * words ever start arriving, `thought` carries them and they unfold under the same line.
+ */
+function Thought({ thought, tokens }: { thought: string[]; tokens: number | null }) {
+  const [open, setOpen] = useState(false);
+  if (thought.length === 0 && tokens === null) return null;
+  const size = tokens === null ? null : tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : `${tokens}`;
+  return (
+    <div className="chats-thought">
+      {thought.length === 0 ? (
+        <p className="chats-thought-line">thought for ~{size} tokens</p>
+      ) : (
+        <button
+          type="button"
+          className="chats-thought-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+        >
+          {open ? "hide thinking" : size === null ? "thinking" : `thinking · ~${size} tokens`}
+        </button>
+      )}
+      {open &&
+        thought.map((text, index) => (
+          <p key={`thought-${index}`} className="chats-thought-text">
+            {text}
+          </p>
+        ))}
+    </div>
   );
 }
 

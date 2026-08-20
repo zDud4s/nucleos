@@ -3413,6 +3413,12 @@ struct AssistantTurn {
     /// two codebases have to agree on.
     #[serde(skip)]
     tools_used: Option<String>,
+    /// What the turn thought, as the JSON `thought` holds. Not serialized, for the reason above it.
+    #[serde(skip)]
+    thought: Option<String>,
+    /// Roughly how many tokens the turn spent thinking, or null when it did not think and on every
+    /// turn from before the column. Serialized as it stands: it is a number, not a private shape.
+    thought_tokens: Option<i64>,
 }
 
 /// One turn as the window receives it: the row, plus what the turn did.
@@ -3426,12 +3432,36 @@ struct AssistantTurnOut {
     #[serde(flatten)]
     turn: AssistantTurn,
     did: Vec<crate::runner::ToolCall>,
+    /// What the turn thought before it answered, oldest first.
+    ///
+    /// Empty both for a turn that thought nothing and for a turn from before the column. The two
+    /// are different facts and the row keeps them apart, but a window cannot act on the difference:
+    /// either way there is nothing to draw.
+    thought: Vec<String>,
     /// The token count past which this daemon stops resuming and mints a fresh session.
     ///
     /// The same number on every row, because it is a property of the daemon and not of the turn.
     /// It rides here so the window never keeps its own copy of a rule this side owns: a constant
     /// duplicated across two codebases is one that drifts silently the day one of them changes it.
     context_rotates_at: i64,
+}
+
+/// A conversation as it is read back: its turns, and whatever it was handed before the first one.
+///
+/// An object rather than the bare array this used to be, because a transcript is not only its
+/// turns. A chat picked up from a session too large to resume begins with the verbatim tail of that
+/// session in front of it, the model answers from that tail — and nothing in the window said so.
+/// You asked, it replied knowing a past it never lived, and the reason sat in a column.
+///
+/// `handoff.rs` states the rule this serves: context pressure must leave an auditable record rather
+/// than quietly erase how work continued. A compaction that is stored and never shown is still an
+/// erasure from where the person is standing.
+#[derive(serde::Serialize)]
+struct TranscriptOut {
+    /// The exchanges this conversation was handed, oldest first. Empty for an ordinary chat, which
+    /// is most of them, and empty rather than absent so a reader never has to branch on missing.
+    handed: Vec<(String, String)>,
+    turns: Vec<AssistantTurnOut>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3451,10 +3481,11 @@ const ASSISTANT_TRANSCRIPT_LIMIT: i64 = 100;
 async fn get_assistant_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
-) -> Result<Json<Vec<AssistantTurnOut>>, StatusCode> {
+) -> Result<Json<TranscriptOut>, StatusCode> {
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                answered_by, session_id, created_at, context_fill, tools_used
+                answered_by, session_id, created_at, context_fill, tools_used, thought,
+                thought_tokens
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -3469,8 +3500,14 @@ async fn get_assistant_chat(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     turns.reverse();
-    Ok(Json(
-        turns
+    // Read through `assistant::handed_over` rather than parsed here: that function is already the
+    // one reader of the column's shape, and a second one is a second thing to change the day the
+    // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
+    // every ordinary conversation.
+    let handed = crate::assistant::handed_over(&state.pool, &chat_id).await;
+    Ok(Json(TranscriptOut {
+        handed,
+        turns: turns
             .into_iter()
             .map(|turn| {
                 let did = turn
@@ -3478,14 +3515,20 @@ async fn get_assistant_chat(
                     .as_deref()
                     .and_then(|json| serde_json::from_str(json).ok())
                     .unwrap_or_default();
+                let thought = turn
+                    .thought
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
                 AssistantTurnOut {
                     turn,
                     did,
+                    thought,
                     context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
                 }
             })
             .collect(),
-    ))
+    }))
 }
 
 /// A turn while it is still being written: what has been said, and what is being done.
@@ -8335,7 +8378,7 @@ mod tests {
             .unwrap();
         let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        let asked: Vec<&str> = turns
+        let asked: Vec<&str> = turns["turns"]
             .as_array()
             .unwrap()
             .iter()
@@ -8383,9 +8426,9 @@ mod tests {
             .unwrap();
         let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(turns[0]["context_fill"], serde_json::json!(96000));
+        assert_eq!(turns["turns"][0]["context_fill"], serde_json::json!(96000));
         assert_eq!(
-            turns[0]["context_rotates_at"],
+            turns["turns"][0]["context_rotates_at"],
             serde_json::json!(crate::assistant::CONTEXT_ROTATION_TOKENS)
         );
     }
@@ -8418,8 +8461,9 @@ mod tests {
             .await
             .unwrap();
         let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // An array, not the single run object `/assistant/{turn_id}` would have answered with.
-        assert_eq!(turns.as_array().unwrap().len(), 1);
+        // A transcript, not the single run object `/assistant/{turn_id}` would have answered
+        // with — and one whose `turns` is this chat's own.
+        assert_eq!(turns["turns"].as_array().unwrap().len(), 1);
     }
 
     /// Reads a response body as JSON, which every chat-route test below needs.
@@ -9204,6 +9248,110 @@ mod tests {
         assert!(listed.iter().all(|chat| chat.chat_id != id));
     }
 
+    /// A conversation says what it was handed, because otherwise it silently pretends to remember.
+    ///
+    /// A session too large to resume is picked up with the verbatim tail of its predecessor in
+    /// front of it, and the model answers from that tail. Nothing in the window said so — you asked
+    /// something, it replied knowing the past, and the reason lived in a column nobody could see.
+    ///
+    /// `handoff.rs` states the position this asserts: context pressure must leave an auditable
+    /// record rather than erase how work continued. A compaction stored and never shown is still an
+    /// erasure from where the person is standing.
+    #[tokio::test]
+    async fn a_transcript_says_what_the_conversation_was_handed() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, ide_session_id, handover)
+             VALUES ('handed', 'cloud', '2026-08-19T10:00:00Z', 'aaaa-1111', ?)",
+        )
+        .bind(r#"[["arranja o parser","arranjado, o mês vinha antes do dia"]]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+             VALUES ('e agora os testes', 'completed', 'assistant', 'handed', 'feitos', '2026-08-19T10:01:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/handed")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["handed"][0][0], "arranja o parser");
+        assert_eq!(body["handed"][0][1], "arranjado, o mês vinha antes do dia");
+        // And the turns are still there, under their own name rather than as the whole body.
+        assert_eq!(body["turns"][0]["asked"], "e agora os testes");
+    }
+
+    /// A conversation nobody handed anything says so as an empty list, not as a missing field.
+    ///
+    /// The window draws a mark when there is something to draw. `null` and `[]` would both work by
+    /// accident today and diverge the first time anything counts them.
+    #[tokio::test]
+    async fn a_transcript_of_an_ordinary_conversation_was_handed_nothing() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["handed"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// The measurement reaches the window, or the column that stores it is write-only.
+    #[tokio::test]
+    async fn a_transcript_carries_how_much_each_turn_thought() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, thought, thought_tokens, created_at)
+             VALUES ('arranja', 'completed', 'assistant', 'thoughtful', 'feito', '[]', 177, '2026-08-19T10:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/thoughtful")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["turns"][0]["thought_tokens"], 177);
+        // And no words are claimed, because the CLI sent none — see 0093.
+        assert_eq!(
+            body["turns"][0]["thought"].as_array().map(Vec::len),
+            Some(0)
+        );
+    }
+
     /// Without this column on the way out, the window has no way to see that a conversation changed
     /// model, and the mark it draws to say so simply never appears. The failure is silent, which is
     /// why it is asserted here rather than left to the page's own tests.
@@ -9234,7 +9382,7 @@ mod tests {
             .unwrap();
 
         let body = json_body(response).await;
-        let by: Vec<&str> = body
+        let by: Vec<&str> = body["turns"]
             .as_array()
             .unwrap()
             .iter()

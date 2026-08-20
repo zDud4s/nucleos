@@ -23,6 +23,8 @@ function row(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     session_id: null,
     created_at: "2026-08-18T09:00:00Z",
     did: [],
+    thought: [],
+    thought_tokens: null,
     context_fill: null,
     context_rotates_at: 140000,
     ...overrides,
@@ -39,11 +41,41 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     answeredBy: null,
     sessionId: null,
     did: [],
+    thought: [],
+    thoughtTokens: null,
     contextFill: null,
     rotatesAt: 140000,
     ...overrides,
   };
 }
+
+describe("turnFromRow, on what a turn thought", () => {
+  // The size, because the words do not exist: the CLI sends every thinking block with its text
+  // stripped and a running token estimate beside it. This is the whole of what a turn can be
+  // asked about, so it is the thing that must survive the read.
+  it("carries how much it thought, beside an answer that stays its own", () => {
+    const thoughtful = turnFromRow(
+      row({ thought: [], thought_tokens: 177, answer: "é o parser de datas" }),
+    );
+
+    expect(thoughtful.thoughtTokens).toBe(177);
+    expect(thoughtful.thought).toEqual([]);
+    expect(thoughtful.answer).toBe("é o parser de datas");
+  });
+
+  // A daemon older than the columns sends neither key. A conversation that refuses to draw over
+  // one missing field is a worse answer than a conversation that draws without it.
+  it("reads a turn that carries neither as one that did not think", () => {
+    const older = row();
+    delete (older as Partial<AssistantTurnRow>).thought;
+    delete (older as Partial<AssistantTurnRow>).thought_tokens;
+
+    expect(turnFromRow(older).thought).toEqual([]);
+    // Null, never zero: "did not think" and "thought nothing measurable" are different claims,
+    // and only one of them is knowable here.
+    expect(turnFromRow(older).thoughtTokens).toBeNull();
+  });
+});
 
 /* ------------------------------------------------------------- turnFromRow -- */
 

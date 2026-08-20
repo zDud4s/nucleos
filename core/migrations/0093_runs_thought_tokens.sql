@@ -1,0 +1,18 @@
+-- How much a turn thought, since what it thought cannot be had.
+--
+-- 0092 added `thought` to carry the reasoning itself, and stated that the editor shows it and this
+-- window dropped it. Half of that is wrong, and this is the correction: the words are not dropped
+-- here, they never arrive. Asked of the CLI directly -- one non-interactive run, then a whole
+-- interactive session, 610 thinking blocks -- every `thinking` block came through as
+-- `{"type":"thinking","thinking":"","signature":"..."}`. Claude Code emits the signature and a
+-- running token estimate and withholds the text, in `stream-json` and in its own transcript files
+-- alike.
+--
+-- So `thought` stays, empty, for the day that changes, and this is what a turn can actually be
+-- asked about: whether the model deliberated, and roughly how hard. The window says
+-- "thought for ~180 tokens" rather than offering to show reasoning it does not hold.
+--
+-- An estimate, and the column is named one. It is the CLI's own running `thinking_tokens` count.
+-- NULL means the turn did not think, or ran before this column -- and zero is not written for
+-- either, because "did not think" and "thought nothing measurable" are not the same claim.
+ALTER TABLE runs ADD COLUMN thought_tokens INTEGER;

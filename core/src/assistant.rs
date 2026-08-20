@@ -752,7 +752,7 @@ núcleo: ",
 ///
 /// A failure to read or parse it is empty, not an error. A turn answering without its predecessor's
 /// tail is worse than one answering with it, and better than one that refuses.
-async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
+pub(crate) async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
     let stored = match crate::chats::handover_of(pool, chat_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return Vec::new(),
@@ -1247,9 +1247,18 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // belongs to, and a table would be a join for something no query ever asks
                     // about on its own. An empty list is stored as `[]`, which says "acted on
                     // nothing" — NULL is reserved for turns nobody asked.
+                    let live = crate::runner::live_from_stream(&o.stdout);
                     let tools_used =
-                        serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
-                            .unwrap_or_else(|_| "[]".to_string());
+                        serde_json::to_string(&live.did).unwrap_or_else(|_| "[]".to_string());
+                    // The same argument as the line above, about the other half of the stream. The
+                    // reasoning is discarded with the live tail the instant the turn ends, so
+                    // without a column it is visible only while the turn runs — and a conversation
+                    // reopened tomorrow shows a conclusion with nothing behind it.
+                    let thought =
+                        serde_json::to_string(&live.thought).unwrap_or_else(|_| "[]".to_string());
+                    // And the measurement, which unlike the words is actually there. See
+                    // `0093_runs_thought_tokens.sql` for what the CLI does and does not send.
+                    let thought_tokens = live.thought_tokens;
                     // Read out of the same stream, and stored here because this is where an
                     // assistant turn ends. `runs.rs` does the equivalent at its own terminal write,
                     // and a chat turn never passes through it — so the column stayed null on every
@@ -1262,7 +1271,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                         crate::runner::context_fill_from_line(line, fill)
                     });
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
@@ -1270,6 +1279,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
                     .bind(&tools_used)
+                    .bind(&thought)
+                    .bind(thought_tokens)
                     .bind(context_fill)
                     .bind(&completed_at)
                     .bind(id)
@@ -3471,6 +3482,39 @@ mod tests {
         assert_eq!(did.len(), 1);
         assert_eq!(did[0].name, "Read");
         assert_eq!(did[0].detail.as_deref(), Some("core/src/parser.rs"));
+    }
+
+    /// How much a turn THOUGHT outlives the stream it thought it in, as what it did does.
+    ///
+    /// The live tail is discarded the moment the turn ends, so without a column this is visible
+    /// while the turn runs and gone for ever afterwards. Written from a real stream's shape: the
+    /// thinking block arrives with its text stripped and the size arrives on a `system` line beside
+    /// it, which is the only part of a thought this machine is given.
+    #[tokio::test]
+    async fn a_finished_turn_records_how_much_it_thought() {
+        let mut state = test_state().await;
+        state.runner = ran_a_tool(&[
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":177,"estimated_tokens_delta":27}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"ErwFCqUB"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"é o parser de datas"}"#,
+        ]);
+
+        let id = send_message(&state, "assistant-thought-chat", "arranja", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let (thought, tokens): (Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT thought, thought_tokens FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        assert_eq!(tokens, Some(177));
+        // And the words are recorded as the nothing they were, rather than as an empty string
+        // pretending to be a thought.
+        assert_eq!(thought.as_deref(), Some("[]"));
     }
 
     /// A turn that only talked records an EMPTY list, not nothing at all.

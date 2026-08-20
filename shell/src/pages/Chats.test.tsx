@@ -66,6 +66,8 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     session_id: "s-1",
     created_at: "2026-08-18T09:00:00Z",
     did: [],
+    thought: [],
+    thought_tokens: null,
     context_fill: null,
     context_rotates_at: 140000,
     ...overrides,
@@ -97,7 +99,18 @@ function chatsFetch(
     /** The sessions the picker offers. Mutated in place by the wiring route below. */
     ideSessions?: IdeSession[];
     /** What each turn in flight is writing right now, by turn id. */
-    live?: Record<number, { text: string; doing: string | null; did?: ToolCall[] }>;
+    live?: Record<
+      number,
+      {
+        text: string;
+        doing: string | null;
+        did?: ToolCall[];
+        thought?: string[];
+        thought_tokens?: number | null;
+      }
+    >;
+    /** What each conversation was handed in place of a session too large to resume. */
+    handed?: Record<string, Array<[string, string]>>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -138,7 +151,9 @@ function chatsFetch(
       return found;
     }
     const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
-    if (match !== null) return transcripts[match[1]] ?? [];
+    if (match !== null) {
+      return { handed: opts.handed?.[match[1]] ?? [], turns: transcripts[match[1]] ?? [] };
+    }
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
     return undefined;
   };
@@ -378,6 +393,78 @@ describe("Chats - a conversation picked up from the editor", () => {
     const turns = await screen.findByRole("list", { name: "Transcript" });
     expect(said.compareDocumentPosition(turns) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(within(turns).getByText("and now the rest")).toBeTruthy();
+  });
+
+  // The window drew somebody's whole editor conversation and a fresh turn under it with no seam,
+  // which reads as one continuous thing the model has all of. For a session past the ceiling that
+  // is false: it was not resumed, and what it got was the last few exchanges in front of nothing.
+  it("says a session too large to resume was handed a tail rather than remembered", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "e agora", answer: "feito" })] }, {
+        said: {
+          "aaaa-1111": {
+            cut: true,
+            said: [{ by_owner: true, text: "fix the date parser", aside: false }],
+            context_estimate: 272900,
+          },
+        },
+        handed: { "c-1": [["fix the date parser", "it is fixed"]] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/too large to resume/i)).toBeTruthy();
+    // Shut until asked: the claim is the note, the exchanges are the audit behind it.
+    expect(screen.queryByRole("list", { name: "What the model was handed" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /show what it was handed/i }));
+
+    const handed = await screen.findByRole("list", { name: "What the model was handed" });
+    expect(within(handed).getByText("it is fixed")).toBeTruthy();
+  });
+
+  // The opposite claim, and it must not be made by accident: a session small enough to resume IS
+  // resumed, and everything above genuinely is in context.
+  it("says a session small enough to resume was resumed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "e agora", answer: "feito" })] }, {
+        said: {
+          "aaaa-1111": {
+            cut: false,
+            said: [{ by_owner: true, text: "fix the date parser", aside: false }],
+            context_estimate: 12000,
+          },
+        },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/was resumed/i)).toBeTruthy();
+    expect(screen.queryByText(/too large to resume/i)).toBeNull();
+  });
+
+  // Neither claim is true of a conversation picked up before any of this existed: it is over the
+  // ceiling and was handed nothing. Saying "resumed" there would be the window inventing a fact.
+  it("makes no claim about a large session it was told nothing about", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "e agora", answer: "feito" })] }, {
+        said: {
+          "aaaa-1111": {
+            cut: true,
+            said: [{ by_owner: true, text: "fix the date parser", aside: false }],
+            context_estimate: 272900,
+          },
+        },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/picked up here/i)).toBeTruthy();
+    expect(screen.queryByText(/was resumed/i)).toBeNull();
+    expect(screen.queryByText(/too large to resume/i)).toBeNull();
   });
 
   it("says nothing was said only when the daemon answered with an empty conversation", async () => {
@@ -671,6 +758,91 @@ describe("where a subagent worked", () => {
     const row = note.closest("li") as HTMLElement;
     expect(within(row).queryByText("núcleo")).toBeNull();
     expect(row.className).toContain("aside");
+  });
+});
+
+/* ---------------------------------------------------------- the thinking -- */
+
+describe("what a turn thought", () => {
+  // Not a disclosure, because there is nothing to disclose: the CLI sends every thinking block with
+  // its text stripped. A control that opened on emptiness would promise words this machine does not
+  // have, so the size is stated instead -- which is true, and is the whole of what is knowable.
+  it("states how much it thought rather than offering reasoning nobody has", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            asked: "arranja isso",
+            answer: "e o parser de datas",
+            thought: [],
+            thought_tokens: 1770,
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/thought for ~1\.8k tokens/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /thinking/i })).toBeNull();
+  });
+
+  it("says nothing at all where a turn did not think", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem", thought_tokens: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByText("tudo bem");
+    // Zero is not written for a turn that did not think, and neither is a line about it.
+    expect(screen.queryByText(/thought for/i)).toBeNull();
+  });
+
+  // A turn in flight is measured as it goes, and that arrives on the live poll rather than on the
+  // row -- a different route, and one this page reads separately.
+  it("measures a turn that is still thinking", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+        { live: { 1: { text: "", doing: null, thought: [], thought_tokens: 177 } } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/thought for ~177 tokens/i)).toBeTruthy();
+  });
+
+  // The parse for the words stays, so the day the CLI stops withholding them they unfold under the
+  // same line rather than needing a feature. Asserted so that path does not rot unseen.
+  it("unfolds the words if they ever arrive", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            asked: "arranja isso",
+            answer: "feito",
+            thought: ["o mes vem antes do dia"],
+            thought_tokens: 177,
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const toggle = await screen.findByRole("button", { name: /thinking/i });
+    expect(screen.queryByText(/o mes vem antes do dia/)).toBeNull();
+
+    fireEvent.click(toggle);
+
+    expect(await screen.findByText(/o mes vem antes do dia/)).toBeTruthy();
   });
 });
 

@@ -702,3 +702,103 @@
 .chats-carries-over {
   color: var(--tone-warn-fg);
 }
+
+/* What the model thought, folded shut.
+ *
+ * Quieter than the answer and set off by a rule down its side: this is working, not a conclusion,
+ * and it should read as something you can look into rather than something the turn is claiming. */
+.chats-thought {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-2);
+}
+
+/* Stated, not offered: there is nothing behind it to open. */
+.chats-thought-line {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+  letter-spacing: var(--tracking-wide);
+}
+
+.chats-thought-toggle {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+  letter-spacing: var(--tracking-wide);
+  cursor: pointer;
+}
+
+.chats-thought-toggle:hover {
+  color: var(--text-muted);
+}
+
+/* Verbatim, so its own line breaks are kept. It was drafted, not composed. */
+.chats-thought-text {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--border);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* What a conversation was handed when its session was too large to resume.
+ *
+ * Marked rather than whispered: everything above it is a conversation the model does NOT have, and
+ * a page that drew the two with no seam was claiming otherwise. */
+.chats-handed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--tone-warn-fg);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.chats-handed-line {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+.chats-handed-toggle {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  cursor: pointer;
+}
+
+.chats-handed-toggle:hover {
+  color: var(--text-muted);
+}
+
+.chats-handed-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chats-handed-pair {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}

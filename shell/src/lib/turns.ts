@@ -78,6 +78,24 @@ export interface AssistantTurnRow {
    * two deliberately, because a client cannot act on the difference.
    */
   did: ToolCall[];
+  /**
+   * What the turn thought, oldest first — and empty on every turn so far.
+   *
+   * The CLI withholds the words: a `thinking` block arrives as
+   * `{"type":"thinking","thinking":"","signature":"…"}`, in its stream and in
+   * its own transcript files alike. The field is carried so the day that
+   * changes the words appear; until then `thought_tokens` below is what a turn
+   * can honestly be asked about.
+   */
+  thought: string[];
+  /**
+   * Roughly how many tokens the turn spent thinking, or null when it did not
+   * think and on every turn from before the column.
+   *
+   * An estimate — the CLI's own running count. What it has to be right about
+   * is whether the model deliberated and roughly how hard.
+   */
+  thought_tokens: number | null;
 }
 
 /**
@@ -100,6 +118,10 @@ export interface Turn {
   sessionId: string | null;
   /** What the turn ran. See `AssistantTurnRow.did`. */
   did: ToolCall[];
+  /** See `AssistantTurnRow.thought`. */
+  thought: string[];
+  /** See `AssistantTurnRow.thought_tokens`. */
+  thoughtTokens: number | null;
   /** See `AssistantTurnRow.context_fill`. */
   contextFill: number | null;
   /** See `AssistantTurnRow.context_rotates_at`. */
@@ -146,6 +168,10 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     // Defaulted rather than trusted: a daemon older than the column sends no such key, and a
     // conversation losing one line is a better answer to that than a page that will not draw.
     did: row.did ?? [],
+    // Defaulted for the reason `did` is: a daemon older than the column sends no such key, and a
+    // turn drawn without its reasoning beats a page that refuses to draw the turn.
+    thought: row.thought ?? [],
+    thoughtTokens: row.thought_tokens ?? null,
     contextFill: row.context_fill ?? null,
     // Null, not a number this side made up. A daemon that does not send the ceiling is one whose
     // ceiling this window does not know, and guessing it would draw a proportion out of nothing.
