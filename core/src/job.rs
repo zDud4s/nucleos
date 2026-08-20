@@ -142,6 +142,12 @@ pub enum ItemState {
     /// and neither `ending()` nor `close_the_round` counts it — a job is not `gate_failed` for a
     /// verdict it has not finished answering.
     ///
+    /// **In a job a team directs the tree is "as the attempt left it, plus the job's branch".** The
+    /// item works in a checkout of its own, and that checkout has been standing still while other
+    /// items landed; `catch_up_the_item` brings the branch in before the node starts. Without it a
+    /// retry would answer a gate whose verdict was about a repository that no longer exists — and a
+    /// red gate caused by somebody else's merge would not be fixable from here at all.
+    ///
     /// Never stored. `job_items.status` says `gate_failed` either way; this state is what
     /// `item_state_from` makes of that status once it has read the attempt count beside the job's
     /// budget, and neither number means anything alone.
@@ -424,17 +430,16 @@ pub fn next_step(job: &JobView) -> Next {
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
-    // `Conflicted` and `Reverted` wait alongside `Running`, and neither is reachable yet — nothing
-    // writes those rows. They are here because the alternative is worse than being early: a
-    // non-terminal state this search walked past would be read as finished by every check after it,
-    // which is the one direction `item_state_from` already refuses to err in. `Merging` has left
-    // this list, having been given a step of its own below.
-    if job.items.iter().any(|item| {
-        matches!(
-            item,
-            ItemState::Running | ItemState::Conflicted | ItemState::Reverted
-        )
-    }) {
+    // `Reverted` waits alongside `Running`, and is the last state left with no step of its own and
+    // no writer. It is here because the alternative is worse than being early: a non-terminal state
+    // this search walked past would be read as finished by every check after it, which is the one
+    // direction `item_state_from` already refuses to err in. `Merging` and `Conflicted` have both
+    // left this list, each having been given a step below.
+    if job
+        .items
+        .iter()
+        .any(|item| matches!(item, ItemState::Running | ItemState::Reverted))
+    {
         return Next::Wait;
     }
     // A merge that has landed is measured before anything else moves. Ahead of the merge below, and
@@ -470,11 +475,18 @@ pub fn next_step(job: &JobView) -> Next {
     // would build it on a tree that still stands where the red gate left it, and the next gate could
     // no longer say which of the two broke it — which is the whole reason gating happens between
     // items rather than at the end.
-    if let Some(ordinal) = job
-        .items
-        .iter()
-        .position(|item| matches!(item, ItemState::Pending | ItemState::GateRetriable))
-    {
+    //
+    // `Conflicted` is found by the same search, and it is work for the same reason: the item owes
+    // a run, in the checkout it already has. What that run does differs — it resolves a merge
+    // rather than writing a feature — but that is a difference in the prompt, not in whether there
+    // is anything to start. Leaving it out would put the item down for good over a conflict, which
+    // is not a verdict about the work.
+    if let Some(ordinal) = job.items.iter().position(|item| {
+        matches!(
+            item,
+            ItemState::Pending | ItemState::GateRetriable | ItemState::Conflicted
+        )
+    }) {
         return Next::SpawnImplement { ordinal };
     }
 
@@ -2193,6 +2205,64 @@ async fn item_provisioning(
     })
 }
 
+/// Brings the job's branch into this item's own checkout, and says what happened.
+///
+/// `None` when there is nothing to do or nothing to do it to: no team, no checkout of the item's
+/// own, or the item is starting for the first time. In every one of those the item works where it
+/// always worked and the prompt says nothing extra.
+///
+/// **A conflict is left staged, and that is the design rather than a fallback.** The alternative —
+/// telling the agent to merge — cannot work: any `git merge` an agent runs goes to the approval
+/// queue, and what the agent would be asking permission for is the merge that just failed. It would
+/// circle, and no wording gets it out, because the refusal is structural. With the conflict already
+/// in the files, the agent does what an agent does: edits and commits. `worktree::stage_conflict`
+/// carries the same argument for the VCS resolver, and this is the same inversion for a job item.
+async fn catch_up_the_item(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<String> {
+    let item_id: i64 =
+        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+    let tree: Option<String> = sqlx::query_scalar(
+        "SELECT path FROM worktrees
+         WHERE owner_kind = 'item' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let tree = std::path::PathBuf::from(tree?);
+    let (_, job_branch) = job_worktree(pool, job.id).await.ok().flatten()?;
+
+    match crate::worktree::catch_up(&tree, &job_branch).await {
+        Ok(crate::worktree::CatchUp::Clean) => Some(format!(
+            "
+
+Your working tree has been brought up to date with `{job_branch}`, the branch this              job is building. Everything other items have landed since you last ran is now here,              and it merged cleanly.
+"
+        )),
+        Ok(crate::worktree::CatchUp::Conflicted) => Some(format!(
+            "
+
+Merging `{job_branch}` — the branch this job is building — into your work              conflicts, and the merge has been left STAGED in your working tree: the conflict              markers are in the files and MERGE_HEAD is set.
+
+             Resolve the conflicted files and commit. Do NOT run `git merge`, `git merge --abort`              or `git rebase`: the merge you would be asking for is the one already staged here, and              the request would be refused. Editing and committing is the whole of the work.
+"
+        )),
+        Err(error) => {
+            // Not a reason to refuse to start. The checkout still holds the item's own work and the
+            // node can still make progress in it; what is lost is being up to date, and the merge
+            // that follows will meet the same divergence and say so where it can be acted on.
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not bring the job's branch into an item's tree");
+            None
+        }
+    }
+}
+
 async fn spawn_node(
     state: &AppState,
     job: &JobRow,
@@ -2250,6 +2320,22 @@ async fn spawn_node(
         }
     };
     let mut prompt = prompt;
+    // Before the notes and before the lessons, because it is about the CHECKOUT this node is
+    // about to open its editor in, and everything else is about the work. An item going round
+    // again — because its gate went red, or because its merge conflicted — has a checkout of its
+    // own that has been standing still while the job's branch moved on. Bringing the branch in is
+    // what makes the second attempt an attempt at the CURRENT state rather than at the state the
+    // first one saw.
+    //
+    // This is the contract `GateRetriable` used to name the other way round: "in the tree exactly
+    // as the rejected attempt left it". It still is that, plus everything that landed since — and
+    // that addition is what a red gate caused by somebody else's merge needs in order to be
+    // fixable at all.
+    if let Some(ItemClaim { ordinal, .. }) = item
+        && let Some(block) = catch_up_the_item(pool, job, ordinal).await
+    {
+        prompt.push_str(&block);
+    }
     if let Some(block) = crate::notes::render(&waiting) {
         prompt.push_str(&block);
     }
@@ -4220,6 +4306,31 @@ mod tests {
         );
     }
 
+    /// A conflicted item is work, not a verdict.
+    ///
+    /// It is found by the same positional search that finds a pending one, because it owes the same
+    /// thing: a run, in the checkout it already has. What that run does differs — it resolves a
+    /// staged merge instead of writing a feature — and that is a difference in the prompt. Leaving
+    /// `Conflicted` out of the search would put the item down for good over two pieces of work
+    /// disagreeing, which is not a judgement about either of them.
+    #[test]
+    fn a_conflicted_item_is_started_again_rather_than_given_up_on() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view_with_team(&[Conflicted], ReviewState::NotWanted)),
+            Next::SpawnImplement { ordinal: 0 }
+        );
+        // And it does not jump the queue: the same positional search means an earlier item still
+        // goes first.
+        assert_eq!(
+            next_step(&view_with_team(
+                &[Pending, Conflicted],
+                ReviewState::NotWanted
+            )),
+            Next::SpawnImplement { ordinal: 0 }
+        );
+    }
+
     /// A merge that has landed is measured before another item is brought in.
     ///
     /// The order is the design and not an accident of which `if` came first: an item's divergence
@@ -4360,21 +4471,25 @@ mod tests {
 
     /// A non-terminal state with no step of its own is waited for, never walked past.
     ///
-    /// `Merging` has left this list: it now has a step — the gate that measures the merge it
-    /// landed. `Conflicted` and `Reverted` have not, and neither is reachable yet, which is exactly
-    /// why the assertion is worth keeping. Walking past a non-terminal state is how an item gets
-    /// reported finished with its work still in flight, and it is the one direction
-    /// `item_state_from` already refuses to err in.
+    /// `Merging` and `Conflicted` have both left this list, each having been given a step — the
+    /// gate that measures a landed merge, and the run that resolves a staged one. `Reverted` is the
+    /// last one without either, and unreachable because nothing writes it: the red arm records
+    /// `gate_failed` after the reset, exactly as a sequential job always did, and what says the
+    /// branch was put back is `merge_base_sha` being set beside that verdict.
+    ///
+    /// The assertion is kept anyway, because the direction it guards is the expensive one. Walking
+    /// past a non-terminal state is how an item is reported finished with its work still in flight.
     #[test]
     fn an_item_mid_merge_is_work_in_flight() {
         use ItemState::*;
-        for state in [Conflicted, Reverted] {
-            assert_eq!(
-                next_step(&view_with_team(&[state, Pending], ReviewState::NotWanted)),
-                Next::Wait,
-                "{state:?} must not let the queue move on"
-            );
-        }
+        assert_eq!(
+            next_step(&view_with_team(
+                &[Reverted, Pending],
+                ReviewState::NotWanted
+            )),
+            Next::Wait,
+            "Reverted must not let the queue move on"
+        );
     }
 
     /// A red gate that still has a retry left has not finished with its item.

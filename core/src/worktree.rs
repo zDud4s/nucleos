@@ -321,6 +321,41 @@ pub async fn create_at(
 /// unmerged paths, and staging nothing while reporting a staged conflict would put an agent in a
 /// worktree with no work in it and no way to tell.
 pub async fn stage_conflict(worktree: &Path, source: &str) -> io::Result<()> {
+    match catch_up(worktree, source).await? {
+        CatchUp::Conflicted => Ok(()),
+        CatchUp::Clean => Err(io::Error::other(format!(
+            "{source} merged cleanly, so there is no conflict left to resolve —              the repository moved between the escalation and now"
+        ))),
+    }
+}
+
+/// What bringing a branch into a worktree came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUp {
+    /// It merged, and the checkout now holds both sides of the work.
+    Clean,
+    /// It did not, and the conflict is **left staged** for whoever works here next.
+    Conflicted,
+}
+
+/// Brings `source` into this checkout, leaving a conflict staged rather than aborting it.
+///
+/// The difference from [`merge_branch`] is why both exist, and it is about whose checkout it is.
+/// Merging INTO the job's shared branch aborts on conflict, because that checkout belongs to the job
+/// and the next item's merge needs it clean. Merging into an ITEM's own checkout leaves the
+/// conflict, because that checkout belongs to the item and the conflict is precisely the work its
+/// next run has to do.
+///
+/// A clean merge is a value here and an error in [`stage_conflict`], which is a caller asking a
+/// different question: that one launches an agent whose only job is to resolve, so nothing to
+/// resolve means it should not launch. This one catches an item's checkout up with the branch it
+/// will be merged into, and no conflict is the good outcome.
+///
+/// Conflicted is told apart from broken by `ls-files --unmerged` rather than by the exit code, which
+/// is 1 for both. A merge refused before it started — an unknown ref, a dirty tree — leaves no
+/// unmerged paths, and reporting that as a staged conflict would put an agent in a checkout with no
+/// work in it and no way to tell.
+pub(crate) async fn catch_up(worktree: &Path, source: &str) -> io::Result<CatchUp> {
     let merged = git()
         .arg("-C")
         .arg(worktree)
@@ -332,10 +367,7 @@ pub async fn stage_conflict(worktree: &Path, source: &str) -> io::Result<()> {
         .output()
         .await?;
     if merged.status.success() {
-        return Err(io::Error::other(format!(
-            "{source} merged cleanly, so there is no conflict left to resolve — \
-             the repository moved between the escalation and now"
-        )));
+        return Ok(CatchUp::Clean);
     }
 
     let unmerged = git()
@@ -351,7 +383,7 @@ pub async fn stage_conflict(worktree: &Path, source: &str) -> io::Result<()> {
             "merging {source} left no conflicted paths to resolve: {stderr}"
         )));
     }
-    Ok(())
+    Ok(CatchUp::Conflicted)
 }
 
 /// Where a job's nodes hand work to each other, relative to the worktree they share.
@@ -2027,6 +2059,90 @@ mod tests {
         assert!(
             !canary.exists(),
             "the target repository's core.fsmonitor command was executed"
+        );
+    }
+
+    /// `catch_up` reports both outcomes as values, and leaves the conflicted one staged.
+    ///
+    /// The staging is the half that matters. An agent handed a conflict it must merge itself would
+    /// be asking the approval queue for the merge that just failed — it would circle, and no wording
+    /// gets it out. With the conflict in the files it edits and commits, which is all it ever does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catching_up_reports_a_clean_merge_and_leaves_a_conflicted_one_staged() {
+        let _lock = env_lock();
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        // Two checkouts off the same commit, each committing a file. Different files merge; the
+        // same file does not.
+        let theirs = create(repo.path(), Owner::Item(1)).await.expect("theirs");
+        std::fs::write(
+            theirs.path.join("theirs.txt"),
+            "theirs
+",
+        )
+        .expect("write");
+        assert!(git_ok(&theirs.path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &theirs.path,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("theirs")]
+        ));
+
+        let mine = create(repo.path(), Owner::Item(2)).await.expect("mine");
+        std::fs::write(
+            mine.path.join("mine.txt"),
+            "mine
+",
+        )
+        .expect("write");
+        assert!(git_ok(&mine.path, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &mine.path,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("mine")]
+        ));
+
+        assert_eq!(
+            catch_up(&mine.path, &theirs.branch)
+                .await
+                .expect("catch up"),
+            CatchUp::Clean
+        );
+        assert!(mine.path.join("theirs.txt").exists());
+
+        // Now both touch the same file, from the commit they now share.
+        let clash = create(repo.path(), Owner::Item(3)).await.expect("clash");
+        for (tree, text) in [
+            (
+                &clash.path,
+                "one
+",
+            ),
+            (
+                &mine.path, "two
+",
+            ),
+        ] {
+            std::fs::write(tree.join("clash.txt"), text).expect("write");
+            assert!(git_ok(tree, &[OsStr::new("add"), OsStr::new("-A")]));
+            assert!(git_ok(
+                tree,
+                &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("clash")]
+            ));
+        }
+
+        assert_eq!(
+            catch_up(&mine.path, &clash.branch).await.expect("catch up"),
+            CatchUp::Conflicted
+        );
+        let staged = std::fs::read_to_string(mine.path.join("clash.txt")).expect("read");
+        assert!(
+            staged.contains("<<<<<<<"),
+            "the conflict was not left in the files for the agent to resolve: {staged}"
+        );
+        assert!(
+            mine.path.join(".git").exists() || mine.path.join(".git").is_file(),
+            "the checkout survived"
         );
     }
 
