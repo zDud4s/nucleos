@@ -262,6 +262,21 @@ func newSite(t *testing.T) *site {
 			<button id=ok>Approve the write-down</button>`)
 	})
 
+	// A server that answers and then does not stop, which is how most chat and progress APIs work.
+	// It declares itself, which is what lets the ferry refuse it at the headers instead of thirty
+	// seconds later — and the handler holds the connection open so that a version which read the
+	// body anyway would be measured doing it.
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			fmt.Fprint(w, "data: one\n\n")
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	})
+
 	// A neighbouring service, which is what the modern web actually looks like: the page is
 	// app.example.com and its data is at api.example.com. What it answers with is decided by the
 	// query, because the whole question here is whether the SERVER opted in — the ferry applies the

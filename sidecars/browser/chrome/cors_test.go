@@ -109,3 +109,28 @@ func TestACookieGoesBackIntoTheProfileAsItWasSent(t *testing.T) {
 		})
 	}
 }
+
+// TestAStreamIsRecognisedByWhatTheServerCalledIt.
+//
+// The parse is the point. `text/event-stream; charset=utf-8` is the same declaration as the bare
+// type, and a substring check would be one header parameter away from missing it — which is a
+// refusal that arrives thirty seconds later as a timeout instead of at once as a rule.
+func TestAStreamIsRecognisedByWhatTheServerCalledIt(t *testing.T) {
+	for _, one := range []struct {
+		header string
+		stream bool
+	}{
+		{header: "text/event-stream", stream: true},
+		{header: "text/event-stream; charset=utf-8", stream: true},
+		{header: "TEXT/EVENT-STREAM", stream: true},
+		{header: " text/event-stream ", stream: true},
+		{header: "text/html; charset=utf-8", stream: false},
+		{header: "application/json", stream: false},
+		{header: "", stream: false},
+		{header: "nonsense", stream: false},
+	} {
+		if got := streaming(one.header); got != one.stream {
+			t.Errorf("%q was read as stream=%v", one.header, got)
+		}
+	}
+}

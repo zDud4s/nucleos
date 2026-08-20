@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -58,6 +59,9 @@ import (
 //     not a way around the method rule.
 //   - Sockets. There is no ferry for WebSocket and there will not be one: a socket is a channel, and
 //     a channel is the thing being refused.
+//   - Streams. `EventSource` is not shimmed at all — it meets the CSP and `csp.go` reports it — and a
+//     `fetch` of `text/event-stream` is refused the moment the headers say so. A stream is a channel
+//     wearing HTTP, and the ferry carries answers that end.
 //   - XMLHttpRequest beyond the plain asynchronous text case. What the shim cannot do properly it
 //     does not do at all — it leaves the real XHR in place, which the CSP refuses and `csp.go`
 //     reports. A half-working shim would fail in ways that look like the page.
@@ -88,6 +92,13 @@ const (
 	ferryBodyCap = 4 << 20
 	// ferryTimeout bounds one carried request.
 	ferryTimeout = 30 * time.Second
+	// ferryBodyWithin bounds the BODY, once the headers have arrived.
+	//
+	// Separate from ferryTimeout because the two failures are not the same shape. A server that is
+	// slow to answer is slow; a server that answers and then never stops is a stream, and the ferry
+	// carries documents. Held to the outer bound, a page fetching a stream sat for thirty seconds
+	// and then failed — and a slow refusal reads like the network rather than like a rule.
+	ferryBodyWithin = 10 * time.Second
 )
 
 // ferryShim is injected before every document.
@@ -478,7 +489,12 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 		return 0, "", nil, fmt.Errorf("%s", verdict.Detail)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	// Its own cancel, so the body can be given a shorter deadline than the exchange once the
+	// headers are in. Cancelling this is what stops a read that would otherwise never return.
+	bodyCtx, stopBody := context.WithCancel(ctx)
+	defer stopBody()
+
+	request, err := http.NewRequestWithContext(bodyCtx, http.MethodGet, target, nil)
 	if err != nil {
 		return 0, "", nil, err
 	}
@@ -536,8 +552,23 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 		}
 	}
 
+	if streaming(response.Header.Get("Content-Type")) {
+		// At the headers, which is the moment the server declares it. The alternative was reading a
+		// body that never ends until the outer bound, and answering thirty seconds later — a rule
+		// that arrives that late is indistinguishable from a network that is broken.
+		return 0, "", nil, fmt.Errorf("that is a stream, and the fence carries answers that end")
+	}
+
+	// A body that does not end and never said so. Undeclared, so it cannot be refused at the
+	// headers the way a stream can; bounded instead, and named for what it was.
+	tooSlow := time.AfterFunc(ferryBodyWithin, stopBody)
+	defer tooSlow.Stop()
+
 	body, err := io.ReadAll(io.LimitReader(response.Body, ferryBodyCap+1))
 	if err != nil {
+		if bodyCtx.Err() != nil && ctx.Err() == nil {
+			return 0, "", nil, fmt.Errorf("the answer did not finish arriving within %s", ferryBodyWithin)
+		}
 		return 0, "", nil, err
 	}
 	if len(body) > ferryBodyCap {
@@ -589,6 +620,19 @@ func corsAllows(header http.Header, origin string, credentialed bool) error {
 		return fmt.Errorf("this is readable by %s and the page is %s", allowed, origin)
 	}
 	return nil
+}
+
+// streaming reports whether the server said this answer is a stream rather than a document.
+//
+// By the media type only, and the parse is what makes that reliable: `text/event-stream;
+// charset=utf-8` is the same declaration as `text/event-stream`, and a substring check would be one
+// header parameter away from missing it.
+func streaming(contentType string) bool {
+	kind, _, err := mime.ParseMediaType(strings.TrimSpace(contentType))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(kind, "text/event-stream")
 }
 
 // hostOf is an origin without its scheme, for a refusal a person reads.
