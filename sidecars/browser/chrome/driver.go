@@ -129,6 +129,14 @@ type session struct {
 	// status is the HTTP status of the last main-frame document response, or 0 for a page that never
 	// produced one. See recordStatus for why it is not reset with the rest of this struct.
 	status int
+	// mayWrite is the write window one act opens: the permission for a single form submission, for
+	// as long as that act lasts. Nil the rest of the time, which is the ordinary state — see
+	// chrome/write.go for why the lifetime is the act's and not a number of milliseconds.
+	mayWrite *writeWindow
+	// writes are the form submissions this session has actually sent and not yet reported. NOT reset
+	// with the rest of the per-document state: a submission navigates, so resetting on navigation
+	// would throw away the record of the very thing that caused it.
+	writes []browser.Write
 }
 
 // contextKey names one execution context. The id is unique within a target and not across them, so

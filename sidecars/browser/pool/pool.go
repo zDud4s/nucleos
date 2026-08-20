@@ -121,11 +121,16 @@ type placed struct {
 // waits on it instead of launching in parallel — see the package comment on why two Chromes over one
 // profile directory is worse than slow.
 type entry struct {
-	ref     profile.Ref
-	origins string
-	ready   chan struct{}
-	driver  Instance
-	err     error
+	ref profile.Ref
+	// fenced is the whole placement reduced to one comparable string — the sites this browser
+	// admits AND the ones it may submit a form to. Both, and it used to be only the first: a write
+	// grant withdrawn while a browser was up changed no origin, so the fingerprint matched, and the
+	// pool handed back a browser still fenced by the permission that had just been taken away. A
+	// revocation that does not reach the process enforcing it is a revocation in name.
+	fenced string
+	ready  chan struct{}
+	driver Instance
+	err    error
 	// human marks the browser a person is driving. It is not a property of the session but of the
 	// BROWSER, because that is what spec §4.1 bounds: one process per profile, and while it is the
 	// headful one there is nowhere for an agent session on that profile to be put.
@@ -287,7 +292,7 @@ func (p *Pool) unreserve() {
 
 // acquire returns the browser for a placement, launching it if it is not already up.
 func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy fence.Policy) (*entry, error) {
-	fingerprint := fingerprintOf(placement.Origins)
+	fingerprint := fingerprintOf(placement)
 
 	for {
 		p.mu.Lock()
@@ -295,7 +300,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 		if !running {
 			starting := &entry{
 				ref:      placement.Profile,
-				origins:  fingerprint,
+				fenced:   fingerprint,
 				ready:    make(chan struct{}),
 				sessions: map[browser.SessionID]struct{}{},
 			}
@@ -323,7 +328,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			// for as long as a person takes, which spec §4.4 rule 2 says has no bound at all.
 			return nil, fmt.Errorf("%w: %s", browser.ErrPersonIsDriving, placement.Profile)
 		}
-		if existing.origins == fingerprint {
+		if existing.fenced == fingerprint {
 			return existing, nil
 		}
 
@@ -462,13 +467,21 @@ func (p *Pool) lookup(id browser.SessionID) (placed, error) {
 	return session, nil
 }
 
-// fingerprintOf reduces a site list to something comparable.
+// fingerprintOf reduces a placement's two lists to something comparable.
 //
 // Normalised and sorted, so that a list the núcleo happened to send in a different order does not
 // look like a different policy and tear down a working browser. Entries that normalise to nothing are
 // dropped here for the same reason fence.Policy rejects them: they must not be the difference between
 // two fingerprints when they are not the difference between two policies.
-func fingerprintOf(origins []string) string {
+//
+// BOTH lists, and they are kept apart by the separator rather than merged: a profile that may read
+// two sites and write to neither must not fingerprint the same as one that may read one and write to
+// the other, and concatenating the two lists into one bag is exactly how it would.
+func fingerprintOf(placement browser.Placement) string {
+	return normalisedList(placement.Origins) + " | " + normalisedList(placement.Writable)
+}
+
+func normalisedList(origins []string) string {
 	normalised := make([]string, 0, len(origins))
 	for _, origin := range origins {
 		if entry := fence.NormaliseEntry(origin); entry != "" {

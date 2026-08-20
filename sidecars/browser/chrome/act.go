@@ -104,6 +104,16 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		on = key.session
 	}
 
+	// The write window (spec's fifth condition; see chrome/write.go). Armed before the verb and shut
+	// when this function returns, so "this act caused it" is what the arrangement literally says
+	// rather than a duration somebody guessed. The defer covers every path out, including the ones
+	// where the verb declines — a window left open would be a permission outliving the act it
+	// belonged to, which is the whole thing this is arranged to prevent.
+	if opensAForm(action.Kind) {
+		d.armWrite(ctx, entry, on, objectID, action)
+	}
+	defer d.disarmWrite(entry)
+
 	var refusal *browser.Refusal
 	var err error
 	switch action.Kind {
@@ -138,8 +148,14 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		// Still through afterAct: the verb declined, but a page can have moved for its own reasons
 		// while the act was in flight, and the agent's refs are stale either way. A verb that
 		// declined ran no page code, so there is nothing for it to have started.
-		return d.afterAct(ctx, entry, moved, false, began,
-			browser.Refused(refusal.Consequence, refusal.Detail)), nil
+		declined := d.afterAct(ctx, entry, moved, false, began,
+			browser.Refused(refusal.Consequence, refusal.Detail))
+		// Drained here too, and it is not symmetry for its own sake: a session carries writes that
+		// landed after the PREVIOUS act's window closed, and an act that declines is still an act
+		// the núcleo is about to file. Dropping them here would lose a record on the one path where
+		// nothing else reports anything.
+		declined.Writes = d.drainWrites(entry)
+		return declined, nil
 	}
 
 	refused, consumed := d.refusalForAt(ctx, id, before)
@@ -154,7 +170,21 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	// Both, and in this order: an act can be refused AND move the page. A click that navigates and
 	// also fires a blocked beacon is one act with two things worth saying about it, and reporting
 	// only the first would leave the agent holding refs to a document that is gone.
-	return d.afterAct(ctx, entry, moved, ranPageCode(action.Kind), began, result), nil
+	result = d.afterAct(ctx, entry, moved, ranPageCode(action.Kind), began, result)
+	// After afterAct and never before it. A form submission IS a navigation, so the record of it is
+	// written while the wait for the new document is still running; draining first would report the
+	// act that caused a write as having caused nothing, and hand the write to whatever act came next.
+	result.Writes = d.drainWrites(entry)
+	return result, nil
+}
+
+// opensAForm says which verbs may arm the write window.
+//
+// Click and press, and nothing else. Type and select change what a form CARRIES and do not send it;
+// scroll, back and goto are not acts on a control at all. The set is small because the window is a
+// permission, and a permission that a verb opens by accident is one nobody granted.
+func opensAForm(kind browser.ActionKind) bool {
+	return kind == browser.ActionClick || kind == browser.ActionPress
 }
 
 // ranPageCode says whether this verb handed control to the page's own scripts.

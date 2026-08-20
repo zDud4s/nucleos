@@ -196,6 +196,107 @@ func newSite(t *testing.T) *site {
 		fmt.Fprintf(w, `<!doctype html><title>found</title><h1>Results for %s</h1>`,
 			template.HTMLEscapeString(r.URL.Query().Get("q")))
 	})
+	// ---- writing ---------------------------------------------------------------------------
+	//
+	// The pages the write rule is measured against. Every one of them is a form that would be
+	// perfectly ordinary on a real site — a reply box, a page that saves itself, a form aimed
+	// somewhere else — and the only thing separating them is which of the five conditions holds.
+
+	// A reply form. The password field is not decoration: it is what the record has to name and must
+	// never carry, and a form with one is the ordinary case rather than an exotic one.
+	mux.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>write</title>
+			<form id=f method=post action="/wrote">
+				<label>Body <input id=body name=body value="looks fine to me"></label>
+				<label>Secret <input type=password name=secret value="hunter2"></label>
+				<input type=hidden name=csrf value="t0ken">
+				<button id=go type=submit>Send reply</button>
+			</form>`)
+	})
+	mux.HandleFunc("/wrote", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>wrote</title><h1 id=here>Reply delivered</h1>`)
+	})
+
+	// The same form, submitted by the PAGE and not by anybody acting on it. This is what hostile
+	// content inside an origin the person granted looks like from the fence's side, and it is the
+	// only reason the grant is not the whole rule.
+	mux.HandleFunc("/selfwrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>selfwrite</title><h1 id=here>selfwrite</h1>
+			<form id=f method=post action="/wrote"><input name=body value="x"></form>
+			<script>setTimeout(() => document.getElementById('f').submit(), 50);</script>`)
+	})
+
+	// A form on this origin aimed at another one. The exfiltration shape §6.2 exists to close, and
+	// the one no grant turns into something else.
+	mux.HandleFunc("/crosswrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>crosswrite</title>
+			<form id=f method=post action=%q>
+				<input name=body value="everything I just read">
+				<button id=go type=submit>Send reply</button>
+			</form>`, r.URL.Query().Get("to"))
+	})
+
+	// One act, two forms. What makes the window a window and not a switch: the click submits the form
+	// the button belongs to, and that form's own handler slips a second submission through behind it.
+	//
+	// Both target iframes, so neither navigates the page away and both are observable. The button is
+	// INSIDE the first form and is a real submit button, because a button sitting outside every form
+	// arms nothing at all — which is a different rule, tested elsewhere, and would make this page
+	// measure that one instead.
+	mux.HandleFunc("/twowrites", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>twowrites</title>
+			<form id=a method=post action="/wrote" target=one>
+				<input name=body value="one">
+				<button id=go type=submit>Send reply</button>
+			</form>
+			<form id=b method=post action="/alsowrote" target=two><input name=body value="two"></form>
+			<iframe name=one></iframe><iframe name=two></iframe>
+			<script>
+				document.getElementById('a').addEventListener('submit', () => {
+					document.getElementById('b').submit();
+				});
+			</script>`)
+	})
+	mux.HandleFunc("/alsowrote", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		fmt.Fprint(w, "also")
+	})
+
+	// A search that posts. The shape of every chat box and half the search boxes on the web: one
+	// field, no visible button, and Enter is how it is sent.
+	mux.HandleFunc("/keywrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>keywrite</title>
+			<form id=f method=post action="/wrote">
+				<label>Message <input id=q name=message value="on my way"></label>
+			</form>`)
+	})
+
+	// A POST from a script rather than from a form. The path an injection takes without passing
+	// through any act at all, and the reason the ferry stayed GET-only.
+	mux.HandleFunc("/fetchwrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>fetchwrite</title><h1 id=here>fetchwrite</h1>
+			<button id=go>Send reply</button>
+			<script>
+				document.getElementById('go').addEventListener('click', () => {
+					fetch('/wrote', {method: 'POST', body: 'body=x'}).catch(() => {});
+				});
+			</script>`)
+	})
+
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Disposition", `attachment; filename="report.txt"`)
@@ -600,6 +701,26 @@ func (s *site) note(r *http.Request) {
 	}
 }
 
+// arrivals collects everything that reached the server within a window.
+//
+// The plural of `reached`, and needed where the claim is about a COUNT rather than about one label:
+// asking `reached` twice would consume the answer to the second question while looking for the
+// first. "Exactly one of these two forms was sent" is that kind of claim, and it is also the only
+// race-free way to state it — which of the two wins the window is up to Chromium's ordering, and the
+// rule never said which.
+func (s *site) arrivals(within time.Duration) []string {
+	var seen []string
+	deadline := time.After(within)
+	for {
+		select {
+		case got := <-s.arrived:
+			seen = append(seen, got)
+		case <-deadline:
+			return seen
+		}
+	}
+}
+
 // reached reports whether a label arrived within the window. A window and not an instant, because a
 // page's request is not synchronous with the act that caused it.
 func (s *site) reached(label string, within time.Duration) bool {
@@ -688,6 +809,18 @@ func admitting(s *site) fence.Policy {
 		Origins:  []string{"https://nucleos.invalid"},
 		Loopback: []string{s.origin()},
 	}
+}
+
+// admittingWritable is `admitting` plus the grant a person gives at the login: this profile may also
+// submit forms to that origin.
+//
+// A separate helper and not a flag, so every test that uses it says in its own first line which of
+// the two permissions it is about — and so the pair of tests that differ only in this call is a pair
+// a reader can see is a pair.
+func admittingWritable(s *site) fence.Policy {
+	policy := admitting(s)
+	policy.Writable = []string{s.origin()}
+	return policy
 }
 
 // fenced launches a browser with the fence attached and returns the driver.

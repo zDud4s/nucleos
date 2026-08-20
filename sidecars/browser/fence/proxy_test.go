@@ -102,6 +102,55 @@ func TestTheProxyRefusesAPost(t *testing.T) {
 	}
 }
 
+// TestTheProxyCarriesAPostToAnOriginWithAWriteGrant.
+//
+// The exception the write rule opens at this layer, and the reason it exists at all.
+//
+// It was found by the gate rather than reasoned out. The CDP fence allowed a form submission on a
+// granted origin, the driver wrote it down as having left, and this layer answered 403 to the same
+// request a moment later — so the agent got a page saying "non-get-method" from a fence that had
+// already decided otherwise, with the record of the submission already written by the half that said
+// yes. Two layers of one rule disagreeing, and the layer with less information winning.
+//
+// What this layer still refuses is the case above it: a POST to an origin nobody granted. It cannot
+// tell a form from a script and it does not pretend to — the other four conditions belong to the CDP
+// fence, which is the same division this layer already makes for the site allowlist.
+func TestTheProxyCarriesAPostToAnOriginWithAWriteGrant(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			reached <- struct{}{}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+
+	// A PROJECT profile, because that is the only kind a write grant exists in: a throwaway has no
+	// login in it, so there is nobody for a form to be submitted as, and Validate refuses the pairing
+	// outright. `admitting` builds a throwaway, which is right for every other test in this file.
+	policy := Policy{
+		Profile:  Project,
+		Origins:  []string{"https://nucleos.invalid"},
+		Loopback: []string{origin.URL},
+		Writable: []string{origin.URL},
+	}
+	proxy := startProxy(t, policy)
+
+	response, err := throughProxy(t, proxy).Post(origin.URL, "text/plain", strings.NewReader("x"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want the POST carried", response.StatusCode)
+	}
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the proxy answered 200 and the POST never reached the origin")
+	}
+}
+
 // TestTheProxyRefusesAWebSocketHandshake is spec §11 test 3, at the layer that can actually see it.
 //
 // The spike measured Fetch never receiving a ws: url and Network.setBlockedURLs completing the

@@ -69,17 +69,42 @@ func (d *Driver) onFetchPaused(event cdp.Event) {
 	d.answerRequest(ctx, event.Session, paused)
 }
 
-func (d *Driver) answerRequest(ctx context.Context, session cdp.SessionID, paused fetchPaused) {
-	verdict := fence.Decide(d.policy, fence.Request{
+func (d *Driver) answerRequest(ctx context.Context, on cdp.SessionID, paused fetchPaused) {
+	request := fence.Request{
 		Method:       paused.Request.Method,
 		URL:          paused.Request.URL,
 		ResourceType: paused.ResourceType,
 		Headers:      paused.Request.Headers,
-	})
+	}
+
+	// The write rule's fifth condition, and the only part of the fence that is about an instant
+	// rather than about configuration: was this submission caused by an act? Looked up before the
+	// decision and CONSUMED after it, so a POST refused for something else — the wrong origin, a
+	// profile with no grant — does not also burn the window the act opened.
+	//
+	// NeedsWriteWindow rather than a method check written out here, so this side cannot drift from
+	// the side that judges: a request Decide judges by the write rule and that arrives with Armed
+	// unfilled would be refused for a reason that is true of the field and false of the world.
+	var owner *session
+	var window *writeWindow
+	if fence.NeedsWriteWindow(request) {
+		owner, window = d.armedWrite(paused.FrameID, fence.WriteOriginOf(request.URL))
+		if window != nil {
+			request.Armed = window.origin
+		}
+	}
+
+	verdict := fence.Decide(d.policy, request)
 	if !verdict.Allow {
-		d.recordRefusal(session, verdict)
-		d.failRequest(ctx, session, paused.RequestID)
+		d.recordRefusal(on, verdict)
+		d.failRequest(ctx, on, paused.RequestID)
 		return
+	}
+	if window != nil {
+		// Only now, and only here. What is written down is what LEFT — a submission the fence
+		// stopped is a refusal, and the record of what an agent did as the person must not contain
+		// things it did not do.
+		d.takeWrite(owner, window, request.Method, request.URL)
 	}
 
 	params := map[string]any{"requestId": paused.RequestID}
@@ -90,7 +115,7 @@ func (d *Driver) answerRequest(ctx context.Context, session cdp.SessionID, pause
 		// asset would double the interception cost of every page for a check that cannot fire.
 		params["interceptResponse"] = true
 	}
-	d.answerOrFail(ctx, session, paused.RequestID, "Fetch.continueRequest", params)
+	d.answerOrFail(ctx, on, paused.RequestID, "Fetch.continueRequest", params)
 }
 
 func (d *Driver) answerResponse(ctx context.Context, session cdp.SessionID, paused fetchPaused) {

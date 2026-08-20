@@ -37,9 +37,16 @@ import (
 //
 // # Why it is not an open relay worth worrying about
 //
-// It listens on loopback and forwards only GET and HEAD, and refuses loopback destinations. Any local
-// process that could reach it could already make the same request directly, so it hands out no reach
-// that was not already there.
+// It listens on loopback and forwards GET, HEAD, and a POST to an origin the profile has a write
+// grant for — and refuses loopback destinations it was not told about. Any local process that could
+// reach it could already make the same request directly, so it hands out no reach that was not
+// already there.
+//
+// The POST is the one thing here that a person's decision opens, and this layer answers only the
+// part of the write rule it is able to: whether the origin was granted. It cannot see whether a
+// request is a document, and it has no idea what an act is doing, so the other four conditions are
+// the CDP fence's — which is the same division this layer already makes for the site allowlist, for
+// the same reason. See decideWrite.
 type Proxy struct {
 	policy    Policy
 	listener  net.Listener
@@ -134,10 +141,13 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ResourceType is left empty on purpose. This layer sees bytes, not Chrome's classification, so
-	// it cannot tell a document from a sub-resource — and Decide's allowlist rule applies only to
-	// documents, so leaving it empty means the proxy enforces method, scheme and channel and leaves
-	// the allowlist to the layer that can actually see which is which (spec §5.4, §5.5).
+	// ResourceType is left empty on purpose, and it is READ as a signal rather than merely absent.
+	// This layer sees bytes, not Chrome's classification, so it cannot tell a document from a
+	// sub-resource — and two of Decide's rules turn on exactly that. The allowlist applies only to
+	// documents (spec §5.4, §5.5), and the write rule's other four conditions need to know both which
+	// requests are documents and which act is in flight. Both are left to the layer that can see, and
+	// Decide branches on the empty string to say so. See decideWrite for what this layer still
+	// answers, and for the gate run that found the two layers disagreeing.
 	verdict := Decide(p.policy, Request{
 		Method:  r.Method,
 		URL:     r.URL.String(),

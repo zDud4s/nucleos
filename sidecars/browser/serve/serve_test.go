@@ -197,6 +197,11 @@ func TestThePlacementReachesTheDriverUnchanged(t *testing.T) {
 		Placement: browser.Placement{
 			Profile: profile.Ref{Kind: profile.Project, ID: "acme"},
 			Origins: []string{"https://jira.example.org", "https://accounts.google.com"},
+			// One of the two, so the assertion below can tell a list that travelled from a list that
+			// was copied off the other one. A write grant dropped on the wire would be a fence that
+			// refuses every submission a person granted, and nothing would report it: the agent would
+			// simply be told no, correctly, about a rule nobody wrote.
+			Writable: []string{"https://jira.example.org"},
 		},
 	}
 	if response := post(t, server, "/open", sent, true); response.StatusCode != http.StatusOK {
@@ -214,6 +219,9 @@ func TestThePlacementReachesTheDriverUnchanged(t *testing.T) {
 	}
 	if !slices.Equal(got.Placement.Origins, sent.Placement.Origins) {
 		t.Errorf("origins: got %v, want %v", got.Placement.Origins, sent.Placement.Origins)
+	}
+	if !slices.Equal(got.Placement.Writable, sent.Placement.Writable) {
+		t.Errorf("writable: got %v, want %v", got.Placement.Writable, sent.Placement.Writable)
 	}
 }
 

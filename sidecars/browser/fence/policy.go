@@ -95,6 +95,23 @@ type Policy struct {
 	// It also accepts http://, which Origins never does: a local dev server on plain http is the
 	// ordinary case here, and there is no session on it to lose.
 	Loopback []string
+	// Writable are the origins this profile may submit a form to.
+	//
+	// A subset of Origins in practice and NOT by construction: reading a site and acting as the
+	// person on it are different sentences, and the second is never implied by the first. There are
+	// sites one wants an agent to read and on which one wants it to submit nothing — read the Jira
+	// and open no tickets, read the inbox and answer nothing — so the two lists are two lists.
+	//
+	// Nothing enforces the subset here either, and that is deliberate rather than an omission: an
+	// entry that is writable and not admitted is inert, because [Decide] refuses the document for
+	// its origin a few lines below the write rule. Validating the relation would be a check that
+	// rejects a configuration nothing can act on, and the ordering that makes it inert is measured
+	// in the table test rather than asserted twice.
+	//
+	// Loopback entries are accepted here for the same reason Loopback itself accepts http: if a
+	// profile has business with a local service at all, whether it may be written to is the same
+	// question asked of the same list, and answering it somewhere else would be a second rule.
+	Writable []string
 }
 
 // ErrNoProfileKind is [Policy.Validate]'s refusal to fence a profile nobody named. Spec §6.2a's rule
@@ -109,11 +126,21 @@ func (p Policy) Validate() error {
 			return fmt.Errorf("fence: %q is not a loopback origin", entry)
 		}
 	}
+	for _, entry := range p.Writable {
+		if normaliseWritable(entry) == "" {
+			return fmt.Errorf("fence: %q is not an origin a form could be submitted to", entry)
+		}
+	}
 	switch p.Profile {
 	case Ephemeral:
 		if len(p.Origins) > 0 {
 			// Silently ignoring a list somebody wrote is how a security control becomes decorative.
 			return errors.New("fence: an ephemeral profile has no origin list; this one would be ignored")
+		}
+		if len(p.Writable) > 0 {
+			// A throwaway has no login in it, so there is no "as the person" to write as — and a
+			// list here would be the same decorative control the line above refuses.
+			return errors.New("fence: an ephemeral profile has nobody to write as; this list would be ignored")
 		}
 		return nil
 	case Project:
@@ -156,6 +183,18 @@ type Request struct {
 	// executes in the profile, which is why the allowlist applies to it and not to the rest (§5.5).
 	ResourceType string
 	Headers      map[string]string
+	// Armed is the origin an ACT has opened a write window for, and "" when no act is in flight.
+	//
+	// The fifth condition of the write rule lives here rather than in Policy because it is not
+	// configuration: it is a fact about this instant — that a click or a key press on something the
+	// reading showed is what caused this request. The driver arms it before the verb and disarms it
+	// when the verb returns (see chrome/write.go); this package only reads it, which keeps Decide a
+	// table test with no Chrome in it.
+	//
+	// Without it, "this origin may be written to" would be a blank cheque: hostile content INSIDE a
+	// granted origin — a comment on a forum, an issue title — could submit that origin's forms on
+	// its own, with the agent doing nothing at all.
+	Armed string
 }
 
 // IsDocument reports whether this request would produce a document — top-level or in a frame. Spec
@@ -205,6 +244,10 @@ func Decide(policy Policy, request Request) Verdict {
 
 	switch strings.ToUpper(request.Method) {
 	case "GET", "HEAD":
+	case "POST":
+		if verdict := decideWrite(policy, request); !verdict.Allow {
+			return verdict
+		}
 	default:
 		if request.IsDocument() {
 			// A non-GET that produces a document is a form submission in all but name. Reporting it
@@ -244,6 +287,146 @@ func Decide(policy Policy, request Request) Verdict {
 	}
 
 	return allow()
+}
+
+// NeedsWriteWindow reports whether this request is the kind the write rule judges, and therefore
+// whether a driver has to go looking for an armed window before it calls [Decide].
+//
+// It lives here rather than in the driver so the two cannot drift. A driver that stopped filling
+// [Request.Armed] for a request Decide still judges would turn every form submission in the product
+// into a refusal saying nothing caused it — which is true of the field and false of the world, and
+// is the one refusal nobody could act on.
+func NeedsWriteWindow(request Request) bool {
+	return strings.EqualFold(strings.TrimSpace(request.Method), "POST") && request.IsDocument()
+}
+
+// decideWrite is the write rule: the five conditions under which a POST leaves this machine.
+//
+// Everything else about §6.2 is unchanged, and this is the whole of the exception. The conditions
+// are, in the order they are asked:
+//
+//  1. It produces a DOCUMENT. A POST from a script — fetch, XHR, a beacon — is the path hostile
+//     content would take without passing through any act at all, so the ferry stays GET-only and so
+//     does this.
+//  2. It goes to an origin this file can name. A form aimed at something that is not an https
+//     origin (or a loopback service the profile was given) has no identity to check a grant against.
+//  3. An ACT caused it. See [Request.Armed].
+//  4. It goes back to the origin the act was on. A cross-origin write is the exfiltration §6.2
+//     exists to close, and no grant makes it something else.
+//  5. That origin has a write grant in this profile — a person's decision, taken at the login.
+//
+// # Why the grant is asked LAST, and not first
+//
+// The order decides which reason a refusal reports when more than one applies, and only one of these
+// five points at a person. Refusing a script-driven POST with "ask for the wheel so someone can
+// grant this" would send a person to hand over a permission that changes nothing: the request would
+// still not leave, because nothing acted. So the conditions about THIS REQUEST are asked before the
+// condition about configuration, which is the same shape [Decide] already has — it ends on the
+// allowlist, having refused everything it can refuse for what the request itself is.
+func decideWrite(policy Policy, request Request) Verdict {
+	origin := WriteOriginOf(request.URL)
+
+	// # The proxy asks this question too, and can answer less of it
+	//
+	// A caller with no ResourceType is the loopback proxy (see proxy.go's handle): it sees bytes on a
+	// socket, not Chrome's classification, so it cannot tell a form submission from a scripted POST
+	// and it has no idea what any act is doing. It is already the layer that leaves the ALLOWLIST to
+	// the CDP fence for exactly that reason, and the write rule divides the same way.
+	//
+	// This was found by the gate rather than reasoned out, and the shape is worth recording: the CDP
+	// fence allowed a granted form, the driver wrote the submission down as having left, and the
+	// proxy answered 403 to the same request a layer later. The agent got a page saying
+	// "non-get-method" from a fence that had just decided otherwise — two layers of one rule
+	// disagreeing, with the record already written by the one that said yes.
+	//
+	// What is left here is the part the proxy CAN answer, and it is not nothing: a POST may pass only
+	// to an origin a person granted. Everything else about the rule is decided upstream, by the layer
+	// that sees which requests are documents and which act is in flight — and nothing reaches this
+	// point that the CDP fence did not already allow.
+	if request.ResourceType == "" {
+		if origin == "" || !listedWritable(origin, policy.Writable) {
+			// Reported as the METHOD and never as a form, which is the only thing this layer can
+			// honestly claim. Naming the handoff here would tell an agent a person could grant this,
+			// and for a scripted POST that is false — and telling a form from a script is precisely
+			// what this layer cannot do. So it says what it knows: a POST has a consequence.
+			return refuse(browser.ConsequenceMethod, "POST has a consequence")
+		}
+		return allow()
+	}
+
+	// Before anything about origins, and the order matters for what gets REPORTED. Nothing on the
+	// page was submitted here — a script made a request — so the agent learning "POST has a
+	// consequence" is right, and "that button submits a form" would be a sentence about a button that
+	// does not exist. Asking about the origin first would put that sentence on every scripted POST to
+	// a plain-http host.
+	if !request.IsDocument() {
+		return refuse(browser.ConsequenceMethod, "POST has a consequence")
+	}
+	if origin == "" {
+		return refuse(browser.ConsequenceForm,
+			"a form is submitted to an https origin, and %s is not one", describeOrigin(request.URL, ""))
+	}
+	if request.Armed == "" {
+		return refuse(browser.ConsequenceForm,
+			"nothing on the page submitted this; a form leaves only when an act on something the reading"+
+				" showed causes it, and this one was submitted by the page itself")
+	}
+	if request.Armed != origin {
+		return refuse(browser.ConsequenceForm,
+			"a form on %s submits to itself, and this one goes to %s", request.Armed, origin)
+	}
+	if !listedWritable(origin, policy.Writable) {
+		return refuseUnwritable(origin)
+	}
+	return allow()
+}
+
+// refuseUnwritable is the one refusal in the write rule that a PERSON can do something about, so it
+// is worded once and in one place rather than twice with a drift between them.
+func refuseUnwritable(origin string) Verdict {
+	return refuse(browser.ConsequenceForm,
+		"%s may be READ in this profile and not written to; browser_handoff asks a person for the"+
+			" wheel, and the grant is theirs to give from the form in front of them", origin)
+}
+
+// WriteOriginOf reduces a url to the identity the write list is written in.
+//
+// [OriginOf] for anything on the web, so a write grant is checked against exactly the string the
+// núcleo stored. The one difference is loopback, where it keeps the scheme the way
+// [Policy.Loopback] does: a local service admitted on plain http has no session to lose by being
+// http, and asking whether it may be written to somewhere else would be a second rule about the
+// same list.
+func WriteOriginOf(raw string) string {
+	if isLoopbackURL(raw) {
+		return loopbackOriginOf(raw)
+	}
+	return OriginOf(raw)
+}
+
+// normaliseWritable brings a write-list entry into the shape [WriteOriginOf] produces, or "".
+//
+// The two forms cannot collide: normaliseLoopback answers only for a loopback host, and
+// NormaliseEntry produces https only, so an entry is at most one of the two.
+func normaliseWritable(entry string) string {
+	if loopback := normaliseLoopback(entry); loopback != "" {
+		return loopback
+	}
+	return NormaliseEntry(entry)
+}
+
+// listedWritable is exact whole-origin matching against the write list, the same rule [listed] uses
+// for the read list and for the same reason: inside a profile holding live logins, a subdomain is a
+// different principal.
+func listedWritable(origin string, entries []string) bool {
+	if origin == "" {
+		return false
+	}
+	for _, entry := range entries {
+		if normalised := normaliseWritable(entry); normalised != "" && normalised == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // DecideTunnel is the CONNECT rule, and it is deliberately thin.

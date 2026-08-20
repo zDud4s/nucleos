@@ -64,6 +64,14 @@ const (
 type Placement struct {
 	Profile profile.Ref `json:"profile"`
 	Origins []string    `json:"origins,omitempty"`
+	// Writable are the origins this profile may SUBMIT A FORM to, and it is a second list rather
+	// than a flag on the first because reading a site and acting as the person on it are different
+	// permissions. A person grants the second at the login, next to the first and separately from
+	// it — there are sites one wants read and on which one wants nothing submitted.
+	//
+	// Empty for an ephemeral profile, and it must be, for a reason narrower than Origins': a
+	// throwaway has no login in it, so there is nobody for a form to be submitted AS.
+	Writable []string `json:"writable,omitempty"`
 }
 
 // OpenRequest asks for a session on a URL, in the profile the núcleo chose.
@@ -356,6 +364,14 @@ const (
 	// document GET — the same request a link to action?fields would make — and it goes through, as
 	// the fence's other rules judge any navigation: refused for its origin if the profile does not
 	// admit the host, allowed otherwise. See fence/csp.go for why the CSP stopped saying otherwise.
+	//
+	// Nor is a POST always this. One leaves — the only kind that does — when five things hold at
+	// once: it produces a document, it goes back to the origin the page is on, that origin has a
+	// WRITE grant a person gave at the login, and an act on something the reading showed is what
+	// caused it. Anything short of all five is this consequence, and the detail says WHICH of the
+	// five failed, because they are five different next moves: ask a person for the wheel, act on
+	// the form instead of watching the page submit it, or stop trying. See fence/policy.go's
+	// decideWrite and chrome/write.go.
 	ConsequenceForm Consequence = "form-submission"
 	// ConsequenceChannel — a channel that is not HTTP(S): WebSocket, WebRTC (spec §6.2, §6.2b).
 	ConsequenceChannel Consequence = "non-http-channel"
@@ -425,6 +441,53 @@ type ActResult struct {
 	URL string `json:"url,omitempty"`
 	// StillLoading has the same meaning as on Session, for the page this act navigated to.
 	StillLoading bool `json:"still_loading,omitempty"`
+	// Writes are the form submissions this act actually sent — the ones the fence LET THROUGH.
+	//
+	// Only what left. A submission the fence refused is a Refusal and not a Write, and conflating
+	// the two would make the record of what an agent did as the person include things it did not do.
+	//
+	// Reported on the act rather than gathered by the núcleo from somewhere else, because the act is
+	// the only place that knows both halves: the sidecar saw the request leave, and the núcleo has
+	// the session row to file it against. It is a slice and not a single value for the same reason
+	// the refusal record has a cursor — one that lands after this act's window is carried to the
+	// next one — though here the race is close to impossible in practice: a submission produces a
+	// document, and the act waits for that very document to arrive.
+	Writes []Write `json:"writes,omitempty"`
+}
+
+// Write is one form submission that left this machine, as much of it as is safe to keep.
+//
+// # What is here, and what is deliberately not
+//
+// The names of the fields and how many there were. Never the VALUES. A form carries a password, a
+// token, a private message; a record of what was submitted would be the most useful audit trail
+// there is and would also turn the núcleo's database into a place where credentials come to rest,
+// permanently, for every form an agent ever fills. The price is accepted with open eyes and is worth
+// stating: knowing that something was submitted to a reply form does not say what the reply said.
+//
+// It exists because supervision has to be possible AFTERWARDS, given that it deliberately is not
+// beforehand — the whole point of the grant is that the agent works alone inside it. Autonomy with
+// no record is autonomy with no supervision available at all, which is a different arrangement and
+// not the one this pillar wants.
+type Write struct {
+	// Origin is where it went, in the shape the grant is written in.
+	Origin string `json:"origin"`
+	// Action is the form's action as the page resolved it, and Method what it was submitted with.
+	// Together they are what ties this row to something a person can see on the page.
+	Action string `json:"action"`
+	Method string `json:"method"`
+	// Fields are the NAMES of what was submitted, in document order. Only named fields: a control
+	// with no name sends nothing, so a name that is absent here is a field that was absent from the
+	// request.
+	Fields []string `json:"fields,omitempty"`
+	// FieldCount is how many there were in total, which is not len(Fields) when a form is long
+	// enough to be truncated. A count that quietly became "the first thirty-two" would be the same
+	// shape of quiet wrongness the reading half of this pillar spent itself removing.
+	FieldCount int `json:"field_count"`
+	// Ref and Verb are the act that caused it — the fifth condition of the write rule, written down
+	// rather than asserted, so a row can be read back against the snapshot that produced it.
+	Ref  string `json:"ref,omitempty"`
+	Verb string `json:"verb,omitempty"`
 }
 
 // Valid reports whether an ActResult is internally consistent. A driver that returns a refusal with

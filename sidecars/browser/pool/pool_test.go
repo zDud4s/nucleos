@@ -338,6 +338,45 @@ func TestAChangedSiteListRelaunchesWhenIdleAndRefusesWhenNot(t *testing.T) {
 	}
 }
 
+// TestAWithdrawnWriteGrantIsADifferentPolicy.
+//
+// The hole this was written for, and it was a real one while the fingerprint was made from the
+// origins alone: taking a write grant back changes NO origin, so the fingerprint matched, so the
+// pool handed back a browser still fenced by the permission that had just been withdrawn. A
+// revocation that does not reach the process enforcing it is a revocation in name — and it would
+// have looked correct everywhere a person could see, the row gone from the screen and the grant gone
+// from the database, while the browser kept submitting forms.
+//
+// It is measured with a session still OPEN, which is the only place the fingerprint is observable at
+// all: a browser whose last session closes is retired outright (see release), so a close-then-reopen
+// launches a second browser whatever the fingerprint said. The first half of this test is what makes
+// the second half mean something — the identical placement finds the running browser, so the changed
+// one being refused is about the change and not about pooling.
+func TestAWithdrawnWriteGrantIsADifferentPolicy(t *testing.T) {
+	launcher := &fakeLauncher{}
+	pool, _ := testPool(t, launcher, 4)
+
+	writing := project("acme", "https://jira.example.org")
+	writing.Writable = []string{"https://jira.example.org"}
+	mustOpen(t, pool, writing)
+
+	// The control: the same two lists find the browser that is already up.
+	mustOpen(t, pool, writing)
+	if len(launcher.launched()) != 1 {
+		t.Fatalf("an unchanged placement launched %d browsers", len(launcher.launched()))
+	}
+
+	// And the withdrawal, which changes no origin at all.
+	_, err := pool.Open(context.Background(), browser.OpenRequest{
+		URL:       "https://example.org/",
+		Placement: project("acme", "https://jira.example.org"),
+	})
+	if !errors.Is(err, ErrPolicyChanged) {
+		t.Fatalf("opening after a write grant was withdrawn = %v, want ErrPolicyChanged;"+
+			" the browser enforcing it was never told", err)
+	}
+}
+
 // TestTheSameListInAnotherOrderIsTheSamePolicy. Nothing promises the núcleo sends a list in a stable
 // order, and tearing down a working browser because a slice was shuffled would be a restart nobody
 // asked for — visible to the person as a page that closed itself.
