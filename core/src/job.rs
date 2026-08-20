@@ -88,6 +88,17 @@ struct PlanItem {
     /// work that has not landed.
     #[serde(default)]
     depends_on: Option<Vec<i64>>,
+    /// Which member of the team works this item.
+    ///
+    /// `Option` for a different reason from the other two. Absent and empty are not opposites here
+    /// — an empty agent id is not an answer anybody could act on — it is that a job WITHOUT a team
+    /// has nobody to name, so the key is required with one and never read without one.
+    ///
+    /// There is no fallback member and there must not be. Choosing for a director that did not
+    /// choose would put the assignment in two places — its judgement and a rule here — and the rule
+    /// would win silently on exactly the plans where the director had least to say.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 /// One item of the queue: what to do, and where the planner guessed it lives.
@@ -100,6 +111,9 @@ pub struct PlannedItem {
     /// The global ordinals this item may not start before. Empty for a plan with no graph in it,
     /// which is every plan a job without a team produces.
     pub depends_on: Vec<i64>,
+    /// Who works it, checked against the team's roster. `None` for every plan of every job without
+    /// a team, which is the whole of what makes those jobs read here exactly as they always did.
+    pub agent_id: Option<String>,
 }
 
 /// A validated work queue, plus however much of it did not fit.
@@ -133,9 +147,11 @@ fn edges(depends_on: &[i64]) -> Option<String> {
 
 /// The graph rules this job's next plan is held to, or `None` for a job with no team.
 ///
-/// Reads the two facts the rules need at the moment the plan is being read, and not earlier. The
-/// first ordinal in particular has to be current: it is what a `depends_on` is range-checked
-/// against, and it moves every time a round is ingested.
+/// Reads the facts the rules need at the moment the plan is being read, and not earlier. The first
+/// ordinal in particular has to be current: it is what a `depends_on` is range-checked against, and
+/// it moves every time a round is ingested. The roster has to be current for the same kind of
+/// reason — somebody removed from the team between the plan and the replan may not be given work by
+/// the second one.
 async fn graph_rules(pool: &SqlitePool, job: &JobRow) -> Option<Graph> {
     let team: Option<String> =
         sqlx::query_scalar::<_, Option<String>>("SELECT team_id FROM jobs WHERE id = ?")
@@ -145,7 +161,7 @@ async fn graph_rules(pool: &SqlitePool, job: &JobRow) -> Option<Graph> {
             .ok()
             .flatten()
             .flatten();
-    team?;
+    let team = team?;
 
     // The same expression `ingest_replan` uses to hand out ordinals, asked here so the number the
     // plan is checked against is the number the plan will be given.
@@ -157,15 +173,59 @@ async fn graph_rules(pool: &SqlitePool, job: &JobRow) -> Option<Graph> {
             .unwrap_or(0);
     Some(Graph {
         first_ordinal: first_ordinal.max(0) as usize,
+        roster: roster_of(pool, &team).await,
     })
 }
 
-/// The rules a plan is held to when a team wrote it, and the one number those rules need.
+/// Everyone this team's director may give work to, with the line it chooses them by.
+///
+/// **The director is on its own roster**, and that is a decision rather than an oversight. A team of
+/// one — a director and no members — is an ordinary way to ask for parallel work under a single
+/// persona, and leaving it out would make every such team refuse every plan it ever wrote, for a
+/// reason no message could usefully explain. `team.rs` keeps its departments' directors off the
+/// roster because there a director hands work to specialists and does none itself; here the roster
+/// is "who may write code in this job", and the director qualifies.
+///
+/// Ordered and de-duplicated by the `UNION`, so the prompt lists the same people in the same order
+/// every round — a roster that reshuffles between rounds is a director being asked the same question
+/// twice in two different words.
+async fn roster_of(pool: &SqlitePool, team_id: &str) -> Vec<TeamMate> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT agents.id, agents.speciality FROM agents
+          WHERE agents.id IN (
+                SELECT agent_id FROM team_members WHERE team_id = ?
+                UNION
+                SELECT director_agent_id FROM teams WHERE id = ?)
+          ORDER BY agents.id",
+    )
+    .bind(team_id)
+    .bind(team_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, speciality)| TeamMate { id, speciality })
+    .collect()
+}
+
+/// One name a director may put on an item, and the line it decides by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamMate {
+    pub id: String,
+    /// One line, and load-bearing rather than decoration — `agent.rs:11` says so. It is the whole of
+    /// what the director is shown about each member, and the whole of what it chooses on.
+    pub speciality: String,
+}
+
+/// The rules a plan is held to when a team wrote it, and the facts those rules need.
 ///
 /// Present only for a job a team directs. Its absence is not laxity for its own sake: without a team
-/// the items share one checkout and run one at a time, so neither key buys anything and demanding
-/// them would fail plans that were right.
-#[derive(Debug, Clone, Copy)]
+/// the items share one checkout and run one at a time, so none of the keys buys anything and
+/// demanding them would fail plans that were right.
+///
+/// No longer `Copy`, because the roster is a `Vec`. It travels by reference from here on; the three
+/// functions that take it never keep it.
+#[derive(Debug, Clone)]
 pub struct Graph {
     /// The global ordinal the FIRST item of this round will be given.
     ///
@@ -176,23 +236,31 @@ pub struct Graph {
     /// finished. Range-checking against this makes the mistake visible instead, and the prompt is
     /// told the same number so the director can be right in the first place.
     pub first_ordinal: usize,
+    /// Who may be given work, and what each of them is for.
+    ///
+    /// Empty only when the team's every agent has been deleted, which `foreign_keys` makes very
+    /// nearly impossible. An empty roster refuses every plan, and the message says the roster is
+    /// empty rather than that the name was wrong — the two are different problems and only one of
+    /// them is the director's.
+    pub roster: Vec<TeamMate>,
 }
 
 impl Graph {
-    /// PURE: the two keys of one planned item, checked, or the reason the whole plan is refused.
+    /// PURE: the three keys of one planned item, checked, or the reason the whole plan is refused.
     ///
     /// **One bad row refuses the plan rather than dropping the row**, and that is the decision worth
     /// arguing with. Dropping it would leave a queue that looks complete and is missing the work
     /// somebody asked for; refusing costs a round and says why. A job whose director cannot answer
-    /// the two questions is a job that should stop being run in parallel, not one that should be run
-    /// in parallel badly.
+    /// the three questions is a job that should stop being run in parallel, not one that should be
+    /// run in parallel badly.
     fn check(
-        self,
+        &self,
         index: usize,
         description: &str,
         files: Option<Vec<String>>,
         depends_on: Option<Vec<i64>>,
-    ) -> Result<(Vec<String>, Vec<i64>), PlanError> {
+        agent_id: Option<String>,
+    ) -> Result<(Vec<String>, Vec<i64>, String), PlanError> {
         let named = || description.chars().take(60).collect::<String>();
         let Some(files) = files else {
             return Err(PlanError::Rejected(format!(
@@ -235,7 +303,76 @@ impl Graph {
                 )));
             }
         }
-        Ok((files, depends_on))
+
+        // Named last of the three because it is the one a director can get wrong while meaning
+        // well: the other two are shapes, and this is a name that has to exist. The message carries
+        // the roster, because "no such member" without saying who there IS costs the next round to
+        // discover.
+        let Some(agent_id) = agent_id else {
+            return Err(PlanError::Rejected(format!(
+                "item {} (`{}`) names no `agent_id`. With a team every item is given to somebody:                  {}",
+                index + 1,
+                named(),
+                self.who()
+            )));
+        };
+        if !self.roster.iter().any(|mate| mate.id == agent_id) {
+            return Err(PlanError::Rejected(format!(
+                "item {} (`{}`) is given to `{agent_id}`, who is not on this team: {}",
+                index + 1,
+                named(),
+                self.who()
+            )));
+        }
+        Ok((files, depends_on, agent_id))
+    }
+
+    /// The roster as a sentence for a prompt, one member per line.
+    ///
+    /// One per line rather than run together, because this is a list to choose FROM: a director
+    /// reading a comma-separated paragraph picks the first name whose speciality matches the word
+    /// it was thinking of, and the ones after the second comma stop being read. The refusals use
+    /// `who()` instead, which runs them together — there the roster is context for a mistake, not a
+    /// menu.
+    fn introduce(&self) -> String {
+        if self.roster.is_empty() {
+            // Reachable only if the team's every agent has been deleted, which `foreign_keys` makes
+            // very nearly impossible. Said plainly anyway: a director told "the team is:" followed
+            // by nothing invents a name, and the plan is refused for a reason that reads as its
+            // fault.
+            return "This team has no members on record, so there is nobody to give the work to \
+                    and any plan will be refused. Say so instead of guessing at a name."
+                .to_owned();
+        }
+        format!(
+            "The team is:\n{}\n",
+            self.roster
+                .iter()
+                .map(|mate| format!("  {} — {}", mate.id, mate.speciality))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    /// The roster as a sentence, for the two refusals that have to name it.
+    ///
+    /// An empty roster gets a different sentence, because it is a different problem: the director
+    /// answered as well as it could and there was nobody to answer with, which is the owner's to fix
+    /// and not the director's. Told as "nobody is on this team" it costs one reading; told as "`x`
+    /// is not on this team" it costs a round of guessing at names.
+    fn who(&self) -> String {
+        if self.roster.is_empty() {
+            return "this team has no members and no director, so there is nobody to give it to"
+                .to_owned();
+        }
+        format!(
+            "the team is {}",
+            self.roster
+                .iter()
+                .map(|mate| format!("`{}` ({})", mate.id, mate.speciality))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -247,7 +384,7 @@ impl Graph {
 pub fn parse_plan(
     contents: Option<&[u8]>,
     max_items: usize,
-    graph: Option<Graph>,
+    graph: Option<&Graph>,
 ) -> Result<PlannedItems, PlanError> {
     let bytes = contents.ok_or(PlanError::Absent)?;
     let parsed: PlanFile =
@@ -260,17 +397,24 @@ pub fn parse_plan(
             description,
             files,
             depends_on,
+            agent_id,
         } = item;
-        let (files, depends_on) = match graph {
-            Some(graph) => graph.check(index, &description, files, depends_on)?,
-            // No team, no graph. Both keys mean nothing here and an absent one is not an answer
-            // anybody was owed — which is what every plan written before this parsing relies on.
-            None => (files.unwrap_or_default(), Vec::new()),
+        let (files, depends_on, agent_id) = match graph {
+            Some(graph) => {
+                let (files, depends_on, agent_id) =
+                    graph.check(index, &description, files, depends_on, agent_id)?;
+                (files, depends_on, Some(agent_id))
+            }
+            // No team, no graph. None of the keys means anything here and an absent one is not an
+            // answer anybody was owed — which is what every plan written before this parsing relies
+            // on.
+            None => (files.unwrap_or_default(), Vec::new(), None),
         };
         items.push(PlannedItem {
             description,
             files,
             depends_on,
+            agent_id,
         });
     }
 
@@ -721,6 +865,43 @@ pub fn next_step(job: &JobView) -> Next {
         ReviewState::Pending => Next::SpawnReview,
         ReviewState::Running => Next::Wait,
         ReviewState::NotWanted | ReviewState::Done => close_the_round(job),
+    }
+}
+
+/// Who the director gave this item to, in their own words, or `None`.
+///
+/// **The prompt is read NOW and not stored on the row**, which is what makes `job_items.agent_id` a
+/// reference rather than a copy. An owner who edits an agent between the plan and the run gets the
+/// edited agent doing the work, which is the behaviour a catalogue is for: the alternative freezes a
+/// persona at plan time and leaves the owner unable to say why their correction had no effect.
+///
+/// `None` three ways, and they mean the same thing to the caller and different things to a reader:
+/// the item has no agent, because its job has no team; the agent was deleted between the plan and
+/// the run, which `foreign_keys` and `agent::delete` between them make very nearly impossible; or
+/// the read failed. The last is the only one worth saying out loud, because it is the one where the
+/// item runs with a brief that is missing something it was supposed to have.
+async fn persona_for(pool: &SqlitePool, agent_id: Option<&str>) -> Option<String> {
+    let agent_id = agent_id?;
+    match crate::agent::get(pool, agent_id).await {
+        Ok(Some(agent)) => Some(format!(
+            "{}\n\nYou are `{}` on this job's team, and you were given the item below because your \
+             speciality is {}.\n\n",
+            agent.prompt, agent.name, agent.speciality
+        )),
+        Ok(None) => {
+            tracing::warn!(
+                agent_id,
+                "a job item names an agent the catalogue does not have"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                agent_id,
+                "could not read the agent a job item was given to; it runs without its brief"
+            );
+            None
+        }
     }
 }
 
@@ -1801,7 +1982,7 @@ const HISTORY_IS_THE_JOBS: &str = "The job commits the tree itself once an item'
 /// It says the file is the only thing read, because it is: §5.2 of the design takes the queue from
 /// `plan.json` and never from stdout, so that a stream truncated mid-write cannot be parsed into a
 /// plausible short queue that reads as "there was less work than expected".
-pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str, graph: Option<Graph>) -> String {
+pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str, graph: Option<&Graph>) -> String {
     let Some(graph) = graph else {
         return format!(
             "You are the PLAN node of an autonomous job. Break the task below into at most \
@@ -1826,8 +2007,11 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str, graph: Option<
          much of it can happen at once.\n\n\
          {HISTORY_IS_THE_JOBS}\n\n\
          Write them to {artifacts}/plan.json and change nothing else:\n\n\
-         {{\"items\": [{{\"description\": \"...\", \"files\": [\"path\"], \"depends_on\": []}}]}}\n\n\
-         BOTH keys are required on every item, and leaving one out refuses the whole plan.\n\n\
+         {{\"items\": [{{\"description\": \"...\", \"files\": [\"path\"], \"depends_on\": [], \
+         \"agent_id\": \"...\"}}]}}\n\n\
+         ALL THREE keys are required on every item, and leaving one out refuses the whole plan.\n\n\
+         \"agent_id\": who does the item. {roster} Choose by what each one is for; one of them may \
+         take several items, and an item may go to whoever fits it best.\n\n\
          \"files\": every file you expect the item to touch. This is what tells two items apart \
          before either has run — two items naming the same file are never started together. Name \
          too few and their edits collide; name the whole repository and nothing ever runs beside \
@@ -1844,6 +2028,7 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str, graph: Option<
          work to do, write {{\"items\": []}} — an empty queue is a legitimate answer and is not a \
          failure. Do not begin any of the work yourself.\n\n\
          The task:\n\n{task}",
+        roster = graph.introduce(),
         first = graph.first_ordinal,
         second = graph.first_ordinal + 1,
     )
@@ -1868,7 +2053,7 @@ pub fn replan_prompt(
     round: i64,
     archives: &[String],
     artifacts: &str,
-    graph: Option<Graph>,
+    graph: Option<&Graph>,
 ) -> String {
     let history = if archives.is_empty() {
         // Reachable when the archive copy failed, and the honest thing to say is that it is missing.
@@ -1889,15 +2074,18 @@ pub fn replan_prompt(
     // two dry rounds later the job reports `completed` having done only its first round.
     let (shape, rules) = match graph {
         Some(graph) => (
-            ", \"files\": [\"path\"], \"depends_on\": []",
+            ", \"files\": [\"path\"], \"depends_on\": [], \"agent_id\": \"...\"",
             format!(
-                "Both extra keys are required on every item you list, and leaving one out refuses \
-                 the whole plan. \"files\" is every file you expect the item to touch, and it is \
-                 what tells two items apart before either has run. \"depends_on\" is the ordinals \
-                 this item may not start before, or [] if there are none — counted across the \
-                 WHOLE job, so the items you list now are numbered from {}, and a dependency must \
-                 point at an EARLIER ordinal than the item naming it.\n\n",
-                graph.first_ordinal
+                "All three extra keys are required on every item you list, and leaving one out \
+                 refuses the whole plan. \"files\" is every file you expect the item to touch, and \
+                 it is what tells two items apart before either has run. \"depends_on\" is the \
+                 ordinals this item may not start before, or [] if there are none — counted across \
+                 the WHOLE job, so the items you list now are numbered from {}, and a dependency \
+                 must point at an EARLIER ordinal than the item naming it. \"agent_id\" is who \
+                 does the item.\n\n\
+                 {}\n",
+                graph.first_ordinal,
+                graph.introduce()
             ),
         ),
         None => ("", String::new()),
@@ -1938,6 +2126,12 @@ pub fn replan_prompt(
 /// than a second independent guess at the same item, because §5.4 keeps the second node from ever
 /// seeing the first one's session: without the output travelling in the prompt, a whole run is spent
 /// rediscovering what the gate already printed.
+///
+/// `persona` is who the director gave the item to, and it is `None` for every item of every job
+/// without a team — which is what keeps the brief below byte-for-byte what it has always been. It is
+/// PREPENDED rather than mixed in, for the reason `speciality` exists at all: the agent's own prompt
+/// is a standing instruction about how this one works, and the item is a piece of work. Interleaving
+/// them would make each read like a qualification of the other.
 pub fn implement_prompt(
     description: &str,
     ordinal: usize,
@@ -1945,8 +2139,13 @@ pub fn implement_prompt(
     artifacts: &str,
     files: &[String],
     gate_output: Option<&str>,
+    persona: Option<&str>,
 ) -> String {
-    let mut prompt = format!(
+    // Prepended and not woven in, so a job with no team is handed the brief it has always been
+    // handed, byte for byte. It goes FIRST because it is who is reading, and everything after it is
+    // what they are reading about — the order `team.rs`'s `specialist_prompt` already uses.
+    let mut prompt = persona.unwrap_or_default().to_owned();
+    prompt.push_str(&format!(
         "You are item {} of {total} in an autonomous job. The working tree already holds the work \
          of the earlier items; this is the only one you do.\n\n\
          {description}\n\n\
@@ -1955,7 +2154,7 @@ pub fn implement_prompt(
          Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
          stops this item to ask permission for something already arranged.",
         ordinal + 1
-    );
+    ));
     if !files.is_empty() {
         // Told where to begin, and told in the same breath that beginning is all it is. A list
         // written before any of the earlier items ran cannot know what they moved, so a node that
@@ -2172,7 +2371,7 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     let planned = match parse_plan(
         contents.as_deref(),
         job.max_items.max(0) as usize,
-        graph_rules(pool, job).await,
+        graph_rules(pool, job).await.as_ref(),
     ) {
         Ok(planned) => planned,
         // Absent and unreadable are both planning failures, and neither is an empty queue. The
@@ -2200,14 +2399,16 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
             .then(|| serde_json::to_string(&item.files).ok())
             .flatten();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on)
-             VALUES (?, ?, ?, 'pending', ?, ?)",
+            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
+                                    agent_id)
+             VALUES (?, ?, ?, 'pending', ?, ?, ?)",
         )
         .bind(job.id)
         .bind(ordinal as i64)
         .bind(&item.description)
         .bind(files)
         .bind(edges(&item.depends_on))
+        .bind(item.agent_id.as_deref())
         .execute(pool)
         .await?;
     }
@@ -2327,7 +2528,7 @@ async fn ingest_replan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     let planned = match parse_plan(
         contents.as_deref(),
         job.max_items.max(0) as usize,
-        graph_rules(pool, job).await,
+        graph_rules(pool, job).await.as_ref(),
     ) {
         Ok(planned) => planned,
         Err(error) => {
@@ -2422,8 +2623,9 @@ async fn open_the_next_round(
             .then(|| serde_json::to_string(&item.files).ok())
             .flatten();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, round, files, depends_on)
-             VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+            "INSERT INTO job_items (job_id, ordinal, description, status, round, files, depends_on,
+                                    agent_id)
+             VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(next_ordinal + offset as i64)
@@ -2431,6 +2633,7 @@ async fn open_the_next_round(
         .bind(round)
         .bind(files)
         .bind(edges(&item.depends_on))
+        .bind(item.agent_id.as_deref())
         .execute(pool)
         .await?;
     }
@@ -3694,7 +3897,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 &task,
                 job.max_items.max(0) as usize,
                 &artifacts,
-                graph_rules(pool, job).await,
+                graph_rules(pool, job).await.as_ref(),
             );
             spawn_node(state, job, "plan", prompt, None, worktree).await
         }
@@ -3716,20 +3919,21 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 );
                 return Step::Stopped;
             };
-            let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-                "SELECT description, files, gate_output FROM job_items
+            let row =
+                sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+                    "SELECT description, files, gate_output, agent_id FROM job_items
                  WHERE job_id = ? AND ordinal = ?",
-            )
-            .bind(job.id)
-            .bind(ordinal as i64)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+                )
+                .bind(job.id)
+                .bind(ordinal as i64)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
             // `gate_output` is NULL for every item on its first attempt, which is every item of every
             // job that never retries anything — so the `None` this reads is the prompt staying
             // exactly as it was, not a fallback.
-            let Some((description, files, gate_output)) = row else {
+            let Some((description, files, gate_output, agent_id)) = row else {
                 tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
                 return Step::Stopped;
             };
@@ -3739,6 +3943,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             let files: Vec<String> = files
                 .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
                 .unwrap_or_default();
+            let persona = persona_for(pool, agent_id.as_deref()).await;
             let prompt = implement_prompt(
                 &description,
                 ordinal,
@@ -3746,6 +3951,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 &artifacts,
                 &files,
                 gate_output.as_deref(),
+                persona.as_deref(),
             );
             spawn_node(
                 state,
@@ -3771,7 +3977,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 view.rounds.round,
                 &archives,
                 &artifacts,
-                graph_rules(pool, job).await,
+                graph_rules(pool, job).await.as_ref(),
             );
             spawn_node(state, job, "replan", prompt, None, worktree).await
         }
@@ -5390,7 +5596,7 @@ mod tests {
         let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos", None);
         let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos", None);
         // No hint, because what this pins is the paragraph every node gets regardless of one.
-        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None);
+        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None, None);
 
         for prompt in [&plan, &replan] {
             assert!(
@@ -5459,6 +5665,7 @@ mod tests {
                 description: "a".to_owned(),
                 files: Vec::new(),
                 depends_on: Vec::new(),
+                agent_id: None,
             }
         );
         // Reported, never silent: a queue quietly cut from seven to five reads downstream as "the
@@ -5466,59 +5673,137 @@ mod tests {
         assert_eq!(plan.dropped, 2);
     }
 
-    /// The four ways a team's plan is refused, and each is a different mistake.
+    /// A team's rules, with a roster of two. Every graph test is held to these.
+    fn directed(first_ordinal: usize) -> Graph {
+        Graph {
+            first_ordinal,
+            roster: vec![
+                TeamMate {
+                    id: "ana".to_owned(),
+                    speciality: "migrations".to_owned(),
+                },
+                TeamMate {
+                    id: "bo".to_owned(),
+                    speciality: "the shell".to_owned(),
+                },
+            ],
+        }
+    }
+
+    /// Every way a team's plan is refused, each named and each a different mistake.
     ///
     /// The whole plan is refused for one bad row rather than the row dropped, and that is the
     /// decision to argue with. A dropped row leaves a queue that looks complete and is missing work
     /// somebody asked for; a refusal costs a round and says which item and why. A director that
-    /// cannot answer the two questions should stop being run in parallel, not be run in parallel
+    /// cannot answer the three questions should stop being run in parallel, not be run in parallel
     /// badly.
+    ///
+    /// **Every case names all three keys except the one it is about**, which is what stops this
+    /// being a list of plans that merely happen to be refused. A row missing two keys is refused by
+    /// whichever check runs first, and the case for the second key would pass with that check
+    /// deleted.
     #[test]
     fn a_teams_plan_is_refused_for_a_graph_that_does_not_hold_up() {
-        let graph = Some(Graph { first_ordinal: 0 });
+        let graph = directed(0);
         for (why, json) in [
             (
                 "no files",
-                br#"{"items":[{"description":"x","depends_on":[]}]}"#.as_slice(),
+                br#"{"items":[{"description":"x","depends_on":[],"agent_id":"ana"}]}"#.as_slice(),
             ),
             (
                 "empty files",
-                br#"{"items":[{"description":"x","files":[],"depends_on":[]}]}"#.as_slice(),
+                br#"{"items":[{"description":"x","files":[],"depends_on":[],
+                              "agent_id":"ana"}]}"#
+                    .as_slice(),
             ),
             (
                 "no depends_on",
-                br#"{"items":[{"description":"x","files":["a.rs"]}]}"#.as_slice(),
+                br#"{"items":[{"description":"x","files":["a.rs"],"agent_id":"ana"}]}"#.as_slice(),
             ),
             (
                 "an ordinal that is not an earlier item",
-                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[7]}]}"#.as_slice(),
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[7],
+                              "agent_id":"ana"}]}"#
+                    .as_slice(),
             ),
             (
                 "a dependency on itself",
-                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[0]}]}"#.as_slice(),
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[0],
+                              "agent_id":"ana"}]}"#
+                    .as_slice(),
             ),
             (
                 "a cycle, which pointing forwards already is",
-                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[1]},
-                              {"description":"y","files":["b.rs"],"depends_on":[0]}]}"#
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[1],
+                              "agent_id":"ana"},
+                              {"description":"y","files":["b.rs"],"depends_on":[0],
+                              "agent_id":"bo"}]}"#
+                    .as_slice(),
+            ),
+            (
+                "no agent_id",
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[]}]}"#.as_slice(),
+            ),
+            (
+                "an agent who is not on this team",
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[],
+                              "agent_id":"someone-else"}]}"#
                     .as_slice(),
             ),
         ] {
             assert!(
                 matches!(
-                    parse_plan(Some(json), 5, graph),
+                    parse_plan(Some(json), 5, Some(&graph)),
                     Err(PlanError::Rejected(_))
                 ),
                 "a plan with {why} was accepted"
             );
         }
 
-        // And the shape that holds up: a backwards edge, and an explicit "nothing".
-        let good = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[]},
-                                 {"description":"y","files":["b.rs"],"depends_on":[0]}]}"#;
-        let plan = parse_plan(Some(good), 5, graph).expect("a plan that holds up");
+        // And the shape that holds up: a backwards edge, an explicit "nothing", and two members of
+        // the roster each given something.
+        let good = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[],
+                                  "agent_id":"ana"},
+                                 {"description":"y","files":["b.rs"],"depends_on":[0],
+                                  "agent_id":"bo"}]}"#;
+        let plan = parse_plan(Some(good), 5, Some(&graph)).expect("a plan that holds up");
         assert_eq!(plan.items[1].depends_on, vec![0]);
         assert_eq!(plan.items[0].depends_on, Vec::<i64>::new());
+        assert_eq!(plan.items[0].agent_id.as_deref(), Some("ana"));
+        assert_eq!(plan.items[1].agent_id.as_deref(), Some("bo"));
+    }
+
+    /// A refusal names who there IS, because "no such member" without the roster costs a whole
+    /// round to act on: the director's next answer would be another guess at a name.
+    ///
+    /// The empty roster gets its own sentence, and that is not tidiness. It is a different problem
+    /// with a different owner — the director answered as well as it could and there was nobody to
+    /// answer with — and told as "`ana` is not on this team" it reads as the director's fault.
+    #[test]
+    fn a_refusal_over_an_agent_says_who_is_on_the_team() {
+        let json = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[],
+                                  "agent_id":"nobody"}]}"#;
+        let Err(PlanError::Rejected(said)) = parse_plan(Some(json), 5, Some(&directed(0))) else {
+            panic!("a plan naming a stranger was accepted");
+        };
+        assert!(said.contains("ana"), "{said}");
+        assert!(
+            said.contains("migrations"),
+            "the speciality is what to choose on: {said}"
+        );
+        assert!(said.contains("bo"), "{said}");
+
+        let deserted = Graph {
+            first_ordinal: 0,
+            roster: Vec::new(),
+        };
+        let Err(PlanError::Rejected(said)) = parse_plan(Some(json), 5, Some(&deserted)) else {
+            panic!("a plan under an empty roster was accepted");
+        };
+        assert!(
+            said.contains("no members"),
+            "an empty roster is the owner's problem, not the director's: {said}"
+        );
     }
 
     /// Ordinals continue across rounds, so a later round's `depends_on` is checked against where
@@ -5530,22 +5815,25 @@ mod tests {
     /// ordinal is what turns a plan that reads fine into one that is refused with a reason.
     #[test]
     fn a_later_rounds_dependencies_are_checked_against_that_rounds_own_ordinals() {
-        let round_two = Some(Graph { first_ordinal: 4 });
+        let round_two = directed(4);
         // Item 4 depending on item 3: an item of round 1, which is legitimate and useful.
-        let across = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[3]}]}"#;
-        assert!(parse_plan(Some(across), 5, round_two).is_ok());
+        let across = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[3],
+                                    "agent_id":"ana"}]}"#;
+        assert!(parse_plan(Some(across), 5, Some(&round_two)).is_ok());
 
         // The same plan on round 1 would be nonsense, and is refused there.
         assert!(matches!(
-            parse_plan(Some(across), 5, Some(Graph { first_ordinal: 0 })),
+            parse_plan(Some(across), 5, Some(&directed(0))),
             Err(PlanError::Rejected(_))
         ));
 
         // And an item of round 2 cannot depend on its own successor.
-        let forwards = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[5]},
-                                     {"description":"y","files":["b.rs"],"depends_on":[]}]}"#;
+        let forwards = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[5],
+                                      "agent_id":"ana"},
+                                     {"description":"y","files":["b.rs"],"depends_on":[],
+                                      "agent_id":"bo"}]}"#;
         assert!(matches!(
-            parse_plan(Some(forwards), 5, round_two),
+            parse_plan(Some(forwards), 5, Some(&round_two)),
             Err(PlanError::Rejected(_))
         ));
     }
@@ -5553,7 +5841,7 @@ mod tests {
     /// A job without a team reads exactly what it always read.
     ///
     /// The strictness is affordable only because it is scoped. Every `plan.json` ever written omits
-    /// both keys, and reading one has to stay a plan rather than become a refusal.
+    /// all three keys, and reading one has to stay a plan rather than become a refusal.
     #[test]
     fn without_a_team_a_plan_missing_both_keys_is_still_a_plan() {
         let old = br#"{"items":[{"description":"x"},{"description":"y","files":["b.rs"]}]}"#;
@@ -5561,6 +5849,10 @@ mod tests {
         assert_eq!(plan.items.len(), 2);
         assert_eq!(plan.items[0].files, Vec::<String>::new());
         assert_eq!(plan.items[1].depends_on, Vec::<i64>::new());
+        assert_eq!(
+            plan.items[0].agent_id, None,
+            "there is nobody to name, and inventing one would change every job in the repository"
+        );
     }
 
     /// The plan node is told the number its `depends_on` will be checked against.
@@ -5569,18 +5861,12 @@ mod tests {
     /// about to list are numbered from 4, so any dependency it writes is a guess.
     #[test]
     fn a_teams_plan_prompt_names_the_ordinal_this_round_starts_at() {
-        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(Graph { first_ordinal: 4 }));
+        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&directed(4)));
         assert!(prompt.contains("NUMBERED FROM 4"), "{prompt}");
         assert!(prompt.contains("depends_on"));
         assert!(prompt.contains("EARLIER ordinal"));
 
-        let replan = replan_prompt(
-            "t",
-            2,
-            &[],
-            "/wt/.nucleos",
-            Some(Graph { first_ordinal: 9 }),
-        );
+        let replan = replan_prompt("t", 2, &[], "/wt/.nucleos", Some(&directed(9)));
         assert!(replan.contains("numbered from 9"), "{replan}");
         assert!(replan.contains("depends_on"));
 
@@ -5607,11 +5893,13 @@ mod tests {
                     description: "x".to_owned(),
                     files: vec!["a.rs".to_owned(), "b.rs".to_owned()],
                     depends_on: Vec::new(),
+                    agent_id: None,
                 },
                 PlannedItem {
                     description: "y".to_owned(),
                     files: Vec::new(),
                     depends_on: Vec::new(),
+                    agent_id: None,
                 },
             ]
         );
@@ -5806,6 +6094,185 @@ mod tests {
 
         assert!(!load_view(&pool, alone).await.unwrap().has_team);
         assert!(load_view(&pool, directed).await.unwrap().has_team);
+    }
+
+    /// One agent in the catalogue, ready to be put on a team.
+    async fn seed_agent(pool: &sqlx::SqlitePool, id: &str, speciality: &str, prompt: &str) {
+        let now = "2026-08-20T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'claude', 'inherit', ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("Agent {id}"))
+        .bind(speciality)
+        .bind(prompt)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A team, its director, and however many members. `foreign_keys` is on, so the order is not
+    /// optional: agents, then the team that names one of them, then the memberships.
+    async fn seed_crew(pool: &sqlx::SqlitePool, team_id: &str, director: &str, members: &[&str]) {
+        let now = "2026-08-20T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES (?, ?, 'ship it', ?, 3, 2, ?, ?)",
+        )
+        .bind(team_id)
+        .bind(format!("Team {team_id}"))
+        .bind(director)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        for member in members {
+            sqlx::query("INSERT INTO team_members (team_id, agent_id) VALUES (?, ?)")
+                .bind(team_id)
+                .bind(member)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The roster a director chooses from is its members AND itself.
+    ///
+    /// **A team of one would otherwise be dead on arrival**, and silently: a director with no
+    /// members has nobody to name, every plan it writes is refused for naming a stranger, and the
+    /// refusal blames the director for the one answer available to it. A director and no members is
+    /// an ordinary way to ask for parallel work under a single persona, so it has to be a team that
+    /// can plan.
+    ///
+    /// `team.rs` keeps its departments' directors off their rosters, and that is not a
+    /// disagreement: there a director hands work to specialists and does none itself. Here the
+    /// roster answers "who may write code in this job", and the director qualifies.
+    #[tokio::test]
+    async fn a_director_may_give_work_to_itself_and_to_every_member() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "dir", "directing", "lead").await;
+        seed_agent(&pool, "ana", "migrations", "you are careful with schemas").await;
+        seed_crew(&pool, "crew", "dir", &["ana"]).await;
+        seed_agent(&pool, "solo", "everything", "you do it all").await;
+        seed_crew(&pool, "alone", "solo", &[]).await;
+
+        let named = |roster: Vec<TeamMate>| {
+            roster
+                .into_iter()
+                .map(|mate| mate.id)
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            named(roster_of(&pool, "crew").await),
+            vec!["ana".to_owned(), "dir".to_owned()],
+            "the director is on its own roster, and the order is stable"
+        );
+        assert_eq!(
+            named(roster_of(&pool, "alone").await),
+            vec!["solo".to_owned()],
+            "a team of one can still be given work, or it can never plan at all"
+        );
+        assert_eq!(
+            roster_of(&pool, "crew").await[0].speciality,
+            "migrations",
+            "the speciality travels, because it is the whole of what a director chooses on"
+        );
+    }
+
+    /// The roster reaches the plan node, or the director is asked to name somebody it has never
+    /// been told about.
+    #[tokio::test]
+    async fn a_teams_plan_prompt_introduces_the_people_it_may_name() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "dir", "directing", "lead").await;
+        seed_agent(&pool, "ana", "migrations and schema work", "careful").await;
+        seed_crew(&pool, "crew", "dir", &["ana"]).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = live_jobs(&pool).await.unwrap().pop().unwrap();
+
+        let rules = graph_rules(&pool, &job).await.expect("a job with a team");
+        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&rules));
+
+        assert!(prompt.contains("agent_id"), "{prompt}");
+        assert!(prompt.contains("ana"), "{prompt}");
+        assert!(
+            prompt.contains("migrations and schema work"),
+            "the director chooses on the speciality, so it has to be in front of it: {prompt}"
+        );
+        assert!(prompt.contains("dir"), "{prompt}");
+    }
+
+    /// The item's agent is read when the node starts, not copied onto the row when the plan lands.
+    ///
+    /// Which is the behaviour a catalogue is for. An owner who corrects an agent's prompt between
+    /// the plan and the run gets the correction; freezing it at plan time would leave them watching
+    /// the old brief run and unable to say why their edit did nothing.
+    #[tokio::test]
+    async fn an_items_agent_is_read_when_the_node_starts_and_not_frozen_at_plan_time() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "ana", "migrations", "the brief as it was written").await;
+
+        let first = persona_for(&pool, Some("ana")).await.expect("an agent");
+        assert!(first.contains("the brief as it was written"), "{first}");
+        assert!(
+            first.contains("migrations"),
+            "the item is told WHY it was given to this one: {first}"
+        );
+
+        sqlx::query("UPDATE agents SET prompt = 'the brief after the correction' WHERE id = 'ana'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = persona_for(&pool, Some("ana")).await.expect("an agent");
+        assert!(second.contains("after the correction"), "{second}");
+
+        // Two ways there is nobody, and both leave the item running with the brief it would have
+        // had before any of this existed rather than refusing to run it.
+        assert_eq!(persona_for(&pool, None).await, None);
+        assert_eq!(persona_for(&pool, Some("nobody")).await, None);
+    }
+
+    /// The persona goes FIRST, and everything after it is untouched.
+    ///
+    /// The second half is the half that protects every job without a team: `None` has to produce
+    /// the brief this function has always produced, byte for byte, and the `ends_with` is what says
+    /// the assigned one is that brief with something in front of it rather than a rewrite of it.
+    #[test]
+    fn a_teams_item_is_briefed_as_somebody_before_it_is_briefed_about_the_work() {
+        let anybody = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None, None);
+        let ana = implement_prompt(
+            "write the thing",
+            0,
+            3,
+            "/wt/.nucleos",
+            &[],
+            None,
+            Some("You are careful with schemas.\n\n"),
+        );
+
+        assert!(
+            ana.starts_with("You are careful with schemas."),
+            "who is reading comes before what they are reading about: {ana}"
+        );
+        assert!(
+            ana.ends_with(&anybody),
+            "the brief itself is unchanged, and the persona is in front of it: {ana}"
+        );
+        assert!(
+            !anybody.contains("careful"),
+            "a job with no team is told nothing about a team"
+        );
     }
 
     /// And the two halves joined: a directed job with a failed item keeps going, an undirected one
@@ -8552,7 +9019,7 @@ mod tests {
             "core/src/job.rs".to_owned(),
             "core/migrations/0052.sql".to_owned(),
         ];
-        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints, None);
+        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints, None, None);
 
         assert!(hinted.contains("core/src/job.rs"));
         assert!(hinted.contains("core/migrations/0052.sql"));
@@ -8561,7 +9028,7 @@ mod tests {
             "the list is a hint, not a boundary: {hinted}"
         );
 
-        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None);
+        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None, None);
         assert_eq!(
             bare,
             "You are item 1 of 3 in an autonomous job. The working tree already holds the work \
@@ -8609,7 +9076,7 @@ mod tests {
     /// the node was told before it is still there and in the same place.
     #[test]
     fn the_retry_prompt_carries_the_gate_output() {
-        let first = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None);
+        let first = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None, None);
         let retry = implement_prompt(
             "write the thing",
             0,
@@ -8617,6 +9084,7 @@ mod tests {
             "/wt/.nucleos",
             &[],
             Some("FAILED test_x"),
+            None,
         );
 
         assert!(
