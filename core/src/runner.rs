@@ -862,6 +862,60 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
 ///
 /// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
 /// result event itself; the token counts live under its `usage` object.
+/// One turn's own numbers, out of a process that may answer more than once.
+///
+/// `RunOutcome` describes a PROCESS — its exit code, its whole stdout, everything it spent. This
+/// describes one answer inside it, which is the unit a conversation is billed and recorded by. The
+/// two coincide exactly as long as a process serves one turn, and stop coinciding the moment one
+/// serves two.
+// `cost_usd` is an `f64`, which is not `Eq`, for the reason `RunOutcome` gives above its own derive.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnOutcome {
+    pub session_id: Option<String>,
+    /// What THIS turn added, never what the process has spent altogether.
+    pub cost_usd: Option<f64>,
+    pub usage: RunUsage,
+}
+
+/// What one `result` line added, given what the process has already reported spending — and the new
+/// running total to carry into the next one. `None` for every line that does not end a turn.
+///
+/// The two halves are read differently ON PURPOSE, and the reason is measured rather than assumed.
+/// Two turns fed down one stdin reported `total_cost_usd` 0.1046 and then 0.2024 — a running total
+/// over the process — while `num_turns` read 1 on both and `usage` described only the turn that had
+/// just ended. So the cost is differenced and nothing beside it is: differencing the counts would
+/// produce a negative number the first time a turn used fewer tokens than the one before it, and
+/// recording the cost verbatim would bill each turn for every turn that preceded it.
+///
+/// The session id is read here as well because a turn is where it becomes true: measured on the same
+/// two turns, a live process keeps ONE session across all of them, which is what lets a conversation
+/// still be resumed by it after the process is gone.
+pub(crate) fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOutcome, f64)> {
+    let line = line.trim();
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("result") {
+        return None;
+    }
+    // `cost_usd` as the fallback spelling for the same reason the stdout loop accepts both: older
+    // CLI builds emit it, and a turn whose cost silently read `None` would be a free turn in the
+    // ledger.
+    let spent = value
+        .get("total_cost_usd")
+        .or_else(|| value.get("cost_usd"))
+        .and_then(serde_json::Value::as_f64);
+    let turn = TurnOutcome {
+        session_id: value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        cost_usd: spent.map(|total| total - already_spent),
+        usage: extract_usage(line),
+    };
+    // A result carrying no cost at all must not reset the total: the next turn would then be
+    // differenced against zero and billed for the whole conversation.
+    Some((turn, spent.unwrap_or(already_spent)))
+}
+
 pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
     let mut usage = RunUsage::default();
     for line in stdout.lines() {
@@ -1597,6 +1651,9 @@ impl CommandRunner for ClaudeCliRunner {
             .or_else(|| request.resume_session_id.clone());
         let mut cli_session_seen = false;
         let mut cost_usd: Option<f64> = None;
+        // What the process has reported spending so far, so each `result` can be read as what its
+        // own turn added rather than as the running total the CLI actually writes.
+        let mut spent = 0.0_f64;
         let mut usage = RunUsage::default();
         let mut running_context_fill: Option<i64> = None;
 
@@ -1667,14 +1724,19 @@ impl CommandRunner for ClaudeCliRunner {
                         break;
                     }
                 }
-                if v.get("type").and_then(|x| x.as_str()) == Some("result") {
-                    usage = extract_usage(&line);
-                    if let Some(c) = v
-                        .get("total_cost_usd")
-                        .or_else(|| v.get("cost_usd"))
-                        .and_then(|x| x.as_f64())
-                    {
-                        cost_usd = Some(c);
+                // Every `result` is the end of a TURN, which is the same thing as the end of the
+                // process only while a process serves one. `turn_from_result` is where that
+                // distinction is written down — the cost a result carries is a running total and
+                // the counts beside it are not — so reading it here keeps one account of the
+                // semantics rather than two that can drift apart.
+                //
+                // What this loop reports is unchanged: `cost_usd` is still the process's whole
+                // bill, and `usage` still describes the turn that ended last.
+                if let Some((turn, total)) = turn_from_result(&line, spent) {
+                    spent = total;
+                    usage = turn.usage;
+                    if turn.cost_usd.is_some() {
+                        cost_usd = Some(spent);
                     }
                 }
             }
@@ -3191,6 +3253,61 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(500));
         assert_eq!(usage.cache_read_tokens, None);
         assert_eq!(usage.num_turns, Some(12));
+    }
+
+    /// A process that answers twice reports what it has spent in total, not what the last turn
+    /// added. Measured on the real CLI, two turns down one stdin: `total_cost_usd` read 0.1046 and
+    /// then 0.2024, so recording the second `result` verbatim bills that turn for the first one as
+    /// well — and every turn after it, compounding.
+    #[test]
+    fn a_later_turns_cost_is_what_it_added_not_what_the_process_has_spent() {
+        let first =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1046,"num_turns":1}"#;
+        let second =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.2024,"num_turns":1}"#;
+
+        let (one, spent) = turn_from_result(first, 0.0).unwrap();
+        assert_eq!(one.cost_usd, Some(0.1046));
+
+        let (two, spent) = turn_from_result(second, spent).unwrap();
+        assert!(
+            (two.cost_usd.unwrap() - 0.0978).abs() < 1e-9,
+            "expected the difference, got {:?}",
+            two.cost_usd
+        );
+        assert!((spent - 0.2024).abs() < 1e-9);
+    }
+
+    /// The counts beside the cost are the turn's OWN — `num_turns` read 1 on both of those two
+    /// results rather than 1 and 2 — so differencing them would turn a correct number into a
+    /// negative one the moment a turn used fewer tokens than the turn before it.
+    #[test]
+    fn a_turns_token_counts_are_its_own_and_are_not_differenced() {
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.30,"num_turns":1,"usage":{"input_tokens":40,"output_tokens":500,"cache_read_input_tokens":32194,"cache_creation_input_tokens":0}}"#;
+
+        let (turn, _) = turn_from_result(line, 0.25).unwrap();
+
+        assert_eq!(turn.usage.input_tokens, Some(40));
+        assert_eq!(turn.usage.output_tokens, Some(500));
+        assert_eq!(turn.usage.cache_read_tokens, Some(32194));
+        assert_eq!(turn.usage.num_turns, Some(1));
+    }
+
+    /// Everything else on the stream is not a turn ending, and a boundary drawn on the wrong line
+    /// would close a run row while the CLI was still mid-answer.
+    #[test]
+    fn only_a_result_line_ends_a_turn() {
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            "not json at all",
+            "",
+        ] {
+            assert!(
+                turn_from_result(line, 0.0).is_none(),
+                "{line} must not be read as the end of a turn"
+            );
+        }
     }
 
     #[test]
