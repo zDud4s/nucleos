@@ -189,7 +189,7 @@ fn deny_with(reason: &str) -> Decision {
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
-    Json(payload): Json<PreToolUsePayload>,
+    Json(mut payload): Json<PreToolUsePayload>,
 ) -> Json<Decision> {
     // `run_id` arrives in the body, which makes it a claim the caller makes about itself, and every
     // branch below reads `mode` from it. A scoped key names its own run, and the daemon resolved
@@ -211,6 +211,17 @@ pub async fn pretooluse_decision(
         Scope::Run(id) => id,
         _ => payload.run_id,
     };
+    // Corrected IN the payload, and not merely beside it. Every branch below is handed `&payload`
+    // and several read the id back out of it — `rooted_decision` checks the read-untrusted barrier
+    // with it, `assistant_decision` both checks and SETS it — so leaving the claim in place would
+    // fix the id in this function and leave it stale in the ones that decide with it.
+    //
+    // Which is the hole a kept process opens, and it is not the one the key closed: a CLI is handed
+    // its environment once, so from the second turn on `ask_daemon.py` echoes the FIRST turn's id
+    // for the rest of the conversation. A turn that read a stranger's text is marked on its own row;
+    // a barrier reading the first turn's row finds nothing there, and the ordering rule holds on
+    // turn one and is walked around on every turn after it.
+    payload.run_id = run_id;
 
     // Validate run_id against runs actually in flight before trusting anything derived from it (spec
     // §3.4 — the hook's environment sits inside the same cooperative trust model as the token, so the
@@ -1622,6 +1633,80 @@ mod tests {
             .await
             .unwrap();
         token
+    }
+
+    /// A living conversation's turn is judged on what IT read, not on what its first turn read.
+    ///
+    /// This is the hole a kept process opens, and it is not the one the key closed. `ask_daemon.py`
+    /// echoes `NUCLEOS_RUN_ID` out of an environment fixed at spawn, so from the second turn on the
+    /// claim in the body names the FIRST turn — for the rest of the conversation. The handler
+    /// resolves the real turn from the key; every branch it hands the payload to was still reading
+    /// the claim.
+    ///
+    /// What that costs is the ordering rule: read what you like, act while nothing third-party has
+    /// entered the turn, but not both and not in that order. A turn that read a stranger's text is
+    /// marked on ITS row, and a barrier checking the first turn's row finds nothing there — so the
+    /// rule holds on turn one and is walked around on every turn after it, in the exact
+    /// conversations that were given Bash, Read and Write.
+    #[tokio::test]
+    async fn a_living_conversations_turn_is_judged_on_what_it_read_not_on_what_its_first_turn_did()
+    {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES ('live-chat', 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // The turn the process was started for, long finished — and clean.
+        let first = turn_of(&state, "live-chat").await;
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        // The turn being answered right now, down the same living process, which has read a
+        // stranger's text.
+        let now = turn_of(&state, "live-chat").await;
+        crate::runs::mark_untrusted_context(&state.pool, now)
+            .await
+            .unwrap();
+
+        let key = crate::auth::mint_chat_token(&state.pool, "live-chat")
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        // The process still echoes the id it was spawned with, because that is the only id it has.
+        let decision = decide_as(
+            &app,
+            &key,
+            &format!(
+                r#"{{"run_id":{first},"tool_name":"Bash","tool_input":{{"command":"echo hi"}}}}"#
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, UNTRUSTED_CONTEXT_DENY_REASON);
+    }
+
+    /// One running turn of a conversation, the shape a chat turn's row actually has.
+    async fn turn_of(state: &AppState, chat_id: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
+        )
+        .bind(chat_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
     }
 
     /// `run_id` comes from the request body, so it is a claim the caller makes about itself. Every
