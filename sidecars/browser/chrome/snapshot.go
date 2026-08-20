@@ -53,6 +53,10 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 	_, carrying := d.ferryState(entry)
 	stillLoading := (facts.Ready != "" && facts.Ready != "complete") || carrying > 0
 
+	// The cross-origin half. pageQuestion walked every frame it was allowed to touch; these are the
+	// ones it was not, and an embedded dashboard is usually one of them.
+	facts.Unread = mergeUnread(facts.Unread, d.unreadInFrames(ctx, entry))
+
 	read := collect(root, req, entry.final)
 	elements, gone := d.name(entry, read.elements, req.ChangesOnly)
 
@@ -657,11 +661,20 @@ type pageFacts struct {
 //
 // The sizes are thresholds and not truth: a one-pixel canvas is a tracking pixel and a six-hundred
 // pixel one is a chart, and the point of the whole field is to be worth reading rather than to be
-// exhaustive. It sees the MAIN frame only — a chart inside a cross-origin frame is not counted, and
-// counting it would need this evaluated per target.
+// exhaustive.
+//
+// It walks SAME-ORIGIN frames as well as the main document, which the first version did not, and the
+// gap was not a corner: querySelectorAll does not cross into an iframe's document, so an embedded
+// dashboard — the single most likely place for a chart to be — was invisible to a field whose entire
+// purpose is to notice charts. A cross-origin frame throws on the first property touched, is caught
+// here, and is asked separately over its own target (unreadInFrames): the two halves together are
+// what "what is on this page" means.
+//
+// Bounded on both axes. Depth, because frames nest; breadth, because a page can carry hundreds of
+// them and this runs on every snapshot.
 const pageQuestion = `JSON.stringify((() => {
-  const seen = [];
-  const add = (kind, n) => { if (n > 0) { seen.push({kind: kind, count: n}); } };
+  const seen = {};
+  const add = (kind, n) => { if (n > 0) { seen[kind] = (seen[kind] || 0) + n; } };
   const big = (el, min) => {
     const box = el.getBoundingClientRect();
     return box.width >= min && box.height >= min;
@@ -670,19 +683,87 @@ const pageQuestion = `JSON.stringify((() => {
     (el.getAttribute('aria-label') || '').trim() !== '' ||
     (el.getAttribute('alt') || '').trim() !== '' ||
     el.querySelector('title, desc') !== null;
-  try {
-    add('canvas', [...document.querySelectorAll('canvas')].filter(el => big(el, 64)).length);
-    add('video', [...document.querySelectorAll('video')].filter(el => big(el, 64)).length);
-    add('drawing', [...document.querySelectorAll('svg')].filter(el => big(el, 64) && !described(el)).length);
-    add('image', [...document.querySelectorAll('img')].filter(el => big(el, 256) && !described(el)).length);
-  } catch (e) {}
+  const count = (doc) => {
+    add('canvas', [...doc.querySelectorAll('canvas')].filter(el => big(el, 64)).length);
+    add('video', [...doc.querySelectorAll('video')].filter(el => big(el, 64)).length);
+    add('drawing', [...doc.querySelectorAll('svg')].filter(el => big(el, 64) && !described(el)).length);
+    add('image', [...doc.querySelectorAll('img')].filter(el => big(el, 256) && !described(el)).length);
+  };
+  const walk = (win, depth) => {
+    try { count(win.document); } catch (e) { return; }
+    if (depth <= 0) { return; }
+    const many = Math.min(win.frames.length, 16);
+    for (let i = 0; i < many; i++) {
+      try { walk(win.frames[i], depth - 1); } catch (e) {}
+    }
+  };
+  try { walk(window, 4); } catch (e) {}
   return {
     url: location.href,
     title: document.title,
     ready: document.readyState,
-    unread: seen,
+    unread: Object.keys(seen).map((kind) => ({kind: kind, count: seen[kind]})),
   };
 })())`
+
+// framesAsked bounds how many cross-origin frames a reading interrogates.
+//
+// Each one is a round trip, on every snapshot, and the whole argument for pageFacts is that a
+// reading which costs several of those is one an agent stops taking between actions. Four covers the
+// embedded-dashboard case this exists for; a page with forty cross-origin frames is an advertising
+// page, and counting the fortieth iframe's image would cost the agent more than it tells it.
+const framesAsked = 4
+
+// unreadInFrames asks each cross-origin frame what it is showing, and adds it to the page's own.
+//
+// The same-origin walk inside pageQuestion cannot reach these: touching a cross-origin frame's
+// document throws, by the rule the whole browser is built on. They are separate targets with
+// separate execution contexts, so the only way to ask is to ask them, one at a time, over their own
+// session — which is exactly what the accessibility walk already does for their contents.
+//
+// Sorted, so that two readings of an unchanged page say the same thing in the same order. Map order
+// in Go is deliberately random, and a snapshot that reshuffles its own fields between calls makes a
+// changes-only reading report changes that did not happen.
+func (d *Driver) unreadInFrames(ctx context.Context, entry *session) []browser.Unread {
+	d.mu.Lock()
+	sessions := make([]string, 0, len(entry.frames))
+	for on := range entry.frames {
+		sessions = append(sessions, string(on))
+	}
+	d.mu.Unlock()
+	sort.Strings(sessions)
+
+	var found []browser.Unread
+	for i, on := range sessions {
+		if i >= framesAsked {
+			break
+		}
+		found = mergeUnread(found, d.locate(ctx, cdp.SessionID(on)).Unread)
+	}
+	return found
+}
+
+// mergeUnread adds one frame's tally to the running one, keeping first-seen order.
+//
+// By KIND and not by frame, because the agent is not going to act on any of it. "Two canvases" is
+// the whole of what it needs: that the page shows something this reading does not carry, and roughly
+// how much of it. Which document each one sits in would be detail with nothing on the other end.
+func mergeUnread(into, more []browser.Unread) []browser.Unread {
+	for _, one := range more {
+		found := false
+		for i := range into {
+			if into[i].Kind == one.Kind {
+				into[i].Count += one.Count
+				found = true
+				break
+			}
+		}
+		if !found {
+			into = append(into, one)
+		}
+	}
+	return into
+}
 
 // locate asks the page the one question a snapshot needs answered about it.
 func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) pageFacts {
