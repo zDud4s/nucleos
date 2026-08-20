@@ -40,13 +40,18 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 	read := collect(root, req)
 	elements, gone := d.name(entry, read.elements, req.ChangesOnly)
 
-	url, title := d.locate(ctx, entry.cdp)
+	url, title, ready := d.locate(ctx, entry.cdp)
 	if url != "" {
 		entry.final = url
 	}
 	if title != "" {
 		entry.title = title
 	}
+	// An empty readyState is a page that could not be asked, and is not evidence of anything. Said
+	// only when something actually says it: a reading that guesses "unfinished" would send the agent
+	// round a loop it can never leave.
+	_, carrying := d.ferryState(entry)
+	stillLoading := (ready != "" && ready != "complete") || carrying > 0
 
 	return browser.Snapshot{
 		SessionID:    id,
@@ -59,8 +64,9 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 		Gone:         gone,
 		// A filtered reading is a partial one for the same reason a differential one is: without
 		// this the agent reads a search that found two things as a page with two things on it.
-		Partial: req.ChangesOnly || strings.TrimSpace(req.Find) != "",
-		Blocked: d.blockedSoFar(entry),
+		Partial:      req.ChangesOnly || strings.TrimSpace(req.Find) != "",
+		Blocked:      d.blockedSoFar(entry),
+		StillLoading: stillLoading,
 	}, nil
 }
 
@@ -578,13 +584,18 @@ func interesting(role, name string) bool {
 	}
 }
 
-func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) (url, title string) {
+// locate asks the page where it is, what it is called, and whether it has finished arriving.
+//
+// Three answers on one round trip, and the third rides along for free: a snapshot already pays for
+// this call, so saying whether the document has settled costs nothing, and the alternative was
+// raising `still_loading` on the way in and never lowering it.
+func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) (url, title, ready string) {
 	result, err := d.conn.Call(ctx, cdpSession, "Runtime.evaluate", map[string]any{
-		"expression":    "JSON.stringify({url: location.href, title: document.title})",
+		"expression":    "JSON.stringify({url: location.href, title: document.title, ready: document.readyState})",
 		"returnByValue": true,
 	})
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	var payload struct {
 		Result struct {
@@ -592,14 +603,15 @@ func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) (url, tit
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(result, &payload); err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	var located struct {
 		URL   string `json:"url"`
 		Title string `json:"title"`
+		Ready string `json:"ready"`
 	}
 	if err := json.Unmarshal([]byte(payload.Result.Value), &located); err != nil {
-		return "", ""
+		return "", "", ""
 	}
-	return located.URL, located.Title
+	return located.URL, located.Title, located.Ready
 }

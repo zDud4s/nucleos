@@ -524,6 +524,9 @@ impl NucleosTools {
                        refused: what you are reading may be a shell rather than the page, \
                        so do not conclude the thing you were sent for is absent - say the \
                        page needs a person, or try another route to the same information. \
+                       If `still_loading` is there the page had not finished arriving \
+                       when this was read: take another snapshot rather than concluding \
+                       anything from what is missing. \
                        Cheap enough to call between actions, and you \
                        should: a ref only names something a snapshot actually showed you."
     )]

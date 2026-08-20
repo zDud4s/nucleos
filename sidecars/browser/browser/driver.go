@@ -196,6 +196,14 @@ type Snapshot struct {
 	// no request is ever made and there is nothing for the other two layers to report, so a page
 	// that could not fetch its own content used to read as a page that had none.
 	Blocked *Blocked `json:"blocked,omitempty"`
+	// StillLoading has the same meaning here as on Session, and it is here because otherwise the
+	// flag could be raised and never lowered.
+	//
+	// Opening said it, acting said it, and a snapshot — the only thing an agent can do about it —
+	// said nothing. There is no `wait` verb, deliberately: waiting is not something an agent should
+	// have to spend a turn asking for. So the reading itself carries whether the page has settled,
+	// and an agent told "not finished" can take another one and be told it now is.
+	StillLoading bool `json:"still_loading,omitempty"`
 }
 
 // ActionKind is the verb. The set is small and closed on purpose (spec §6.2, "consequence-free in

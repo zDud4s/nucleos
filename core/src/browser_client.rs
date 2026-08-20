@@ -181,6 +181,13 @@ pub struct Snapshot {
     /// This is what stops the agent concluding the page is blank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Blocked>,
+    /// The page had not finished arriving when this reading was taken.
+    ///
+    /// It is here because otherwise the flag could be raised and never lowered: opening said it,
+    /// acting said it, and the only thing an agent can do about it — take another reading — said
+    /// nothing at all. There is no `wait` verb on purpose, so the reading has to carry it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub still_loading: bool,
 }
 
 /// What the injected CSP stopped: how many, and the most recent one.
