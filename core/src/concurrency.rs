@@ -407,6 +407,33 @@ mod tests {
         pool
     }
 
+    /// A fresh install has room for a job and two of its items, and this is where the feature is
+    /// switched on or off.
+    ///
+    /// **One tree, one slot.** A job holds a slot for the branch it integrates into and each item
+    /// worked in parallel holds its own, so running `k` items at once needs `k + 1`. At the ceiling
+    /// of two that `0052` set, `k` is one: every plan executed one item at a time, every measurement
+    /// showing the sequential timings, and no symptom at all beyond parallelism never seeming to
+    /// help. That is how an earlier draft of this design convinced itself it worked.
+    ///
+    /// Asserted here rather than left to the migration, because a migration that is reverted or
+    /// whose `WHERE` stops matching says nothing at all, and this says it.
+    #[tokio::test]
+    async fn a_fresh_install_has_room_for_a_job_and_two_of_its_items() {
+        let pool = test_pool().await;
+
+        assert_eq!(
+            slots_limit(&pool, "project-a").await.unwrap(),
+            3,
+            "one integration tree plus two items"
+        );
+        assert_eq!(
+            house_limit(&pool).await.unwrap(),
+            4,
+            "one project running a team, and a second getting on with something"
+        );
+    }
+
     async fn set_limits(pool: &SqlitePool, per_project: i64, house: i64) {
         sqlx::query(
             "UPDATE autopilot_global SET max_concurrent_slots = ?, max_concurrent_total = ?",

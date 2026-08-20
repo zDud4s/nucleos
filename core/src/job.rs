@@ -557,12 +557,20 @@ pub enum Outcome {
 }
 
 /// What the daemon should do next for a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`, because a batch is a `Vec`. The three places that relied on it took the value
+/// out of a binding they went on using; they borrow now.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     SpawnPlan,
-    SpawnImplement {
-        ordinal: usize,
-    },
+    /// The items to start now, by ordinal — **at most one** for a job without a team.
+    ///
+    /// A list and not an ordinal, and the difference is the whole of this design. A single ordinal
+    /// can only ever be answered again after the item it names has finished, so the queue was
+    /// sequential by the shape of this type before it was sequential by any rule. What decides the
+    /// list is `batch_of`; what decides how much of it actually starts is the driver, because a
+    /// project with no room left refuses the second checkout and the batch comes out smaller.
+    SpawnImplement(Vec<usize>),
     RunGate {
         ordinal: usize,
     },
@@ -673,11 +681,14 @@ pub struct JobView {
     /// every tick would answer `SpawnPlan` while the first planner was still running. The item
     /// queue is what stops that from happening to an implement node; the plan node has no item.
     pub planning: bool,
-    /// The queue of the CURRENT round, never of every round the job has had.
+    /// Every item the job has ever queued, in ordinal order — **not** the current round's.
     ///
-    /// Load-bearing and easy to get wrong: read without filtering on `job_items.round`, round 2
-    /// would see round 1's finished items sitting beside its own and start the round again from the
-    /// first pending one it found.
+    /// This said the opposite until now, and the loader has always disagreed with it in writing:
+    /// *"Deliberately NOT filtered by round … Filtering would have made the position in this vector
+    /// stop being the ordinal in the table"*. The unfiltered read is the right one and three things
+    /// rest on it — `advance` looks an item up by its position, `depends_on` names global ordinals
+    /// and has to be able to point back into an earlier round, and `ending()` still reports a
+    /// round-1 red gate when round 3 finishes.
     pub items: Vec<ItemView>,
     pub review: ReviewState,
     pub rounds: RoundState,
@@ -691,14 +702,26 @@ pub struct JobView {
     /// share one tree, so an item that broke leaves edits nothing measured where the next item
     /// would build on them — which is why `false` still stops the job at the first failure.
     pub has_team: bool,
+    /// How many of this job's items may be worked on at once — `teams.max_parallel`, or **1**.
+    ///
+    /// One without a team, which is what makes the batch below come out as a queue of one and the
+    /// sequential job identical to what it always was. Never zero: a ceiling of zero would build an
+    /// empty batch for ever while the queue still owed work, and the round would close on it.
+    ///
+    /// **The project's free slots are deliberately NOT folded in here.** This function is pure and
+    /// `concurrency.rs` says the `INSERT` is the lock; asking how much room there is would be
+    /// reading a number that another job can take between the read and the claim. The driver claims
+    /// and keeps what it gets, and a refusal is the batch coming out smaller — which is the same
+    /// answer, arrived at where it is true.
+    pub max_parallel: usize,
 }
 
 /// One item of the queue, as the decision below has to see it.
 ///
 /// A struct and not a bare [`ItemState`] because two items being independent is not something their
-/// states can say. `depends_on` is the only thing that can, and it has to be in the pure function —
-/// deciding it outside would put "which item may run" in two places, and the second one would not be
-/// table-testable.
+/// states can say. `depends_on` and `files` are the only things that can, and they have to be in the
+/// pure function — deciding outside would put "which item may run" in two places, and the second one
+/// would not be table-testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemView {
     pub state: ItemState,
@@ -707,15 +730,27 @@ pub struct ItemView {
     /// Empty for every item of every job without a team, which is what makes those jobs read here
     /// exactly as they always did.
     pub depends_on: Vec<i64>,
+    /// What the director said this item will touch.
+    ///
+    /// The other half of "these two may run together", and the half that answers it for items with
+    /// no dependency between them at all. Two items naming one path are never started together,
+    /// because the second one to merge would conflict and the retry costs more than the wait.
+    ///
+    /// Empty without a team, and there it is a hint the implement node is given rather than a
+    /// boundary — see `implement_prompt`. It is a boundary only here, where nothing has run yet and
+    /// a guess is all there is to go on.
+    pub files: Vec<String>,
 }
 
 impl ItemView {
-    /// A view of an item that waits for nobody, which is what a job without a team has.
+    /// A view of an item that waits for nobody and declares nothing, which is what a job without a
+    /// team has.
     #[cfg(test)]
     fn plain(state: ItemState) -> Self {
         Self {
             state,
             depends_on: Vec::new(),
+            files: Vec::new(),
         }
     }
 }
@@ -776,15 +811,26 @@ pub fn next_step(job: &JobView) -> Next {
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
-    // `Reverted` waits alongside `Running`, and is the last state left with no step of its own and
-    // no writer. It is here because the alternative is worse than being early: a non-terminal state
-    // this search walked past would be read as finished by every check after it, which is the one
-    // direction `item_state_from` already refuses to err in. `Merging` and `Conflicted` have both
-    // left this list, each having been given a step below.
+    // `Reverted` is the last state left with no step of its own and no writer. It is here because
+    // the alternative is worse than being early: a non-terminal state this search walked past would
+    // be read as finished by every check after it, which is the one direction `item_state_from`
+    // already refuses to err in. `Merging` and `Conflicted` have both left this list, each having
+    // been given a step below.
+    //
+    // **`Running` waits only without a team, and that one condition is the whole of continuous
+    // start.** The line used to read "anything in flight, wait", and it is what made the queue
+    // sequential: a job could never have two items going at once because the first one to start
+    // stopped the search. A team's items work in checkouts of their own, so the reason behind the
+    // line — the shared tree holding work nothing has measured — is not true for them.
     if job
         .items
         .iter()
-        .any(|item| matches!(item.state, ItemState::Running | ItemState::Reverted))
+        .any(|item| item.state == ItemState::Reverted)
+        || (!job.has_team
+            && job
+                .items
+                .iter()
+                .any(|item| item.state == ItemState::Running))
     {
         return Next::Wait;
     }
@@ -844,13 +890,36 @@ pub fn next_step(job: &JobView) -> Next {
     }) {
         return Next::Orphan { ordinal };
     }
-    if let Some(ordinal) = job.items.iter().position(|item| {
-        matches!(
-            item.state,
-            ItemState::Pending | ItemState::GateRetriable | ItemState::Conflicted
-        )
-    }) {
-        return Next::SpawnImplement { ordinal };
+    let batch = batch_of(job);
+    if !batch.is_empty() {
+        return Next::SpawnImplement(batch);
+    }
+    // Nothing could be started, and the two reasons for that are as far apart as reasons get.
+    //
+    // Something in flight is the ordinary one: the queue is at its ceiling, or everything left is
+    // waiting on a dependency, and the item that lands next will free it. Nothing in flight while
+    // the queue still owes a run is a queue that cannot move — an item that will never be selected
+    // by the fold above and will never be put down by the orphan check either, because it has work
+    // in a checkout of its own and something it depends on was skipped rather than failed.
+    //
+    // **It says `stopped`, and never `completed`.** `stopped` is the ending that means "I was cut
+    // short and what I did is on the branch", which is exactly true here; falling through to
+    // `close_the_round` would report a job with unstarted work as finished, and that is the one
+    // reading nobody can catch afterwards. Unreachable without a team — there the fold always takes
+    // the first claimable item — and that is why this is a guard rather than a case.
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::Running)
+    {
+        return Next::Wait;
+    }
+    if job
+        .items
+        .iter()
+        .any(|item| item.state.claimable_as().is_some())
+    {
+        return Next::Finish(Outcome::Stopped);
     }
 
     // Two ways a round closes without being reviewed, and both are about not spending a run for
@@ -903,6 +972,90 @@ async fn persona_for(pool: &SqlitePool, agent_id: Option<&str>) -> Option<String
             None
         }
     }
+}
+
+/// PURE: which items may be started right now, by ordinal, at most `max_parallel` of them.
+///
+/// **A fold and not a search**, which is the difference between this and the positional walk it
+/// replaced. Each candidate is admitted against what is already in flight AND against what earlier
+/// candidates of this same batch have taken, so the answer is a set that can safely run together
+/// rather than the first thing that could run.
+///
+/// Three rules, and each rejects for a different reason:
+///
+/// 1. **Its dependencies have all passed.** Not "have all finished" — a dependency that failed or
+///    was skipped never lands, and the item waiting on it is put down by the orphan step above
+///    rather than started here.
+/// 2. **Nothing it declares is already spoken for.** By work in flight, or by an earlier item of
+///    this batch. Two items writing one file do not conflict in git while they are apart and break
+///    the branch together when they merge, and the retry that costs is the most expensive step in
+///    this design.
+/// 3. **The ceiling.** Counted as the batch plus what is already `Running`, because continuous
+///    start means this runs again while earlier items are still going.
+///
+/// **The candidate excludes itself from what blocks it.** `Conflicted` is both a state that holds
+/// paths and a state that owes a run, so an item in it would otherwise be permanently ineligible —
+/// blocked by its own declaration, for ever, with nothing to say why.
+///
+/// **Greedy by ordinal, and it can lose.** Item 1 declaring `{a, b}` takes the batch and excludes
+/// both 2 (`{a}`) and 3 (`{b}`) — a batch of one where a different choice would have made two. The
+/// alternative is a combinatorial search on a function that runs every 30 seconds for every live
+/// job, to buy an item's worth of parallelism in a case a director can avoid by splitting its work
+/// differently.
+///
+/// `Merging` and `Implemented` are in the blocking set and cannot be seen from here: the exclusive
+/// steps above return before this is reached whenever an item is in either. They are named anyway
+/// because the set is a statement about which states hold paths, and a set that is only right
+/// because of the order of the checks above it is a set that breaks silently when that order moves.
+fn batch_of(job: &JobView) -> Vec<usize> {
+    let running = job
+        .items
+        .iter()
+        .filter(|item| item.state == ItemState::Running)
+        .count();
+    let mut batch: Vec<usize> = Vec::new();
+    let mut taken: Vec<&str> = Vec::new();
+
+    for (ordinal, item) in job.items.iter().enumerate() {
+        if batch.len() + running >= job.max_parallel {
+            break;
+        }
+        if item.state.claimable_as().is_none() {
+            continue;
+        }
+        let landed = item.depends_on.iter().all(|dependency| {
+            job.items
+                .get(*dependency as usize)
+                .is_some_and(|dependency| dependency.state == ItemState::Passed)
+        });
+        if !landed {
+            continue;
+        }
+        let clashes = item.files.iter().any(|file| {
+            taken.contains(&file.as_str())
+                || job.items.iter().enumerate().any(|(other, mate)| {
+                    other != ordinal && holds_paths(mate.state) && mate.files.contains(file)
+                })
+        });
+        if clashes {
+            continue;
+        }
+        taken.extend(item.files.iter().map(String::as_str));
+        batch.push(ordinal);
+    }
+    batch
+}
+
+/// PURE: whether an item in this state has a claim on the paths it declared.
+///
+/// Everything from the moment a node starts writing until the merge has landed or been taken back.
+/// `Passed` is out — its work is on the job's branch, so the next item to start inherits it rather
+/// than racing it — and so is every terminal state, which owns nothing.
+fn holds_paths(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Running | ItemState::Merging | ItemState::Conflicted | ItemState::Implemented
+    )
 }
 
 /// PURE: whether an item in this state will never contribute its work.
@@ -1217,12 +1370,26 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     // `gate_attempts` travels with the status because the status alone cannot say what `gate_failed`
     // means any more: read against the job's budget it is either an item to try again or an item
     // that is over, and reading it without the count would make every red gate terminal again.
-    let items: Vec<(String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT status, gate_attempts, depends_on FROM job_items WHERE job_id = ? ORDER BY ordinal",
+    let items: Vec<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, gate_attempts, depends_on, files FROM job_items
+         WHERE job_id = ? ORDER BY ordinal",
     )
     .bind(job_id)
     .fetch_all(pool)
     .await?;
+
+    // The team's ceiling, read here rather than carried on `jobs`, because it is the team's number
+    // and an owner who raises it means it to apply to the job running right now. One without a
+    // team, and never zero: `teams.max_parallel` is NOT NULL but nothing stops a 0 being written,
+    // and a ceiling of zero would build an empty batch for ever over a queue that still owed work.
+    let max_parallel: i64 = match team_id.as_deref() {
+        Some(team) => sqlx::query_scalar("SELECT max_parallel FROM teams WHERE id = ?")
+            .bind(team)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or(1),
+        None => 1,
+    };
 
     // Both node states are read by stage, not from the job's status: the job can be sitting in
     // `waiting` for budget while a node is the thing that has yet to run.
@@ -1295,7 +1462,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         planning: plan_run.as_deref().is_some_and(node_in_flight),
         items: items
             .iter()
-            .map(|(status, attempts, depends_on)| ItemView {
+            .map(|(status, attempts, depends_on, files)| ItemView {
                 state: item_state_from(status, *attempts, gate_retries),
                 // A list that will not parse is read as no list at all, and that is the safe
                 // direction: an item believed to depend on nothing is started early, where an item
@@ -1305,6 +1472,16 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
                 depends_on: depends_on
                     .as_deref()
                     .and_then(|json| serde_json::from_str::<Vec<i64>>(json).ok())
+                    .unwrap_or_default(),
+                // And here the same unreadable list errs the OTHER way, because the direction that
+                // is safe is the other one. An item believed to declare nothing clashes with
+                // nobody and is started beside anything, so two of them could write one file at
+                // once. Nothing to be done about it from here — an empty list is also what an
+                // honest job without a team has — which is why `parse_plan` refuses an empty
+                // `files` from a director instead, before the row is ever written.
+                files: files
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
                     .unwrap_or_default(),
             })
             .collect(),
@@ -1327,6 +1504,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             },
         },
         has_team: team_id.is_some(),
+        max_parallel: max_parallel.max(1) as usize,
     })
 }
 
@@ -1932,6 +2110,19 @@ pub const MAX_JOB_LIFETIME: chrono::Duration = chrono::Duration::hours(4);
 /// run: a gate, and the finish that may follow it. The bound is a backstop against a state machine
 /// that decides it can move forever without ever spawning anything.
 const MAX_STEPS_PER_PASS: usize = 4;
+
+/// What a node that cannot get a worktree slot means for the job.
+///
+/// The same refusal is two different facts depending on what else the job has going. With nothing
+/// started, no room means the job cannot move and `waiting` is the honest status. With an item
+/// already running, it means the batch is bigger than the project's ceiling and came out smaller —
+/// which is what `next_step` deliberately left the driver to discover, since a slot count read
+/// inside a pure function is a number somebody else can take before the claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoRoom {
+    Park,
+    ShrinkTheBatch,
+}
 
 /// Whether a job can move again in the same pass.
 #[derive(Debug, PartialEq, Eq)]
@@ -2809,6 +3000,7 @@ async fn spawn_node(
     prompt: String,
     item: Option<ItemClaim>,
     worktree: (PathBuf, String),
+    no_room: NoRoom,
 ) -> Step {
     let pool = &state.pool;
 
@@ -2981,13 +3173,22 @@ async fn spawn_node(
         // four-hour ceiling is what stops a starved job from waiting forever.
         Err(crate::runs::CreateRunError::Busy) => {
             release_item(pool, job, item).await;
-            park(
-                state,
-                job,
-                "slot",
-                "another run holds the project's worktree slot",
-            )
-            .await
+            match no_room {
+                NoRoom::Park => {
+                    park(
+                        state,
+                        job,
+                        "slot",
+                        "another run holds the project's worktree slot",
+                    )
+                    .await
+                }
+                // Nothing to park: this job already has an item going, and the batch simply came
+                // out smaller than the fold proposed. Parking here would tell a reader the job is
+                // blocked while it is in fact working, and the park would be lifted by the next
+                // tick anyway.
+                NoRoom::ShrinkTheBatch => Step::Stopped,
+            }
         }
         Err(error) => {
             release_item(pool, job, item).await;
@@ -3776,7 +3977,8 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     if matches!(next, Next::Wait) {
         return Step::Stopped;
     }
-    if let Next::Finish(outcome) = next {
+    if let Next::Finish(outcome) = &next {
+        let outcome = *outcome;
         if let Err(error) = finish(pool, job.id, outcome).await {
             tracing::warn!(job_id = job.id, %error, "could not finish a job");
             return Step::Stopped;
@@ -3798,20 +4000,21 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     // The gate is a subprocess, not a run: it starts no CLI, consumes no quota and answers to no
     // brake. Refusing to measure an item because the owner sat down would leave the tree holding
     // edits nothing has verified, which is the state decision 10 exists to avoid.
-    if let Next::RunGate { ordinal } = next {
-        return gate_item(state, job, ordinal, view.items.len()).await;
+    if let Next::RunGate { ordinal } = &next {
+        return gate_item(state, job, *ordinal, view.items.len()).await;
     }
     // A merge is a subprocess too, and it goes past the brakes for the same reason plus one of its
     // own: the item's work is already done and paid for, sitting on a branch. Refusing to bring it
     // in because the owner sat down would leave it there, diverging from the job's branch for as
     // long as the brake holds — and the divergence is what the retry has to absorb.
-    if let Next::MergeItem { ordinal } = next {
-        return merge_item(state, job, ordinal).await;
+    if let Next::MergeItem { ordinal } = &next {
+        return merge_item(state, job, *ordinal).await;
     }
     // Past the brakes with the other two, and it is the cheapest of the three: one UPDATE, no
     // subprocess and no run. Parking a job rather than writing it would leave the item reading
     // `pending` — work a person is told is still coming — for as long as the brake holds.
-    if let Next::Orphan { ordinal } = next {
+    if let Next::Orphan { ordinal } = &next {
+        let ordinal = *ordinal;
         let marked = sqlx::query(
             "UPDATE job_items SET status = 'orphaned'
              WHERE job_id = ? AND ordinal = ? AND status = 'pending'",
@@ -3899,73 +4102,53 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 &artifacts,
                 graph_rules(pool, job).await.as_ref(),
             );
-            spawn_node(state, job, "plan", prompt, None, worktree).await
+            spawn_node(state, job, "plan", prompt, None, worktree, NoRoom::Park).await
         }
-        Next::SpawnImplement { ordinal } => {
-            // What the claim below has to find. Taken from the verdict this pass already reached —
-            // `next_step` named this ordinal precisely because `item_state_from` called it `Pending`
-            // or `GateRetriable` — rather than asked of the database a second time. The alternative
-            // is a `WHERE` clause that re-derives which red gates are retriable, which is the same
-            // rule in a second dialect and drifts the first time either side is edited.
-            let Some(held) = view
-                .items
-                .get(ordinal)
-                .and_then(|item| item.state.claimable_as())
-            else {
-                tracing::warn!(
-                    job_id = job.id,
+        Next::SpawnImplement(ordinals) => {
+            // One node per ordinal, in order, under the ONE brake reading this pass took. A brake is
+            // a statement about the JOB — its budget, the owner's attention, the window — so
+            // re-reading it between two items of one batch would let the second half be refused
+            // under a rule the first half was allowed under, for the same job at the same moment.
+            let mut step = Step::Stopped;
+            for (position, ordinal) in ordinals.into_iter().enumerate() {
+                // Re-read between items for the reason `drive` re-reads between passes: the item
+                // before this one may have parked the job for want of a slot, or ended it because
+                // its run could not be created at all, and the next item must not be started on top
+                // of either. `is_paused` as well as the live list, because `waiting` IS live — a
+                // parked job is one that will come back, not one that is over.
+                if position > 0 {
+                    let Ok(current) = load_job(pool, job.id).await else {
+                        break;
+                    };
+                    if !LIVE_STATUSES.contains(&current.status.as_str())
+                        || is_paused(&current.status)
+                    {
+                        break;
+                    }
+                }
+                step = start_item(
+                    state,
+                    job,
+                    &view,
+                    &artifacts,
+                    worktree.clone(),
                     ordinal,
-                    "asked to implement an item that is not startable"
-                );
-                return Step::Stopped;
-            };
-            let row =
-                sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
-                    "SELECT description, files, gate_output, agent_id FROM job_items
-                 WHERE job_id = ? AND ordinal = ?",
+                    // The first item parks the job when the project has no room, and the ones after
+                    // it do not. With something already started the job is not blocked; it is at the
+                    // project's ceiling, and `waiting` would be a status the next tick has to undo.
+                    if position == 0 {
+                        NoRoom::Park
+                    } else {
+                        NoRoom::ShrinkTheBatch
+                    },
                 )
-                .bind(job.id)
-                .bind(ordinal as i64)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
-            // `gate_output` is NULL for every item on its first attempt, which is every item of every
-            // job that never retries anything — so the `None` this reads is the prompt staying
-            // exactly as it was, not a fallback.
-            let Some((description, files, gate_output, agent_id)) = row else {
-                tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
-                return Step::Stopped;
-            };
-            // A hint that will not parse is no hint. It is an optimisation for where to start
-            // reading, and refusing to run the item over it would fail the work for the sake of the
-            // advice about the work.
-            let files: Vec<String> = files
-                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
-                .unwrap_or_default();
-            let persona = persona_for(pool, agent_id.as_deref()).await;
-            let prompt = implement_prompt(
-                &description,
-                ordinal,
-                view.items.len(),
-                &artifacts,
-                &files,
-                gate_output.as_deref(),
-                persona.as_deref(),
-            );
-            spawn_node(
-                state,
-                job,
-                "implement",
-                prompt,
-                Some(ItemClaim { ordinal, held }),
-                worktree,
-            )
-            .await
+                .await;
+            }
+            step
         }
         Next::SpawnReview => {
             let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
-            spawn_node(state, job, "review", prompt, None, worktree).await
+            spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
         }
         Next::SpawnReplan => {
             // Archived BEFORE the node starts, because the node is about to overwrite `plan.json`
@@ -3979,7 +4162,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 &artifacts,
                 graph_rules(pool, job).await.as_ref(),
             );
-            spawn_node(state, job, "replan", prompt, None, worktree).await
+            spawn_node(state, job, "replan", prompt, None, worktree, NoRoom::Park).await
         }
         // All four are answered above, before the brakes and before the worktree is resolved.
         // Reaching one here means the dispatch above stopped covering something it used to.
@@ -3989,6 +4172,82 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
         | Next::MergeItem { .. }
         | Next::Orphan { .. } => Step::Stopped,
     }
+}
+
+/// Starts one item's node: the whole of what the batch loop does for one ordinal.
+///
+/// Lifted out of the dispatch rather than left inline, because a batch runs it more than once in a
+/// pass and the alternative was a sixty-line loop body inside a `match` arm.
+async fn start_item(
+    state: &AppState,
+    job: &JobRow,
+    view: &JobView,
+    artifacts: &str,
+    worktree: (PathBuf, String),
+    ordinal: usize,
+    no_room: NoRoom,
+) -> Step {
+    let pool = &state.pool;
+    // What the claim below has to find. Taken from the verdict this pass already reached —
+    // `next_step` named this ordinal precisely because `item_state_from` called it `Pending`
+    // or `GateRetriable` — rather than asked of the database a second time. The alternative
+    // is a `WHERE` clause that re-derives which red gates are retriable, which is the same
+    // rule in a second dialect and drifts the first time either side is edited.
+    let Some(held) = view
+        .items
+        .get(ordinal)
+        .and_then(|item| item.state.claimable_as())
+    else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "asked to implement an item that is not startable"
+        );
+        return Step::Stopped;
+    };
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT description, files, gate_output, agent_id FROM job_items
+             WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    // `gate_output` is NULL for every item on its first attempt, which is every item of every
+    // job that never retries anything — so the `None` this reads is the prompt staying
+    // exactly as it was, not a fallback.
+    let Some((description, files, gate_output, agent_id)) = row else {
+        tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
+        return Step::Stopped;
+    };
+    // A hint that will not parse is no hint. It is an optimisation for where to start
+    // reading, and refusing to run the item over it would fail the work for the sake of the
+    // advice about the work.
+    let files: Vec<String> = files
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .unwrap_or_default();
+    let persona = persona_for(pool, agent_id.as_deref()).await;
+    let prompt = implement_prompt(
+        &description,
+        ordinal,
+        view.items.len(),
+        artifacts,
+        &files,
+        gate_output.as_deref(),
+        persona.as_deref(),
+    );
+    spawn_node(
+        state,
+        job,
+        "implement",
+        prompt,
+        Some(ItemClaim { ordinal, held }),
+        worktree,
+        no_room,
+    )
+    .await
 }
 
 /// Drives one job as far as it will go this pass.
@@ -4668,6 +4927,9 @@ mod tests {
             review,
             rounds: RoundState::default(),
             has_team: false,
+            // One, which is what a job without a team has and what makes the batch below come out
+            // as a queue of one.
+            max_parallel: 1,
         }
     }
 
@@ -4680,6 +4942,7 @@ mod tests {
             review,
             rounds,
             has_team: false,
+            max_parallel: 1,
         }
     }
 
@@ -4694,6 +4957,281 @@ mod tests {
             has_team: true,
             ..view(true, items, review)
         }
+    }
+
+    /// A team's job that may work on more than one item at once.
+    ///
+    /// Separate again, and for the sibling reason: a team's job with a ceiling of one behaves like
+    /// the queue of today apart from the endings, and most of the tests written for the earlier
+    /// slices mean exactly that. Raising the number is the thing this slice does, so it says so.
+    fn view_with_parallel(items: &[ItemView], max_parallel: usize) -> JobView {
+        JobView {
+            planned: true,
+            planning: false,
+            items: items.to_vec(),
+            review: ReviewState::NotWanted,
+            rounds: RoundState::default(),
+            has_team: true,
+            max_parallel,
+        }
+    }
+
+    /// One item of a team's plan: a state, what it waits for, and what it says it will touch.
+    fn item(state: ItemState, depends_on: &[i64], files: &[&str]) -> ItemView {
+        ItemView {
+            state,
+            depends_on: depends_on.to_vec(),
+            files: files.iter().map(|file| (*file).to_owned()).collect(),
+        }
+    }
+
+    /// Two items that declare the same file are never started together.
+    ///
+    /// The one rule that makes parallel work worth having rather than merely faster to start. Two
+    /// nodes writing one file do not conflict while they are apart — each tree builds, each gate
+    /// could pass — and they collide at the merge, where the loser pays a resolution run and a
+    /// second gate. That is the most expensive step in this design, and this is what avoids it.
+    #[test]
+    fn two_items_declaring_one_file_do_not_come_out_in_the_same_batch() {
+        use ItemState::*;
+        let shared = view_with_parallel(
+            &[
+                item(Pending, &[], &["core/src/job.rs", "core/src/runs.rs"]),
+                item(Pending, &[], &["core/src/job.rs"]),
+                item(Pending, &[], &["shell/src/App.tsx"]),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            next_step(&shared),
+            Next::SpawnImplement(vec![0, 2]),
+            "item 1 shares job.rs with item 0 and waits; item 2 shares nothing and goes"
+        );
+    }
+
+    /// And greedy by ordinal, which can lose — said out loud rather than left to be discovered.
+    ///
+    /// Item 0 declaring both files takes the batch and excludes 1 and 2, which declare one each and
+    /// could have run together. A batch of one where a different choice made two. The alternative is
+    /// a combinatorial search inside a function that runs every thirty seconds for every live job,
+    /// to buy one item's parallelism in a case the director can avoid by splitting differently.
+    #[test]
+    fn the_fold_is_greedy_by_ordinal_and_can_take_the_worse_pair() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Pending, &[], &["a.rs", "b.rs"]),
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0]));
+    }
+
+    /// A `Conflicted` item is work, and it does not block itself.
+    ///
+    /// It is in both lists — the states that hold paths, and the states that owe a run — so a
+    /// candidate checked against the whole blocking set including itself would be permanently
+    /// ineligible, blocked by its own declaration, with nothing anywhere to say why. The exclusion
+    /// of self is what makes a conflict a step rather than a grave.
+    #[test]
+    fn a_conflicted_item_is_startable_and_does_not_block_itself() {
+        use ItemState::*;
+        let job = view_with_parallel(&[item(Conflicted, &[], &["a.rs"])], 2);
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0]));
+    }
+
+    /// But it does block a SIBLING that declares the same file, because its tree holds that work.
+    #[test]
+    fn a_conflicted_item_still_holds_the_paths_it_declared_against_everybody_else() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Conflicted, &[], &["a.rs"]),
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0, 2]));
+    }
+
+    /// An item still running holds its paths, and does not stop the queue.
+    ///
+    /// **Continuous start, in one assertion.** The old line was "anything in flight, wait", and it
+    /// is what made the queue sequential before any rule did: the first item to start stopped the
+    /// search, so a second could not begin until the first had finished. Here item 0 is running and
+    /// item 2 starts beside it, while item 1 waits for the file item 0 is holding.
+    #[test]
+    fn an_item_already_running_holds_its_files_and_does_not_stop_the_queue() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Running, &[], &["a.rs"]),
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![2]));
+
+        // And without a team the same queue waits, exactly as it always did.
+        let sequential = JobView {
+            has_team: false,
+            ..job
+        };
+        assert_eq!(next_step(&sequential), Next::Wait);
+    }
+
+    /// The ceiling counts what is running as well as what is being started.
+    ///
+    /// Continuous start is what makes that necessary: this function runs again while earlier items
+    /// are still going, so a batch measured against its own length alone would add `max_parallel`
+    /// more agents every time it was asked.
+    #[test]
+    fn the_ceiling_counts_the_batch_and_what_is_already_running() {
+        use ItemState::*;
+        let running_one = view_with_parallel(
+            &[
+                item(Running, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+                item(Pending, &[], &["c.rs"]),
+            ],
+            2,
+        );
+        assert_eq!(
+            next_step(&running_one),
+            Next::SpawnImplement(vec![1]),
+            "one running plus one started is the ceiling of two"
+        );
+
+        let idle = view_with_parallel(
+            &[
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+                item(Pending, &[], &["c.rs"]),
+            ],
+            2,
+        );
+        assert_eq!(next_step(&idle), Next::SpawnImplement(vec![0, 1]));
+    }
+
+    /// A dependency that has not PASSED holds its dependent back, whatever else it has done.
+    #[test]
+    fn an_item_waits_until_everything_it_depends_on_has_passed() {
+        use ItemState::*;
+        for held in [Pending, Running, Merging, Conflicted, GateRetriable] {
+            let job = view_with_parallel(
+                &[item(held, &[], &["a.rs"]), item(Pending, &[0], &["b.rs"])],
+                3,
+            );
+            assert!(
+                !batch_of(&job).contains(&1),
+                "an item started while its dependency was {held:?}"
+            );
+        }
+
+        let landed = view_with_parallel(
+            &[item(Passed, &[], &["a.rs"]), item(Pending, &[0], &["b.rs"])],
+            3,
+        );
+        assert_eq!(batch_of(&landed), vec![1]);
+    }
+
+    /// An exclusive step takes precedence over the batch, and the reason is arithmetic rather than
+    /// taste: an item's divergence from the job's branch grows with every minute it waits, and it is
+    /// the retry — the most expensive step in this design — that has to absorb it. Draining what
+    /// is already in flight before starting more is what keeps that divergence small.
+    #[test]
+    fn a_merge_or_a_gate_outranks_starting_new_work() {
+        use ItemState::*;
+        let to_merge = view_with_parallel(
+            &[
+                item(Implemented, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+        assert_eq!(next_step(&to_merge), Next::MergeItem { ordinal: 0 });
+
+        let to_gate = view_with_parallel(
+            &[item(Merging, &[], &["a.rs"]), item(Pending, &[], &["b.rs"])],
+            3,
+        );
+        assert_eq!(next_step(&to_gate), Next::RunGate { ordinal: 0 });
+    }
+
+    /// `Implemented` and `Merging` hold their paths too, and this is asked of the fold directly.
+    ///
+    /// It has to be: the exclusive steps above return before the batch is ever built whenever an
+    /// item is in either state, so `next_step` cannot reach a case that would show it. They are in
+    /// the blocking set anyway, because it is a statement about which states hold paths — and a
+    /// set that is only right because of the order of the checks in front of it is a set that breaks
+    /// in silence the day that order moves.
+    #[test]
+    fn work_waiting_to_merge_holds_its_paths_against_the_batch() {
+        use ItemState::*;
+        for holder in [Implemented, Merging] {
+            let job = view_with_parallel(
+                &[
+                    item(holder, &[], &["a.rs"]),
+                    item(Pending, &[], &["a.rs"]),
+                    item(Pending, &[], &["b.rs"]),
+                ],
+                3,
+            );
+            assert_eq!(
+                batch_of(&job),
+                vec![2],
+                "an item in {holder:?} did not hold the file it is about to merge"
+            );
+        }
+    }
+
+    /// A queue that owes a run and cannot start one says `stopped`, and never `completed`.
+    ///
+    /// The shape is narrow and real: item 0 is skipped — a decision somebody was asked for — and
+    /// item 1 depends on it and has already run, so the orphan step walks past it (its work is in a
+    /// checkout of its own, and whether that work is still worth anything is not a sibling's
+    /// verdict). It can never be selected, because its dependency will never pass. Nothing is in
+    /// flight. Falling through would close the round and report `completed` over an item nobody
+    /// started, which is the one reading that cannot be caught afterwards.
+    #[test]
+    fn a_queue_that_owes_a_run_and_cannot_start_one_is_stopped_and_not_completed() {
+        use ItemState::*;
+        let stuck = view_with_parallel(
+            &[
+                item(Skipped, &[], &["a.rs"]),
+                item(Conflicted, &[0], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert!(batch_of(&stuck).is_empty(), "the fold cannot select it");
+        assert_eq!(next_step(&stuck), Next::Finish(Outcome::Stopped));
+    }
+
+    /// And the same shape with something in flight WAITS, because the thing that lands next is what
+    /// frees it. Told apart from the case above by one item's state, and they are opposite answers.
+    #[test]
+    fn a_batch_that_comes_out_empty_with_work_in_flight_waits() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Running, &[], &["a.rs"]),
+                item(Pending, &[0], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert!(batch_of(&job).is_empty());
+        assert_eq!(next_step(&job), Next::Wait);
     }
 
     /// Seeds a job in a given status.
@@ -4754,7 +5292,7 @@ mod tests {
         );
         assert_eq!(
             next_step(&view(true, &items, ReviewState::Pending)),
-            Next::SpawnImplement { ordinal: 0 }
+            Next::SpawnImplement(vec![0])
         );
 
         items[0] = ItemState::Implemented;
@@ -4766,7 +5304,7 @@ mod tests {
         items[0] = ItemState::Passed;
         assert_eq!(
             next_step(&view(true, &items, ReviewState::Pending)),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
 
         items[1] = ItemState::Passed;
@@ -4835,7 +5373,7 @@ mod tests {
                 &[ItemState::GateFailed, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 },
+            Next::SpawnImplement(vec![1]),
             "the item after a red one is still work worth doing"
         );
     }
@@ -4906,7 +5444,11 @@ mod tests {
     #[test]
     fn an_item_whose_dependency_will_not_land_is_put_down_and_counted() {
         use ItemState::*;
-        let waiting_on = |state, depends_on: Vec<i64>| ItemView { state, depends_on };
+        let waiting_on = |state, depends_on: Vec<i64>| ItemView {
+            state,
+            depends_on,
+            files: Vec::new(),
+        };
 
         for blocker in [Failed, GateFailed, GateErrored, Skipped, Orphaned] {
             let job = JobView {
@@ -4942,6 +5484,7 @@ mod tests {
                     ItemView {
                         state: Pending,
                         depends_on: vec![0],
+                        files: Vec::new(),
                     },
                 ],
                 ..view_with_team(&[], ReviewState::NotWanted)
@@ -4989,7 +5532,7 @@ mod tests {
         use ItemState::*;
         assert_eq!(
             next_step(&view_with_team(&[Conflicted], ReviewState::NotWanted)),
-            Next::SpawnImplement { ordinal: 0 }
+            Next::SpawnImplement(vec![0])
         );
         // And it does not jump the queue: the same positional search means an earlier item still
         // goes first.
@@ -4998,7 +5541,7 @@ mod tests {
                 &[Pending, Conflicted],
                 ReviewState::NotWanted
             )),
-            Next::SpawnImplement { ordinal: 0 }
+            Next::SpawnImplement(vec![0])
         );
     }
 
@@ -5059,14 +5602,14 @@ mod tests {
     fn without_a_team_every_state_decides_exactly_as_it_did() {
         use ItemState::*;
         for (state, expected) in [
-            (Pending, Next::SpawnImplement { ordinal: 0 }),
+            (Pending, Next::SpawnImplement(vec![0])),
             (Running, Next::Wait),
             (Implemented, Next::RunGate { ordinal: 0 }),
             (Passed, Next::SpawnReview),
             (Failed, Next::Finish(Outcome::Failed)),
             (Cancelled, Next::Finish(Outcome::Cancelled)),
             (GateFailed, Next::SpawnReview),
-            (GateRetriable, Next::SpawnImplement { ordinal: 0 }),
+            (GateRetriable, Next::SpawnImplement(vec![0])),
             (GateErrored, Next::Finish(Outcome::GateErrored)),
             (Skipped, Next::SpawnReview),
         ] {
@@ -5089,14 +5632,14 @@ mod tests {
         use ItemState::*;
         assert_eq!(
             next_step(&view_with_team(&[Failed, Pending], ReviewState::NotWanted)),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
         assert_eq!(
             next_step(&view_with_team(
                 &[GateErrored, Pending],
                 ReviewState::NotWanted
             )),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
         assert_eq!(
             next_step(&view_with_team(
@@ -5350,7 +5893,7 @@ mod tests {
                 &[ItemState::Passed, ItemState::GateRetriable],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
     }
 
@@ -5369,7 +5912,7 @@ mod tests {
                 &[ItemState::GateRetriable, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 0 }
+            Next::SpawnImplement(vec![0])
         );
     }
 
@@ -5388,7 +5931,7 @@ mod tests {
                 &[ItemState::GateFailed, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
     }
 
@@ -5453,7 +5996,7 @@ mod tests {
                 &[ItemState::Skipped, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 },
+            Next::SpawnImplement(vec![1]),
             "the queue has to move past it"
         );
         assert_eq!(
@@ -5483,7 +6026,7 @@ mod tests {
         let items = [ItemState::Passed, ItemState::Passed, ItemState::Pending];
         assert_eq!(
             next_step(&view(true, &items, ReviewState::Pending)),
-            Next::SpawnImplement { ordinal: 2 }
+            Next::SpawnImplement(vec![2])
         );
     }
 
@@ -6318,7 +6861,7 @@ mod tests {
         );
         assert_eq!(
             next_step(&load_view(&pool, directed).await.unwrap()),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
     }
 
@@ -6330,7 +6873,7 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
 
-        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+        assert_eq!(next_step(&view), Next::SpawnImplement(vec![2]));
     }
 
     // ---- rounds (Chunk 3) ------------------------------------------------------------------------
@@ -6509,7 +7052,7 @@ mod tests {
         assert_eq!(view.rounds.round, 1);
         // 2, not 0. This is the number `advance` binds into
         // `SELECT description FROM job_items WHERE job_id = ? AND ordinal = ?`.
-        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+        assert_eq!(next_step(&view), Next::SpawnImplement(vec![2]));
     }
 
     /// A NULL `max_rounds` is "nobody asked for rounds", not "use the daemon's ceiling". Resolving it
@@ -6536,7 +7079,7 @@ mod tests {
 
         // Erring toward "not finished" costs a repeated item. Erring the other way skips work the
         // job exists to do and reports it complete, which is the failure nobody sees.
-        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 1 });
+        assert_eq!(next_step(&view), Next::SpawnImplement(vec![1]));
     }
 
     #[tokio::test]
@@ -8023,7 +8566,7 @@ mod tests {
         assert_eq!(placed, vec![(0, 0), (1, 0), (2, 1)]);
         assert_eq!(
             next_step(&load_view(&pool, job_id).await.unwrap()),
-            Next::SpawnImplement { ordinal: 2 }
+            Next::SpawnImplement(vec![2])
         );
     }
 
@@ -8729,7 +9272,7 @@ mod tests {
 
         assert_eq!(
             next_step(&load_view(&pool, job_id).await.unwrap()),
-            Next::SpawnImplement { ordinal: 0 },
+            Next::SpawnImplement(vec![0]),
             "the queue has to come back to the same item, not stop and not step over it"
         );
     }
@@ -8750,6 +9293,114 @@ mod tests {
     /// `running` and it has a run attached. The prompt is the third assertion, and it is what makes
     /// the whole chain load-bearing — output stored by `record_gate`, selected by `advance`, appended
     /// by `implement_prompt`, and handed to a node. Any link missing and this says so.
+    /// **Two items of one job are worked on at the same time.** The criterion §7 says the whole
+    /// design rests on.
+    ///
+    /// It exists because the other criterion cannot catch a no-op on its own. "The parallel run is
+    /// not slower than the sequential one" is satisfied trivially by a parallelism that collapsed to
+    /// one — same plan, same order, same timings — and that is exactly how an earlier draft of
+    /// this design convinced itself it worked. This asks the question the timings cannot: were two
+    /// nodes ever going at once.
+    ///
+    /// Deterministic, and it has to be: no sleeping, no wall clock, no ordering between threads. One
+    /// pass of `advance` over a queue of three, and the rows afterwards say how many started. Three
+    /// items and a ceiling of two, so the answer distinguishes "two" from both "one" (no
+    /// parallelism) and "all of them" (no ceiling).
+    ///
+    /// Item 1 declares the same file as item 0 and is the control: it must NOT be in the batch, or
+    /// the two that did start were chosen by counting rather than by the fold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_items_of_a_team_are_started_in_one_pass_and_a_third_is_not() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-parallel-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        seed_agent(&pool, "ana", "migrations", "careful").await;
+        seed_crew(&pool, "crew", "ana", &[]).await;
+        sqlx::query("UPDATE teams SET max_parallel = 2 WHERE id = 'crew'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+
+        // The queue a director's plan produces: three items, and item 1 sharing a file with item 0.
+        for (ordinal, files) in [(0, r#"["a.rs"]"#), (1, r#"["a.rs"]"#), (2, r#"["b.rs"]"#)] {
+            sqlx::query(
+                "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
+                                        agent_id)
+                 VALUES (?, ?, 'an item', 'pending', ?, '[]', 'ana')",
+            )
+            .bind(job_id)
+            .bind(ordinal as i64)
+            .bind(files)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["running", "pending", "running"],
+            "one pass started items 0 and 2 together, and left 1 for the file it shares with 0"
+        );
+
+        // And they are two nodes, in two checkouts, not one node counted twice. `item_id` is what
+        // says so: it is the owner of the worktree each of them opened its editor in.
+        let items: Vec<i64> = sqlx::query_scalar(
+            "SELECT runs.item_id FROM runs
+              WHERE runs.job_id = ? AND runs.item_id IS NOT NULL ORDER BY runs.item_id",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(items.len(), 2, "two runs, one per started item: {items:?}");
+        assert_ne!(items[0], items[1]);
+
+        let trees: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM worktrees WHERE owner_kind = 'item' AND removed_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trees, 2, "each item is writing in a checkout of its own");
+    }
+
     /// A real repository and a real worktree, because a node that cannot be provisioned would leave
     /// the item back where it started for a reason that has nothing to do with the claim — and would
     /// look exactly like the defect this pins.
@@ -9277,6 +9928,7 @@ mod tests {
                 held: "pending",
             }),
             (PathBuf::from("/project/a/worktree"), "nucleos/job".into()),
+            NoRoom::Park,
         )
         .await;
 
