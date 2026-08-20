@@ -5248,6 +5248,32 @@ async fn post_proposal_reject(
         };
     }
 
+    if kind == "github-action" {
+        // Refusing leaves nothing behind, because nothing was done: `github::submit` files the
+        // proposal and returns, and the operation reaches `gh` only on the approval path. So this is
+        // a status flip with no second half — the opposite of the approve side, which claims the row
+        // BEFORE spawning precisely because there IS one there.
+        //
+        // Its absence was invisible until somebody refused one by hand. The fallback below knows
+        // only `action-approval`, so a `github-action` fell through to it and came back 409 saying
+        // NotPending about a proposal sitting there pending; `/dismiss`, which knows only
+        // `skipped-item`, answered the same. An operation the owner could approve and could not
+        // refuse waited for a decision that had no way to arrive.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "rejected", "rejected by user").await
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "refusing a github action failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
     if kind == "team-action" {
         // Refusing closes the action as well as the proposal, in that order: the proposal is the
         // decision and the action is what is left to do about it, and leaving the second `pending`
@@ -12277,6 +12303,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_status, "cancelled");
+    }
+
+    /// A GitHub operation the owner could approve and could not refuse.
+    ///
+    /// `/reject`'s fallback knows only `action-approval` and `/dismiss` only `skipped-item`, so
+    /// before the arm above existed a `github-action` got 409 from both — and the 409 said
+    /// NotPending about a proposal that was pending, which sends the reader to the wrong question.
+    /// Found by refusing one by hand during the plan's own verification, and not by a test, which
+    /// is why there is a test now.
+    #[tokio::test]
+    async fn a_github_action_can_be_refused_and_not_only_approved() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let proposal_id = proposals::create_github_action(
+            &pool,
+            "pr_comment",
+            "a run asked GitHub for pr_comment on owner/name",
+            r#"{"op":"pr_comment","repo":"owner/name","number":"1","body":"hello"}"#,
+        )
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{proposal_id}/reject"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let proposal = proposals::get(&pool, proposal_id).await.unwrap().unwrap();
+        assert_eq!(proposal.status, "rejected");
     }
 
     #[tokio::test]
