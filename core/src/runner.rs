@@ -2814,6 +2814,95 @@ mod tests {
         }
     }
 
+    /// Two turns down one REAL CLI, through the argument vector this daemon actually builds.
+    ///
+    /// `#[ignore]` because it needs the Claude Code CLI installed, an authenticated session, and
+    /// about twenty cents of somebody's money. Everything else about a conversation keeping its
+    /// process is tested against `FakeCommandRunner`, which proves the wiring and proves nothing
+    /// about whether the CLI serves a second turn down a stdin this code built.
+    ///
+    /// That exact gap has already bitten once, this month: the fake did not implement
+    /// `run_prompt_with_turns` at all, so every rooted chat turn in the suite took a path that could
+    /// not work — and every assertion still passed, because they all look at what the runner was
+    /// HANDED rather than at what came back.
+    ///
+    /// What it pins: one process answering twice, one session across both, and the two turns' costs
+    /// adding up to the process's own. That last one is the whole of `TurnSplitter`'s reason to
+    /// exist — the CLI prints a RUNNING TOTAL on every `result`, so a second turn recorded verbatim
+    /// bills the first one again, and a third bills the first two.
+    #[tokio::test]
+    #[ignore = "spawns the real Claude CLI and spends money; run with --include-ignored"]
+    async fn a_real_cli_answers_a_second_turn_down_the_same_stdin() {
+        let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (turn_events, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let mut request = test_run_request("Reply with the single word one.");
+        request.steerable = true;
+        request.messages = Some(incoming);
+        request.model = Some("sonnet".to_owned());
+
+        let runner = ClaudeCliRunner {
+            model: "sonnet".to_owned(),
+            plan_model: None,
+            review_model: None,
+        };
+        let process = tokio::spawn(async move {
+            runner
+                .run_prompt_with_turns(
+                    request,
+                    session_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                    std::sync::Arc::new(std::sync::Mutex::new(None)),
+                    Some(turn_events),
+                )
+                .await
+        });
+
+        let mut ended = Vec::new();
+        while let Some(event) = events.recv().await {
+            let TurnEvent::Ended(turn) = event else {
+                continue;
+            };
+            ended.push(turn);
+            if ended.len() == 1 {
+                // The second turn, written while the process that answered the first is still
+                // standing. This is the line the whole feature is about.
+                messages
+                    .send("Reply with the single word two.".to_owned())
+                    .unwrap();
+            } else {
+                break;
+            }
+        }
+        // Closing stdin is how a steerable run is told no more turns are coming.
+        drop(messages);
+        let outcome = process.await.unwrap().expect("the CLI should have run");
+
+        assert_eq!(ended.len(), 2, "one process must have answered twice");
+
+        let summed: f64 = ended.iter().filter_map(|turn| turn.cost_usd).sum();
+        let whole = outcome
+            .cost_usd
+            .expect("a finished process reports what it spent");
+        assert!(
+            (summed - whole).abs() < 1e-6,
+            "the turns must add up to the process: {summed} against {whole}"
+        );
+
+        // One session across both turns, which is what lets the conversation be resumed by it after
+        // the process is gone — so losing the process costs speed and never continuity.
+        let announced = session_rx
+            .recv()
+            .await
+            .expect("the CLI announces its session");
+        assert!(!announced.is_empty());
+        assert!(
+            session_rx.try_recv().is_err(),
+            "a second session was started"
+        );
+    }
+
     fn test_run_request(prompt: &str) -> RunRequest {
         RunRequest {
             prompt: prompt.to_string(),
