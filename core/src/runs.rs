@@ -4338,8 +4338,14 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// is its row id, so a retry asks for the slot it is already holding; if `claim` were not
     /// idempotent, or if the tree were named after the run, a three-attempt item would end up
     /// holding three of a project's slots and the project would refuse itself.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn an_item_run_gets_its_own_tree_and_pays_one_slot_for_every_attempt() {
+        // Held across the awaits on purpose: it serialises mutation of the process-wide
+        // `NUCLEOS_WORKTREE_ROOT`, which is the whole reason it exists. Without it a sibling test
+        // moves the root out from under `adopt_or_create_at`, which then looks for this item's
+        // checkout somewhere it never was, decides there is none, and fails to create one over a
+        // branch that already exists — a failure that reads like a bug in adoption and is not.
+        let _lock = crate::worktree::test_env_lock();
         let (state, _runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         let container = crate::git_exec::tests::space_free_tempdir("nucleos-item-tree-");

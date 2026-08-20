@@ -435,6 +435,15 @@ pub enum Next {
     MergeItem {
         ordinal: usize,
     },
+    /// Put an item down because something it depends on will never land.
+    ///
+    /// A step and not a silent skip, because the row has to say so. Left `pending`, the item is
+    /// work nothing will ever start: it holds a slot and a checkout to the end of the job, it is
+    /// counted among the unfinished, and a person reading the queue is told the job is still going
+    /// to do it.
+    Orphan {
+        ordinal: usize,
+    },
     SpawnReview,
     /// Ask again now that this round's queue is empty: either for more work, or for "done".
     SpawnReplan,
@@ -525,7 +534,7 @@ pub struct JobView {
     /// Load-bearing and easy to get wrong: read without filtering on `job_items.round`, round 2
     /// would see round 1's finished items sitting beside its own and start the round again from the
     /// first pending one it found.
-    pub items: Vec<ItemState>,
+    pub items: Vec<ItemView>,
     pub review: ReviewState,
     pub rounds: RoundState,
     /// Whether a team directs this job — `jobs.team_id` being set, and nothing more.
@@ -538,6 +547,33 @@ pub struct JobView {
     /// share one tree, so an item that broke leaves edits nothing measured where the next item
     /// would build on them — which is why `false` still stops the job at the first failure.
     pub has_team: bool,
+}
+
+/// One item of the queue, as the decision below has to see it.
+///
+/// A struct and not a bare [`ItemState`] because two items being independent is not something their
+/// states can say. `depends_on` is the only thing that can, and it has to be in the pure function —
+/// deciding it outside would put "which item may run" in two places, and the second one would not be
+/// table-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemView {
+    pub state: ItemState,
+    /// The global ordinals this item may not start before.
+    ///
+    /// Empty for every item of every job without a team, which is what makes those jobs read here
+    /// exactly as they always did.
+    pub depends_on: Vec<i64>,
+}
+
+impl ItemView {
+    /// A view of an item that waits for nobody, which is what a job without a team has.
+    #[cfg(test)]
+    fn plain(state: ItemState) -> Self {
+        Self {
+            state,
+            depends_on: Vec::new(),
+        }
+    }
 }
 
 /// Decides a job's next move from what is observable about it.
@@ -574,7 +610,7 @@ pub fn next_step(job: &JobView) -> Next {
     //
     // `Cancelled` keeps no guard, in either kind of job. It is not a claim about trees — it is a
     // person having stopped this, and carrying on would be answering them.
-    for item in &job.items {
+    for item in job.items.iter().map(|item| &item.state) {
         match item {
             ItemState::Failed if !job.has_team => return Next::Finish(Outcome::Failed),
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
@@ -604,7 +640,7 @@ pub fn next_step(job: &JobView) -> Next {
     if job
         .items
         .iter()
-        .any(|item| matches!(item, ItemState::Running | ItemState::Reverted))
+        .any(|item| matches!(item.state, ItemState::Running | ItemState::Reverted))
     {
         return Next::Wait;
     }
@@ -615,7 +651,7 @@ pub fn next_step(job: &JobView) -> Next {
     if let Some(ordinal) = job
         .items
         .iter()
-        .position(|item| *item == ItemState::Merging)
+        .position(|item| item.state == ItemState::Merging)
     {
         return Next::RunGate { ordinal };
     }
@@ -628,7 +664,7 @@ pub fn next_step(job: &JobView) -> Next {
     if let Some(ordinal) = job
         .items
         .iter()
-        .position(|item| *item == ItemState::Implemented)
+        .position(|item| item.state == ItemState::Implemented)
     {
         return if job.has_team {
             Next::MergeItem { ordinal }
@@ -647,9 +683,26 @@ pub fn next_step(job: &JobView) -> Next {
     // rather than writing a feature — but that is a difference in the prompt, not in whether there
     // is anything to start. Leaving it out would put the item down for good over a conflict, which
     // is not a verdict about the work.
+    // An item whose dependency will never land is put down before the search below runs, so that
+    // search never has to know about the graph. It stays a plain positional walk over states, and
+    // "which item is next" keeps meaning one thing.
+    //
+    // Only `Pending` is orphaned. An item that has already run has work in a checkout of its own,
+    // and whether that work is worth anything now is a question for the person reading the branch —
+    // not something to be decided by a sibling's failure.
+    if let Some(ordinal) = job.items.iter().position(|item| {
+        item.state == ItemState::Pending
+            && item.depends_on.iter().any(|dependency| {
+                job.items
+                    .get(*dependency as usize)
+                    .is_some_and(|dependency| never_lands(dependency.state))
+            })
+    }) {
+        return Next::Orphan { ordinal };
+    }
     if let Some(ordinal) = job.items.iter().position(|item| {
         matches!(
-            item,
+            item.state,
             ItemState::Pending | ItemState::GateRetriable | ItemState::Conflicted
         )
     }) {
@@ -669,6 +722,32 @@ pub fn next_step(job: &JobView) -> Next {
         ReviewState::Running => Next::Wait,
         ReviewState::NotWanted | ReviewState::Done => close_the_round(job),
     }
+}
+
+/// PURE: whether an item in this state will never contribute its work.
+///
+/// The condition that orphans everything waiting on it, and it is deliberately wider than "failed".
+/// What a dependent needs to know is not whether its dependency went wrong but whether its work is
+/// ever going to arrive, and for these five the answer is no.
+///
+/// **`Skipped` is in the list, and it is the one worth arguing about.** A skipped item is not a
+/// failure — nothing broke and nobody stopped anything — and `ending()` deliberately walks past it
+/// so that a job which skipped one item is not reported as failed. That stays true: a skipped item
+/// ALONE still ends the job `completed`. What changes is a skipped item that something else was
+/// waiting for, and there the job did not do what was asked, because a person now has to decide
+/// about the prerequisite before any of it can happen.
+///
+/// `Cancelled` is here for completeness and never decides: it stops the job at the short-circuit.
+fn never_lands(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Failed
+            | ItemState::GateFailed
+            | ItemState::GateErrored
+            | ItemState::Cancelled
+            | ItemState::Skipped
+            | ItemState::Orphaned
+    )
 }
 
 /// PURE: what happens when a round's queue is spent and its review has been had.
@@ -757,16 +836,28 @@ fn ending(job: &JobView) -> Outcome {
 /// `Cancelled` is deliberately absent. It stops the job at the short-circuit, team or no team, and
 /// never reaches here.
 fn failed_ending(job: &JobView) -> Option<Outcome> {
-    if job.items.contains(&ItemState::GateErrored) {
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::GateErrored)
+    {
         return Some(Outcome::GateErrored);
     }
-    if job.items.contains(&ItemState::Failed) {
+    if job.items.iter().any(|item| item.state == ItemState::Failed) {
         return Some(Outcome::Failed);
     }
-    if job.items.contains(&ItemState::GateFailed) {
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::GateFailed)
+    {
         return Some(Outcome::GateFailed);
     }
-    if job.items.contains(&ItemState::Orphaned) {
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::Orphaned)
+    {
         return Some(Outcome::Failed);
     }
     None
@@ -945,8 +1036,8 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     // `gate_attempts` travels with the status because the status alone cannot say what `gate_failed`
     // means any more: read against the job's budget it is either an item to try again or an item
     // that is over, and reading it without the count would make every red gate terminal again.
-    let items: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT status, gate_attempts FROM job_items WHERE job_id = ? ORDER BY ordinal",
+    let items: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT status, gate_attempts, depends_on FROM job_items WHERE job_id = ? ORDER BY ordinal",
     )
     .bind(job_id)
     .fetch_all(pool)
@@ -1023,7 +1114,18 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         planning: plan_run.as_deref().is_some_and(node_in_flight),
         items: items
             .iter()
-            .map(|(status, attempts)| item_state_from(status, *attempts, gate_retries))
+            .map(|(status, attempts, depends_on)| ItemView {
+                state: item_state_from(status, *attempts, gate_retries),
+                // A list that will not parse is read as no list at all, and that is the safe
+                // direction: an item believed to depend on nothing is started early, where an item
+                // believed to depend on something that is not there would never start. The column
+                // is written by this module from a checked plan, so a failure here means the row was
+                // edited by hand.
+                depends_on: depends_on
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<Vec<i64>>(json).ok())
+                    .unwrap_or_default(),
+            })
             .collect(),
         review,
         rounds: RoundState {
@@ -3503,6 +3605,43 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     if let Next::MergeItem { ordinal } = next {
         return merge_item(state, job, ordinal).await;
     }
+    // Past the brakes with the other two, and it is the cheapest of the three: one UPDATE, no
+    // subprocess and no run. Parking a job rather than writing it would leave the item reading
+    // `pending` — work a person is told is still coming — for as long as the brake holds.
+    if let Next::Orphan { ordinal } = next {
+        let marked = sqlx::query(
+            "UPDATE job_items SET status = 'orphaned'
+             WHERE job_id = ? AND ordinal = ? AND status = 'pending'",
+        )
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .execute(pool)
+        .await;
+        return match marked {
+            // The compare-and-swap matters for the same reason `spawn_node`'s does: two passes
+            // reaching this at once must not both act, and an item that stopped being `pending` in
+            // between is one somebody else has already decided about.
+            Ok(result) if result.rows_affected() == 1 => {
+                say(
+                    pool,
+                    job,
+                    "job_item_orphaned",
+                    &format!(
+                        "job {} at item {}: something it depends on will not land, so it was put                          down without being attempted",
+                        job.id,
+                        ordinal + 1
+                    ),
+                )
+                .await;
+                Step::Continued
+            }
+            Ok(_) => Step::Continued,
+            Err(error) => {
+                tracing::warn!(job_id = job.id, ordinal, %error, "could not put down an orphaned item");
+                Step::Stopped
+            }
+        };
+    }
 
     match brakes(state, job, now).await {
         Brake::Go => {}
@@ -3523,7 +3662,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                     job.id,
                     view.items
                         .iter()
-                        .filter(|item| item.claimable_as().is_some())
+                        .filter(|item| item.state.claimable_as().is_some())
                         .count()
                 ),
             )
@@ -3568,7 +3707,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             let Some(held) = view
                 .items
                 .get(ordinal)
-                .and_then(|state| state.claimable_as())
+                .and_then(|item| item.state.claimable_as())
             else {
                 tracing::warn!(
                     job_id = job.id,
@@ -3638,9 +3777,11 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
         }
         // All four are answered above, before the brakes and before the worktree is resolved.
         // Reaching one here means the dispatch above stopped covering something it used to.
-        Next::Wait | Next::Finish(_) | Next::RunGate { .. } | Next::MergeItem { .. } => {
-            Step::Stopped
-        }
+        Next::Wait
+        | Next::Finish(_)
+        | Next::RunGate { .. }
+        | Next::MergeItem { .. }
+        | Next::Orphan { .. } => Step::Stopped,
     }
 }
 
@@ -4317,7 +4458,7 @@ mod tests {
         JobView {
             planned,
             planning: false,
-            items: items.to_vec(),
+            items: items.iter().copied().map(ItemView::plain).collect(),
             review,
             rounds: RoundState::default(),
             has_team: false,
@@ -4329,7 +4470,7 @@ mod tests {
         JobView {
             planned: true,
             planning: false,
-            items: items.to_vec(),
+            items: items.iter().copied().map(ItemView::plain).collect(),
             review,
             rounds,
             has_team: false,
@@ -4548,6 +4689,85 @@ mod tests {
         assert_eq!(
             next_step(&view_with_team(&[Merging], ReviewState::NotWanted)),
             Next::RunGate { ordinal: 0 }
+        );
+    }
+
+    /// An item waiting on work that will never land is put down, and the job says so.
+    ///
+    /// Both halves matter. Left `pending` the item is work nothing will start, holding a slot and a
+    /// checkout to the end of the job while a person reading the queue is told it is still coming;
+    /// and reported `completed`, the job claims to have done work it never attempted.
+    #[test]
+    fn an_item_whose_dependency_will_not_land_is_put_down_and_counted() {
+        use ItemState::*;
+        let waiting_on = |state, depends_on: Vec<i64>| ItemView { state, depends_on };
+
+        for blocker in [Failed, GateFailed, GateErrored, Skipped, Orphaned] {
+            let job = JobView {
+                has_team: true,
+                items: vec![ItemView::plain(blocker), waiting_on(Pending, vec![0])],
+                ..view_with_team(&[], ReviewState::NotWanted)
+            };
+            assert_eq!(
+                next_step(&job),
+                Next::Orphan { ordinal: 1 },
+                "a dependency in {blocker:?} still lets its dependent be started"
+            );
+        }
+
+        // And once it is down, the job does not report itself complete.
+        let done = JobView {
+            has_team: true,
+            items: vec![ItemView::plain(Skipped), ItemView::plain(Orphaned)],
+            ..view_with_team(&[], ReviewState::NotWanted)
+        };
+        assert_eq!(next_step(&done), Next::Finish(Outcome::Failed));
+    }
+
+    /// A dependency that merely has not finished yet is not a reason to put anything down.
+    #[test]
+    fn an_item_waiting_on_work_still_in_flight_is_left_alone() {
+        use ItemState::*;
+        for blocker in [Pending, Implemented, Passed, Merging, GateRetriable] {
+            let job = JobView {
+                has_team: true,
+                items: vec![
+                    ItemView::plain(blocker),
+                    ItemView {
+                        state: Pending,
+                        depends_on: vec![0],
+                    },
+                ],
+                ..view_with_team(&[], ReviewState::NotWanted)
+            };
+            assert_ne!(
+                next_step(&job),
+                Next::Orphan { ordinal: 1 },
+                "a dependency in {blocker:?} orphaned its dependent"
+            );
+        }
+    }
+
+    /// A skipped item ALONE is still not a failure, which is the reading `ending()` protects.
+    ///
+    /// What changed is only the case where something was waiting for it: there the job did not do
+    /// what was asked, because a person has to decide about the prerequisite first.
+    #[test]
+    fn a_skipped_item_nothing_waited_for_still_completes_the_job() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[Passed, Skipped], ReviewState::Done)),
+            Next::Finish(Outcome::Completed)
+        );
+    }
+
+    /// Without a team nothing depends on anything, so no item is ever put down this way.
+    #[test]
+    fn without_a_team_a_failure_still_stops_the_job_rather_than_orphaning_anything() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[Failed, Pending], ReviewState::NotWanted)),
+            Next::Finish(Outcome::Failed)
         );
     }
 
@@ -5815,7 +6035,7 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
         assert_eq!(
-            view.items,
+            view.items.iter().map(|item| item.state).collect::<Vec<_>>(),
             vec![ItemState::Passed, ItemState::Skipped, ItemState::Pending],
             "the earlier round's items stay in the queue, terminal and walked past"
         );
