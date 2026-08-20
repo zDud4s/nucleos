@@ -567,6 +567,8 @@ function ChatDetail({
         </div>
       )}
 
+      {summary !== undefined && summary.cwd === null && <NoProject />}
+
       {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
       {summary !== undefined && summary.ide_session_id !== null && (
@@ -590,6 +592,30 @@ function ChatDetail({
 
       <Composer chatId={chatId} />
     </Panel>
+  );
+}
+
+/**
+ * What a conversation started here cannot do, and why it will never be able to.
+ *
+ * A conversation's working directory is written once, at creation, out of the editor session it was
+ * picked up from — `chats.cwd` has no other writer anywhere in the daemon. One started here has
+ * none, so `tool_policy_for` answers `McpOnly` for as long as it exists: no Bash, no Read, no Write.
+ *
+ * Nothing said so. You would ask it to fix a file, watch it not fix the file, and have nowhere to
+ * find out why — the same silence `NoTools` ends on the other side of the pick-up, and the worse
+ * half of it, because there is no button here that would change the answer.
+ *
+ * So it says what this is rather than offering a cure it does not have, and names the one route that
+ * does work.
+ */
+function NoProject() {
+  return (
+    <p className="chats-new-warning" role="status">
+      this conversation has no project — it can talk about code and remember what was said, but it{" "}
+      <b>cannot open a file, run a command, or change anything</b> on this machine. A conversation
+      gets those by being picked up from the editor.
+    </p>
   );
 }
 

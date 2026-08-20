@@ -396,6 +396,45 @@ describe("Chats - an empty list", () => {
   });
 });
 
+/* ---------------------------------------------- a conversation with no project -- */
+
+describe("Chats - what a conversation without a project can do", () => {
+  // A conversation gets its working directory from the session it was picked up from, and there is
+  // no other way to get one — `cwd` is written once, at creation, from a pick-up. So a conversation
+  // started here has none, which means `tool_policy_for` answers `McpOnly`: no Bash, no Read, no
+  // Write, for as long as it exists.
+  //
+  // Nothing said so. You would ask it to fix a file, watch it not fix the file, and have nowhere to
+  // find out why — which is the same silence `NoTools` was written to end on the other side of the
+  // pick-up.
+  it("says what one started here cannot do, rather than letting somebody find out", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/cannot open a file/i)).toBeTruthy();
+  });
+
+  it("says nothing of the sort about one that has a project", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Waited on the transcript rather than on a word in it: what matters here is that the page has
+    // finished drawing, and a note that appears late would otherwise pass this by not existing yet.
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByText(/cannot open a file/i)).toBeNull();
+  });
+});
+
 /* ------------------------------------------------- picked up from the editor -- */
 
 describe("Chats - a conversation picked up from the editor", () => {
