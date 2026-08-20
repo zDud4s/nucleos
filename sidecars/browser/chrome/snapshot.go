@@ -57,8 +57,10 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 		TextNext:     read.textNext,
 		ControlsNext: read.controlsNext,
 		Gone:         gone,
-		Partial:      req.ChangesOnly,
-		Blocked:      d.blockedSoFar(entry),
+		// A filtered reading is a partial one for the same reason a differential one is: without
+		// this the agent reads a search that found two things as a page with two things on it.
+		Partial: req.ChangesOnly || strings.TrimSpace(req.Find) != "",
+		Blocked: d.blockedSoFar(entry),
 	}, nil
 }
 
@@ -98,6 +100,15 @@ func (d *Driver) name(entry *session, collected []found, changesOnly bool) ([]br
 		element.Ref = ref
 		refs[ref] = one.key
 		reported[ref] = element
+
+		// Every control on the page is above this line and only the carried ones are below it. That
+		// is what makes `refs` a picture of the PAGE rather than of the last reading of it — a
+		// second page of controls used to replace the first, so following `controls_next` quietly
+		// invalidated every ref the agent was still holding — and it is what makes `gone` mean "not
+		// on the page" instead of "not in this slice of it".
+		if !one.carried {
+			continue
+		}
 
 		if changesOnly {
 			if before, seen := previous[ref]; seen && sameElement(before, element) {
@@ -240,6 +251,12 @@ type found struct {
 	element browser.Element
 	key     nodeKey
 	control bool
+	// carried says this line is in the answer. A control that a budget, a cursor or a search left
+	// out is still collected, because refs are minted from this list and a ref has to keep meaning
+	// the same element: dropping it here would make an act on something an EARLIER snapshot showed
+	// come back as a stale ref, which is a true sentence about the wrong thing — the element is on
+	// the page, and only this reading of it was filtered.
+	carried bool
 }
 
 // collect walks the tree in document order and decides what earns a line.
@@ -267,6 +284,25 @@ func collect(root *tree, req browser.SnapshotRequest) slice {
 	controlsSpent, controlsPassed := 0, 0
 	textCut, controlsCut := false, false
 
+	// says is the Find filter, and an absent one matches everything — which is every snapshot this
+	// file took before there was a filter at all.
+	//
+	// Substring and case-insensitive, deliberately: an agent searching a page is searching for words
+	// it read in that page or in the task, and a regular expression here would be a language to get
+	// wrong for a gain nobody asked for.
+	needle := strings.ToLower(strings.TrimSpace(req.Find))
+	says := func(parts ...string) bool {
+		if needle == "" {
+			return true
+		}
+		for _, part := range parts {
+			if strings.Contains(strings.ToLower(part), needle) {
+				return true
+			}
+		}
+		return false
+	}
+
 	// A paragraph and a table row are the same thing as far as the budget is concerned: both are
 	// what the page SAYS, and neither is something an act can name.
 	//
@@ -275,6 +311,9 @@ func collect(root *tree, req browser.SnapshotRequest) slice {
 	say := func(role, text string) {
 		switch {
 		case text == "" || textCut:
+		case !says(text):
+			// Filtered out, and not charged for: a search that spent the budget on what it discarded
+			// would answer a narrow question at the price of the whole page.
 		case passed < req.TextFrom:
 			passed += len(text)
 		case spent+len(text) > textBudget:
@@ -335,7 +374,21 @@ func collect(root *tree, req browser.SnapshotRequest) slice {
 			if !node.Ignored {
 				switch {
 				case isControl:
+					name := strings.TrimSpace(node.Name.Value)
+					value := strings.TrimSpace(node.Value.Value)
+					one := found{
+						element: browser.Element{
+							Role:  node.Role.Value,
+							Name:  name,
+							Value: value,
+							State: stateOf(node),
+						},
+						key:     nodeKey{session: t.session, backend: node.BackendDOMNodeID},
+						control: true,
+					}
 					switch {
+					case !says(node.Role.Value, name, value):
+						// Not what was asked for. Collected anyway — see found.carried.
 					case controlsCut:
 						// Past the cut nothing more, in the order the page has it.
 					case controlsPassed < req.ControlsFrom:
@@ -345,17 +398,9 @@ func collect(root *tree, req browser.SnapshotRequest) slice {
 					default:
 						controlsSpent++
 						controlsPassed++
-						elements = append(elements, found{
-							element: browser.Element{
-								Role:  node.Role.Value,
-								Name:  strings.TrimSpace(node.Name.Value),
-								Value: strings.TrimSpace(node.Value.Value),
-								State: stateOf(node),
-							},
-							key:     nodeKey{session: t.session, backend: node.BackendDOMNodeID},
-							control: true,
-						})
+						one.carried = true
 					}
+					elements = append(elements, one)
 				case isRow:
 					// The row as one line, and the text inside it suppressed below. Emitted here so
 					// it lands where the row is, which is the whole of what a table is.
