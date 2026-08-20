@@ -165,6 +165,7 @@ export const keys = {
     live: (turnId: number) => ["chats", "live", turnId] as const,
     /** Keyed by the query too: each keystroke is a different question, and its own cached answer. */
     files: (chatId: string, query: string) => ["chats", "files", chatId, query] as const,
+    commands: (chatId: string, query: string) => ["chats", "commands", chatId, query] as const,
   },
 
   council: {

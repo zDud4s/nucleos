@@ -9,6 +9,7 @@ import {
   useIdeConversation,
   useIdeSessions,
   useWireIdeSessionTools,
+  useChatCommands,
   useChatFiles,
   useLiveTurn,
   useLocalModel,
@@ -19,6 +20,7 @@ import {
   useStopTurn,
   type Brain,
   type ChatSummary,
+  type Command,
   type Exchange,
   type Mention,
   type IdeSession,
@@ -35,7 +37,7 @@ import {
   type Todo,
 } from "../lib/turns";
 import { blocks, lines, type Line as RichLine } from "../lib/rich";
-import { mentionAt, withMention } from "../lib/mention";
+import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
 import {
   Badge,
   Button,
@@ -1212,35 +1214,46 @@ const MESSAGE_SENTENCES: Record<string, string> = {
   errand_not_answering: "the errand behind this conversation is not answering right now",
 };
 
+/**
+ * One thing the list can offer, whichever gesture opened it.
+ *
+ * A `@` and a `/` are the same move — type a sigil, narrow a list, choose — and the arrows, the
+ * Enter and the highlight are identical for both. Only what is being listed differs, so that is the
+ * only thing this carries: a strong half, a quiet half, and what picking it does.
+ */
+interface Choice {
+  key: string;
+  primary: string;
+  secondary: string;
+  chosen: () => void;
+}
+
 function Composer({ chatId }: { chatId: string }) {
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
-  // Escape closes the list without closing the mention: the `@` and what follows it stay in the
-  // box, being typed. Held as the query it was dismissed AT, so the next letter — a different
-  // question — opens it again rather than leaving somebody stuck with a feature they turned off.
+  // Escape closes the list without closing what is being typed: the sigil and what follows it stay
+  // in the box. Held as the query it was dismissed AT, so the next letter — a different question —
+  // opens it again rather than leaving somebody stuck with a feature they turned off.
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [highlight, setHighlight] = useState(0);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
 
-  const at = mentionAt(text, caret);
-  const asking = at !== null && at.query !== dismissed ? at.query : null;
-  const files = useChatFiles(chatId, asking);
-  const hits = asking === null ? [] : (files.data?.hits ?? []);
-  const open = asking !== null && (hits.length > 0 || files.data?.rooted === false);
+  // Never both: a command is only ever the first character of the box, and a mention needs
+  // whitespace before it, so a live `/` means everything up to the caret has no space in it and
+  // there is no mention to find. Computed separately all the same, because relying on that
+  // reasoning silently would be relying on two functions in another module agreeing forever.
+  const mention = mentionAt(text, caret);
+  const command = commandAt(text, caret);
+  const live = (at: { query: string } | null) =>
+    at !== null && at.query !== dismissed ? at.query : null;
 
-  // One place, two ways in: the button and the key. Duplicating the guards into the key handler is
-  // how one of them ends up sending an empty turn six months from now.
-  const say = () => {
-    if (text.trim() === "" || send.isPending) return;
-    send.mutate(text.trim(), { onSuccess: () => setText("") });
-  };
+  const files = useChatFiles(chatId, command === null ? live(mention) : null);
+  const commands = useChatCommands(chatId, live(command));
 
-  // Writing the path back means moving the caret, and only the element knows how. Set on the next
+  // Writing the choice back means moving the caret, and only the element knows how. Set on the next
   // frame because React has not re-rendered the new value yet at the moment this is called.
-  const pick = (hit: Mention) => {
-    if (at === null) return;
-    const written = withMention(text, at, hit.path, hit.is_dir);
+  const write = (written: { text: string; caret: number }) => {
     setText(written.text);
     setDismissed(null);
     setHighlight(0);
@@ -1251,6 +1264,39 @@ function Composer({ chatId }: { chatId: string }) {
     });
   };
 
+  const choices: Choice[] =
+    command !== null && live(command) !== null
+      ? (commands.data?.commands ?? []).map((hit: Command) => ({
+          key: hit.name,
+          primary: `/${hit.name}${hit.hint === null ? "" : ` ${hit.hint}`}`,
+          // The source is worth saying: two commands can share a name, and which one runs depends
+          // on where it came from. Falls back to it when a command's file gives no description.
+          secondary: hit.description ?? hit.source,
+          chosen: () => write(withCommand(text, command, hit.name)),
+        }))
+      : mention !== null && live(mention) !== null
+        ? (files.data?.hits ?? []).map((hit: Mention) => ({
+            key: hit.path,
+            primary: `${hit.name}${hit.is_dir ? "/" : ""}`,
+            secondary: hit.path,
+            chosen: () => write(withMention(text, mention, hit.path, hit.is_dir)),
+          }))
+        : [];
+
+  // A file gesture over a conversation with no directory is the one case with something to say and
+  // nothing to list. A command gesture never has it: personal and plugin commands exist wherever
+  // the conversation runs.
+  const nowhere =
+    command === null && mention !== null && live(mention) !== null && files.data?.rooted === false;
+  const open = choices.length > 0 || nowhere;
+
+  // One place, two ways in: the button and the key. Duplicating the guards into the key handler is
+  // how one of them ends up sending an empty turn six months from now.
+  const say = () => {
+    if (text.trim() === "" || send.isPending) return;
+    send.mutate(text.trim(), { onSuccess: () => setText("") });
+  };
+
   return (
     <form
       className="chats-composer"
@@ -1259,13 +1305,17 @@ function Composer({ chatId }: { chatId: string }) {
         say();
       }}
     >
-      {open && (
-        <MentionList
-          hits={hits}
-          rooted={files.data?.rooted !== false}
-          truncated={files.data?.truncated === true}
+      {nowhere && (
+        <p className="chats-mentions-none">
+          this conversation has no directory, so there are no files to name here
+        </p>
+      )}
+      {choices.length > 0 && (
+        <Choices
+          label={command === null ? "Files to mention" : "Commands to run"}
+          choices={choices}
           highlight={highlight}
-          onPick={pick}
+          truncated={command === null && files.data?.truncated === true}
         />
       )}
       <label className="chats-field">
@@ -1281,38 +1331,38 @@ function Composer({ chatId }: { chatId: string }) {
             setDismissed(null);
             setHighlight(0);
           }}
-          // The caret moves without the text changing — arrows, a click, Home. A mention is read
-          // from where the caret IS, so every one of those has to be heard or the list goes stale
-          // against a position it no longer describes.
+          // The caret moves without the text changing — arrows, a click, Home. What is being typed
+          // is read from where the caret IS, so every one of those has to be heard or the list goes
+          // stale against a position it no longer describes.
           onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
           // Enter sends and Shift+Enter breaks the line, because that is what every chat anybody
           // has ever used does — and a textarea does the opposite by default, so the habit costs a
           // reach for the mouse on every single message.
           //
-          // While the list is open those same keys belong to it. This is not a special case bolted
-          // on: a list under the caret owns the arrows and the Enter for as long as it is showing,
-          // which is what every editor does and what the hand already expects.
+          // While a list is open those same keys belong to it. Not a special case bolted on: a list
+          // under the caret owns the arrows and the Enter for as long as it is showing, which is
+          // what every editor does and what the hand already expects.
           onKeyDown={(event) => {
-            if (open && hits.length > 0) {
+            if (choices.length > 0) {
               if (event.key === "ArrowDown") {
                 event.preventDefault();
-                setHighlight((was) => (was + 1) % hits.length);
+                setHighlight((was) => (was + 1) % choices.length);
                 return;
               }
               if (event.key === "ArrowUp") {
                 event.preventDefault();
-                setHighlight((was) => (was - 1 + hits.length) % hits.length);
+                setHighlight((was) => (was - 1 + choices.length) % choices.length);
                 return;
               }
               if (event.key === "Enter" || event.key === "Tab") {
                 event.preventDefault();
-                pick(hits[Math.min(highlight, hits.length - 1)]);
+                choices[Math.min(highlight, choices.length - 1)].chosen();
                 return;
               }
             }
             if (open && event.key === "Escape") {
               event.preventDefault();
-              setDismissed(asking);
+              setDismissed(live(command) ?? live(mention));
               return;
             }
             if (event.key !== "Enter" || event.shiftKey) return;
@@ -1332,55 +1382,41 @@ function Composer({ chatId }: { chatId: string }) {
 }
 
 /**
- * The names an `@` offers, above the box rather than below it.
+ * What the caret is offering, above the box rather than below it.
  *
  * Above because the box sits at the bottom of the window: a list drawn under it would open off the
  * edge of the panel, which is the one place it cannot be read.
  *
- * A conversation with nowhere to look says so instead of showing an empty list. The two are
- * different facts — "nothing matches" sends somebody hunting for a typo, "there is no directory"
- * tells them why nothing will ever match — and only one of them is true here.
+ * One component for files and for commands. The two are the same gesture with different contents,
+ * and a second copy of this would be a second place for the highlight, the keys and the truncation
+ * note to drift apart.
  */
-function MentionList({
-  hits,
-  rooted,
-  truncated,
+function Choices({
+  label,
+  choices,
   highlight,
-  onPick,
+  truncated,
 }: {
-  hits: Mention[];
-  rooted: boolean;
-  truncated: boolean;
+  label: string;
+  choices: Choice[];
   highlight: number;
-  onPick: (hit: Mention) => void;
+  truncated: boolean;
 }) {
-  if (!rooted) {
-    return (
-      <p className="chats-mentions-none">
-        this conversation has no directory, so there are no files to name here
-      </p>
-    );
-  }
   return (
-    <ul className="chats-mentions" aria-label="Files to mention">
-      {hits.map((hit, index) => (
-        <li key={hit.path}>
+    <ul className="chats-mentions" aria-label={label}>
+      {choices.map((choice, index) => (
+        <li key={choice.key}>
           <button
             type="button"
-            className={
-              index === highlight ? "chats-mention chats-mention-on" : "chats-mention"
-            }
+            className={index === highlight ? "chats-mention chats-mention-on" : "chats-mention"}
             aria-current={index === highlight}
             // The mouse must not take focus off the box: the caret is the whole state this list
             // reads from, and a blur would move it before the click ever lands.
             onMouseDown={(event) => event.preventDefault()}
-            onClick={() => onPick(hit)}
+            onClick={choice.chosen}
           >
-            <span className="chats-mention-name">
-              {hit.name}
-              {hit.is_dir && "/"}
-            </span>
-            <span className="chats-mention-path">{hit.path}</span>
+            <span className="chats-mention-name">{choice.primary}</span>
+            <span className="chats-mention-path">{choice.secondary}</span>
           </button>
         </li>
       ))}

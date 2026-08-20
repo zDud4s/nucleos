@@ -69,3 +69,35 @@ export function withMention(
     caret: at.from + written.length,
   };
 }
+
+/**
+ * The command being typed at `caret`, or nothing.
+ *
+ * Only at the very start of the box, which is not a simplification — it is what the CLI does. A
+ * slash anywhere else is passed through as ordinary text, so a picker that opened mid-sentence
+ * would offer to insert something that then does nothing at all. Verified before this was written:
+ * `claude -p "/thing"` answers `Launching skill: thing`, and only for a leading slash.
+ *
+ * Whitespace ends it, exactly as it ends a mention: once an argument has begun, the name is
+ * finished and the list has nothing left to narrow.
+ */
+export function commandAt(text: string, caret: number): Mentioning | null {
+  if (!text.startsWith("/") || caret < 1) return null;
+  const typed = text.slice(1, caret);
+  if (/\s/.test(typed)) return null;
+  return { query: typed, from: 0, to: caret };
+}
+
+/**
+ * The box with `name` written where the half-typed command was.
+ *
+ * Always a trailing space and never a slash, unlike a file: a command is a whole thing, and what
+ * comes after it is its argument rather than more of its name.
+ */
+export function withCommand(text: string, at: Mentioning, name: string): Written {
+  const written = `/${name} `;
+  return {
+    text: text.slice(0, at.from) + written + text.slice(at.to),
+    caret: at.from + written.length,
+  };
+}

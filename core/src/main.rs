@@ -14,6 +14,7 @@ mod calendar;
 mod chats;
 mod classifier;
 mod collision;
+mod commands;
 mod concurrency;
 mod config;
 mod contacts;

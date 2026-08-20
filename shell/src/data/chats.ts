@@ -173,6 +173,19 @@ export interface Mentions {
   truncated: boolean;
 }
 
+/** Where a command came from, which is the only thing explaining two of the same name. */
+export type CommandSource = "project" | "personal" | "plugin";
+
+/** One slash command a conversation can run. */
+export interface Command {
+  /** What is typed after the slash: `name`, `dir:name`, or `plugin:name`. */
+  name: string;
+  description: string | null;
+  /** What the command expects after its name, when its file says. */
+  hint: string | null;
+  source: CommandSource;
+}
+
 /** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */
 export interface NewChat {
   brain?: Brain;
@@ -404,6 +417,30 @@ export function useChatFiles(chatId: string, query: string | null) {
     placeholderData: keepPreviousData,
     // A checkout does not change between keystrokes. Re-walking it for a query already asked would
     // be a directory walk to learn nothing.
+    staleTime: 10_000,
+    retry: false,
+  });
+}
+
+/**
+ * The slash commands this conversation can run, narrowed by what has been typed.
+ *
+ * `null` disables it, exactly as the file completion does: no command is being typed, so nothing is
+ * asked. No `rooted` in the answer — a conversation with no directory still has the person's own
+ * commands and every installed plugin's, so there is no "nowhere to look" to report.
+ */
+export function useChatCommands(chatId: string, query: string | null) {
+  return useQuery({
+    queryKey: keys.chats.commands(chatId, query ?? ""),
+    queryFn: () =>
+      apiFetch<{ commands: Command[] }>(
+        `/assistant/chats/${encodeURIComponent(chatId)}/commands?q=${encodeURIComponent(query ?? "")}`,
+      ),
+    enabled: query !== null,
+    placeholderData: keepPreviousData,
+    // Short, not zero: a command is a file somebody may have just written, and a picker that needed
+    // a restart to notice it is a picker people stop trusting. Ten seconds is long enough to spare
+    // the disk between keystrokes and short enough that a new command shows up while you look.
     staleTime: 10_000,
     retry: false,
   });

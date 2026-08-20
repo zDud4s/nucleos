@@ -22,7 +22,7 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary, Conversation, IdeSession, Mention } from "../data/chats";
+import type { ChatSummary, Command, Conversation, IdeSession, Mention } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
@@ -113,6 +113,8 @@ function chatsFetch(
     handed?: Record<string, Array<[string, string]>>;
     /** The names each conversation offers for an `@`, by chat id. Absent means it has no directory. */
     files?: Record<string, Mention[]>;
+    /** The slash commands each conversation offers, by chat id. */
+    commands?: Record<string, Command[]>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -154,6 +156,12 @@ function chatsFetch(
     }
     // Before the transcript match below: that pattern would not hit a path with a further
     // segment, but the order is what makes that true rather than a coincidence.
+    const commands = /^\/assistant\/chats\/([^/?]+)\/commands\?q=(.*)$/.exec(path);
+    if (commands !== null) {
+      const offered = opts.commands?.[decodeURIComponent(commands[1])] ?? [];
+      const query = decodeURIComponent(commands[2]).toLowerCase();
+      return { commands: offered.filter((hit) => hit.name.toLowerCase().includes(query)) };
+    }
     const files = /^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
     if (files !== null) {
       const offered = opts.files?.[decodeURIComponent(files[1])];
@@ -870,6 +878,106 @@ describe("naming a file with @", () => {
         daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/message"),
       ).toBe(true);
     });
+  });
+});
+
+/* -------------------------------------------------------- slash commands -- */
+
+describe("running a command with /", () => {
+  const commit: Command = {
+    name: "commit",
+    description: "Ship it",
+    hint: "[message]",
+    source: "project",
+  };
+  const brainstorm: Command = {
+    name: "superpowers:brainstorm",
+    description: null,
+    hint: null,
+    source: "plugin",
+  };
+
+  const withCommands = (commands: Command[]) => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })] },
+        { commands: { "c-1": commands } },
+      ),
+    );
+    return renderChats("/chats/c-1");
+  };
+
+  it("offers commands once a slash is typed, with what each one expects", async () => {
+    await withCommands([commit]);
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/comm", selectionStart: 5 } });
+
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+    // The hint is part of what is shown: a command taking an argument and one taking none look
+    // identical without it, and the difference is the whole of how you use it.
+    expect(within(list).getByText("/commit [message]")).toBeTruthy();
+    expect(within(list).getByText("Ship it")).toBeTruthy();
+  });
+
+  it("writes the command and a space, so an argument can follow", async () => {
+    await withCommands([commit]);
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/comm", selectionStart: 5 } });
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+    fireEvent.click(within(list).getByRole("button", { name: /commit/ }));
+
+    await waitFor(() => {
+      expect((box as HTMLTextAreaElement).value).toBe("/commit ");
+    });
+  });
+
+  // The CLI only expands a slash command at the very start of a message. Offering one mid-sentence
+  // would insert text that then does nothing at all.
+  it("stays shut for a slash that is not the first character", async () => {
+    await withCommands([commit]);
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "olha o /comm", selectionStart: 12 } });
+
+    await screen.findByLabelText("Message");
+    expect(screen.queryByRole("list", { name: "Commands to run" })).toBeNull();
+  });
+
+  // A command's file need not describe itself. Where it came from is the next most useful thing,
+  // and it is the thing that explains two commands sharing a name.
+  it("falls back to where a command came from when its file says nothing", async () => {
+    await withCommands([brainstorm]);
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/brain", selectionStart: 6 } });
+
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+    expect(within(list).getByText("plugin")).toBeTruthy();
+  });
+
+  // Two gestures, one list, and they must not both claim it: a live slash means everything up to
+  // the caret has no space in it, so there is no mention to find.
+  it("never offers files and commands at the same time", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })] },
+        {
+          commands: { "c-1": [commit] },
+          files: { "c-1": [{ path: "core/src/commit.rs", name: "commit.rs", is_dir: false }] },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/comm", selectionStart: 5 } });
+
+    await screen.findByRole("list", { name: "Commands to run" });
+    expect(screen.queryByRole("list", { name: "Files to mention" })).toBeNull();
   });
 });
 

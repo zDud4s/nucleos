@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mentionAt, withMention } from "./mention";
+import { commandAt, mentionAt, withCommand, withMention } from "./mention";
 
 /* ------------------------------------------------------------- mentionAt -- */
 
@@ -79,5 +79,57 @@ describe("withMention", () => {
 
     expect(next.text).toBe("@core/src/");
     expect(next.caret).toBe(10);
+  });
+});
+
+/* ------------------------------------------------------------- commandAt -- */
+
+describe("commandAt", () => {
+  it("finds a command being typed at the start of the box", () => {
+    expect(commandAt("/comm", 5)).toEqual({ query: "comm", from: 0, to: 5 });
+  });
+
+  it("finds a bare slash as an empty query, which is where the list opens", () => {
+    expect(commandAt("/", 1)).toEqual({ query: "", from: 0, to: 1 });
+  });
+
+  // The CLI only expands a slash command at the very start of a message. A picker that opened
+  // mid-sentence would offer to insert something that then does nothing at all.
+  it("is nothing when the slash is not the first character", () => {
+    expect(commandAt("olha /comm", 10)).toBeNull();
+    expect(commandAt(" /comm", 6)).toBeNull();
+  });
+
+  it("is nothing once the name is finished and an argument has begun", () => {
+    expect(commandAt("/commit a mensagem", 18)).toBeNull();
+  });
+
+  // A namespace is part of the name, and typing the colon must not close the list.
+  it("keeps reading through a namespace separator", () => {
+    expect(commandAt("/superpowers:brain", 18)).toEqual({
+      query: "superpowers:brain",
+      from: 0,
+      to: 18,
+    });
+  });
+
+  it("stops at the caret", () => {
+    expect(commandAt("/commit", 4)).toEqual({ query: "com", from: 0, to: 4 });
+  });
+});
+
+describe("withCommand", () => {
+  it("writes the command and a space, so an argument can follow", () => {
+    const next = withCommand("/comm", { query: "comm", from: 0, to: 5 }, "commit");
+
+    expect(next.text).toBe("/commit ");
+    expect(next.caret).toBe(8);
+  });
+
+  it("keeps whatever was after the caret", () => {
+    const next = withCommand("/comm tudo", { query: "comm", from: 0, to: 5 }, "commit");
+
+    expect(next.text).toBe("/commit  tudo");
+    expect(next.caret).toBe(8);
   });
 });

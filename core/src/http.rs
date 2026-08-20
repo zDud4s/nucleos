@@ -223,6 +223,12 @@ pub fn build_router(state: AppState) -> Router {
         // The names an `@` in the composer completes against. A segment deeper than the chat
         // itself, and rooted at that chat's own directory rather than at anything the caller sends.
         .route("/assistant/chats/{chat_id}/files", get(get_chat_files))
+        // And the commands a `/` completes against. Beside `/files` because it is the same gesture
+        // at the same place, answered from a different part of the same directory.
+        .route(
+            "/assistant/chats/{chat_id}/commands",
+            get(get_chat_commands),
+        )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
@@ -3494,6 +3500,50 @@ struct MentionsOut {
     rooted: bool,
     #[serde(flatten)]
     found: crate::mentions::Found,
+}
+
+/// What a conversation offers for a `/`.
+///
+/// No `rooted` here, unlike the file route beside it, and the difference is real: a conversation
+/// with no directory still has the person's own commands and every installed plugin's. Nowhere to
+/// look is a thing that can only be true of files.
+#[derive(serde::Serialize)]
+struct CommandsOut {
+    commands: Vec<crate::commands::Command>,
+}
+
+/// The slash commands this conversation can run.
+///
+/// Three sources, read on the request rather than cached: a command is a file somebody just wrote,
+/// and a picker that needed a daemon restart to notice it would be a picker people stop trusting.
+/// Measured on this machine at about 7ms for the whole sweep, which is a keystroke's worth.
+async fn get_chat_commands(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<MentionQuery>,
+) -> Result<Json<CommandsOut>, StatusCode> {
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading where a conversation runs failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let typed: String = query.q.chars().take(MENTION_QUERY_LIMIT).collect();
+    // Off the async runtime, as the file walk is: this reads several directories and every command
+    // file's front matter, which is short but is still disk on a request thread.
+    let commands = tokio::task::spawn_blocking(move || {
+        let available = crate::commands::available(
+            cwd.as_deref().map(std::path::Path::new),
+            crate::commands::home().as_deref(),
+        );
+        crate::commands::matching(&available, &typed)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(CommandsOut { commands }))
 }
 
 /// Names under this conversation's own working directory, for completing an `@`.
@@ -9421,6 +9471,73 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/assistant/chats/never-opened/files?q=parser")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A conversation offers the commands in its own directory, by the name they are typed as.
+    ///
+    /// Asked of the CLI before any of it was built: `claude -p "/thing"` EXPANDS the command rather
+    /// than passing it through as text — the run answers `Launching skill: thing` and the file's
+    /// body arrives as the prompt. Without that this picker would be inserting text the model reads
+    /// literally, which is a feature that looks right and does nothing.
+    #[tokio::test]
+    async fn a_conversation_offers_the_commands_in_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/commands/commit.md"),
+            "---\ndescription: Ship it\nargument-hint: [message]\n---\n\nCommit and push.\n",
+        )
+        .unwrap();
+
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES ('with-commands', 'cloud', '2026-08-20T10:00:00Z', ?)",
+        )
+        .bind(dir.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/with-commands/commands?q=comm")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let mine = body["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["source"] == "project")
+            .expect("the project's own command was not offered");
+        assert_eq!(mine["name"], "commit");
+        assert_eq!(mine["description"], "Ship it");
+        assert_eq!(mine["hint"], "[message]");
+    }
+
+    /// A conversation nobody opened is a 404 here too, and for the same reason as its files.
+    #[tokio::test]
+    async fn offering_commands_for_a_conversation_that_does_not_exist_says_so() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/never-opened/commands?q=")
                     .header("Authorization", "Bearer test-token")
                     .body(Body::empty())
                     .unwrap(),
