@@ -285,18 +285,49 @@ const ORPHANED_SLOTS_SQL: &str = "DELETE FROM project_slots
 pub struct HeldSlot {
     pub project_id: String,
     pub slot: i64,
-    /// `'run'` or `'job'`. A `String` and not `Owner`, because this leaves over JSON and the
-    /// consumer is an interface that only wants to know which tab to link to.
+    /// `'run'`, `'job'` or `'item'`. A `String` and not `Owner`, because this leaves over JSON and
+    /// the consumer is an interface that only wants to know which tab to link to.
     pub owner_kind: String,
     pub owner_id: i64,
     pub claimed_at: String,
+    /// The job an ITEM belongs to, and `None` for every other kind of owner.
+    ///
+    /// **This and the two below are what let a screen describe an item at all.** `owner_id` is
+    /// `job_items.id` — a number from a sequence nobody reads, which the fleet card could only
+    /// print raw. There is no listing of items by id anywhere in the API to look it up in, and
+    /// there should not be: an item is a step of a job, and the way to reach one is through the job
+    /// that owns it. So the join happens here, once, beside the row that needs it.
+    ///
+    /// Three fields because they answer three questions a card has to answer at once: which job to
+    /// point at, which of its items this is, and whether the slot it holds is busy or stuck.
+    pub job_id: Option<i64>,
+    /// Which item of that job this is, counting from zero. `None` for every other kind of owner.
+    pub ordinal: Option<i64>,
+    /// What that item is doing. `None` for every other kind of owner.
+    ///
+    /// Not redundant with "it holds a slot". A slot is held from the claim until the item goes
+    /// terminal, and that window covers `running`, `merging`, `conflicted` and `reverted` — one of
+    /// which is work in progress and one of which is work waiting on a person. A capacity screen
+    /// that cannot tell those apart cannot answer the question it exists for: is this slot busy or
+    /// is it stuck.
+    pub item_status: Option<String>,
 }
 
 /// Every slot taken right now, in project and number order.
+///
+/// The owner-kind predicate is in the `ON` clause and not in a `WHERE`, for the reason
+/// `ONE_SUMMARY_SQL` gives about its own join: in a `WHERE` it would turn the left join into an
+/// inner one and drop every slot held by a run or a job — which is nearly all of them.
 pub async fn held_slots(pool: &SqlitePool) -> sqlx::Result<Vec<HeldSlot>> {
     sqlx::query_as(
-        "SELECT project_id, slot, owner_kind, owner_id, claimed_at
-         FROM project_slots ORDER BY project_id, slot",
+        "SELECT project_slots.project_id, project_slots.slot, project_slots.owner_kind,
+                project_slots.owner_id, project_slots.claimed_at,
+                job_items.job_id AS job_id, job_items.ordinal AS ordinal,
+                job_items.status AS item_status
+         FROM project_slots
+         LEFT JOIN job_items
+           ON project_slots.owner_kind = 'item' AND job_items.id = project_slots.owner_id
+         ORDER BY project_slots.project_id, project_slots.slot",
     )
     .fetch_all(pool)
     .await
@@ -469,6 +500,60 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid()
+    }
+
+    /// A slot held by an item carries the job it is a step of, and the ones held by anything else
+    /// carry nothing.
+    ///
+    /// **Both halves, because the join is the kind that quietly loses rows.** The owner-kind
+    /// predicate is in the `ON` clause; moved to a `WHERE` it turns the left join into an inner one
+    /// and every slot held by a run or a job — nearly all of them — vanishes from the readout. That
+    /// failure looks like an empty fleet screen, not like a missing field.
+    ///
+    /// The pair is what makes an item describable at all. `owner_id` for an item is
+    /// `job_items.id`, a number no route lists and no reader recognises, and the screen could only
+    /// ever print it raw.
+    #[tokio::test]
+    async fn a_slot_held_by_an_item_says_which_job_and_which_item_it_is() {
+        let pool = test_pool().await;
+        let job = seed_job(&pool, "project-a", "implementing").await;
+        let item: i64 = sqlx::query_scalar(
+            "INSERT INTO job_items (job_id, ordinal, description, status)
+             VALUES (?, 2, 'an item', 'running') RETURNING id",
+        )
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        claim(&pool, "project-a", Owner::Job(job)).await.unwrap();
+        claim(&pool, "project-a", Owner::Item(item)).await.unwrap();
+
+        let held = held_slots(&pool).await.unwrap();
+
+        let of_item = held
+            .iter()
+            .find(|slot| slot.owner_kind == "item")
+            .expect("the item's slot is in the readout");
+        assert_eq!(of_item.job_id, Some(job));
+        assert_eq!(
+            of_item.ordinal,
+            Some(2),
+            "counting from zero, as the row does"
+        );
+        assert_eq!(
+            of_item.item_status.as_deref(),
+            Some("running"),
+            "a slot is held from the claim until the item is terminal, so what it is DOING is the \
+             difference between a slot that is busy and one that is stuck"
+        );
+
+        let of_job = held
+            .iter()
+            .find(|slot| slot.owner_kind == "job")
+            .expect("the job's slot did not survive the join");
+        assert_eq!(of_job.job_id, None, "a job is not a step of anything");
+        assert_eq!(of_job.ordinal, None);
+        assert_eq!(of_job.item_status, None);
     }
 
     /// The numbers start at zero and go up, which is the whole mechanism: the second claimant does

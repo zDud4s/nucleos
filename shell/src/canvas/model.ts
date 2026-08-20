@@ -58,6 +58,8 @@ export function ownerKey(slot: HeldSlot): string {
 export type SlotDetail =
   | { kind: "job"; job: Job }
   | { kind: "run"; run: RunSearchResult }
+  /** One item of a job a team directs, named by the job it belongs to. */
+  | { kind: "item"; job: Job; ordinal: number; status: string }
   | { kind: "unknown" }
   | { kind: "orphaned" };
 
@@ -68,14 +70,19 @@ export type SlotDetail =
  * for the reason {@link ownerKey} gives: a join on the id would give a run's
  * card the description of the job that shares its number.
  *
- * **An item is named and not resolved, and the arm is explicit for that reason.**
- * It used to be the `else` — anything that was not a job was looked up among the
- * runs — so an item's slot took the description of whatever run happened to
- * carry its number, which is the exact defect the paragraph above is about. The
- * page has no listing of items by id to look it up in: `GET /jobs/<id>` carries
- * them, and the id on the slot does not say which job to ask. So the honest
- * answer is `unknown` — *slot taken, detail unavailable* — and not `orphaned`,
- * which claims a listing answered without it.
+ * **An item is resolved through its JOB and never through its own id**, and the
+ * arm is explicit for that reason. It used to be the `else` — anything that was
+ * not a job was looked up among the runs — so an item's slot took the
+ * description of whatever run happened to carry its number, which is exactly the
+ * defect the paragraph above is about. And `owner_id` for an item is
+ * `job_items.id`, which is a number from a sequence nobody reads and which no
+ * route lists. What makes this answerable is the pair the daemon joins onto the
+ * slot: the job to point at, and which of its items this is.
+ *
+ * An item whose `job_id` is absent has lost the row it was a step of, which is a
+ * leaked slot rather than a description problem — `unknown` until the sweep
+ * takes it back, because `orphaned` is a claim about a LISTING that answered
+ * without it, and no listing was consulted.
  */
 export function slotDetail(
   slot: HeldSlot,
@@ -89,7 +96,14 @@ export function slotDetail(
     if (found !== undefined) return { kind: "job", job: found };
     return jobs.length >= limit ? { kind: "unknown" } : { kind: "orphaned" };
   }
-  if (slot.owner_kind === "item") return { kind: "unknown" };
+  if (slot.owner_kind === "item") {
+    const { job_id: owner, ordinal, item_status: status } = slot;
+    if (owner === null || ordinal === null || status === null) return { kind: "unknown" };
+    if (jobs === undefined) return { kind: "unknown" };
+    const found = jobs.find((job) => job.id === owner);
+    if (found !== undefined) return { kind: "item", job: found, ordinal, status };
+    return jobs.length >= limit ? { kind: "unknown" } : { kind: "orphaned" };
+  }
   if (runs === undefined) return { kind: "unknown" };
   const found = runs.find((run) => run.id === slot.owner_id);
   if (found !== undefined) return { kind: "run", run: found };

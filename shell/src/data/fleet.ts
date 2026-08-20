@@ -43,6 +43,27 @@ export interface HeldSlot {
   owner_kind: "run" | "job" | "item";
   owner_id: number;
   claimed_at: string;
+  /**
+   * The job an ITEM belongs to, and `null` for every other kind of owner.
+   *
+   * Joined by the daemon rather than looked up here, because there is nothing
+   * here to look it up in: `owner_id` for an item is `job_items.id`, and no
+   * route lists items by id. Nor should one — an item is a step of a job, and
+   * the way to reach one is through the job that owns it.
+   */
+  job_id: number | null;
+  /** Which item of that job, counting from zero. `null` for the other kinds. */
+  ordinal: number | null;
+  /**
+   * What that item is doing, and `null` for the other kinds.
+   *
+   * Not the same question as "does it hold a slot". A slot is held from the
+   * claim until the item is terminal, and that window covers `running`,
+   * `merging`, `conflicted` and `reverted` — one of which is work in progress
+   * and one of which is work waiting on a person. A capacity screen that cannot
+   * tell those apart cannot say whether a slot is busy or stuck.
+   */
+  item_status: string | null;
 }
 
 /** Whose tree an overlap belongs to. Job ids and run ids collide, so the pair is the identity. */
