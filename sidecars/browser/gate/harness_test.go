@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +103,25 @@ func newSite(t *testing.T) *site {
 		s.note(r)
 		fmt.Fprint(w, "ok")
 	})
+	// The other half of the same rule: a search box. Same page shape as /form, same button, and the
+	// only difference is the one the fence is supposed to care about. It carries a filled field
+	// rather than an empty form because what has to arrive at the server is the FIELD — a submission
+	// that navigates to /found and loses the query is a submission in name only.
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>search</title>
+			<form id=f method=get action="/found">
+				<label>Query <input id=q name=q value="invoices"></label>
+				<button id=go type=submit>Search</button>
+			</form>`)
+	})
+	mux.HandleFunc("/found", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>found</title><h1>Results for %s</h1>`,
+			template.HTMLEscapeString(r.URL.Query().Get("q")))
+	})
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Disposition", `attachment; filename="report.txt"`)
@@ -156,11 +176,13 @@ func newSite(t *testing.T) *site {
 	})
 
 	// A page with one link to wherever the query string says. It exists for the reporting half of
-	// spec §6.2 and not for the blocking half, and the distinction is the whole reason it is a link
-	// and not the form above: the injected CSP carries `form-action 'none'`, so a form POST is
-	// stopped twice over and the two stops race. Nothing in `fence.Directives` bounds a top-level
-	// navigation — there is no `navigate-to` in it — so a click here leaves exactly one mechanism
-	// standing, which is the only way an assertion about WHAT THE AGENT IS TOLD can be deterministic.
+	// spec §6.2 and not for the blocking half, and it was a link and not the form above because the
+	// injected CSP carried `form-action 'none'`, so a form POST was stopped twice over and the two
+	// stops raced. That is no longer true — the directive admits http: and https: now, and a
+	// same-origin POST meets the method rule alone — so the form would serve here too. It stays a
+	// link because nothing in `fence.Directives` bounds a top-level navigation at all (there is no
+	// `navigate-to` in it), which makes this the one channel with a single mechanism standing by
+	// construction rather than by the current value of a directive.
 	// A page with prose, a filled box and a ticked control, for the snapshot group. It is deliberately
 	// ordinary HTML with no ARIA: what matters is what Chromium's own accessibility tree makes of a
 	// page nobody wrote for a machine, which is every page the agent will actually meet.

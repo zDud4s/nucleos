@@ -310,7 +310,15 @@ type Consequence string
 const (
 	// ConsequenceMethod — anything that is not GET or HEAD (spec §6.2).
 	ConsequenceMethod Consequence = "non-get-method"
-	// ConsequenceForm — a form submission, whatever its method.
+	// ConsequenceForm — a form submission with a method that has a consequence. It is the same rule
+	// as ConsequenceMethod above and a better name for it: a non-GET that produces a DOCUMENT is a
+	// form in all but name, and telling the agent "that button submits a form" is worth more than
+	// telling it "something was blocked".
+	//
+	// "Whatever its method" is what this used to say, and it is no longer true. A GET form is a
+	// document GET — the same request a link to action?fields would make — and it goes through, as
+	// the fence's other rules judge any navigation: refused for its origin if the profile does not
+	// admit the host, allowed otherwise. See fence/csp.go for why the CSP stopped saying otherwise.
 	ConsequenceForm Consequence = "form-submission"
 	// ConsequenceChannel — a channel that is not HTTP(S): WebSocket, WebRTC (spec §6.2, §6.2b).
 	ConsequenceChannel Consequence = "non-http-channel"

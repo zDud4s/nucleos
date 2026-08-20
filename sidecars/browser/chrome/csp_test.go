@@ -7,6 +7,7 @@ import (
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp/cdptest"
+	"nucleosbrowser/fence"
 )
 
 // refusedBy is the sentence Chromium writes to its own log when our CSP stops something.
@@ -17,6 +18,20 @@ func refusedBy(what, url, directive string) map[string]any {
 		"text": "Refused to " + what + " '" + url + "' because it violates the following " +
 			"Content Security Policy directive: \"" + directive + "\".",
 	}}
+}
+
+// formActionDirective is the form-action clause exactly as the fence sends it.
+//
+// Read from fence.Directives rather than written out, because `violation` matches the whole
+// `directive value` pair against what the fence actually ships: a literal here would keep passing
+// after someone changed the policy, asserting a route for a sentence Chromium would never print.
+func formActionDirective() string {
+	for _, one := range strings.Split(fence.Directives, ";") {
+		if trimmed := strings.TrimSpace(one); strings.HasPrefix(trimmed, "form-action") {
+			return trimmed
+		}
+	}
+	return "form-action"
 }
 
 func snapshotOf(t *testing.T, driver *Driver, id browser.SessionID) browser.Snapshot {
@@ -112,17 +127,23 @@ func TestABlockedWebSocketKeepsItsOwnName(t *testing.T) {
 
 // TestAFormTheCSPStoppedReachesTheActThatCausedIt.
 //
-// This is the one that used to come back as "done". A POST is stopped twice — by the method rule and
-// by `form-action 'none'` — and the two race inside Chrome; when the CSP won there was no request,
-// so nothing to report. The gate test that should have caught it had its assertion removed, with a
-// comment recording exactly this. A form submission is always caused by an act, so it belongs on the
-// act and not on the reading.
+// This is the one that used to come back as "done". A POST was stopped twice — by the method rule
+// and by `form-action 'none'` — and the two raced inside Chrome; when the CSP won there was no
+// request, so nothing to report. The gate test that should have caught it had its assertion removed,
+// with a comment recording exactly this. A form submission is always caused by an act, so it belongs
+// on the act and not on the reading.
+//
+// The directive is no longer 'none' (fence/csp.go), so the race that produced the bug is gone and
+// what remains here is the ROUTE: a form-action violation lands on the act. It fires for a form
+// aimed somewhere off the network now — blob:, in practice — which is rare and is exactly why the
+// path needs a test rather than a witness. The value is taken from the real one so that changing
+// the directive cannot leave this asserting a string Chromium will never print.
 func TestAFormTheCSPStoppedReachesTheActThatCausedIt(t *testing.T) {
 	fake, driver := connected(t)
 	id := withRef(t, fake, driver)
 	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) {
 		fake.Emit("S1", "Log.entryAdded",
-			refusedBy("send form data to", "https://example.org/submit", "form-action 'none'"))
+			refusedBy("send form data to", "blob:https://example.org/9f2c", formActionDirective()))
 		return map[string]any{}, nil
 	})
 

@@ -110,11 +110,16 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	//
 	// It used to fail about one run in three, and the comment blamed the settle window. MEASURED,
 	// 2026-08-16, against the pinned build: twelve consecutive acts over 16.5s never produced a
-	// refusal either, so the window was never the reason. A form POST is stopped TWICE — by the
-	// method rule, and by `form-action 'none'` in the CSP the fence injects — and the two race
+	// refusal either, so the window was never the reason. A form POST was stopped TWICE — by the
+	// method rule, and by `form-action 'none'` in the CSP the fence injected — and the two raced
 	// inside Chrome. When the CSP won, the renderer abandoned the submission before a request
 	// existed, so Fetch never paused and the fence had nothing to say. The stronger outcome wore
 	// the weaker report, and the assertion was dropped rather than the silence fixed.
+	//
+	// Past tense throughout, now. `form-action` admits http: and https: (fence/csp.go), this form is
+	// same-origin, and so the method rule is the only thing standing here — the race is not survived,
+	// it is gone. Which makes this the deterministic half of the pair: the test below submits the
+	// same shape of form with a method that has no consequence, and it goes through.
 	//
 	// It is back because the silence is fixed: the CSP layer now speaks too (chrome/csp.go), and
 	// both racers answer under the same name. Which one wins no longer changes what the agent hears,
@@ -162,6 +167,76 @@ func TestAFormSubmissionDoesNotLeave(t *testing.T) {
 	}
 	if !site.reached("POST /submit", settle) {
 		t.Fatal("the POST did not arrive with the fence off either; the test proves nothing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 2a — a form whose method has no consequence is submitted.
+// ---------------------------------------------------------------------------
+
+// TestASearchFormIsSubmittedAndItsAnswerIsRead is the other half of the rule above, and the pair to
+// it: the same page shape, the same button, and the only difference is the one §6.2 says the
+// boundary is drawn on.
+//
+// For a long time neither half went through, and the reason was not the method rule — it was
+// `form-action 'none'` in the injected CSP, which refused a submission for BEING a submission. That
+// closed every search box, filter and pager on the web to the agent, inside a section of the spec
+// whose title is that the boundary is the network and not the intent. A link to /found?q=invoices
+// was allowed the whole time; the form that builds that exact url was not.
+//
+// Three things are asserted, and each one alone would pass on a broken version:
+//
+//   - the act is not refused, which is the permission;
+//   - the request ARRIVES, which is what a submission that silently does nothing would fail;
+//   - the answer is READ, with the query in it, which is what a submission that navigates and drops
+//     the field would fail — and dropping the field is the failure that looks like success, because
+//     /found answers either way and the agent gets a page.
+func TestASearchFormIsSubmittedAndItsAnswerIsRead(t *testing.T) {
+	site := newSite(t)
+	driver, _ := fenced(t, admitting(site))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: site.origin() + "/search"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	button := findRef(t, snapshot, "Search")
+
+	result, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: button})
+	if err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if result.Outcome == browser.OutcomeRefused {
+		t.Fatalf("the search was refused as %q: %s", result.Refusal.Consequence, result.Refusal.Detail)
+	}
+	if !site.reached("GET /found", settle) {
+		t.Fatal("the agent pressed Search and nothing searched: the submission never reached the server")
+	}
+
+	after, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot after: %v", err)
+	}
+	if !strings.Contains(after.URL, "/found?q=invoices") {
+		t.Fatalf("the agent is reading %q, not the results it asked for", after.URL)
+	}
+	// Through the ANSWER and not the request line, because the harness records a method and a path
+	// and the field is in neither. /found answers a query-less request too, so a submission that
+	// dropped the field would satisfy everything above and read as a search that found nothing.
+	said := false
+	for _, element := range after.Elements {
+		if strings.Contains(element.Name, "Results for invoices") {
+			said = true
+		}
+	}
+	if !said {
+		t.Fatalf("the query did not travel — the server answered without it, so the agent searched for"+
+			" nothing and is reading a page that truthfully says so: %+v", after.Elements)
 	}
 }
 

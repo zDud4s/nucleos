@@ -23,9 +23,14 @@ import (
 //
 //   - A form submission stopped by `form-action 'none'` came back to the agent as "done". The gate
 //     test that would have caught it had its assertion REMOVED, with a comment recording the
-//     measurement: a POST is stopped twice, by the method rule and by the CSP, and when the CSP wins
-//     the race there is no request to report. That was the stronger outcome wearing the weaker
+//     measurement: a POST was stopped twice, by the method rule and by the CSP, and when the CSP won
+//     the race there was no request to report. That was the stronger outcome wearing the weaker
 //     report.
+//
+//     That directive is no longer 'none' (fence/csp.go), so this particular race is over and the
+//     gate assertion is back. What is not over is the reason this file exists: the CSP is still the
+//     one layer of the fence that refuses things without producing a request, and connect-src below
+//     is the load-bearing case.
 //
 //   - `connect-src 'none'` closes fetch, XHR, EventSource and beacons. A page that arrives empty and
 //     fills itself from an API therefore renders a shell — and the agent reads the shell, correctly,

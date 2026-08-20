@@ -573,10 +573,13 @@ impl NucleosTools {
                        select works on a real dropdown and says so when the thing is not one. \
                        If the answer carries `navigated`, the page changed underneath you and \
                        EVERY ref you hold is dead: take a fresh snapshot before acting again. \
-                       Actions with a consequence outside this machine - submitting a form, any \
-                       non-GET request, a download, a new window - are REFUSED, and a refusal \
+                       Actions with a consequence outside this machine - any non-GET request, a \
+                       download, a new window - are REFUSED, and a refusal \
                        is a normal answer carrying the reason, not an error: read it and go a \
-                       different way rather than retrying. If you need to do one of those \
+                       different way rather than retrying. A form is not refused for being a \
+                       form: a search, a filter or a pager submits and you read the results, \
+                       while a form that sends, buys or saves is a non-GET and comes back \
+                       refused as form-submission. If you need to do one of those \
                        things, ask a person with browser_handoff. The refusal may also arrive \
                        on the NEXT action rather than this one, because a click and the request \
                        it causes are not simultaneous."
@@ -1196,11 +1199,17 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("approve_proposal", ToolEffect::Acts),
     // The browser's five, all `ReadsUntrusted`, and the classification is an ASSERTION ABOUT THE
     // FENCE rather than an observation about the verbs (spec §6.1a). `browser_act` clicks and types;
-    // under the fence of §6.2 nothing it does leaves the machine — no non-GET request, no form
-    // submission, no download, no WebSocket, no new window — so what it produces is more of a
+    // under the fence of §6.2 nothing it does leaves the machine with a consequence — no non-GET
+    // request, no download, no WebSocket, no new window — so what it produces is more of a
     // stranger's prose and no effect on the world. If the fence stops holding, this line becomes a
     // lie, which is why the gate group against a real Chrome is a gate on this registration and not
     // a nice-to-have.
+    //
+    // "No form submission" was on that list and was taken off, and a loosening gets spelled out
+    // rather than quietly edited: a GET form submits now. It IS a document GET to a host the profile
+    // admits, so the two rules that have always bounded a link — the method and the allowlist —
+    // bound it unchanged, and it can carry nothing a link with a query string could not. What this
+    // line never claimed is that no bytes travel: clicking a link has always sent a GET.
     //
     // `browser_handoff` is here rather than `ReadsOwn`, and that is a correction worth keeping: it
     // spends a person's attention and proposes a host chosen by an agent whose context is full of
@@ -1967,8 +1976,10 @@ mod tests {
             "web_navigate",
             // The browser half of the same guard (spec §6.0, §14.3 rule 3). `browser_act` DOES click
             // and type, and it is allowed to because the fence of §6.2 makes those consequence-free
-            // — a click cannot produce a non-GET request, a form submission, a download, a socket or
-            // a new window. Every name below is a verb that would reach past the fence by
+            // — a click cannot produce a non-GET request, a download, a socket or a new window. A
+            // form submission was on that list and is not any more: a GET form is a document GET,
+            // which a click on a link has always been able to produce. Every name below is a verb
+            // that would reach past the fence by
             // definition, so its existence would mean the fence had been given an exception rather
             // than a new caller. `browser_grant` is here for a different reason and the sharpest
             // one: the site list grows when a person finishes a login and by no other means (§5.2),

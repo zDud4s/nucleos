@@ -66,10 +66,29 @@ func TestDecide(t *testing.T) {
 			request: Request{Method: "HEAD", URL: "https://example.org/page", ResourceType: "Document"},
 		},
 		{
+			// A search box, a filter, a pager. Indistinguishable from the row above it and from a
+			// link, which is the point: the fence judges the method and the origin, and a GET form
+			// has the same two as a GET anything. It was refused for years by `form-action 'none'`
+			// in the CSP rather than by anything here, and see csp.go for why that stopped.
+			name:    "a GET form submission is a GET",
+			policy:  listed,
+			request: Request{Method: "GET", URL: "https://example.org/search?q=invoices", ResourceType: "Document"},
+		},
+		{
+			// The rule that actually bounds a form, and now the ONLY one: with the CSP loosened this
+			// is what stops a same-origin POST, alone and therefore deterministically.
 			name:    "a POST that would produce a document is a form submission",
 			policy:  listed,
 			request: Request{Method: "POST", URL: "https://example.org/save", ResourceType: "Document"},
 			want:    browser.ConsequenceForm,
+		},
+		{
+			// The other one: a GET form aimed off the allowlist is refused for where it goes, exactly
+			// as a link there would be. Nothing about it being a form enters into it.
+			name:    "a GET form to a host the profile does not admit is off-allowlist",
+			policy:  listed,
+			request: Request{Method: "GET", URL: "https://stranger.example.net/search?q=invoices", ResourceType: "Document"},
+			want:    browser.ConsequenceOffAllowlist,
 		},
 		{
 			name:    "a POST from a script is reported as the method",
