@@ -148,16 +148,31 @@ func TestAPageThatKeepsAskingIsCutOff(t *testing.T) {
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(lastRefusal(fake), fmt.Sprintf("%d requests", ferryBudget)) {
+		if answeredWith(fake, fmt.Sprintf("%d requests", ferryBudget)) {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("a page asked past the budget and was never cut off; last was %q", lastRefusal(fake))
+	t.Fatalf("a page asked past the budget and was never cut off; the answers were %q", answers(fake))
 }
 
-func lastRefusal(fake *cdptest.Browser) string {
-	last := ""
+// answeredWith asks whether the budget refusal is among the answers, and NOT whether it is the last
+// one. It used to ask for the last, and that was a race the test lost about one run in twenty: the
+// requests are carried concurrently, so a refusal for one of the early asks can be written after the
+// refusal for a later one. The claim being made is "a page that keeps asking gets cut off", and the
+// ordering of the answers was never part of it — but a failure looked exactly like the fence
+// refusing for the wrong reason, which cost an investigation.
+func answeredWith(fake *cdptest.Browser, said string) bool {
+	for _, answer := range answers(fake) {
+		if strings.Contains(answer, said) {
+			return true
+		}
+	}
+	return false
+}
+
+func answers(fake *cdptest.Browser) []string {
+	var said []string
 	for _, call := range fake.Calls() {
 		if call.Method != "Runtime.evaluate" {
 			continue
@@ -166,8 +181,8 @@ func lastRefusal(fake *cdptest.Browser) string {
 			Expression string `json:"expression"`
 		}
 		if err := json.Unmarshal(call.Params, &params); err == nil {
-			last = params.Expression
+			said = append(said, params.Expression)
 		}
 	}
-	return last
+	return said
 }
