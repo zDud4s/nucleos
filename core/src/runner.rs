@@ -862,6 +862,14 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
 ///
 /// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
 /// result event itself; the token counts live under its `usage` object.
+/// The processes kept alive between a conversation's turns, held so the kernel takes them down if
+/// this daemon goes without getting the chance to.
+///
+/// A `Litter` and not a `TreeKiller`: the two are the same primitive with opposite flags, and this
+/// is the one whose promise survives the daemon being killed rather than asked to stop.
+static KEPT_ALIVE: std::sync::LazyLock<crate::process_tree::Litter> =
+    std::sync::LazyLock::new(crate::process_tree::Litter::new);
+
 /// One turn's own numbers, out of a process that may answer more than once.
 ///
 /// `RunOutcome` describes a PROCESS — its exit code, its whole stdout, everything it spent. This
@@ -1673,6 +1681,23 @@ impl CommandRunner for ClaudeCliRunner {
         // exactly what makes `git worktree remove` fail through its whole backoff afterwards.
         let mut tree_killer = child.id().map(TreeKiller::new);
 
+        // A process meant to outlive its TURN must not outlive the DAEMON.
+        //
+        // `TreeKiller` above covers being dropped, which is a thing that happens in a program that
+        // is still running. It does nothing for `TerminateProcess` — what Task Manager,
+        // `Stop-Process` and a crash all do — which runs no destructor and leaves every child
+        // alive. `process_tree` records what that costs, measured this month: two days of daemon
+        // restarts left 31 orphaned sidecars, each holding the loopback port its own replacement
+        // then died trying to bind.
+        //
+        // A one-turn run is already bounded by its turn and is not enrolled. A CLI held idle
+        // between a conversation's turns is exactly the shape of thing that incident was about.
+        if turn_events.is_some()
+            && let Some(pid) = child.id()
+        {
+            KEPT_ALIVE.adopt(pid);
+        }
+
         // A steerable run's turns are written in their OWN task, concurrently with the stdout loop
         // below, for the same reason stderr is drained in one: a turn written while the CLI is
         // mid-answer must not stop anything reading what it is saying.
@@ -2324,6 +2349,55 @@ pub struct FakeCommandRunner {
 #[cfg(test)]
 #[async_trait]
 impl CommandRunner for FakeCommandRunner {
+    /// The live-process door, so a conversation that keeps its CLI is exercised in tests rather than
+    /// only in production.
+    ///
+    /// Without this the default would delegate to `run_prompt`, which sends no turn events at all —
+    /// and a rooted chat turn would sit waiting for a boundary that never came, fail, and still let
+    /// every existing assertion pass, because those look at what the runner was HANDED. That is the
+    /// worst shape a gap can have.
+    ///
+    /// It answers the opening turn and then one more for every line written to its stdin, which is
+    /// what a real process does. A fresh `TurnSplitter` per turn, unlike the CLI runner's one across
+    /// the whole stream: a canned outcome is one answer repeated, so a shared splitter would report
+    /// every turn after the first as having cost nothing — true of the CLI's running total, and
+    /// nonsense for a double whose whole job is to be legible.
+    async fn run_prompt_with_turns(
+        &self,
+        mut request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        _context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+        turn_events: Option<UnboundedSender<TurnEvent>>,
+    ) -> std::io::Result<RunOutcome> {
+        // Taken before the request is handed over, because the request is what carries it.
+        let mut later = request.messages.take();
+        let outcome = self.run_prompt(request, session_tx, transcript).await?;
+
+        let Some(turn_events) = turn_events else {
+            return Ok(outcome);
+        };
+
+        let answer = |stdout: &str| {
+            let mut splitter = TurnSplitter::new();
+            for line in stdout.lines() {
+                for event in splitter.line(line.to_owned()) {
+                    let _ = turn_events.send(event);
+                }
+            }
+        };
+
+        answer(&outcome.stdout);
+        if let Some(later) = later.as_mut() {
+            // Stays alive until its stdin closes, exactly as the process does — which is what makes
+            // a test of "the second turn reused the process" mean anything.
+            while later.recv().await.is_some() {
+                answer(&outcome.stdout);
+            }
+        }
+        Ok(outcome)
+    }
+
     async fn run_prompt(
         &self,
         request: RunRequest,

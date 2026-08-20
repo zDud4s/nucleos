@@ -1,5 +1,5 @@
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 use crate::runner::extract_reply;
@@ -34,6 +34,368 @@ impl ChatSlot {
 impl Drop for ChatSlot {
     fn drop(&mut self) {
         BUSY_CHATS.lock().unwrap().remove(&self.chat_id);
+    }
+}
+
+/// Every conversation's living CLI, so the next turn does not pay to start one.
+///
+/// A static beside `BUSY_CHATS`, and for the same reason: this is runtime state about a chat, keyed
+/// by chat, that no request and no row owns. It is not in `AppState` because nothing outside this
+/// module has any business speaking into a conversation's stdin.
+static LIVE_CHATS: LazyLock<Mutex<HashMap<String, LiveChat>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long a conversation's process waits for a turn that may never come.
+///
+/// Short on purpose. What it buys is a BURST — the turns somebody takes while they are working on
+/// something — and a process idle longer than this is one whose next turn is minutes away, where
+/// fourteen seconds of start-up is not what anybody is waiting on. A CLI holds a few hundred
+/// megabytes while it waits, and a desktop app is the wrong place to spend that on a conversation
+/// nobody came back to.
+const LIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// One conversation's living CLI, kept between turns instead of started again for each.
+///
+/// **Measured before it was built**, on the real CLI, two turns down one stdin against a fresh spawn
+/// that resumes: `init` at 1.5s against 5.8s, the first shell command running at 6.7s against 26.4s,
+/// the whole turn finishing in 12.0s against 26-32s. None of the four `SessionStart` hooks fire on
+/// the second turn at all, and the shell the `Bash` tool uses is started once rather than once per
+/// turn — which is the larger half, and the one nothing in the daemon could otherwise reach.
+///
+/// **None of it is money.** Turn two's cost came out inside the noise of a resumed spawn's, and the
+/// `cache_read` figures were identical to the token: the prompt cache lives at the API, not in the
+/// process. What is bought here is wall-clock and nothing else, which is worth saying plainly
+/// because the opposite was assumed twice before it was measured.
+///
+/// The process keeps ONE session across every turn it serves — measured — so a conversation whose
+/// process is gone can still be resumed by that id. Losing the process costs speed, never continuity.
+struct LiveChat {
+    /// Where a later turn is written.
+    ///
+    /// Dropping this closes the CLI's stdin, which ends the process *after* it finishes whatever
+    /// turn it is on — measured; it is not a way to interrupt one. That is what `abort` is for.
+    messages: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Everything the process says, already split into turns by `runner::TurnSplitter`.
+    events: tokio::sync::mpsc::UnboundedReceiver<crate::runner::TurnEvent>,
+    /// The session every turn of this process shares, once its first `init` has said what it is.
+    ///
+    /// Shared rather than owned because it becomes known DURING the first turn, from a task reading
+    /// the runner's session channel, while this struct is already in the first turn's hands.
+    session_id: std::sync::Arc<Mutex<Option<String>>>,
+    /// How the process is stopped for real, for the turn that was cancelled and cannot wait for a
+    /// closed stdin to be honoured.
+    abort: tokio::task::AbortHandle,
+    /// Where the process is standing, fixed when it was spawned.
+    ///
+    /// Kept so it can be COMPARED. A conversation's working directory is resolved per turn — an
+    /// errand's folder wins over the chat's — so it can differ from the one this process was started
+    /// in, and a turn spoken down it would then run in the wrong directory with nothing anywhere
+    /// saying so.
+    cwd: Option<std::path::PathBuf>,
+    /// When it last finished a turn, which is what the reaper measures.
+    idle_since: std::time::Instant,
+}
+
+impl Drop for LiveChat {
+    /// A dropped `LiveChat` is a conversation that moved on, was stopped, or was reaped — and in
+    /// every one of those a process still working is working for nobody. Closing stdin would let it
+    /// finish the turn it is on first, so the abort is the honest instrument: it drops the runner's
+    /// future, whose `TreeKiller` takes the process and everything it spawned down with it.
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+/// What happened when a conversation's living process was spoken to.
+///
+/// The three are told apart because two of them are safe to start over from and one is not.
+enum LiveTurn {
+    /// It answered.
+    Answered(crate::runner::TurnOutcome),
+    /// Nothing was written: the process was already gone. The turn can be started fresh, because
+    /// as far as anything outside is concerned it never happened.
+    NotWritten,
+    /// It was written, and the process died before answering. The turn is lost and must NOT be
+    /// quietly started again — whatever it had already done, a command run or a file written, would
+    /// be done a second time.
+    DiedMidTurn,
+}
+
+impl LiveChat {
+    /// Says something to this process and gathers the one turn it answers with.
+    async fn turn(&mut self, text: &str, transcript: &std::sync::Arc<Mutex<String>>) -> LiveTurn {
+        if self.messages.send(text.to_owned()).is_err() {
+            return LiveTurn::NotWritten;
+        }
+        self.gather(transcript).await
+    }
+
+    /// Gathers the turn the process was STARTED with, which travelled in its opening line rather
+    /// than down this channel — so there is nothing to send, only an answer to wait for.
+    async fn opening(&mut self, transcript: &std::sync::Arc<Mutex<String>>) -> LiveTurn {
+        self.gather(transcript).await
+    }
+
+    /// Reads one turn's worth of the stream into `transcript`, stopping at its own end.
+    ///
+    /// Stops at its own `Ended` and not a line later. Reading past it would swallow the opening of
+    /// the turn after this one; stopping short would hand that turn the tail of this one. Both fail
+    /// the same way from outside — a conversation whose answers are quietly somebody else's — which
+    /// is why the boundary is drawn in `runner::TurnSplitter`, where a test can reach it.
+    async fn gather(&mut self, transcript: &std::sync::Arc<Mutex<String>>) -> LiveTurn {
+        while let Some(event) = self.events.recv().await {
+            match event {
+                crate::runner::TurnEvent::Line(line) => {
+                    // The same accumulation the runner does for a one-turn process, so a turn served
+                    // this way leaves the transcript a turn served the other way would have.
+                    if let Ok(mut shared) = transcript.lock() {
+                        shared.push_str(&line);
+                        shared.push('\n');
+                    }
+                }
+                crate::runner::TurnEvent::Ended(outcome) => return LiveTurn::Answered(outcome),
+            }
+        }
+        LiveTurn::DiedMidTurn
+    }
+}
+
+/// Takes a conversation's living process out of the registry for the length of one turn.
+///
+/// Taken OUT rather than borrowed in place, and the ownership is the point. A turn holds the only
+/// handle while it runs, so if its task is aborted — `/cancel`, a dropped request, a panic — the
+/// handle is dropped with it and `Drop` takes the process down. Nothing has to remember to clean up
+/// on a path where nothing gets the chance to run.
+fn take_live(chat_id: &str) -> Option<LiveChat> {
+    LIVE_CHATS.lock().unwrap().remove(chat_id)
+}
+
+/// Puts a process back, having just finished a turn, for the next one to find.
+fn keep_live(chat_id: &str, mut live: LiveChat) {
+    live.idle_since = std::time::Instant::now();
+    LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
+    reap_idle_live_chats();
+}
+
+/// Stops a conversation's process for good, if it has one.
+fn evict_live(chat_id: &str) {
+    // The removed value is dropped here, which is what aborts it.
+    LIVE_CHATS.lock().unwrap().remove(chat_id);
+}
+
+/// Starts the one task that stops processes nobody came back to.
+///
+/// A task rather than a check at the start of the next turn, because the conversation this is about
+/// is precisely the one where there is no next turn. Started on the first process kept rather than
+/// at boot, so a daemon that never has a rooted conversation never has the task either.
+fn reap_idle_live_chats() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tick.tick().await;
+            // `retain` drops what it removes, and dropping is what stops the process.
+            LIVE_CHATS
+                .lock()
+                .unwrap()
+                .retain(|_, live| live.idle_since.elapsed() < LIVE_IDLE);
+        }
+    });
+}
+
+/// Serves one turn: down the conversation's living process when it has one, by starting one when it
+/// does not, and by the one-shot path every turn used to take when it may not have one at all.
+///
+/// Answers in exactly the shape `tokio::time::timeout(run_timeout, runner.run_prompt(..))` answered
+/// in before this existed, so everything downstream reads one thing whichever door the turn took.
+#[allow(clippy::too_many_arguments)]
+async fn serve_turn(
+    runner: &std::sync::Arc<dyn crate::runner::CommandRunner>,
+    request: crate::runner::RunRequest,
+    session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    transcript: &std::sync::Arc<Mutex<String>>,
+    chat_id: &str,
+    run_timeout: std::time::Duration,
+    may_live: bool,
+) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
+    if !may_live {
+        return tokio::time::timeout(
+            run_timeout,
+            runner.run_prompt(request, session_tx, std::sync::Arc::clone(transcript)),
+        )
+        .await;
+    }
+
+    if let Some(mut live) = take_live(chat_id) {
+        // What the process has been calling this conversation since it started. Sent into the turn's
+        // own recorder because that is what puts the session on this turn's row — the same job the
+        // CLI's first `init` does for a process being started.
+        //
+        // A process that never said is one whose `init` never arrived, which is not a process worth
+        // speaking to; it falls through and is dropped on the way out.
+        let known = live.session_id.lock().unwrap().clone();
+        // Everything a process fixed when it was spawned and cannot be told to change: where it is
+        // standing, and which conversation it is having. Both are resolved per turn — an errand's
+        // folder wins over the chat's, and a rotation abandons the session — so a process that no
+        // longer matches this turn is not a process this turn may be answered by. It falls through
+        // and is dropped, which stops it, and a new one is started to the turn's own shape.
+        let same_ground = live.cwd == request.cwd;
+        let same_conversation = known.is_some() && request.resume_session_id == known;
+        if let Some(session_id) = known.filter(|_| same_ground && same_conversation) {
+            let _ = session_tx.send(session_id.clone());
+            // Bound before the match, not inside its scrutinee: a temporary there would hold the
+            // borrow of `live` through every arm, and one of them has to hand it back.
+            let served =
+                tokio::time::timeout(run_timeout, live.turn(&request.prompt, transcript)).await;
+            match served {
+                Ok(LiveTurn::Answered(outcome)) => {
+                    let stdout = transcript
+                        .lock()
+                        .map(|held| held.clone())
+                        .unwrap_or_default();
+                    let gathered = gathered(outcome, stdout, session_id);
+                    keep_live(chat_id, live);
+                    return Ok(Ok(gathered));
+                }
+                // It heard the turn and died before answering. Starting it again would re-run
+                // whatever it had already done, so this is reported as the failure it is.
+                Ok(LiveTurn::DiedMidTurn) => {
+                    return Ok(Err(std::io::Error::other(
+                        "the conversation's process ended in the middle of this turn",
+                    )));
+                }
+                // Nothing was written, so as far as anything outside is concerned this turn has not
+                // happened yet, and starting a process for it is safe.
+                Ok(LiveTurn::NotWritten) => {}
+                // Dropping `live` on the way out is what stops a process that stopped answering.
+                Err(elapsed) => return Err(elapsed),
+            }
+        }
+    }
+
+    start_live_chat(
+        runner,
+        request,
+        session_tx,
+        transcript,
+        chat_id,
+        run_timeout,
+    )
+    .await
+}
+
+/// Starts a conversation's process, gathers the turn it was started with, and keeps it for the next.
+async fn start_live_chat(
+    runner: &std::sync::Arc<dyn crate::runner::CommandRunner>,
+    mut request: crate::runner::RunRequest,
+    session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    transcript: &std::sync::Arc<Mutex<String>>,
+    chat_id: &str,
+    run_timeout: std::time::Duration,
+) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
+    let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let (process_session_tx, mut process_session_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Read before the request is handed over, because that is what carries it, and kept so a later
+    // turn wanting a different directory can be told this process is the wrong one.
+    let started_in = request.cwd.clone();
+
+    // stdin IS the channel a later turn arrives on, so a process meant to serve more than one has to
+    // take that door whether or not this turn carries anything that could only fit through it.
+    request.steerable = true;
+    request.messages = Some(incoming);
+
+    // The PROCESS's transcript, which is nobody's turn. What the window watches is built out of the
+    // turn events instead, one turn at a time — a process serving five turns would otherwise hand
+    // the fifth the other four.
+    let process_transcript = std::sync::Arc::new(Mutex::new(String::new()));
+    let runner = std::sync::Arc::clone(runner);
+    let supervisor = tokio::spawn(async move {
+        // The outcome describes the PROCESS — every turn's cost added together, its whole stream —
+        // and each turn has already been recorded from its own `Ended` long before this resolves.
+        // What is left to say about the process itself, the runner has already logged.
+        let _ = runner
+            .run_prompt_with_turns(
+                request,
+                process_session_tx,
+                process_transcript,
+                std::sync::Arc::new(Mutex::new(None)),
+                Some(events_tx),
+            )
+            .await;
+    });
+
+    let session_id = std::sync::Arc::new(Mutex::new(None));
+    {
+        let known = std::sync::Arc::clone(&session_id);
+        tokio::spawn(async move {
+            if let Some(id) = process_session_rx.recv().await {
+                *known.lock().unwrap() = Some(id.clone());
+                // Onward to the turn's own recorder, which writes it to this turn's row and to the
+                // chat's resumable session — the two writes that let the conversation survive the
+                // process it is being answered by.
+                let _ = session_tx.send(id);
+            }
+        });
+    }
+
+    let mut live = LiveChat {
+        messages,
+        events,
+        session_id: std::sync::Arc::clone(&session_id),
+        abort: supervisor.abort_handle(),
+        cwd: started_in,
+        idle_since: std::time::Instant::now(),
+    };
+
+    let served = tokio::time::timeout(run_timeout, live.opening(transcript)).await;
+    match served {
+        Ok(LiveTurn::Answered(outcome)) => {
+            let stdout = transcript
+                .lock()
+                .map(|held| held.clone())
+                .unwrap_or_default();
+            let known = session_id.lock().unwrap().clone().unwrap_or_default();
+            let gathered = gathered(outcome, stdout, known);
+            keep_live(chat_id, live);
+            Ok(Ok(gathered))
+        }
+        // A process that fell over without answering. `live` is dropped on the way out, which takes
+        // down whatever is left of it.
+        Ok(LiveTurn::NotWritten | LiveTurn::DiedMidTurn) => Ok(Err(std::io::Error::other(
+            "the conversation's process ended without answering",
+        ))),
+        Err(elapsed) => Err(elapsed),
+    }
+}
+
+/// A turn served by a living process, in the shape everything downstream already reads.
+///
+/// `exit_code: 0` because the turn ended with a `result` and the process is still standing — two
+/// different facts, and a turn only arrives here having produced the first. `stderr` empty for the
+/// same reason: it belongs to the process, which is still using it, and a turn that answered has no
+/// failure to explain. A turn that did not answer never comes through here.
+fn gathered(
+    outcome: crate::runner::TurnOutcome,
+    stdout: String,
+    session_id: String,
+) -> crate::runner::RunOutcome {
+    crate::runner::RunOutcome {
+        exit_code: 0,
+        stdout,
+        stderr: String::new(),
+        session_id: Some(session_id),
+        cost_usd: outcome.cost_usd,
+        input_tokens: outcome.usage.input_tokens,
+        output_tokens: outcome.usage.output_tokens,
+        cache_read_tokens: outcome.usage.cache_read_tokens,
+        cache_creation_tokens: outcome.usage.cache_creation_tokens,
+        num_turns: outcome.usage.num_turns,
     }
 }
 
@@ -1440,77 +1802,103 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             });
         }
 
-        let result = tokio::time::timeout(
-            run_timeout,
-            runner.run_prompt(
-                crate::runner::RunRequest {
-                    prompt: text,
-                    env,
-                    // Set for every rooted conversation, elevated or not: this is how the CLI finds
-                    // the session to resume in the first place. For an errand it is the errand's own
-                    // folder, so a relative path the model writes lands where the errand can find it
-                    // again — and a conversation with neither a root nor an errand keeps `None`,
-                    // because one quietly given a working directory is one whose relative paths
-                    // moved.
-                    cwd,
-                    plan_only: false,
-                    resume_session_id: resume,
-                    mcp_config: Some(turn.mcp_path.clone()),
-                    // Decided by `tool_policy_for`, which is where the rule is written out. The
-                    // default remains what it always was — the orchestrator talks to NucleOS and to
-                    // nothing else, and the MCP allowlist does not enforce that on its own, because
-                    // an allowlist only grants.
-                    tool_policy,
-                    progress_timeout: None,
-                    // No ceiling, and the only production `None`. A chat turn is
-                    // watched by the person who asked for it, who can stop it — and a turn cut off
-                    // mid-answer by a limit nobody set reads as the app breaking rather than as a
-                    // brake working. The wall clock around this call is the guard here.
-                    max_turns: None,
-                    // Always set. `cli_args` reads this only when there is no `--resume`, which is
-                    // exactly the first turn — the one that used to be launched with no session id
-                    // at all.
-                    session_id: Some(session_id),
-                    fork_session: false,
-                    // Asked for so the tail above carries the answer AS IT IS WRITTEN rather than a
-                    // paragraph at a time. It costs nothing when nobody is watching: these are more
-                    // events on a stream the daemon already reads line by line, and `extract_reply`
-                    // takes the reply from the `result` event either way.
-                    include_partial_messages: true,
-                    // An orchestrator turn is one message answered and closed; the next one arrives
-                    // as its own turn on the resumed session, which is where a Telegram reply
-                    // already goes. Nothing here needs a stdin, so it keeps a closed one.
-                    images,
-                    // Bytes only fit on stdin: an argument vector holds a string and there is
-                    // nowhere in it for a picture to go. So a turn carrying one takes the other
-                    // door — which is the same one-turn run either way, because `messages` is None
-                    // and stdin closes the moment the opening line is written.
-                    steerable: carries_pictures,
+        // Which door this turn goes through. Decided once and named, because the two are not
+        // interchangeable and the reason is a security one before it is a speed one.
+        //
+        // A rooted turn carries a key scoped to its CONVERSATION, minted just above, which stays
+        // true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
+        // safe only because that policy leaves it no Bash, no Read and no Write to look at its own
+        // environment with — and a process holding THAT key, kept alive and idle between turns, is
+        // a different and much worse proposition. So only rooted conversations keep a process, and
+        // the barrier that makes it safe is the same one that earned it the tools.
+        let may_live = matches!(tool_policy, crate::runner::ToolPolicy::Unrestricted);
 
-                    // An orchestrator turn is answered by a person watching a chat, so the CLI's
-                    // own permission surface is the right one: there IS somebody to approve. It is
-                    // `McpOnly` besides, so the surface being argued over is nearly empty.
-                    classifier_governs_tools: false,
-                    messages: None,
-                    // `McpOnly` already pushes the strict flag unconditionally, so this changes
-                    // nothing here — it is the same answer said in the request rather than inferred.
-                    ambient_mcp: false,
-                    // An orchestrator turn is not a job node, so it has no role to route.
-                    model: None,
-                    // The wildcard, on purpose: an orchestrator turn acts for the person watching
-                    // the chat and carries the control token, so narrowing what it is offered would
-                    // only take away tools it is entitled to call.
-                    allowed_mcp_tools: None,
-                },
-                session_tx,
-                // The published buffer, so what the window watches is what the CLI is writing.
-                //
-                // Still not the turn's PRODUCT: the reply is what `extract_reply` pulls out of the
-                // `result` event of a completed run, and a turn the wall clock killed has no reply
-                // to salvage. This is the same distinction as before — the stream is transport, the
-                // result is the answer — with the transport now visible while it moves.
-                transcript,
-            ),
+        // A picture cannot travel a later turn: `messages` carries text, and the opening line is the
+        // only one anything is attached to. So a turn carrying one starts a process of its own,
+        // whose opening line does carry it, rather than being spoken into a process that would drop
+        // it without a word.
+        //
+        // And a turn with no `resume` is a conversation that has rotated onto a fresh context, so a
+        // process still holding the old session has to go rather than be spoken to — answering down
+        // it would continue exactly the conversation the rotation just ended.
+        if carries_pictures || resume.is_none() {
+            evict_live(&turn.slot.chat_id);
+        }
+
+        let request = crate::runner::RunRequest {
+            prompt: text,
+            env,
+            // Set for every rooted conversation, elevated or not: this is how the CLI finds
+            // the session to resume in the first place. For an errand it is the errand's own
+            // folder, so a relative path the model writes lands where the errand can find it
+            // again — and a conversation with neither a root nor an errand keeps `None`,
+            // because one quietly given a working directory is one whose relative paths
+            // moved.
+            cwd,
+            plan_only: false,
+            resume_session_id: resume,
+            mcp_config: Some(turn.mcp_path.clone()),
+            // Decided by `tool_policy_for`, which is where the rule is written out. The
+            // default remains what it always was — the orchestrator talks to NucleOS and to
+            // nothing else, and the MCP allowlist does not enforce that on its own, because
+            // an allowlist only grants.
+            tool_policy,
+            progress_timeout: None,
+            // No ceiling, and the only production `None`. A chat turn is
+            // watched by the person who asked for it, who can stop it — and a turn cut off
+            // mid-answer by a limit nobody set reads as the app breaking rather than as a
+            // brake working. The wall clock around this call is the guard here.
+            max_turns: None,
+            // Always set. `cli_args` reads this only when there is no `--resume`, which is
+            // exactly the first turn — the one that used to be launched with no session id
+            // at all.
+            session_id: Some(session_id),
+            fork_session: false,
+            // Asked for so the tail above carries the answer AS IT IS WRITTEN rather than a
+            // paragraph at a time. It costs nothing when nobody is watching: these are more
+            // events on a stream the daemon already reads line by line, and `extract_reply`
+            // takes the reply from the `result` event either way.
+            include_partial_messages: true,
+            // An orchestrator turn is one message answered and closed; the next one arrives
+            // as its own turn on the resumed session, which is where a Telegram reply
+            // already goes. Nothing here needs a stdin, so it keeps a closed one.
+            images,
+            // Bytes only fit on stdin: an argument vector holds a string and there is
+            // nowhere in it for a picture to go. So a turn carrying one takes the other
+            // door — which is the same one-turn run either way, because `messages` is None
+            // and stdin closes the moment the opening line is written.
+            steerable: carries_pictures,
+
+            // An orchestrator turn is answered by a person watching a chat, so the CLI's
+            // own permission surface is the right one: there IS somebody to approve. It is
+            // `McpOnly` besides, so the surface being argued over is nearly empty.
+            classifier_governs_tools: false,
+            messages: None,
+            // `McpOnly` already pushes the strict flag unconditionally, so this changes
+            // nothing here — it is the same answer said in the request rather than inferred.
+            ambient_mcp: false,
+            // An orchestrator turn is not a job node, so it has no role to route.
+            model: None,
+            // The wildcard, on purpose: an orchestrator turn acts for the person watching
+            // the chat and carries the control token, so narrowing what it is offered would
+            // only take away tools it is entitled to call.
+            allowed_mcp_tools: None,
+        };
+
+        let result = serve_turn(
+            &runner,
+            request,
+            session_tx,
+            // The published buffer, so what the window watches is what the CLI is writing.
+            //
+            // Still not the turn's PRODUCT: the reply is what `extract_reply` pulls out of the
+            // `result` event of a completed run, and a turn the wall clock killed has no reply to
+            // salvage. This is the same distinction as before — the stream is transport, the result
+            // is the answer — with the transport now visible while it moves.
+            &transcript,
+            &turn.slot.chat_id,
+            run_timeout,
+            may_live,
         )
         .await;
         let completed_at = chrono::Utc::now().to_rfc3339();
@@ -3957,6 +4345,312 @@ mod tests {
         );
     }
 
+    /// A conversation with a living process answers the next turn down it, without starting one.
+    ///
+    /// The lines it gathers are the turn's own transcript, and the outcome is the turn's own bill.
+    #[tokio::test]
+    async fn a_living_conversation_answers_a_later_turn_down_the_process_it_already_has() {
+        let (mut live, mut said, events) = live_chat_for_testing();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+        events
+            .send(crate::runner::TurnEvent::Line("hello".to_owned()))
+            .unwrap();
+        events
+            .send(crate::runner::TurnEvent::Ended(
+                crate::runner::TurnOutcome {
+                    cost_usd: Some(0.08),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+
+        let LiveTurn::Answered(outcome) = live.turn("e agora?", &transcript).await else {
+            panic!("a process with an answer queued must answer");
+        };
+
+        assert_eq!(outcome.cost_usd, Some(0.08));
+        assert_eq!(transcript.lock().unwrap().as_str(), "hello\n");
+        assert_eq!(said.recv().await.as_deref(), Some("e agora?"));
+    }
+
+    /// A turn stops at its OWN end, leaving whatever comes after it for the turn that comes after.
+    ///
+    /// The one thing this type exists to get right. A turn that read past its `Ended` would swallow
+    /// the next turn's opening lines, and one that stopped short would hand the next turn the tail
+    /// of this one — and both look identical from outside: a conversation whose answers are subtly
+    /// somebody else's.
+    #[tokio::test]
+    async fn a_turn_gathers_its_own_lines_and_leaves_the_next_turns_alone() {
+        let (mut live, _said, events) = live_chat_for_testing();
+        let first = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let second = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+        for event in [
+            crate::runner::TurnEvent::Line("mine".to_owned()),
+            crate::runner::TurnEvent::Ended(crate::runner::TurnOutcome::default()),
+            crate::runner::TurnEvent::Line("theirs".to_owned()),
+            crate::runner::TurnEvent::Ended(crate::runner::TurnOutcome::default()),
+        ] {
+            events.send(event).unwrap();
+        }
+
+        assert!(matches!(
+            live.turn("um", &first).await,
+            LiveTurn::Answered(_)
+        ));
+        assert!(matches!(
+            live.turn("dois", &second).await,
+            LiveTurn::Answered(_)
+        ));
+
+        assert_eq!(first.lock().unwrap().as_str(), "mine\n");
+        assert_eq!(second.lock().unwrap().as_str(), "theirs\n");
+    }
+
+    /// A process that died must say so at once rather than leave the conversation waiting on a pipe
+    /// nobody is writing to. The caller then starts one, which is what every turn did before this
+    /// existed — so the worst case is last week's speed, not a conversation that hangs.
+    #[tokio::test]
+    async fn a_conversation_whose_process_is_gone_says_so_instead_of_waiting() {
+        let (mut live, said, events) = live_chat_for_testing();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+        // BOTH ends, because that is what a process actually being gone looks like: the runner's
+        // future owns the stdin the turns are written to and the sender the events come out of, so
+        // when it ends it drops the pair. Dropping only one of them models nothing.
+        drop(events);
+        drop(said);
+
+        // `NotWritten` and not `DiedMidTurn`, and the difference decides whether the caller may
+        // start over: nothing reached the process, so as far as anything outside is concerned this
+        // turn has not happened yet.
+        assert!(matches!(
+            live.turn("estas ai?", &transcript).await,
+            LiveTurn::NotWritten
+        ));
+    }
+
+    /// A process that heard the turn and died before answering is NOT the same as one that never
+    /// heard it, and the caller must be able to tell — starting over would run a second time
+    /// whatever the first attempt had already done.
+    #[tokio::test]
+    async fn a_process_that_dies_mid_turn_is_told_apart_from_one_that_never_heard() {
+        let (mut live, said, events) = live_chat_for_testing();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+        events
+            .send(crate::runner::TurnEvent::Line("working on it".to_owned()))
+            .unwrap();
+        drop(events);
+
+        assert!(matches!(
+            live.turn("faz isso", &transcript).await,
+            LiveTurn::DiedMidTurn
+        ));
+        // It really was written — which is the whole reason this case may not be retried.
+        drop(said);
+    }
+
+    /// A `LiveChat` wired to plain channels instead of a process: the far end of its stdin, and a
+    /// handle to say what it answers.
+    ///
+    /// No process, because what these tests are about is where one turn ends and the next begins,
+    /// and a real CLI would make them depend on one being installed. No recorder task either: what
+    /// was written is read straight off the channel, so an assertion cannot pass or fail on whether
+    /// some other task happened to have run yet.
+    fn live_chat_for_testing() -> (
+        LiveChat,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::mpsc::UnboundedSender<crate::runner::TurnEvent>,
+    ) {
+        let (messages, said) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        (
+            LiveChat {
+                messages,
+                events,
+                session_id: std::sync::Arc::new(std::sync::Mutex::new(Some("s-1".to_owned()))),
+                // Nothing to stop, but the field is what stops a real one, so it is not optional.
+                abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                cwd: None,
+                idle_since: std::time::Instant::now(),
+            },
+            said,
+            events_tx,
+        )
+    }
+
+    /// A conversation whose turns get tools: a directory of its own, and the classifier hook wired
+    /// inside it.
+    ///
+    /// `tool_policy_for` grants tools only when both are there, so without them a turn is `McpOnly`,
+    /// carries the control token, and keeps no process — a different rule entirely, and one that
+    /// would let a weaker version of every test below pass.
+    ///
+    /// The `TempDir` is returned rather than dropped: dropping it deletes the directory, and a
+    /// conversation whose working directory vanished is not the thing under test.
+    async fn rooted_chat(state: &AppState, chat_id: &str) -> tempfile::TempDir {
+        let root = tempfile::TempDir::new().unwrap();
+        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES (?, 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(chat_id)
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        root
+    }
+
+    /// The whole point: a conversation's second turn is answered by the process its first one
+    /// started.
+    ///
+    /// Counted at the runner, because the runner is where the cost is. `calls` counts LAUNCHES, and
+    /// two turns down one process is one launch — measured on the real CLI, the launch it saves is
+    /// worth 14 to 19 seconds: 5.8s to reach `init` against 1.5s, and 26.4s before the first shell
+    /// command runs against 6.7s.
+    ///
+    /// Both turns still get a row of their own, because a turn is a billed run whichever process
+    /// answered it. That half is asserted here too: a conversation that answered twice and recorded
+    /// once would be cheaper to run and impossible to read.
+    #[tokio::test]
+    async fn a_conversations_second_turn_is_answered_by_the_process_the_first_one_started() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "warm-chat").await;
+
+        let first = send_message(&state, "warm-chat", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let second = send_message(&state, "warm-chat", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            1,
+            "the second turn started a second process instead of speaking to the first"
+        );
+        for (turn, id) in [("first", first), ("second", second)] {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(status, "completed", "the {turn} turn did not complete");
+        }
+    }
+
+    /// A conversation that has rotated onto a fresh context must not be answered by the process
+    /// holding the old one.
+    ///
+    /// Rotation is the daemon deciding this conversation starts again: the window is full, or
+    /// something untrusted was read and the session may no longer be resumed. A process kept from
+    /// before is holding exactly the session that decision just abandoned, so speaking down it would
+    /// continue the conversation that was supposed to have ended — with every one of those reasons
+    /// still true, and nothing in the transcript to show it happened.
+    #[tokio::test]
+    async fn a_conversation_that_rotated_is_not_answered_by_the_process_holding_the_old_session() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "rotating-chat").await;
+
+        let first = send_message(&state, "rotating-chat", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        // What rotation leaves behind: no session to resume. The reasons differ — a full window, a
+        // mail body read — and they all arrive here as the same absence.
+        sqlx::query("DELETE FROM assistant_sessions WHERE chat_id = 'rotating-chat'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let second = send_message(&state, "rotating-chat", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the rotated turn was answered by the process holding the session it left"
+        );
+    }
+
+    /// A conversation that moved is not answered by the process standing where it used to be.
+    ///
+    /// A working directory is resolved per turn — an errand's folder wins over the chat's, and the
+    /// chat's own can be repointed from the window — while a process is standing wherever it was
+    /// spawned and cannot be told to move. Answering down it would run the turn's commands, and
+    /// resolve every relative path it wrote, in the wrong tree; the transcript would look right.
+    #[tokio::test]
+    async fn a_conversation_that_moved_is_not_answered_by_the_process_standing_where_it_was() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "moving-chat").await;
+
+        let first = send_message(&state, "moving-chat", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        // Wired in the new place too, so what this test measures is the MOVE and not the loss of
+        // tools: an unwired directory would take the one-shot path anyway and pass for free.
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        crate::autopilot::wire_classifier_hook(elsewhere.path()).unwrap();
+        sqlx::query("UPDATE chats SET cwd = ? WHERE chat_id = 'moving-chat'")
+            .bind(elsewhere.path().to_str().unwrap())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let second = send_message(&state, "moving-chat", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the turn was answered by a process standing in the old directory"
+        );
+    }
+
+    /// A conversation with no tools keeps no process, and the reason is not caution.
+    ///
+    /// A rooted turn carries a key scoped to its conversation, which stays true as the turns change
+    /// under it. An `McpOnly` turn carries the daemon's CONTROL token — safe only because that
+    /// policy leaves it no Bash, no Read and no Write to look at its own environment with — and a
+    /// process holding that key, kept alive and idle between turns, is a different and much worse
+    /// proposition. The barrier that earns a conversation its tools is the same one that lets it
+    /// keep a process.
+    #[tokio::test]
+    async fn a_conversation_without_tools_starts_a_process_for_every_turn() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+
+        // No directory and no hook: `tool_policy_for` answers `McpOnly`.
+        for text in ["primeiro", "segundo"] {
+            let id = send_message(&state, "cold-chat", text, Origin::Shell)
+                .await
+                .unwrap();
+            settled_turn(&state.pool, id).await;
+        }
+
+        assert_eq!(*fake.calls.lock().unwrap(), 2);
+    }
+
     /// A rooted turn carries a key scoped to the CONVERSATION, not to the turn.
     ///
     /// The turn is what gets a `runs` row, so a key naming the run is the obvious thing and is what
@@ -3976,19 +4670,7 @@ mod tests {
         let mut state = test_state().await;
         state.runner = fake.clone();
 
-        // A directory AND a wired classifier hook, because `tool_policy_for` grants tools only when
-        // both are there. Without them this turn is `McpOnly` and carries the control token, which
-        // is a different rule entirely and would pass a weaker version of this test.
-        let root = tempfile::TempDir::new().unwrap();
-        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
-        sqlx::query(
-            "INSERT INTO chats (chat_id, brain, created_at, cwd)
-             VALUES ('keyed-chat', 'cloud', '2026-01-01T00:00:00Z', ?)",
-        )
-        .bind(root.path().to_str().unwrap())
-        .execute(&state.pool)
-        .await
-        .unwrap();
+        let _root = rooted_chat(&state, "keyed-chat").await;
 
         let id = send_message(&state, "keyed-chat", "arranja o parser", Origin::Shell)
             .await
