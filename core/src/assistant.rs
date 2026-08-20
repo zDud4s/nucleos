@@ -197,12 +197,24 @@ fn reap_idle_live_chats() {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             tick.tick().await;
-            // `retain` drops what it removes, and dropping is what stops the process.
-            LIVE_CHATS
-                .lock()
-                .unwrap()
-                .retain(|_, live| live.idle_since.elapsed() < LIVE_IDLE);
+            reap_now();
         }
+    });
+}
+
+/// Drops every kept process that is no longer worth keeping.
+///
+/// Its own function, called by the ticker, so the rule can be asserted without waiting fifteen
+/// seconds for a task to decide to run.
+fn reap_now() {
+    // `retain` drops what it removes, and dropping is what stops the process.
+    LIVE_CHATS.lock().unwrap().retain(|_, live| {
+        // A closed stdin is the runner's future having ended — it owns the far end — so the process
+        // behind this handle is already gone. Kept entries like that are not merely useless: the
+        // next turn survives finding one, because writing to it fails and it starts a process
+        // instead, but on a conversation nobody returns to it sits there for good.
+        let still_standing = !live.messages.is_closed();
+        still_standing && live.idle_since.elapsed() < LIVE_IDLE
     });
 }
 
@@ -315,11 +327,17 @@ async fn start_live_chat(
     // the fifth the other four.
     let process_transcript = std::sync::Arc::new(Mutex::new(String::new()));
     let runner = std::sync::Arc::clone(runner);
+    let named = chat_id.to_owned();
     let supervisor = tokio::spawn(async move {
         // The outcome describes the PROCESS — every turn's cost added together, its whole stream —
         // and each turn has already been recorded from its own `Ended` long before this resolves.
-        // What is left to say about the process itself, the runner has already logged.
-        let _ = runner
+        // What is left is why it STOPPED, and that has nowhere else to go.
+        //
+        // Discarding it was the wrong shape of quiet. A conversation whose process cannot start
+        // simply starts one per turn from then on and keeps working — at exactly the speed this
+        // whole thing exists to improve, with nothing anywhere saying so. Slow for a knowable reason
+        // is worth a line; slow for a reason nobody can find is what this avoids.
+        let ended = runner
             .run_prompt_with_turns(
                 request,
                 process_session_tx,
@@ -328,6 +346,25 @@ async fn start_live_chat(
                 Some(events_tx),
             )
             .await;
+        match ended {
+            // The last few lines rather than the whole stream: it is a process's stderr, it can be
+            // long, and what says why something stopped is at the end of it.
+            Ok(outcome) if outcome.exit_code != 0 => {
+                let tail = outcome.stderr.lines().rev().take(5).collect::<Vec<_>>();
+                tracing::warn!(
+                    chat_id = %named,
+                    exit_code = outcome.exit_code,
+                    stderr = %tail.into_iter().rev().collect::<Vec<_>>().join(" | "),
+                    "a conversation's process stopped badly; its turns will each start their own"
+                );
+            }
+            Err(error) => tracing::warn!(
+                chat_id = %named,
+                %error,
+                "a conversation's process could not be started; its turns will each start their own"
+            ),
+            Ok(_) => {}
+        }
     });
 
     let session_id = std::sync::Arc::new(Mutex::new(None));
@@ -4503,6 +4540,66 @@ mod tests {
         .await
         .unwrap();
         root
+    }
+
+    /// A process that has ended is not kept as a handle to nothing.
+    ///
+    /// The next turn would survive finding one — it writes, the write fails, and it starts a process
+    /// instead — but the entry sits there until then holding a conversation's place, and on a daemon
+    /// where nobody comes back it sits there for good. A closed stdin is the runner's future having
+    /// ended, which is the only signal there is that the process behind it is gone.
+    #[tokio::test]
+    async fn a_process_that_ended_is_not_kept_as_a_handle_to_nothing() {
+        let (live, said, _events) = live_chat_for_testing();
+        LIVE_CHATS
+            .lock()
+            .unwrap()
+            .insert("ended-chat".to_owned(), live);
+
+        // What the runner's future ending does: it owns the far end of this conversation's stdin.
+        drop(said);
+
+        reap_now();
+
+        assert!(!LIVE_CHATS.lock().unwrap().contains_key("ended-chat"));
+    }
+
+    /// A process nobody came back to is stopped rather than left holding a few hundred megabytes.
+    ///
+    /// What keeping one buys is a burst — the turns somebody takes while working on something. Past
+    /// that the next turn is minutes away, where the start-up it saves is not what anybody is
+    /// waiting on, and a desktop app is the wrong place to spend the memory.
+    #[tokio::test]
+    async fn a_process_nobody_came_back_to_is_stopped() {
+        let (mut live, _said, _events) = live_chat_for_testing();
+        live.idle_since = std::time::Instant::now()
+            .checked_sub(LIVE_IDLE * 2)
+            .expect("a machine that has been up two minutes");
+        LIVE_CHATS
+            .lock()
+            .unwrap()
+            .insert("abandoned-chat".to_owned(), live);
+
+        reap_now();
+
+        assert!(!LIVE_CHATS.lock().unwrap().contains_key("abandoned-chat"));
+    }
+
+    /// And one still standing, still recent, is left exactly where it is — or the reaper would be
+    /// taking away the thing it exists to protect.
+    #[tokio::test]
+    async fn a_process_still_standing_and_still_recent_is_left_alone() {
+        let (live, _said, _events) = live_chat_for_testing();
+        LIVE_CHATS
+            .lock()
+            .unwrap()
+            .insert("working-chat".to_owned(), live);
+
+        reap_now();
+
+        assert!(LIVE_CHATS.lock().unwrap().contains_key("working-chat"));
+        // Taken back out, because this map outlives the test that wrote to it.
+        LIVE_CHATS.lock().unwrap().remove("working-chat");
     }
 
     /// The whole point: a conversation's second turn is answered by the process its first one

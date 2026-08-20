@@ -29,6 +29,9 @@
 # A second target directory, for building tests while the daemon is running out of the first one:
 # `cargo test` relinks the binary, and Windows refuses to replace an executable that is in use.
 /target-test/
+# And the same directory under the crate, which is where `CARGO_TARGET_DIR` lands when tests are
+# built from `core/` rather than from the root.
+/core/target-test/
 /shell/node_modules/
 /shell/dist/
 /shell/src-tauri/target/
