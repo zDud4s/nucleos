@@ -18,9 +18,11 @@ import (
 // agent's next reading was of the page as it stood before it pressed anything. Open was covered,
 // goto and back were covered, and the case the feature was built for was not.
 //
-// ONE snapshot, taken immediately, with no polling. Polling is exactly what hides this: retry for a
-// second and the answer turns up, and the test then proves that the content eventually appears
-// rather than that the act waited for it.
+// ONE snapshot, taken immediately, with no polling, AND a slow endpoint. Both are needed. Polling
+// hides the race — retry for a second and the answer turns up. And an act already spends up to a
+// second and a half waiting for a fence refusal, so a page that answers inside that window is
+// covered whether this wait works or not: the first version of this test fetched an instant
+// endpoint and would have passed with the wait deleted.
 func TestAClickThatFetchesIsFinishedBeforeTheActReturns(t *testing.T) {
 	site := newSite(t)
 	driver, _ := fenced(t, admitting(site))
@@ -40,12 +42,16 @@ func TestAClickThatFetchesIsFinishedBeforeTheActReturns(t *testing.T) {
 		t.Fatal("the page had the content before anything was pressed; this proves nothing")
 	}
 
+	began := time.Now()
 	result, err := driver.Act(ctx, session.ID, browser.Action{
 		Kind: browser.ActionClick,
 		Ref:  refFor(t, before, "Load the report"),
 	})
 	if err != nil {
 		t.Fatalf("click: %v", err)
+	}
+	if spent := time.Since(began); spent < 2*time.Second {
+		t.Fatalf("the click returned after %v, which is inside the refusal window; it did not wait for the fetch", spent)
 	}
 	if result.Outcome != browser.OutcomeDone {
 		t.Fatalf("the click was refused: %+v", result.Refusal)
@@ -111,8 +117,11 @@ func TestAClickThatStartsNothingCostsOnlyTheReactionWindow(t *testing.T) {
 // to hear, so before the page's own MutationObserver there was no signal at all — the act returned
 // on the CDP round trip, and the next reading was of the page as it stood before the click.
 //
-// ONE snapshot, no polling, for the same reason as its neighbour: polling proves the content turns
-// up eventually, which is not the claim.
+// This one CANNOT be made to discriminate, and saying so is better than implying otherwise. A pure
+// redraw is bounded by movingBound at a second and a half, which is also what an act already spends
+// waiting for a fence refusal — so any redraw this wait covers, that window covered too. What it
+// asserts is that the end-to-end behaviour is right; the evidence that awaitSettled is what makes it
+// right is in chrome/settle_test.go, which calls it directly.
 func TestAClickThatRedrawsIsFinishedBeforeTheActReturns(t *testing.T) {
 	site := newSite(t)
 	driver, _ := fenced(t, admitting(site))
@@ -151,5 +160,53 @@ func TestAClickThatRedrawsIsFinishedBeforeTheActReturns(t *testing.T) {
 	}
 	if !hasName(after, "Revenue fell") {
 		t.Fatalf("the act returned before the page had finished drawing: %+v", after.Elements)
+	}
+}
+
+// TestAScrollThatLoadsMoreIsWaitedFor.
+//
+// Scroll was left out of the wait because "it moves the viewport and runs no handler", which is false
+// on any endless list: scrolling is THE gesture that loads more.
+//
+// The claim has to be made against a load that is SLOWER than the window an act already spends
+// waiting for a fence refusal — one and a half seconds — or the test passes on that window and
+// measures nothing. /slow-rows takes two and a half, so a wait that does not drain what the ferry is
+// carrying returns first and the reading shows the list exactly as it was.
+func TestAScrollThatLoadsMoreIsWaitedFor(t *testing.T) {
+	site := newSite(t)
+	driver, _ := fenced(t, admitting(site))
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: site.origin() + "/endless"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	before, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if hasName(before, "Revenue fell") {
+		t.Fatal("the list was already full; this proves nothing")
+	}
+
+	began := time.Now()
+	result, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionScroll, Text: "down"})
+	if err != nil {
+		t.Fatalf("scroll: %v", err)
+	}
+	if result.Outcome != browser.OutcomeDone {
+		t.Fatalf("the scroll was refused: %+v", result.Refusal)
+	}
+	if spent := time.Since(began); spent < 2*time.Second {
+		t.Fatalf("the scroll returned after %v, which is inside the refusal window; it did not wait for the load", spent)
+	}
+
+	after, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !hasName(after, "Revenue fell") {
+		t.Fatalf("the scroll returned before what it loaded arrived: %+v", after.Elements)
 	}
 }

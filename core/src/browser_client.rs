@@ -147,9 +147,21 @@ pub struct Element {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub value: String,
     /// The accessibility properties that change what an act would MEAN: `checked`/`unchecked`,
-    /// `disabled`, `expanded`/`collapsed`, `selected`, `required`.
+    /// `disabled`, `expanded`/`collapsed`, `selected`, `required`, `focused`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub state: Vec<String>,
+    /// Where a link goes — a path when it points at the page's own origin, the whole address
+    /// otherwise. Without it two links called "Details" are one link, and a link that opens in a
+    /// window (which the fence refuses) has no way onward, because `goto` needs an address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+}
+
+/// One kind of thing on the page that the accessibility tree does not carry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Unread {
+    pub kind: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -181,6 +193,15 @@ pub struct Snapshot {
     /// This is what stops the agent concluding the page is blank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Blocked>,
+    /// What is ON the page that the accessibility tree cannot express: a canvas, a video, an
+    /// undescribed drawing or image.
+    ///
+    /// A page drawn into a canvas — a chart, a map, a PDF viewer — loads perfectly and leaves
+    /// nothing in the tree, so the reading comes back short and with nothing to doubt. This does not
+    /// make the drawing readable; it makes the absence legible, which is the difference between an
+    /// agent concluding the answer is not there and knowing to ask a person.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<Unread>,
     /// The page had not finished arriving when this reading was taken.
     ///
     /// It is here because otherwise the flag could be raised and never lowered: opening said it,

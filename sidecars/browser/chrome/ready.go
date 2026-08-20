@@ -235,6 +235,19 @@ const changeDebounce = 40 * time.Millisecond
 // as it stood before — which is why the next reading says `still_loading` when it is, and why taking
 // another one is cheap.
 
+// quietAfterChange is how long a page that redrew has to redraw again before it counts as finished.
+//
+// Separate from renderGrace, which is shorter and answers a different question. There we KNOW the
+// request completed and are only allowing for a promise and a DOM write; here we know nothing —
+// the second half of a skeleton-then-data render arrives from a timer we cannot see, and the only
+// evidence available is silence.
+//
+// So this is a stated bound and not a measurement: a page whose two halves are further apart than
+// this is read as it stood after the first. Five hundred milliseconds covers the ordinary
+// placeholder-then-content gap; a second longer would cover more and would be paid by every act
+// that redraws once and stops.
+const quietAfterChange = 500 * time.Millisecond
+
 // movingBound caps how long a page may hold an act by changing.
 //
 // A page that never stops changing is ORDINARY — a clock, a carousel, a spinner — and waiting it out
@@ -274,7 +287,7 @@ func (d *Driver) awaitSettled(ctx context.Context, entry *session, since time.Ti
 		// A redraw from before this act is somebody else's news. Only what happened after it began
 		// is evidence that it began anything.
 		busy := carrying > 0
-		drawing := !changed.Before(since) && time.Since(changed) < renderGrace
+		drawing := !changed.Before(since) && time.Since(changed) < quietAfterChange
 		if busy || drawing {
 			started = true
 		}

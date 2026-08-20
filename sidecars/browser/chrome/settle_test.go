@@ -181,3 +181,55 @@ func TestARedrawAfterTheReactionWindowIsNotWaitedFor(t *testing.T) {
 		t.Fatalf("waited %v for a redraw that arrived long after the act", spent)
 	}
 }
+
+// TestASecondRedrawInsideTheQuietWindowExtendsTheWait.
+//
+// A page that draws a placeholder and then its content is drawing twice, and the second half arrives
+// from a timer nothing on this side can see. Silence is the only evidence there is, so the rule is
+// how long silence has to last before it counts as finished — and both halves of that rule are
+// asserted, here and below, because a bound stated only in a comment is a bound nobody keeps.
+func TestASecondRedrawInsideTheQuietWindowExtendsTheWait(t *testing.T) {
+	driver, entry := settling(settleGrace, 10*time.Second)
+	driver.movingWithin = 10 * time.Second
+
+	since := time.Now()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		driver.setChanged(entry, time.Now())
+		time.Sleep(quietAfterChange - 200*time.Millisecond)
+		driver.setChanged(entry, time.Now())
+	}()
+
+	if driver.awaitSettled(context.Background(), entry, since) {
+		t.Fatal("the page drew twice and stopped; it is not still loading")
+	}
+	// Past the second draw, which is the whole claim: a wait that ended on the first would have
+	// returned with the placeholder on screen.
+	if spent := time.Since(since); spent < 100*time.Millisecond+quietAfterChange-200*time.Millisecond {
+		t.Fatalf("returned after %v, before the second draw", spent)
+	}
+}
+
+// TestASecondRedrawAfterTheQuietWindowIsNotWaitedFor.
+//
+// The other half, and the honest one. There is no signal for a timer, so a page whose two halves are
+// further apart than the window is read as it stood after the first — and the cost of covering it
+// would be paid by every act that redraws once and stops.
+func TestASecondRedrawAfterTheQuietWindowIsNotWaitedFor(t *testing.T) {
+	driver, entry := settling(settleGrace, 10*time.Second)
+	driver.movingWithin = 10 * time.Second
+
+	since := time.Now()
+	driver.setChanged(entry, since)
+	go func() {
+		time.Sleep(quietAfterChange + 400*time.Millisecond)
+		driver.setChanged(entry, time.Now())
+	}()
+
+	if driver.awaitSettled(context.Background(), entry, since) {
+		t.Fatal("nothing was in flight")
+	}
+	if spent := time.Since(since); spent > quietAfterChange+300*time.Millisecond {
+		t.Fatalf("waited %v, so the window is not the bound it says it is", spent)
+	}
+}

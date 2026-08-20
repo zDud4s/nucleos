@@ -159,13 +159,17 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 
 // ranPageCode says whether this verb handed control to the page's own scripts.
 //
-// Scroll and back do not: one moves the viewport and the other unwinds history, and neither runs a
-// handler that could ask the ferry for anything. The rest do, which is why they are the ones that
-// get a moment to show what they started. Goto and the navigating half of everything else are
-// covered by the other branch of afterAct, which waits on the load.
+// Scroll is in the list, and the reasoning that kept it out was wrong in exactly the place it
+// mattered. "It moves the viewport and runs no handler" is false on any page with an infinite list:
+// scrolling is THE gesture that loads more, so the one case where a scroll does something was the
+// one case nothing waited for it.
+//
+// Back and goto are not here because they navigate, and a navigation is the other branch of
+// afterAct — which waits on the load rather than on a reaction.
 func ranPageCode(kind browser.ActionKind) bool {
 	switch kind {
-	case browser.ActionClick, browser.ActionType, browser.ActionSelect, browser.ActionPress:
+	case browser.ActionClick, browser.ActionType, browser.ActionSelect,
+		browser.ActionPress, browser.ActionScroll:
 		return true
 	default:
 		return false

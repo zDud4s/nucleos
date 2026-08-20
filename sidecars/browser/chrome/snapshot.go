@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,21 +38,23 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 		return browser.Snapshot{}, err
 	}
 
-	read := collect(root, req)
-	elements, gone := d.name(entry, read.elements, req.ChangesOnly)
-
-	url, title, ready := d.locate(ctx, entry.cdp)
-	if url != "" {
-		entry.final = url
+	// Before the walk, because a link's address is shortened against the page's own origin and the
+	// walk is where the elements are built.
+	facts := d.locate(ctx, entry.cdp)
+	if facts.URL != "" {
+		entry.final = facts.URL
 	}
-	if title != "" {
-		entry.title = title
+	if facts.Title != "" {
+		entry.title = facts.Title
 	}
 	// An empty readyState is a page that could not be asked, and is not evidence of anything. Said
 	// only when something actually says it: a reading that guesses "unfinished" would send the agent
 	// round a loop it can never leave.
 	_, carrying := d.ferryState(entry)
-	stillLoading := (ready != "" && ready != "complete") || carrying > 0
+	stillLoading := (facts.Ready != "" && facts.Ready != "complete") || carrying > 0
+
+	read := collect(root, req, entry.final)
+	elements, gone := d.name(entry, read.elements, req.ChangesOnly)
 
 	return browser.Snapshot{
 		SessionID:    id,
@@ -67,6 +70,7 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 		Partial:      req.ChangesOnly || strings.TrimSpace(req.Find) != "",
 		Blocked:      d.blockedSoFar(entry),
 		StillLoading: stillLoading,
+		Unread:       facts.Unread,
 	}, nil
 }
 
@@ -281,7 +285,7 @@ type found struct {
 // this one stopped. Truncation is terminal for prose rather than skip-and-continue: a reading that
 // dropped one long paragraph and then included a short one from further down would be a page nobody
 // wrote, and the agent has no way to tell that from the page.
-func collect(root *tree, req browser.SnapshotRequest) slice {
+func collect(root *tree, req browser.SnapshotRequest, page string) slice {
 	elements := make([]found, 0, len(root.nodes))
 	// Two pairs and not one. spent/passed are the prose: what this slice delivered, and where the
 	// prose has got to overall. controlsSpent/controlsPassed are the same for the actionable set,
@@ -388,6 +392,7 @@ func collect(root *tree, req browser.SnapshotRequest) slice {
 							Name:  name,
 							Value: value,
 							State: stateOf(node),
+							URL:   shortURL(propertyOf(node, "url"), page),
 						},
 						key:     nodeKey{session: t.session, backend: node.BackendDOMNodeID},
 						control: true,
@@ -490,13 +495,61 @@ func stateOf(node axNode) []string {
 			} else if value == "false" {
 				state = append(state, "collapsed")
 			}
-		case "disabled", "selected", "required":
+		case "disabled", "selected", "required", "focused":
 			if value == "true" {
 				state = append(state, property.Name)
 			}
 		}
 	}
 	return state
+}
+
+// propertyOf reads one accessibility property by name, or "".
+func propertyOf(node axNode, name string) string {
+	for _, property := range node.Properties {
+		if property.Name == name {
+			return strings.TrimSpace(property.Value.Value)
+		}
+	}
+	return ""
+}
+
+// shortURL is a link's address as the agent should read it.
+//
+// A path when it points at the page's own origin, which is most links on most pages: it is shorter,
+// it is more legible, and `goto` resolves a relative url against the page anyway, so nothing is lost
+// by handing back the half that differs. A link to anywhere else keeps its whole address, because
+// where it leaves to is the part worth knowing.
+//
+// The saving is not cosmetic. A listing carries up to a control budget of links, and a full absolute
+// url on each of them is comparable to the entire prose budget.
+func shortURL(raw, page string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	target, err := url.Parse(raw)
+	if err != nil || !target.IsAbs() {
+		return raw
+	}
+	base, baseErr := url.Parse(page)
+	if baseErr != nil || base.Host == "" {
+		return raw
+	}
+	if !strings.EqualFold(target.Scheme, base.Scheme) || !strings.EqualFold(target.Host, base.Host) {
+		return raw
+	}
+	short := target.EscapedPath()
+	if short == "" {
+		short = "/"
+	}
+	if target.RawQuery != "" {
+		short += "?" + target.RawQuery
+	}
+	if target.Fragment != "" {
+		short += "#" + target.EscapedFragment()
+	}
+	return short
 }
 
 // axValue is one field of an accessibility node, and it is tolerant on purpose.
@@ -584,18 +637,59 @@ func interesting(role, name string) bool {
 	}
 }
 
-// locate asks the page where it is, what it is called, and whether it has finished arriving.
+// pageFacts is everything one Runtime.evaluate can answer about a page at once.
 //
-// Three answers on one round trip, and the third rides along for free: a snapshot already pays for
-// this call, so saying whether the document has settled costs nothing, and the alternative was
-// raising `still_loading` on the way in and never lowering it.
-func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) (url, title, ready string) {
+// One call, because a snapshot already pays for it. Where the page is, what it is called, whether it
+// has finished arriving, and what it is showing that the accessibility tree cannot express — each of
+// those separately would be a round trip, and a reading that costs four round trips is one an agent
+// stops taking between actions.
+type pageFacts struct {
+	URL    string           `json:"url"`
+	Title  string           `json:"title"`
+	Ready  string           `json:"ready"`
+	Unread []browser.Unread `json:"unread"`
+}
+
+// pageQuestion is what gets evaluated. A raw string with no backtick anywhere inside it, which is a
+// property of the file and not of the JavaScript.
+//
+// The sizes are thresholds and not truth: a one-pixel canvas is a tracking pixel and a six-hundred
+// pixel one is a chart, and the point of the whole field is to be worth reading rather than to be
+// exhaustive. It sees the MAIN frame only — a chart inside a cross-origin frame is not counted, and
+// counting it would need this evaluated per target.
+const pageQuestion = `JSON.stringify((() => {
+  const seen = [];
+  const add = (kind, n) => { if (n > 0) { seen.push({kind: kind, count: n}); } };
+  const big = (el, min) => {
+    const box = el.getBoundingClientRect();
+    return box.width >= min && box.height >= min;
+  };
+  const described = (el) =>
+    (el.getAttribute('aria-label') || '').trim() !== '' ||
+    (el.getAttribute('alt') || '').trim() !== '' ||
+    el.querySelector('title, desc') !== null;
+  try {
+    add('canvas', [...document.querySelectorAll('canvas')].filter(el => big(el, 64)).length);
+    add('video', [...document.querySelectorAll('video')].filter(el => big(el, 64)).length);
+    add('drawing', [...document.querySelectorAll('svg')].filter(el => big(el, 64) && !described(el)).length);
+    add('image', [...document.querySelectorAll('img')].filter(el => big(el, 256) && !described(el)).length);
+  } catch (e) {}
+  return {
+    url: location.href,
+    title: document.title,
+    ready: document.readyState,
+    unread: seen,
+  };
+})())`
+
+// locate asks the page the one question a snapshot needs answered about it.
+func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) pageFacts {
 	result, err := d.conn.Call(ctx, cdpSession, "Runtime.evaluate", map[string]any{
-		"expression":    "JSON.stringify({url: location.href, title: document.title, ready: document.readyState})",
+		"expression":    pageQuestion,
 		"returnByValue": true,
 	})
 	if err != nil {
-		return "", "", ""
+		return pageFacts{}
 	}
 	var payload struct {
 		Result struct {
@@ -603,15 +697,11 @@ func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) (url, tit
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(result, &payload); err != nil {
-		return "", "", ""
+		return pageFacts{}
 	}
-	var located struct {
-		URL   string `json:"url"`
-		Title string `json:"title"`
-		Ready string `json:"ready"`
+	var facts pageFacts
+	if err := json.Unmarshal([]byte(payload.Result.Value), &facts); err != nil {
+		return pageFacts{}
 	}
-	if err := json.Unmarshal([]byte(payload.Result.Value), &located); err != nil {
-		return "", "", ""
-	}
-	return located.URL, located.Title, located.Ready
+	return facts
 }

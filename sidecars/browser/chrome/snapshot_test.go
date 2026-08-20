@@ -19,6 +19,10 @@ func snapshotFrom(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 	return elements, backends(entry.refs), truncated
 }
 
+// testPage is where these trees pretend to have come from, which is what a link's address is
+// shortened against.
+const testPage = "https://example.org/here"
+
 // oneDocument wraps a node list as a page with nothing framed in it, which is what every test in
 // this file is about — the framing is measured against real Chromium in the gate, because a fake
 // tree cannot have a process boundary in it.
@@ -282,19 +286,19 @@ func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
 // sliceFrom is snapshotFrom with the prose cursor, for the tests that are about continuation.
 // collectParts keeps the older tests reading the way they did, before one snapshot had two budgets.
 func collectParts(root *tree, req browser.SnapshotRequest) ([]found, bool) {
-	read := collect(root, req)
+	read := collect(root, req, testPage)
 	return read.elements, read.truncated
 }
 
 func sliceFrom(nodes []axNode, textFrom int) ([]browser.Element, bool, int) {
-	read := collect(oneDocument(nodes), browser.SnapshotRequest{TextFrom: textFrom})
+	read := collect(oneDocument(nodes), browser.SnapshotRequest{TextFrom: textFrom}, testPage)
 	elements, _ := (&Driver{}).name(newTestSession(), read.elements, false)
 	return elements, read.truncated, read.textNext
 }
 
 // controlsFrom is sliceFrom for the other budget.
 func controlsFrom(nodes []axNode, from int) ([]browser.Element, bool, int) {
-	read := collect(oneDocument(nodes), browser.SnapshotRequest{ControlsFrom: from})
+	read := collect(oneDocument(nodes), browser.SnapshotRequest{ControlsFrom: from}, testPage)
 	elements, _ := (&Driver{}).name(newTestSession(), read.elements, false)
 	return elements, read.truncated, read.controlsNext
 }

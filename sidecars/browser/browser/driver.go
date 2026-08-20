@@ -115,10 +115,24 @@ type Element struct {
 	Value string `json:"value,omitempty"`
 	// State is the handful of accessibility properties that change what an act would MEAN, and only
 	// those: `checked`/`unchecked`/`mixed`, `disabled`, `expanded`/`collapsed`, `selected`,
-	// `required`. Both halves of the booleans are spelled out rather than left implied, because an
-	// absent `checked` is indistinguishable from an element that has no checked state at all — and
-	// that is exactly the distinction a checkbox turns on.
+	// `required`, `focused`. Both halves of the booleans are spelled out rather than left implied,
+	// because an absent `checked` is indistinguishable from an element that has no checked state at
+	// all — and that is exactly the distinction a checkbox turns on.
+	//
+	// `focused` is here because `press` with no ref sends its key to whatever has focus, and without
+	// this the reading never named the one element the verb was about to act on.
 	State []string `json:"state,omitempty"`
+	// URL is where a link goes.
+	//
+	// Its absence was a dead end rather than an inconvenience, because it compounded with the
+	// refusal of new windows: a link that opens in a tab is refused, the way onward is `goto`, and
+	// `goto` needs an address no reading had ever given. Two links called "Details" were also, to an
+	// agent, the same link.
+	//
+	// Shortened to a path when it points at the page's own origin, which is most of them: it is
+	// shorter, it is more legible, and `goto` resolves a relative url against the page anyway. A
+	// link to anywhere else carries its whole address, because that is the part worth knowing.
+	URL string `json:"url,omitempty"`
 }
 
 // SnapshotRequest is what to read and how much of it.
@@ -196,6 +210,17 @@ type Snapshot struct {
 	// no request is ever made and there is nothing for the other two layers to report, so a page
 	// that could not fetch its own content used to read as a page that had none.
 	Blocked *Blocked `json:"blocked,omitempty"`
+	// Unread is what is ON the page that the accessibility tree cannot express.
+	//
+	// The last shape of the failure this whole pillar was built to end. A page drawn into a canvas —
+	// a chart, a map, a PDF viewer, a design tool — has nothing in the tree, so the reading comes
+	// back correct, short, and with nothing to doubt: no `blocked`, no `truncated`, no
+	// `still_loading`. An agent reads "there is nothing here" and it is the one page where that is
+	// most confidently wrong.
+	//
+	// This does not make the content readable. It makes the ABSENCE legible, which is the difference
+	// between an agent concluding the answer is not there and an agent knowing to ask a person.
+	Unread []Unread `json:"unread,omitempty"`
 	// StillLoading has the same meaning here as on Session, and it is here because otherwise the
 	// flag could be raised and never lowered.
 	//
@@ -204,6 +229,15 @@ type Snapshot struct {
 	// have to spend a turn asking for. So the reading itself carries whether the page has settled,
 	// and an agent told "not finished" can take another one and be told it now is.
 	StillLoading bool `json:"still_loading,omitempty"`
+}
+
+// Unread is one kind of thing on the page that the accessibility tree does not carry.
+//
+// A kind and a count, not a list: there is nothing to act on, and what the agent needs to know is
+// that the page shows something this reading does not.
+type Unread struct {
+	Kind  string `json:"kind"`
+	Count int    `json:"count"`
 }
 
 // ActionKind is the verb. The set is small and closed on purpose (spec §6.2, "consequence-free in

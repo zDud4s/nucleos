@@ -222,13 +222,49 @@ func newSite(t *testing.T) *site {
 			<script>
 			document.getElementById('load').addEventListener('click', () => {
 				setTimeout(() => {
-					fetch('/content').then(r => r.text())
+					fetch('/slow-content').then(r => r.text())
 						.then(t => { document.getElementById('app').innerHTML = t; })
 						.catch(e => { new Image().src = '/beacon?what=click-fetch-failed'; });
 				}, 30);
 			});
 			</script>`)
 	})
+	// Two links with the same words and different destinations, which is what a directory looks
+	// like. Plus one that leaves the host, because that is the case where the whole address is the
+	// news rather than the path.
+	mux.HandleFunc("/links", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, PAGE_LINKS, otherHostOf(r))
+	})
+
+	// A box that has the keyboard from the moment the page loads. `press` with no ref goes wherever
+	// focus is, so this is the page that says whether the reading can name it.
+	mux.HandleFunc("/focus", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_FOCUS)
+	})
+
+	// A page whose content is drawn, not written: nothing of it reaches the accessibility tree. A
+	// chart, a map, a PDF viewer. The heading is there so the reading is not empty — an empty one
+	// would be ambiguous with a page that failed to load, and the claim is about a page that
+	// loaded fine and still cannot be read.
+	mux.HandleFunc("/canvas", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_CANVAS)
+	})
+
+	// An endless list: scrolling is what loads more, which is the case that made excluding scroll
+	// from the wait wrong. Two steps for the same reason as /click-render — the first inside the
+	// reaction window, the last well outside it.
+	mux.HandleFunc("/endless", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_ENDLESS)
+	})
+
 	// A click that changes the page and asks for NOTHING, which is the half the ferry cannot see: no
 	// request, no navigation, just the page redrawing itself. A menu opening, a route rendering from
 	// data already in memory, a list filtering. The delay is short and real — a framework does not
@@ -251,7 +287,7 @@ func newSite(t *testing.T) *site {
 				setTimeout(() => {
 					app.innerHTML =
 						'<p>Revenue fell by eleven percent, which nobody had forecast.</p>';
-				}, 600);
+				}, 450);
 			});
 			</script>`)
 	})
@@ -275,6 +311,28 @@ func newSite(t *testing.T) *site {
 			flusher.Flush()
 		}
 		<-r.Context().Done()
+	})
+
+	// The same content as /content, and slow on purpose, for the tests whose claim is about WAITING
+	// rather than about reading. An act already spends up to a second and a half waiting for a fence
+	// refusal, so anything a page finishes inside that window is covered whether the wait after it
+	// works or not — and a test written against such a page passes either way.
+	mux.HandleFunc("/slow-content", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		time.Sleep(2500 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<p>Revenue fell by eleven percent, which nobody had forecast.</p>"+
+			"<button id=ok>Approve the write-down</button>")
+	})
+
+	// The rows an endless list loads, and slowly on purpose: longer than the window an act already
+	// spends waiting for a fence refusal. A wait that did not drain what the ferry is carrying returns
+	// before this answers, and the reading shows the list exactly as it was.
+	mux.HandleFunc("/slow-rows", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		time.Sleep(2500 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<p>Revenue fell by eleven percent, which nobody had forecast.</p>")
 	})
 
 	// A neighbouring service, which is what the modern web actually looks like: the page is
@@ -728,3 +786,54 @@ func evaluate(t *testing.T, conn *cdp.Conn, session cdp.SessionID, expression st
 	}
 	return payload.Result.Value
 }
+
+// otherHostOf is this same server under the name Chromium calls a different site, built from the
+// request so the page does not have to be told its own address.
+func otherHostOf(r *http.Request) string {
+	return "http://localhost:" + portOf(r.Host) + "/reading"
+}
+
+func portOf(hostPort string) string {
+	if _, port, err := net.SplitHostPort(hostPort); err == nil {
+		return port
+	}
+	return "80"
+}
+
+const PAGE_LINKS = `<!doctype html><title>links</title><body>
+	<h1>Invoices</h1>
+	<ul>
+		<li>March <a href="/invoices/1">Details</a></li>
+		<li>April <a href="/invoices/2?open=1">Details</a></li>
+		<li><a href="%s">Details</a></li>
+	</ul>`
+
+const PAGE_FOCUS = `<!doctype html><title>focus</title><body>
+	<h1>Search</h1>
+	<label>Query <input id=q autofocus></label>
+	<label>Notes <input id=n></label>`
+
+const PAGE_CANVAS = `<!doctype html><title>canvas</title><body>
+	<h1>Quarterly</h1>
+	<canvas id=chart width=600 height=400></canvas>
+	<script>
+	const ink = document.getElementById('chart').getContext('2d');
+	ink.fillStyle = '#333';
+	ink.fillRect(20, 20, 120, 300);
+	ink.fillText('Revenue fell by eleven percent', 200, 200);
+	</script>`
+
+const PAGE_ENDLESS = `<!doctype html><title>endless</title><body>
+	<h1>Everything</h1>
+	<div id=list><p>Row one.</p></div>
+	<div style="height: 4000px"></div>
+	<script>
+	let loading = false;
+	window.addEventListener('scroll', () => {
+		if (loading || window.scrollY < 100) { return; }
+		loading = true;
+		fetch('/slow-rows').then(r => r.text()).then(t => {
+			document.getElementById('list').insertAdjacentHTML('beforeend', t);
+		});
+	});
+	</script>`
