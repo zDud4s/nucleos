@@ -229,6 +229,12 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/chats/{chat_id}/commands",
             get(get_chat_commands),
         )
+        // Taking back something that has not been sent. A segment deeper than the chat, and named
+        // for the thing it removes rather than for the chat it removes it from.
+        .route(
+            "/assistant/chats/{chat_id}/queue/{queued_id}",
+            delete(delete_queued),
+        )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
@@ -3529,11 +3535,12 @@ struct TranscriptOut {
     /// is most of them, and empty rather than absent so a reader never has to branch on missing.
     handed: Vec<(String, String)>,
     turns: Vec<AssistantTurnOut>,
-    /// What was said to this conversation while it was busy, and has not been sent yet.
+    /// What was said to this conversation while it was busy, and has not been sent yet, each with
+    /// the name it can be taken back by.
     ///
     /// Here rather than on its own route because it belongs to the same picture and moves on the
     /// same poll: the window draws it under the last turn, where the answer will land.
-    queued: Vec<String>,
+    queued: Vec<crate::chats::Waiting>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3609,7 +3616,27 @@ async fn get_chat_commands(
     Ok(Json(CommandsOut { commands }))
 }
 
-/// Names under this conversation's own working directory, for completing an `@`.
+/// Takes a message back off a conversation's queue before it is sent.
+///
+/// 404 when there was nothing to take, which covers both of the ways that happens: a message the
+/// drain sent a moment ago, and one that belongs to a different conversation. They are the same
+/// answer on purpose — a caller learning which of the two it was would be learning something about
+/// somebody else's queue.
+async fn delete_queued(
+    State(state): State<AppState>,
+    Path((chat_id, queued_id)): Path<(String, i64)>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::chats::drop_queued(&state.pool, &chat_id, queued_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, "taking a message off a queue failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Names under this conversation's own working directory, for completing an `@'`.
 ///
 /// The root comes from the chat's row and never from the caller. A route that took a directory
 /// would be a route that reads any directory — and there is nothing to gain by it: the only
@@ -9655,7 +9682,56 @@ mod tests {
             .unwrap();
 
         let body = json_body(response).await;
-        assert_eq!(body["queued"][0], "e os testes tambem");
+        assert_eq!(body["queued"][0]["text"], "e os testes tambem");
+        // Named, so it can be taken back: a position would mean something different the moment the
+        // drain sends whatever is in front of it.
+        assert!(body["queued"][0]["id"].is_i64());
+    }
+
+    /// Taking back a message that has not been sent, and being told when there was nothing to take.
+    #[tokio::test]
+    async fn a_message_can_be_taken_back_off_the_queue_before_it_is_sent() {
+        let state = test_state().await;
+        crate::chats::enqueue(&state.pool, "waiting", "deixa estar", "shell", "[]")
+            .await
+            .unwrap();
+        let id = crate::chats::queued(&state.pool, "waiting").await.unwrap()[0].id;
+
+        let taken = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assistant/chats/waiting/queue/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(taken.status(), StatusCode::NO_CONTENT);
+        assert!(
+            crate::chats::queued(&state.pool, "waiting")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // And again, on the same id: the drain may have sent it a moment ago, which is the same
+        // answer as it never having been this conversation's.
+        let again = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assistant/chats/waiting/queue/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(again.status(), StatusCode::NOT_FOUND);
     }
 
     /// A conversation offers the commands in its own directory, by the name they are typed as.

@@ -11,6 +11,7 @@ import {
   useWireIdeSessionTools,
   useChatCommands,
   useChatFiles,
+  useDropQueued,
   useLiveTurn,
   useLocalModel,
   usePatchChat,
@@ -24,6 +25,7 @@ import {
   type Command,
   type Exchange,
   type Mention,
+  type Waiting,
   type IdeSession,
   type ToolCall,
   type Turn,
@@ -576,7 +578,7 @@ function ChatDetail({
       )}
       {/* Below the transcript and above the box, which is where these words are in time: said
           after everything above them, and not yet said at all. */}
-      <Waiting queued={transcript.data?.queued ?? []} />
+      <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
 
       <Composer chatId={chatId} />
     </Panel>
@@ -870,18 +872,28 @@ function HowItContinued({
  * No control to cancel one, and that is a gap rather than a decision: the daemon can drop a queued
  * message, nothing here asks it to yet.
  */
-function Waiting({ queued }: { queued: string[] }) {
+function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
+  const drop = useDropQueued(chatId);
   if (queued.length === 0) return null;
   return (
     <ul className="chats-waiting" aria-label="Waiting to be sent">
-      {queued.map((text, index) => (
-        // Keyed by position: this is a stored list, in the order it was typed, and nothing here
-        // reorders or removes from it. Two identical messages are two real entries.
-        <li key={`waiting-${index}`} className="chats-waiting-line">
+      {queued.map((message) => (
+        // Keyed by the daemon's own id, not by position: the front of this list is sent while it
+        // is on screen, and a key that moved with it would redraw the wrong row.
+        <li key={message.id} className="chats-waiting-line">
           <span className="chats-waiting-who">you · waiting</span>
           {/* Verbatim, and not through `Rich`: it is what a person typed, and a message redrawn
               as bold is a message they did not write. */}
-          <p className="chats-waiting-text">{text}</p>
+          <p className="chats-waiting-text">{message.text}</p>
+          <button
+            type="button"
+            className="chats-waiting-drop"
+            aria-label={`Do not send: ${message.text}`}
+            disabled={drop.isPending}
+            onClick={() => drop.mutate(message.id)}
+          >
+            don't send this
+          </button>
         </li>
       ))}
     </ul>
@@ -1155,6 +1167,7 @@ function TurnPictures({ paths }: { paths: string[] }) {
 function TurnPicture({ path }: { path: string }) {
   const [url, setUrl] = useState<string | null>(null);
   const [gone, setGone] = useState(false);
+  const [open, setOpen] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -1178,7 +1191,62 @@ function TurnPicture({ path }: { path: string }) {
   // record, and an empty space where one was is indistinguishable from a turn that had none.
   if (gone) return <p className="chats-picture-gone">a picture sent here can no longer be read</p>;
   if (url === null) return <p className="chats-picture-gone">reading a picture…</p>;
-  return <img className="chats-picture" src={url} alt={`sent with this message: ${path}`} />;
+  return (
+    <>
+      {/* A button and not a bare image: opening one is an action, and an image that grows when
+          clicked without ever saying it could is a thing people find by accident. */}
+      <button
+        type="button"
+        className="chats-picture-open"
+        aria-label={`Open picture ${path}`}
+        onClick={() => setOpen(true)}
+      >
+        <img className="chats-picture" src={url} alt={`sent with this message: ${path}`} />
+      </button>
+      {open && <PictureOverlay url={url} path={path} onClose={() => setOpen(false)} />}
+    </>
+  );
+}
+
+/**
+ * One picture, filling the window, until it is dismissed.
+ *
+ * Escape closes it as well as the button, because a thing that covers the page and can only be left
+ * by finding a small target is a thing that traps people. The same object URL the thumbnail is
+ * already holding — fetching the bytes a second time to show the same picture larger would be
+ * paying twice for one file.
+ */
+function PictureOverlay({
+  url,
+  path,
+  onClose,
+}: {
+  url: string;
+  path: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="chats-picture-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Picture ${path}`}
+      onClick={onClose}
+    >
+      <img className="chats-picture-full" src={url} alt={path} />
+      <button type="button" className="chats-picture-close" aria-label="Close picture">
+        close
+      </button>
+    </div>
+  );
 }
 
 /**

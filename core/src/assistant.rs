@@ -3777,10 +3777,13 @@ mod tests {
             send_or_queue(&state, chat_id, "e os testes tambem", &[], Origin::Shell).await;
 
         assert_eq!(outcome, Ok(Sent::Queued));
-        assert_eq!(
-            crate::chats::queued(&state.pool, chat_id).await.unwrap(),
-            vec!["e os testes tambem".to_string()]
-        );
+        let waiting: Vec<String> = crate::chats::queued(&state.pool, chat_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.text)
+            .collect();
+        assert_eq!(waiting, vec!["e os testes tambem".to_string()]);
     }
 
     /// A caller that did not ask to wait is still refused, exactly as before.
@@ -3863,10 +3866,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            crate::chats::queued(&state.pool, chat_id).await.unwrap(),
-            vec!["segundo".to_string(), "terceiro".to_string()]
-        );
+        let waiting: Vec<String> = crate::chats::queued(&state.pool, chat_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.text)
+            .collect();
+        assert_eq!(waiting, vec!["segundo".to_string(), "terceiro".to_string()]);
     }
 
     /// With nothing in flight there is nothing to wait for, and asking to wait must not make a

@@ -149,13 +149,26 @@ export interface Transcript {
   turns: Turn[];
   /**
    * What was said to this conversation while it was busy and has not been sent
-   * yet, oldest first.
+   * yet, oldest first, each with the name it can be taken back by.
    *
    * Not turns and never drawn as ones: nothing has run, nothing is billed, and
    * a bubble that looked like a turn would be claiming a run that does not
    * exist. They leave this list by becoming turns, on their own.
    */
-  queued: string[];
+  queued: Waiting[];
+}
+
+/**
+ * One message waiting to be said, and the name it can be taken back by.
+ *
+ * An id and not a position: the daemon sends the front of the queue while a
+ * person is looking at it, so "the second one" means something different a
+ * moment later — and taking one back by position would take back a message
+ * nobody pointed at.
+ */
+export interface Waiting {
+  id: number;
+  text: string;
 }
 
 /** One name a conversation offers for an `@`, relative to its own directory. */
@@ -260,7 +273,7 @@ export function useChatTranscript(chatId: string | null) {
       const read = await apiFetch<{
         handed: Exchange[];
         turns: AssistantTurnRow[];
-        queued: string[];
+        queued: Waiting[];
       }>(
         `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
       );
@@ -489,6 +502,29 @@ export function useChatCommands(chatId: string, query: string | null) {
     // the disk between keystrokes and short enough that a new command shows up while you look.
     staleTime: 10_000,
     retry: false,
+  });
+}
+
+/**
+ * Takes a message back off the queue before it is sent.
+ *
+ * A 404 is not an error worth showing: it means the daemon sent that message a moment before the
+ * click landed, which is a race a person loses harmlessly. Either way the transcript is asked
+ * again, and either way what is on screen becomes true.
+ */
+export function useDropQueued(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (queuedId: number) =>
+      apiFetch<void>(
+        `/assistant/chats/${encodeURIComponent(chatId)}/queue/${queuedId}`,
+        { method: "DELETE" },
+      ),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
   });
 }
 

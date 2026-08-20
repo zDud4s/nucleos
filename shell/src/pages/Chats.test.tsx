@@ -124,7 +124,7 @@ function chatsFetch(
     /** The slash commands each conversation offers, by chat id. */
     commands?: Record<string, Command[]>;
     /** What is waiting to be said to each conversation, by chat id. */
-    queued?: Record<string, string[]>;
+    queued?: Record<string, Array<{ id: number; text: string }>>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -798,6 +798,53 @@ describe("where a subagent worked", () => {
   });
 });
 
+describe("opening a picture", () => {
+  it("fills the window, and Escape leaves it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "que cor e esta?", answer: "magenta", images: ["chats/1-0.png"] }),
+        ],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open picture chats/1-0.png" }));
+
+    const shown = await screen.findByRole("dialog", { name: "Picture chats/1-0.png" });
+    expect(shown).toBeTruthy();
+
+    // A thing that covers the page and can only be left by finding a small target is a trap.
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Picture chats/1-0.png" })).toBeNull();
+    });
+  });
+});
+
+describe("taking a waiting message back", () => {
+  const waiting = () =>
+    chatsFetch(
+      [chatSummary({ chat_id: "c-1" })],
+      { "c-1": [turnRow({ id: 1, asked: "arranja", status: "running", answer: null })] },
+      { queued: { "c-1": [{ id: 7, text: "deixa estar" }] } },
+    );
+
+  it("asks the daemon to drop it by its own id", async () => {
+    daemon.apiFetch.mockImplementation(waiting());
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Do not send: deixa estar" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/queue/7", {
+        method: "DELETE",
+      });
+    });
+  });
+});
+
 /* -------------------------------------------------------------- pictures -- */
 
 describe("sending a picture", () => {
@@ -953,7 +1000,7 @@ describe("what is waiting to be said", () => {
       chatsFetch(
         [chatSummary({ chat_id: "c-1" })],
         { "c-1": [turnRow({ id: 1, asked: "arranja o parser", status: "running", answer: null })] },
-        { queued: { "c-1": ["e os testes tambem"] } },
+        { queued: { "c-1": [{ id: 7, text: "e os testes tambem" }] } },
       ),
     );
 
