@@ -132,11 +132,21 @@ pub async fn handover_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Optio
 /// Its own query rather than a field off `get`, matching `brain_of`: this is read on the hot path of
 /// every single turn, and `get` walks the whole list to answer.
 pub async fn cwd_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
-    let cwd: Option<Option<String>> = sqlx::query_scalar("SELECT cwd FROM chats WHERE chat_id = ?")
+    opened_in(pool, chat_id).await.map(Option::flatten)
+}
+
+/// Where this conversation runs, keeping "no such conversation" apart from "no directory".
+///
+/// `cwd_of` flattens the two into one `None` because the turn path cannot act on the difference: a
+/// chat with no directory and a chat that is gone both mean "do not set a working directory". A
+/// caller that answers a person can act on it — one is a 404 and the other is a sentence — so the
+/// unflattened answer lives here and `cwd_of` is written in terms of it, rather than the two
+/// queries drifting apart.
+pub async fn opened_in(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<Option<String>>> {
+    sqlx::query_scalar("SELECT cwd FROM chats WHERE chat_id = ?")
         .bind(chat_id)
         .fetch_optional(pool)
-        .await?;
-    Ok(cwd.flatten())
+        .await
 }
 
 /// The app's conversations, most recently active first.

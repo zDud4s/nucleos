@@ -37,6 +37,7 @@ mod local_agent;
 mod logging;
 mod mailsend;
 mod mcp_tools;
+mod mentions;
 mod notes;
 mod notify;
 mod pii_shadow;

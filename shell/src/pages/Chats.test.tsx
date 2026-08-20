@@ -22,7 +22,7 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary, Conversation, IdeSession } from "../data/chats";
+import type { ChatSummary, Conversation, IdeSession, Mention } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
@@ -111,6 +111,8 @@ function chatsFetch(
     >;
     /** What each conversation was handed in place of a session too large to resume. */
     handed?: Record<string, Array<[string, string]>>;
+    /** The names each conversation offers for an `@`, by chat id. Absent means it has no directory. */
+    files?: Record<string, Mention[]>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -149,6 +151,19 @@ function chatsFetch(
       // A transcript this machine does not have is a 404, exactly as the daemon answers.
       if (found === undefined) throw new ApiRefusal(404, "not_found", "Not Found");
       return found;
+    }
+    // Before the transcript match below: that pattern would not hit a path with a further
+    // segment, but the order is what makes that true rather than a coincidence.
+    const files = /^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
+    if (files !== null) {
+      const offered = opts.files?.[decodeURIComponent(files[1])];
+      if (offered === undefined) return { rooted: false, hits: [], truncated: false };
+      const query = decodeURIComponent(files[2]).toLowerCase();
+      return {
+        rooted: true,
+        hits: offered.filter((hit) => hit.name.toLowerCase().includes(query)),
+        truncated: false,
+      };
     }
     const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
     if (match !== null) {
@@ -758,6 +773,103 @@ describe("where a subagent worked", () => {
     const row = note.closest("li") as HTMLElement;
     expect(within(row).queryByText("núcleo")).toBeNull();
     expect(row.className).toContain("aside");
+  });
+});
+
+/* ------------------------------------------------------------ mentioning -- */
+
+describe("naming a file with @", () => {
+  const withFiles = (files: Mention[]) => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        { files: { "c-1": files } },
+      ),
+    );
+    return renderChats("/chats/c-1");
+  };
+
+  const parser: Mention = { path: "core/src/parser.rs", name: "parser.rs", is_dir: false };
+
+  it("offers names once an @ is typed, and writes the path when one is chosen", async () => {
+    await withFiles([parser]);
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "olha o @pars", selectionStart: 12 } });
+
+    const list = await screen.findByRole("list", { name: "Files to mention" });
+    fireEvent.click(within(list).getByRole("button", { name: /parser\.rs/ }));
+
+    // The path, not the name: it is what the model can open from where its turn runs. And a space
+    // after it, so the next thing typed does not become part of the filename.
+    await waitFor(() => {
+      expect((box as HTMLTextAreaElement).value).toBe("olha o @core/src/parser.rs ");
+    });
+  });
+
+  // Everybody types an email address eventually, and a file list over one is the feature getting
+  // in the way of the message. Aimed at a word the offered file WOULD match, so the boundary rule
+  // is the only thing holding the list shut -- an @ nothing matches proves nothing about the rule.
+  it("stays out of the way of an @ inside a word", async () => {
+    await withFiles([parser]);
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "manda para duarte@parser", selectionStart: 24 } });
+
+    await screen.findByLabelText("Message");
+    expect(screen.queryByRole("list", { name: "Files to mention" })).toBeNull();
+  });
+
+  // "nothing matches what you typed" sends somebody hunting for a spelling mistake. "there is no
+  // directory" tells them why nothing will ever match. Only the second is true here.
+  it("says a conversation has nowhere to look rather than showing an empty list", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "@pars", selectionStart: 5 } });
+
+    expect(await screen.findByText(/no directory/i)).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Files to mention" })).toBeNull();
+  });
+
+  // The list owns Enter while it is open -- that is what the hand expects -- but it must give it
+  // back, or a person who does not want a file cannot send their message.
+  it("takes Enter while it is open and gives it back once dismissed", async () => {
+    await withFiles([parser]);
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "olha o @pars", selectionStart: 12 } });
+    await screen.findByRole("list", { name: "Files to mention" });
+
+    // Enter belongs to the list: it chooses, and nothing is sent.
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => {
+      expect((box as HTMLTextAreaElement).value).toContain("core/src/parser.rs");
+    });
+    expect(
+      daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/message"),
+    ).toBe(false);
+
+    fireEvent.change(box, { target: { value: "olha o @pars", selectionStart: 12 } });
+    await screen.findByRole("list", { name: "Files to mention" });
+    fireEvent.keyDown(box, { key: "Escape" });
+    await waitFor(() => {
+      expect(screen.queryByRole("list", { name: "Files to mention" })).toBeNull();
+    });
+
+    // And now Enter is the composer's again.
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => {
+      expect(
+        daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/message"),
+      ).toBe(true);
+    });
   });
 });
 

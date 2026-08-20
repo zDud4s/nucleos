@@ -149,6 +149,30 @@ export interface Transcript {
   turns: Turn[];
 }
 
+/** One name a conversation offers for an `@`, relative to its own directory. */
+export interface Mention {
+  /** Relative to the conversation's directory, forward-slashed. This is what goes in the message. */
+  path: string;
+  /** The last component, which is what is being typed at. */
+  name: string;
+  is_dir: boolean;
+}
+
+/** What a conversation offers for an `@`, and whether it had anywhere to look. */
+export interface Mentions {
+  /**
+   * False when this conversation has no working directory, or its directory is gone.
+   *
+   * The distinction an empty list cannot draw: "nothing matches what you typed" and "there is
+   * nowhere to look" look identical to a caller and are entirely different facts. Only the second
+   * is worth a sentence.
+   */
+  rooted: boolean;
+  hits: Mention[];
+  /** True when a ceiling cut the list, so the window never implies the file is simply not there. */
+  truncated: boolean;
+}
+
 /** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */
 export interface NewChat {
   brain?: Brain;
@@ -356,6 +380,32 @@ export function useLiveTurn(turnId: number, alive: boolean) {
     queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
     enabled: alive,
     refetchInterval: POLL.turn,
+  });
+}
+
+/**
+ * The names this conversation offers for an `@`, for what has been typed so far.
+ *
+ * `null` means no mention is being typed and nothing is asked at all — the query is disabled rather
+ * than fired with an empty string, because those are different questions and only one of them is
+ * worth a request.
+ *
+ * Previous data is kept while the next keystroke resolves. Without it the list empties and refills
+ * on every letter, which reads as flickering rather than as narrowing.
+ */
+export function useChatFiles(chatId: string, query: string | null) {
+  return useQuery({
+    queryKey: keys.chats.files(chatId, query ?? ""),
+    queryFn: () =>
+      apiFetch<Mentions>(
+        `/assistant/chats/${encodeURIComponent(chatId)}/files?q=${encodeURIComponent(query ?? "")}`,
+      ),
+    enabled: query !== null,
+    placeholderData: keepPreviousData,
+    // A checkout does not change between keystrokes. Re-walking it for a query already asked would
+    // be a directory walk to learn nothing.
+    staleTime: 10_000,
+    retry: false,
   });
 }
 

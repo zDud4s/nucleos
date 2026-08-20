@@ -220,6 +220,9 @@ pub fn build_router(state: AppState) -> Router {
                 .patch(patch_chat)
                 .delete(delete_chat),
         )
+        // The names an `@` in the composer completes against. A segment deeper than the chat
+        // itself, and rooted at that chat's own directory rather than at anything the caller sends.
+        .route("/assistant/chats/{chat_id}/files", get(get_chat_files))
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
@@ -3466,6 +3469,91 @@ struct TranscriptOut {
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
 const ASSISTANT_TRANSCRIPT_LIMIT: i64 = 100;
+
+/// The longest query the name completion will act on.
+///
+/// Not a safety limit — `mentions::matching` walks the same tree whatever it is given. It is a
+/// statement about what the field is for: past this, what arrived is not somebody typing a filename
+/// and answering it as though it were would be answering the wrong question slowly.
+const MENTION_QUERY_LIMIT: usize = 100;
+
+#[derive(serde::Deserialize)]
+struct MentionQuery {
+    /// What has been typed after the `@`. Absent or empty asks for the top level.
+    #[serde(default)]
+    q: String,
+}
+
+/// The names a conversation offers, and whether it had anywhere to look at all.
+///
+/// `rooted` is the distinction an empty list cannot draw: "nothing here matches what you typed" and
+/// "this conversation has no directory" look identical to a caller and are entirely different
+/// facts. Only the second is worth a sentence in the window.
+#[derive(serde::Serialize)]
+struct MentionsOut {
+    rooted: bool,
+    #[serde(flatten)]
+    found: crate::mentions::Found,
+}
+
+/// Names under this conversation's own working directory, for completing an `@`.
+///
+/// The root comes from the chat's row and never from the caller. A route that took a directory
+/// would be a route that reads any directory — and there is nothing to gain by it: the only
+/// defensible root is where this conversation's turns already run, because the model can open those
+/// files anyway and naming them discloses nothing it could not read.
+///
+/// A directory that is gone reads as `rooted: false` rather than as an empty search. It is the same
+/// fact as having none: there is nowhere to look, and saying "no matches" would send somebody
+/// hunting for a spelling mistake.
+async fn get_chat_files(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<MentionQuery>,
+) -> Result<Json<MentionsOut>, StatusCode> {
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading where a conversation runs failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let Some(cwd) = cwd else {
+        return Ok(Json(MentionsOut {
+            rooted: false,
+            found: crate::mentions::Found {
+                hits: Vec::new(),
+                truncated: false,
+            },
+        }));
+    };
+
+    let typed: String = query.q.chars().take(MENTION_QUERY_LIMIT).collect();
+    // Off the async runtime: this is a directory walk on a keystroke, and holding a runtime thread
+    // for it would stall every other request sharing that thread.
+    let answered = tokio::task::spawn_blocking(move || {
+        let root = std::path::Path::new(&cwd);
+        root.is_dir()
+            .then(|| crate::mentions::matching(root, &typed))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(match answered {
+        Some(found) => MentionsOut {
+            rooted: true,
+            found,
+        },
+        None => MentionsOut {
+            rooted: false,
+            found: crate::mentions::Found {
+                hits: Vec::new(),
+                truncated: false,
+            },
+        },
+    }))
+}
 
 /// A chat's turns, oldest first.
 ///
@@ -9246,6 +9334,101 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let listed = crate::chats::list(&state.pool).await.unwrap();
         assert!(listed.iter().all(|chat| chat.chat_id != id));
+    }
+
+    /// The names a conversation can mention are the ones under its OWN directory.
+    ///
+    /// An `@` in the composer has to complete against something, and the only defensible something
+    /// is where this conversation's turns already run: the model can open those files, so naming
+    /// them discloses nothing it could not read anyway. The root comes from the chat's row and
+    /// never from the caller — a route that took a directory would be a route that reads any
+    /// directory.
+    #[tokio::test]
+    async fn a_conversation_completes_names_from_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/parser.rs"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/parser.d"), "x").unwrap();
+
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES ('rooted', 'cloud', '2026-08-20T10:00:00Z', ?)",
+        )
+        .bind(dir.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/rooted/files?q=parser")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["rooted"], true);
+        let paths: Vec<&str> = body["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["core/src/parser.rs"]);
+    }
+
+    /// A conversation with no directory says so, rather than answering with an empty list.
+    ///
+    /// The two look identical to a caller and are entirely different facts: one is "nothing here
+    /// matches what you typed", the other is "there is nowhere to look". Only the second is worth
+    /// a sentence in the window, and a bare empty list cannot say it.
+    #[tokio::test]
+    async fn a_conversation_with_nowhere_to_look_says_so_rather_than_finding_nothing() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}/files?q=parser"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["rooted"], false);
+        assert_eq!(body["hits"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// A conversation nobody opened is a 404, not an empty answer about a directory it does not
+    /// have. The distinction is the same one the route above draws, one level up.
+    #[tokio::test]
+    async fn completing_names_for_a_conversation_that_does_not_exist_says_so() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/never-opened/files?q=parser")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A conversation says what it was handed, because otherwise it silently pretends to remember.

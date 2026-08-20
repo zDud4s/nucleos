@@ -802,16 +802,11 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
         }
     }
 
-    if current.is_none()
-        && value.get("type").and_then(serde_json::Value::as_str) == Some("system")
-        && value.get("subtype").and_then(serde_json::Value::as_str) == Some("thinking_tokens")
-    {
-        return value
-            .get("estimated_tokens")
-            .and_then(serde_json::Value::as_i64)
-            .or(current);
-    }
-
+    // `system`/`thinking_tokens` is deliberately NOT read here, although it is the only other line
+    // carrying a token count. It measures what the model spent reasoning, not how full its window
+    // is, and against a real stream the two are out by two orders of magnitude — 177 of thinking on
+    // a turn carrying 48,733 of context. It is read by `live_from_stream` instead, under its own
+    // name, where it says the thing it actually means.
     current
 }
 
@@ -3184,16 +3179,27 @@ mod tests {
         );
     }
 
+    /// Thinking tokens are not context, and a run with no usage line knows nothing.
+    ///
+    /// This read `thinking_tokens` as a fallback, and the two numbers are not the same kind of
+    /// thing: one is what the model spent reasoning, the other is how full its window is. Measured
+    /// against a real stream they are not even close — 177 tokens of thinking on a turn carrying
+    /// 48,733 of context, out by two hundred and fifty times.
+    ///
+    /// It matters because of what reads this column. `get_session` refuses to resume past
+    /// `CONTEXT_ROTATION_TOKENS`, and the window draws "x of 140k" under every turn: a run that
+    /// recorded 177 was a run claiming to be nearly empty while it was a third full. Unknown is the
+    /// honest answer, and the one the ceiling already handles — a NULL fill has never tripped it,
+    /// and neither did the wrong number.
     #[test]
-    fn context_fill_falls_back_to_thinking_tokens_when_usage_is_absent() {
+    fn thinking_tokens_are_not_read_as_context_because_they_are_not_context() {
         let thinking = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":125}"#;
-        let unrelated = r#"{"type":"assistant","message":{"content":[]}}"#;
 
-        let current = crate::runner::context_fill_from_line(thinking, None);
-        assert_eq!(current, Some(125));
+        assert_eq!(crate::runner::context_fill_from_line(thinking, None), None);
+        // And it does not overwrite a real reading that arrived before it, either.
         assert_eq!(
-            crate::runner::context_fill_from_line(unrelated, current),
-            Some(125)
+            crate::runner::context_fill_from_line(thinking, Some(48_733)),
+            Some(48_733)
         );
     }
 

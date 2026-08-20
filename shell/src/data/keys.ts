@@ -163,6 +163,8 @@ export const keys = {
     ideSessions: ["chats", "ide-sessions"] as const,
     ideSession: (sessionId: string) => ["chats", "ide-session", sessionId] as const,
     live: (turnId: number) => ["chats", "live", turnId] as const,
+    /** Keyed by the query too: each keystroke is a different question, and its own cached answer. */
+    files: (chatId: string, query: string) => ["chats", "files", chatId, query] as const,
   },
 
   council: {

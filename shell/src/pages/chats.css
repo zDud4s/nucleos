@@ -802,3 +802,79 @@
   flex-direction: column;
   gap: var(--space-1);
 }
+
+/* The names an @ offers.
+ *
+ * Above the box, because the box is at the bottom of the panel and a list under it opens off the
+ * edge. Bounded and scrolling: forty names is a list, forty names at full height is a page. */
+.chats-mentions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 14rem;
+  margin: 0 0 var(--space-2);
+  padding: var(--space-1);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  list-style: none;
+}
+
+.chats-mention {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chats-mention:hover {
+  background: var(--surface);
+}
+
+/* The keyboard's position, which must read as strongly as a hover or arrowing through the list
+ * looks like nothing is happening. */
+.chats-mention-on {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.chats-mention-name {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-weight: var(--weight-medium);
+}
+
+/* The path is context, not the thing being chosen: quieter, and it gives way first when narrow. */
+.chats-mention-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chats-mentions-cut,
+.chats-mentions-none {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.chats-mentions-cut {
+  margin: 0;
+  background: none;
+}
