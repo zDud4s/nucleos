@@ -150,6 +150,73 @@ pub async fn create(project_root: &Path, owner: Owner) -> io::Result<WorktreeInf
     create_at(project_root, owner, None).await
 }
 
+/// `create_at`, for an owner whose name is the same every time it comes back.
+///
+/// **A stable name is what makes a tree findable and what makes creating one fail the second time.**
+/// A run's name is minted with the run, so `create_at` meets a clean slate; an item's is its row's
+/// id, so a retry, a resolution and a resume all arrive at a directory and a branch that may already
+/// exist. Three states, and each needs a different answer:
+///
+/// 1. **The tree is there.** Reuse it. This is the ordinary retry, and it is the whole point of a
+///    stable name: the rejected attempt's work is still in that checkout, and the gate output being
+///    answered was measured against it.
+/// 2. **The branch is there and the tree is not.** A crash between `git worktree add` and the row
+///    that records it, or a tree removed while its branch stayed. Delete the branch and create.
+///    Without this the item fails every thirty seconds for ever, on a name only it can use.
+/// 3. **Neither.** `create_at`.
+///
+/// `git worktree prune` first, because git keeps administrative files for a checkout whose directory
+/// was deleted from underneath it, and while they are there `worktree add` refuses the path.
+pub async fn adopt_or_create_at(
+    project_root: &Path,
+    owner: Owner,
+    base: Option<&str>,
+) -> io::Result<WorktreeInfo> {
+    let path = worktree_root(project_root).join(owner.dir_name());
+    let branch = owner.branch_name();
+
+    if path.join(".git").exists() {
+        // Its base is what it was born on, and that is the row's business, not this one's — the
+        // caller's `record` is an upsert on the same key and will not overwrite a base with a
+        // fresher HEAD. Reporting HEAD here would be reporting where the tree STANDS as though it
+        // were where the tree began, which is the reading collision measures against.
+        return Ok(WorktreeInfo {
+            path,
+            branch,
+            base_sha: None,
+        });
+    }
+
+    let _ = git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("prune")
+        .output()
+        .await;
+
+    match create_at(project_root, owner, base).await {
+        Ok(info) => Ok(info),
+        Err(error) => {
+            // Only try this once, and only for a branch that exists with no checkout on it: `git
+            // branch -D` refuses a branch some worktree is using, which is the one case where
+            // deleting would take somebody else's work.
+            let deleted = git()
+                .arg("-C")
+                .arg(project_root)
+                .arg("branch")
+                .arg("-D")
+                .arg(&branch)
+                .output()
+                .await;
+            match deleted {
+                Ok(output) if output.status.success() => create_at(project_root, owner, base).await,
+                _ => Err(error),
+            }
+        }
+    }
+}
+
 /// `create`, on a named starting point instead of wherever the project's checkout happens to stand.
 ///
 /// **One caller needs this and the reason is not convenience.** A conflict resolver's tree has to be
@@ -894,7 +961,7 @@ pub(crate) async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()>
     Ok(())
 }
 
-async fn head_sha(worktree_path: &Path) -> io::Result<String> {
+pub(crate) async fn head_sha(worktree_path: &Path) -> io::Result<String> {
     let output = git()
         .arg("-C")
         .arg(worktree_path)
@@ -1003,11 +1070,27 @@ pub async fn record(
     branch: &str,
     base_sha: Option<&str>,
 ) -> sqlx::Result<()> {
+    // An upsert, and the conflict arm only ever fires for an owner whose name comes back — an item.
+    // A run's id is minted with the run and a job records once, so for both of those this is the
+    // plain INSERT it always was. For an item, a tree adopted on a retry writes the same row again,
+    // and a tree recreated after the GC took the last one has to clear `removed_at` or the sweep
+    // would collect the new checkout on the strength of the old one's ending.
+    //
+    // `COALESCE(excluded.base_sha, base_sha)` and not a plain overwrite: an adopted tree reports no
+    // base, because where it STANDS is not where it was born, and letting a `None` erase the
+    // recorded base would turn every retry into `not measured` for collision.
     sqlx::query(
         "INSERT INTO worktrees
          (owner_kind, owner_id, project_id, project_root, path, branch, base_sha,
           created_at, removed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(owner_kind, owner_id) DO UPDATE SET
+             project_id   = excluded.project_id,
+             project_root = excluded.project_root,
+             path         = excluded.path,
+             branch       = excluded.branch,
+             base_sha     = COALESCE(excluded.base_sha, base_sha),
+             removed_at   = NULL",
     )
     .bind(owner.kind())
     .bind(owner.id())
@@ -1903,6 +1986,97 @@ mod tests {
             !canary.exists(),
             "the target repository's core.fsmonitor command was executed"
         );
+    }
+
+    /// The three states `adopt_or_create_at` exists for, walked in the order an item meets them.
+    ///
+    /// Nothing here is hypothetical. A stable name means the second call finds what the first left,
+    /// and `git worktree add -b` refuses a branch that already exists — so without this an item that
+    /// went red once would fail to provision every thirty seconds until the job's four hours ran
+    /// out, on a name only it could ever use.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_item_tree_is_created_then_adopted_then_recreated_over_its_orphan_branch() {
+        let _lock = env_lock();
+        let repo = init_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+
+        // (3) Neither the tree nor the branch is there.
+        let first = adopt_or_create_at(repo.path(), Owner::Item(7), None)
+            .await
+            .expect("create the item's tree");
+        assert!(first.path.is_dir());
+        assert_eq!(first.branch, "nucleos/item-7");
+        std::fs::write(
+            first.path.join("half-done.txt"),
+            "work
+",
+        )
+        .expect("write");
+
+        // (1) The tree is there. The retry continues in it — with the rejected attempt's work still
+        // in the checkout, which is the whole reason the name is stable.
+        let adopted = adopt_or_create_at(repo.path(), Owner::Item(7), None)
+            .await
+            .expect("adopt the item's tree");
+        assert_eq!(adopted.path, first.path);
+        assert!(
+            adopted.path.join("half-done.txt").exists(),
+            "adoption threw away the work it exists to keep"
+        );
+
+        // (2) The branch is there and the tree is not: a crash between `worktree add` and the row
+        // that records it, or a checkout removed with its branch left behind.
+        std::fs::remove_dir_all(&first.path).expect("remove the checkout");
+        let recreated = adopt_or_create_at(repo.path(), Owner::Item(7), None)
+            .await
+            .expect("recreate over the orphan branch");
+        assert_eq!(recreated.path, first.path);
+        assert!(recreated.path.is_dir());
+        assert!(
+            !recreated.path.join("half-done.txt").exists(),
+            "a recreated tree is a fresh one"
+        );
+    }
+
+    /// Adoption reports no base, and `record` keeps the one already stored.
+    ///
+    /// Where a tree STANDS is not where it was born, and the two are read for different things —
+    /// collision measures against the base. A retry that overwrote the base with a fresher HEAD
+    /// would make every item report `not measured` from its second attempt onward.
+    #[tokio::test(flavor = "current_thread")]
+    async fn adopting_a_tree_does_not_overwrite_the_base_it_was_born_on() {
+        let pool = test_pool().await;
+        record(
+            &pool,
+            Owner::Item(7),
+            "proj",
+            "/repo",
+            "/trees/item-7",
+            "nucleos/item-7",
+            Some("born-here"),
+        )
+        .await
+        .unwrap();
+        record(
+            &pool,
+            Owner::Item(7),
+            "proj",
+            "/repo",
+            "/trees/item-7",
+            "nucleos/item-7",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let base: Option<String> = sqlx::query_scalar(
+            "SELECT base_sha FROM worktrees WHERE owner_kind = 'item' AND owner_id = 7",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(base.as_deref(), Some("born-here"));
     }
 
     #[tokio::test(flavor = "current_thread")]

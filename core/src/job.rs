@@ -2111,6 +2111,57 @@ struct ItemClaim {
     held: &'static str,
 }
 
+/// What this item needs to be given a checkout of its own, or `None` if it should work in the
+/// job's.
+///
+/// `None` for four different reasons and they are all the same answer, which is why they are read
+/// here rather than at the call site: the job has no team, the item has no row, the job has no
+/// branch to be born on, or the branch has no tip. **The last two are the ones worth naming.** An
+/// item's tree is born on the tip of its job's branch as the last gate left it, and that is the
+/// whole of what makes a dependency graph mean anything — an item whose dependency has just landed
+/// starts WITH that work. There is no honest fallback: `None` would give git's default, the project
+/// checkout's HEAD, which is a commit with none of this job's work in it, and the graph would be
+/// decorative. Falling back to the shared tree is slower and correct; falling back to `master` is
+/// faster and wrong.
+async fn item_provisioning(
+    pool: &SqlitePool,
+    job: &JobRow,
+    stage: &'static str,
+    ordinal: usize,
+) -> Option<crate::runs::JobItem> {
+    let team_id: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT team_id FROM jobs WHERE id = ?")
+            .bind(job.id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    team_id?;
+
+    let item_id: i64 =
+        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+
+    // The job's own checkout stands on the tip of the job's branch — it is where its nodes have
+    // been committing all along — so its HEAD is the commit an item should be born on, read from
+    // the tree rather than from a ref name that a second worktree could be holding.
+    let (path, _) = job_worktree(pool, job.id).await.ok().flatten()?;
+    let base = crate::worktree::head_sha(&path).await.ok()?;
+
+    Some(crate::runs::JobItem {
+        job_id: job.id,
+        item_id,
+        stage,
+        base,
+    })
+}
+
 async fn spawn_node(
     state: &AppState,
     job: &JobRow,
@@ -2190,19 +2241,45 @@ async fn spawn_node(
         prompt.push_str(&block);
     }
 
-    let created = crate::runs::create_job_node_run(
-        state,
-        prompt,
-        job.project_id.clone(),
-        job.project_root.clone(),
-        crate::runs::JobNode {
-            job_id: job.id,
-            stage,
-            worktree_path: path.to_string_lossy().into_owned(),
-            branch,
-        },
-    )
-    .await;
+    // An item of a job a team directs gets a checkout of its own; everything else — every node of
+    // every job without a team, and this job's own plan, replan and review nodes — works in the
+    // job's, exactly as before.
+    //
+    // Keyed on the item and on the team together, and both halves matter. Without a team there is
+    // no reason to pay for a second checkout, and the sequential job is what this must not change.
+    // Without an item there is nothing to name a tree after: a plan node has no row in `job_items`,
+    // and a review node reads the branch the whole job produced rather than any one item's.
+    let own_tree = match item {
+        Some(ItemClaim { ordinal, .. }) => item_provisioning(pool, job, stage, ordinal).await,
+        None => None,
+    };
+    let created = match own_tree {
+        Some(item) => {
+            crate::runs::create_job_item_run(
+                state,
+                prompt,
+                job.project_id.clone(),
+                job.project_root.clone(),
+                item,
+            )
+            .await
+        }
+        None => {
+            crate::runs::create_job_node_run(
+                state,
+                prompt,
+                job.project_id.clone(),
+                job.project_root.clone(),
+                crate::runs::JobNode {
+                    job_id: job.id,
+                    stage,
+                    worktree_path: path.to_string_lossy().into_owned(),
+                    branch,
+                },
+            )
+            .await
+        }
+    };
 
     match created {
         Ok(run_id) => {
