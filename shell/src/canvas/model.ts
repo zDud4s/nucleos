@@ -67,6 +67,15 @@ export type SlotDetail =
  * The comparison uses the pair `(owner_kind, owner_id)` and never the id alone,
  * for the reason {@link ownerKey} gives: a join on the id would give a run's
  * card the description of the job that shares its number.
+ *
+ * **An item is named and not resolved, and the arm is explicit for that reason.**
+ * It used to be the `else` — anything that was not a job was looked up among the
+ * runs — so an item's slot took the description of whatever run happened to
+ * carry its number, which is the exact defect the paragraph above is about. The
+ * page has no listing of items by id to look it up in: `GET /jobs/<id>` carries
+ * them, and the id on the slot does not say which job to ask. So the honest
+ * answer is `unknown` — *slot taken, detail unavailable* — and not `orphaned`,
+ * which claims a listing answered without it.
  */
 export function slotDetail(
   slot: HeldSlot,
@@ -80,6 +89,7 @@ export function slotDetail(
     if (found !== undefined) return { kind: "job", job: found };
     return jobs.length >= limit ? { kind: "unknown" } : { kind: "orphaned" };
   }
+  if (slot.owner_kind === "item") return { kind: "unknown" };
   if (runs === undefined) return { kind: "unknown" };
   const found = runs.find((run) => run.id === slot.owner_id);
   if (found !== undefined) return { kind: "run", run: found };

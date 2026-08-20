@@ -35,8 +35,12 @@ export interface HouseCapacity {
 export interface HeldSlot {
   project_id: string;
   slot: number;
-  /** A worktree run holds a slot too — counting jobs alone would over-report the room left. */
-  owner_kind: "run" | "job";
+  /**
+   * A worktree run holds a slot too — counting jobs alone would over-report the
+   * room left — and so does one item of a job a team directs, which gets a
+   * checkout of its own and pays for it under the same house rule.
+   */
+  owner_kind: "run" | "job" | "item";
   owner_id: number;
   claimed_at: string;
 }
@@ -200,6 +204,21 @@ export interface NewJob {
 export interface SlotOwner {
   kind: "run" | "job";
   id: number;
+}
+
+/**
+ * The owner of a slot, when the gesture that takes it back has a route to call.
+ *
+ * `null` for an item. There is no `/items/<id>/cancel`, and the kind is not a
+ * detail of the URL the way a run and a job are: an item is one step of a job,
+ * so the thing to stop is the job, and the card for that is the one beside it.
+ * Offering the button anyway would send `POST /runs/<item id>/cancel` — a
+ * destructive gesture aimed by a number that means something else, which is the
+ * defect `ownerKey` exists to prevent, arriving through the door nobody was
+ * watching.
+ */
+export function cancellableOwner(slot: HeldSlot): SlotOwner | null {
+  return slot.owner_kind === "item" ? null : { kind: slot.owner_kind, id: slot.owner_id };
 }
 
 /**

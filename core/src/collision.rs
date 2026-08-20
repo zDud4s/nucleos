@@ -10,7 +10,7 @@
 //! warning that only comes once both worktrees have written to the same file comes late — hence
 //! both — and an intention presented as fact would be a lie — hence separate.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The pair `worktrees` and `project_slots` use to name an owner.
 ///
@@ -129,10 +129,18 @@ pub fn only_predicted(declared: Vec<Overlap>, observed: &[Overlap]) -> Vec<Overl
 /// as "I measured everything", which is precisely what this module cannot say without it being
 /// true.
 ///
-/// **It truncates by starvation, not by deferral.** The order is stable (`ORDER BY owner_kind,
-/// owner_id`), so the seventeenth tree is not measured on the next tick — it is not measured at
-/// all, and its project stays `not_measured` for as long as that holds. It is the safe side, and it
-/// is not what a reader assumes on seeing a per-pass ceiling.
+/// **It truncates by starvation, not by deferral.** The order is stable, so the tree that does not
+/// fit is not measured on the next tick — it is not measured at all, and its project stays
+/// `not_measured` for as long as that holds. It is the safe side, and it is not what a reader
+/// assumes on seeing a per-pass ceiling.
+///
+/// Which is why the budget is **shared between projects** rather than spent in order. It used to be
+/// spent in `ORDER BY owner_kind`, which sorts `'item'` before `'job'` before `'run'` — so once one
+/// team's job filled the pass with item trees, a project running nothing but standalone runs was
+/// not measured on this tick, nor on the next, nor ever while that held, and read `not_measured`
+/// for reasons that had nothing to do with it. `fair_share` takes one tree from each project in
+/// turn instead: a project goes short only when there are more projects than the cap, never because
+/// of the shape of a neighbour's work.
 const MEASURE_CAP: usize = 16;
 
 /// How long a tick gives the whole pass.
@@ -152,6 +160,44 @@ struct LiveTree {
     base_sha: Option<String>,
 }
 
+/// PURE: the trees one pass takes, at most `cap`, dealt one per project in turn.
+///
+/// The input arrives grouped by project (`ORDER BY project_id, …`) and each project's queue keeps
+/// that order, so what a project loses to the cap is its tail and not an arbitrary subset — the
+/// same stability the ordering was there to give.
+///
+/// A single project with more trees than the cap still loses the tail, and there is nothing to
+/// share it with. What this removes is the case where the loser is decided by somebody else's
+/// worktrees.
+fn fair_share(trees: Vec<LiveTree>, cap: usize) -> Vec<LiveTree> {
+    let mut by_project: BTreeMap<String, VecDeque<LiveTree>> = BTreeMap::new();
+    for tree in trees {
+        by_project
+            .entry(tree.project_id.clone())
+            .or_default()
+            .push_back(tree);
+    }
+
+    let mut taken = Vec::new();
+    // One round per lap: every project hands over its next tree, until the cap is full or nobody
+    // has one left. `dealt` is what ends the loop when the cap is larger than the fleet.
+    loop {
+        let mut dealt = false;
+        for queue in by_project.values_mut() {
+            if taken.len() == cap {
+                return taken;
+            }
+            if let Some(tree) = queue.pop_front() {
+                taken.push(tree);
+                dealt = true;
+            }
+        }
+        if !dealt {
+            return taken;
+        }
+    }
+}
+
 /// Measures every live worktree and stores the result. Called by the job tick.
 ///
 /// Nothing here propagates an error: a measurement is a warning, and a warning that could not be
@@ -160,7 +206,8 @@ struct LiveTree {
 pub async fn measure(pool: &sqlx::SqlitePool) {
     let trees: Vec<LiveTree> = match sqlx::query_as(
         "SELECT owner_kind, owner_id, project_id, path, base_sha
-         FROM worktrees WHERE removed_at IS NULL ORDER BY owner_kind, owner_id",
+         FROM worktrees WHERE removed_at IS NULL
+         ORDER BY project_id, owner_kind, owner_id",
     )
     .fetch_all(pool)
     .await
@@ -179,11 +226,11 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
         .filter(|tree| tree.base_sha.is_some())
         .collect();
     let candidate_count = candidates.len();
-    let measurable: Vec<LiveTree> = candidates.into_iter().take(MEASURE_CAP).collect();
-    if candidate_count > MEASURE_CAP {
+    let measurable = fair_share(candidates, MEASURE_CAP);
+    if candidate_count > measurable.len() {
         tracing::warn!(
             candidates = candidate_count,
-            measuring = MEASURE_CAP,
+            measuring = measurable.len(),
             "more measurable worktrees than one pass takes; the rest stay not measured"
         );
     }
@@ -270,8 +317,14 @@ pub async fn forget(pool: &sqlx::SqlitePool, owner_kind: &str, owner_id: i64) ->
 
 /// Both sources, for one project.
 ///
-/// The order of work is: gather the observed sets, gather the predicted ones, cross each, and
-/// **subtract the observed from the predicted** — because a path both name is one event, not two.
+/// The order of work is: gather the observed sets, cross them, drop the pairs that are one item
+/// beside its own job, gather the predicted ones, cross those, and **subtract the observed from the
+/// predicted** — because a path both name is one event, not two.
+///
+/// The subtraction only lands because the two sources name owners the same way: an item of a job a
+/// team directs is `item:<id>` on both sides. While the predicted source collapsed a job's items
+/// into `job:<id>` and the observed one measured their checkouts separately, no pair ever matched
+/// and every shared path was reported twice, once per source.
 ///
 /// **The declared source's `Clean` is about JOB worktrees, not about the whole project.** A project
 /// with one job (which declared files) and one live run reads `declared: clean`, even though the
@@ -281,7 +334,7 @@ pub async fn forget(pool: &sqlx::SqlitePool, owner_kind: &str, owner_id: i64) ->
 /// declare.
 pub async fn for_project(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Collisions> {
     let (measured, observed_complete) = observed_sets(pool, project_id).await?;
-    let observed = overlaps(&measured);
+    let observed = between_strangers(overlaps(&measured), &item_families(pool, project_id).await?);
 
     let (predicted, anybody_declared) = declared_sets(pool, project_id).await?;
     let declared = only_predicted(overlaps(&predicted), &observed);
@@ -305,6 +358,54 @@ pub async fn for_project(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Res
             overlaps: observed,
         },
     })
+}
+
+/// PURE: drops the pairs that are one piece of work seen twice rather than two racing.
+///
+/// An item's tree and its job's tree are not two units of concurrent work; they are one unit at two
+/// moments. `changed_paths` measures `base..HEAD`, so the moment an item's branch merges, the paths
+/// it wrote appear on the job's tree as well as on its own, and the pair collides — every merged
+/// item, always, for as long as both trees live. Left in, a team's job would paint the screen red
+/// with its own progress and the warnings worth reading would be lost among them.
+///
+/// **What it costs, said out loud.** A sibling still writing that file is a real warning, and this
+/// removes one of the two ways to see it: `(item:2, job:5)`, where item 1's work reached the job's
+/// branch. The other way is `(item:1, item:2)` — the two checkouts, compared directly — which says
+/// the same thing more precisely and is what this makes visible in the first place. The pair is
+/// only lost when item 1's tree is already gone, and the GC keeps it for 72 hours.
+///
+/// Observed only. The predicted source names an item OR its job and never both, so it has no pair
+/// of this shape to lose.
+fn between_strangers(found: Vec<Overlap>, family: &BTreeMap<i64, i64>) -> Vec<Overlap> {
+    let same_family = |item: &OwnerRef, job: &OwnerRef| {
+        item.kind == "item" && job.kind == "job" && family.get(&item.id) == Some(&job.id)
+    };
+    found
+        .into_iter()
+        .filter(|overlap| {
+            !same_family(&overlap.a, &overlap.b) && !same_family(&overlap.b, &overlap.a)
+        })
+        .collect()
+}
+
+/// Which job each live item tree belongs to.
+///
+/// Read through `worktrees` and not through `jobs`, so it is bounded by the trees that can appear
+/// in an overlap rather than by every item the project has ever had.
+async fn item_families(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<BTreeMap<i64, i64>> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT job_items.id, job_items.job_id
+         FROM job_items
+         JOIN worktrees ON worktrees.owner_kind = 'item' AND worktrees.owner_id = job_items.id
+         WHERE worktrees.project_id = ? AND worktrees.removed_at IS NULL",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// A collision that was found is true even when the measurement is incomplete — what incompleteness
@@ -387,8 +488,20 @@ async fn observed_sets(
 /// Joined at read time and copied nowhere: `job_items.files` is already in SQLite, and holding it
 /// here would give it a staleness window it does not have.
 ///
-/// Only `'job'` owners: a run has no items, so it declares nothing. `files` is nullable and NULL is
-/// the ordinary case — a planner that names no files did not name an empty set of them.
+/// Found through `'job'` worktrees: a run has no items, so it declares nothing. `files` is nullable
+/// and NULL is the ordinary case — a planner that names no files did not name an empty set of them.
+///
+/// **The job's tree is how the items are found; it is not who declares.** In a job a team directs,
+/// each item is its own unit of work in a checkout of its own, and collapsing the siblings into one
+/// owner — which is what this did, and all it could do while there was one checkout — makes the one
+/// collision that matters most invisible: two items of the same job about to write the same file.
+/// So the owner is the ITEM there, and stays the JOB where there is no team and the work really
+/// does all land in one tree.
+///
+/// **It is found through the job's tree and not through the item's, and that is the point.** An
+/// item that has not started has no checkout, and that is exactly when its declaration is worth
+/// something — *"intent … arrives in time for you to stop"*. Requiring a tree would leave the
+/// source with nothing to say until it had nothing left to warn about.
 ///
 /// **A negative list, and not `IN ('pending','running')`.** `item_state_from` (`job.rs:438`) has no
 /// arm for `"pending"` — `Pending` is the *fallback*, with the reason written down: *"An
@@ -402,15 +515,28 @@ async fn declared_sets(
     pool: &sqlx::SqlitePool,
     project_id: &str,
 ) -> sqlx::Result<(Vec<(OwnerRef, BTreeSet<String>)>, bool)> {
-    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(DECLARED_SETS_SQL)
+    let rows: Vec<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(DECLARED_SETS_SQL)
         .bind(project_id)
         .fetch_all(pool)
         .await?;
 
-    let mut by_job: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    let mut by_owner: BTreeMap<OwnerRef, BTreeSet<String>> = BTreeMap::new();
     let mut anybody = false;
-    for (job_id, files) in rows {
-        let entry = by_job.entry(job_id).or_default();
+    for (job_id, item_id, team_id, files) in rows {
+        // A team is what makes the siblings separable, because it is what gives each of them a
+        // checkout. Without one they share the job's, and two entries would claim two units of
+        // work where the disk holds one.
+        let owner = match team_id {
+            Some(_) => OwnerRef {
+                kind: "item".to_string(),
+                id: item_id,
+            },
+            None => OwnerRef {
+                kind: "job".to_string(),
+                id: job_id,
+            },
+        };
+        let entry = by_owner.entry(owner).or_default();
         let Some(files) = files else { continue };
         let Ok(paths) = serde_json::from_str::<Vec<String>>(&files) else {
             continue;
@@ -421,19 +547,7 @@ async fn declared_sets(
         entry.extend(paths);
     }
 
-    let sets = by_job
-        .into_iter()
-        .map(|(id, paths)| {
-            (
-                OwnerRef {
-                    kind: "job".to_string(),
-                    id,
-                },
-                paths,
-            )
-        })
-        .collect();
-    Ok((sets, anybody))
+    Ok((by_owner.into_iter().collect(), anybody))
 }
 
 /// The states that **leave** the predicted set; whatever is left goes in.
@@ -441,15 +555,30 @@ async fn declared_sets(
 /// Mirrors the explicit arms of `item_state_from` minus `"running"`. Kept apart from the function
 /// because it is what the drift guard compares, and written by hand because sqlx refuses SQL built
 /// at runtime — the same trade `LIVE_JOBS_SQL` and `ORPHANED_SLOTS_SQL` make, with the same guard.
-const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.files
+///
+/// **The four states of a parallel item all leave, for two different reasons.** `orphaned` is
+/// terminal and would otherwise declare for ever, on work nobody will ever do. `merging`,
+/// `conflicted` and `reverted` leave for the reason `implemented` does, which is not that the item
+/// will never write again — `conflicted` and `reverted` both go round again — but that it already
+/// HAS: each of them owns a live checkout with its work in it, so the observed source is measuring
+/// that work directly and is the better of the two answers. Leaving them in would shrink to nothing
+/// under `only_predicted` anyway, after saying the same thing twice on the way.
+///
+/// Removing a state from the predicted set is the unsafe direction — a path that leaves the
+/// intersection turns a `Collide` into a `Clean` — and what makes it safe here is precisely that
+/// these three have trees. `orphaned` never gets one and never writes, so there is nothing to lose.
+const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.id, jobs.team_id,
+            job_items.files
      FROM worktrees
      JOIN job_items ON job_items.job_id = worktrees.owner_id
+     JOIN jobs ON jobs.id = job_items.job_id
      WHERE worktrees.project_id = ?
        AND worktrees.removed_at IS NULL
        AND worktrees.owner_kind = 'job'
        AND job_items.status NOT IN ('implemented','passed','failed','cancelled',
-                                    'gate_failed','gate_errored','skipped')
-     ORDER BY worktrees.owner_id";
+                                    'gate_failed','gate_errored','skipped',
+                                    'merging','conflicted','reverted','orphaned')
+     ORDER BY worktrees.owner_id, job_items.id";
 
 #[cfg(test)]
 mod tests {
@@ -534,25 +663,68 @@ mod tests {
     /// A job with an **explicit** id, unlike `concurrency.rs`'s `seed_job` which returns one: the
     /// tests here pin ids 1 and 2 so they line up with the `worktrees` rows.
     async fn seed_job_row(pool: &sqlx::SqlitePool, id: i64, project_id: &str) {
+        seed_directed_job_row(pool, id, project_id, None).await;
+    }
+
+    /// The same, with a team directing it — which is what decides whether its items declare
+    /// separately or as one.
+    async fn seed_directed_job_row(
+        pool: &sqlx::SqlitePool,
+        id: i64,
+        project_id: &str,
+        team_id: Option<&str>,
+    ) {
         sqlx::query(
-            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
-             VALUES (?, ?, 'C:/somewhere', 'implementing', 5, '2026-08-08T00:00:00Z')",
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at, team_id)
+             VALUES (?, ?, 'C:/somewhere', 'implementing', 5, '2026-08-08T00:00:00Z', ?)",
         )
         .bind(id)
         .bind(project_id)
+        .bind(team_id)
         .execute(pool)
         .await
         .unwrap();
     }
 
-    /// `files` is a JSON array, or `NULL` — which is the ordinary case, not the exception.
+    /// A team a job can name. Not ceremony: `storage.rs` runs with `foreign_keys` on, so a job
+    /// cannot name a team out of thin air, nor a team a director.
+    async fn seed_team(pool: &sqlx::SqlitePool, id: &str) {
+        let now = "2026-08-08T00:00:00Z";
+        let director = format!("{id}-director");
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES (?, 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+        )
+        .bind(&director)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES (?, 'Crew', 'ship it', ?, 3, 2, ?, ?)",
+        )
+        .bind(id)
+        .bind(&director)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// `files` is a JSON array, or `NULL` — which is the ordinary case, not the exception. Returns
+    /// the item's id, because that is what an item of a team's job is named by from here on.
     async fn seed_item(
         pool: &sqlx::SqlitePool,
         job_id: i64,
         ordinal: i64,
         status: &str,
         files: Option<&[&str]>,
-    ) {
+    ) -> i64 {
         sqlx::query(
             "INSERT INTO job_items (job_id, ordinal, description, status, files)
              VALUES (?, ?, 'an item', ?, ?)",
@@ -563,7 +735,8 @@ mod tests {
         .bind(files.map(|paths| serde_json::to_string(paths).unwrap()))
         .execute(pool)
         .await
-        .unwrap();
+        .unwrap()
+        .last_insert_rowid()
     }
 
     /// A worktree marked `removed_at` stops contributing — and the row goes with it, rather than
@@ -886,15 +1059,297 @@ mod tests {
         db.close().await;
     }
 
+    /// Two items of one team's job, both about to write the same file.
+    ///
+    /// **The collision this screen exists for, and the one it could not see.** While a job's items
+    /// were collapsed into `job:<id>`, their declarations were unioned before anything was crossed,
+    /// and `overlaps` only compares distinct owners — so the sibling pair had nowhere to appear. It
+    /// is also the pair with the shortest fuse: unlike two jobs, these two are going to merge into
+    /// the same branch within minutes of each other.
+    #[tokio::test]
+    async fn two_items_of_one_team_declaring_one_file_collide_as_siblings() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        seed_team(&db.pool, "crew").await;
+        seed_directed_job_row(&db.pool, 1, "project-a", Some("crew")).await;
+        let first = seed_item(&db.pool, 1, 0, "pending", Some(&["shared.rs", "only-a.rs"])).await;
+        let second = seed_item(&db.pool, 1, 1, "pending", Some(&["shared.rs"])).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.declared.state, State::Collide);
+        assert_eq!(collisions.declared.overlaps.len(), 1);
+        assert_eq!(collisions.declared.overlaps[0].a, owner("item", first));
+        assert_eq!(collisions.declared.overlaps[0].b, owner("item", second));
+        assert_eq!(
+            collisions.declared.overlaps[0].paths,
+            vec!["shared.rs".to_string()],
+            "the intersection, not the union of what the two declared"
+        );
+        db.close().await;
+    }
+
+    /// Neither item has a checkout, and that is the whole value of the declared source: a `pending`
+    /// item is the one moment a warning still arrives in time to stop something.
+    #[tokio::test]
+    async fn siblings_declare_before_either_of_them_has_a_tree() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        seed_team(&db.pool, "crew").await;
+        seed_directed_job_row(&db.pool, 1, "project-a", Some("crew")).await;
+        seed_item(&db.pool, 1, 0, "pending", Some(&["shared.rs"])).await;
+        seed_item(&db.pool, 1, 1, "pending", Some(&["shared.rs"])).await;
+
+        let item_trees: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worktrees WHERE owner_kind = 'item'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            item_trees, 0,
+            "the point of the test is that there are none"
+        );
+        assert_eq!(
+            for_project(&db.pool, "project-a")
+                .await
+                .unwrap()
+                .declared
+                .state,
+            State::Collide
+        );
+        db.close().await;
+    }
+
+    /// A job with no team declares as ONE owner, and this is the regression that matters most: two
+    /// of its items naming the same file is a queue writing it twice in a row, in one checkout, and
+    /// calling that a collision would put a permanent warning on every ordinary job.
+    #[tokio::test]
+    async fn two_items_of_a_job_with_no_team_do_not_collide_with_each_other() {
+        let db = crate::storage::TempDb::new().await;
+        seed_worktree_row(
+            &db.pool,
+            "job",
+            1,
+            "project-a",
+            at("C:/x"),
+            Some(&"a".repeat(40)),
+        )
+        .await;
+        seed_job_row(&db.pool, 1, "project-a").await;
+        seed_item(&db.pool, 1, 0, "pending", Some(&["shared.rs"])).await;
+        seed_item(&db.pool, 1, 1, "pending", Some(&["shared.rs"])).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.declared.state, State::Clean);
+        assert!(collisions.declared.overlaps.is_empty());
+        db.close().await;
+    }
+
+    /// A path two siblings declared and both already wrote is ONE warning, on the observed source —
+    /// and the one they have not written yet is still the predicted source's to say.
+    ///
+    /// **It is the naming that makes the subtraction land**, and the two declared paths are how
+    /// this test can tell. While the predicted source said `job:1` and the observed one said
+    /// `item:…`, `only_predicted` had no pair to match — it subtracts per pair, deliberately —
+    /// so `written.rs` came out on both sources, for the same two checkouts, as two warnings about
+    /// one event. Asserting only that the predicted source is empty would not catch that: a
+    /// predicted source with nothing in it at all passes that assertion for the opposite reason.
+    #[tokio::test]
+    async fn one_path_two_siblings_wrote_is_subtracted_and_the_other_is_not() {
+        let db = crate::storage::TempDb::new().await;
+        let base = "a".repeat(40);
+        seed_worktree_row(&db.pool, "job", 1, "project-a", at("C:/x"), Some(&base)).await;
+        seed_team(&db.pool, "crew").await;
+        seed_directed_job_row(&db.pool, 1, "project-a", Some("crew")).await;
+        let declared = Some(&["written.rs", "still_to_write.rs"][..]);
+        let first = seed_item(&db.pool, 1, 0, "running", declared).await;
+        let second = seed_item(&db.pool, 1, 1, "running", declared).await;
+        for id in [first, second] {
+            seed_worktree_row(&db.pool, "item", id, "project-a", at("C:/i"), Some(&base)).await;
+            seed_measurement(&db.pool, "item", id, "project-a", &["written.rs"]).await;
+        }
+        // The job's own tree has had nothing merged into it yet.
+        seed_measurement(&db.pool, "job", 1, "project-a", &[]).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::Collide);
+        assert_eq!(
+            collisions.observed.overlaps[0].paths,
+            vec!["written.rs".to_string()]
+        );
+        assert_eq!(
+            collisions.declared.overlaps[0].paths,
+            vec!["still_to_write.rs".to_string()],
+            "the written path is the observed source's; the unwritten one is not"
+        );
+        db.close().await;
+    }
+
+    /// An item's tree beside its own job's tree is one piece of work at two moments, not two
+    /// pieces racing.
+    ///
+    /// `changed_paths` measures `base..HEAD`, so the instant an item's branch merges, every path it
+    /// wrote is on the job's tree as well as on its own. Left alone, a team's job would report a
+    /// collision against itself for every item it successfully landed — a screen painted red by its
+    /// own progress, which is the one way a warning stops being read.
+    #[tokio::test]
+    async fn an_item_beside_its_own_job_is_one_piece_of_work_and_not_a_collision() {
+        let db = crate::storage::TempDb::new().await;
+        let base = "a".repeat(40);
+        seed_worktree_row(&db.pool, "job", 1, "project-a", at("C:/x"), Some(&base)).await;
+        seed_team(&db.pool, "crew").await;
+        seed_directed_job_row(&db.pool, 1, "project-a", Some("crew")).await;
+        let item = seed_item(&db.pool, 1, 0, "merging", None).await;
+        seed_worktree_row(&db.pool, "item", item, "project-a", at("C:/i"), Some(&base)).await;
+        seed_measurement(&db.pool, "item", item, "project-a", &["merged.rs"]).await;
+        seed_measurement(&db.pool, "job", 1, "project-a", &["merged.rs"]).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::Clean);
+        assert!(collisions.observed.overlaps.is_empty());
+        db.close().await;
+    }
+
+    /// And the negation, so the rule above is about ONE job and not about the word `item`: another
+    /// job's tree is concurrent work, and an item colliding with it is exactly what this reports.
+    #[tokio::test]
+    async fn an_item_still_collides_with_the_tree_of_a_job_it_does_not_belong_to() {
+        let db = crate::storage::TempDb::new().await;
+        let base = "a".repeat(40);
+        seed_worktree_row(&db.pool, "job", 1, "project-a", at("C:/x"), Some(&base)).await;
+        seed_worktree_row(&db.pool, "job", 2, "project-a", at("C:/y"), Some(&base)).await;
+        seed_team(&db.pool, "crew").await;
+        seed_directed_job_row(&db.pool, 1, "project-a", Some("crew")).await;
+        seed_job_row(&db.pool, 2, "project-a").await;
+        let item = seed_item(&db.pool, 1, 0, "merging", None).await;
+        seed_worktree_row(&db.pool, "item", item, "project-a", at("C:/i"), Some(&base)).await;
+        seed_measurement(&db.pool, "item", item, "project-a", &["shared.rs"]).await;
+        seed_measurement(&db.pool, "job", 1, "project-a", &["shared.rs"]).await;
+        seed_measurement(&db.pool, "job", 2, "project-a", &["shared.rs"]).await;
+
+        let collisions = for_project(&db.pool, "project-a").await.unwrap();
+
+        assert_eq!(collisions.observed.state, State::Collide);
+        let pairs: Vec<(OwnerRef, OwnerRef)> = collisions
+            .observed
+            .overlaps
+            .iter()
+            .map(|overlap| (overlap.a.clone(), overlap.b.clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (owner("item", item), owner("job", 2)),
+                (owner("job", 1), owner("job", 2)),
+            ],
+            "the item's own job is dropped and nothing else is"
+        );
+        db.close().await;
+    }
+
+    fn live_tree(project_id: &str, owner_id: i64) -> LiveTree {
+        LiveTree {
+            owner_kind: "run".to_string(),
+            owner_id,
+            project_id: project_id.to_string(),
+            path: "C:/x".to_string(),
+            base_sha: Some("a".repeat(40)),
+        }
+    }
+
+    fn dealt(taken: Vec<LiveTree>) -> Vec<(String, i64)> {
+        taken
+            .into_iter()
+            .map(|tree| (tree.project_id, tree.owner_id))
+            .collect()
+    }
+
+    /// The budget is dealt one tree per project in turn, and a project is never starved by the
+    /// shape of a neighbour's work.
+    ///
+    /// The order used to be `owner_kind, owner_id` across the whole fleet, and `'item'` sorts before
+    /// `'job'` before `'run'`. One team's job with enough item trees took the entire pass, and a
+    /// project running nothing but standalone runs read `not_measured` — not this tick, but every
+    /// tick, for as long as that held. The truncation is by starvation and not by deferral, which
+    /// is what makes the difference permanent rather than a delay.
+    #[test]
+    fn the_measuring_budget_is_dealt_one_tree_per_project_in_turn() {
+        let trees = vec![
+            live_tree("busy", 1),
+            live_tree("busy", 2),
+            live_tree("busy", 3),
+            live_tree("busy", 4),
+            live_tree("quiet", 9),
+        ];
+
+        assert_eq!(
+            dealt(fair_share(trees, 3)),
+            vec![
+                ("busy".to_string(), 1),
+                ("quiet".to_string(), 9),
+                ("busy".to_string(), 2),
+            ],
+            "the quiet project must be measured before the busy one's second lap"
+        );
+    }
+
+    /// A fleet smaller than the budget is measured whole — and the dealing stops rather than
+    /// looping over empty queues for ever.
+    #[test]
+    fn a_fleet_smaller_than_the_budget_is_measured_whole() {
+        let trees = vec![
+            live_tree("a", 1),
+            live_tree("a", 2),
+            live_tree("b", 3),
+            live_tree("c", 4),
+        ];
+
+        let taken = dealt(fair_share(trees, MEASURE_CAP));
+
+        assert_eq!(taken.len(), 4);
+        assert!(taken.contains(&("a".to_string(), 2)));
+    }
+
+    /// A single project with more trees than the budget still loses its tail, because there is
+    /// nobody to share with. What went away is the loser being chosen by somebody else's work.
+    #[test]
+    fn one_project_over_the_budget_loses_its_own_tail_in_order() {
+        let trees = vec![live_tree("a", 1), live_tree("a", 2), live_tree("a", 3)];
+
+        assert_eq!(
+            dealt(fair_share(trees, 2)),
+            vec![("a".to_string(), 1), ("a".to_string(), 2)]
+        );
+    }
+
     /// A state an item can take that this SQL does not know is a predicted path lost in silence —
     /// and a lost path reads as `clean`. The guard walks the explicit arms of `item_state_from` and
-    /// demands each be named, minus the two that stay in.
+    /// demands each be named, minus `running`, the one that stays in.
     ///
     /// Written as a literal list and not by reflection because Rust has no reflection over `match`.
     /// What it catches is the asymmetric edit: somebody adds a state to `job.rs` and not here.
     #[test]
     fn the_predicted_set_names_every_state_that_has_finished_writing() {
-        // The explicit arms of `item_state_from` (`job.rs:438`), minus `running`, which stays in
+        // The explicit arms of `item_state_from` (`job.rs:890`), minus `running`, which stays in
         // the predicted set because it is still writing.
         let finished = [
             "implemented",
@@ -904,6 +1359,12 @@ mod tests {
             "gate_failed",
             "gate_errored",
             crate::job::STATUS_SKIPPED,
+            // The four of a parallel item. Three of them own a checkout the observed source is
+            // measuring, and the fourth will never write anything at all.
+            "merging",
+            "conflicted",
+            "reverted",
+            "orphaned",
         ];
         for status in finished {
             assert!(

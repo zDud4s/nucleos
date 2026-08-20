@@ -280,6 +280,65 @@ describe("Fleet — columns", () => {
     expect(whole.kind).toBe("orphaned");
   });
 
+  it("does not describe an item's slot with the run that shares its number", () => {
+    // One item of a job a team directs holds a slot of its own. Until it had an
+    // arm here, anything that was not a job fell through to the runs listing —
+    // so an item's card carried the status and prompt of an unrelated run that
+    // happened to be numbered the same, which is the exact confusion `ownerKey`
+    // was written to prevent.
+    const item = slot({ slot: 1, owner_kind: "item", owner_id: 7 });
+    expect(slotDetail(item, [job()], [run({ id: 7 })]).kind).toBe("unknown");
+    // And the run that shares the number is still described as itself.
+    const sharing = slot({ slot: 1, owner_kind: "run", owner_id: 7 });
+    expect(slotDetail(sharing, [job()], [run({ id: 7 })]).kind).toBe("run");
+  });
+
+  it("shows an item's card its own collision, and no cancel it has no route for", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 2 },
+            projects: [
+              column({
+                slots: [
+                  slot({ slot: 0, owner_kind: "item", owner_id: 7 }),
+                  slot({ slot: 1, owner_kind: "item", owner_id: 8 }),
+                ],
+                collision: {
+                  declared: { state: "clean", overlaps: [] },
+                  // Two items of one job, named apart. While the daemon
+                  // collapsed a job's items into `job:<id>`, this pair had
+                  // nowhere to appear and the card said nothing at all.
+                  observed: {
+                    state: "collide",
+                    overlaps: [
+                      {
+                        a: { kind: "item", id: 7 },
+                        b: { kind: "item", id: 8 },
+                        paths: ["core/src/job.rs"],
+                      },
+                    ],
+                  },
+                },
+              }),
+            ],
+          },
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const mine = await screen.findByRole("article", { name: "slot 0 — item 7" });
+    expect(within(mine).getByText(/also touched by item 8/)).toBeDefined();
+    expect(within(mine).getByText(/core\/src\/job\.rs/)).toBeDefined();
+    // No `/items/<id>/cancel` exists, and the number would aim the one route
+    // there is at somebody else's run. The gesture that stops this work is the
+    // job's, on the job's card.
+    expect(within(mine).queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
   it("keeps the last good cards and says the view is stale when a refetch fails", async () => {
     const state = fleetState({
       concurrency: {

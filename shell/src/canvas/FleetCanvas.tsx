@@ -22,7 +22,7 @@ import {
 // 'self'`, so a stylesheet fetched from anywhere else is a blank canvas in the
 // shipped app and a working one in the dev server — the worst pair of outcomes.
 import "@xyflow/react/dist/style.css";
-import { useJob, type JobItem, type SlotOwner } from "../data/fleet";
+import { cancellableOwner, useJob, type JobItem, type SlotOwner } from "../data/fleet";
 import { Button, ConfirmButton, StateBadge } from "../ui";
 import {
   clamped,
@@ -137,6 +137,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
   const { detail, slot } = card;
   const jobId = detail.kind === "job" ? detail.job.id : null;
   const open = jobId !== null && actions.openJob === jobId;
+  const cancellable = cancellableOwner(slot);
 
   return (
     <article
@@ -228,11 +229,17 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
         </p>
       ))}
 
-      <ConfirmButton
-        label="Cancel"
-        confirmLabel={`Cancel ${slot.owner_kind} ${slot.owner_id}?`}
-        onConfirm={() => actions.cancel({ kind: slot.owner_kind, id: slot.owner_id })}
-      />
+      {/* Absent on an item's card, and absent rather than disabled: the thing to
+          stop is the job, whose own card is in the same column, and a button
+          that has to explain why it cannot be pressed is one more thing to read
+          on a card that is already dense. */}
+      {cancellable !== null && (
+        <ConfirmButton
+          label="Cancel"
+          confirmLabel={`Cancel ${slot.owner_kind} ${slot.owner_id}?`}
+          onConfirm={() => actions.cancel(cancellable)}
+        />
+      )}
 
       {connectable && (
         <>
