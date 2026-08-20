@@ -190,9 +190,9 @@ struct GithubReadParams {
 /// An action on GitHub, flat. Wider than its reading sibling because the operations are.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct GithubActParams {
-    /// One of: workflow_run, run_rerun, pr_create, pr_comment, issue_close, raw.
+    /// One of: workflow_run, run_rerun, pr_create, pr_comment, issue_close, api_read.
     operation: String,
-    /// The repository, as owner/name. Every operation but raw needs one.
+    /// The repository, as owner/name. Every operation but api_read needs one.
     repo: Option<String>,
     /// A run id for run_rerun, a number for pr_comment and issue_close.
     id: Option<String>,
@@ -209,7 +209,7 @@ struct GithubActParams {
     /// workflow_run: the branch or tag to run it on.
     #[serde(rename = "ref")]
     git_ref: Option<String>,
-    /// raw only: the arguments to `gh api`, already separated. Never a command line — this module
+    /// api_read only: the arguments to `gh api`, already separated. Never a command line — this module
     /// splits nothing.
     args: Option<Vec<String>>,
 }
@@ -696,7 +696,7 @@ impl NucleosTools {
 
     #[tool(
         description = "Do something on GitHub through NucleOS: workflow_run, run_rerun, pr_create, \
-                       pr_comment, issue_close, or raw for anything else via the REST API. The \
+                       pr_comment, issue_close, or api_read to GET a REST path. The \
                        núcleo runs it, never you. Whether it happens straight away or waits for a \
                        person is the owner\'s to decide in .ai/github.yaml — an operation off that \
                        list is FILED for approval and answers with a number, and your turn carries \
