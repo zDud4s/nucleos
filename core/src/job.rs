@@ -250,6 +250,19 @@ pub enum Next {
     RunGate {
         ordinal: usize,
     },
+    /// Bring one item's branch into the job's, in the job's own checkout.
+    ///
+    /// Only ever answered for a job a team directs. Without a team the items write into the one
+    /// shared checkout and there is nothing to bring anywhere — `Implemented` goes straight to
+    /// [`Next::RunGate`], exactly as it always did.
+    ///
+    /// A step of its own rather than the first half of the gate, because what has to be exclusive is
+    /// the merge and the gate merely follows it. Two steps also means `MAX_STEPS_PER_PASS` counts
+    /// them apart, so one pass drains two merged-and-gated items rather than four merges with
+    /// nothing measured.
+    MergeItem {
+        ordinal: usize,
+    },
     SpawnReview,
     /// Ask again now that this round's queue is empty: either for more work, or for "done".
     SpawnReplan,
@@ -411,28 +424,46 @@ pub fn next_step(job: &JobView) -> Next {
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
-    // `Merging`, `Conflicted` and `Reverted` wait alongside `Running`, and none of them is
-    // reachable yet — nothing writes those rows until the merge step of a later slice. They are
-    // here because the alternative is worse than being early: a non-terminal state this search
-    // walked past would be read as finished by every check after it, which is the one direction
-    // `item_state_from` already refuses to err in. A later slice gives `Conflicted` a step of its
-    // own and takes it back out of this list.
+    // `Conflicted` and `Reverted` wait alongside `Running`, and neither is reachable yet — nothing
+    // writes those rows. They are here because the alternative is worse than being early: a
+    // non-terminal state this search walked past would be read as finished by every check after it,
+    // which is the one direction `item_state_from` already refuses to err in. `Merging` has left
+    // this list, having been given a step of its own below.
     if job.items.iter().any(|item| {
         matches!(
             item,
-            ItemState::Running | ItemState::Merging | ItemState::Conflicted | ItemState::Reverted
+            ItemState::Running | ItemState::Conflicted | ItemState::Reverted
         )
     }) {
         return Next::Wait;
     }
+    // A merge that has landed is measured before anything else moves. Ahead of the merge below, and
+    // that order is the design: an item's divergence from the job's branch grows with every minute
+    // it waits, and it is the retry — the most expensive step here — that has to absorb it. Draining
+    // what is already in flight before starting more is what keeps that divergence small.
+    if let Some(ordinal) = job
+        .items
+        .iter()
+        .position(|item| *item == ItemState::Merging)
+    {
+        return Next::RunGate { ordinal };
+    }
     // Gate before starting the next item: on a shared worktree, letting item i+1 build on unmeasured
     // work means a later red gate cannot say which item broke it.
+    //
+    // With a team the same sentence has a merge in the middle of it. The item's work is in a
+    // checkout of its own, so there is nothing on the job's branch to measure until it is brought
+    // there — and bringing it there is what must not happen twice at once.
     if let Some(ordinal) = job
         .items
         .iter()
         .position(|item| *item == ItemState::Implemented)
     {
-        return Next::RunGate { ordinal };
+        return if job.has_team {
+            Next::MergeItem { ordinal }
+        } else {
+            Next::RunGate { ordinal }
+        };
     }
     // A retriable item is work to do, found by the SAME positional search that finds a pending one,
     // so an earlier red-gated item outranks a later untouched one. Running the pending item first
@@ -2390,6 +2421,108 @@ async fn park(state: &AppState, job: &JobRow, reason: &str, detail: &str) -> Ste
 }
 
 /// Runs the gate for one item and records its verdict on that item.
+/// Brings one item's branch into the job's, in the job's own checkout.
+///
+/// **`merge_base_sha` is written BEFORE the merge, and that order is the whole of this function.**
+/// It is the commit the job's branch stands on right now, and after the merge nothing on the branch
+/// says which of its commits this merge added. A merge that landed with the write lost would leave
+/// an item on the branch with no way back off it, and the `reset --hard` that undoes a red gate
+/// would have no target — so the write comes first and a failure to write refuses the merge.
+///
+/// `--no-ff` and not a fast-forward. The reset would work either way, but a fast-forward leaves no
+/// merge commit, and then nothing in the history says this item arrived as one thing rather than as
+/// a handful of commits that happen to be adjacent.
+///
+/// A conflict is aborted here and resolved elsewhere. Aborting leaves the job's checkout clean,
+/// which is what the next item's merge depends on; resolving would mean an agent editing the job's
+/// branch in the shared checkout, which is the thing every worktree in this design exists to avoid.
+/// The item is put down as `conflicted` and the run that clears it works in the item's own tree —
+/// the procedure `git_exec::compute_merge` already tells an agent to follow when the queue refuses
+/// its merge.
+async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -> Step {
+    let pool = &state.pool;
+
+    let Ok(Some((worktree, _))) = job_worktree(pool, job.id).await else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "no worktree on record to merge into"
+        );
+        return Step::Stopped;
+    };
+    let item_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let Some(item_id) = item_id else {
+        tracing::warn!(job_id = job.id, ordinal, "no item row to merge");
+        return Step::Stopped;
+    };
+    let branch = crate::worktree::Owner::Item(item_id).branch_name();
+
+    let Ok(base) = crate::worktree::head_sha(&worktree).await else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "could not read where the job's branch stands, so nothing was merged"
+        );
+        return Step::Stopped;
+    };
+    let recorded =
+        sqlx::query("UPDATE job_items SET merge_base_sha = ? WHERE job_id = ? AND ordinal = ?")
+            .bind(&base)
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+    if let Err(error) = recorded {
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not record where a merge would start, so nothing was merged");
+        return Step::Stopped;
+    }
+
+    match crate::worktree::merge_branch(&worktree, &branch).await {
+        Ok(true) => {
+            let _ = sqlx::query(
+                "UPDATE job_items SET status = 'merging' WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+            Step::Continued
+        }
+        Ok(false) => {
+            let _ = sqlx::query(
+                "UPDATE job_items SET status = 'conflicted' WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+            say(
+                pool,
+                job,
+                "job_item_conflicted",
+                &format!(
+                    "job {} at item {}: `{branch}` does not merge into the job's branch, so it was                      put down and nothing was published",
+                    job.id,
+                    ordinal + 1
+                ),
+            )
+            .await;
+            Step::Continued
+        }
+        Err(error) => {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not merge an item");
+            Step::Stopped
+        }
+    }
+}
+
 async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize) -> Step {
     let pool = &state.pool;
     let last = ordinal + 1 == items;
@@ -2471,6 +2604,39 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
         .execute(pool)
         .await;
     record_gate(state, job, ordinal, outcome).await
+}
+
+/// Where the job's branch is put back to when this item's work has to come off it.
+///
+/// **Two answers, and which one is right depends on how the work got onto the branch.**
+///
+/// An item that was MERGED has `merge_base_sha`: the commit the branch stood on immediately before
+/// that merge. Resetting there removes that merge and nothing else, whatever order the other items
+/// arrived in — which is the only property that survives items landing out of ordinal order.
+///
+/// An item that was WRITTEN into the shared checkout has no merge and no base, and falls back to
+/// [`footing_for`], which walks back through the ordinals to the nearest item a gate agreed with.
+/// That is still exactly right there, because in a sequential queue the order work reached the
+/// branch IS the order of the ordinals — and it is the only answer available, since nothing recorded
+/// a per-item boundary.
+///
+/// The pair is read here rather than at the call site so that "which reset target" is one decision
+/// with one place to look, instead of a condition threaded through the red-gate arm.
+async fn revert_point(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<String> {
+    let merged: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT merge_base_sha FROM job_items WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    if merged.is_some() {
+        return merged;
+    }
+    footing_for(pool, job, ordinal).await
 }
 
 /// The commit an item at `ordinal` falls back to when its own work has to be undone.
@@ -2748,7 +2914,7 @@ async fn record_gate(
     if matches!(outcome, crate::gate::GateOutcome::Failed { .. }) {
         let reverted = match (
             job_worktree(pool, job.id).await,
-            footing_for(pool, job, ordinal).await,
+            revert_point(pool, job, ordinal).await,
         ) {
             (Ok(Some((worktree, _))), Some(footing)) => {
                 match crate::worktree::revert_to(&worktree, &footing).await {
@@ -3010,6 +3176,13 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     if let Next::RunGate { ordinal } = next {
         return gate_item(state, job, ordinal, view.items.len()).await;
     }
+    // A merge is a subprocess too, and it goes past the brakes for the same reason plus one of its
+    // own: the item's work is already done and paid for, sitting on a branch. Refusing to bring it
+    // in because the owner sat down would leave it there, diverging from the job's branch for as
+    // long as the brake holds — and the divergence is what the retry has to absorb.
+    if let Next::MergeItem { ordinal } = next {
+        return merge_item(state, job, ordinal).await;
+    }
 
     match brakes(state, job, now).await {
         Brake::Go => {}
@@ -3132,7 +3305,11 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
             let prompt = replan_prompt(&task, view.rounds.round, &archives, &artifacts);
             spawn_node(state, job, "replan", prompt, None, worktree).await
         }
-        Next::Wait | Next::Finish(_) | Next::RunGate { .. } => Step::Stopped,
+        // All four are answered above, before the brakes and before the worktree is resolved.
+        // Reaching one here means the dispatch above stopped covering something it used to.
+        Next::Wait | Next::Finish(_) | Next::RunGate { .. } | Next::MergeItem { .. } => {
+            Step::Stopped
+        }
     }
 }
 
@@ -4020,6 +4197,47 @@ mod tests {
         );
     }
 
+    /// Where an implemented item goes next, and it is the team that decides.
+    ///
+    /// Without a team the work is already on the job's branch — the items write into the one shared
+    /// checkout — so there is nothing to bring anywhere and the gate follows immediately. With one,
+    /// the work is on a branch of its own and the gate would measure a tree that does not have it.
+    #[test]
+    fn an_implemented_item_is_merged_first_only_when_a_team_wrote_it_elsewhere() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[Implemented], ReviewState::NotWanted)),
+            Next::RunGate { ordinal: 0 }
+        );
+        assert_eq!(
+            next_step(&view_with_team(&[Implemented], ReviewState::NotWanted)),
+            Next::MergeItem { ordinal: 0 }
+        );
+        // And once it has landed, the gate measures the branch it landed on.
+        assert_eq!(
+            next_step(&view_with_team(&[Merging], ReviewState::NotWanted)),
+            Next::RunGate { ordinal: 0 }
+        );
+    }
+
+    /// A merge that has landed is measured before another item is brought in.
+    ///
+    /// The order is the design and not an accident of which `if` came first: an item's divergence
+    /// from the job's branch grows with every minute it waits, and the retry that has to absorb it
+    /// is the most expensive step here. Draining what is in flight keeps that divergence small.
+    #[test]
+    fn a_landed_merge_is_gated_before_another_item_is_brought_in() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view_with_team(
+                &[Implemented, Merging],
+                ReviewState::NotWanted
+            )),
+            Next::RunGate { ordinal: 1 },
+            "the merge already on the branch is measured first"
+        );
+    }
+
     /// The precedence between unhappy endings, as a table — because it is a decision, and not a
     /// side effect of the order somebody happened to write the `if`s in.
     #[test]
@@ -4140,16 +4358,17 @@ mod tests {
         );
     }
 
-    /// The three non-terminal newcomers are waited for, not walked past.
+    /// A non-terminal state with no step of its own is waited for, never walked past.
     ///
-    /// None of them is reachable in this slice — nothing writes those rows yet — and that is
-    /// exactly why the assertion is worth having: it is the behaviour the merge step will inherit,
-    /// written while it is still cheap to write. Walking past a non-terminal state is how an item
-    /// gets reported finished with its work still in flight.
+    /// `Merging` has left this list: it now has a step — the gate that measures the merge it
+    /// landed. `Conflicted` and `Reverted` have not, and neither is reachable yet, which is exactly
+    /// why the assertion is worth keeping. Walking past a non-terminal state is how an item gets
+    /// reported finished with its work still in flight, and it is the one direction
+    /// `item_state_from` already refuses to err in.
     #[test]
     fn an_item_mid_merge_is_work_in_flight() {
         use ItemState::*;
-        for state in [Merging, Conflicted, Reverted] {
+        for state in [Conflicted, Reverted] {
             assert_eq!(
                 next_step(&view_with_team(&[state, Pending], ReviewState::NotWanted)),
                 Next::Wait,
@@ -5860,6 +6079,113 @@ mod tests {
             .expect("run git")
             .status
             .success()
+    }
+
+    /// **The proof of this slice: undoing a red merge takes back that merge and nothing else.**
+    ///
+    /// Two items with checkouts of their own. A lands and is kept; B lands and is rejected. The
+    /// reset has to leave the branch holding A's file and not B's — and the reason it is not
+    /// obvious is the ordinals. `footing_for`, which is what a sequential job reverts by, walks
+    /// BACKWARDS THROUGH ORDINALS to the nearest item a gate agreed with. Here B is ordinal 0 and A
+    /// is ordinal 1, and B merged second: reverting B by ordinal finds nothing before it and falls
+    /// back to the job's `head_sha`, which takes A's merge with it.
+    ///
+    /// So the ordinals are deliberately the reverse of the merge order. That is not a contrived
+    /// case — it is the ordinary one the moment items are allowed to finish at their own speed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reverting_a_red_merge_leaves_the_other_items_work_on_the_branch() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-merge-", "git --version");
+        let trees = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(trees.path());
+        let pool = test_pool().await;
+        let job_id = seed_job_in(
+            &pool,
+            "nucleos",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The job's own checkout, on the job's branch. This is what the merges land in.
+        let job_tree = crate::worktree::create(&repo, crate::worktree::Owner::Job(job_id))
+            .await
+            .expect("the job's checkout");
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Job(job_id),
+            "nucleos",
+            &repo.to_string_lossy(),
+            &job_tree.path.to_string_lossy(),
+            &job_tree.branch,
+            job_tree.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+
+        // Ordinal 0 is the one that will go red, ordinal 1 the one that must survive it.
+        seed_items(&pool, job_id, &["implemented", "implemented"]).await;
+        let items: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        // Each item works in a checkout of its own, born where the job's branch stands, and commits
+        // one file there.
+        for (item_id, file) in [(items[0], "red.txt"), (items[1], "green.txt")] {
+            let base = crate::worktree::head_sha(&job_tree.path).await.unwrap();
+            let tree = crate::worktree::adopt_or_create_at(
+                &repo,
+                crate::worktree::Owner::Item(item_id),
+                Some(&base),
+            )
+            .await
+            .expect("the item's checkout");
+            std::fs::write(
+                tree.path.join(file),
+                "work
+",
+            )
+            .expect("write the item's work");
+            assert!(git_ok(&tree.path, &["add", "-A"]));
+            assert!(git_ok(&tree.path, &["commit", "-m", file]));
+        }
+
+        // The green one lands first, and is kept.
+        let state = test_state(pool.clone()).await;
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 1).await,
+            Step::Continued
+        );
+        assert!(job_tree.path.join("green.txt").exists());
+
+        // Then the red one lands, on top of it.
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
+            Step::Continued
+        );
+        assert!(job_tree.path.join("red.txt").exists());
+
+        // And is undone.
+        let target = revert_point(&pool, &load_job(&pool, job_id).await.unwrap(), 0)
+            .await
+            .expect("a red merge knows where it started");
+        crate::worktree::revert_to(&job_tree.path, &target)
+            .await
+            .expect("put the branch back");
+
+        assert!(
+            !job_tree.path.join("red.txt").exists(),
+            "the rejected merge is still on the branch"
+        );
+        assert!(
+            job_tree.path.join("green.txt").exists(),
+            "undoing item 0 took item 1's merge with it — which is what reverting by ordinal does"
+        );
     }
 
     /// A job nobody scheduled: no rule on the row, and no rule in the line a person reads.

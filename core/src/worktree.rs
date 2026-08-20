@@ -933,6 +933,48 @@ pub(crate) async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
 /// `sha` NEVER comes from a request. Every caller passes `job_items.checkpoint_sha` or
 /// `jobs.head_sha`, both written by this daemon. A `reset --hard` taking a caller-supplied ref is an
 /// arbitrary-write primitive pointed at the user's own repository.
+/// Brings `branch` into whatever this checkout stands on. `Ok(false)` means it conflicts.
+///
+/// **A conflict is a value and not an error**, and the distinction is the reason this exists rather
+/// than a `git merge` at the call site. The two outcomes ask for opposite things from the caller: an
+/// error means the merge did not happen and something is wrong with the machine, where a conflict
+/// means the merge was attempted, was refused, and the refusal is information about two pieces of
+/// work. Collapsing them would make an unreadable repository and a genuine conflict read the same.
+///
+/// The conflict is **aborted before returning**, so this checkout is left exactly as it was found.
+/// That is what the next merge into the same branch depends on, and it is also what makes resolving
+/// somewhere else possible: there is no half-merged state here for anyone to be tempted by.
+///
+/// `--no-ff`, so the history says a merge happened even when it could have fast-forwarded. Nothing
+/// downstream reads the merge commit, but the branch is handed to a person, and a person reading it
+/// should see the shape of what arrived.
+pub(crate) async fn merge_branch(worktree_path: &Path, branch: &str) -> io::Result<bool> {
+    let merged = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("merge")
+        .arg("--no-ff")
+        .arg("-m")
+        .arg(format!("merge {branch}"))
+        .arg(branch)
+        .output()
+        .await?;
+    if merged.status.success() {
+        return Ok(true);
+    }
+
+    // Best-effort, exactly as `git_exec::compute_merge` treats it: the next operation resets this
+    // checkout anyway, and a failed abort must not replace the answer the caller came for.
+    let _ = git()
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("merge")
+        .arg("--abort")
+        .output()
+        .await;
+    Ok(false)
+}
+
 pub(crate) async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()> {
     let reset = git()
         .arg("-C")
