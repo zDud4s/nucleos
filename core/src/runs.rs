@@ -1107,6 +1107,8 @@ fn spawn_run(
                 mirror_context_fill(&pool, id, std::sync::Arc::clone(&context_fill));
             let mut request = crate::runner::RunRequest {
                 prompt: prompt.clone(),
+                // A background run carries no pictures: nobody is here to attach one.
+                images: Vec::new(),
                 env: env.clone(),
                 cwd: spawn_cwd.clone(),
                 plan_only,

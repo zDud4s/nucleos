@@ -1422,6 +1422,7 @@ impl Driver {
             // `steerable: true` with `messages: None` is a documented state, not a borrowed one —
             // the writer task ends after the opening turn and closes stdin, which `run_prompt`'s own
             // comment calls "the one-turn run the argv path performs".
+            images: Vec::new(),
             steerable: true,
             // The classifier never sees a seat: `hooks.rs` answers before it, because a
             // `pending_approval` would terminate the seat and mint an approval that resumes into a

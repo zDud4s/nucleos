@@ -915,3 +915,94 @@
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+
+/* Pictures on their way out, above the box. Small: they are a reminder of what is attached, not a
+ * viewer, and a full-size screenshot here would push the box off the panel. */
+.chats-attached {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-attached-item {
+  position: relative;
+}
+
+.chats-attached-thumb {
+  display: block;
+  width: 4rem;
+  height: 4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+}
+
+.chats-attached-drop {
+  position: absolute;
+  top: -0.4rem;
+  right: -0.4rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* The file input itself is the one control here nobody can style into the others, so it is hidden
+ * and its label carries the whole button. */
+.chats-attach {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.chats-attach input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.chats-attach:hover {
+  color: var(--text-muted);
+}
+
+/* Pictures a turn was sent with, under what was typed. Bounded so a tall screenshot does not turn
+ * one turn into the whole page. */
+.chats-pictures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-picture {
+  display: block;
+  max-width: 18rem;
+  max-height: 14rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  object-fit: contain;
+}
+
+/* Said rather than left blank: an empty space where a picture was reads as a turn that had none. */
+.chats-picture-gone {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+}

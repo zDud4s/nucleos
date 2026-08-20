@@ -13,7 +13,12 @@ import {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
+const daemon = vi.hoisted(() => ({
+  apiFetch: vi.fn(),
+  apiText: vi.fn(),
+  apiBlob: vi.fn(),
+  probeHealth: vi.fn(),
+}));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
   ...daemon,
@@ -30,6 +35,8 @@ import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
+  daemon.apiBlob.mockReset();
+  daemon.apiBlob.mockResolvedValue(new Blob(["hello"], { type: "image/png" }));
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();
   daemon.probeHealth.mockResolvedValue(true);
@@ -66,6 +73,7 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     session_id: "s-1",
     created_at: "2026-08-18T09:00:00Z",
     did: [],
+    images: [],
     thought: [],
     thought_tokens: null,
     context_fill: null,
@@ -787,6 +795,114 @@ describe("where a subagent worked", () => {
     const row = note.closest("li") as HTMLElement;
     expect(within(row).queryByText("núcleo")).toBeNull();
     expect(row.className).toContain("aside");
+  });
+});
+
+/* -------------------------------------------------------------- pictures -- */
+
+describe("sending a picture", () => {
+  const picture = () =>
+    new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" });
+
+  const open = () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })],
+      }),
+    );
+    return renderChats("/chats/c-1");
+  };
+
+  it("attaches one and sends it inside the message", async () => {
+    await open();
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, { target: { files: [picture()] } });
+
+    // It is shown before it is sent: attaching and sending are two gestures, and a picture that
+    // vanished between them would leave nothing to say what is about to go.
+    const attached = await screen.findByRole("list", { name: "Attached pictures" });
+    expect(within(attached).getAllByRole("img")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/message",
+      );
+      expect(sent).toBeDefined();
+      const body = JSON.parse(String((sent?.[1] as RequestInit)?.body));
+      expect(body.images).toHaveLength(1);
+      expect(body.images[0].media_type).toBe("image/png");
+      // Base64, with no data-URL prefix left in it: a payload carrying one is valid base64 of the
+      // wrong bytes, and reaches the model as a picture that will not decode.
+      expect(String(body.images[0].data)).not.toContain("base64,");
+    });
+  });
+
+  // A picture on its own is a message. "what is this?" is a reasonable thing to send with nothing
+  // typed, and refusing it because the box is empty would be the window deciding what counts.
+  it("can be sent with nothing typed", async () => {
+    await open();
+
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, { target: { files: [picture()] } });
+
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(
+        false,
+      );
+    });
+  });
+
+  it("can be taken back off before it is sent", async () => {
+    await open();
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, { target: { files: [picture()] } });
+    await screen.findByRole("list", { name: "Attached pictures" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove attached picture 1" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("list", { name: "Attached pictures" })).toBeNull();
+    });
+  });
+
+  // Refused in the window rather than accepted, uploaded, and refused at the far end after the
+  // person has waited for it.
+  it("ignores a file the API could not carry", async () => {
+    await open();
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, {
+      target: { files: [new File([""], "notes.pdf", { type: "application/pdf" })] },
+    });
+
+    await screen.findByLabelText("Message");
+    expect(screen.queryByRole("list", { name: "Attached pictures" })).toBeNull();
+  });
+
+  // The bytes are on disk under the daemon's root and never on the transcript, so the window asks
+  // for them by path — through the same door as everything else, because an `<img src>` pointed at
+  // the daemon would carry no token.
+  it("draws what a turn was sent with, fetched by path", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "que cor e esta?", answer: "magenta", images: ["chats/1-0.png"] }),
+        ],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const sent = await screen.findByRole("list", { name: "Pictures sent with this message" });
+    await waitFor(() => {
+      expect(within(sent).getByRole("img")).toBeTruthy();
+    });
+    expect(daemon.apiBlob).toHaveBeenCalledWith("/files/download?path=chats%2F1-0.png");
   });
 });
 

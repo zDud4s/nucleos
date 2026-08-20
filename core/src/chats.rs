@@ -146,21 +146,30 @@ pub async fn queued(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<String
         .await
 }
 
-/// Keeps a message until this conversation has a turn free for it.
+/// Keeps a message, and whatever was attached to it, until the conversation has a turn free.
+///
+/// The pictures travel as bytes here, unlike on a run, which keeps paths. The two rows have
+/// opposite lives: a run is read on every poll and lives for ever, a queued message is read once by
+/// the drain that sends it and is deleted in the same statement. Keeping the words and losing the
+/// screenshot would be losing half of what somebody sent, without saying so.
 pub async fn enqueue(
     pool: &SqlitePool,
     chat_id: &str,
     text: &str,
     origin: &str,
+    images: &str,
 ) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO chat_queue (chat_id, text, origin, created_at) VALUES (?, ?, ?, ?)")
-        .bind(chat_id)
-        .bind(text)
-        .bind(origin)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(pool)
-        .await
-        .map(|_| ())
+    sqlx::query(
+        "INSERT INTO chat_queue (chat_id, text, origin, images, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(chat_id)
+    .bind(text)
+    .bind(origin)
+    .bind(images)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// Takes the oldest waiting message off this conversation's queue, or `None` when there is none.
@@ -174,11 +183,11 @@ pub async fn enqueue(
 pub async fn take_queued(
     pool: &SqlitePool,
     chat_id: &str,
-) -> sqlx::Result<Option<(String, Option<String>)>> {
+) -> sqlx::Result<Option<(String, Option<String>, Option<String>)>> {
     sqlx::query_as(
         "DELETE FROM chat_queue
           WHERE id = (SELECT id FROM chat_queue WHERE chat_id = ? ORDER BY id LIMIT 1)
-      RETURNING text, origin",
+      RETURNING text, origin, images",
     )
     .bind(chat_id)
     .fetch_optional(pool)

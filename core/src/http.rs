@@ -759,6 +759,16 @@ struct AssistantMessageRequest {
     /// what every caller written before this field existed expects.
     #[serde(default)]
     wait_if_busy: bool,
+    /// The pictures attached to this message. Empty for every caller that attaches none.
+    #[serde(default)]
+    images: Vec<ImageIn>,
+}
+
+/// One picture as the window sends it: base64, with the sender's claim about what it is.
+#[derive(Deserialize)]
+struct ImageIn {
+    media_type: String,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -1887,13 +1897,30 @@ async fn post_assistant_message(
     let wait = body.wait_if_busy;
     let outcome = uncancellable(async move {
         let origin = crate::assistant::Origin::from_wire(body.origin.as_deref());
+        // The window's shape becomes the runner's here, at the edge, so nothing inside the daemon
+        // has to know what a request body looks like.
+        let images: Vec<crate::runner::Attachment> = body
+            .images
+            .into_iter()
+            .map(|image| crate::runner::Attachment {
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect();
         match wait {
             true => {
-                crate::assistant::send_or_queue(&state, &body.chat_id, &body.text, origin).await
+                crate::assistant::send_or_queue(&state, &body.chat_id, &body.text, &images, origin)
+                    .await
             }
-            false => crate::assistant::send_message(&state, &body.chat_id, &body.text, origin)
-                .await
-                .map(crate::assistant::Sent::Turn),
+            false => crate::assistant::send_message_with(
+                &state,
+                &body.chat_id,
+                &body.text,
+                &images,
+                origin,
+            )
+            .await
+            .map(crate::assistant::Sent::Turn),
         }
     })
     .await
@@ -3447,6 +3474,10 @@ struct AssistantTurn {
     /// What the turn thought, as the JSON `thought` holds. Not serialized, for the reason above it.
     #[serde(skip)]
     thought: Option<String>,
+    /// Where the turn's pictures were kept, as the JSON `prompt_images` holds. Not serialized, for
+    /// the reason above it.
+    #[serde(skip)]
+    prompt_images: Option<String>,
     /// Roughly how many tokens the turn spent thinking, or null when it did not think and on every
     /// turn from before the column. Serialized as it stands: it is a number, not a private shape.
     thought_tokens: Option<i64>,
@@ -3463,6 +3494,11 @@ struct AssistantTurnOut {
     #[serde(flatten)]
     turn: AssistantTurn,
     did: Vec<crate::runner::ToolCall>,
+    /// The pictures this turn was sent with, as paths under the files root.
+    ///
+    /// Paths and not bytes, all the way to the window: it asks the files route for each one, which
+    /// means a transcript of forty turns costs forty short strings rather than forty screenshots.
+    images: Vec<String>,
     /// What the turn thought before it answered, oldest first.
     ///
     /// Empty both for a turn that thought nothing and for a turn from before the column. The two
@@ -3650,7 +3686,7 @@ async fn get_assistant_chat(
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
                 answered_by, session_id, created_at, context_fill, tools_used, thought,
-                thought_tokens
+                thought_tokens, prompt_images
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -3692,9 +3728,15 @@ async fn get_assistant_chat(
                     .as_deref()
                     .and_then(|json| serde_json::from_str(json).ok())
                     .unwrap_or_default();
+                let images = turn
+                    .prompt_images
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
                 AssistantTurnOut {
                     turn,
                     did,
+                    images,
                     thought,
                     context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
                 }
@@ -9597,7 +9639,7 @@ mod tests {
     #[tokio::test]
     async fn a_transcript_carries_what_is_still_waiting_to_be_said() {
         let state = test_state().await;
-        crate::chats::enqueue(&state.pool, "waiting", "e os testes tambem", "shell")
+        crate::chats::enqueue(&state.pool, "waiting", "e os testes tambem", "shell", "[]")
             .await
             .unwrap();
 
@@ -9753,6 +9795,34 @@ mod tests {
 
         let body = json_body(response).await;
         assert_eq!(body["handed"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// The pictures reach the window, or a conversation shows a question about one nobody can see.
+    #[tokio::test]
+    async fn a_transcript_says_which_pictures_a_turn_was_sent_with() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, prompt_images, created_at)
+             VALUES ('que cor e esta?', 'completed', 'assistant', 'pictured', 'magenta', ?, '2026-08-20T10:00:00Z')",
+        )
+        .bind(r#"["chats/7-0.png"]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/pictured")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["turns"][0]["images"][0], "chats/7-0.png");
     }
 
     /// The measurement reaches the window, or the column that stores it is write-only.

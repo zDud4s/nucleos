@@ -335,18 +335,106 @@ pub async fn send_or_queue(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
+    images: &[crate::runner::Attachment],
     origin: Origin,
 ) -> Result<Sent, String> {
-    match send_message(state, chat_id, text, origin).await {
+    match send_message_with(state, chat_id, text, images, origin).await {
         Ok(id) => Ok(Sent::Turn(id)),
         Err(refusal) if refusal == TURN_IN_PROGRESS => {
-            crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire())
+            // Serialised here rather than at the drain, because this is the only moment the bytes
+            // are in hand. A message that waits with its pictures is the whole of what was sent;
+            // one that waits without them is half of it, silently.
+            let carried = serde_json::to_string(
+                &images
+                    .iter()
+                    .map(|image| {
+                        serde_json::json!({
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_string());
+            crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried)
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(Sent::Queued)
         }
         Err(other) => Err(other),
     }
+}
+
+/// Writes a turn's pictures where the window can ask for them again, answering their paths.
+///
+/// Paths and not bytes on the row: `runs` is read on every transcript poll and on every list, and a
+/// column holding base64 screenshots would drag megabytes through queries that want a prompt and a
+/// status.
+///
+/// A daemon with no files root keeps nothing and says so by answering an empty list. The turn still
+/// goes — the model sees the picture either way — and what is lost is being able to look at it
+/// afterwards.
+fn keep_images(
+    state: &crate::state::AppState,
+    id: i64,
+    images: &[crate::runner::Attachment],
+) -> Vec<String> {
+    use base64::Engine;
+    let Some(root) = state.files_root.as_deref() else {
+        return Vec::new();
+    };
+    if images.is_empty() {
+        return Vec::new();
+    }
+    if let Err(error) = crate::files::create_folder(root, CHAT_IMAGES) {
+        tracing::warn!(?error, "could not make the folder a turn's pictures go in");
+        return Vec::new();
+    }
+
+    let mut kept = Vec::new();
+    for (at, image) in images.iter().enumerate() {
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) else {
+            tracing::warn!(id, at, "a picture could not be decoded and was not kept");
+            continue;
+        };
+        let name = format!("{id}-{at}.{}", extension_of(&image.media_type));
+        match crate::files::write_file(root, CHAT_IMAGES, &name, &bytes) {
+            Ok(written) => kept.push(format!("{CHAT_IMAGES}/{written}")),
+            Err(error) => tracing::warn!(?error, id, at, "a picture could not be written"),
+        }
+    }
+    kept
+}
+
+/// Where a conversation's pictures live under the files root.
+const CHAT_IMAGES: &str = "chats";
+
+/// The file extension for a claimed media type.
+///
+/// The sender's claim, taken at face value and used only to name a file. Nothing here sniffs the
+/// bytes: a run reading the picture is reading it either way, and a daemon second-guessing the
+/// label would be deciding on behalf of a model that can see it.
+fn extension_of(media_type: &str) -> &'static str {
+    match media_type {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    }
+}
+
+/// Records where a turn's pictures were kept — `[]` for a turn that carried none.
+///
+/// An empty list rather than NULL, deliberately: NULL is what a turn from before this column has,
+/// and "carried nothing" and "nobody asked" are different facts.
+async fn record_images(pool: &SqlitePool, id: i64, kept: &[String]) -> sqlx::Result<()> {
+    let stored = serde_json::to_string(kept).unwrap_or_else(|_| "[]".to_string());
+    sqlx::query("UPDATE runs SET prompt_images = ? WHERE id = ?")
+        .bind(stored)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 /// Sends whatever waited, once the conversation has a turn free for it.
@@ -370,9 +458,25 @@ async fn drain_queued(state: &crate::state::AppState, chat_id: &str) {
             return;
         }
     };
-    let (text, origin) = taken;
+    let (text, origin, carried) = taken;
     let origin = Origin::from_wire(origin.as_deref());
-    if let Err(refusal) = Box::pin(send_message(state, chat_id, &text, origin)).await {
+    // A queue row that will not parse is sent without its pictures rather than not sent at all: the
+    // words are the part somebody is waiting on an answer to, and refusing the whole turn over an
+    // unreadable column would lose those too.
+    let images: Vec<crate::runner::Attachment> = carried
+        .as_deref()
+        .and_then(|stored| serde_json::from_str::<Vec<serde_json::Value>>(stored).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|image| {
+            Some(crate::runner::Attachment {
+                media_type: image.get("media_type")?.as_str()?.to_string(),
+                data: image.get("data")?.as_str()?.to_string(),
+            })
+        })
+        .collect();
+    if let Err(refusal) = Box::pin(send_message_with(state, chat_id, &text, &images, origin)).await
+    {
         tracing::warn!(
             %refusal,
             chat_id,
@@ -529,12 +633,57 @@ fn record_in_notebook(
     }
 }
 
+/// How many pictures one turn may carry.
+///
+/// A ceiling on what a person can attach in one go, not on what the model can read. Past a handful
+/// the question stops being about the pictures and the cost of the turn stops being predictable.
+pub const MAX_IMAGES: usize = 5;
+
+/// The largest a single picture may be, as base64 characters. Roughly 5MB of bytes, which is what
+/// the API accepts for one image.
+pub const MAX_IMAGE_CHARS: usize = 7_000_000;
+
+/// Why a turn was refused before it cost anything: it carried more pictures than a turn may.
+pub const TOO_MANY_IMAGES: &str = "a turn may carry at most five pictures";
+
+/// Why a turn was refused before it cost anything: one of its pictures is too big to send.
+pub const IMAGE_TOO_LARGE: &str = "one of those pictures is too large to send";
+
+/// Sends a message with nothing attached, which is every caller but the window.
 pub async fn send_message(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
     origin: Origin,
 ) -> Result<i64, String> {
+    send_message_with(state, chat_id, text, &[], origin).await
+}
+
+/// Sends a message, with whatever pictures were attached to it.
+///
+/// The pictures travel INSIDE the message rather than as paths for the model to go and read: they
+/// are part of what was said. Measured against the CLI before any of this was built — a `user` line
+/// whose content is an array with an `image` block is accepted, and a solid magenta square asked
+/// about came back "Magenta".
+///
+/// Which forces the stdin path, because an argument vector holds a string and there is nowhere in
+/// it for bytes to go. `steerable` and `images` are therefore decided together, below, at the one
+/// place that can see both.
+pub async fn send_message_with(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    images: &[crate::runner::Attachment],
+    origin: Origin,
+) -> Result<i64, String> {
+    // Refused before the slot is taken, so a turn nobody can send costs nothing and leaves the
+    // conversation answerable.
+    if images.len() > MAX_IMAGES {
+        return Err(TOO_MANY_IMAGES.to_string());
+    }
+    if images.iter().any(|i| i.data.len() > MAX_IMAGE_CHARS) {
+        return Err(IMAGE_TOO_LARGE.to_string());
+    }
     // Held from here on: every early return, error, and dropped future below releases the chat by
     // dropping this, which is why none of them needs a cleanup statement of its own.
     let slot = ChatSlot::acquire(chat_id).ok_or(TURN_IN_PROGRESS.to_string())?;
@@ -656,6 +805,17 @@ pub async fn send_message(
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
 
+    // Written after the row exists, because the turn's own id is what names the files — which is
+    // what makes two people pasting the same screenshot two different files rather than a race.
+    //
+    // A failure here is not a failed turn. The pictures are already in memory and on their way to
+    // the model; what is lost is the window's ability to show them afterwards, which is worth a
+    // warning and not worth refusing a turn somebody is waiting for.
+    let kept = keep_images(state, id, images);
+    if let Err(error) = record_images(&state.pool, id, &kept).await {
+        tracing::warn!(%error, id, "the turn was sent but its pictures were not recorded");
+    }
+
     if let Some(turn) = &errand {
         mark_if_remembering(state, id, turn).await?;
     }
@@ -725,6 +885,7 @@ pub async fn send_message(
             // The prompt the model sees, not the text the person typed: for an errand the two
             // differ by the notebook and the preamble, and the row already holds the typed half.
             text: prompt,
+            images: images.to_vec(),
             resume,
             session_id,
             mcp_path,
@@ -1126,6 +1287,11 @@ struct TurnLaunch {
     id: i64,
     slot: ChatSlot,
     text: String,
+    /// The pictures this turn carries. Empty for almost every turn.
+    ///
+    /// Carried here rather than fetched later because they decide which door the run goes through:
+    /// bytes only fit on stdin, so a turn with any of these is `steerable` and one without is not.
+    images: Vec<crate::runner::Attachment>,
     /// The session this turn continues, or `None` to start on a fresh context.
     resume: Option<String>,
     /// The id this turn is recorded under, which is `resume` when there is one.
@@ -1146,6 +1312,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         id,
         slot,
         text,
+        images,
         resume,
         session_id,
         mcp_path,
@@ -1161,6 +1328,10 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
+    // Read before `images` is moved into the request below, and named rather than asked inline:
+    // this decides which door the run goes through, and a bare `!images.is_empty()` buried in a
+    // struct literal is not a sentence anybody reads.
+    let carries_pictures = !images.is_empty();
     let turn = TurnGuard { slot, mcp_path };
     // Kept for after the turn: draining what waited needs the whole state, and `spawn_registered`
     // takes ownership of it. The chat id is copied for the same reason — it lives on the guard,
@@ -1281,7 +1452,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // An orchestrator turn is one message answered and closed; the next one arrives
                     // as its own turn on the resumed session, which is where a Telegram reply
                     // already goes. Nothing here needs a stdin, so it keeps a closed one.
-                    steerable: false,
+                    images,
+                    // Bytes only fit on stdin: an argument vector holds a string and there is
+                    // nowhere in it for a picture to go. So a turn carrying one takes the other
+                    // door — which is the same one-turn run either way, because `messages` is None
+                    // and stdin closes the moment the opening line is written.
+                    steerable: carries_pictures,
+
                     // An orchestrator turn is answered by a person watching a chat, so the CLI's
                     // own permission surface is the right one: there IS somebody to approve. It is
                     // `McpOnly` besides, so the surface being argued over is nearly empty.
@@ -3596,7 +3773,8 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = send_or_queue(&state, chat_id, "e os testes tambem", Origin::Shell).await;
+        let outcome =
+            send_or_queue(&state, chat_id, "e os testes tambem", &[], Origin::Shell).await;
 
         assert_eq!(outcome, Ok(Sent::Queued));
         assert_eq!(
@@ -3637,7 +3815,7 @@ mod tests {
         let first = send_message(&state, chat_id, "arranja o parser", Origin::Shell)
             .await
             .unwrap();
-        send_or_queue(&state, chat_id, "e os testes tambem", Origin::Shell)
+        send_or_queue(&state, chat_id, "e os testes tambem", &[], Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, first).await;
@@ -3678,10 +3856,10 @@ mod tests {
         let _first = send_message(&state, chat_id, "primeiro", Origin::Shell)
             .await
             .unwrap();
-        send_or_queue(&state, chat_id, "segundo", Origin::Shell)
+        send_or_queue(&state, chat_id, "segundo", &[], Origin::Shell)
             .await
             .unwrap();
-        send_or_queue(&state, chat_id, "terceiro", Origin::Shell)
+        send_or_queue(&state, chat_id, "terceiro", &[], Origin::Shell)
             .await
             .unwrap();
 
@@ -3697,9 +3875,142 @@ mod tests {
     async fn asking_to_wait_still_sends_immediately_when_nothing_is_running() {
         let state = test_state().await;
 
-        let outcome = send_or_queue(&state, "idle-chat", "arranja isso", Origin::Shell).await;
+        let outcome = send_or_queue(&state, "idle-chat", "arranja isso", &[], Origin::Shell).await;
 
         assert!(matches!(outcome, Ok(Sent::Turn(_))), "{outcome:?}");
+    }
+
+    /// A picture sent with a turn reaches the model INSIDE the message.
+    ///
+    /// Not as a path for it to go and read: it is part of what was said. Measured against the CLI
+    /// first — a `user` line whose content is an array with an `image` block is accepted, and a
+    /// solid magenta square asked about came back "Magenta".
+    ///
+    /// Which forces the stdin path. An argument vector holds a string and there is nowhere in it
+    /// for bytes to go, so a turn carrying a picture is `steerable` and one carrying none is not —
+    /// the two are decided together, here, because a run given images and not steerable would drop
+    /// them without a word.
+    #[tokio::test]
+    async fn a_turn_sent_with_a_picture_carries_it_into_the_run() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let images = vec![crate::runner::Attachment {
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }];
+
+        let id = send_message_with(
+            &state,
+            "picture-chat",
+            "que cor e esta?",
+            &images,
+            Origin::Shell,
+        )
+        .await
+        .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let images = fake.last_images.lock().unwrap().clone().unwrap_or_default();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "aGVsbG8=");
+        // Bytes have nowhere to go in an argv, so a turn carrying them must take the other door.
+        assert_eq!(
+            *fake.last_steerable.lock().unwrap(),
+            Some(true),
+            "a turn with a picture must go by stdin"
+        );
+    }
+
+    /// A turn carrying nothing keeps the argument vector it has always used.
+    #[tokio::test]
+    async fn a_turn_sent_with_nothing_keeps_the_argument_vector() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+
+        let id = send_message(&state, "plain-chat", "arranja o parser", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert!(
+            fake.last_images
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(*fake.last_steerable.lock().unwrap(), Some(false));
+    }
+
+    /// What was sent is kept, or the conversation shows a question about a picture nobody can see.
+    ///
+    /// Paths and not bytes: `runs` is read on every transcript poll, and a column holding base64
+    /// screenshots would drag megabytes through queries that want a prompt and a status.
+    #[tokio::test]
+    async fn a_picture_sent_with_a_turn_is_kept_where_it_can_be_opened_again() {
+        // Through `ensure_root`, the way every other test of the files pillar builds one: a bare
+        // temp path is not a root — `resolve_within` canonicalises, and on Windows a canonical path
+        // carries a prefix a raw one does not, so every write under it reads as an escape.
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(dir.path()).unwrap();
+        let mut state = test_state().await;
+        state.files_root = Some(root.clone());
+        let images = vec![crate::runner::Attachment {
+            media_type: "image/png".into(),
+            // "hello" — not a real PNG, and nothing here claims to check.
+            data: "aGVsbG8=".into(),
+        }];
+
+        let id = send_message_with(
+            &state,
+            "kept-chat",
+            "que cor e esta?",
+            &images,
+            Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT prompt_images FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let paths: Vec<String> =
+            serde_json::from_str(&stored.expect("the turn recorded no pictures")).unwrap();
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with(".png"), "{paths:?}");
+        // And the bytes are actually there, under the files root, where the window can ask for them.
+        let written = root.join(&paths[0]);
+        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
+    }
+
+    /// A turn that carried none records an EMPTY list, never nothing at all.
+    ///
+    /// NULL is what a turn from before the column has, and the two are different facts: one is a
+    /// turn known to have carried nothing, the other is a turn nobody asked.
+    #[tokio::test]
+    async fn a_turn_that_carried_no_picture_records_an_empty_list() {
+        let state = test_state().await;
+
+        let id = send_message(&state, "empty-chat", "arranja o parser", Origin::Shell)
+            .await
+            .unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT prompt_images FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        assert_eq!(stored.as_deref(), Some("[]"));
     }
 
     /// An origin has to survive being written down, or a queued Telegram turn comes back as the

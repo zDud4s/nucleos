@@ -182,6 +182,12 @@ export interface Mentions {
   truncated: boolean;
 }
 
+/** A picture on its way out: base64, with what the browser said it is. */
+export interface Attachment {
+  media_type: string;
+  data: string;
+}
+
 /** Where a command came from, which is the only thing explaining two of the same name. */
 export type CommandSource = "project" | "personal" | "plugin";
 
@@ -335,17 +341,17 @@ export function useIdeConversation(sessionId: string | null) {
 export function useSendMessage(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (text: string) =>
+    mutationFn: ({ text, images }: { text: string; images: Attachment[] }) =>
       // `wait_if_busy` is what turns the old 409 into a place in the queue. A person looking at the
       // window would rather their words were kept than be told no and handed back an empty box —
       // the Telegram sidecar, which gives up on a turn after a timeout, would rather be refused,
       // and so it does not ask.
       apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",
-        body: JSON.stringify({ chat_id: chatId, text, wait_if_busy: true }),
+        body: JSON.stringify({ chat_id: chatId, text, images, wait_if_busy: true }),
       }),
     retry: false,
-    onSuccess: (result, text) => {
+    onSuccess: (result, { text }) => {
       // Kept rather than sent: there is no turn to draw, and inventing one would put a bubble on
       // screen for a run that does not exist. The transcript's own read carries what is waiting, so
       // asking for it again is the whole of what this side has to do.
@@ -362,6 +368,10 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // Not the pictures that were just sent: those are on disk under names only the daemon
+        // knows, because it names them after the turn's own id. They arrive with the next read,
+        // which is a beat later — and a wrong guess at a path would draw a broken image instead.
+        images: [],
         // Nothing has run and nothing has been thought: this turn has not started.
         thought: [],
         thoughtTokens: null,

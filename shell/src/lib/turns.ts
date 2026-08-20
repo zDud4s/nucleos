@@ -89,6 +89,14 @@ export interface AssistantTurnRow {
    */
   thought: string[];
   /**
+   * The pictures this turn was sent with, as paths under the files root.
+   *
+   * Paths and not bytes: a transcript of forty turns costs forty short strings
+   * rather than forty screenshots, and each one is fetched only when it is
+   * actually about to be drawn.
+   */
+  images: string[];
+  /**
    * Roughly how many tokens the turn spent thinking, or null when it did not
    * think and on every turn from before the column.
    *
@@ -118,6 +126,8 @@ export interface Turn {
   sessionId: string | null;
   /** What the turn ran. See `AssistantTurnRow.did`. */
   did: ToolCall[];
+  /** See `AssistantTurnRow.images`. */
+  images: string[];
   /** See `AssistantTurnRow.thought`. */
   thought: string[];
   /** See `AssistantTurnRow.thought_tokens`. */
@@ -170,6 +180,7 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     did: row.did ?? [],
     // Defaulted for the reason `did` is: a daemon older than the column sends no such key, and a
     // turn drawn without its reasoning beats a page that refuses to draw the turn.
+    images: row.images ?? [],
     thought: row.thought ?? [],
     thoughtTokens: row.thought_tokens ?? null,
     contextFill: row.context_fill ?? null,

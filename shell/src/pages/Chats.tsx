@@ -19,6 +19,7 @@ import {
   useSendMessage,
   useStopTurn,
   type Brain,
+  type Attachment,
   type ChatSummary,
   type Command,
   type Exchange,
@@ -38,6 +39,8 @@ import {
 } from "../lib/turns";
 import { blocks, lines, type Line as RichLine } from "../lib/rich";
 import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
+import { fetchFileBlob } from "../data/files";
+import { attachmentFrom, isPicture } from "../lib/picture";
 import {
   Badge,
   Button,
@@ -958,6 +961,7 @@ function TurnBlock({
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
+      <TurnPictures paths={turn.images} />
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} />}
@@ -1121,6 +1125,63 @@ function LiveAnswer({ turnId }: { turnId: number }) {
 }
 
 /**
+ * The pictures a turn was sent with, drawn under what was typed.
+ *
+ * Fetched one at a time, by path, from the files route — the bytes are on disk under the daemon's
+ * own root and never on the transcript, so a conversation of forty turns costs forty short strings
+ * to read and only the pictures actually on screen to draw.
+ */
+function TurnPictures({ paths }: { paths: string[] }) {
+  if (paths.length === 0) return null;
+  return (
+    <ul className="chats-pictures" aria-label="Pictures sent with this message">
+      {paths.map((path) => (
+        <li key={path}>
+          <TurnPicture path={path} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * One picture, fetched as bytes and held as an object URL for as long as it is on screen.
+ *
+ * Not an `<img src>` pointed at the route: every request to the daemon carries a token, and a
+ * browser fetching an image never sends one. So the bytes come through the same door as everything
+ * else and become a URL this document owns — revoked on the way out, because an object URL nobody
+ * releases is a leak that lasts as long as the window does.
+ */
+function TurnPicture({ path }: { path: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [gone, setGone] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    let made: string | null = null;
+    void fetchFileBlob(path)
+      .then((blob) => {
+        if (!live) return;
+        made = URL.createObjectURL(blob);
+        setUrl(made);
+      })
+      .catch(() => {
+        if (live) setGone(true);
+      });
+    return () => {
+      live = false;
+      if (made !== null) URL.revokeObjectURL(made);
+    };
+  }, [path]);
+
+  // Said, not left blank: a picture that was sent and can no longer be read is a fact about the
+  // record, and an empty space where one was is indistinguishable from a turn that had none.
+  if (gone) return <p className="chats-picture-gone">a picture sent here can no longer be read</p>;
+  if (url === null) return <p className="chats-picture-gone">reading a picture…</p>;
+  return <img className="chats-picture" src={url} alt={`sent with this message: ${path}`} />;
+}
+
+/**
  * That the model thought, and how much — because what it thought cannot be had.
  *
  * This began as "show the reasoning, folded shut", which is what the editor does. Asked of the CLI
@@ -1247,6 +1308,15 @@ const MESSAGE_SENTENCES: Record<string, string> = {
 };
 
 /**
+ * How many pictures one message may carry.
+ *
+ * The daemon's own ceiling, said again here so the window stops before the refusal rather than
+ * after it. A number duplicated across two codebases is one that drifts, and this one is worth the
+ * risk: the alternative is letting somebody attach nine screenshots and telling them at Send.
+ */
+const MAX_PICTURES = 5;
+
+/**
  * One thing the list can offer, whichever gesture opened it.
  *
  * A `@` and a `/` are the same move — type a sigil, narrow a list, choose — and the arrows, the
@@ -1268,8 +1338,19 @@ function Composer({ chatId }: { chatId: string }) {
   // opens it again rather than leaving somebody stuck with a feature they turned off.
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [highlight, setHighlight] = useState(0);
+  const [attached, setAttached] = useState<Attachment[]>([]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
+
+  // A picture is read here, in the window, and travels as base64 inside the message. Not as a path
+  // for the model to go and read: it is part of what was said, and the CLI takes it that way —
+  // measured, with a magenta square it correctly named.
+  const attach = async (files: FileList | File[] | null) => {
+    const pictures = Array.from(files ?? []).filter(isPicture);
+    if (pictures.length === 0) return;
+    const read = await Promise.all(pictures.map(attachmentFrom));
+    setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
+  };
 
   // Never both: a command is only ever the first character of the box, and a mention needs
   // whitespace before it, so a live `/` means everything up to the caret has no space in it and
@@ -1324,9 +1405,20 @@ function Composer({ chatId }: { chatId: string }) {
 
   // One place, two ways in: the button and the key. Duplicating the guards into the key handler is
   // how one of them ends up sending an empty turn six months from now.
+  // A picture on its own is a message: "what is this?" is a reasonable thing to send with nothing
+  // typed, and refusing it because the box is empty would be the window deciding what counts.
+  const sayable = (text.trim() !== "" || attached.length > 0) && !send.isPending;
   const say = () => {
-    if (text.trim() === "" || send.isPending) return;
-    send.mutate(text.trim(), { onSuccess: () => setText("") });
+    if (!sayable) return;
+    send.mutate(
+      { text: text.trim(), images: attached },
+      {
+        onSuccess: () => {
+          setText("");
+          setAttached([]);
+        },
+      },
+    );
   };
 
   return (
@@ -1350,10 +1442,40 @@ function Composer({ chatId }: { chatId: string }) {
           truncated={command === null && files.data?.truncated === true}
         />
       )}
+      {attached.length > 0 && (
+        <ul className="chats-attached" aria-label="Attached pictures">
+          {attached.map((picture, index) => (
+            <li key={`attached-${index}`} className="chats-attached-item">
+              <img
+                className="chats-attached-thumb"
+                alt={`attached picture ${index + 1}`}
+                src={`data:${picture.media_type};base64,${picture.data}`}
+              />
+              <button
+                type="button"
+                className="chats-attached-drop"
+                aria-label={`Remove attached picture ${index + 1}`}
+                onClick={() => setAttached((was) => was.filter((_, at) => at !== index))}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
       <label className="chats-field">
         <span>Message</span>
         <textarea
           ref={box}
+          // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
+          // anything that made you save it to a file first would be a step nobody takes.
+          onPaste={(event) => {
+            const pictures = Array.from(event.clipboardData.files).filter(isPicture);
+            if (pictures.length === 0) return;
+            // Only when there IS a picture: a plain text paste must stay a text paste.
+            event.preventDefault();
+            void attach(pictures);
+          }}
           rows={3}
           aria-label="Message"
           value={text}
@@ -1404,7 +1526,23 @@ function Composer({ chatId }: { chatId: string }) {
         />
       </label>
       <div className="chats-composer-actions">
-        <Button type="submit" intent="go" disabled={text.trim() === "" || send.isPending}>
+        {/* The way in for anything not on the clipboard. Hidden behind its own label because a bare
+            file input is the one control on this page nobody can style into the others. */}
+        <label className="chats-attach">
+          <span>Attach a picture</span>
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            aria-label="Attach a picture"
+            onChange={(event) => {
+              void attach(event.target.files);
+              // Cleared so the same file chosen twice in a row is heard the second time.
+              event.target.value = "";
+            }}
+          />
+        </label>
+        <Button type="submit" intent="go" disabled={!sayable}>
           Send
         </Button>
       </div>

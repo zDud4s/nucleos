@@ -2492,6 +2492,7 @@ async fn spawn_agent(
         // only way to keep the prompt off the command line, and a director's prompt carries the
         // whole folder index. Windows caps a command line at 32 767 characters, and the first real
         // council died exactly there.
+        images: Vec::new(),
         steerable: true,
         classifier_governs_tools: false,
         messages: None,

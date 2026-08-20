@@ -145,6 +145,12 @@ pub struct RunRequest {
     pub session_id: Option<String>,
     pub fork_session: bool,
     pub include_partial_messages: bool,
+    /// Pictures travelling with this run's opening turn. Empty for every run that carries none.
+    ///
+    /// Only ever read on the stdin path: an argument vector holds a string and there is nowhere in
+    /// it for bytes to go. A run given images and not `steerable` would silently drop them, so the
+    /// two are decided together at the one place that builds a turn with a picture in it.
+    pub images: Vec<Attachment>,
     /// Whether this run's turns arrive on stdin instead of in its argument vector.
     ///
     /// The opt-in is made once, here, because it decides the shape of the launch and cannot be
@@ -202,16 +208,58 @@ pub struct RunRequest {
     pub allowed_mcp_tools: Option<&'static [&'static str]>,
 }
 
+/// A picture travelling with a turn, as the API carries one.
+///
+/// Base64 rather than bytes, because base64 is what goes on the wire in both directions: it arrives
+/// that way from the window and leaves that way to the CLI, and decoding in between would be work
+/// done only to be undone.
+///
+/// `media_type` is the sender's claim about what these bytes are, and it is passed on as a claim.
+/// Nothing here sniffs the content: a run reading a picture is reading it either way, and a daemon
+/// that second-guessed the label would be deciding on behalf of a model that can see the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub media_type: String,
+    pub data: String,
+}
+
 /// One line of `--input-format stream-json` stdin: a single user turn.
 ///
 /// Measured against CLI 2.1.198, this shape is accepted and the run proceeds — the `init` event fires
 /// and the process exits 0. Built through `serde_json` rather than `format!` because a turn is
 /// delimited by a newline: a prompt containing one, or a quote, would otherwise arrive as two
 /// half-parsed lines instead of the single instruction it is.
-pub(crate) fn user_message_line(text: &str) -> String {
+pub(crate) fn user_message_line(text: &str, images: &[Attachment]) -> String {
+    // A plain string when there is nothing to carry, and that is not tidiness: the string form is
+    // the one measured working, and every run in this daemon that is not a chat uses it. Rewriting
+    // them all as arrays to make one new case uniform would change what is proven to make room for
+    // what is not.
+    //
+    // An array when there is. The image comes first and the words after — the order the API
+    // documents for a question about a picture, and the order a person types in.
+    let content = match images.is_empty() {
+        true => serde_json::Value::String(text.to_string()),
+        false => {
+            let mut blocks: Vec<serde_json::Value> = images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        },
+                    })
+                })
+                .collect();
+            blocks.push(serde_json::json!({ "type": "text", "text": text }));
+            serde_json::Value::Array(blocks)
+        }
+    };
     let mut line = serde_json::json!({
         "type": "user",
-        "message": { "role": "user", "content": text },
+        "message": { "role": "user", "content": content },
     })
     .to_string();
     line.push('\n');
@@ -1502,7 +1550,7 @@ impl CommandRunner for ClaudeCliRunner {
                 .stdin
                 .take()
                 .expect("stdin piped above when steerable");
-            let opening = user_message_line(&request.prompt);
+            let opening = user_message_line(&request.prompt, &request.images);
             let mut messages = request.messages.take();
             steering_task = Some(tokio::spawn(async move {
                 // `ChildStdin` writes straight to the OS pipe, so a completed `write_all` has
@@ -1517,7 +1565,9 @@ impl CommandRunner for ClaudeCliRunner {
                 };
                 while let Some(text) = messages.recv().await {
                     if stdin
-                        .write_all(user_message_line(&text).as_bytes())
+                        // A later turn carries no pictures: they belong to the opening one, which
+                        // is the only turn anybody attaches anything to.
+                        .write_all(user_message_line(&text, &[]).as_bytes())
                         .await
                         .is_err()
                     {
@@ -2094,6 +2144,10 @@ pub struct FakeCommandRunner {
     /// reason `last_tool_policy` is: it decides what a run CAN have done to it, so which value
     /// reached the runner is a safety property rather than a detail of the request.
     pub last_steerable: std::sync::Mutex<Option<bool>>,
+    /// The pictures the launch was handed. Recorded because bytes can only travel the stdin path,
+    /// so a run given images and not `steerable` drops them without a word — a failure invisible
+    /// from everywhere except here.
+    pub last_images: std::sync::Mutex<Option<Vec<Attachment>>>,
     /// Whether the launch handed the run the classifier's permission surface instead of the CLI's.
     /// Recorded for the same reason `last_tool_policy` is: it decides what a run CAN do.
     pub last_classifier_governs_tools: std::sync::Mutex<Option<bool>>,
@@ -2151,6 +2205,7 @@ impl CommandRunner for FakeCommandRunner {
                 .expect("the plan node writes its queue");
         }
         *self.last_prompt.lock().unwrap() = Some(request.prompt.clone());
+        *self.last_images.lock().unwrap() = Some(request.images.clone());
         *self.last_cwd.lock().unwrap() = request.cwd.clone();
         *self.last_plan_only.lock().unwrap() = Some(request.plan_only);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
@@ -2415,7 +2470,7 @@ mod tests {
     fn a_steering_turn_is_one_json_user_line_whatever_its_text_contains() {
         let text = "stop after this file\nand say \"done\"";
 
-        let line = user_message_line(text);
+        let line = user_message_line(text, &[]);
 
         assert!(line.ends_with('\n'), "a turn is terminated: {line:?}");
         let body = line.strip_suffix('\n').unwrap();
@@ -2523,6 +2578,7 @@ mod tests {
             session_id: Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
             fork_session: false,
             include_partial_messages: false,
+            images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
             ambient_mcp: false,
@@ -2546,6 +2602,7 @@ mod tests {
             session_id: None,
             fork_session: false,
             include_partial_messages: false,
+            images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
             ambient_mcp: false,
@@ -2772,6 +2829,57 @@ mod tests {
         let did = live_from_stream(&stream).did;
 
         assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
+    }
+
+    /// A turn carrying a picture is a content ARRAY, which is the API's own shape for one.
+    ///
+    /// Asked of the CLI before this existed, because nothing here could answer it: a `user` line
+    /// whose content is an array with an `image` block in it is accepted by
+    /// `--input-format stream-json`, and the model SEES it — sent a solid magenta square and asked
+    /// what colour it was, it answered "Magenta", which is not a thing anybody guesses.
+    ///
+    /// The image comes FIRST and the words after. That is the order the API documents for a
+    /// question about a picture, and the order a person types in: the screenshot, then what they
+    /// want to know about it.
+    #[test]
+    fn a_turn_carrying_a_picture_is_written_as_a_content_array() {
+        let line = user_message_line(
+            "what colour is this?",
+            &[Attachment {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        );
+
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let content = value
+            .pointer("/message/content")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "aGVsbG8=");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "what colour is this?");
+    }
+
+    /// A turn carrying nothing keeps the plain string it has always been.
+    ///
+    /// Not tidiness: the string form is the one measured working against the CLI, and every run in
+    /// this daemon that is not a chat uses it. Rewriting them all as arrays to make one new case
+    /// uniform would be changing what is proven to make room for what is not.
+    #[test]
+    fn a_turn_carrying_nothing_is_written_as_the_plain_string_it_has_always_been() {
+        let line = user_message_line("arranja o parser", &[]);
+
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            value.pointer("/message/content").unwrap(),
+            "arranja o parser"
+        );
     }
 
     /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.
