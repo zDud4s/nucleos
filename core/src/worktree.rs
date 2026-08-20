@@ -71,6 +71,14 @@ pub(crate) fn git() -> tokio::process::Command {
 pub enum Owner {
     Run(i64),
     Job(i64),
+    /// One item of a job, working in a tree of its own rather than in the job's.
+    ///
+    /// Keyed on `job_items.id` and never on the run — `spawn_node` rewrites `job_items.run_id` on
+    /// every start, so a tree named after a run is renamed by the first retry and the retry then
+    /// cannot find the tree it was meant to continue in. The item's id is written once and is the
+    /// same name for the life of the item, which is what lets a retry, a resolution and a resume
+    /// all arrive back at the same checkout.
+    Item(i64),
 }
 
 impl Owner {
@@ -78,12 +86,13 @@ impl Owner {
         match self {
             Owner::Run(_) => "run",
             Owner::Job(_) => "job",
+            Owner::Item(_) => "item",
         }
     }
 
     pub fn id(self) -> i64 {
         match self {
-            Owner::Run(id) | Owner::Job(id) => id,
+            Owner::Run(id) | Owner::Job(id) | Owner::Item(id) => id,
         }
     }
 
@@ -103,7 +112,7 @@ impl Owner {
     pub fn feed_run_id(self) -> Option<i64> {
         match self {
             Owner::Run(id) => Some(id),
-            Owner::Job(_) => None,
+            Owner::Job(_) | Owner::Item(_) => None,
         }
     }
 
@@ -972,6 +981,7 @@ impl WorktreeRow {
         match self.owner_kind.as_str() {
             "run" => Some(Owner::Run(self.owner_id)),
             "job" => Some(Owner::Job(self.owner_id)),
+            "item" => Some(Owner::Item(self.owner_id)),
             _ => None,
         }
     }
@@ -1343,6 +1353,11 @@ fn owner_from_dir_name(name: &str) -> Option<Owner> {
     if let Some(rest) = name.strip_prefix("job-") {
         return rest.parse::<i64>().ok().map(Owner::Job);
     }
+    // Without this arm an item's checkout — the biggest directory this daemon creates, since it
+    // carries a `target/` of its own — is invisible to the orphan sweep for ever.
+    if let Some(rest) = name.strip_prefix("item-") {
+        return rest.parse::<i64>().ok().map(Owner::Item);
+    }
     None
 }
 
@@ -1538,6 +1553,71 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
+
+    /// Every owner kind, for the tests that have to say something about all of them.
+    const EVERY_OWNER: [Owner; 3] = [Owner::Run(7), Owner::Job(7), Owner::Item(7)];
+
+    /// The names on disk, spelled out rather than derived.
+    ///
+    /// Derived, this test would pass on any renaming scheme including one that broke every checkout
+    /// already on disk. `run-`/`job-` are byte-identical to what they always were — a directory
+    /// that stopped being recognisable would be uncollectable for ever — and `item-7` is the new
+    /// one. The same id in all three is on purpose: the three sequences are independent, so a
+    /// scheme that dropped the kind would collide silently.
+    #[test]
+    fn each_owner_kind_names_its_own_directory_and_branch() {
+        assert_eq!(Owner::Run(7).dir_name(), "run-7");
+        assert_eq!(Owner::Job(7).dir_name(), "job-7");
+        assert_eq!(Owner::Item(7).dir_name(), "item-7");
+        assert_eq!(Owner::Item(7).branch_name(), "nucleos/item-7");
+    }
+
+    /// The round trip through the directory name, for every kind.
+    ///
+    /// `owner_from_dir_name` is what the orphan sweep sees a directory WITH: a kind missing from it
+    /// is a checkout the sweep walks past for ever, and an item's checkout is the largest thing
+    /// this daemon creates because it carries a `target/` of its own.
+    #[test]
+    fn every_owner_survives_the_round_trip_through_its_directory_name() {
+        for owner in EVERY_OWNER {
+            assert_eq!(
+                owner_from_dir_name(&owner.dir_name()),
+                Some(owner),
+                "{owner:?} does not come back from its own directory name"
+            );
+        }
+        assert_eq!(owner_from_dir_name("something-else"), None);
+    }
+
+    /// And the round trip through the two stored columns, which is the other direction the same
+    /// fact travels — a row the database accepts but `WorktreeRow::owner` answers `None` for is a
+    /// checkout nothing will ever touch again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_owner_survives_the_round_trip_through_its_row() {
+        let pool = test_pool().await;
+        for owner in EVERY_OWNER {
+            record(
+                &pool,
+                owner,
+                "proj",
+                "/repo",
+                &format!("/trees/{}", owner.dir_name()),
+                &owner.branch_name(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows: Vec<WorktreeRow> = sqlx::query_as("SELECT * FROM worktrees")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+        let mut found: Vec<Owner> = rows.iter().filter_map(|row| row.owner()).collect();
+        found.sort_by_key(|owner| owner.kind());
+        assert_eq!(found, vec![Owner::Item(7), Owner::Job(7), Owner::Run(7)]);
+    }
 
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()

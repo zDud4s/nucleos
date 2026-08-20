@@ -2400,7 +2400,7 @@ async fn footing_for(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<
 /// `hooks.rs` knows a `run_id` and nothing else — it is answering a tool call, not walking a queue —
 /// so it cannot supply the ordinal [`footing_for`] wants. This resolves it, and deliberately reuses
 /// the same query rather than growing a second answer to "what does this item fall back to".
-pub async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Option<String> {
+async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Option<String> {
     let ordinal: i64 =
         sqlx::query_scalar("SELECT ordinal FROM job_items WHERE job_id = ? AND run_id = ?")
             .bind(job_id)
@@ -2415,12 +2415,63 @@ pub async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Opt
 }
 
 /// The job's worktree path, for callers outside this module that hold no `JobRow`.
-pub async fn job_worktree_path(pool: &SqlitePool, job_id: i64) -> Option<PathBuf> {
+async fn job_worktree_path(pool: &SqlitePool, job_id: i64) -> Option<PathBuf> {
     job_worktree(pool, job_id)
         .await
         .ok()
         .flatten()
         .map(|(path, _)| path)
+}
+
+/// Where a node's half-written edits are, and what to put that tree back to.
+///
+/// **One question and one answer, because the two halves have to agree.** They used to be asked
+/// separately — `job_worktree_path` for the tree, `footing_for_run` for the sha — and separately is
+/// how they came to disagree: the first always answered with the JOB's checkout, and a node working
+/// in a tree of its own would have had that tree reverted to a checkpoint it never wrote, while its
+/// own edits stayed exactly where they were. Reverting the wrong tree is worse than reverting none.
+///
+/// For a node with an item of its own the answer is that item's checkout and the commit it was born
+/// on — `worktrees.base_sha`, which migration 0062 defines as *"where the worktree branched from"*,
+/// and where an item that never got started belongs. `None` if that base was never recorded, and
+/// **deliberately not a fallback to the job's tree**: a missing base is a tree this cannot put
+/// right, which the caller reports and leaves alone.
+pub async fn revert_target(
+    pool: &SqlitePool,
+    job_id: i64,
+    run_id: i64,
+) -> Option<(PathBuf, String)> {
+    // `Option<i64>` is named as the scalar type rather than left to inference, and it is not
+    // style. Inferred as `i64`, a NULL `item_id` does not come back as `None` — it comes back as a
+    // run that claims to be working on item 0, and this then answers `None` because no worktree
+    // belongs to that item. Every node that exists before this column did has a NULL here, so the
+    // wrong spelling turns "revert the item's tree" into "revert nothing" for all of them.
+    let item_id: Option<i64> =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT item_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+
+    if let Some(item_id) = item_id {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT path, base_sha FROM worktrees
+             WHERE owner_kind = 'item' AND owner_id = ? AND removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        let (path, base_sha) = row?;
+        return Some((PathBuf::from(path), base_sha?));
+    }
+
+    let path = job_worktree_path(pool, job_id).await?;
+    let sha = footing_for_run(pool, job_id, run_id).await?;
+    Some((path, sha))
 }
 
 /// How much of a red gate's output is kept for the node that has to answer it.
@@ -4481,6 +4532,113 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    /// Undoing a skipped node happens in the tree that node wrote in, and nowhere else.
+    ///
+    /// Three cases, and the third is the one worth the test. A node with an item of its own is put
+    /// back to where ITS tree began; a node without one keeps the answer it always had; and a node
+    /// whose item tree has no recorded base gets `None` — **never** the job's tree as a fallback.
+    /// That last arm is the whole reason these two questions were joined into one: reverting a
+    /// checkout to a footing taken from a different checkout is worse than reverting nothing, and
+    /// it is exactly what two separately-resolved answers produced.
+    #[tokio::test]
+    async fn a_skipped_node_is_undone_in_the_tree_it_wrote_in() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["running", "running"]).await;
+        let items: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        // The job's own tree and a checkpoint to fall back to, which is what a node without an item
+        // of its own is answered with.
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Job(job_id),
+            "project-a",
+            "/repo",
+            "/trees/job",
+            "nucleos/job",
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET head_sha = 'head0' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Item 0 has a tree with a base; item 1 has a tree that was never measured.
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Item(items[0]),
+            "project-a",
+            "/repo",
+            "/trees/item-a",
+            "nucleos/item-a",
+            Some("base0"),
+        )
+        .await
+        .unwrap();
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Item(items[1]),
+            "project-a",
+            "/repo",
+            "/trees/item-b",
+            "nucleos/item-b",
+            None,
+        )
+        .await
+        .unwrap();
+
+        async fn run(pool: &sqlx::SqlitePool, job_id: i64, item: Option<i64>) -> i64 {
+            sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, item_id)
+                 VALUES ('project-a', 'x', 'running', 'worktree', '2026-01-01T00:00:00Z', ?, ?)",
+            )
+            .bind(job_id)
+            .bind(item)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+        }
+
+        let with_base = run(&pool, job_id, Some(items[0])).await;
+        assert_eq!(
+            revert_target(&pool, job_id, with_base).await,
+            Some((PathBuf::from("/trees/item-a"), "base0".to_owned())),
+            "an item is put back to where its own tree began"
+        );
+
+        // Today's link between a node and its item is `job_items.run_id`, and it is what
+        // `footing_for_run` walks. The run below carries no `item_id` precisely because that is
+        // every node that exists before this slice.
+        let no_item = run(&pool, job_id, None).await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE id = ?")
+            .bind(no_item)
+            .bind(items[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            revert_target(&pool, job_id, no_item).await,
+            Some((PathBuf::from("/trees/job"), "head0".to_owned())),
+            "a node without an item keeps the answer it always had"
+        );
+
+        let unmeasured = run(&pool, job_id, Some(items[1])).await;
+        assert_eq!(
+            revert_target(&pool, job_id, unmeasured).await,
+            None,
+            "an unmeasured item tree answers nothing — reverting the job's would be worse"
+        );
     }
 
     #[tokio::test]

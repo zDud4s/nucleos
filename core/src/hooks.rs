@@ -1378,17 +1378,17 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
     // to that footing would discard the checkpoint of the job's final item — the very work the
     // review was there to read. A node that changes nothing by design has nothing to put back.
     if had_an_item {
-        let footing = crate::job::footing_for_run(&state.pool, job_id, run_id).await;
-        match (
-            crate::job::job_worktree_path(&state.pool, job_id).await,
-            footing,
-        ) {
-            (Some(worktree), Some(sha)) => {
+        // One call and not two. The tree and the sha are a pair — reverting a checkout to a footing
+        // taken from a different one is worse than reverting nothing — and asking for them together
+        // is what keeps them from being resolved off different keys, which is how a node working in
+        // its item's own tree came to have the job's reverted instead.
+        match crate::job::revert_target(&state.pool, job_id, run_id).await {
+            Some((worktree, sha)) => {
                 if let Err(error) = crate::worktree::revert_to(&worktree, &sha).await {
                     tracing::warn!(run_id, job_id, %error, "pretooluse-decision: could not revert a skipped item");
                 }
             }
-            _ => tracing::warn!(
+            None => tracing::warn!(
                 run_id,
                 job_id,
                 "pretooluse-decision: no worktree or no footing to revert a skipped item to"

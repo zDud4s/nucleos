@@ -859,16 +859,21 @@ async fn prepare_handoff_successor(
     }
 
     let session_id = crate::auth::generate_uuid_v4();
-    // `job_id` and `stage` are carried across with everything else. A node that runs out of context
-    // is still that node — same item, same tree — and a successor belonging to no job would be
-    // invisible to the chain that has to finalise it: the item would stay `running` until the
-    // four-hour ceiling, with the work already done and nothing saying where it went.
+    // `job_id`, `stage` and `item_id` are carried across with everything else. A node that runs out
+    // of context is still that node — same item, same tree — and a successor belonging to no job
+    // would be invisible to the chain that has to finalise it: the item would stay `running` until
+    // the four-hour ceiling, with the work already done and nothing saying where it went.
+    //
+    // `item_id` is the same fact one level down, and the column list here is explicit, so leaving
+    // it out is not a no-op: the successor of a node working in its item's own tree would arrive
+    // with no item, resolve to the job's tree instead, and relaunch the agent somewhere its work
+    // is not.
     let inserted = sqlx::query(
         "INSERT INTO runs (
              project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at,
-             job_id, stage
+             job_id, stage, item_id
          )
-         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage
+         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage, item_id
          FROM runs WHERE id = ?",
     )
     .bind(HANDOFF_CONTINUATION_PROMPT)
@@ -2162,15 +2167,19 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // this node started. Looking it up by run would answer "no live worktree" for every paused job
     // node, so approving one returned `NotResumable` and the shell offered a button that could not
     // work. Which owner to ask for is decided by the paused run's own `job_id`.
-    let (job_id, stage): (Option<i64>, Option<String>) =
-        sqlx::query_as("SELECT job_id, stage FROM runs WHERE id = ?")
+    let (job_id, stage, item_id): (Option<i64>, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT job_id, stage, item_id FROM runs WHERE id = ?")
             .bind(original_run_id)
             .fetch_optional(&state.pool)
             .await?
-            .unwrap_or((None, None));
-    let owner = match job_id {
-        Some(job_id) => crate::worktree::Owner::Job(job_id),
-        None => crate::worktree::Owner::Run(original_run_id),
+            .unwrap_or((None, None, None));
+    // Item before job, and both are set at once — a node of an item IS a node of its job. The
+    // innermost tree wins, because it is the one the work is in: answering with the job's would
+    // resume the agent in the integration checkout with its edits somewhere else entirely.
+    let owner = match (item_id, job_id) {
+        (Some(item_id), _) => crate::worktree::Owner::Item(item_id),
+        (None, Some(job_id)) => crate::worktree::Owner::Job(job_id),
+        (None, None) => crate::worktree::Owner::Run(original_run_id),
     };
 
     let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
@@ -2279,10 +2288,14 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // The resume carries the node's identity forward. Without it the new run belongs to no job, so
     // the chain that has to finalise it cannot see it: the item stays `running` forever and the job
     // sits there until the four-hour ceiling retires it, with the approved work already done.
+    // `item_id` travels with the rest of that identity, and it is the second approval that proves
+    // it does: left out, the FIRST resume still lands in the right tree — it was resolved from the
+    // predecessor's own row — while the successor it writes carries no item, so approving that one
+    // resolves to the job's tree instead. One approval looks correct; two do not.
     let result = sqlx::query(
         "INSERT INTO runs
-           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage)
-         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?)",
+           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage, item_id)
+         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?)",
     )
     .bind(&wt_project_id)
     .bind(&wt_path)
@@ -2291,6 +2304,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     .bind(&now)
     .bind(job_id)
     .bind(stage.as_deref())
+    .bind(item_id)
     .execute(&mut *tx)
     .await?;
     let resume_id = result.last_insert_rowid();
@@ -3979,6 +3993,164 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         .unwrap();
 
         (proposal_id, branch, container)
+    }
+
+    /// **An item's tree survives two approvals in a row, and is found again both times.**
+    ///
+    /// Two and not one, because of WHERE the defect lives. With `item_id` left out of the successor
+    /// INSERT the first resume still lands in the right checkout — the owner is resolved from the
+    /// predecessor's row, which has the item — and what goes wrong is only what that resume WRITES:
+    /// a run with no item, whose own approval would then resolve to the job's integration tree and
+    /// relaunch the agent with its work in a checkout nobody is looking at. So the loop asserts the
+    /// stored column and not only the directory, and it runs twice: the column is what carries the
+    /// answer forward, and the second turn is what a run of one would never reach.
+    ///
+    /// Confirmed by removing the column from that INSERT: the loop fails on the first turn, on the
+    /// column, which is the earliest point at which the mistake is visible at all.
+    ///
+    /// The row in `worktrees` is checked at the end for the other half of the same decision: the
+    /// two hand-over statements filter on `owner_kind = 'run'`, so an item's tree does not move
+    /// with the run. That is what a key of `job_items.id` buys, and a "fix" to those filters would
+    /// hand the tree to whichever run finished last and let the GC take it out from under the item.
+    #[tokio::test]
+    async fn an_items_tree_survives_two_approvals_in_a_row() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-item-approve-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let root = root.to_string_lossy().replace('\\', "/");
+        let branch = crate::git_exec::current_branch(
+            std::path::Path::new(&root),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .expect("the seeded repository has a branch");
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', 'off', ?)
+             ON CONFLICT(project_id) DO UPDATE SET project_root = excluded.project_root",
+        )
+        .bind(&root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &root,
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let item_id = sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status)
+             VALUES (?, 0, 'the item', 'running')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        // The item's own checkout. Standing it at the repository root is enough here: what the
+        // approval reads is the branch of the directory the row names.
+        sqlx::query(
+            "INSERT INTO worktrees
+             (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('item', ?, 'proj', ?, ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(&root)
+        .bind(&root)
+        .bind(&branch)
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let mut paused = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at,
+                               job_id, stage, item_id)
+             VALUES ('proj', ?, 'x', 'awaiting_approval', 'sess-1', 'worktree', ?, ?,
+                     'implement', ?)",
+        )
+        .bind(&root)
+        .bind(&created_at)
+        .bind(job_id)
+        .bind(item_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        for approval in 1..=2 {
+            let proposal_id = proposals::create_action_approval(
+                &state.pool,
+                paused,
+                Some("sess-1"),
+                Some("proj"),
+                "Bash",
+                "needs approval",
+                Some(&serde_json::json!({ "command": "cargo test" }).to_string()),
+            )
+            .await
+            .unwrap();
+
+            let resumed = resume_approved_run(&state, proposal_id)
+                .await
+                .unwrap_or_else(|error| panic!("approval {approval} was refused: {error:?}"));
+
+            let (carried, cwd): (Option<i64>, String) =
+                sqlx::query_as("SELECT item_id, cwd FROM runs WHERE id = ?")
+                    .bind(resumed)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                carried,
+                Some(item_id),
+                "approval {approval} produced a run that had forgotten its item"
+            );
+            assert_eq!(
+                cwd, root,
+                "approval {approval} resumed the agent somewhere other than the item's tree"
+            );
+
+            // Pause the successor, so the next turn of the loop approves that one.
+            sqlx::query("UPDATE runs SET status = 'awaiting_approval' WHERE id = ?")
+                .bind(resumed)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            paused = resumed;
+        }
+
+        let (kind, owner_id): (String, i64) = sqlx::query_as(
+            "SELECT owner_kind, owner_id FROM worktrees WHERE path = ? AND removed_at IS NULL",
+        )
+        .bind(&root)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (kind.as_str(), owner_id),
+            ("item", item_id),
+            "the item's tree moved to a run — the identity a stable key exists to prevent"
+        );
     }
 
     async fn grants_for(state: &AppState, run_id: i64) -> i64 {
