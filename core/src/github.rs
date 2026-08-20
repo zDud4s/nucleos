@@ -1440,8 +1440,27 @@ async fn drain<R: tokio::io::AsyncRead + Unpin>(mut reader: R, into: Arc<Mutex<V
             Ok(0) | Err(_) => return,
             Ok(read) => {
                 let mut buffer = into.lock().expect("the buffer is not poisoned");
-                if buffer.len() < MAX_OUTPUT_BYTES + chunk.len() {
-                    buffer.extend_from_slice(&chunk[..read]);
+                buffer.extend_from_slice(&chunk[..read]);
+                // A sliding TAIL, because `clip` promises one and this is the half that has to
+                // deliver it.
+                //
+                // This used to STOP appending once the buffer reached the cap, which keeps the
+                // head. `clip` then kept the last `MAX_OUTPUT_BYTES` of the first
+                // `MAX_OUTPUT_BYTES` and stamped it with a marker announcing the tail — so the one
+                // case the cap exists for, a workflow log that failed, came back holding the setup
+                // lines with the errors thrown away, while saying the opposite in writing.
+                //
+                // Measured on a real red run before it was fixed: the `failures:` block cargo
+                // prints after every test is exactly what went missing, which is the only part
+                // anybody reads a failing log for.
+                //
+                // Trimmed in one step at twice the cap rather than on every chunk, because trimming
+                // per read would memmove a quarter of a megabyte for every 8 KiB that arrives. What
+                // is left is never smaller than `MAX_OUTPUT_BYTES + 1`, so `clip` still sees that
+                // something was cut and still says so.
+                if buffer.len() > MAX_OUTPUT_BYTES * 2 {
+                    let excess = buffer.len() - (MAX_OUTPUT_BYTES + 1);
+                    buffer.drain(..excess);
                 }
             }
         }
@@ -1788,6 +1807,49 @@ mod tests {
         .await;
 
         assert_eq!(refused, Err(Failure::MissingCli));
+    }
+
+    /// The cap keeps the END of a long stream, which is the half a failing log is read for.
+    ///
+    /// `drain` and not `spawn_gh`, because a stub that emits a quarter-megabyte of DISTINGUISHABLE
+    /// output is not something `echo` or `yes` can be asked for — `yes` repeats one line, and a
+    /// buffer of identical lines cannot tell a kept head from a kept tail. Numbered lines can.
+    ///
+    /// Written after the bug shipped and was found in use: a red CI run came back with its setup
+    /// lines and without its `failures:` block, under a marker claiming the opposite.
+    #[tokio::test]
+    async fn a_stream_past_the_cap_keeps_its_end_and_not_its_beginning() {
+        let mut source: Vec<u8> = Vec::new();
+        let mut n = 0_u64;
+        while source.len() < MAX_OUTPUT_BYTES * 3 {
+            source.extend_from_slice(format!("line {n}\n").as_bytes());
+            n += 1;
+        }
+        let ultima = format!("line {}\n", n - 1);
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        drain(&source[..], buffer.clone()).await;
+        let guardado = buffer.lock().expect("the buffer is not poisoned");
+
+        let texto = String::from_utf8_lossy(&guardado);
+        assert!(
+            texto.ends_with(&ultima),
+            "the end of the stream is missing; it ends with {:?}",
+            &texto[texto.len().saturating_sub(40)..]
+        );
+        assert!(
+            !texto.contains("line 0\n"),
+            "the beginning was kept instead of the end"
+        );
+        assert!(
+            guardado.len() > MAX_OUTPUT_BYTES,
+            "nothing was kept beyond the cap, so `clip` would not report a cut"
+        );
+        assert!(
+            guardado.len() <= MAX_OUTPUT_BYTES * 2,
+            "the sliding window did not bound memory: {} bytes",
+            guardado.len()
+        );
     }
 
     /// The override exists for the reason `NUCLEOS_CLAUDE_BIN` exists, and a default that drifted
