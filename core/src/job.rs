@@ -3352,6 +3352,48 @@ async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -> Step {
     };
     let branch = crate::worktree::Owner::Item(item_id).branch_name();
 
+    // **The item's work is committed HERE, and until this existed nothing committed it at all.**
+    //
+    // An implement node is told in as many words to leave its tree uncommitted: `implement_prompt`
+    // says "the job commits for you once the gate agrees", and for a job without a team that is
+    // exactly what happens — `record_gate`'s green arm checkpoints the one shared checkout. A team's
+    // item has a checkout of its own, and its gate runs AFTER the merge rather than before it, so
+    // the moment that used to commit comes too late. The branch stayed empty, the merge below
+    // brought nothing across, and every item passed a gate over a job branch that had never
+    // received its work. Nothing anywhere reported it, because an empty merge succeeds.
+    //
+    // Before the base is read and before anything is recorded, so a checkpoint that fails leaves no
+    // half-finished merge behind it.
+    //
+    // A checkpoint over a tree with nothing in it is a no-op that answers with HEAD — `checkpoint`
+    // commits only when `git status` has something to say — so an item whose node wrote nothing
+    // merges an empty branch, which is the truthful outcome rather than an error.
+    let item_tree: Option<String> = sqlx::query_scalar(
+        "SELECT path FROM worktrees
+         WHERE owner_kind = 'item' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(item_tree) = item_tree else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "no checkout on record for the item being merged"
+        );
+        return Step::Stopped;
+    };
+    if let Err(error) = crate::worktree::checkpoint(Path::new(&item_tree)).await {
+        // Fatal here, where the same failure is survivable in `record_gate`. There the work is
+        // already on the branch and what is lost is the next item's footing; here the work exists
+        // only in a working tree, and merging without it would put a green gate on a branch that is
+        // missing the thing it is measuring.
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not commit an item's work, so nothing was merged");
+        return Step::Stopped;
+    }
+
     let Ok(base) = crate::worktree::head_sha(&worktree).await else {
         tracing::warn!(
             job_id = job.id,
@@ -7917,8 +7959,13 @@ mod tests {
                 .await
                 .unwrap();
 
-        // Each item works in a checkout of its own, born where the job's branch stands, and commits
-        // one file there.
+        // Each item works in a checkout of its own, born where the job's branch stands, writes one
+        // file there — and LEAVES IT UNCOMMITTED, which is what an implement node is told to do
+        // and therefore what production actually produces.
+        //
+        // It used to commit by hand here, and that hand-commit is what hid the hole this test now
+        // covers: nothing in the daemon committed an item's work, so every merge brought across an
+        // empty branch and succeeded. The fixture was asserting a thing no code did.
         for (item_id, file) in [(items[0], "red.txt"), (items[1], "green.txt")] {
             let base = crate::worktree::head_sha(&job_tree.path).await.unwrap();
             let tree = crate::worktree::adopt_or_create_at(
@@ -7928,14 +7975,20 @@ mod tests {
             )
             .await
             .expect("the item's checkout");
-            std::fs::write(
-                tree.path.join(file),
-                "work
-",
+            // Recorded, as `create_run_with` records it in production: the merge finds the checkout
+            // to commit through this row, and an item whose tree is not on record has none.
+            crate::worktree::record(
+                &pool,
+                crate::worktree::Owner::Item(item_id),
+                "project-a",
+                &repo.to_string_lossy(),
+                &tree.path.to_string_lossy(),
+                &tree.branch,
+                tree.base_sha.as_deref(),
             )
-            .expect("write the item's work");
-            assert!(git_ok(&tree.path, &["add", "-A"]));
-            assert!(git_ok(&tree.path, &["commit", "-m", file]));
+            .await
+            .expect("record the item's checkout");
+            std::fs::write(tree.path.join(file), "work\n").expect("write the item's work");
         }
 
         // The green one lands first, and is kept.
