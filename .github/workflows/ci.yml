@@ -42,15 +42,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No toolchain is named here on purpose: `rust-toolchain.toml` pins the version and the GNU
-      # host, and `rustup toolchain install` with no argument installs exactly what that file names
-      # — components included, which is why no `rustup component add` follows it.
+      # The toolchain is READ out of rust-toolchain.toml and passed as an ARGUMENT, rather than
+      # left for rustup to take from the file itself. A bare `rustup toolchain install` is what this
+      # said until the second run answered it, and it fails here with:
       #
-      # NOT `rustup show`, which is what this said until the first run answered it: since rustup
-      # 1.28 `show` no longer installs a toolchain it cannot find, it fails. The runner ships the
-      # MSVC stable and nothing else, so the job died here in 1s, before a single gate ran.
+      #     error: target tuple in channel name '1.97.1-x86_64-pc-windows-gnu'
+      #
+      # rustup refuses to INSTALL from a toolchain file whose channel carries a target tuple, and
+      # this repo's channel carries one deliberately — the pin is to the GNU host, for the reason
+      # rust-toolchain.toml's own comment gives. The same name is accepted as an argument; only the
+      # file-reading path validates it. That asymmetry is why the failure cannot be seen on a
+      # developer's machine, where the toolchain is already installed and nothing ever installs it
+      # from the file. Not a version difference either: runner and workstation both run rustup
+      # 1.29.0, and the error reproduces on the workstation the moment the toolchain is absent.
+      #
+      # Read rather than retyped, so the version stays in one place — a second copy here is a pin
+      # that drifts in silence. The components ARE retyped, because the file's `components` apply
+      # only on the path this step no longer takes.
       - name: Install the pinned toolchain
-        run: rustup toolchain install
+        run: |
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
       # The workspace root is the repo root (`Cargo.toml` has `members = ["core"]`), which is this
       # action's default — `shell/src-tauri` is deliberately excluded from it and keeps its own
@@ -87,10 +99,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The pinned GNU toolchain from rust-toolchain.toml, installed before cargo-audit is compiled
-      # — same command and same reason as the core job, whose comment carries the detail.
+      # The pinned GNU toolchain, installed before cargo-audit is compiled — same command and same
+      # reason as the core job, whose comment carries the detail.
       - name: Install the pinned toolchain
-        run: rustup toolchain install
+        run: |
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -145,8 +159,10 @@ jobs:
         run: npm run build
 
       # Those three legs are cargo commands, governed by the repo-root rust-toolchain.toml like
-      # every other one. This job named no toolchain at all while they were not running.
+      # every other one. Same install as the core job, for the reason its comment gives.
       - name: Install the pinned toolchain
-        run: rustup toolchain install
+        run: |
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
       - run: bash scripts/gates.sh shell
