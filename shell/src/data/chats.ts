@@ -319,6 +319,13 @@ export function useIdeSessions(enabled: boolean) {
     queryKey: keys.chats.ideSessions,
     queryFn: () => apiFetch<IdeSession[]>("/assistant/ide-sessions"),
     enabled,
+    // The daemon re-reads the CLI's own store on every request, deliberately uncached, because it
+    // changes whenever a session is typed into. That made the DATA live and left the window showing
+    // a photograph: whichever sessions existed at the moment the door was opened, forever.
+    //
+    // `POLL.fast` is the cadence for "the state of the machine right now", which is what a
+    // conversation somebody is in the middle of having is.
+    refetchInterval: POLL.fast,
   });
 }
 
@@ -331,12 +338,17 @@ export function useIdeSessions(enabled: boolean) {
  * not a queue — but the key does sit under `keys.chats.all`, so a mutation in this
  * conversation refetches it, which is the direction that stays right.
  */
-export function useIdeConversation(sessionId: string | null) {
+export function useIdeConversation(sessionId: string | null, watch = false) {
   return useQuery({
     queryKey: keys.chats.ideSession(sessionId ?? ""),
     queryFn: () =>
       apiFetch<Conversation>(`/assistant/ide-sessions/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null,
+    // Opt-in, because the two callers are asking different questions. The editor door is looking at
+    // a conversation that may be happening right now and wants to see it move; a conversation that
+    // was already picked up is showing where it CAME from, which is settled — polling that would be
+    // re-reading somebody's history every few seconds to watch it not change.
+    refetchInterval: watch ? POLL.fast : false,
   });
 }
 

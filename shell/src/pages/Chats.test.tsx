@@ -616,6 +616,50 @@ describe("the editor's sessions, and the door to them", () => {
     expect(await screen.findByRole("button", { name: /arranja o parser de datas/i })).toBeTruthy();
   });
 
+  // Half of watching is the mark; the other half is that the list keeps up. The daemon re-reads the
+  // CLI's store on every request precisely because it changes while somebody types, and a door that
+  // asked once turned that live data back into a photograph.
+  it("follows the editor's sessions instead of photographing them once", async () => {
+    const { queryClient } = await openTheEditorDoor([ideSession()]);
+    await screen.findByRole("button", { name: /arranja o parser de datas/i });
+
+    const query = queryClient
+      .getQueryCache()
+      .find({ queryKey: keys.chats.ideSessions, exact: true });
+    if (query === undefined) throw new Error("the editor's sessions were never asked for");
+    // See the note in the transcript's own cadence test: `refetchInterval` lives on the observer's
+    // options, which is not what `Query.options` is typed as.
+    const interval = (query.options as { refetchInterval?: number | false }).refetchInterval;
+
+    expect(interval).toBe(POLL.fast);
+  });
+
+  // The list already carried the fact and nothing read it: a conversation somebody is typing into
+  // this second was drawn exactly like one from last Tuesday, so the door answered "which of these
+  // is live?" with a wall of identical rows.
+  it("says which of them is happening right now", async () => {
+    const now = Date.now();
+    await openTheEditorDoor([
+      ideSession({
+        session_id: "live-1",
+        title: "a mexer nisto agora",
+        last_activity: new Date(now - 10_000).toISOString(),
+      }),
+      ideSession({
+        session_id: "old-1",
+        title: "isto foi na terca",
+        last_activity: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
+      }),
+    ]);
+
+    const live = await screen.findByRole("button", { name: /a mexer nisto agora/i });
+    expect(within(live).getByText(/happening now/i)).toBeTruthy();
+
+    // And the one nobody is in says nothing, because a mark on every row is a mark on none.
+    const old = await screen.findByRole("button", { name: /isto foi na terca/i });
+    expect(within(old).queryByText(/happening now/i)).toBeNull();
+  });
+
   it("shows a sample and not the whole conversation, which does not fit in a picker", async () => {
     // The picker is a 20rem column. Drawing two hundred messages into it made the panel taller than
     // the page and spilled the preview out from under its own border.

@@ -513,6 +513,20 @@
   overflow-wrap: anywhere;
 }
 
+/* A conversation somebody is in the middle of having, right now. Words and not a coloured dot: a
+   dot means whatever the reader guesses, and the whole point of this mark is to say a thing that
+   was previously unsayable from the list. */
+.chats-editor-live {
+  align-self: flex-start;
+  margin-top: 0.25rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft, rgba(120, 200, 140, 0.16));
+  color: var(--accent, #4c9a63);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+}
+
 .chats-editor-chosen {
   display: flex;
   flex-direction: column;

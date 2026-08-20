@@ -43,6 +43,7 @@ import { blocks, lines, type Line as RichLine } from "../lib/rich";
 import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
 import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
+import { stillGoing } from "../lib/editor";
 import {
   Badge,
   Button,
@@ -395,7 +396,9 @@ function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
 function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
   const sessions = useIdeSessions(true);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const said = useIdeConversation(sessionId);
+  // Watched, not merely read: this is the one panel where the conversation on screen may be being
+  // typed into while somebody looks at it.
+  const said = useIdeConversation(sessionId, true);
   const create = useCreateChat();
   const chosen = (sessions.data ?? []).find((session) => session.session_id === sessionId);
 
@@ -432,6 +435,11 @@ function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
               >
                 <span className="chats-editor-title">{session.title ?? session.session_id}</span>
                 <span className="chats-editor-where">{session.cwd}</span>
+                {/* Inside the button, so the mark is part of the row's own name and a screen reader
+                    hears "happening now" along with the title rather than after a silence. */}
+                {stillGoing(session.last_activity, Date.now()) && (
+                  <span className="chats-editor-live">happening now</span>
+                )}
               </button>
             </li>
           ))}
