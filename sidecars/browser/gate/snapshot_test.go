@@ -189,13 +189,29 @@ func TestAPageFetchesItsOwnContentThroughTheFence(t *testing.T) {
 	}
 }
 
-// TestAPageCannotHaveTheFenceFetchFromAnotherHost.
+// TestAnotherNameForTheSameServerIsAnotherOrigin.
 //
-// The rule that makes the ferry a service and not a hole. Same-origin only: it opens no host the
-// page could not already reach, and the answer comes from a server the page already IS. The origin
-// is taken from the execution context Chromium reports, never from the page, because a restriction
-// the restricted thing describes is not one.
-func TestAPageCannotHaveTheFenceFetchFromAnotherHost(t *testing.T) {
+// # What this test used to say, and why it says something else now
+//
+// It asserted that the ferry carried nothing off the page's own origin, full stop — that not even
+// the REQUEST was made. That rule was replaced on purpose: same-origin-only left every page whose
+// data lives on a neighbouring host reading as blank, which is a large part of the modern web, and
+// the fence reported nothing an agent could act on. What replaced it is the browser's own rule (see
+// chrome/ferry.go and gate/cors_test.go): the profile must admit the other host, and the SERVER
+// must opt in before the answer is handed to the page.
+//
+// The egress that changes hands here is none. `fence.Decide` applies the allowlist only to
+// documents, so a sub-resource — an `<img src>` — already reaches any host at all; a ferried GET,
+// restricted to hosts the profile admits, is strictly narrower than what the page could already do.
+// What the CORS check governs is the half that was never open: READING the answer.
+//
+// # What it still uniquely says
+//
+// That the rule is applied by ORIGIN and not by "is this the same server". This is the same
+// httptest server under a name Chromium treats as a different site, and one the profile admits — so
+// nothing here is refused by the allowlist, and the request is made. `/content` says nothing about
+// who may read it, so the page does not get it, and the reading says so.
+func TestAnotherNameForTheSameServerIsAnotherOrigin(t *testing.T) {
 	site := newSite(t)
 	policy := admitting(site)
 	policy.Loopback = append(policy.Loopback, otherHost(site))
@@ -203,8 +219,6 @@ func TestAPageCannotHaveTheFenceFetchFromAnotherHost(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// The same server under a name Chromium calls a different site, and one this profile even
-	// admits — so what refuses this is the ferry's own rule and not the allowlist.
 	elsewhere := otherHost(site) + "/content"
 	session, err := driver.Open(ctx, browser.OpenRequest{
 		URL: site.origin() + "/spa?src=" + url.QueryEscape(elsewhere),
@@ -213,13 +227,16 @@ func TestAPageCannotHaveTheFenceFetchFromAnotherHost(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
-	if site.reached("GET /content", 5*time.Second) {
-		t.Fatal("the fence carried a request to another host")
+	if !site.reached("GET /content", 5*time.Second) {
+		t.Fatal("the request was never made, so nothing here is about the cross-origin rule")
 	}
 
 	last, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
+	}
+	if hasName(last, "Revenue fell") {
+		t.Fatal("a host that said nothing about who may read it was read by another origin")
 	}
 	if last.Blocked == nil {
 		t.Fatal("the page could not get its content and the reading did not say so")
