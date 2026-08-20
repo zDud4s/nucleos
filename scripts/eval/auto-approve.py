@@ -34,7 +34,18 @@ DEFAULT_DAEMON_URL = "http://127.0.0.1:8791"
 
 
 def control_token(root: str) -> str:
-    """The daemon's token, read the way every other local tool reads it."""
+    """The daemon's token, read the way every other local tool reads it.
+
+    The environment comes first, exactly as `.claude/hooks/ask_daemon.py` reads it: a caller
+    already holding a token should not need a built binary for permission to hand it over.
+    Without that door this needs `target/` to exist, which describes a developer's tree and not
+    a checkout — so the gate around it passed here and failed in CI, where the hooks job
+    installs Python and builds nothing.
+    """
+    from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
+    if from_env:
+        return from_env
+
     for profile in ("debug", "release"):
         binary = os.path.join(root, "target", profile, "nucleos-core.exe")
         if not os.path.exists(binary):

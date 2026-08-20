@@ -82,12 +82,23 @@ def main() -> int:
          "--run", "111", "--daemon-url", f"http://127.0.0.1:{port}",
          "--until-idle", "1", "--interval", "0.1", "--log", log],
         capture_output=True, text=True, cwd=ROOT,
+        # The stub never looks at the Authorization header, but the approver reads a token before
+        # it does anything at all, and reads it out of a built daemon. Handing it one here is what
+        # keeps this test hermetic — see control_token in auto-approve.py.
+        env={**os.environ, "NUCLEOS_DAEMON_TOKEN": "stub"},
     )
     server.shutdown()
 
     print(result.stdout.strip())
     if result.stderr.strip():
         print("STDERR:", result.stderr.strip()[:400])
+
+    # Said here rather than left to `open(log)`: when the approver exits before writing a line,
+    # the traceback names this file and a missing temp path, which describes neither the failure
+    # nor the place to look for it.
+    if not os.path.exists(log):
+        print(f"FAIL the approver wrote no log (exit {result.returncode}); nothing to check")
+        return 1
 
     records = [json.loads(line) for line in open(log, encoding="utf-8")]
     failures = 0

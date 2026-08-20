@@ -42,14 +42,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No toolchain is named here on purpose: `rust-toolchain.toml` pins
-      # stable-x86_64-pc-windows-gnu, and `rustup show` is what installs it from that file rather
-      # than assuming a later command will. The components are then added explicitly, because the
-      # pin does not list them and a default-profile install is a convention, not a guarantee.
+      # No toolchain is named here on purpose: `rust-toolchain.toml` pins the version and the GNU
+      # host, and `rustup toolchain install` with no argument installs exactly what that file names
+      # — components included, which is why no `rustup component add` follows it.
+      #
+      # NOT `rustup show`, which is what this said until the first run answered it: since rustup
+      # 1.28 `show` no longer installs a toolchain it cannot find, it fails. The runner ships the
+      # MSVC stable and nothing else, so the job died here in 1s, before a single gate ran.
       - name: Install the pinned toolchain
-        run: |
-          rustup show
-          rustup component add clippy rustfmt
+        run: rustup toolchain install
 
       # The workspace root is the repo root (`Cargo.toml` has `members = ["core"]`), which is this
       # action's default — `shell/src-tauri` is deliberately excluded from it and keeps its own
@@ -86,10 +87,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      # `rustup show` installs the pinned GNU toolchain from rust-toolchain.toml before cargo-audit
-      # is compiled, just as the core job does for its Rust commands.
+      # The pinned GNU toolchain from rust-toolchain.toml, installed before cargo-audit is compiled
+      # — same command and same reason as the core job, whose comment carries the detail.
       - name: Install the pinned toolchain
-        run: rustup show
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
@@ -135,5 +136,17 @@ jobs:
       - name: Install shell dependencies
         working-directory: shell
         run: npm ci
+
+      # `tauri::generate_context!()` embeds shell/dist at COMPILE time, and dist is gitignored — no
+      # checkout ever carries one. `gates.sh shell` refuses its three src-tauri legs without it, so
+      # until this step existed the job reported "frontend not built" and never reached them.
+      - name: Build the frontend
+        working-directory: shell
+        run: npm run build
+
+      # Those three legs are cargo commands, governed by the repo-root rust-toolchain.toml like
+      # every other one. This job named no toolchain at all while they were not running.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
       - run: bash scripts/gates.sh shell
