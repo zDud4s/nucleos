@@ -327,12 +327,15 @@ impl BrowserClient {
     /// Read the page. `changes_only` asks for what moved since the previous snapshot of this
     /// session rather than the whole page — the same reading, filtered. `text_from` resumes prose
     /// where a truncated snapshot stopped, which is what keeps truncation from being a dead end.
+    /// `find` keeps only the lines that say it, which is the difference between reading a
+    /// two-thousand-link directory and reading the one link that was wanted.
     pub async fn snapshot(
         &self,
         session_id: &str,
         changes_only: bool,
         text_from: i64,
         controls_from: i64,
+        find: &str,
     ) -> Result<Snapshot, BrowserError> {
         self.call(
             "/snapshot",
@@ -341,6 +344,7 @@ impl BrowserClient {
                 "changes_only": changes_only,
                 "text_from": text_from,
                 "controls_from": controls_from,
+                "find": find,
             }),
         )
         .await
@@ -783,7 +787,10 @@ mod tests {
         assert_eq!(session.final_url, "https://jira.example.org/browse");
         assert!(session.refusal.is_none());
 
-        let snapshot = client.snapshot("s1", false, 0, 0).await.expect("snapshot");
+        let snapshot = client
+            .snapshot("s1", false, 0, 300, "invoices")
+            .await
+            .expect("snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
 
         let result = client.act("s1", "click", "e5", "").await.expect("act");
@@ -814,6 +821,12 @@ mod tests {
         }
         assert_eq!(calls[0]["body"]["placement"]["profile"]["kind"], "project");
         assert_eq!(calls[0]["body"]["placement"]["profile"]["id"], "acme");
+        // Every cursor a snapshot can carry, asserted by name. This is the one thing a round trip
+        // through serde cannot catch on its own: a field the far side has no home for marshals
+        // perfectly and arrives nowhere, which is how `controls_from` was sent, dropped, and
+        // answered with the first page of controls for two days without anything reporting a fault.
+        assert_eq!(calls[1]["body"]["controls_from"], 300);
+        assert_eq!(calls[1]["body"]["find"], "invoices");
         assert_eq!(calls[2]["body"]["ref"], "e5");
         assert_eq!(calls[5]["body"]["session_id"], "s1");
     }

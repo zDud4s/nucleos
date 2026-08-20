@@ -1,5 +1,5 @@
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Serialize;
 
 pub struct NucleosTools {
@@ -135,6 +135,12 @@ struct BrowserSnapshotParams {
     /// one and not the other.
     #[serde(default)]
     controls_from: Option<i64>,
+    /// Keep only the lines that say this, matched without regard to case against a control's role,
+    /// name and value and against a paragraph's or a row's text. Use it instead of reading a long
+    /// page you only need one thing from: a directory of two thousand links costs a whole turn to
+    /// page through and nothing to search. The answer comes back marked `partial`, because a search
+    /// that found two things is not a page with two things on it.
+    find: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -509,7 +515,9 @@ impl NucleosTools {
                        budget, not that you reached the bottom of a window - scrolling will not \
                        reach the rest; pass the `text_next` you were given back as \
                        `text_from`. A page can also run out of CONTROLS, separately, and \
-                       then hands you a `controls_next` for `controls_from`. A table comes \
+                       then hands you a `controls_next` for `controls_from`. To find one \
+                       thing on a long page, do not page through it: pass `find` and get \
+                       back only the lines that say it, marked `partial`. A table comes \
                        back as `row` entries, cells separated by a vertical bar, headers \
                        first, and a link inside a cell still has its own ref. If `blocked` \
                        is there, the page tried to fetch its own content and the fence \
@@ -526,6 +534,7 @@ impl NucleosTools {
             changes_only,
             text_from,
             controls_from,
+            find,
         }): Parameters<BrowserSnapshotParams>,
     ) -> String {
         json_result(
@@ -535,6 +544,7 @@ impl NucleosTools {
                     changes_only.unwrap_or(false),
                     text_from.unwrap_or(0),
                     controls_from.unwrap_or(0),
+                    find.as_deref().unwrap_or(""),
                 )
                 .await,
         )

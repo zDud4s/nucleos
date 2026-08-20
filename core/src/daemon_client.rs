@@ -396,6 +396,7 @@ impl DaemonClient {
         changes_only: bool,
         text_from: i64,
         controls_from: i64,
+        find: &str,
     ) -> Result<Value, String> {
         self.request(reqwest::Method::POST, "/browser/snapshot")
             .json(&serde_json::json!({
@@ -403,6 +404,7 @@ impl DaemonClient {
                 "changes_only": changes_only,
                 "text_from": text_from,
                 "controls_from": controls_from,
+                "find": find,
             }))
             .send()
             .await

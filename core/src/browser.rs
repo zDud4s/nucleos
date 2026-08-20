@@ -782,6 +782,11 @@ pub struct SessionBody {
     /// The same, for the actionable elements, which are bounded apart from the prose.
     #[serde(default)]
     pub controls_from: i64,
+    /// Keep only what says this. Also snapshot-only, and the one field here that changes what is
+    /// READ rather than how much of it: a search answers a question about a page without the page
+    /// being carried to answer it.
+    #[serde(default)]
+    pub find: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -844,6 +849,7 @@ pub async fn post_snapshot(
             body.changes_only,
             body.text_from,
             body.controls_from,
+            &body.find,
         )
         .await
     {
