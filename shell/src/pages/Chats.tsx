@@ -655,6 +655,12 @@ function Project({ chatId }: { chatId: string }) {
  * A state on the conversation rather than a choice per message: somebody says "plan this", reads
  * it, then says "go". Making it per-message would turn one decision into a thing to remember every
  * time.
+ *
+ * **It is not "changes nothing", and this said so until it was measured.** A planning turn still
+ * reaches for tools — `Glob`, `Read`, and a `Write` that RAN, which the daemon's gate saw and the
+ * transcript recorded. What it wrote was its own plan, as a document in the working directory;
+ * what it did not do was the work. The label says that now, because a control promising more than
+ * the mode delivers is worse than no control.
  */
 function Planning({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
@@ -662,7 +668,10 @@ function Planning({ chatId }: { chatId: string }) {
   const planning = project.data?.planning ?? false;
 
   return (
-    <label className="chats-planning" title="answer with a plan, and change nothing">
+    <label
+      className="chats-planning"
+      title="answer with a plan instead of doing the work — it may still write the plan down"
+    >
       <input
         type="checkbox"
         checked={planning}
