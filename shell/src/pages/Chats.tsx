@@ -1085,30 +1085,6 @@ function HowItContinued({
 }
 
 /**
- * What was said to this conversation while it was busy, and has not been sent yet.
- *
- * Outside the transcript, deliberately. A turn is a run: it has an id, it has a cost, and it is in
- * the history for ever. These have none of that — nothing has been spawned, nothing is billed, and
- * a bubble that looked like a turn would be claiming one that does not exist. They leave this list
- * by becoming turns, on their own, the moment the conversation has a slot free.
- *
- * No control to cancel one, and that is a gap rather than a decision: the daemon can drop a queued
- * message, nothing here asks it to yet.
- */
-/**
- * What this conversation is waiting to be allowed to do.
- *
- * The wall this removes: the classifier sends everything not provably read-only for approval, a
- * conversation cannot park a proposal — one expects a worktree run to resume into and a chat has
- * none — so the answer used to be a refusal telling the person to go and do it somewhere else.
- * There was nowhere else. It is their window and they are looking at it, and the honest reply to
- * somebody who is watching is a question.
- *
- * Urgent on purpose. A turn is held while this stands and the daemon refuses on its own after about
- * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
- * where the next thing would have appeared rather than tucked away somewhere tidy.
- */
-/**
  * What is different in this conversation's project, without leaving the app.
  *
  * The question a person has after a coding turn is "what changed", and the transcript answers it
@@ -1181,6 +1157,19 @@ function ChangedRefusal({ error }: { error: unknown }) {
   );
 }
 
+/**
+ * What this conversation is waiting to be allowed to do.
+ *
+ * The wall this removes: the classifier sends everything not provably read-only for approval, a
+ * conversation cannot park a proposal — one expects a worktree run to resume into and a chat has
+ * none — so the answer used to be a refusal telling the person to go and do it somewhere else.
+ * There was nowhere else. It is their window and they are looking at it, and the honest reply to
+ * somebody who is watching is a question.
+ *
+ * Urgent on purpose. A turn is held while this stands and the daemon refuses on its own after about
+ * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
+ * where the next thing would have appeared rather than tucked away somewhere tidy.
+ */
 function Asking({ asks, chatId }: { asks: Ask[]; chatId: string }) {
   const answer = useAnswerAsk(chatId);
   if (asks.length === 0) return null;
@@ -1220,6 +1209,18 @@ function Asking({ asks, chatId }: { asks: Ask[]; chatId: string }) {
   );
 }
 
+/**
+ * What was said to this conversation while it was busy, and has not been sent yet.
+ *
+ * Outside the transcript, deliberately. A turn is a run: it has an id, it has a cost, and it is in
+ * the history for ever. These have none of that — nothing has been spawned, nothing is billed, and
+ * a bubble that looked like a turn would be claiming one that does not exist. They leave this list
+ * by becoming turns, on their own, the moment the conversation has a slot free.
+ *
+ * One can be taken back, by its own id and never by its place in the line. The front of this list
+ * is sent while somebody is looking at it, so a position names a different message by the time the
+ * button is pressed.
+ */
 function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
   const drop = useDropQueued(chatId);
   if (queued.length === 0) return null;
@@ -1422,25 +1423,6 @@ function ContextFill({ fill, rotatesAt }: { fill: number | null; rotatesAt: numb
 }
 
 /**
- * The brain and restart marks a transcript draws above one turn.
- *
- * The brain mark's copy is deliberately asymmetric: moving *to* the cloud is
- * about where what you type now goes, and moving *to* the local model is
- * about where the answer comes from — the two directions are not mirror
- * images of the same fact.
- */
-/**
- * A turn as it happens: the words so far, and what it is doing between them.
- *
- * Its own component so the poll lives and dies with the live turn — mounted only where `TurnBlock`
- * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all.
- *
- * Three states, and they are different claims. Nothing written and no tool is "thinking…", which is
- * what this said before and is still the honest answer while the daemon has nothing to show. A tool
- * running is named, because "thinking" over a command that is compiling something is the wrong word
- * for the wait. And words already written are shown as they arrive.
- */
-/**
  * The way out of a turn that is going nowhere.
  *
  * Offered only while the turn is live, because that is the only time it means anything: cancelling
@@ -1459,6 +1441,17 @@ function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
   );
 }
 
+/**
+ * A turn as it happens: the words so far, and what it is doing between them.
+ *
+ * Its own component so the poll lives and dies with the live turn — mounted only where `TurnBlock`
+ * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all.
+ *
+ * Three states, and they are different claims. Nothing written and no tool is "thinking…", which is
+ * what this said before and is still the honest answer while the daemon has nothing to show. A tool
+ * running is named, because "thinking" over a command that is compiling something is the wrong word
+ * for the wait. And words already written are shown as they arrive.
+ */
 function LiveAnswer({ turnId }: { turnId: number }) {
   const live = useLiveTurn(turnId, true);
   const text = live.data?.text ?? "";
@@ -1694,6 +1687,13 @@ function WhatItDid({ did }: { did: ToolCall[] }) {
   );
 }
 
+/**
+ * The brain and restart marks a transcript draws above one turn.
+ *
+ * The brain mark's copy is deliberately asymmetric: moving *to* the cloud is about where what you
+ * type now goes, and moving *to* the local model is about where the answer comes from — the two
+ * directions are not mirror images of the same fact.
+ */
 function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "restart") {
     return (
