@@ -16,7 +16,7 @@
 //!
 //! Requests are typed, never command strings — the law `vcs.rs` states for its own queue and which
 //! holds here unchanged: parsing shell is the surface `classifier.rs` exists to keep closed, so the
-//! daemon builds every argv itself. **`ActOp::Raw` carries `Vec<String>` rather than a line**, and
+//! daemon builds every argv itself. **`ActOp::ApiRead` carries `Vec<String>` rather than a line**, and
 //! that is the variant where the law costs most and matters most: the one escape hatch for cases
 //! nobody foresaw is exactly where a command string would undo it.
 
@@ -98,13 +98,25 @@ pub enum ActOp {
     ///
     /// `Vec<String>` and not a line: see the module doc.
     ///
-    /// **What `--` costs here, said out loud rather than discovered.** Every caller argument lands
-    /// after the terminator, so `Raw` reaches `gh api` with a path and positional arguments and no
-    /// flags — `-X DELETE` arrives as two more positionals and does not select a method. That is a
-    /// real narrowing of "total capability" down to reads of the REST surface, and it is the
-    /// deliberate reading of the rule that no caller value may ever act as a flag. Whoever wants the
-    /// verb wants a typed variant for it, which is the same answer the rest of this enum gives.
-    Raw {
+    /// **The name is what `--` already did, moved out of this comment and into the type.** Every
+    /// caller argument lands after the terminator, so this reaches `gh api` with a path and
+    /// positional arguments and no flags — `-X DELETE` arrives as two more positionals and does not
+    /// select a method. That is a real narrowing of "total capability" down to reads of the REST
+    /// surface, and it is the deliberate reading of the rule that no caller value may ever act as a
+    /// flag. Whoever wants the verb wants a typed variant for it, which is the same answer the rest
+    /// of this enum gives.
+    ///
+    /// It was called `Raw` while that narrowing lived only in this comment. `Raw` promises an escape
+    /// hatch for anything, which is the opposite of what the caller gets, and a name that
+    /// contradicts its own doc is read far more often than the doc is. Renamed while the wire string
+    /// had never reached the database — the only moment such a rename costs nothing.
+    ///
+    /// **A read, and still an `ActOp`, which is not a contradiction.** The partition is not about
+    /// what an operation does to GitHub but about what the núcleo can VOUCH for: `ReadOp` is the
+    /// closed set whose every argv this module built and can name. An arbitrary REST path is not in
+    /// that set, so it stays `Acts` — approval-bearing, and refused after untrusted text — and being
+    /// a GET does not earn it the other half's guarantees.
+    ApiRead {
         args: Vec<String>,
     },
 }
@@ -227,7 +239,7 @@ impl ActOp {
             ActOp::PrCreate { .. } => "pr_create",
             ActOp::PrComment { .. } => "pr_comment",
             ActOp::IssueClose { .. } => "issue_close",
-            ActOp::Raw { .. } => "raw",
+            ActOp::ApiRead { .. } => "api_read",
         }
     }
 
@@ -245,7 +257,7 @@ impl ActOp {
 
     /// The repository this touches, for the sentence a person reads before approving.
     ///
-    /// `None` for `Raw`, and that is the honest answer rather than a gap: `gh api` names a REST path
+    /// `None` for `ApiRead`, and that is the honest answer rather than a gap: `gh api` names a REST path
     /// and a path is not a repository, however often it happens to contain one.
     pub fn repo(&self) -> Option<&Repo> {
         match self {
@@ -254,7 +266,7 @@ impl ActOp {
             | ActOp::PrCreate { repo, .. }
             | ActOp::PrComment { repo, .. }
             | ActOp::IssueClose { repo, .. } => Some(repo),
-            ActOp::Raw { .. } => None,
+            ActOp::ApiRead { .. } => None,
         }
     }
 
@@ -318,7 +330,7 @@ impl ActOp {
             ActOp::IssueClose { repo, number } => {
                 argv(&["issue", "close"], [repo_flag(repo)], &[number.as_str()])
             }
-            ActOp::Raw { args } => {
+            ActOp::ApiRead { args } => {
                 let mut built = vec!["api".to_owned(), "--".to_owned()];
                 built.extend(args.iter().cloned());
                 built
@@ -357,7 +369,7 @@ impl ActOp {
                 repo,
                 number: IssueNumber::new("1").expect("the sample issue number is valid"),
             },
-            ActOp::Raw { args: Vec::new() },
+            ActOp::ApiRead { args: Vec::new() },
         ];
         for operation in &every {
             match operation {
@@ -366,7 +378,7 @@ impl ActOp {
                 | ActOp::PrCreate { .. }
                 | ActOp::PrComment { .. }
                 | ActOp::IssueClose { .. }
-                | ActOp::Raw { .. } => {}
+                | ActOp::ApiRead { .. } => {}
             }
         }
         every
@@ -520,14 +532,14 @@ impl ActOp {
             args,
         } = request;
         let operation = operation.trim().to_ascii_lowercase();
-        // `raw` is settled before the repository is, because it is the one operation that names no
+        // `api_read` is settled before the repository is, because it is the one operation that names no
         // repository — asking for one first would refuse it for a field it does not have.
-        if operation == "raw" {
+        if operation == "api_read" {
             let args = args.unwrap_or_default();
             if args.is_empty() {
-                return Err("raw needs at least an endpoint in args".to_owned());
+                return Err("api_read needs at least an endpoint in args".to_owned());
             }
-            return Ok(ActOp::Raw { args });
+            return Ok(ActOp::ApiRead { args });
         }
         let repo = Repo::new(&required(repo, &operation, "repository")?)?;
         match operation.as_str() {
@@ -864,9 +876,9 @@ pub const READ_CEILING: &[&str] = &[
     "gh workflow list",
 ];
 
-/// The `ActOp` kinds eligible for autonomy. `raw` is outside it and stays outside.
+/// The `ActOp` kinds eligible for autonomy. `api_read` is outside it and stays outside.
 ///
-/// `pr_create` is outside too, and for its own reason rather than `raw`'s: opening a pull request
+/// `pr_create` is outside too, and for its own reason rather than `api_read`'s: opening a pull request
 /// publishes a title and a body under the owner's name to people who will read them as the owner's
 /// words. That is not undoable by closing it.
 pub const ACTION_CEILING: &[&str] = &["workflow_run", "run_rerun", "pr_comment", "issue_close"];
@@ -1428,8 +1440,27 @@ async fn drain<R: tokio::io::AsyncRead + Unpin>(mut reader: R, into: Arc<Mutex<V
             Ok(0) | Err(_) => return,
             Ok(read) => {
                 let mut buffer = into.lock().expect("the buffer is not poisoned");
-                if buffer.len() < MAX_OUTPUT_BYTES + chunk.len() {
-                    buffer.extend_from_slice(&chunk[..read]);
+                buffer.extend_from_slice(&chunk[..read]);
+                // A sliding TAIL, because `clip` promises one and this is the half that has to
+                // deliver it.
+                //
+                // This used to STOP appending once the buffer reached the cap, which keeps the
+                // head. `clip` then kept the last `MAX_OUTPUT_BYTES` of the first
+                // `MAX_OUTPUT_BYTES` and stamped it with a marker announcing the tail — so the one
+                // case the cap exists for, a workflow log that failed, came back holding the setup
+                // lines with the errors thrown away, while saying the opposite in writing.
+                //
+                // Measured on a real red run before it was fixed: the `failures:` block cargo
+                // prints after every test is exactly what went missing, which is the only part
+                // anybody reads a failing log for.
+                //
+                // Trimmed in one step at twice the cap rather than on every chunk, because trimming
+                // per read would memmove a quarter of a megabyte for every 8 KiB that arrives. What
+                // is left is never smaller than `MAX_OUTPUT_BYTES + 1`, so `clip` still sees that
+                // something was cut and still says so.
+                if buffer.len() > MAX_OUTPUT_BYTES * 2 {
+                    let excess = buffer.len() - (MAX_OUTPUT_BYTES + 1);
+                    buffer.drain(..excess);
                 }
             }
         }
@@ -1743,16 +1774,16 @@ mod tests {
     /// production two minutes is not a wait a suite can take, and a deadline that cannot be
     /// exercised is a deadline nobody has seen fire.
     ///
-    /// **`Raw` and not `PrList`, and the first attempt is the reason.** `yes pr list --repo=o/r`
+    /// **`ApiRead` and not `PrList`, and the first attempt is the reason.** `yes pr list --repo=o/r`
     /// exits 1 with "unknown option" — `yes` runs getopt over its arguments like any coreutil, so a
-    /// stub cannot be handed an argv full of flags and be expected to ignore them. `Raw` puts every
+    /// stub cannot be handed an argv full of flags and be expected to ignore them. `ApiRead` puts every
     /// caller value after `--`, which is the one argv shape in this module that carries no option at
     /// all, so it is the shape a stub can actually receive.
     #[tokio::test]
     async fn a_command_that_never_ends_dies_on_the_deadline() {
         let refused = spawn_gh(
             &pointed_at("yes"),
-            &Op::Act(ActOp::Raw {
+            &Op::Act(ActOp::ApiRead {
                 args: vec!["forever".to_owned()],
             }),
             "unused",
@@ -1776,6 +1807,49 @@ mod tests {
         .await;
 
         assert_eq!(refused, Err(Failure::MissingCli));
+    }
+
+    /// The cap keeps the END of a long stream, which is the half a failing log is read for.
+    ///
+    /// `drain` and not `spawn_gh`, because a stub that emits a quarter-megabyte of DISTINGUISHABLE
+    /// output is not something `echo` or `yes` can be asked for — `yes` repeats one line, and a
+    /// buffer of identical lines cannot tell a kept head from a kept tail. Numbered lines can.
+    ///
+    /// Written after the bug shipped and was found in use: a red CI run came back with its setup
+    /// lines and without its `failures:` block, under a marker claiming the opposite.
+    #[tokio::test]
+    async fn a_stream_past_the_cap_keeps_its_end_and_not_its_beginning() {
+        let mut source: Vec<u8> = Vec::new();
+        let mut n = 0_u64;
+        while source.len() < MAX_OUTPUT_BYTES * 3 {
+            source.extend_from_slice(format!("line {n}\n").as_bytes());
+            n += 1;
+        }
+        let ultima = format!("line {}\n", n - 1);
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        drain(&source[..], buffer.clone()).await;
+        let guardado = buffer.lock().expect("the buffer is not poisoned");
+
+        let texto = String::from_utf8_lossy(&guardado);
+        assert!(
+            texto.ends_with(&ultima),
+            "the end of the stream is missing; it ends with {:?}",
+            &texto[texto.len().saturating_sub(40)..]
+        );
+        assert!(
+            !texto.contains("line 0\n"),
+            "the beginning was kept instead of the end"
+        );
+        assert!(
+            guardado.len() > MAX_OUTPUT_BYTES,
+            "nothing was kept beyond the cap, so `clip` would not report a cut"
+        );
+        assert!(
+            guardado.len() <= MAX_OUTPUT_BYTES * 2,
+            "the sliding window did not bound memory: {} bytes",
+            guardado.len()
+        );
     }
 
     /// The override exists for the reason `NUCLEOS_CLAUDE_BIN` exists, and a default that drifted
@@ -1838,12 +1912,12 @@ mod tests {
         }
     }
 
-    /// The law, in the variant where it costs most and matters most. A `Raw` carrying a line would
+    /// The law, in the variant where it costs most and matters most. A `ApiRead` carrying a line would
     /// be "never a command string" undone by the one variant that exists for the cases nobody
     /// foresaw.
     #[test]
-    fn raw_carries_separate_arguments_and_never_a_line() {
-        let op = ActOp::Raw {
+    fn api_read_carries_separate_arguments_and_never_a_line() {
+        let op = ActOp::ApiRead {
             args: vec!["repos/o/r".into(), "-X".into(), "GET".into()],
         };
         assert_eq!(op.argv(), vec!["api", "--", "repos/o/r", "-X", "GET"]);
@@ -1986,14 +2060,14 @@ mod tests {
     fn the_file_may_narrow_the_ceiling_and_never_widens_it() {
         let policy = policy_from(Some(
             "autonomous_reads:\n  - gh run list\n  - gh auth token\n\
-             autonomous_actions:\n  - pr_comment\n  - raw\n",
+             autonomous_actions:\n  - pr_comment\n  - api_read\n",
         ));
         assert_eq!(policy.autonomous_reads(), ["gh run list"]);
         assert_eq!(policy.autonomous_actions(), ["pr_comment"]);
         assert!(policy.read_is_autonomous("gh run list"));
         assert!(!policy.read_is_autonomous("gh auth token"));
         assert!(policy.action_is_autonomous("pr_comment"));
-        assert!(!policy.action_is_autonomous("raw"));
+        assert!(!policy.action_is_autonomous("api_read"));
     }
 
     /// The two that never pass, with the file explicitly asking for the opposite.
@@ -2001,7 +2075,7 @@ mod tests {
     fn gh_api_and_gh_auth_token_are_never_autonomous() {
         let policy = policy_from(Some(
             "autonomous_reads:\n  - gh auth token\n  - gh auth status\n  - gh secret list\n  \
-             - gh variable list\nautonomous_actions:\n  - raw\n",
+             - gh variable list\nautonomous_actions:\n  - api_read\n",
         ));
         assert!(policy.autonomous_reads().is_empty());
         assert!(policy.autonomous_actions().is_empty());
@@ -2225,7 +2299,7 @@ mod tests {
         assert!(nonsense.unwrap_err().contains("unknown read operation"));
     }
 
-    /// A missing field names itself, and `raw` is settled before the repository is — otherwise the
+    /// A missing field names itself, and `api_read` is settled before the repository is — otherwise the
     /// one operation that names no repository would be refused for not having one.
     #[test]
     fn from_request_names_the_field_it_is_missing() {
@@ -2237,12 +2311,15 @@ mod tests {
         });
         assert!(missing.unwrap_err().contains("body"));
 
-        let raw = ActOp::from_request(ActRequest {
-            operation: "raw".to_owned(),
+        let api_read = ActOp::from_request(ActRequest {
+            operation: "api_read".to_owned(),
             args: Some(vec!["repos/o/r".to_owned()]),
             ..ActRequest::default()
         });
-        assert_eq!(raw.expect("raw needs no repository").kind(), "raw");
+        assert_eq!(
+            api_read.expect("api_read needs no repository").kind(),
+            "api_read"
+        );
     }
 
     /// `effect_of_kind` and `effect()` are one answer, because the first is derived from the same
@@ -2395,8 +2472,8 @@ mod tests {
             assert!(kinds.contains(entry), "{entry} is not an ActOp kind");
         }
         assert!(
-            !ACTION_CEILING.contains(&"raw"),
-            "`raw` is never eligible for autonomy"
+            !ACTION_CEILING.contains(&"api_read"),
+            "`api_read` is never eligible for autonomy"
         );
     }
 }

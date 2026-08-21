@@ -2313,6 +2313,19 @@ impl CommandRunner for CodexCliRunner {
     }
 }
 
+/// What a run was launched WITH, as opposed to what it went on to do.
+///
+/// Its own type rather than four loose fields, because the four answer one question together --
+/// does this run start with a past?
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    pub prompt: String,
+    pub resume_session_id: Option<String>,
+    pub session_id: Option<String>,
+    pub fork_session: bool,
+}
+
 /// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
 /// it into the daemon would ship a runner that can fake a run's outcome.
 #[cfg(test)]
@@ -2351,6 +2364,14 @@ pub struct FakeCommandRunner {
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
     pub calls: std::sync::Mutex<u32>,
+    /// Test-only: how the last call was launched.
+    ///
+    /// `runs.rs`'s context handoff is why this exists. Its successor was launched
+    /// `--resume <predecessor> --fork-session`, which copies a conversation rather than ending one,
+    /// and nothing here could see it: this fake recorded the environment and the outcome, never the
+    /// session shape, so a run inheriting everything looked exactly like one inheriting nothing. It
+    /// took a live CLI to notice.
+    pub last_launch: std::sync::Mutex<Option<Launch>>,
     /// Test-only: whether a living process was STOPPED rather than allowed to end.
     ///
     /// Set by a guard the fake's own future holds, and disarmed just before that future returns —
@@ -2372,6 +2393,19 @@ pub struct FakeCommandRunner {
     /// than copied, because only the first node of a job plans: an implement node that rewrote the
     /// queue it is working from is a fiction no real run can produce.
     pub plan_to_write: std::sync::Mutex<Option<String>>,
+    /// Test-only: a scripted agent. `(marker, path, contents)` — a run whose PROMPT contains the
+    /// marker writes `contents` to `path` inside the checkout it was handed.
+    ///
+    /// **Keyed on the prompt and not on the order of calls**, which is the whole point. Two items of
+    /// one batch start as two spawned tasks and reach this in whatever order the runtime picks, so a
+    /// queue taken one entry per call would hand item 3's file to item 1 about half the time, and
+    /// the test built on it would be measuring the scheduler's mood. The prompt carries the item's
+    /// description, which is the one thing that identifies the item from in here.
+    ///
+    /// It writes and does NOT commit, because that is what a real implement node does: the prompt
+    /// tells it to leave the tree uncommitted and `merge_item` is what commits. A double that
+    /// committed would put a fixture back to asserting something no code does.
+    pub writes: std::sync::Mutex<Vec<(String, String, String)>>,
 }
 
 #[cfg(test)]
@@ -2464,6 +2498,12 @@ impl CommandRunner for FakeCommandRunner {
         // Before the failure injection below: what a run was handed is worth knowing even when the
         // launch is made to fail.
         *self.last_env.lock().unwrap() = Some(request.env.clone());
+        *self.last_launch.lock().unwrap() = Some(Launch {
+            prompt: request.prompt.clone(),
+            resume_session_id: request.resume_session_id.clone(),
+            session_id: request.session_id.clone(),
+            fork_session: request.fork_session,
+        });
         {
             let mut remaining = self.fail_times.lock().unwrap();
             if *remaining > 0 {
@@ -2483,6 +2523,19 @@ impl CommandRunner for FakeCommandRunner {
             let _ = std::fs::create_dir_all(artifacts);
             std::fs::write(std::path::Path::new(artifacts).join("plan.json"), plan)
                 .expect("the plan node writes its queue");
+        }
+        // The scripted agent, after the plan node's file and before anything is recorded: an
+        // implement node's whole observable effect is what it left in its checkout.
+        if let Some(cwd) = request.cwd.as_ref() {
+            for (marker, path, contents) in self.writes.lock().unwrap().iter() {
+                if request.prompt.contains(marker.as_str()) {
+                    let target = cwd.join(path);
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&target, contents).expect("the scripted agent writes its file");
+                }
+            }
         }
         *self.last_prompt.lock().unwrap() = Some(request.prompt.clone());
         *self.last_images.lock().unwrap() = Some(request.images.clone());

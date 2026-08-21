@@ -5662,6 +5662,32 @@ async fn post_proposal_reject(
         };
     }
 
+    if kind == "github-action" {
+        // Refusing leaves nothing behind, because nothing was done: `github::submit` files the
+        // proposal and returns, and the operation reaches `gh` only on the approval path. So this is
+        // a status flip with no second half — the opposite of the approve side, which claims the row
+        // BEFORE spawning precisely because there IS one there.
+        //
+        // Its absence was invisible until somebody refused one by hand. The fallback below knows
+        // only `action-approval`, so a `github-action` fell through to it and came back 409 saying
+        // NotPending about a proposal sitting there pending; `/dismiss`, which knows only
+        // `skipped-item`, answered the same. An operation the owner could approve and could not
+        // refuse waited for a decision that had no way to arrive.
+        let state = state.clone();
+        let rejected = uncancellable(async move {
+            crate::proposals::transition(&state.pool, id, "rejected", "rejected by user").await
+        })
+        .await?;
+        return match rejected {
+            Ok(true) => Ok(StatusCode::NO_CONTENT),
+            Ok(false) => Err(StatusCode::CONFLICT),
+            Err(error) => {
+                tracing::warn!(proposal_id = id, %error, "refusing a github action failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
+
     if kind == "team-action" {
         // Refusing closes the action as well as the proposal, in that order: the proposal is the
         // decision and the action is what is left to do about it, and leaving the second `pending`
@@ -5838,6 +5864,11 @@ async fn create_job(
                 // for it, exactly as it has none for `max_items`.
                 gate_retries: crate::config::DEFAULT_GATE_RETRIES as i64,
                 head_sha: head_sha.as_deref(),
+                // The caller's, like `max_rounds` and `budget_usd` above and unlike `max_items`.
+                // Whether it names a team that exists is `job::start`'s to answer and not this
+                // route's: the catalogue can change between a request being written and it landing,
+                // and the answer has to be read where the row is made.
+                team_id: request.team_id.as_deref(),
             },
         )
         .await
@@ -5853,6 +5884,10 @@ async fn create_job(
         // reason travels because the two ceilings have different remedies — one waits for this
         // project's own work, the other for anybody's.
         crate::job::JobStart::NoRoom(reason) => Err((StatusCode::CONFLICT, reason)),
+        // 422 and not 404: the URL is right and the project exists, and it is one field of the body
+        // that names something that does not. The same status `resolve_start` gives a project that
+        // is real but configured differently from what the request assumed.
+        crate::job::JobStart::NoTeam(reason) => Err((StatusCode::UNPROCESSABLE_ENTITY, reason)),
         // Past the INSERT: the row existed and `fail_early` retired it and said so in the feed. 500
         // rather than 409, because nothing the caller could change would have helped.
         crate::job::JobStart::Failed => Err((
@@ -11597,6 +11632,144 @@ mod tests {
         assert_eq!(branch, format!("nucleos/job-{job_id}"));
     }
 
+    /// A team seeded so a job can ask for it. `foreign_keys` is on: the agent, then the team.
+    async fn team_in(pool: &sqlx::SqlitePool, team_id: &str) {
+        let now = "2026-08-20T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES (?, 'Crew', 'ship it', 'dir', 3, 2, ?, ?)",
+        )
+        .bind(team_id)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// **A job can be asked for with a team, and that is the whole of whether the feature exists.**
+    ///
+    /// Everything else about parallel work was already written and green while `jobs.team_id` was
+    /// set by nothing outside a test — seven slices of code no caller could reach, which is the
+    /// same shape of failure as shipping it with the slot ceiling too low, arrived at from the other
+    /// end. This asserts the column on the STORED row, because that is what `load_view` reads and
+    /// therefore the only thing that decides whether the job runs in parallel.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_caller_may_ask_for_a_team_and_the_job_is_directed_by_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-team-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+        team_in(&pool, "crew").await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request_with(serde_json::json!({
+                "project_id": "p",
+                "prompt": "build the thing",
+                "team_id": "crew",
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let job_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["job_id"]
+            .as_i64()
+            .expect("the response carries the job id");
+
+        let team: Option<String> = sqlx::query_scalar("SELECT team_id FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(team.as_deref(), Some("crew"));
+        assert!(
+            crate::job::load_view(&pool, job_id).await.unwrap().has_team,
+            "the column reaches the decision, or naming a team bought nothing"
+        );
+    }
+
+    /// And a caller that says nothing gets the job every caller has always got.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_caller_that_asks_for_no_team_gets_the_job_of_today() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-noteam-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request("p"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let team: Option<String> = sqlx::query_scalar("SELECT team_id FROM jobs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(team, None);
+    }
+
+    /// A team that does not exist is a 422, and **no job row is left behind**.
+    ///
+    /// The second half is the one worth the test. `foreign_keys` is on, so without the check in
+    /// `job::start` this same request reaches the INSERT, fails on the constraint, and comes back as
+    /// "the job was created and could not be provisioned; it has been retired" — a 500 whose two
+    /// halves are both untrue, over a typo the caller could have fixed in a second.
+    ///
+    /// And it is a refusal rather than a job with no team, which is the decision to argue with.
+    /// Falling back would run the work sequentially and report `completed`, leaving "the
+    /// parallelism I configured never seems to happen" as the only symptom.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_asking_for_a_team_that_does_not_exist_is_refused_and_leaves_no_row() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-noteam422-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request_with(serde_json::json!({
+                "project_id": "p",
+                "prompt": "build the thing",
+                "team_id": "a-team-nobody-made",
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let said = String::from_utf8_lossy(&body);
+        assert!(said.contains("a-team-nobody-made"), "{said}");
+        assert_eq!(job_count(&pool).await, 0, "nothing was created to retire");
+    }
+
     /// The two numbers a caller may choose, and the one it may not.
     ///
     /// `max_rounds` and `budget_usd` are how long and how much, which are the caller's to say —
@@ -13325,6 +13498,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_status, "cancelled");
+    }
+
+    /// A GitHub operation the owner could approve and could not refuse.
+    ///
+    /// `/reject`'s fallback knows only `action-approval` and `/dismiss` only `skipped-item`, so
+    /// before the arm above existed a `github-action` got 409 from both — and the 409 said
+    /// NotPending about a proposal that was pending, which sends the reader to the wrong question.
+    /// Found by refusing one by hand during the plan's own verification, and not by a test, which
+    /// is why there is a test now.
+    #[tokio::test]
+    async fn a_github_action_can_be_refused_and_not_only_approved() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let proposal_id = proposals::create_github_action(
+            &pool,
+            "pr_comment",
+            "a run asked GitHub for pr_comment on owner/name",
+            r#"{"op":"pr_comment","repo":"owner/name","number":"1","body":"hello"}"#,
+        )
+        .await
+        .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/proposals/{proposal_id}/reject"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let proposal = proposals::get(&pool, proposal_id).await.unwrap().unwrap();
+        assert_eq!(proposal.status, "rejected");
     }
 
     #[tokio::test]

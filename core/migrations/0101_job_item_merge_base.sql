@@ -1,0 +1,28 @@
+-- Where the job's branch stood immediately before this item was merged into it.
+--
+-- The target of the `reset --hard` that undoes a red merge, and the whole reason it is stored rather
+-- than computed. `footing_for` answers the same question by walking BACKWARDS THROUGH ORDINALS --
+-- the nearest earlier item a gate agreed with -- and that is right exactly while the order work
+-- reaches the branch is the order of the ordinals. One shared worktree and a sequential queue
+-- guarantee that. Items merging from trees of their own do not: item 3 can land before item 1, and
+-- reverting item 1 to "the checkpoint before it" would throw away the green merges of 2 and 3.
+--
+-- Recorded at the moment of the merge because that is the only moment the answer exists. Afterwards
+-- the branch has moved and nothing on it says which of its commits this merge added.
+--
+-- NULL is the information: this item was never merged, because in its job the work does not merge --
+-- it is written in the one shared checkout, and `footing_for` is still the right answer there.
+--
+-- `git revert -m 1` was the alternative and it is worse in a way that is silent: after reverting a
+-- merge, merging the same branch again brings nothing back, because the merge-base already contains
+-- those commits. The retry would produce an empty diff and a green gate over work that is not there.
+--
+-- 0101 and not 0098, which is what this was called first. Two branches taking the same free number
+-- is the registry collision that merges cleanly and kills the gate, and skipping 0097 to dodge one
+-- branch's `0097_chat_queue.sql` was not enough: that branch went on to 0098, 0099 and 0100 while
+-- this one was being written. The ceiling is read from every live worktree at the moment of taking
+-- a number, and taken ABOVE all of them. Renumbering was free here because the live database is at
+-- 96 -- neither of these had ever been applied to it. It would not have been free a day later.
+--
+-- A gap costs nothing: sqlx orders by version and does not require them to be contiguous.
+ALTER TABLE job_items ADD COLUMN merge_base_sha TEXT;

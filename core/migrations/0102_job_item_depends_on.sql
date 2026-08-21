@@ -1,0 +1,20 @@
+-- Which earlier items this one may not start before, as a JSON array of global ordinals.
+--
+-- The edges of the graph a director draws over its own plan, and the only thing that lets two items
+-- run at once be a decision rather than a gamble. Without it "these two are independent" is
+-- something the queue would have to infer from file hints, and file hints are a guess about where
+-- work will land, not a statement about what depends on what.
+--
+-- Global ordinals and not per-round ones, because ordinals continue across rounds and `advance`
+-- looks items up by that number. An item of round 3 depending on an item of round 1 is ordinary and
+-- has to be expressible; renumbering per round would make the same integer mean two different rows.
+--
+-- NULL is the information: nobody was asked. Every item of every job without a team has it, and so
+-- does every item written before this column existed. An empty array means the opposite and is a
+-- real answer -- "this item depends on nothing" -- which is why the parsing keeps them apart and
+-- refuses a plan whose director left the key out.
+--
+-- TEXT holding JSON, following `job_items.files` (0056). A join table would be the normalised shape
+-- and would buy nothing here: nothing queries across items' dependencies, the whole list is read
+-- with the row that owns it, and a table would make ingesting one plan a transaction over two.
+ALTER TABLE job_items ADD COLUMN depends_on TEXT;
