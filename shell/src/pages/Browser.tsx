@@ -589,6 +589,15 @@ function WriteRow({ wrote }: { wrote: Written }) {
         {shown !== "" && <>: {shown}</>}
         {more > 0 && <> and {more} more</>}
       </p>
+      {wrote.files.length > 0 && (
+        // Its own line, and toned as a warning rather than as detail. "A comment was posted" and
+        // "a document was posted" are not the same event, and a person scanning this list for
+        // something they did not expect is looking for exactly this difference.
+        <p className="browser-meta browser-files">
+          with {wrote.files.length === 1 ? "a file" : `${wrote.files.length} files`}:{" "}
+          {wrote.files.join(", ")}
+        </p>
+      )}
       {wrote.verb !== "" && (
         <p className="browser-meta">
           sent by a {wrote.verb}

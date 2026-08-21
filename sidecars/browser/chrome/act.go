@@ -129,6 +129,8 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		err = d.typeInto(ctx, on, objectID, action.Text)
 	case browser.ActionSelect:
 		refusal, err = d.choose(ctx, on, objectID, action.Text)
+	case browser.ActionUpload:
+		refusal, err = d.attach(ctx, entry, on, objectID, action)
 	case browser.ActionPress:
 		refusal, err = d.press(ctx, on, objectID, action.Text)
 	case browser.ActionBack:
@@ -180,9 +182,14 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 
 // opensAForm says which verbs may arm the write window.
 //
-// Click and press, and nothing else. Type and select change what a form CARRIES and do not send it;
-// scroll, back and goto are not acts on a control at all. The set is small because the window is a
-// permission, and a permission that a verb opens by accident is one nobody granted.
+// Click and press, and nothing else. Type, select and upload change what a form CARRIES and do not
+// send it; scroll, back and goto are not acts on a control at all. The set is small because the
+// window is a permission, and a permission that a verb opens by accident is one nobody granted.
+//
+// Upload is the one somebody will be tempted to add, because attaching a file feels like the moment
+// something leaves. It is not: the file goes when the form is submitted, by a later click, and that
+// click opens the window that judges it. Arming here would open a permission on an act that sends
+// nothing — and close it again before the act that does.
 func opensAForm(kind browser.ActionKind) bool {
 	return kind == browser.ActionClick || kind == browser.ActionPress
 }
@@ -199,7 +206,7 @@ func opensAForm(kind browser.ActionKind) bool {
 func ranPageCode(kind browser.ActionKind) bool {
 	switch kind {
 	case browser.ActionClick, browser.ActionType, browser.ActionSelect,
-		browser.ActionPress, browser.ActionScroll:
+		browser.ActionPress, browser.ActionScroll, browser.ActionUpload:
 		return true
 	default:
 		return false
@@ -211,7 +218,7 @@ func ranPageCode(kind browser.ActionKind) bool {
 // scroll to content that is not in a snapshot yet — which is the only reason to scroll.
 func needsRef(kind browser.ActionKind) bool {
 	switch kind {
-	case browser.ActionClick, browser.ActionType, browser.ActionSelect:
+	case browser.ActionClick, browser.ActionType, browser.ActionSelect, browser.ActionUpload:
 		return true
 	default:
 		return false

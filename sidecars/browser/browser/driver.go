@@ -319,20 +319,52 @@ const (
 	// allowlist answers for it exactly as it answers for a link the page itself offers, and the
 	// scheme is checked here as well because file: and data: are not requests the interception sees.
 	ActionGoto ActionKind = "goto"
+	// ActionUpload attaches a file to an `<input type=file>` — and the file is one the AGENT WROTE,
+	// never one it named on this disk. Text is the contents and Filename is what the site is told it
+	// is called; nothing here takes a path, and there is deliberately no way to say one.
+	//
+	// # Why it carries contents rather than a path, which is the whole design
+	//
+	// The obvious version takes a filename and reads it from some folder. That folder then has to be
+	// bounded, and every bound anybody could name here is either unreachable or wrong. The one the
+	// design wanted — the errand's own folder — does not exist on a browsing turn: no browser tool is
+	// in `ERRAND_TOOLS`, so the turns that can browse and the turns that have a folder are disjoint
+	// sets. The one that is reachable — the files folder, where the owner's uploads and filed mail
+	// live — is measurably worse than it looks: nothing on this surface can READ a file from it
+	// (`list_files` returns names), so an upload from there would let an agent send out the contents
+	// of files it cannot itself see, chosen by a name a sender may have picked.
+	//
+	// Carrying the contents dissolves the question instead of answering it. There is no folder to
+	// escape from, no path to canonicalise, no symlink to chase — and, the part that matters, no new
+	// channel: anything an agent can put in Text it could already have typed into a form field with
+	// ActionType. Upload is genuinely the type of files.
+	//
+	// What it does not do is attach a file the owner already has. That is a real limitation and not
+	// a step on the way here: it needs a folder a browsing turn can reach, which is a decision about
+	// what an errand may do, not about this verb.
+	ActionUpload ActionKind = "upload"
 )
 
 // Action is one attempt to touch the page.
 type Action struct {
 	Kind ActionKind `json:"kind"`
-	// Ref names the element, and is required for click, type and select. Scroll takes one to bring
-	// an element into view and takes none to move the page itself; press takes one to focus before
-	// the key and takes none to send it wherever focus already is; back never takes one.
+	// Ref names the element, and is required for click, type, select and upload. Scroll takes one to
+	// bring an element into view and takes none to move the page itself; press takes one to focus
+	// before the key and takes none to send it wherever focus already is; back never takes one.
 	Ref string `json:"ref"`
 	// Text is the verb's argument: the characters for type, the option's label for select, the key's
-	// name for press, the direction for a page scroll, and the url for goto. One field rather than
-	// five, because a verb has at most one and naming them apart would only spread the same value
-	// over a wider shape.
+	// name for press, the direction for a page scroll, the url for goto, and the file's CONTENTS for
+	// upload. One field rather than six, because a verb has at most one and naming them apart would
+	// only spread the same value over a wider shape.
 	Text string `json:"text,omitempty"`
+	// Filename is upload's second argument, and it is second because upload is the one verb that
+	// genuinely has two: what the file says, and what it is called. They cannot share a field —
+	// a convention for splitting one string is exactly the kind of thing a page's words could learn
+	// to exploit — so the shape widens rather than the meaning.
+	//
+	// A NAME and never a path. It is validated as one before anything touches a disk, because it
+	// becomes a real filename: see chrome/upload.go.
+	Filename string `json:"filename,omitempty"`
 }
 
 // Outcome is the shape of an ActResult.
@@ -488,6 +520,14 @@ type Write struct {
 	// rather than asserted, so a row can be read back against the snapshot that produced it.
 	Ref  string `json:"ref,omitempty"`
 	Verb string `json:"verb,omitempty"`
+	// Files are the NAMES of the attachments this submission carried, and never their
+	// contents.
+	//
+	// The same rule as Fields above and for a sharper reason: a form field's value is a line
+	// of text somebody typed, and a file is the most concentrated form there is of content
+	// that must not come to rest in this database. What the owner needs to see is that a file
+	// left and what it was called; what it said is between them and the site they sent it to.
+	Files []string `json:"files,omitempty"`
 }
 
 // Valid reports whether an ActResult is internally consistent. A driver that returns a refusal with

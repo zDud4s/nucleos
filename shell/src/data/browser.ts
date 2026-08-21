@@ -113,6 +113,14 @@ export interface Written {
   /** The act that caused it: the ref from the snapshot, and the verb. */
   element_ref: string;
   verb: string;
+  /**
+   * The names of any files this submission carried, and never their contents.
+   *
+   * Empty for a submission that carried none, and also for every row written before uploads
+   * existed. The database keeps those apart (migration 0098) and this screen does not, because
+   * there is nothing it would show differently.
+   */
+  files: string[];
   written_at: string;
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -468,6 +469,36 @@ func newSite(t *testing.T) *site {
 		fmt.Fprint(w, PAGE_LOOKBUTTON)
 	})
 
+	// A multipart form with a file input, and a server that records what actually ARRIVED. The whole
+	// upload verb is only worth anything if bytes reach the other end, and the only witness that can
+	// say so is the server — the same rule the write group already follows.
+	mux.HandleFunc("/attach", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_ATTACH)
+	})
+	mux.HandleFunc("/attached", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		if err := r.ParseMultipartForm(4 << 20); err != nil {
+			s.record("attach-not-multipart")
+			http.Error(w, "not multipart", http.StatusBadRequest)
+			return
+		}
+		file, header, err := r.FormFile("document")
+		if err != nil {
+			s.record("attach-no-file")
+			http.Error(w, "no file", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		body, _ := io.ReadAll(file)
+		// The name AND the bytes, so a test can tell "a file arrived" from "the right file arrived".
+		s.record("attach-name=" + header.Filename)
+		s.record("attach-body=" + string(body))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<!doctype html><title>attached</title><h1>Attached</h1>")
+	})
+
 	// A page as crowded as a real application's toolbar: small buttons packed close together, a form
 	// beside them, and a table of rows that each carry their own control. It exists to answer a
 	// question the tidy fixtures cannot — whether the labels a look draws are still LEGIBLE once
@@ -731,6 +762,16 @@ func (s *site) note(r *http.Request) {
 	if r.Header.Get("Upgrade") != "" {
 		label = "UPGRADE " + r.URL.Path
 	}
+	s.record(label)
+}
+
+// record puts an arbitrary observation on the same channel the arrivals go to.
+//
+// A handler that wants to say more than "something reached me" — which part arrived, what it was
+// called, what it contained — says it here, so a test asks one question of one place. Non-blocking
+// like note is, and for the same reason: a server that stalls because nobody is reading is a server
+// that changes the thing the test is measuring.
+func (s *site) record(label string) {
 	select {
 	case s.arrived <- label:
 	default:
@@ -1149,3 +1190,14 @@ const PAGE_DENSE = `<!doctype html><title>dense</title>
 	</table>
 	<p><a href=/reading>Ver tudo</a> &middot; <a href=/canvas>Grafico</a> &middot;
 	<a href=/focus>Procurar</a></p>`
+
+// PAGE_ATTACH is one multipart form with one file input and one submit button. Deliberately plain:
+// the question is whether an attachment survives the fence and reaches the server, and every extra
+// control on the page is a way for the test to end up about something else.
+const PAGE_ATTACH = `<!doctype html><title>attach</title><body>
+	<h1>Send a document</h1>
+	<form method=post enctype="multipart/form-data" action=/attached>
+	<label>Document <input type=file name=document></label>
+	<label>Note <input name=note value=hello></label>
+	<button type=submit>Send</button>
+	</form>`

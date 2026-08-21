@@ -133,6 +133,11 @@ type session struct {
 	// as long as that act lasts. Nil the rest of the time, which is the ordinary state — see
 	// chrome/write.go for why the lifetime is the act's and not a number of milliseconds.
 	mayWrite *writeWindow
+	// attachDir is where this session's uploads were written, or empty until one is. Per session
+	// and not per act, because Chromium reads a file input's file when the FORM IS SUBMITTED — a
+	// later act than the one that attached it — so a directory cleaned up when the upload returned
+	// would be a form that submits nothing and reports success. Removed by Close.
+	attachDir string
 	// writes are the form submissions this session has actually sent and not yet reported. NOT reset
 	// with the rest of the per-document state: a submission navigates, so resetting on navigation
 	// would throw away the record of the very thing that caused it.
@@ -628,6 +633,10 @@ func (d *Driver) Close(ctx context.Context, id browser.SessionID) error {
 	_, callErr := d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{
 		"targetId": entry.target,
 	})
+	// Before the session is forgotten, because forgetAttachments reads it. A session that closes
+	// without this leaves the agent's own words on the disk of a machine it was never asked to
+	// write to.
+	d.forgetAttachments(entry)
 	d.mu.Lock()
 	delete(d.sessions, id)
 	delete(d.targets, entry.target)

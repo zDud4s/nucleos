@@ -260,3 +260,13 @@
   gap: var(--space-2);
   margin: 0 0 var(--space-3);
 }
+
+/* A submission that carried a file, on the record screen.
+   Toned rather than plain, and it is the only line in this list that is: "a
+   comment was posted" and "a document was posted" are not the same event, and
+   somebody scanning the record for something they did not expect is looking
+   for exactly that difference. The names are here; what the file said is
+   deliberately nowhere (migration 0098). */
+.browser-files {
+  color: var(--tone-danger-fg);
+}

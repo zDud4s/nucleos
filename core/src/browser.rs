@@ -354,6 +354,11 @@ pub struct Written {
     /// The act that caused it: the ref from the snapshot, and the verb.
     pub element_ref: String,
     pub verb: String,
+    /// The names of any files that went with it. Empty is "none went"; the column is NULL for rows
+    /// written before attachments existed, and both read as empty here — the distinction lives in
+    /// the database, where migration 0098 explains it, and there is nothing a screen would do
+    /// differently with it.
+    pub files: Vec<String>,
     pub written_at: String,
 }
 
@@ -373,11 +378,19 @@ pub async fn record_writes(
 ) {
     for wrote in writes {
         let fields = serde_json::to_string(&wrote.fields).unwrap_or_else(|_| "[]".to_string());
+        // `None` when nothing was attached, and not an empty list. Migration 0098 asks for the
+        // distinction: a row that predates attachments and a submission that carried none are
+        // different facts, and a column that says "[]" for both loses the only one it could tell.
+        let files = if wrote.files.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&wrote.files).unwrap_or_else(|_| "[]".to_string()))
+        };
         let outcome = sqlx::query(
             "INSERT INTO browser_writes \
              (session_id, project_id, origin, action, method, fields, field_count, ref, verb, \
-              written_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              files, written_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(session_id)
         .bind(project_id)
@@ -388,6 +401,7 @@ pub async fn record_writes(
         .bind(wrote.field_count)
         .bind(&wrote.r#ref)
         .bind(&wrote.verb)
+        .bind(&files)
         .bind(now)
         .execute(pool)
         .await;
@@ -412,8 +426,9 @@ pub async fn list_writes(
     limit: i64,
 ) -> sqlx::Result<Vec<Written>> {
     let rows = sqlx::query(
-        "SELECT id, session_id, origin, action, method, fields, field_count, ref, verb, written_at \
-         FROM browser_writes WHERE project_id = ? ORDER BY written_at DESC, id DESC LIMIT ?",
+        "SELECT id, session_id, origin, action, method, fields, field_count, ref, verb, files, \
+         written_at FROM browser_writes WHERE project_id = ? ORDER BY written_at DESC, id DESC \
+         LIMIT ?",
     )
     .bind(project_id)
     .bind(limit.clamp(1, 500))
@@ -433,6 +448,10 @@ pub async fn list_writes(
             field_count: row.get("field_count"),
             element_ref: row.get::<Option<String>, _>("ref").unwrap_or_default(),
             verb: row.get::<Option<String>, _>("verb").unwrap_or_default(),
+            files: row
+                .get::<Option<String>, _>("files")
+                .and_then(|said| serde_json::from_str(&said).ok())
+                .unwrap_or_default(),
             written_at: row.get("written_at"),
         })
         .collect())
@@ -1002,6 +1021,11 @@ pub struct ActBody {
     pub element_ref: String,
     #[serde(default)]
     pub text: String,
+    /// Upload's second argument: what the file is called. A NAME, judged as one by the sidecar
+    /// before anything touches a disk — the daemon does not resolve it, because resolving is
+    /// deciding and there is nothing here for it to decide against.
+    #[serde(default)]
+    pub filename: String,
 }
 
 /// `POST /browser/open`.
@@ -1094,7 +1118,13 @@ pub async fn post_act(
     match state
         .browser
         .client
-        .act(&row.sidecar_id, &body.kind, &body.element_ref, &body.text)
+        .act(
+            &row.sidecar_id,
+            &body.kind,
+            &body.element_ref,
+            &body.text,
+            &body.filename,
+        )
         .await
     {
         Ok(result) => {
@@ -1823,6 +1853,7 @@ mod tests {
                 field_count: 9,
                 r#ref: "e7".into(),
                 verb: "click".into(),
+                files: Vec::new(),
             }],
             NOW,
         )
@@ -1855,6 +1886,7 @@ mod tests {
             field_count: 1,
             r#ref: "e1".into(),
             verb: "click".into(),
+            files: Vec::new(),
         };
         record_writes(
             &db.pool,
@@ -1909,6 +1941,7 @@ mod tests {
                 field_count: 1,
                 r#ref: "e1".into(),
                 verb: "click".into(),
+                files: Vec::new(),
             }],
             NOW,
         )

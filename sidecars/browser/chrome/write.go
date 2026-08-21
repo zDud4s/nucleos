@@ -159,8 +159,12 @@ func (d *Driver) armWrite(ctx context.Context, entry *session, on cdp.SessionID,
 		form: browser.Write{
 			Fields:     names,
 			FieldCount: seen.Count,
-			Ref:        action.Ref,
-			Verb:       string(action.Kind),
+			// Read HERE, at the moment the form is armed, and not when the request is answered. By
+			// then the fence has bytes and no page: a multipart body says a file went, and only the
+			// document doing the submitting knows what it was called.
+			Files: d.attachedNames(ctx, on, objectID),
+			Ref:   action.Ref,
+			Verb:  string(action.Kind),
 		},
 	}
 	d.mu.Lock()

@@ -350,6 +350,11 @@ pub struct Write {
     pub r#ref: String,
     #[serde(default)]
     pub verb: String,
+    /// The NAMES of any files this submission carried, and never their contents. Migration 0098
+    /// carries the argument; it is `fields`' argument concentrated, because a file is the densest
+    /// thing an agent can send and the one an owner is most likely to have forgotten they had.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 impl ActResult {
@@ -495,6 +500,7 @@ impl BrowserClient {
         kind: &str,
         element_ref: &str,
         text: &str,
+        filename: &str,
     ) -> Result<ActResult, BrowserError> {
         self.call(
             "/act",
@@ -503,6 +509,10 @@ impl BrowserClient {
                 "kind": kind,
                 "ref": element_ref,
                 "text": text,
+                // Only upload reads it, and it travels on every act for the reason every other
+                // argument does: a shape that changes with the verb is a shape each end has to agree
+                // about twice.
+                "filename": filename,
             }),
         )
         .await
@@ -942,7 +952,7 @@ mod tests {
             .expect("snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
 
-        let result = client.act("s1", "click", "e5", "").await.expect("act");
+        let result = client.act("s1", "click", "e5", "", "").await.expect("act");
         assert!(result.refused(), "a refusal must survive as a value");
 
         let ticket = client.handoff("s1", "login").await.expect("handoff");

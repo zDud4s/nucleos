@@ -66,6 +66,7 @@ function written(overrides: Partial<Written> = {}): Written {
     field_count: 2,
     element_ref: "e7",
     verb: "click",
+    files: [],
     written_at: "2026-08-17T09:30:00Z",
     ...overrides,
   };
@@ -377,6 +378,38 @@ describe("Browser - the write grant", () => {
     expect(await screen.findByText("https://jira.example.org/browse/X-1/comment")).toBeDefined();
     expect(screen.getByText(/2 fields: body, password/)).toBeDefined();
     expect(screen.getByText(/sent by a click on e7/)).toBeDefined();
+  });
+
+  /**
+   * A submission that carried a document is not the same event as one that carried a comment, and
+   * the record is the only place the owner ever sees either. The names show; what the file said is
+   * deliberately not in the database at all (migration 0098), so there is nothing here to leak.
+   */
+  it("says when a submission carried a file, and says what it was called", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written({ files: ["relatorio.txt"] })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/with a file: relatorio.txt/)).toBeDefined();
+  });
+
+  /** And a submission that carried none says nothing about files, rather than "0 files". */
+  it("stays quiet about files when none went", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written()],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/2 fields: body, password/)).toBeDefined();
+    expect(screen.queryByText(/with a file/)).toBeNull();
+    expect(screen.queryByText(/with 0 files/)).toBeNull();
   });
 
   /** A profile that has written nothing says so, rather than showing an empty box. */

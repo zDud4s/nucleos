@@ -128,6 +128,57 @@ func TestRefusalIsTwoHundred(t *testing.T) {
 	}
 }
 
+// TestUploadCrossesTheWireWithBothOfItsArguments.
+//
+// **The gap this closes was live for the length of an afternoon.** The gate exercises upload against
+// a real Chromium by calling `driver.Act` directly, so it never touches this package — and this
+// package's request struct had no `filename` at all, while `parseKind` had never heard of the verb.
+// Every test in the repository was green, and through the daemon the upload would have been rejected
+// at the door.
+//
+// It is the failure `Asked` was added for one struct over: a field a wire shape is MISSING does not
+// error. The sender fills it, the decoder finds no home for it, and the driver answers a request
+// nobody made.
+func TestUploadCrossesTheWireWithBothOfItsArguments(t *testing.T) {
+	driver := &browser.Fake{FenceAttached: true}
+	server := testServer(t, driver)
+
+	var session browser.Session
+	response := post(t, server, "/open", opening("https://example.org/"), true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("open: got %d", response.StatusCode)
+	}
+	if err := json.NewDecoder(response.Body).Decode(&session); err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+
+	response = post(t, server, "/act", ActRequest{
+		SessionID: string(session.ID),
+		Kind:      "upload",
+		Ref:       "e5",
+		Text:      "linha um",
+		Filename:  "relatorio.txt",
+	}, true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; upload is a kind this server has to know", response.StatusCode)
+	}
+
+	if len(driver.Actions) != 1 {
+		t.Fatalf("actions = %+v, want the one upload", driver.Actions)
+	}
+	got := driver.Actions[0]
+	if got.Kind != browser.ActionUpload {
+		t.Fatalf("kind = %q", got.Kind)
+	}
+	if got.Filename != "relatorio.txt" {
+		t.Fatalf("filename = %q: it did not survive the wire, so the driver was handed a file with "+
+			"no name and would refuse it for having none", got.Filename)
+	}
+	if got.Text != "linha um" {
+		t.Fatalf("text = %q: the contents did not survive the wire", got.Text)
+	}
+}
+
 // TestUnknownActionKindIsRefusedAtTheDoor. The vocabulary is closed (spec §6.2, consequence-free in
 // v1); an unknown verb must not reach a driver that might interpret it generously.
 func TestUnknownActionKindIsRefusedAtTheDoor(t *testing.T) {

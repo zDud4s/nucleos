@@ -429,6 +429,7 @@ impl DaemonClient {
         kind: &str,
         element_ref: &str,
         text: Option<String>,
+        filename: Option<String>,
     ) -> Result<Value, String> {
         self.request(reqwest::Method::POST, "/browser/act")
             .json(&serde_json::json!({
@@ -436,6 +437,7 @@ impl DaemonClient {
                 "kind": kind,
                 "ref": element_ref,
                 "text": text.unwrap_or_default(),
+                "filename": filename.unwrap_or_default(),
             }))
             .send()
             .await

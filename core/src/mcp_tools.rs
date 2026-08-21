@@ -147,19 +147,26 @@ struct BrowserSnapshotParams {
 struct BrowserActParams {
     /// The session id browser_open gave back.
     session_id: i64,
-    /// One of: click, type, scroll, select, press, back, goto.
+    /// One of: click, type, scroll, select, press, back, goto, upload.
     kind: String,
     /// A ref from the most recent snapshot, such as "e5". Never a CSS selector, and never a ref
-    /// you have not seen in a snapshot of THIS page. Required for click, type and select. Leave
-    /// it out to scroll the page itself, to send a key wherever the focus already is, or to go
-    /// back or goto.
+    /// you have not seen in a snapshot of THIS page. Required for click, type, select and upload.
+    /// Leave it out to scroll the page itself, to send a key wherever the focus already is, or to
+    /// go back or goto.
     #[serde(rename = "ref", default)]
     element_ref: String,
+    /// Only for "upload": what the file is called when the site receives it. A NAME - no folders,
+    /// no "..", no drive letters. Give it something a person reading the record would recognise,
+    /// because that name is what gets written down.
+    #[serde(default)]
+    filename: Option<String>,
     /// The verb's argument: the characters for "type", the option's visible label for "select",
     /// the key's name for "press" (Enter, Tab, Escape, Backspace, Delete, Home, End, PageUp,
     /// PageDown, ArrowUp/Down/Left/Right - no modifiers), the direction for a page "scroll"
-    /// (down, up, top, bottom; down if you say nothing), and the url for "goto" - absolute, or
-    /// relative to the page you are on.
+    /// (down, up, top, bottom; down if you say nothing), the url for "goto" - absolute, or
+    /// relative to the page you are on - and the file's CONTENTS for "upload". You write the file
+    /// here: there is no way to attach one that already exists on this machine, and a path is not
+    /// something this accepts.
     text: Option<String>,
 }
 
@@ -584,6 +591,12 @@ impl NucleosTools {
                        read, which is how you reach an address the page names in words \
                        rather than as a link. type PASTES - it fires no keystroke - so a \
                        box that submits on Enter needs a press after it. \
+                       upload attaches a file to a file input: `text` is the file's CONTENTS and \
+                       `filename` is what it is called. You WRITE the file here - there is no way \
+                       to attach one that is already on this machine, and asking for a path will \
+                       not work. So this carries what you can compose: a note, a CSV you built, a \
+                       report you wrote. Attaching does not send anything; the file goes when you \
+                       submit the form, and that submission is judged like any other. \
                        select works on a real dropdown and says so when the thing is not one. \
                        click moves a real pointer onto the element before pressing, so a menu \
                        that opens on hover is already open in your next snapshot. It can refuse: \
@@ -617,11 +630,12 @@ impl NucleosTools {
             kind,
             element_ref,
             text,
+            filename,
         }): Parameters<BrowserActParams>,
     ) -> String {
         json_result(
             self.client
-                .browser_act(session_id, &kind, &element_ref, text)
+                .browser_act(session_id, &kind, &element_ref, text, filename)
                 .await,
         )
     }

@@ -108,6 +108,12 @@ type ActRequest struct {
 	Kind      string `json:"kind"`
 	Ref       string `json:"ref"`
 	Text      string `json:"text,omitempty"`
+	// Filename is upload's second argument. A field a wire shape is missing is the one thing that
+	// fails in total silence — the sender fills it, the decoder finds no home for it, and the
+	// driver answers a request nobody made. That happened once already on this struct, with
+	// `controls_from`, and it is why `browser.Fake` records the whole request rather than the
+	// pieces a caller happened to check.
+	Filename string `json:"filename,omitempty"`
 }
 
 // HandoffRequest asks for the session to be made ready for a person.
@@ -183,13 +189,14 @@ func actHandler(driver browser.Driver) http.HandlerFunc {
 		if !ok {
 			// A closed vocabulary, refused at the door. An unknown verb must not reach a driver
 			// that might interpret it generously (spec §6.2: consequence-free in v1).
-			http.Error(w, "unknown action kind: expected click, type, scroll, select, press, back or goto", http.StatusBadRequest)
+			http.Error(w, "unknown action kind: expected click, type, scroll, select, press, back, goto or upload", http.StatusBadRequest)
 			return
 		}
 		result, err := driver.Act(r.Context(), browser.SessionID(request.SessionID), browser.Action{
-			Kind: kind,
-			Ref:  request.Ref,
-			Text: request.Text,
+			Kind:     kind,
+			Ref:      request.Ref,
+			Text:     request.Text,
+			Filename: request.Filename,
 		})
 		if err != nil {
 			writeDriverError(w, "act", err)
@@ -388,7 +395,8 @@ func forgetHandler(profiles browser.Profiles) http.HandlerFunc {
 func parseKind(raw string) (browser.ActionKind, bool) {
 	switch kind := browser.ActionKind(raw); kind {
 	case browser.ActionClick, browser.ActionType, browser.ActionScroll,
-		browser.ActionSelect, browser.ActionPress, browser.ActionBack, browser.ActionGoto:
+		browser.ActionSelect, browser.ActionPress, browser.ActionBack, browser.ActionGoto,
+		browser.ActionUpload:
 		return kind, true
 	default:
 		return "", false
