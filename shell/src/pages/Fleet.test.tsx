@@ -82,6 +82,11 @@ function slot(overrides: Partial<HeldSlot> = {}): HeldSlot {
     owner_kind: "job",
     owner_id: 41,
     claimed_at: "2026-08-17T09:00:00Z",
+    // The daemon joins these on for an item and leaves them null for everything
+    // else, so null is what the default fixture — a job's slot — really carries.
+    job_id: null,
+    ordinal: null,
+    item_status: null,
     ...overrides,
   };
 }
@@ -278,6 +283,134 @@ describe("Fleet — columns", () => {
     expect(cut.kind).toBe("unknown");
     const whole = slotDetail(slot({ owner_id: 41 }), [job({ id: 99 })], undefined, 50);
     expect(whole.kind).toBe("orphaned");
+  });
+
+  it("describes an item's slot through its job, and never through the run that shares its number", () => {
+    // One item of a job a team directs holds a slot of its own, and `owner_id`
+    // for it is `job_items.id` — a number no route lists and no reader knows.
+    // Until it had an arm here, anything that was not a job fell through to the
+    // runs listing, so the card carried the status and prompt of an unrelated run
+    // that happened to be numbered the same: the exact confusion `ownerKey` was
+    // written to prevent, arriving through the door nobody was watching.
+    const item = slot({ slot: 1, owner_kind: "item", owner_id: 7, job_id: 41, ordinal: 2, item_status: "running" });
+    const detail = slotDetail(item, [job({ id: 41 })], [run({ id: 7 })]);
+
+    expect(detail).toEqual({ kind: "item", job: job({ id: 41 }), ordinal: 2, status: "running" });
+
+    // And the run that shares the number is still described as itself.
+    const sharing = slot({ slot: 1, owner_kind: "run", owner_id: 7 });
+    expect(slotDetail(sharing, [job()], [run({ id: 7 })]).kind).toBe("run");
+  });
+
+  it("says it cannot describe an item whose job it was not told, rather than guessing", () => {
+    // `job_id` absent means the slot's item row has gone, which is a leaked slot
+    // waiting on `reconcile_orphaned_slots` and not a description problem. It
+    // reads `unknown` and never `orphaned`: the second is a claim about a LISTING
+    // that answered without it, and here no listing was consulted at all.
+    const orphanedSlot = slot({ slot: 1, owner_kind: "item", owner_id: 7, job_id: null });
+    expect(slotDetail(orphanedSlot, [job()], [run({ id: 7 })]).kind).toBe("unknown");
+
+    // And a job that IS named but is not in a complete listing is the leak the
+    // job arm already reports, reported the same way.
+    const gone = slot({ slot: 1, owner_kind: "item", owner_id: 7, job_id: 99, ordinal: 0, item_status: "running" });
+    expect(slotDetail(gone, [job({ id: 41 })], undefined, 50).kind).toBe("orphaned");
+  });
+
+  it("shows an item's card its own collision, and no cancel it has no route for", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 2 },
+            projects: [
+              column({
+                slots: [
+                  slot({ slot: 0, owner_kind: "item", owner_id: 7 }),
+                  slot({ slot: 1, owner_kind: "item", owner_id: 8 }),
+                ],
+                collision: {
+                  declared: { state: "clean", overlaps: [] },
+                  // Two items of one job, named apart. While the daemon
+                  // collapsed a job's items into `job:<id>`, this pair had
+                  // nowhere to appear and the card said nothing at all.
+                  observed: {
+                    state: "collide",
+                    overlaps: [
+                      {
+                        a: { kind: "item", id: 7 },
+                        b: { kind: "item", id: 8 },
+                        paths: ["core/src/job.rs"],
+                      },
+                    ],
+                  },
+                },
+              }),
+            ],
+          },
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const mine = await screen.findByRole("article", { name: "slot 0 — item 7" });
+    expect(within(mine).getByText(/also touched by item 8/)).toBeDefined();
+    expect(within(mine).getByText(/core\/src\/job\.rs/)).toBeDefined();
+    // No `/items/<id>/cancel` exists, and the number would aim the one route
+    // there is at somebody else's run. The gesture that stops this work is the
+    // job's, on the job's card.
+    expect(within(mine).queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
+  it("an item's card says which item of which job it is", async () => {
+    // The half that was missing while the card could only print `item 7`: an id
+    // out of a sequence nobody reads, next to a slot number, next to nothing.
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 2 },
+            projects: [
+              column({
+                slots: [
+                  slot({ slot: 0, owner_id: 41 }),
+                  slot({
+                    slot: 1,
+                    owner_kind: "item",
+                    owner_id: 7,
+                    job_id: 41,
+                    ordinal: 2,
+                    item_status: "conflicted",
+                  }),
+                ],
+              }),
+            ],
+          },
+          jobs: [job({ id: 41, rule_name: "nightly-backlog" })],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    const card = await screen.findByRole("article", { name: "slot 1 — item 7" });
+    // Counting from one on screen and from zero in the row, like every other
+    // place this repository prints an ordinal to a person.
+    expect(within(card).getByText(/item 3 of job 41/)).toBeDefined();
+    expect(within(card).getByText(/nightly-backlog/)).toBeDefined();
+    // A slot is held from the claim until the item is terminal, so "it holds a
+    // slot" says nothing about whether it is working. This one is waiting on a
+    // person, and until `itemReading` learned the four states of a parallel item
+    // every one of them fell to its default and read as "to do".
+    expect(within(card).getByText(/the merge conflicted/)).toBeDefined();
+    expect(
+      within(card).queryByText(/detail unavailable/i),
+      "the card can describe itself now, so it must stop saying it cannot",
+    ).toBeNull();
+    expect(
+      within(card).queryByText(/to do/),
+      "an item mid-conflict is not work nobody has started",
+    ).toBeNull();
   });
 
   it("keeps the last good cards and says the view is stale when a refetch fails", async () => {

@@ -35,10 +35,35 @@ export interface HouseCapacity {
 export interface HeldSlot {
   project_id: string;
   slot: number;
-  /** A worktree run holds a slot too — counting jobs alone would over-report the room left. */
-  owner_kind: "run" | "job";
+  /**
+   * A worktree run holds a slot too — counting jobs alone would over-report the
+   * room left — and so does one item of a job a team directs, which gets a
+   * checkout of its own and pays for it under the same house rule.
+   */
+  owner_kind: "run" | "job" | "item";
   owner_id: number;
   claimed_at: string;
+  /**
+   * The job an ITEM belongs to, and `null` for every other kind of owner.
+   *
+   * Joined by the daemon rather than looked up here, because there is nothing
+   * here to look it up in: `owner_id` for an item is `job_items.id`, and no
+   * route lists items by id. Nor should one — an item is a step of a job, and
+   * the way to reach one is through the job that owns it.
+   */
+  job_id: number | null;
+  /** Which item of that job, counting from zero. `null` for the other kinds. */
+  ordinal: number | null;
+  /**
+   * What that item is doing, and `null` for the other kinds.
+   *
+   * Not the same question as "does it hold a slot". A slot is held from the
+   * claim until the item is terminal, and that window covers `running`,
+   * `merging`, `conflicted` and `reverted` — one of which is work in progress
+   * and one of which is work waiting on a person. A capacity screen that cannot
+   * tell those apart cannot say whether a slot is busy or stuck.
+   */
+  item_status: string | null;
 }
 
 /** Whose tree an overlap belongs to. Job ids and run ids collide, so the pair is the identity. */
@@ -200,6 +225,21 @@ export interface NewJob {
 export interface SlotOwner {
   kind: "run" | "job";
   id: number;
+}
+
+/**
+ * The owner of a slot, when the gesture that takes it back has a route to call.
+ *
+ * `null` for an item. There is no `/items/<id>/cancel`, and the kind is not a
+ * detail of the URL the way a run and a job are: an item is one step of a job,
+ * so the thing to stop is the job, and the card for that is the one beside it.
+ * Offering the button anyway would send `POST /runs/<item id>/cancel` — a
+ * destructive gesture aimed by a number that means something else, which is the
+ * defect `ownerKey` exists to prevent, arriving through the door nobody was
+ * watching.
+ */
+export function cancellableOwner(slot: HeldSlot): SlotOwner | null {
+  return slot.owner_kind === "item" ? null : { kind: slot.owner_kind, id: slot.owner_id };
 }
 
 /**

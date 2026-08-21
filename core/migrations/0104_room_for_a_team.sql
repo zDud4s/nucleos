@@ -1,0 +1,30 @@
+-- The two concurrency ceilings go up by one, because a job with a team needs more than one checkout.
+--
+-- **Without this the feature ships switched off, and nothing would say so.** The house rule is one
+-- tree, one slot. A job holds a slot for the branch it integrates into, and every item worked in
+-- parallel holds its own -- so a job running `k` items at once needs `k + 1` project slots. At the
+-- ceiling of 2 that 0052 set, `k` is 1: every plan would be executed one item at a time, every
+-- measurement would show the sequential timings, and the only symptom would be that parallelism
+-- never seemed to help. That is how an earlier draft of this design fooled itself.
+--
+-- 3 per project: the integration tree plus two items. 4 in the house: one project running a team
+-- while a second gets on with something. The per-project number is still measured against the same
+-- thing 0052 measured it against -- "two simultaneous gates are two cold Rust builds" -- and that
+-- has not changed. What changed is that one job can now bring more than one tree.
+--
+-- **`WHERE` the old default, and the cost of that is worth saying.** A row still holding 2 and 3 is
+-- almost always a row nobody has ever opened the setting on: 0052 backfilled every install with
+-- those numbers. But an owner who looked at the setting and deliberately chose 2 is indistinguishable
+-- from one who never looked, and this raises theirs too. The alternative is leaving every existing
+-- install unable to run the thing this slice turns on. The setting is one screen away in either
+-- direction.
+--
+-- No column DEFAULT is touched, and none needs to be: `autopilot_global` has exactly one row,
+-- inserted by 0006, and nothing ever inserts another. The DEFAULT only ever mattered for 0052's
+-- backfill.
+--
+-- `worktree_root` is a sibling of each project root (`worktree.rs:31-39`), so the disk this spends
+-- is the disk of the project that spends it. `runs::no_room_on_disk` refuses a checkout below a
+-- configurable floor, which is the check that keeps a raised ceiling from filling a volume.
+UPDATE autopilot_global SET max_concurrent_slots = 3 WHERE max_concurrent_slots = 2;
+UPDATE autopilot_global SET max_concurrent_total = 4 WHERE max_concurrent_total = 3;

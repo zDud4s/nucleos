@@ -1,0 +1,23 @@
+-- Which agent of the team works this item.
+--
+-- The half of "a team per job" that makes the word `team` mean something. Without it a team is a
+-- number (`max_parallel`) and a set of rules about a graph; with it the director is choosing WHO
+-- does each piece, out of a roster whose `speciality` line exists for exactly that -- `agent.rs:11`
+-- says so: "This is what a director reads to decide who gets the work, so it is load-bearing and
+-- not decoration."
+--
+-- NULL is the information: nobody was asked, because this job has no team. Every item of every job
+-- without one has it, and so does every item written before this column existed. There is no
+-- default agent and there must not be: a job without a team runs its items with the same brief it
+-- always ran them with, and inventing a persona for them would change every job in the repository.
+--
+-- REFERENCES agents(id) and not a copy of the prompt, following `team_items.agent_id` (0071). The
+-- consequence is deliberate: an agent edited between the plan and the run works the item as it is
+-- NOW, because what the row stores is who, not what they were told. And `agent.rs:203` already
+-- guarantees the id survives a rename -- "The id is deliberately NOT recomputed from the new name:
+-- it is a reference".
+--
+-- An agent deleted between the plan and the run is the one case this cannot express, and
+-- `foreign_keys` is on, so the delete is refused while the row points at it. `agent::delete` has an
+-- `InUse` arm for that; this column joins `team_items` and `teams.director_agent_id` in it.
+ALTER TABLE job_items ADD COLUMN agent_id TEXT REFERENCES agents(id);
