@@ -2070,6 +2070,19 @@ impl CommandRunner for CodexCliRunner {
     }
 }
 
+/// What a run was launched WITH, as opposed to what it went on to do.
+///
+/// Its own type rather than four loose fields, because the four answer one question together --
+/// does this run start with a past?
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    pub prompt: String,
+    pub resume_session_id: Option<String>,
+    pub session_id: Option<String>,
+    pub fork_session: bool,
+}
+
 /// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
 /// it into the daemon would ship a runner that can fake a run's outcome.
 #[cfg(test)]
@@ -2104,6 +2117,14 @@ pub struct FakeCommandRunner {
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
     pub calls: std::sync::Mutex<u32>,
+    /// Test-only: how the last call was launched.
+    ///
+    /// `runs.rs`'s context handoff is why this exists. Its successor was launched
+    /// `--resume <predecessor> --fork-session`, which copies a conversation rather than ending one,
+    /// and nothing here could see it: this fake recorded the environment and the outcome, never the
+    /// session shape, so a run inheriting everything looked exactly like one inheriting nothing. It
+    /// took a live CLI to notice.
+    pub last_launch: std::sync::Mutex<Option<Launch>>,
     /// Test-only: the queue a plan node writes, taken by the first call that is given a handoff
     /// directory.
     ///
@@ -2130,6 +2151,12 @@ impl CommandRunner for FakeCommandRunner {
         // Before the failure injection below: what a run was handed is worth knowing even when the
         // launch is made to fail.
         *self.last_env.lock().unwrap() = Some(request.env.clone());
+        *self.last_launch.lock().unwrap() = Some(Launch {
+            prompt: request.prompt.clone(),
+            resume_session_id: request.resume_session_id.clone(),
+            session_id: request.session_id.clone(),
+            fork_session: request.fork_session,
+        });
         {
             let mut remaining = self.fail_times.lock().unwrap();
             if *remaining > 0 {
