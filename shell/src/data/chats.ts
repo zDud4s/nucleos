@@ -49,6 +49,18 @@ export interface ChatSummary {
   waiting: number;
 }
 
+/**
+ * Where a conversation runs, and whether that gives its turns tools.
+ *
+ * Two facts and not one, because a directory alone is not enough: the daemon grants tools on a
+ * directory whose classifier hook is wired, and every fresh worktree lacks one. A window that read
+ * only `cwd` would say "this conversation has a project" about one that still cannot open a file.
+ */
+export interface ChatProject {
+  cwd: string | null;
+  tools: boolean;
+}
+
 /** A conversation already had in the IDE that this daemon could continue. */
 export interface IdeSession {
   session_id: string;
@@ -314,7 +326,7 @@ export function useLocalModel() {
  * conversation" picker, and asking for it on every visit to this page would
  * be a directory scan nobody is looking at.
  */
-export function useIdeSessions(enabled: boolean) {
+export function useIdeSessions(enabled: boolean, watch = false) {
   return useQuery({
     queryKey: keys.chats.ideSessions,
     queryFn: () => apiFetch<IdeSession[]>("/assistant/ide-sessions"),
@@ -325,7 +337,26 @@ export function useIdeSessions(enabled: boolean) {
     //
     // `POLL.fast` is the cadence for "the state of the machine right now", which is what a
     // conversation somebody is in the middle of having is.
-    refetchInterval: POLL.fast,
+    //
+    // Opt-in, because the two callers want different things from the same list. The editor door is
+    // watching conversations that may be happening; the project form wants the directories in it as
+    // suggestions, and a list of folders does not need re-reading every three seconds.
+    refetchInterval: watch ? POLL.fast : false,
+  });
+}
+
+/**
+ * Where this conversation runs, and whether that gives it tools.
+ *
+ * Not polled: it changes when somebody changes it — points the conversation at a project, or wires
+ * that project's hook — and both of those are mutations in this window that invalidate it. A timer
+ * would be re-stating a filesystem to itself.
+ */
+export function useChatProject(chatId: string) {
+  return useQuery({
+    queryKey: keys.chats.project(chatId),
+    queryFn: () =>
+      apiFetch<ChatProject>(`/assistant/chats/${encodeURIComponent(chatId)}/project`),
   });
 }
 
@@ -536,6 +567,50 @@ export function useDropQueued(chatId: string) {
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Point a conversation at the project it is about.
+ *
+ * The only way a conversation opened here ever gets tools. The daemon refuses a path that is not an
+ * absolute directory, so a typo comes back as a refusal rather than as a conversation that looks
+ * fine until somebody asks it to read a file.
+ *
+ * It also drops the session the conversation was on, which is why the transcript is invalidated
+ * too: the next turn starts a fresh one, in the new tree.
+ */
+export function useSetChatProject(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (cwd: string) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ cwd }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Wire the classifier hook in this conversation's project, which is what turns talk into tools.
+ *
+ * The same act the editor door offers before a pick-up, reached from the other side: there it is a
+ * session that has a directory, here a conversation that was given one.
+ */
+export function useWireChatTools(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/tools`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
     },
   });
 }

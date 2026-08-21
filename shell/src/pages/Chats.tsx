@@ -8,9 +8,12 @@ import {
   useCreateChat,
   useIdeConversation,
   useIdeSessions,
+  useSetChatProject,
+  useWireChatTools,
   useWireIdeSessionTools,
   useChatCommands,
   useChatFiles,
+  useChatProject,
   useDropQueued,
   useLiveTurn,
   useLocalModel,
@@ -394,7 +397,7 @@ function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
  * quietly starts a fresh conversation instead of the one you chose.
  */
 function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
-  const sessions = useIdeSessions(true);
+  const sessions = useIdeSessions(true, true);
   const [sessionId, setSessionId] = useState<string | null>(null);
   // Watched, not merely read: this is the one panel where the conversation on screen may be being
   // typed into while somebody looks at it.
@@ -567,7 +570,7 @@ function ChatDetail({
         </div>
       )}
 
-      {summary !== undefined && summary.cwd === null && <NoProject />}
+      <Project chatId={chatId} />
 
       {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
@@ -596,26 +599,129 @@ function ChatDetail({
 }
 
 /**
- * What a conversation started here cannot do, and why it will never be able to.
+ * Where this conversation runs, and what that lets it do.
  *
- * A conversation's working directory is written once, at creation, out of the editor session it was
- * picked up from — `chats.cwd` has no other writer anywhere in the daemon. One started here has
- * none, so `tool_policy_for` answers `McpOnly` for as long as it exists: no Bash, no Read, no Write.
+ * Three states and each says a different thing, because they are three different situations and
+ * running them together is how a person ends up guessing:
  *
- * Nothing said so. You would ask it to fix a file, watch it not fix the file, and have nowhere to
- * find out why — the same silence `NoTools` ends on the other side of the pick-up, and the worse
- * half of it, because there is no button here that would change the answer.
+ * - **no project** — it can talk and nothing else, and here is how to change that;
+ * - **a project with no wired hook** — it has a tree and still cannot touch it, and here is the one
+ *   press that fixes it;
+ * - **both** — a quiet line naming the folder, so pressing the button leaves visible proof rather
+ *   than silence.
  *
- * So it says what this is rather than offering a cure it does not have, and names the one route that
- * does work.
+ * Read on demand and not polled: it changes when somebody changes it, and both of the somethings
+ * are mutations in this window.
  */
-function NoProject() {
+function Project({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+
+  // Nothing at all until it is known. A conversation is not "without a project" because the answer
+  // has not arrived yet, and a note that appears and then retracts itself is worse than a late one.
+  if (project.data === undefined) return null;
+  if (project.data.cwd === null) return <NoProject chatId={chatId} />;
+  if (!project.data.tools) {
+    return <ProjectWithoutTools chatId={chatId} cwd={project.data.cwd} />;
+  }
+  return <p className="chats-project-where">this conversation is about {project.data.cwd}</p>;
+}
+
+/**
+ * What a conversation started here cannot do, and the way to change it.
+ *
+ * A conversation's working directory used to be written once, at creation, out of the editor
+ * session it was picked up from — so one started here had none, and `tool_policy_for` answered
+ * `McpOnly` for as long as it existed. No Bash, no Read, no Write, and nothing said so: you would
+ * ask it to fix a file, watch it not fix the file, and have nowhere to find out why.
+ *
+ * The suggestions are the folders the editor's own sessions were had in, which is where somebody
+ * asking this question almost always means. Typed rather than picked from a dialog because a native
+ * folder picker is a Tauri plugin this app does not carry, and the daemon refuses a path that is not
+ * an absolute directory — so a typo comes back as a sentence instead of as a broken conversation.
+ */
+function NoProject({ chatId }: { chatId: string }) {
+  const point = useSetChatProject(chatId);
+  // Not watched: these are wanted as a list of folders, and a list of folders does not need
+  // re-reading every three seconds.
+  const sessions = useIdeSessions(true);
+  const [path, setPath] = useState("");
+
+  const folders = Array.from(new Set((sessions.data ?? []).map((session) => session.cwd)));
+
   return (
-    <p className="chats-new-warning" role="status">
-      this conversation has no project — it can talk about code and remember what was said, but it{" "}
-      <b>cannot open a file, run a command, or change anything</b> on this machine. A conversation
-      gets those by being picked up from the editor.
-    </p>
+    <div className="chats-project">
+      <p className="chats-new-warning" role="status">
+        this conversation has no project — it can talk about code and remember what was said, but it{" "}
+        <b>cannot open a file, run a command, or change anything</b> on this machine.
+      </p>
+      <form
+        className="chats-project-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (point.isPending) return;
+          point.mutate(path.trim());
+        }}
+      >
+        <label htmlFor="chat-project">Project folder</label>
+        <input
+          id="chat-project"
+          list="chat-project-folders"
+          className="chats-project-path"
+          placeholder="C:/Projects/something"
+          value={path}
+          onChange={(event) => setPath(event.target.value)}
+        />
+        <datalist id="chat-project-folders">
+          {folders.map((folder) => (
+            <option key={folder} value={folder} />
+          ))}
+        </datalist>
+        <Button type="submit" intent="go" disabled={point.isPending || path.trim() === ""}>
+          Use this project
+        </Button>
+      </form>
+      {point.isError && <ProjectRefusal error={point.error} />}
+    </div>
+  );
+}
+
+/**
+ * A conversation that has a tree and still cannot touch it.
+ *
+ * The daemon grants tools on a directory whose classifier hook is wired, and a fresh worktree has
+ * none — `.claude/` is not committed. Same words as the editor door's own warning, because it is the
+ * same situation reached from the other side.
+ */
+function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
+  const wire = useWireChatTools(chatId);
+
+  return (
+    <div className="chats-project">
+      <p className="chats-new-warning" role="status">
+        this conversation is about {cwd}, which has no núcleo hook — it can talk about the code but{" "}
+        <b>cannot read or change any file</b>, and cannot run anything
+      </p>
+      <Button type="button" disabled={wire.isPending} onClick={() => wire.mutate()}>
+        Give it the tools
+      </Button>
+      {wire.isError && <WireRefusal error={wire.error} cwd={cwd} />}
+    </div>
+  );
+}
+
+function ProjectRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return <ErrorNote>the núcleo did not answer — the conversation was left as it was</ErrorNote>;
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        bad_request: "that has to be an absolute path to a folder that exists on this machine",
+        conflict: "this conversation is answering — wait for the turn to end, then move it",
+        not_found: "that conversation is no longer here",
+      }}
+    />
   );
 }
 

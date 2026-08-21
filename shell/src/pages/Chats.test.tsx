@@ -27,7 +27,14 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary, Command, Conversation, IdeSession, Mention } from "../data/chats";
+import type {
+  ChatProject,
+  ChatSummary,
+  Command,
+  Conversation,
+  IdeSession,
+  Mention,
+} from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
@@ -125,6 +132,14 @@ function chatsFetch(
     commands?: Record<string, Command[]>;
     /** What is waiting to be said to each conversation, by chat id. */
     queued?: Record<string, Array<{ id: number; text: string }>>;
+    /**
+     * Where each conversation runs and whether that gives it tools, by chat id.
+     *
+     * Absent means "read it off the summary and assume the hook is wired", which is the ordinary
+     * case: a test that cares about a conversation with a directory and NO tools is testing that
+     * distinction and says so.
+     */
+    projects?: Record<string, ChatProject>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -171,6 +186,22 @@ function chatsFetch(
       const offered = opts.commands?.[decodeURIComponent(commands[1])] ?? [];
       const query = decodeURIComponent(commands[2]).toLowerCase();
       return { commands: offered.filter((hit) => hit.name.toLowerCase().includes(query)) };
+    }
+    const project = /^\/assistant\/chats\/([^/?]+)\/project$/.exec(path);
+    if (project !== null) {
+      const chatId = decodeURIComponent(project[1]);
+      const told = opts.projects?.[chatId];
+      if (told !== undefined) return told;
+      const row = chats.find((chat) => chat.chat_id === chatId);
+      return { cwd: row?.cwd ?? null, tools: row?.cwd != null };
+    }
+    const wireChat = /^\/assistant\/chats\/([^/?]+)\/tools$/.exec(path);
+    if (wireChat !== null && init?.method === "POST") {
+      // What the daemon does: the hook goes into that conversation's project, and the next read
+      // says so.
+      const told = opts.projects?.[decodeURIComponent(wireChat[1])];
+      if (told !== undefined) told.tools = true;
+      return undefined;
     }
     const files = /^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
     if (files !== null) {
@@ -432,6 +463,94 @@ describe("Chats - what a conversation without a project can do", () => {
     // finished drawing, and a note that appears late would otherwise pass this by not existing yet.
     await screen.findByRole("list", { name: "Transcript" });
     expect(screen.queryByText(/cannot open a file/i)).toBeNull();
+  });
+});
+
+describe("Chats - giving a conversation a project", () => {
+  // The other half of saying it. A conversation started here had no directory and no way to be
+  // given one, so the note was a diagnosis with no treatment.
+  it("offers a way to say which project it is about, and sends it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const field = await screen.findByLabelText(/project/i);
+    fireEvent.change(field, { target: { value: "C:/Projects/nucleos" } });
+    fireEvent.click(screen.getByRole("button", { name: /use this project/i }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "PATCH",
+      );
+      expect(sent).toBeDefined();
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({
+        cwd: "C:/Projects/nucleos",
+      });
+    });
+  });
+
+  // A directory is not the whole of it: the daemon grants tools on a directory whose classifier
+  // hook is wired, and every fresh worktree lacks one. Saying "it has a project" and stopping there
+  // would be true and misleading at once.
+  it("says when it has a project and still no tools, and offers to give it them", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        { projects: { "c-1": { cwd: "C:/Projects/fresh-worktree", tools: false } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/cannot read or change any file/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /give it the tools/i }));
+
+    await waitFor(() => {
+      expect(
+        daemon.apiFetch.mock.calls.some(
+          (call) =>
+            String(call[0]) === "/assistant/chats/c-1/tools" && call[1]?.method === "POST",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("says none of it when the conversation has a project and the tools that come with it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByText(/cannot open a file/i)).toBeNull();
+    expect(screen.queryByText(/cannot read or change any file/i)).toBeNull();
+  });
+
+  // The daemon refuses a path that is not an absolute directory. A refusal that reached the person
+  // as nothing at all would leave them looking at a form that did not work and no reason why.
+  it("says so when the path is refused", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (String(path) === "/assistant/chats/c-1" && init?.method === "PATCH") {
+        throw new ApiRefusal(400, "bad_request", "Bad Request");
+      }
+      return chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      })(path, init);
+    });
+    await renderChats("/chats/c-1");
+
+    const field = await screen.findByLabelText(/project/i);
+    fireEvent.change(field, { target: { value: "not a real folder" } });
+    fireEvent.click(screen.getByRole("button", { name: /use this project/i }));
+
+    expect(await screen.findByText(/absolute path to a folder/i)).toBeTruthy();
   });
 });
 
