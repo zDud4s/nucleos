@@ -1824,6 +1824,10 @@ pub fn resolve_start(
 ///
 /// Kept apart from `Failed` because the caller turns them into different answers: no room is a 409
 /// the asker can act on by waiting, and `Failed` is a 500 nothing they do would have helped.
+///
+/// `Debug` so a test that expected a start and got a refusal can say WHICH refusal. Without it the
+/// panic reads "the job did not start" and the next hour goes on finding out why.
+#[derive(Debug)]
 pub enum JobStart {
     Started(i64),
     NoRoom(String),
@@ -8130,6 +8134,248 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("a node never finished");
+    }
+
+    /// What one walk cost, in the two units that matter.
+    ///
+    /// **Passes and never seconds.** The tick is 30 s and `MAX_STEPS_PER_PASS` is 4, so a job's wall
+    /// clock is how many times the daemon has to come back to it. A stopwatch would measure this
+    /// machine on this afternoon; passes measure the schedule, and answer the same on a busy laptop
+    /// and an idle server.
+    ///
+    /// **And writing rounds, because passes alone cannot see what parallelism buys.** A pass stops
+    /// as soon as it starts a node, so a batch of two costs one pass exactly as a batch of one does
+    /// — and the merges and gates behind them are a queue either way. What the design shortens is
+    /// the WRITING: `24 min -> 8 min (overlapped)` in the design's own table. Here the scripted
+    /// agent returns instantly, so that term weighs nothing and the totals come out equal. Counting
+    /// the passes in which an implement node actually started is how the overlapped term is
+    /// measured at all.
+    #[derive(Debug)]
+    struct Walk {
+        ending: String,
+        /// Every pass the daemon made, which is the wall-clock term the tick dominates.
+        passes: usize,
+        /// The passes that started at least one implement node: how many rounds of WRITING the
+        /// queue took. This is the number a ceiling of two is supposed to shrink.
+        writing: usize,
+    }
+
+    async fn walk_counting(state: &AppState, job_id: i64) -> Walk {
+        let started = |pool: sqlx::SqlitePool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM runs WHERE job_id = ? AND stage = 'implement'",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let mut writing = 0;
+        for pass in 1..=40 {
+            let before = started(state.pool.clone()).await;
+            job_tick(state, Utc::now()).await;
+            settle(state, job_id).await;
+            if started(state.pool.clone()).await > before {
+                writing += 1;
+            }
+            let status = job_status(&state.pool, job_id).await;
+            if !LIVE_STATUSES.contains(&status.as_str()) {
+                return Walk {
+                    ending: status,
+                    passes: pass,
+                    writing,
+                };
+            }
+        }
+        panic!(
+            "the job never reached an ending; last status {}",
+            job_status(&state.pool, job_id).await
+        );
+    }
+
+    /// A team of one, and a job it directs, over a real repository.
+    ///
+    /// The plan goes in through `plan_to_write`, so the queue this walks is one the daemon read off
+    /// disk and put through `Graph::check` — files, dependencies and an agent id all validated —
+    /// rather than three rows a fixture inserted.
+    async fn start_directed_job(
+        state: &AppState,
+        runner: &crate::runner::FakeCommandRunner,
+        repo: &std::path::Path,
+        plan: &str,
+        max_parallel: i64,
+    ) -> i64 {
+        seed_agent(&state.pool, "ana", "everything", "you are careful").await;
+        seed_crew(&state.pool, "crew", "ana", &[]).await;
+        sqlx::query("UPDATE teams SET max_parallel = ? WHERE id = 'crew'")
+            .bind(max_parallel)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        *runner.plan_to_write.lock().unwrap() = Some(plan.to_owned());
+        let root = repo.to_string_lossy().into_owned();
+        let head_sha = crate::repo_trigger::current_branch_sha(repo, "HEAD", false).await;
+        let job_id = crate::job::start(
+            state,
+            &StartRequest {
+                project_id: "project-a",
+                project_root: &root,
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                // Off: a review node is one more pass in both configurations, so it cancels out of
+                // the comparison while adding a node to every walk.
+                review: false,
+                gate_retries: 0,
+                head_sha: head_sha.as_deref(),
+                max_rounds: None,
+                budget_usd: None,
+                team_id: Some("crew"),
+            },
+        )
+        .await;
+        match job_id {
+            crate::job::JobStart::Started(job_id) => job_id,
+            other => panic!("the directed job did not start: {other:?}"),
+        }
+    }
+
+    /// The plan three scripted items produce. Items 1 and 2 both declare `a.rs`, so the fold may
+    /// never start them together; item 3 declares `b.rs` and may run beside either.
+    const THREE_ITEMS: &str = r#"{"items":[
+        {"description":"ITEM-ONE: write alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-TWO: rewrite alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-THREE: write beta","files":["b.rs"],"depends_on":[],"agent_id":"ana"}
+    ]}"#;
+
+    fn three_scripted_agents() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "ITEM-ONE".to_owned(),
+                "a.rs".to_owned(),
+                "alpha\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "a.rs".to_owned(),
+                "alpha, again\n".to_owned(),
+            ),
+            (
+                "ITEM-THREE".to_owned(),
+                "b.rs".to_owned(),
+                "beta\n".to_owned(),
+            ),
+        ]
+    }
+
+    /// **A job with a team runs its queue to the end, and the work is on the branch.**
+    ///
+    /// The first end-to-end walk of the parallel path, and the thing that made it worth building:
+    /// every slice was green and the path as a whole did nothing, because nothing committed an
+    /// item's work and an empty merge succeeds. A test that only ever asserted per-slice behaviour
+    /// could not see that, and this one cannot miss it — the files either reach the job's branch
+    /// or they do not.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_teams_job_walks_its_whole_queue_and_lands_the_work_on_the_branch() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-accept-whole-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_scripted_agents();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2).await;
+        let walk = walk_counting(&state, job_id).await;
+
+        assert_eq!(walk.ending, "completed", "the queue did not run to the end");
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"]
+        );
+
+        let (job_tree, _) = job_worktree(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job's checkout");
+        assert!(
+            job_tree.join("b.rs").exists(),
+            "item 3's work never reached the job's branch"
+        );
+        // Trimmed, because git rewrites the line ending on checkout under Windows and this
+        // assertion is about WHOSE alpha is on the branch, not about newlines.
+        assert_eq!(
+            std::fs::read_to_string(job_tree.join("a.rs"))
+                .expect("item 1 and 2 wrote alpha")
+                .trim_end(),
+            "alpha, again",
+            "the later item's alpha is what should be on the branch"
+        );
+    }
+
+    /// One walk of the three items at a given ceiling, and how many passes it took.
+    ///
+    /// A fresh repository and a fresh database each time. Sharing either would let the first walk's
+    /// branches and slots decide the second's, which is the one thing a comparison must not have.
+    async fn passes_at(max_parallel: i64, tag: &str) -> Walk {
+        let (_container, repo) = walkable_repo(tag, "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_scripted_agents();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, max_parallel).await;
+        let walk = walk_counting(&state, job_id).await;
+
+        assert_eq!(
+            walk.ending, "completed",
+            "the walk at {max_parallel} did not finish"
+        );
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"],
+            "the walk at {max_parallel} did not do all the work"
+        );
+        walk
+    }
+
+    /// **The same work at two ceilings, and the parallel one is not slower.** §7's first criterion.
+    ///
+    /// Two numbers, because one of them cannot see the thing the design changes.
+    ///
+    /// **Total passes: not more.** That is the criterion as §7 words it, and the `<=` is the whole
+    /// of it. The batch buys overlap on the writing; the merges and the gates behind it stay in a
+    /// queue however many items were written at once, so a design that shortened the queue as well
+    /// would be a different design. Asserting a strict `<` here was measured and is FALSE: three
+    /// items cost five passes at either ceiling, because a pass stops as soon as it starts a node
+    /// and the merges cost the same either way.
+    ///
+    /// **Writing rounds: strictly fewer.** This is the term the ceiling shrinks and the reason the
+    /// first assertion is worth having rather than trivially true. §7 says so in as many words: a
+    /// parallelism collapsed to one satisfies "not slower" by being the same thing, which is how an
+    /// earlier draft of this design convinced itself it worked. Two independent items written in one
+    /// round instead of two is the claim, and it is asserted on rounds the daemon really made.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_same_queue_at_two_ceilings_and_the_parallel_one_is_not_slower() {
+        let _lock = crate::worktree::test_env_lock();
+
+        let sequential = passes_at(1, "nucleos-accept-seq-").await;
+        let parallel = passes_at(2, "nucleos-accept-par-").await;
+
+        assert!(
+            parallel.passes <= sequential.passes,
+            "the parallel walk took {parallel:?} against the sequential {sequential:?}"
+        );
+        assert!(
+            parallel.writing < sequential.writing,
+            "two independent items should be written in one round rather than two: {parallel:?} \
+             against {sequential:?}"
+        );
     }
 
     /// Drives a job to an ending, one pass per loop, exactly as the daemon's tick would.
