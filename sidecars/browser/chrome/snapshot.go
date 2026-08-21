@@ -245,6 +245,12 @@ func cellText(byID map[string]axNode, id string, depth int) string {
 	}
 	name := strings.TrimSpace(node.Name.Value)
 	if interesting(node.Role.Value, name) {
+		if name == "" {
+			// An unnamed box contributes what is IN it, which is the only thing it has to say.
+			// Without this the row reads "Cabo HDMI |  | x" — the hole this function's comment says
+			// it exists to avoid, reintroduced by the very controls that were just let through.
+			return strings.TrimSpace(node.Value.Value)
+		}
 		// A control's text IS its name, and descending would say it again.
 		return name
 	}
@@ -630,13 +636,51 @@ type axNode struct {
 // else then cannot have. Nodes with no accessible name are dropped even when their role is
 // actionable: an unnamed button is one the agent could not describe a reason for pressing, and
 // offering it invites a guess.
+//
+// # The exception, which the rule above got wrong for one whole class of control
+//
+// That reasoning is about NAMING, and it was applied to everything as though it were about
+// ACTIONABILITY. For a button the two coincide: with no name there is nothing to say about what
+// pressing it does, so offering it really would be inviting a guess. For a box that HOLDS something
+// they come apart completely.
+//
+// The quantity field in a table row is the case that showed it. `<td>Cabo HDMI</td><td><input
+// value=1></td>` — the input has no label, so it had no name, so it got no ref, so there was no way
+// to type in it at all. Nothing was ambiguous about it: the row says what it is. What was missing
+// was a handle, and dropping it silently meant the agent could not even report that a field existed
+// and could not be reached.
+//
+// `browser_look` sharpened this from a limitation into a contradiction. The picture shows the box,
+// drawn among the words that explain it, and the reading has no name for the thing the picture
+// shows. Seeing a control you cannot address is worse than not seeing it.
+//
+// So: a control that holds a value earns a ref whatever it is called, because the page's own text
+// around it is what says what it is; a control that only acts still needs a name, because there its
+// name is the only thing that could. `cellText` below carries the other half — an unnamed box
+// contributes its VALUE to the row, so the row does not read with a hole where the field is.
 func interesting(role, name string) bool {
 	if name == "" {
-		return false
+		return holdsAValue(role)
 	}
 	switch role {
 	case "button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox",
 		"listbox", "menuitem", "tab", "switch", "slider", "heading":
+		return true
+	default:
+		return false
+	}
+}
+
+// holdsAValue says which controls are worth a ref even with nothing to call them.
+//
+// Every one of these has a state the agent may need to READ or SET, and every one of them appears
+// unlabelled in ordinary applications: the quantity in a table row, the checkbox that selects it,
+// the search box whose only label is a placeholder. A `link`, a `menuitem` and a `tab` are
+// deliberately absent — they go somewhere, and where they go is what a name would have told you.
+func holdsAValue(role string) bool {
+	switch role {
+	case "textbox", "searchbox", "combobox", "listbox", "checkbox", "radio", "switch",
+		"slider", "spinbutton":
 		return true
 	default:
 		return false

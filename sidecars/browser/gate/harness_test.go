@@ -468,6 +468,17 @@ func newSite(t *testing.T) *site {
 		fmt.Fprint(w, PAGE_LOOKBUTTON)
 	})
 
+	// A page as crowded as a real application's toolbar: small buttons packed close together, a form
+	// beside them, and a table of rows that each carry their own control. It exists to answer a
+	// question the tidy fixtures cannot — whether the labels a look draws are still LEGIBLE once
+	// there are many of them near each other, which is the failure mode every set-of-marks design
+	// runs into and which no test of "was it labelled" can see.
+	mux.HandleFunc("/dense", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_DENSE)
+	})
+
 	// A page that can be asked, from inside itself, whether the look left anything behind. The
 	// question has to be answered by the DOM rather than by a snapshot, because the overlay is
 	// aria-hidden — so a snapshot would report a clean page whether or not one was still there,
@@ -1109,3 +1120,32 @@ const PAGE_LOOKCLEAN = `<!doctype html><title>lookclean</title><body>
 	<h1>Clean</h1>
 	<p id=out>nobody has asked yet</p>
 	<button onclick="out.textContent = 'overlay is ' + (document.getElementById('nucleos-look-overlay') ? 'still here' : 'gone')">Ask</button>`
+
+// PAGE_DENSE is the crowded case: a toolbar of small buttons two pixels apart, a form, and a table
+// whose every row has a control of its own. Roughly thirty labels in one viewport, which is an
+// ordinary application screen and about a quarter of what the label budget allows.
+const PAGE_DENSE = `<!doctype html><title>dense</title>
+	<style>
+	body { font: 13px system-ui, sans-serif; margin: 8px; background: #fff }
+	.bar button { width: 26px; height: 24px; margin: 0 1px; padding: 0 }
+	td, th { border: 1px solid #ccc; padding: 2px 6px; font-size: 12px }
+	</style>
+	<body>
+	<div class=bar>
+	<button>B</button><button>I</button><button>U</button><button>S</button><button>A</button>
+	<button>1</button><button>2</button><button>3</button><button>4</button><button>5</button>
+	</div>
+	<p><label>Name <input size=12></label>
+	<label>Email <input size=14></label>
+	<label>City <select><option>Lisboa</option><option>Porto</option></select></label>
+	<button>Save</button> <button>Cancel</button></p>
+	<table>
+	<tr><th>Item</th><th>Qty</th><th></th></tr>
+	<tr><td>Cabo HDMI</td><td><input size=2 value=1></td><td><button>x</button></td></tr>
+	<tr><td>Rato sem fios</td><td><input size=2 value=2></td><td><button>x</button></td></tr>
+	<tr><td>Teclado</td><td><input size=2 value=1></td><td><button>x</button></td></tr>
+	<tr><td>Monitor 27</td><td><input size=2 value=3></td><td><button>x</button></td></tr>
+	<tr><td>Suporte</td><td><input size=2 value=1></td><td><button>x</button></td></tr>
+	</table>
+	<p><a href=/reading>Ver tudo</a> &middot; <a href=/canvas>Grafico</a> &middot;
+	<a href=/focus>Procurar</a></p>`
