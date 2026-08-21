@@ -22,7 +22,7 @@ import {
 // 'self'`, so a stylesheet fetched from anywhere else is a blank canvas in the
 // shipped app and a working one in the dev server — the worst pair of outcomes.
 import "@xyflow/react/dist/style.css";
-import { useJob, type JobItem, type SlotOwner } from "../data/fleet";
+import { cancellableOwner, useJob, type JobItem, type SlotOwner } from "../data/fleet";
 import { Button, ConfirmButton, StateBadge } from "../ui";
 import {
   clamped,
@@ -137,6 +137,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
   const { detail, slot } = card;
   const jobId = detail.kind === "job" ? detail.job.id : null;
   const open = jobId !== null && actions.openJob === jobId;
+  const cancellable = cancellableOwner(slot);
 
   return (
     <article
@@ -186,6 +187,32 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
         </>
       )}
 
+      {/* One item of a team's job. It says which job and which item, and stops
+          there: the queue belongs to the job, whose own card is in this same
+          column with the button that opens it. Two cards drawing one queue would
+          be the same list twice, opened and closed independently. */}
+      {detail.kind === "item" && (
+        <>
+          <p className="fleet-card-line">
+            {/* The ITEM's reading and never the job's, though the job's would be
+                one field away. A slot is held from the claim until the item is
+                terminal, so what a reader of a capacity screen needs from this
+                card is whether the slot is busy or stuck — and `conflicted` is
+                the answer only the item can give. Plain text rather than a
+                badge, which is the idiom `itemReading` already sets for an
+                item's state one panel over. */}
+            <span className="fleet-item-state">{itemReading({ status: detail.status })}</span>
+            <span className="fleet-card-of">
+              item {detail.ordinal + 1} of job {detail.job.id}
+            </span>
+          </p>
+          {/* Which job's work this is a step of. The item's own description is a
+              round trip this card does not need to make — it is one button away
+              on the job's card, in this same column. */}
+          <p className="fleet-card-prompt">{detail.job.rule_name ?? "started by hand"}</p>
+        </>
+      )}
+
       {/* The listing said nothing about this owner, and the two reasons for that
           are a different kind of news: one is ordinary, the other is a leaked
           slot nothing is working in. */}
@@ -228,11 +255,17 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
         </p>
       ))}
 
-      <ConfirmButton
-        label="Cancel"
-        confirmLabel={`Cancel ${slot.owner_kind} ${slot.owner_id}?`}
-        onConfirm={() => actions.cancel({ kind: slot.owner_kind, id: slot.owner_id })}
-      />
+      {/* Absent on an item's card, and absent rather than disabled: the thing to
+          stop is the job, whose own card is in the same column, and a button
+          that has to explain why it cannot be pressed is one more thing to read
+          on a card that is already dense. */}
+      {cancellable !== null && (
+        <ConfirmButton
+          label="Cancel"
+          confirmLabel={`Cancel ${slot.owner_kind} ${slot.owner_id}?`}
+          onConfirm={() => actions.cancel(cancellable)}
+        />
+      )}
 
       {connectable && (
         <>
@@ -323,7 +356,7 @@ function JobItemsPanel({ jobId }: { jobId: number }) {
  * this was an intermediate item — and the badge beside this text is what says
  * so. The two are separate because they are separate columns.
  */
-function itemReading(item: JobItem): string {
+function itemReading(item: Pick<JobItem, "status">): string {
   switch (item.status) {
     case "pending":
       return "to do";
@@ -343,9 +376,23 @@ function itemReading(item: JobItem): string {
       return "skipped";
     case "cancelled":
       return "cancelled";
+    // The four states an item of a job a team directs can be in. Without them
+    // all four fell to the default below and read as "to do" — a lie about
+    // every one of them, and the worst of the four is `conflicted`: an item
+    // waiting on a person, shown as work not yet begun.
+    case "merging":
+      return "merging into the job's branch";
+    case "conflicted":
+      return "the merge conflicted";
+    case "reverted":
+      return "taken back off the branch";
+    case "orphaned":
+      return "never attempted — something it needed did not land";
     default:
       // The core reads an unknown status as still-to-do rather than as done,
-      // and so does this.
+      // and so does this. Safe in the core, where erring toward "not finished"
+      // costs a repeated item; here it is only ever the last resort, which is
+      // why the arms above exist rather than being left to it.
       return "to do";
   }
 }

@@ -1697,6 +1697,32 @@ pub async fn create_job_node_run(
     .await
 }
 
+/// Starts one item of a job in a worktree of its own.
+///
+/// The sibling of [`create_job_node_run`], and everything said there about `mode` and about
+/// steering holds here word for word. What differs is the checkout: this one provisions its own,
+/// born on the tip of the job's branch, and pays a concurrency slot for it — which is what lets two
+/// items of one job be in flight at the same time without either building on the other's unmeasured
+/// work.
+pub async fn create_job_item_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    item: JobItem,
+) -> Result<i64, CreateRunError> {
+    create_run_with(
+        state,
+        prompt,
+        Some(project_id),
+        Some(project_root),
+        "worktree",
+        false,
+        Some(Provisioning::Item(item)),
+    )
+    .await
+}
+
 /// What a run is handed to start from, when it is handed anything at all.
 ///
 /// **An enum and not two `Option`s, because the two are mutually exclusive and the type should say
@@ -1711,22 +1737,110 @@ enum Provisioning {
     /// A conflict resolution: a worktree of its own, born on the merge's target, with the conflict
     /// already staged in it.
     Resolution(Resolution),
+    /// One item of a job, in a worktree of its own.
+    ///
+    /// Modelled on `Resolution` and NOT on the standalone arm, and the difference is the base. A
+    /// standalone run's tree is born wherever the project checkout stands, which for an item is the
+    /// wrong commit: an item whose dependency has just landed on the job's branch would start
+    /// without that work, and the dependency graph would be decorative.
+    Item(JobItem),
+}
+
+/// One item of a job, about to be given a tree of its own.
+pub struct JobItem {
+    pub job_id: i64,
+    pub item_id: i64,
+    /// `plan` | `implement` | `review`, as [`JobNode::stage`].
+    pub stage: &'static str,
+    /// Where this item's tree is born: the tip of the job's branch as the last gate left it.
+    ///
+    /// Named and not `Option`, because there is no honest default. `None` would mean the project
+    /// checkout's HEAD, which is `master` — a commit that has none of this job's work in it.
+    pub base: String,
 }
 
 impl Provisioning {
     fn node(&self) -> Option<&JobNode> {
         match self {
             Self::Node(node) => Some(node),
-            Self::Resolution(_) => None,
+            Self::Resolution(_) | Self::Item(_) => None,
         }
     }
 
     fn resolution(&self) -> Option<&Resolution> {
         match self {
             Self::Resolution(resolution) => Some(resolution),
-            Self::Node(_) => None,
+            Self::Node(_) | Self::Item(_) => None,
         }
     }
+
+    fn item(&self) -> Option<&JobItem> {
+        match self {
+            Self::Item(item) => Some(item),
+            Self::Node(_) | Self::Resolution(_) => None,
+        }
+    }
+
+    /// Whether this provisioning gets a checkout of its own — and therefore a concurrency slot, a
+    /// `worktrees` row, and a share of the disk.
+    ///
+    /// **The house rule, in one place.** `Node` is the only exception, and it is the exception
+    /// because it gets no tree: it works inside the one its job already owns, and charging it a
+    /// second slot would have a five-item job refuse itself at the second item. Everything else —
+    /// a standalone run, a resolution, an item — brings a tree and pays for it.
+    fn owns_a_tree(&self) -> bool {
+        !matches!(self, Self::Node(_))
+    }
+}
+
+/// How little room may be left on a project's volume before this refuses to open another checkout.
+///
+/// Five gibibytes by default, and the number is a floor rather than a model of what a checkout
+/// costs. A model would have to know the project: this repository's `target/` runs to fifteen
+/// gigabytes and a Go project's build cache is a rounding error, and the daemon has no honest way to
+/// tell before building. What a floor says is narrower and true — below this, the machine is nearly
+/// full and starting another build is how it fills.
+///
+/// `NUCLEOS_MIN_FREE_DISK_GB` overrides it, and `0` switches it off for somebody who knows their
+/// volume better than this does.
+const MIN_FREE_DISK_GB: u64 = 5;
+
+/// Whether the volume that would hold this project's worktrees is too full to open another one.
+///
+/// A **check** and not a reservation, which is the whole of the design. A reservation needs a number
+/// for what a checkout will cost, that number is per-project and unknowable in advance, and a model
+/// carrying it would age on its own — measured once against one repository and then quietly wrong.
+/// This reads the volume each time and answers about now.
+///
+/// A reading that fails is not a refusal. The primitive is a platform call against an already
+/// mounted volume; when it cannot answer, refusing would stop all autonomous work on a machine whose
+/// disk is probably fine, and the health probe already reports the same fact where somebody can see
+/// it.
+async fn no_room_on_disk(project_root: &std::path::Path) -> Option<String> {
+    let floor = std::env::var("NUCLEOS_MIN_FREE_DISK_GB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(MIN_FREE_DISK_GB)
+        .saturating_mul(1024 * 1024 * 1024);
+    if floor == 0 {
+        return None;
+    }
+
+    let root = project_root.to_path_buf();
+    let available =
+        tokio::task::spawn_blocking(move || crate::health::free_space_for_worktrees(&root))
+            .await
+            .ok()?
+            .ok()?;
+
+    (available < floor).then(|| {
+        format!(
+            "only {} MiB free where this project's worktrees live, and a new checkout needs at \
+             least {} MiB",
+            available / (1024 * 1024),
+            floor / (1024 * 1024)
+        )
+    })
 }
 
 async fn create_run_with(
@@ -1740,6 +1854,11 @@ async fn create_run_with(
 ) -> Result<i64, CreateRunError> {
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
+    let item = provisioning.as_ref().and_then(Provisioning::item);
+    // The house rule, asked once: everything but a job node brings a checkout of its own, and
+    // therefore claims a slot, records a row and is charged disk for it. `None` — a standalone
+    // run — brings one too.
+    let owns_a_tree = provisioning.as_ref().is_none_or(Provisioning::owns_a_tree);
     if mode == "worktree" && (project_id.is_none() || cwd.is_none()) {
         return Err(CreateRunError::Invalid(
             "worktree mode requires project_id and cwd (the project root)",
@@ -1769,7 +1888,7 @@ async fn create_run_with(
     // project every thirty seconds would leave a failed run behind every time. A node is exempt: it
     // works inside its job's worktree, on its job's slot.
     if mode == "worktree"
-        && node.is_none()
+        && owns_a_tree
         && let Some(project) = project_id.as_deref()
     {
         // Swept first, and this is where the staleness that matters gets paid off. A run's slot is
@@ -1837,18 +1956,22 @@ async fn create_run_with(
         // and the plan and review nodes change nothing, so gating them spends a whole suite run to
         // re-measure the tree the previous gate already measured. The verdict also belongs to the
         // item it measured, which is a row this path has no access to.
+        // An ITEM is gated elsewhere too, and for a sharper reason than a node is. Its work is
+        // measured after it lands on the job's branch, by the gate the merge runs; gating it here as
+        // well would spend a second cold build to reach a verdict about a tree nobody merges from,
+        // and the two verdicts could disagree — the tree it built in is not the tree the job ships.
         gate_config = match (
-            &node,
+            node.is_some() || item.is_some(),
             crate::config::load_schedule_rules(std::path::Path::new(project_root)),
         ) {
-            (Some(_), _) => GateConfig::NotConfigured,
-            (None, Ok(rules)) => rules
+            (true, _) => GateConfig::NotConfigured,
+            (false, Ok(rules)) => rules
                 .gate_command
                 .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
                     command,
                     project_root: project_root.to_string(),
                 }),
-            (None, Err(error)) => {
+            (false, Err(error)) => {
                 tracing::warn!(
                     project_id = worktree_project_id,
                     project_root,
@@ -1873,14 +1996,21 @@ async fn create_run_with(
                 base_sha: None,
             },
             None => {
-                let owner = crate::worktree::Owner::Run(id);
+                // The tree's name, and with it the slot's owner. An item's is its row's id and
+                // comes back the same on every retry; everything else is named after this run.
+                let owner = match item {
+                    Some(item) => crate::worktree::Owner::Item(item.item_id),
+                    None => crate::worktree::Owner::Run(id),
+                };
 
-                // Only a standalone run claims a slot. A job node inherits its job's worktree, and
-                // its job's slot with it — charging the node a second one would have a five-item job
-                // refuse itself at the second item.
+                // Anything that brings a tree claims a slot. A job node inherits its job's worktree,
+                // and its job's slot with it — charging the node a second one would have a five-item
+                // job refuse itself at the second item — and a node never reaches this arm.
                 //
                 // The table was swept before the row was inserted, at the pre-check above, so this
-                // is the authoritative answer against an already-current count.
+                // is the authoritative answer against an already-current count. `claim` is
+                // idempotent per owner, which is what lets an item's retry ask again for the slot it
+                // is already holding instead of leaking a second one.
                 match crate::concurrency::claim(&state.pool, worktree_project_id, owner).await {
                     Ok(crate::concurrency::ClaimOutcome::Claimed(_)) => {}
                     Ok(crate::concurrency::ClaimOutcome::Full(full)) => {
@@ -1901,15 +2031,47 @@ async fn create_run_with(
                     }
                 }
 
-                // A resolution's tree is born on the merge's TARGET; everything else starts where
-                // the project stands. `worktree::create_at` carries why that is not a preference.
-                match crate::worktree::create_at(
-                    std::path::Path::new(project_root),
-                    owner,
-                    resolution.map(|it| it.target.as_str()),
-                )
-                .await
+                // Checked after the slot and before the tree, which is the only order that reports
+                // the two walls apart. A refusal here is `Busy` and not a failure: the disk is a
+                // condition of the machine, the same shape as a full project, and a batch that
+                // cannot have its third item should come out smaller rather than fail.
+                //
+                // Only for an item, and not because the others are cheaper. A standalone run and a
+                // resolution are asked for one at a time by a person or by the queue; items are
+                // asked for several at once, and each of them grows a `target/` of its own.
+                if item.is_some()
+                    && let Some(refusal) = no_room_on_disk(std::path::Path::new(project_root)).await
                 {
+                    fail_provisioning(state, id, project_id.as_deref(), &refusal).await;
+                    return Err(CreateRunError::Busy);
+                }
+
+                // A resolution's tree is born on the merge's TARGET and an item's on the tip of its
+                // job's branch; everything else starts where the project stands.
+                // `worktree::create_at` carries why that is not a preference.
+                let base = resolution
+                    .map(|it| it.target.as_str())
+                    .or_else(|| item.map(|it| it.base.as_str()));
+                // An item's name comes back, so its checkout and its branch may already be there —
+                // from the attempt this one is retrying, or from a crash between creating the tree
+                // and recording it. `adopt_or_create_at` is the difference between a retry that
+                // continues and an item that fails every thirty seconds for ever on a name only it
+                // can use.
+                let created = match item {
+                    Some(_) => {
+                        crate::worktree::adopt_or_create_at(
+                            std::path::Path::new(project_root),
+                            owner,
+                            base,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::worktree::create_at(std::path::Path::new(project_root), owner, base)
+                            .await
+                    }
+                };
+                match created {
                     Ok(info) => info,
                     Err(error) => {
                         fail_provisioning(
@@ -1930,10 +2092,13 @@ async fn create_run_with(
         // `running` is reconciled only by a restart, which no sweep can help. The `create`
         // branch above compensated; these two propagated with `?` and stranded the run.
         let worktree_path = info.path.to_string_lossy().into_owned();
-        if node.is_none()
+        if owns_a_tree
             && let Err(error) = crate::worktree::record(
                 &state.pool,
-                crate::worktree::Owner::Run(id),
+                match item {
+                    Some(item) => crate::worktree::Owner::Item(item.item_id),
+                    None => crate::worktree::Owner::Run(id),
+                },
                 worktree_project_id,
                 project_root,
                 &worktree_path,
@@ -1954,14 +2119,27 @@ async fn create_run_with(
         // The node's identity lands in the same write as its cwd so a row can never be `running`
         // inside a job's worktree while claiming to belong to no job — which would make it invisible
         // to the chain that has to finalise it.
-        let cwd_update = match &node {
-            Some(node) => {
+        let cwd_update = match (&node, item) {
+            (Some(node), _) => {
                 sqlx::query("UPDATE runs SET cwd = ?, job_id = ?, stage = ? WHERE id = ?")
                     .bind(&worktree_path)
                     .bind(node.job_id)
                     .bind(node.stage)
             }
-            None => sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?").bind(&worktree_path),
+            // The same write, plus the item. `item_id` lands here rather than in the INSERT for the
+            // reason the node's identity does: until the tree exists there is nothing for the row to
+            // claim, and a row that named an item before it had a checkout would be found by the
+            // chain that finalises items and pointed at a directory nobody made.
+            (None, Some(item)) => sqlx::query(
+                "UPDATE runs SET cwd = ?, job_id = ?, stage = ?, item_id = ? WHERE id = ?",
+            )
+            .bind(&worktree_path)
+            .bind(item.job_id)
+            .bind(item.stage)
+            .bind(item.item_id),
+            (None, None) => {
+                sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?").bind(&worktree_path)
+            }
         };
         if let Err(error) = cwd_update.bind(id).execute(&state.pool).await {
             fail_provisioning(
@@ -3842,6 +4020,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -4158,6 +4337,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -4257,6 +4437,140 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             ("item", item_id),
             "the item's tree moved to a run — the identity a stable key exists to prevent"
         );
+    }
+
+    /// An item gets a checkout of its own, born where its job's branch stands, and pays a slot for
+    /// it — and a second run for the same item comes back to the same checkout on the same slot.
+    ///
+    /// The second half is the one that would leak. `claim` is keyed on the owner and an item's owner
+    /// is its row id, so a retry asks for the slot it is already holding; if `claim` were not
+    /// idempotent, or if the tree were named after the run, a three-attempt item would end up
+    /// holding three of a project's slots and the project would refuse itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_item_run_gets_its_own_tree_and_pays_one_slot_for_every_attempt() {
+        // Held across the awaits on purpose: it serialises mutation of the process-wide
+        // `NUCLEOS_WORKTREE_ROOT`, which is the whole reason it exists. Without it a sibling test
+        // moves the root out from under `adopt_or_create_at`, which then looks for this item's
+        // checkout somewhere it never was, decides there is none, and fails to create one over a
+        // branch that already exists — a failure that reads like a bug in adoption and is not.
+        let _lock = crate::worktree::test_env_lock();
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-item-tree-");
+        let root = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&root);
+        let trees = crate::git_exec::tests::space_free_tempdir("nucleos-item-trees-");
+        // Through the guard, and never a bare `set_var`. This used to be one, under a comment
+        // claiming the value was "read by `worktree_root` on this task only" — which is not what
+        // an environment variable is. It was never restored, so every test that ran afterwards and
+        // provisioned a worktree WITHOUT setting a root of its own inherited this one: `worktree_root`
+        // returns the variable verbatim and only falls back to a sibling of the project root when it
+        // is unset. They then shared a root that had already been deleted with this test's
+        // `TempDir`, and two of them creating a job with the same id collided on `nucleos/job-<id>`
+        // — a failure that reads as a bug in worktree adoption, arrives about once in a dozen full
+        // runs depending on which order the thread pool picked, and is neither.
+        let _trees_env = WorktreeRootEnv::set(trees.path());
+
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &root.to_string_lossy(),
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let item_id = sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status)
+             VALUES (?, 0, 'the item', 'running')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        // The commit the item's tree is born on. Read from the repository rather than invented,
+        // because `git worktree add` takes it as a commit-ish and a made-up one does not resolve.
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .arg("rev-parse")
+                .arg("HEAD")
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+
+        let mut paths = Vec::new();
+        for attempt in 1..=2 {
+            let run_id = create_job_item_run(
+                &state,
+                "do the item".to_owned(),
+                "proj".to_owned(),
+                root.to_string_lossy().into_owned(),
+                JobItem {
+                    job_id,
+                    item_id,
+                    stage: "implement",
+                    base: base.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("attempt {attempt} was refused: {error:?}"));
+
+            let (cwd, carried_job, carried_item): (String, Option<i64>, Option<i64>) =
+                sqlx::query_as("SELECT cwd, job_id, item_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!((carried_job, carried_item), (Some(job_id), Some(item_id)));
+            assert!(
+                cwd.ends_with(&format!("item-{item_id}")),
+                "attempt {attempt} ran in `{cwd}`, not in the item's own checkout"
+            );
+            paths.push(cwd);
+        }
+        assert_eq!(paths[0], paths[1], "the second attempt made a second tree");
+
+        let (kind, owner_id): (String, i64) = sqlx::query_as(
+            "SELECT owner_kind, owner_id FROM worktrees WHERE path = ? AND removed_at IS NULL",
+        )
+        .bind(&paths[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!((kind.as_str(), owner_id), ("item", item_id));
+
+        let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_slots")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(slots, 1, "two attempts at one item took two slots");
+        assert!(
+            crate::concurrency::slot_of(&state.pool, crate::worktree::Owner::Item(item_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "the slot is held by the item, which is what gives it back when the item is over"
+        );
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("NUCLEOS_WORKTREE_ROOT") };
     }
 
     async fn grants_for(state: &AppState, run_id: i64) -> i64 {
@@ -4758,6 +5072,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await

@@ -2134,6 +2134,19 @@ pub struct FakeCommandRunner {
     /// than copied, because only the first node of a job plans: an implement node that rewrote the
     /// queue it is working from is a fiction no real run can produce.
     pub plan_to_write: std::sync::Mutex<Option<String>>,
+    /// Test-only: a scripted agent. `(marker, path, contents)` — a run whose PROMPT contains the
+    /// marker writes `contents` to `path` inside the checkout it was handed.
+    ///
+    /// **Keyed on the prompt and not on the order of calls**, which is the whole point. Two items of
+    /// one batch start as two spawned tasks and reach this in whatever order the runtime picks, so a
+    /// queue taken one entry per call would hand item 3's file to item 1 about half the time, and
+    /// the test built on it would be measuring the scheduler's mood. The prompt carries the item's
+    /// description, which is the one thing that identifies the item from in here.
+    ///
+    /// It writes and does NOT commit, because that is what a real implement node does: the prompt
+    /// tells it to leave the tree uncommitted and `merge_item` is what commits. A double that
+    /// committed would put a fixture back to asserting something no code does.
+    pub writes: std::sync::Mutex<Vec<(String, String, String)>>,
 }
 
 #[cfg(test)]
@@ -2176,6 +2189,19 @@ impl CommandRunner for FakeCommandRunner {
             let _ = std::fs::create_dir_all(artifacts);
             std::fs::write(std::path::Path::new(artifacts).join("plan.json"), plan)
                 .expect("the plan node writes its queue");
+        }
+        // The scripted agent, after the plan node's file and before anything is recorded: an
+        // implement node's whole observable effect is what it left in its checkout.
+        if let Some(cwd) = request.cwd.as_ref() {
+            for (marker, path, contents) in self.writes.lock().unwrap().iter() {
+                if request.prompt.contains(marker.as_str()) {
+                    let target = cwd.join(path);
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&target, contents).expect("the scripted agent writes its file");
+                }
+            }
         }
         *self.last_prompt.lock().unwrap() = Some(request.prompt.clone());
         *self.last_cwd.lock().unwrap() = request.cwd.clone();

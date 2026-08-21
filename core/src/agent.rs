@@ -55,7 +55,12 @@ impl std::fmt::Display for AgentError {
             }
             Self::Invalid(message) => formatter.write_str(message),
             Self::NotFound => formatter.write_str("agent not found"),
-            Self::InUse => formatter.write_str("that agent is a member or director of a team"),
+            // Names the work as well as the rosters, because they are undone in different places
+            // and the owner has to be told which one to go to. Told only about teams, somebody who
+            // has already left every team reads this as the daemon being wrong.
+            Self::InUse => formatter.write_str(
+                "that agent directs or belongs to a team, or is holding work that names it",
+            ),
             Self::Db(error) => write!(formatter, "database error: {error}"),
         }
     }
@@ -238,10 +243,20 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError>
     // `Db(SqliteError { code: 787, "FOREIGN KEY constraint failed" })`, which reaches the owner as
     // a 500 naming nothing. This turns the identical refusal into a 409 that says which side is
     // standing on the agent. It does not replace the constraint; it explains it.
+    //
+    // The two WORK tables are named as well as the two roster ones, and the difference between them
+    // is the reason. Being on a roster and having been given work are separate facts: an agent taken
+    // off a team still owns every item already assigned to it, and the roster checks stop seeing it
+    // the moment the membership row goes. Without these two, the sequence "remove from the team,
+    // then delete the agent" reaches the owner as exactly the 500 this function exists to prevent.
     let in_use: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM teams WHERE director_agent_id = ?)
-             OR EXISTS (SELECT 1 FROM team_members WHERE agent_id = ?)",
+             OR EXISTS (SELECT 1 FROM team_members WHERE agent_id = ?)
+             OR EXISTS (SELECT 1 FROM team_items WHERE agent_id = ?)
+             OR EXISTS (SELECT 1 FROM job_items WHERE agent_id = ?)",
     )
+    .bind(id)
+    .bind(id)
     .bind(id)
     .bind(id)
     .fetch_one(pool)
@@ -427,6 +442,43 @@ mod tests {
         let member = create(&pool, request("copywriter")).await.unwrap();
         team_with(&pool, &director.id, &member.id).await;
         let outcome = delete(&pool, &member.id).await;
+        assert!(matches!(outcome, Err(AgentError::InUse)), "{outcome:?}");
+    }
+
+    /// Off the team and still holding work, which is the case the two roster checks cannot see.
+    ///
+    /// Being on a roster and having been given work are separate facts, and the second one outlives
+    /// the first: the membership row goes and the job item still names this agent. Without the work
+    /// tables in the check, "remove from the team, then delete" reaches the owner as the raw
+    /// `FOREIGN KEY constraint failed` — a 500 naming nothing, which is the exact outcome this
+    /// function exists to turn into a 409.
+    #[tokio::test]
+    async fn an_agent_taken_off_a_team_still_cannot_be_deleted_while_it_holds_work() {
+        let pool = pool().await;
+        let director = create(&pool, request("head")).await.unwrap();
+        let member = create(&pool, request("copywriter")).await.unwrap();
+        team_with(&pool, &director.id, &member.id).await;
+        sqlx::query("INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+                     VALUES ('project-a', 'C:/somewhere', 'implementing', 5, '2026-08-20T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, agent_id)
+             VALUES (1, 0, 'an item', 'pending', ?)",
+        )
+        .bind(&member.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM team_members WHERE agent_id = ?")
+            .bind(&member.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = delete(&pool, &member.id).await;
+
         assert!(matches!(outcome, Err(AgentError::InUse)), "{outcome:?}");
     }
 

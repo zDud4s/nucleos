@@ -998,6 +998,22 @@ pub struct GraphConfig {
     /// rather than clamping, for the reasons written at `validate_rules`.
     #[serde(default)]
     pub budget_usd: Option<f64>,
+    /// The team to direct this rule's jobs, by id. Absent is the sequential job in one shared
+    /// checkout — what every `graph:` rule already sitting in somebody's gitignored file means, and
+    /// what it must keep meaning.
+    ///
+    /// A PUBLIC field with no accessor, like `budget_usd` and unlike `max_items`. The two private
+    /// ones are private because their accessor applies a ceiling against a per-developer file
+    /// nobody reviews. There is nothing to clamp here: naming a team buys this job no more of
+    /// anything the daemon pays for, because what a team spends is checkouts, and every checkout is
+    /// still refused by the project's slot count and by the free-disk floor.
+    ///
+    /// Whether the id names a team that exists is NOT checked here, and cannot be: this is a file
+    /// and teams live in the database. `job::start` reads it at the moment the job is made, which is
+    /// the only moment the answer is current — a rule written last month can name a team deleted
+    /// this morning, and nothing in between would have said so.
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 impl GraphConfig {
@@ -1260,6 +1276,41 @@ mod tests {
         )
         .expect("a graph block that says nothing about money parses");
         assert_eq!(rules.schedules[0].graph.as_ref().unwrap().budget_usd, None);
+    }
+
+    /// A rule may name the team that will direct its jobs, and a rule that does not keeps the
+    /// sequential queue every `graph:` rule has meant until now.
+    ///
+    /// Both halves matter and the second more. `#[serde(deny_unknown_fields)]` means the key had to
+    /// be declared before any file could carry it, so the first half is the whole of "the nightly
+    /// job can be run by a team". And every rule already sitting in somebody's gitignored
+    /// `.ai/autopilot.yaml` omits it, so the second half is the promise that none of those nights
+    /// changes shape because this landed.
+    ///
+    /// Nothing here checks that the team exists, and nothing here can: this is a file and the
+    /// catalogue is a table. `job::start` reads it when the job is made, which is the only moment
+    /// the answer is current.
+    #[test]
+    fn a_graph_block_may_name_the_team_that_will_direct_it() {
+        let directed = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      team: crew\n",
+        )
+        .expect("a graph block naming a team parses");
+        assert_eq!(
+            directed.schedules[0]
+                .graph
+                .as_ref()
+                .unwrap()
+                .team
+                .as_deref(),
+            Some("crew")
+        );
+
+        let plain = rules_from(
+            "schedules:\n  - name: r1\n    cron: \"0 3 * * *\"\n    prompt: do it\n    graph:\n      max_items: 2\n",
+        )
+        .expect("a graph block that says nothing about a team parses");
+        assert_eq!(plain.schedules[0].graph.as_ref().unwrap().team, None);
     }
 
     /// Malformed, not clamped. The posture this module advertises is that it falls back to defaults

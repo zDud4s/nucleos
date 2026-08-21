@@ -26,6 +26,13 @@ use crate::state::AppState;
 pub enum PlanError {
     Absent,
     Unreadable(String),
+    /// The plan parsed and the graph in it does not hold up.
+    ///
+    /// A THIRD variant and not an `Unreadable` with a different string, because the two are
+    /// different failures with different owners: unreadable is a node that wrote something that is
+    /// not JSON, and this is a node that answered the wrong thing. The message names the item, since
+    /// the whole plan is refused for one bad row and a reader otherwise cannot tell which.
+    Rejected(String),
 }
 
 impl std::fmt::Display for PlanError {
@@ -33,6 +40,7 @@ impl std::fmt::Display for PlanError {
         match self {
             PlanError::Absent => write!(formatter, "the plan node wrote no plan.json"),
             PlanError::Unreadable(reason) => write!(formatter, "plan.json is unreadable: {reason}"),
+            PlanError::Rejected(reason) => write!(formatter, "the plan was refused: {reason}"),
         }
     }
 }
@@ -58,11 +66,39 @@ struct PlanFile {
 #[derive(Debug, Deserialize)]
 struct PlanItem {
     description: String,
-    /// Defaulted rather than required, because the field is younger than the plans that have to
-    /// keep parsing: every `plan.json` written before it existed omits it, and so does any planner
-    /// that takes the prompt's offer to decline. Both mean the same thing, which is nothing.
+    /// `Option`, and the distinction it carries is the whole of decision 10: **an absent key is not
+    /// an empty list**.
+    ///
+    /// Without a team the two mean the same thing and both mean nothing — the field is younger than
+    /// the plans that have to keep parsing, and any planner may take the prompt's offer to decline.
+    /// With a team they are opposites. An empty list is a director saying "this item touches
+    /// nothing anyone else will"; an absent key is a director that did not answer, which is the most
+    /// likely thing an LLM does with a key it has not seen before. Read as empty, that answer
+    /// degenerates the job into something SLOWER than the sequential one it replaced: nothing can be
+    /// told apart, so nothing may run beside anything.
+    ///
+    /// `#[serde(default)]` on the `Option` keeps every plan written before this parsing, which is
+    /// what makes the strictness affordable.
     #[serde(default)]
-    files: Vec<String>,
+    files: Option<Vec<String>>,
+    /// Which earlier items this one may not start before, by global ordinal.
+    ///
+    /// `Option` for the same reason as `files`, and the stakes are higher: read as empty, an absent
+    /// key is a director saying every item is independent, and the queue would start work on top of
+    /// work that has not landed.
+    #[serde(default)]
+    depends_on: Option<Vec<i64>>,
+    /// Which member of the team works this item.
+    ///
+    /// `Option` for a different reason from the other two. Absent and empty are not opposites here
+    /// — an empty agent id is not an answer anybody could act on — it is that a job WITHOUT a team
+    /// has nobody to name, so the key is required with one and never read without one.
+    ///
+    /// There is no fallback member and there must not be. Choosing for a director that did not
+    /// choose would put the assignment in two places — its judgement and a rule here — and the rule
+    /// would win silently on exactly the plans where the director had least to say.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 /// One item of the queue: what to do, and where the planner guessed it lives.
@@ -72,6 +108,12 @@ pub struct PlannedItem {
     /// Empty when the planner named nothing. A hint and not a boundary — it is where the implement
     /// node starts looking, never the extent of what it may touch.
     pub files: Vec<String>,
+    /// The global ordinals this item may not start before. Empty for a plan with no graph in it,
+    /// which is every plan a job without a team produces.
+    pub depends_on: Vec<i64>,
+    /// Who works it, checked against the team's roster. `None` for every plan of every job without
+    /// a team, which is the whole of what makes those jobs read here exactly as they always did.
+    pub agent_id: Option<String>,
 }
 
 /// A validated work queue, plus however much of it did not fit.
@@ -90,23 +132,291 @@ pub struct PlannedItems {
     pub done: Option<String>,
 }
 
+/// A dependency list on its way into the row, or NULL when there is nothing to say.
+///
+/// **NULL for an empty list, and here that is right where the parsing's opposite rule is also
+/// right.** Coming IN, absent and empty are opposites: one is a director that did not answer and the
+/// other is one that answered "nothing". By the time a list has been checked, both survivors mean
+/// the same thing to every reader downstream — this item waits for nobody — and NULL is how this
+/// schema has spelled that since `files` (0056).
+fn edges(depends_on: &[i64]) -> Option<String> {
+    (!depends_on.is_empty())
+        .then(|| serde_json::to_string(depends_on).ok())
+        .flatten()
+}
+
+/// The graph rules this job's next plan is held to, or `None` for a job with no team.
+///
+/// Reads the facts the rules need at the moment the plan is being read, and not earlier. The first
+/// ordinal in particular has to be current: it is what a `depends_on` is range-checked against, and
+/// it moves every time a round is ingested. The roster has to be current for the same kind of
+/// reason — somebody removed from the team between the plan and the replan may not be given work by
+/// the second one.
+async fn graph_rules(pool: &SqlitePool, job: &JobRow) -> Option<Graph> {
+    let team: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT team_id FROM jobs WHERE id = ?")
+            .bind(job.id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    let team = team?;
+
+    // The same expression `ingest_replan` uses to hand out ordinals, asked here so the number the
+    // plan is checked against is the number the plan will be given.
+    let first_ordinal: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(ordinal) + 1, 0) FROM job_items WHERE job_id = ?")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+    Some(Graph {
+        first_ordinal: first_ordinal.max(0) as usize,
+        roster: roster_of(pool, &team).await,
+    })
+}
+
+/// Everyone this team's director may give work to, with the line it chooses them by.
+///
+/// **The director is on its own roster**, and that is a decision rather than an oversight. A team of
+/// one — a director and no members — is an ordinary way to ask for parallel work under a single
+/// persona, and leaving it out would make every such team refuse every plan it ever wrote, for a
+/// reason no message could usefully explain. `team.rs` keeps its departments' directors off the
+/// roster because there a director hands work to specialists and does none itself; here the roster
+/// is "who may write code in this job", and the director qualifies.
+///
+/// Ordered and de-duplicated by the `UNION`, so the prompt lists the same people in the same order
+/// every round — a roster that reshuffles between rounds is a director being asked the same question
+/// twice in two different words.
+async fn roster_of(pool: &SqlitePool, team_id: &str) -> Vec<TeamMate> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT agents.id, agents.speciality FROM agents
+          WHERE agents.id IN (
+                SELECT agent_id FROM team_members WHERE team_id = ?
+                UNION
+                SELECT director_agent_id FROM teams WHERE id = ?)
+          ORDER BY agents.id",
+    )
+    .bind(team_id)
+    .bind(team_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, speciality)| TeamMate { id, speciality })
+    .collect()
+}
+
+/// One name a director may put on an item, and the line it decides by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamMate {
+    pub id: String,
+    /// One line, and load-bearing rather than decoration — `agent.rs:11` says so. It is the whole of
+    /// what the director is shown about each member, and the whole of what it chooses on.
+    pub speciality: String,
+}
+
+/// The rules a plan is held to when a team wrote it, and the facts those rules need.
+///
+/// Present only for a job a team directs. Its absence is not laxity for its own sake: without a team
+/// the items share one checkout and run one at a time, so none of the keys buys anything and
+/// demanding them would fail plans that were right.
+///
+/// No longer `Copy`, because the roster is a `Vec`. It travels by reference from here on; the three
+/// functions that take it never keep it.
+#[derive(Debug, Clone)]
+pub struct Graph {
+    /// The global ordinal the FIRST item of this round will be given.
+    ///
+    /// **The number without which the whole scheme silently mis-reads itself.** Ordinals continue
+    /// across rounds, so round 2's first item might be ordinal 5. A director writing
+    /// `"depends_on": [0]` meaning "the first item I just listed" would be naming an item from
+    /// round 1 — a plan that is wrong in a way nothing here can see, because ordinal 0 exists and is
+    /// finished. Range-checking against this makes the mistake visible instead, and the prompt is
+    /// told the same number so the director can be right in the first place.
+    pub first_ordinal: usize,
+    /// Who may be given work, and what each of them is for.
+    ///
+    /// Empty only when the team's every agent has been deleted, which `foreign_keys` makes very
+    /// nearly impossible. An empty roster refuses every plan, and the message says the roster is
+    /// empty rather than that the name was wrong — the two are different problems and only one of
+    /// them is the director's.
+    pub roster: Vec<TeamMate>,
+}
+
+impl Graph {
+    /// PURE: the three keys of one planned item, checked, or the reason the whole plan is refused.
+    ///
+    /// **One bad row refuses the plan rather than dropping the row**, and that is the decision worth
+    /// arguing with. Dropping it would leave a queue that looks complete and is missing the work
+    /// somebody asked for; refusing costs a round and says why. A job whose director cannot answer
+    /// the three questions is a job that should stop being run in parallel, not one that should be
+    /// run in parallel badly.
+    fn check(
+        &self,
+        index: usize,
+        description: &str,
+        files: Option<Vec<String>>,
+        depends_on: Option<Vec<i64>>,
+        agent_id: Option<String>,
+    ) -> Result<(Vec<String>, Vec<i64>, String), PlanError> {
+        let named = || description.chars().take(60).collect::<String>();
+        let Some(files) = files else {
+            return Err(PlanError::Rejected(format!(
+                "item {} (`{}`) names no `files`. With a team every item has to say what it will                  touch, because that is the only thing that can tell two items apart before either                  of them has run",
+                index + 1,
+                named()
+            )));
+        };
+        if files.is_empty() {
+            return Err(PlanError::Rejected(format!(
+                "item {} (`{}`) declares an empty `files`. An item that touches nothing overlaps                  with everything, so the queue would run it alone — which is slower than not                  splitting the work at all",
+                index + 1,
+                named()
+            )));
+        }
+        let Some(depends_on) = depends_on else {
+            return Err(PlanError::Rejected(format!(
+                "item {} (`{}`) names no `depends_on`. An absent list is not an empty one: read as                  empty it would say this item may start beside everything, and work would be built                  on work that has not landed. Write `[]` to say it depends on nothing",
+                index + 1,
+                named()
+            )));
+        };
+
+        // **Every dependency must be an EARLIER ordinal**, which is a range check and a cycle check
+        // at once. A graph whose edges only ever point backwards cannot contain a cycle, so there is
+        // nothing here to walk and nothing to get wrong — where a general cycle detector is a second
+        // algorithm that has to agree with this one about what an edge is.
+        //
+        // The cost is that a director has to list items in dependency order. That costs it nothing
+        // and the prompt says so; the alternative buys the freedom to write a plan whose order is
+        // misleading to the person who reads it afterwards.
+        let own = (self.first_ordinal + index) as i64;
+        for dependency in &depends_on {
+            if *dependency < 0 || *dependency >= own {
+                return Err(PlanError::Rejected(format!(
+                    "item {} (`{}`) is ordinal {own} and depends on {dependency}, which is not an                      earlier item of this job. Dependencies point backwards only — list an item                      after everything it needs — and the ordinals of this round start at {}",
+                    index + 1,
+                    named(),
+                    self.first_ordinal
+                )));
+            }
+        }
+
+        // Named last of the three because it is the one a director can get wrong while meaning
+        // well: the other two are shapes, and this is a name that has to exist. The message carries
+        // the roster, because "no such member" without saying who there IS costs the next round to
+        // discover.
+        let Some(agent_id) = agent_id else {
+            return Err(PlanError::Rejected(format!(
+                "item {} (`{}`) names no `agent_id`. With a team every item is given to somebody:                  {}",
+                index + 1,
+                named(),
+                self.who()
+            )));
+        };
+        if !self.roster.iter().any(|mate| mate.id == agent_id) {
+            return Err(PlanError::Rejected(format!(
+                "item {} (`{}`) is given to `{agent_id}`, who is not on this team: {}",
+                index + 1,
+                named(),
+                self.who()
+            )));
+        }
+        Ok((files, depends_on, agent_id))
+    }
+
+    /// The roster as a sentence for a prompt, one member per line.
+    ///
+    /// One per line rather than run together, because this is a list to choose FROM: a director
+    /// reading a comma-separated paragraph picks the first name whose speciality matches the word
+    /// it was thinking of, and the ones after the second comma stop being read. The refusals use
+    /// `who()` instead, which runs them together — there the roster is context for a mistake, not a
+    /// menu.
+    fn introduce(&self) -> String {
+        if self.roster.is_empty() {
+            // Reachable only if the team's every agent has been deleted, which `foreign_keys` makes
+            // very nearly impossible. Said plainly anyway: a director told "the team is:" followed
+            // by nothing invents a name, and the plan is refused for a reason that reads as its
+            // fault.
+            return "This team has no members on record, so there is nobody to give the work to \
+                    and any plan will be refused. Say so instead of guessing at a name."
+                .to_owned();
+        }
+        format!(
+            "The team is:\n{}\n",
+            self.roster
+                .iter()
+                .map(|mate| format!("  {} — {}", mate.id, mate.speciality))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    /// The roster as a sentence, for the two refusals that have to name it.
+    ///
+    /// An empty roster gets a different sentence, because it is a different problem: the director
+    /// answered as well as it could and there was nobody to answer with, which is the owner's to fix
+    /// and not the director's. Told as "nobody is on this team" it costs one reading; told as "`x`
+    /// is not on this team" it costs a round of guessing at names.
+    fn who(&self) -> String {
+        if self.roster.is_empty() {
+            return "this team has no members and no director, so there is nobody to give it to"
+                .to_owned();
+        }
+        format!(
+            "the team is {}",
+            self.roster
+                .iter()
+                .map(|mate| format!("`{}` ({})", mate.id, mate.speciality))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 /// Reads the queue a plan node produced.
 ///
 /// Takes bytes rather than a path so the decisions here stay testable without a filesystem, and so
 /// "the file was missing" is expressed by the caller as `None` rather than inferred from an IO error
 /// that could equally mean a permissions problem.
-pub fn parse_plan(contents: Option<&[u8]>, max_items: usize) -> Result<PlannedItems, PlanError> {
+pub fn parse_plan(
+    contents: Option<&[u8]>,
+    max_items: usize,
+    graph: Option<&Graph>,
+) -> Result<PlannedItems, PlanError> {
     let bytes = contents.ok_or(PlanError::Absent)?;
     let parsed: PlanFile =
         serde_json::from_slice(bytes).map_err(|error| PlanError::Unreadable(error.to_string()))?;
 
     let total = parsed.items.len();
-    let items: Vec<PlannedItem> = parsed
-        .items
-        .into_iter()
-        .take(max_items)
-        .map(|PlanItem { description, files }| PlannedItem { description, files })
-        .collect();
+    let mut items = Vec::with_capacity(total.min(max_items));
+    for (index, item) in parsed.items.into_iter().take(max_items).enumerate() {
+        let PlanItem {
+            description,
+            files,
+            depends_on,
+            agent_id,
+        } = item;
+        let (files, depends_on, agent_id) = match graph {
+            Some(graph) => {
+                let (files, depends_on, agent_id) =
+                    graph.check(index, &description, files, depends_on, agent_id)?;
+                (files, depends_on, Some(agent_id))
+            }
+            // No team, no graph. None of the keys means anything here and an absent one is not an
+            // answer anybody was owed — which is what every plan written before this parsing relies
+            // on.
+            None => (files.unwrap_or_default(), Vec::new(), None),
+        };
+        items.push(PlannedItem {
+            description,
+            files,
+            depends_on,
+            agent_id,
+        });
+    }
 
     Ok(PlannedItems {
         dropped: total - items.len(),
@@ -141,6 +451,12 @@ pub enum ItemState {
     /// in its prompt. `next_step` picks it up by the same positional search that picks up `Pending`,
     /// and neither `ending()` nor `close_the_round` counts it — a job is not `gate_failed` for a
     /// verdict it has not finished answering.
+    ///
+    /// **In a job a team directs the tree is "as the attempt left it, plus the job's branch".** The
+    /// item works in a checkout of its own, and that checkout has been standing still while other
+    /// items landed; `catch_up_the_item` brings the branch in before the node starts. Without it a
+    /// retry would answer a gate whose verdict was about a repository that no longer exists — and a
+    /// red gate caused by somebody else's merge would not be fixable from here at all.
     ///
     /// Never stored. `job_items.status` says `gate_failed` either way; this state is what
     /// `item_state_from` makes of that status once it has read the attempt count beside the job's
@@ -241,13 +557,43 @@ pub enum Outcome {
 }
 
 /// What the daemon should do next for a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`, because a batch is a `Vec`. The three places that relied on it took the value
+/// out of a binding they went on using; they borrow now.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     SpawnPlan,
-    SpawnImplement {
+    /// The items to start now, by ordinal — **at most one** for a job without a team.
+    ///
+    /// A list and not an ordinal, and the difference is the whole of this design. A single ordinal
+    /// can only ever be answered again after the item it names has finished, so the queue was
+    /// sequential by the shape of this type before it was sequential by any rule. What decides the
+    /// list is `batch_of`; what decides how much of it actually starts is the driver, because a
+    /// project with no room left refuses the second checkout and the batch comes out smaller.
+    SpawnImplement(Vec<usize>),
+    RunGate {
         ordinal: usize,
     },
-    RunGate {
+    /// Bring one item's branch into the job's, in the job's own checkout.
+    ///
+    /// Only ever answered for a job a team directs. Without a team the items write into the one
+    /// shared checkout and there is nothing to bring anywhere — `Implemented` goes straight to
+    /// [`Next::RunGate`], exactly as it always did.
+    ///
+    /// A step of its own rather than the first half of the gate, because what has to be exclusive is
+    /// the merge and the gate merely follows it. Two steps also means `MAX_STEPS_PER_PASS` counts
+    /// them apart, so one pass drains two merged-and-gated items rather than four merges with
+    /// nothing measured.
+    MergeItem {
+        ordinal: usize,
+    },
+    /// Put an item down because something it depends on will never land.
+    ///
+    /// A step and not a silent skip, because the row has to say so. Left `pending`, the item is
+    /// work nothing will ever start: it holds a slot and a checkout to the end of the job, it is
+    /// counted among the unfinished, and a person reading the queue is told the job is still going
+    /// to do it.
+    Orphan {
         ordinal: usize,
     },
     SpawnReview,
@@ -335,12 +681,15 @@ pub struct JobView {
     /// every tick would answer `SpawnPlan` while the first planner was still running. The item
     /// queue is what stops that from happening to an implement node; the plan node has no item.
     pub planning: bool,
-    /// The queue of the CURRENT round, never of every round the job has had.
+    /// Every item the job has ever queued, in ordinal order — **not** the current round's.
     ///
-    /// Load-bearing and easy to get wrong: read without filtering on `job_items.round`, round 2
-    /// would see round 1's finished items sitting beside its own and start the round again from the
-    /// first pending one it found.
-    pub items: Vec<ItemState>,
+    /// This said the opposite until now, and the loader has always disagreed with it in writing:
+    /// *"Deliberately NOT filtered by round … Filtering would have made the position in this vector
+    /// stop being the ordinal in the table"*. The unfiltered read is the right one and three things
+    /// rest on it — `advance` looks an item up by its position, `depends_on` names global ordinals
+    /// and has to be able to point back into an earlier round, and `ending()` still reports a
+    /// round-1 red gate when round 3 finishes.
+    pub items: Vec<ItemView>,
     pub review: ReviewState,
     pub rounds: RoundState,
     /// Whether a team directs this job — `jobs.team_id` being set, and nothing more.
@@ -353,6 +702,57 @@ pub struct JobView {
     /// share one tree, so an item that broke leaves edits nothing measured where the next item
     /// would build on them — which is why `false` still stops the job at the first failure.
     pub has_team: bool,
+    /// How many of this job's items may be worked on at once — `teams.max_parallel`, or **1**.
+    ///
+    /// One without a team, which is what makes the batch below come out as a queue of one and the
+    /// sequential job identical to what it always was. Never zero: a ceiling of zero would build an
+    /// empty batch for ever while the queue still owed work, and the round would close on it.
+    ///
+    /// **The project's free slots are deliberately NOT folded in here.** This function is pure and
+    /// `concurrency.rs` says the `INSERT` is the lock; asking how much room there is would be
+    /// reading a number that another job can take between the read and the claim. The driver claims
+    /// and keeps what it gets, and a refusal is the batch coming out smaller — which is the same
+    /// answer, arrived at where it is true.
+    pub max_parallel: usize,
+}
+
+/// One item of the queue, as the decision below has to see it.
+///
+/// A struct and not a bare [`ItemState`] because two items being independent is not something their
+/// states can say. `depends_on` and `files` are the only things that can, and they have to be in the
+/// pure function — deciding outside would put "which item may run" in two places, and the second one
+/// would not be table-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemView {
+    pub state: ItemState,
+    /// The global ordinals this item may not start before.
+    ///
+    /// Empty for every item of every job without a team, which is what makes those jobs read here
+    /// exactly as they always did.
+    pub depends_on: Vec<i64>,
+    /// What the director said this item will touch.
+    ///
+    /// The other half of "these two may run together", and the half that answers it for items with
+    /// no dependency between them at all. Two items naming one path are never started together,
+    /// because the second one to merge would conflict and the retry costs more than the wait.
+    ///
+    /// Empty without a team, and there it is a hint the implement node is given rather than a
+    /// boundary — see `implement_prompt`. It is a boundary only here, where nothing has run yet and
+    /// a guess is all there is to go on.
+    pub files: Vec<String>,
+}
+
+impl ItemView {
+    /// A view of an item that waits for nobody and declares nothing, which is what a job without a
+    /// team has.
+    #[cfg(test)]
+    fn plain(state: ItemState) -> Self {
+        Self {
+            state,
+            depends_on: Vec::new(),
+            files: Vec::new(),
+        }
+    }
 }
 
 /// Decides a job's next move from what is observable about it.
@@ -389,7 +789,7 @@ pub fn next_step(job: &JobView) -> Next {
     //
     // `Cancelled` keeps no guard, in either kind of job. It is not a claim about trees — it is a
     // person having stopped this, and carrying on would be answering them.
-    for item in &job.items {
+    for item in job.items.iter().map(|item| &item.state) {
         match item {
             ItemState::Failed if !job.has_team => return Next::Finish(Outcome::Failed),
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
@@ -411,40 +811,115 @@ pub fn next_step(job: &JobView) -> Next {
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
-    // `Merging`, `Conflicted` and `Reverted` wait alongside `Running`, and none of them is
-    // reachable yet — nothing writes those rows until the merge step of a later slice. They are
-    // here because the alternative is worse than being early: a non-terminal state this search
-    // walked past would be read as finished by every check after it, which is the one direction
-    // `item_state_from` already refuses to err in. A later slice gives `Conflicted` a step of its
-    // own and takes it back out of this list.
-    if job.items.iter().any(|item| {
-        matches!(
-            item,
-            ItemState::Running | ItemState::Merging | ItemState::Conflicted | ItemState::Reverted
-        )
-    }) {
+    // `Reverted` is the last state left with no step of its own and no writer. It is here because
+    // the alternative is worse than being early: a non-terminal state this search walked past would
+    // be read as finished by every check after it, which is the one direction `item_state_from`
+    // already refuses to err in. `Merging` and `Conflicted` have both left this list, each having
+    // been given a step below.
+    //
+    // **`Running` waits only without a team, and that one condition is the whole of continuous
+    // start.** The line used to read "anything in flight, wait", and it is what made the queue
+    // sequential: a job could never have two items going at once because the first one to start
+    // stopped the search. A team's items work in checkouts of their own, so the reason behind the
+    // line — the shared tree holding work nothing has measured — is not true for them.
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::Reverted)
+        || (!job.has_team
+            && job
+                .items
+                .iter()
+                .any(|item| item.state == ItemState::Running))
+    {
         return Next::Wait;
     }
-    // Gate before starting the next item: on a shared worktree, letting item i+1 build on unmeasured
-    // work means a later red gate cannot say which item broke it.
+    // A merge that has landed is measured before anything else moves. Ahead of the merge below, and
+    // that order is the design: an item's divergence from the job's branch grows with every minute
+    // it waits, and it is the retry — the most expensive step here — that has to absorb it. Draining
+    // what is already in flight before starting more is what keeps that divergence small.
     if let Some(ordinal) = job
         .items
         .iter()
-        .position(|item| *item == ItemState::Implemented)
+        .position(|item| item.state == ItemState::Merging)
     {
         return Next::RunGate { ordinal };
+    }
+    // Gate before starting the next item: on a shared worktree, letting item i+1 build on unmeasured
+    // work means a later red gate cannot say which item broke it.
+    //
+    // With a team the same sentence has a merge in the middle of it. The item's work is in a
+    // checkout of its own, so there is nothing on the job's branch to measure until it is brought
+    // there — and bringing it there is what must not happen twice at once.
+    if let Some(ordinal) = job
+        .items
+        .iter()
+        .position(|item| item.state == ItemState::Implemented)
+    {
+        return if job.has_team {
+            Next::MergeItem { ordinal }
+        } else {
+            Next::RunGate { ordinal }
+        };
     }
     // A retriable item is work to do, found by the SAME positional search that finds a pending one,
     // so an earlier red-gated item outranks a later untouched one. Running the pending item first
     // would build it on a tree that still stands where the red gate left it, and the next gate could
     // no longer say which of the two broke it — which is the whole reason gating happens between
     // items rather than at the end.
-    if let Some(ordinal) = job
+    //
+    // `Conflicted` is found by the same search, and it is work for the same reason: the item owes
+    // a run, in the checkout it already has. What that run does differs — it resolves a merge
+    // rather than writing a feature — but that is a difference in the prompt, not in whether there
+    // is anything to start. Leaving it out would put the item down for good over a conflict, which
+    // is not a verdict about the work.
+    // An item whose dependency will never land is put down before the search below runs, so that
+    // search never has to know about the graph. It stays a plain positional walk over states, and
+    // "which item is next" keeps meaning one thing.
+    //
+    // Only `Pending` is orphaned. An item that has already run has work in a checkout of its own,
+    // and whether that work is worth anything now is a question for the person reading the branch —
+    // not something to be decided by a sibling's failure.
+    if let Some(ordinal) = job.items.iter().position(|item| {
+        item.state == ItemState::Pending
+            && item.depends_on.iter().any(|dependency| {
+                job.items
+                    .get(*dependency as usize)
+                    .is_some_and(|dependency| never_lands(dependency.state))
+            })
+    }) {
+        return Next::Orphan { ordinal };
+    }
+    let batch = batch_of(job);
+    if !batch.is_empty() {
+        return Next::SpawnImplement(batch);
+    }
+    // Nothing could be started, and the two reasons for that are as far apart as reasons get.
+    //
+    // Something in flight is the ordinary one: the queue is at its ceiling, or everything left is
+    // waiting on a dependency, and the item that lands next will free it. Nothing in flight while
+    // the queue still owes a run is a queue that cannot move — an item that will never be selected
+    // by the fold above and will never be put down by the orphan check either, because it has work
+    // in a checkout of its own and something it depends on was skipped rather than failed.
+    //
+    // **It says `stopped`, and never `completed`.** `stopped` is the ending that means "I was cut
+    // short and what I did is on the branch", which is exactly true here; falling through to
+    // `close_the_round` would report a job with unstarted work as finished, and that is the one
+    // reading nobody can catch afterwards. Unreachable without a team — there the fold always takes
+    // the first claimable item — and that is why this is a guard rather than a case.
+    if job
         .items
         .iter()
-        .position(|item| matches!(item, ItemState::Pending | ItemState::GateRetriable))
+        .any(|item| item.state == ItemState::Running)
     {
-        return Next::SpawnImplement { ordinal };
+        return Next::Wait;
+    }
+    if job
+        .items
+        .iter()
+        .any(|item| item.state.claimable_as().is_some())
+    {
+        return Next::Finish(Outcome::Stopped);
     }
 
     // Two ways a round closes without being reviewed, and both are about not spending a run for
@@ -460,6 +935,153 @@ pub fn next_step(job: &JobView) -> Next {
         ReviewState::Running => Next::Wait,
         ReviewState::NotWanted | ReviewState::Done => close_the_round(job),
     }
+}
+
+/// Who the director gave this item to, in their own words, or `None`.
+///
+/// **The prompt is read NOW and not stored on the row**, which is what makes `job_items.agent_id` a
+/// reference rather than a copy. An owner who edits an agent between the plan and the run gets the
+/// edited agent doing the work, which is the behaviour a catalogue is for: the alternative freezes a
+/// persona at plan time and leaves the owner unable to say why their correction had no effect.
+///
+/// `None` three ways, and they mean the same thing to the caller and different things to a reader:
+/// the item has no agent, because its job has no team; the agent was deleted between the plan and
+/// the run, which `foreign_keys` and `agent::delete` between them make very nearly impossible; or
+/// the read failed. The last is the only one worth saying out loud, because it is the one where the
+/// item runs with a brief that is missing something it was supposed to have.
+async fn persona_for(pool: &SqlitePool, agent_id: Option<&str>) -> Option<String> {
+    let agent_id = agent_id?;
+    match crate::agent::get(pool, agent_id).await {
+        Ok(Some(agent)) => Some(format!(
+            "{}\n\nYou are `{}` on this job's team, and you were given the item below because your \
+             speciality is {}.\n\n",
+            agent.prompt, agent.name, agent.speciality
+        )),
+        Ok(None) => {
+            tracing::warn!(
+                agent_id,
+                "a job item names an agent the catalogue does not have"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                agent_id,
+                "could not read the agent a job item was given to; it runs without its brief"
+            );
+            None
+        }
+    }
+}
+
+/// PURE: which items may be started right now, by ordinal, at most `max_parallel` of them.
+///
+/// **A fold and not a search**, which is the difference between this and the positional walk it
+/// replaced. Each candidate is admitted against what is already in flight AND against what earlier
+/// candidates of this same batch have taken, so the answer is a set that can safely run together
+/// rather than the first thing that could run.
+///
+/// Three rules, and each rejects for a different reason:
+///
+/// 1. **Its dependencies have all passed.** Not "have all finished" — a dependency that failed or
+///    was skipped never lands, and the item waiting on it is put down by the orphan step above
+///    rather than started here.
+/// 2. **Nothing it declares is already spoken for.** By work in flight, or by an earlier item of
+///    this batch. Two items writing one file do not conflict in git while they are apart and break
+///    the branch together when they merge, and the retry that costs is the most expensive step in
+///    this design.
+/// 3. **The ceiling.** Counted as the batch plus what is already `Running`, because continuous
+///    start means this runs again while earlier items are still going.
+///
+/// **The candidate excludes itself from what blocks it.** `Conflicted` is both a state that holds
+/// paths and a state that owes a run, so an item in it would otherwise be permanently ineligible —
+/// blocked by its own declaration, for ever, with nothing to say why.
+///
+/// **Greedy by ordinal, and it can lose.** Item 1 declaring `{a, b}` takes the batch and excludes
+/// both 2 (`{a}`) and 3 (`{b}`) — a batch of one where a different choice would have made two. The
+/// alternative is a combinatorial search on a function that runs every 30 seconds for every live
+/// job, to buy an item's worth of parallelism in a case a director can avoid by splitting its work
+/// differently.
+///
+/// `Merging` and `Implemented` are in the blocking set and cannot be seen from here: the exclusive
+/// steps above return before this is reached whenever an item is in either. They are named anyway
+/// because the set is a statement about which states hold paths, and a set that is only right
+/// because of the order of the checks above it is a set that breaks silently when that order moves.
+fn batch_of(job: &JobView) -> Vec<usize> {
+    let running = job
+        .items
+        .iter()
+        .filter(|item| item.state == ItemState::Running)
+        .count();
+    let mut batch: Vec<usize> = Vec::new();
+    let mut taken: Vec<&str> = Vec::new();
+
+    for (ordinal, item) in job.items.iter().enumerate() {
+        if batch.len() + running >= job.max_parallel {
+            break;
+        }
+        if item.state.claimable_as().is_none() {
+            continue;
+        }
+        let landed = item.depends_on.iter().all(|dependency| {
+            job.items
+                .get(*dependency as usize)
+                .is_some_and(|dependency| dependency.state == ItemState::Passed)
+        });
+        if !landed {
+            continue;
+        }
+        let clashes = item.files.iter().any(|file| {
+            taken.contains(&file.as_str())
+                || job.items.iter().enumerate().any(|(other, mate)| {
+                    other != ordinal && holds_paths(mate.state) && mate.files.contains(file)
+                })
+        });
+        if clashes {
+            continue;
+        }
+        taken.extend(item.files.iter().map(String::as_str));
+        batch.push(ordinal);
+    }
+    batch
+}
+
+/// PURE: whether an item in this state has a claim on the paths it declared.
+///
+/// Everything from the moment a node starts writing until the merge has landed or been taken back.
+/// `Passed` is out — its work is on the job's branch, so the next item to start inherits it rather
+/// than racing it — and so is every terminal state, which owns nothing.
+fn holds_paths(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Running | ItemState::Merging | ItemState::Conflicted | ItemState::Implemented
+    )
+}
+
+/// PURE: whether an item in this state will never contribute its work.
+///
+/// The condition that orphans everything waiting on it, and it is deliberately wider than "failed".
+/// What a dependent needs to know is not whether its dependency went wrong but whether its work is
+/// ever going to arrive, and for these five the answer is no.
+///
+/// **`Skipped` is in the list, and it is the one worth arguing about.** A skipped item is not a
+/// failure — nothing broke and nobody stopped anything — and `ending()` deliberately walks past it
+/// so that a job which skipped one item is not reported as failed. That stays true: a skipped item
+/// ALONE still ends the job `completed`. What changes is a skipped item that something else was
+/// waiting for, and there the job did not do what was asked, because a person now has to decide
+/// about the prerequisite before any of it can happen.
+///
+/// `Cancelled` is here for completeness and never decides: it stops the job at the short-circuit.
+fn never_lands(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Failed
+            | ItemState::GateFailed
+            | ItemState::GateErrored
+            | ItemState::Cancelled
+            | ItemState::Skipped
+            | ItemState::Orphaned
+    )
 }
 
 /// PURE: what happens when a round's queue is spent and its review has been had.
@@ -548,16 +1170,28 @@ fn ending(job: &JobView) -> Outcome {
 /// `Cancelled` is deliberately absent. It stops the job at the short-circuit, team or no team, and
 /// never reaches here.
 fn failed_ending(job: &JobView) -> Option<Outcome> {
-    if job.items.contains(&ItemState::GateErrored) {
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::GateErrored)
+    {
         return Some(Outcome::GateErrored);
     }
-    if job.items.contains(&ItemState::Failed) {
+    if job.items.iter().any(|item| item.state == ItemState::Failed) {
         return Some(Outcome::Failed);
     }
-    if job.items.contains(&ItemState::GateFailed) {
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::GateFailed)
+    {
         return Some(Outcome::GateFailed);
     }
-    if job.items.contains(&ItemState::Orphaned) {
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::Orphaned)
+    {
         return Some(Outcome::Failed);
     }
     None
@@ -736,12 +1370,26 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     // `gate_attempts` travels with the status because the status alone cannot say what `gate_failed`
     // means any more: read against the job's budget it is either an item to try again or an item
     // that is over, and reading it without the count would make every red gate terminal again.
-    let items: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT status, gate_attempts FROM job_items WHERE job_id = ? ORDER BY ordinal",
+    let items: Vec<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, gate_attempts, depends_on, files FROM job_items
+         WHERE job_id = ? ORDER BY ordinal",
     )
     .bind(job_id)
     .fetch_all(pool)
     .await?;
+
+    // The team's ceiling, read here rather than carried on `jobs`, because it is the team's number
+    // and an owner who raises it means it to apply to the job running right now. One without a
+    // team, and never zero: `teams.max_parallel` is NOT NULL but nothing stops a 0 being written,
+    // and a ceiling of zero would build an empty batch for ever over a queue that still owed work.
+    let max_parallel: i64 = match team_id.as_deref() {
+        Some(team) => sqlx::query_scalar("SELECT max_parallel FROM teams WHERE id = ?")
+            .bind(team)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or(1),
+        None => 1,
+    };
 
     // Both node states are read by stage, not from the job's status: the job can be sitting in
     // `waiting` for budget while a node is the thing that has yet to run.
@@ -814,7 +1462,28 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         planning: plan_run.as_deref().is_some_and(node_in_flight),
         items: items
             .iter()
-            .map(|(status, attempts)| item_state_from(status, *attempts, gate_retries))
+            .map(|(status, attempts, depends_on, files)| ItemView {
+                state: item_state_from(status, *attempts, gate_retries),
+                // A list that will not parse is read as no list at all, and that is the safe
+                // direction: an item believed to depend on nothing is started early, where an item
+                // believed to depend on something that is not there would never start. The column
+                // is written by this module from a checked plan, so a failure here means the row was
+                // edited by hand.
+                depends_on: depends_on
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<Vec<i64>>(json).ok())
+                    .unwrap_or_default(),
+                // And here the same unreadable list errs the OTHER way, because the direction that
+                // is safe is the other one. An item believed to declare nothing clashes with
+                // nobody and is started beside anything, so two of them could write one file at
+                // once. Nothing to be done about it from here — an empty list is also what an
+                // honest job without a team has — which is why `parse_plan` refuses an empty
+                // `files` from a director instead, before the row is ever written.
+                files: files
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+                    .unwrap_or_default(),
+            })
             .collect(),
         review,
         rounds: RoundState {
@@ -835,6 +1504,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             },
         },
         has_team: team_id.is_some(),
+        max_parallel: max_parallel.max(1) as usize,
     })
 }
 
@@ -1007,6 +1677,8 @@ pub struct NewJob<'a> {
     pub max_rounds: Option<i64>,
     /// What the job may spend on itself. `None` leaves only the house limit.
     pub budget_usd: Option<f64>,
+    /// The team directing it, already checked to exist. `None` is the job of today.
+    pub team_id: Option<&'a str>,
 }
 
 /// Starts a job and returns its id.
@@ -1023,8 +1695,8 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     let result = sqlx::query(
         "INSERT INTO jobs
            (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
-            gate_retries, head_sha, max_rounds, budget_usd, created_at)
-         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?)",
+            gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id)
+         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.project_id)
     .bind(job.project_root)
@@ -1040,6 +1712,10 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     .bind(crate::config::rounds_allowed(job.max_rounds))
     .bind(job.budget_usd)
     .bind(chrono::Utc::now().to_rfc3339())
+    // Checked by `start` before this is called, because `foreign_keys` is on and an id that names
+    // nothing arrives here as a raw constraint failure — which the caller turns into "the job was
+    // created and could not be provisioned", a sentence that is wrong in both halves.
+    .bind(job.team_id)
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
@@ -1061,6 +1737,16 @@ pub struct CreateJobRequest {
     /// this number comes from a model filling in a tool call, and a ceiling applied at read time is
     /// a ceiling one forgetful caller can walk past. `None` is one round.
     pub max_rounds: Option<i64>,
+    /// The team to direct this job, by id. `None` is the sequential job in one shared checkout,
+    /// which is what every job before this existed was and what every caller that says nothing gets.
+    ///
+    /// A field the caller fills in, unlike `max_items` — and the asymmetry is the same one
+    /// `max_rounds` and `budget_usd` already have. `max_items` has a ceiling nobody may raise
+    /// because it is fan-out the daemon pays for; a team is a choice about WHO does the work, and
+    /// the ceiling that bounds what it costs is the project's slot count, applied on the way in by
+    /// `room_for` and again by every item that asks for a checkout.
+    #[serde(default)]
+    pub team_id: Option<String>,
 }
 
 /// Why a job cannot be started for a project.
@@ -1138,9 +1824,24 @@ pub fn resolve_start(
 ///
 /// Kept apart from `Failed` because the caller turns them into different answers: no room is a 409
 /// the asker can act on by waiting, and `Failed` is a 500 nothing they do would have helped.
+///
+/// `Debug` so a test that expected a start and got a refusal can say WHICH refusal. Without it the
+/// panic reads "the job did not start" and the next hour goes on finding out why.
+#[derive(Debug)]
 pub enum JobStart {
     Started(i64),
     NoRoom(String),
+    /// The request named a team the catalogue does not have.
+    ///
+    /// Its own answer and not `Failed`, because it is the caller's mistake and a fixable one: a
+    /// mistyped id, or a team deleted since the rule that names it was written. `Failed` would tell
+    /// them the daemon broke.
+    ///
+    /// **Refused rather than run without one**, and that is the decision worth writing down.
+    /// Starting the job with no team would do the work sequentially and report `completed`, and the
+    /// only symptom would be that the parallelism somebody configured never seemed to happen — the
+    /// exact failure this design has already walked into twice.
+    NoTeam(String),
     Failed,
 }
 
@@ -1166,6 +1867,12 @@ pub struct StartRequest<'a> {
     /// round under the house limit — exactly what it did before rounds existed.
     pub max_rounds: Option<i64>,
     pub budget_usd: Option<f64>,
+    /// The team that will direct this job, or `None` for the job of today.
+    ///
+    /// `None` is not a lesser job: it is the sequential queue in one shared checkout that every
+    /// job in this repository has been until now, and it stays the default in both callers. A team
+    /// is asked for, per request and per rule, and never acquired.
+    pub team_id: Option<&'a str>,
 }
 
 /// Creates a job and provisions the worktree it will live in.
@@ -1179,6 +1886,34 @@ pub struct StartRequest<'a> {
 /// never defining them", and the same applies to jobs. It moved here when a second caller appeared:
 /// two copies of this sequence would mean one of them learning a fix the other never learns.
 pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
+    // Before the row, and before the slot, because it is the one refusal here that costs nothing to
+    // discover and everything to discover late. `foreign_keys` is on, so an id naming no team would
+    // fail the INSERT below with a raw constraint error, and the caller would report "the job was
+    // created and could not be provisioned" — a sentence whose two halves are both untrue.
+    //
+    // Read rather than trusted even for a rule, because the file that names the team and the table
+    // that holds it are edited in different places at different times: a team deleted this morning
+    // leaves a `graph:` rule from last month naming it, and nothing anywhere would have complained.
+    if let Some(team_id) = request.team_id {
+        let known: Option<i64> = match sqlx::query_scalar("SELECT 1 FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(known) => known,
+            Err(error) => {
+                tracing::warn!(team_id, %error, "could not read the team a job asked for");
+                return JobStart::Failed;
+            }
+        };
+        if known.is_none() {
+            return JobStart::NoTeam(format!(
+                "no team named `{team_id}` is in the catalogue, and a job that asked for one is not \
+                 started without it"
+            ));
+        }
+    }
+
     // Asked before the row exists, and it is not the decision — `claim` below is. A job cannot claim
     // until it has an id, so the authoritative answer costs a row, and a scheduler firing at a full
     // project every half hour would leave a retired job behind every time. This turns that into the
@@ -1210,6 +1945,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
             head_sha: request.head_sha,
             max_rounds: request.max_rounds,
             budget_usd: request.budget_usd,
+            team_id: request.team_id,
         },
     )
     .await
@@ -1441,6 +2177,19 @@ pub const MAX_JOB_LIFETIME: chrono::Duration = chrono::Duration::hours(4);
 /// that decides it can move forever without ever spawning anything.
 const MAX_STEPS_PER_PASS: usize = 4;
 
+/// What a node that cannot get a worktree slot means for the job.
+///
+/// The same refusal is two different facts depending on what else the job has going. With nothing
+/// started, no room means the job cannot move and `waiting` is the honest status. With an item
+/// already running, it means the batch is bigger than the project's ceiling and came out smaller —
+/// which is what `next_step` deliberately left the driver to discover, since a slot count read
+/// inside a pure function is a number somebody else can take before the claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoRoom {
+    Park,
+    ShrinkTheBatch,
+}
+
 /// Whether a job can move again in the same pass.
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
@@ -1490,20 +2239,55 @@ const HISTORY_IS_THE_JOBS: &str = "The job commits the tree itself once an item'
 /// It says the file is the only thing read, because it is: §5.2 of the design takes the queue from
 /// `plan.json` and never from stdout, so that a stream truncated mid-write cannot be parsed into a
 /// plausible short queue that reads as "there was less work than expected".
-pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str) -> String {
+pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str, graph: Option<&Graph>) -> String {
+    let Some(graph) = graph else {
+        return format!(
+            "You are the PLAN node of an autonomous job. Break the task below into at most \
+             {max_items} items that can be done one after another, in order, in the same working \
+             tree. Prefer fewer, larger items to more, smaller ones.\n\n\
+             {HISTORY_IS_THE_JOBS}\n\n\
+             Write them to {artifacts}/plan.json and change nothing else:\n\n\
+             {{\"items\": [{{\"description\": \"...\", \"files\": [\"path\", \"...\"]}}]}}\n\n\
+             \"files\" is optional and best-effort — name the files you expect the item to touch \
+             if you know them, and omit the field if you do not. A wrong guess costs more than no \
+             guess.\n\n\
+             That file is the only thing that is read; anything you print is discarded. If there is \
+             no work to do, write {{\"items\": []}} — an empty queue is a legitimate answer and \
+             is not a failure. Do not begin any of the work yourself.\n\n\
+             The task:\n\n{task}"
+        );
+    };
     format!(
-        "You are the PLAN node of an autonomous job. Break the task below into at most {max_items} \
-         items that can be done one after another, in order, in the same working tree. Prefer \
-         fewer, larger items to more, smaller ones.\n\n\
+        "You are the PLAN node of an autonomous job that a TEAM will carry out. Break the task \
+         below into at most {max_items} items. Items that do not depend on each other are worked on \
+         AT THE SAME TIME, each in a working tree of its own, so how you split the work decides how \
+         much of it can happen at once.\n\n\
          {HISTORY_IS_THE_JOBS}\n\n\
          Write them to {artifacts}/plan.json and change nothing else:\n\n\
-         {{\"items\": [{{\"description\": \"...\", \"files\": [\"path\", \"...\"]}}]}}\n\n\
-         \"files\" is optional and best-effort — name the files you expect the item to touch if you \
-         know them, and omit the field if you do not. A wrong guess costs more than no guess.\n\n\
+         {{\"items\": [{{\"description\": \"...\", \"files\": [\"path\"], \"depends_on\": [], \
+         \"agent_id\": \"...\"}}]}}\n\n\
+         ALL THREE keys are required on every item, and leaving one out refuses the whole plan.\n\n\
+         \"agent_id\": who does the item. {roster} Choose by what each one is for; one of them may \
+         take several items, and an item may go to whoever fits it best.\n\n\
+         \"files\": every file you expect the item to touch. This is what tells two items apart \
+         before either has run — two items naming the same file are never started together. Name \
+         too few and their edits collide; name the whole repository and nothing ever runs beside \
+         anything.\n\n\
+         \"depends_on\": the ordinals of the items this one may not start before, or [] if there \
+         are none. Ordinals are counted across the whole job, and THIS ROUND'S ITEMS ARE NUMBERED \
+         FROM {first}: the first item you list is ordinal {first}, the second is {second}, and so \
+         on. A dependency must point at an EARLIER ordinal than the item naming it — list each \
+         item after everything it needs. A plan that points forwards, or in a circle, is refused.\n\n\
+         Registry files that many items would touch — a lock file, a module list, a migrations \
+         directory — belong in the \"files\" of every item that will edit one. Two items that \
+         both add a migration do not conflict in git and break the build together.\n\n\
          That file is the only thing that is read; anything you print is discarded. If there is no \
          work to do, write {{\"items\": []}} — an empty queue is a legitimate answer and is not a \
          failure. Do not begin any of the work yourself.\n\n\
-         The task:\n\n{task}"
+         The task:\n\n{task}",
+        roster = graph.introduce(),
+        first = graph.first_ordinal,
+        second = graph.first_ordinal + 1,
     )
 }
 
@@ -1521,7 +2305,13 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str) -> String {
 /// Told to prefer `done` explicitly, and that is not politeness. The failure this feature has to
 /// avoid is a job that will not admit it is finished: ending #4 (out of rounds) costs a full round of
 /// runs to discover, where ending #1 costs one node.
-pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &str) -> String {
+pub fn replan_prompt(
+    task: &str,
+    round: i64,
+    archives: &[String],
+    artifacts: &str,
+    graph: Option<&Graph>,
+) -> String {
     let history = if archives.is_empty() {
         // Reachable when the archive copy failed, and the honest thing to say is that it is missing.
         // Claiming a file that is not there sends the node looking, and what it finds is nothing.
@@ -1534,6 +2324,29 @@ pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &st
             archives.join(", ")
         )
     };
+    // The graph rules are repeated here word for word rather than referred to, and the reason is
+    // that the node reading them is not the node that read them before. A replan writes items into
+    // the SAME queue, numbered from wherever that queue left off, so a `depends_on` written to mean
+    // "the first item I just listed" names a finished item of round 1 — the plan is refused, and
+    // two dry rounds later the job reports `completed` having done only its first round.
+    let (shape, rules) = match graph {
+        Some(graph) => (
+            ", \"files\": [\"path\"], \"depends_on\": [], \"agent_id\": \"...\"",
+            format!(
+                "All three extra keys are required on every item you list, and leaving one out \
+                 refuses the whole plan. \"files\" is every file you expect the item to touch, and \
+                 it is what tells two items apart before either has run. \"depends_on\" is the \
+                 ordinals this item may not start before, or [] if there are none — counted across \
+                 the WHOLE job, so the items you list now are numbered from {}, and a dependency \
+                 must point at an EARLIER ordinal than the item naming it. \"agent_id\" is who \
+                 does the item.\n\n\
+                 {}\n",
+                graph.first_ordinal,
+                graph.introduce()
+            ),
+        ),
+        None => ("", String::new()),
+    };
     format!(
         "You are the REPLAN node of an autonomous job, at the end of round {round}. The working tree \
          holds everything the job has done so far.\n\n\
@@ -1541,11 +2354,12 @@ pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &st
          Decide whether the task below is finished. Write ONE of these to {artifacts}/plan.json and \
          change nothing else:\n\n\
          {{\"done\": true, \"why\": \"...\"}}\n\
-         {{\"items\": [{{\"description\": \"...\"}}]}}\n\n\
+         {{\"items\": [{{\"description\": \"...\"{shape}}}]}}\n\n\
+         {rules}\
          That file is the only thing that is read; anything you print is discarded. Prefer \
-         {{\"done\": true}} when the task is met — saying so ends the job in one node, where leaving \
-         it to run out of rounds costs a full round of work to discover the same thing. Do not begin \
-         any of the work yourself.\n\n\
+         {{\"done\": true}} when the task is met — saying so ends the job in one node, where \
+         leaving it to run out of rounds costs a full round of work to discover the same thing. Do \
+         not begin any of the work yourself.\n\n\
          {HISTORY_IS_THE_JOBS}\n\n\
          {LOOK_WITH_THE_READING_TOOLS}\n\n\
          The task:\n\n{task}"
@@ -1569,6 +2383,12 @@ pub fn replan_prompt(task: &str, round: i64, archives: &[String], artifacts: &st
 /// than a second independent guess at the same item, because §5.4 keeps the second node from ever
 /// seeing the first one's session: without the output travelling in the prompt, a whole run is spent
 /// rediscovering what the gate already printed.
+///
+/// `persona` is who the director gave the item to, and it is `None` for every item of every job
+/// without a team — which is what keeps the brief below byte-for-byte what it has always been. It is
+/// PREPENDED rather than mixed in, for the reason `speciality` exists at all: the agent's own prompt
+/// is a standing instruction about how this one works, and the item is a piece of work. Interleaving
+/// them would make each read like a qualification of the other.
 pub fn implement_prompt(
     description: &str,
     ordinal: usize,
@@ -1576,8 +2396,13 @@ pub fn implement_prompt(
     artifacts: &str,
     files: &[String],
     gate_output: Option<&str>,
+    persona: Option<&str>,
 ) -> String {
-    let mut prompt = format!(
+    // Prepended and not woven in, so a job with no team is handed the brief it has always been
+    // handed, byte for byte. It goes FIRST because it is who is reading, and everything after it is
+    // what they are reading about — the order `team.rs`'s `specialist_prompt` already uses.
+    let mut prompt = persona.unwrap_or_default().to_owned();
+    prompt.push_str(&format!(
         "You are item {} of {total} in an autonomous job. The working tree already holds the work \
          of the earlier items; this is the only one you do.\n\n\
          {description}\n\n\
@@ -1586,7 +2411,7 @@ pub fn implement_prompt(
          Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
          stops this item to ask permission for something already arranged.",
         ordinal + 1
-    );
+    ));
     if !files.is_empty() {
         // Told where to begin, and told in the same breath that beginning is all it is. A list
         // written before any of the earlier items ran cannot know what they moved, so a node that
@@ -1800,7 +2625,11 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
         None => None,
     };
 
-    let planned = match parse_plan(contents.as_deref(), job.max_items.max(0) as usize) {
+    let planned = match parse_plan(
+        contents.as_deref(),
+        job.max_items.max(0) as usize,
+        graph_rules(pool, job).await.as_ref(),
+    ) {
         Ok(planned) => planned,
         // Absent and unreadable are both planning failures, and neither is an empty queue. The
         // queue is never invented: a job that cannot say what it meant to do does not proceed to
@@ -1827,13 +2656,16 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
             .then(|| serde_json::to_string(&item.files).ok())
             .flatten();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, files)
-             VALUES (?, ?, ?, 'pending', ?)",
+            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
+                                    agent_id)
+             VALUES (?, ?, ?, 'pending', ?, ?, ?)",
         )
         .bind(job.id)
         .bind(ordinal as i64)
         .bind(&item.description)
         .bind(files)
+        .bind(edges(&item.depends_on))
+        .bind(item.agent_id.as_deref())
         .execute(pool)
         .await?;
     }
@@ -1950,7 +2782,11 @@ async fn ingest_replan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
         }
         None => None,
     };
-    let planned = match parse_plan(contents.as_deref(), job.max_items.max(0) as usize) {
+    let planned = match parse_plan(
+        contents.as_deref(),
+        job.max_items.max(0) as usize,
+        graph_rules(pool, job).await.as_ref(),
+    ) {
         Ok(planned) => planned,
         Err(error) => {
             stop_after_replan(state, job, run_id, &format!("its replan node {error}")).await?;
@@ -2044,14 +2880,17 @@ async fn open_the_next_round(
             .then(|| serde_json::to_string(&item.files).ok())
             .flatten();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, round, files)
-             VALUES (?, ?, ?, 'pending', ?, ?)",
+            "INSERT INTO job_items (job_id, ordinal, description, status, round, files, depends_on,
+                                    agent_id)
+             VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(next_ordinal + offset as i64)
         .bind(&item.description)
         .bind(round)
         .bind(files)
+        .bind(edges(&item.depends_on))
+        .bind(item.agent_id.as_deref())
         .execute(pool)
         .await?;
     }
@@ -2111,6 +2950,115 @@ struct ItemClaim {
     held: &'static str,
 }
 
+/// What this item needs to be given a checkout of its own, or `None` if it should work in the
+/// job's.
+///
+/// `None` for four different reasons and they are all the same answer, which is why they are read
+/// here rather than at the call site: the job has no team, the item has no row, the job has no
+/// branch to be born on, or the branch has no tip. **The last two are the ones worth naming.** An
+/// item's tree is born on the tip of its job's branch as the last gate left it, and that is the
+/// whole of what makes a dependency graph mean anything — an item whose dependency has just landed
+/// starts WITH that work. There is no honest fallback: `None` would give git's default, the project
+/// checkout's HEAD, which is a commit with none of this job's work in it, and the graph would be
+/// decorative. Falling back to the shared tree is slower and correct; falling back to `master` is
+/// faster and wrong.
+async fn item_provisioning(
+    pool: &SqlitePool,
+    job: &JobRow,
+    stage: &'static str,
+    ordinal: usize,
+) -> Option<crate::runs::JobItem> {
+    let team_id: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT team_id FROM jobs WHERE id = ?")
+            .bind(job.id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    team_id?;
+
+    let item_id: i64 =
+        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+
+    // The job's own checkout stands on the tip of the job's branch — it is where its nodes have
+    // been committing all along — so its HEAD is the commit an item should be born on, read from
+    // the tree rather than from a ref name that a second worktree could be holding.
+    let (path, _) = job_worktree(pool, job.id).await.ok().flatten()?;
+    let base = crate::worktree::head_sha(&path).await.ok()?;
+
+    Some(crate::runs::JobItem {
+        job_id: job.id,
+        item_id,
+        stage,
+        base,
+    })
+}
+
+/// Brings the job's branch into this item's own checkout, and says what happened.
+///
+/// `None` when there is nothing to do or nothing to do it to: no team, no checkout of the item's
+/// own, or the item is starting for the first time. In every one of those the item works where it
+/// always worked and the prompt says nothing extra.
+///
+/// **A conflict is left staged, and that is the design rather than a fallback.** The alternative —
+/// telling the agent to merge — cannot work: any `git merge` an agent runs goes to the approval
+/// queue, and what the agent would be asking permission for is the merge that just failed. It would
+/// circle, and no wording gets it out, because the refusal is structural. With the conflict already
+/// in the files, the agent does what an agent does: edits and commits. `worktree::stage_conflict`
+/// carries the same argument for the VCS resolver, and this is the same inversion for a job item.
+async fn catch_up_the_item(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<String> {
+    let item_id: i64 =
+        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+    let tree: Option<String> = sqlx::query_scalar(
+        "SELECT path FROM worktrees
+         WHERE owner_kind = 'item' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let tree = std::path::PathBuf::from(tree?);
+    let (_, job_branch) = job_worktree(pool, job.id).await.ok().flatten()?;
+
+    match crate::worktree::catch_up(&tree, &job_branch).await {
+        Ok(crate::worktree::CatchUp::Clean) => Some(format!(
+            "
+
+Your working tree has been brought up to date with `{job_branch}`, the branch this              job is building. Everything other items have landed since you last ran is now here,              and it merged cleanly.
+"
+        )),
+        Ok(crate::worktree::CatchUp::Conflicted) => Some(format!(
+            "
+
+Merging `{job_branch}` — the branch this job is building — into your work              conflicts, and the merge has been left STAGED in your working tree: the conflict              markers are in the files and MERGE_HEAD is set.
+
+             Resolve the conflicted files and commit. Do NOT run `git merge`, `git merge --abort`              or `git rebase`: the merge you would be asking for is the one already staged here, and              the request would be refused. Editing and committing is the whole of the work.
+"
+        )),
+        Err(error) => {
+            // Not a reason to refuse to start. The checkout still holds the item's own work and the
+            // node can still make progress in it; what is lost is being up to date, and the merge
+            // that follows will meet the same divergence and say so where it can be acted on.
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not bring the job's branch into an item's tree");
+            None
+        }
+    }
+}
+
 async fn spawn_node(
     state: &AppState,
     job: &JobRow,
@@ -2118,6 +3066,7 @@ async fn spawn_node(
     prompt: String,
     item: Option<ItemClaim>,
     worktree: (PathBuf, String),
+    no_room: NoRoom,
 ) -> Step {
     let pool = &state.pool;
 
@@ -2168,6 +3117,22 @@ async fn spawn_node(
         }
     };
     let mut prompt = prompt;
+    // Before the notes and before the lessons, because it is about the CHECKOUT this node is
+    // about to open its editor in, and everything else is about the work. An item going round
+    // again — because its gate went red, or because its merge conflicted — has a checkout of its
+    // own that has been standing still while the job's branch moved on. Bringing the branch in is
+    // what makes the second attempt an attempt at the CURRENT state rather than at the state the
+    // first one saw.
+    //
+    // This is the contract `GateRetriable` used to name the other way round: "in the tree exactly
+    // as the rejected attempt left it". It still is that, plus everything that landed since — and
+    // that addition is what a red gate caused by somebody else's merge needs in order to be
+    // fixable at all.
+    if let Some(ItemClaim { ordinal, .. }) = item
+        && let Some(block) = catch_up_the_item(pool, job, ordinal).await
+    {
+        prompt.push_str(&block);
+    }
     if let Some(block) = crate::notes::render(&waiting) {
         prompt.push_str(&block);
     }
@@ -2190,19 +3155,45 @@ async fn spawn_node(
         prompt.push_str(&block);
     }
 
-    let created = crate::runs::create_job_node_run(
-        state,
-        prompt,
-        job.project_id.clone(),
-        job.project_root.clone(),
-        crate::runs::JobNode {
-            job_id: job.id,
-            stage,
-            worktree_path: path.to_string_lossy().into_owned(),
-            branch,
-        },
-    )
-    .await;
+    // An item of a job a team directs gets a checkout of its own; everything else — every node of
+    // every job without a team, and this job's own plan, replan and review nodes — works in the
+    // job's, exactly as before.
+    //
+    // Keyed on the item and on the team together, and both halves matter. Without a team there is
+    // no reason to pay for a second checkout, and the sequential job is what this must not change.
+    // Without an item there is nothing to name a tree after: a plan node has no row in `job_items`,
+    // and a review node reads the branch the whole job produced rather than any one item's.
+    let own_tree = match item {
+        Some(ItemClaim { ordinal, .. }) => item_provisioning(pool, job, stage, ordinal).await,
+        None => None,
+    };
+    let created = match own_tree {
+        Some(item) => {
+            crate::runs::create_job_item_run(
+                state,
+                prompt,
+                job.project_id.clone(),
+                job.project_root.clone(),
+                item,
+            )
+            .await
+        }
+        None => {
+            crate::runs::create_job_node_run(
+                state,
+                prompt,
+                job.project_id.clone(),
+                job.project_root.clone(),
+                crate::runs::JobNode {
+                    job_id: job.id,
+                    stage,
+                    worktree_path: path.to_string_lossy().into_owned(),
+                    branch,
+                },
+            )
+            .await
+        }
+    };
 
     match created {
         Ok(run_id) => {
@@ -2248,13 +3239,22 @@ async fn spawn_node(
         // four-hour ceiling is what stops a starved job from waiting forever.
         Err(crate::runs::CreateRunError::Busy) => {
             release_item(pool, job, item).await;
-            park(
-                state,
-                job,
-                "slot",
-                "another run holds the project's worktree slot",
-            )
-            .await
+            match no_room {
+                NoRoom::Park => {
+                    park(
+                        state,
+                        job,
+                        "slot",
+                        "another run holds the project's worktree slot",
+                    )
+                    .await
+                }
+                // Nothing to park: this job already has an item going, and the batch simply came
+                // out smaller than the fold proposed. Parking here would tell a reader the job is
+                // blocked while it is in fact working, and the park would be lifted by the next
+                // tick anyway.
+                NoRoom::ShrinkTheBatch => Step::Stopped,
+            }
         }
         Err(error) => {
             release_item(pool, job, item).await;
@@ -2313,6 +3313,150 @@ async fn park(state: &AppState, job: &JobRow, reason: &str, detail: &str) -> Ste
 }
 
 /// Runs the gate for one item and records its verdict on that item.
+/// Brings one item's branch into the job's, in the job's own checkout.
+///
+/// **`merge_base_sha` is written BEFORE the merge, and that order is the whole of this function.**
+/// It is the commit the job's branch stands on right now, and after the merge nothing on the branch
+/// says which of its commits this merge added. A merge that landed with the write lost would leave
+/// an item on the branch with no way back off it, and the `reset --hard` that undoes a red gate
+/// would have no target — so the write comes first and a failure to write refuses the merge.
+///
+/// `--no-ff` and not a fast-forward. The reset would work either way, but a fast-forward leaves no
+/// merge commit, and then nothing in the history says this item arrived as one thing rather than as
+/// a handful of commits that happen to be adjacent.
+///
+/// A conflict is aborted here and resolved elsewhere. Aborting leaves the job's checkout clean,
+/// which is what the next item's merge depends on; resolving would mean an agent editing the job's
+/// branch in the shared checkout, which is the thing every worktree in this design exists to avoid.
+/// The item is put down as `conflicted` and the run that clears it works in the item's own tree —
+/// the procedure `git_exec::compute_merge` already tells an agent to follow when the queue refuses
+/// its merge.
+async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -> Step {
+    let pool = &state.pool;
+
+    let Ok(Some((worktree, _))) = job_worktree(pool, job.id).await else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "no worktree on record to merge into"
+        );
+        return Step::Stopped;
+    };
+    let item_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let Some(item_id) = item_id else {
+        tracing::warn!(job_id = job.id, ordinal, "no item row to merge");
+        return Step::Stopped;
+    };
+    let branch = crate::worktree::Owner::Item(item_id).branch_name();
+
+    // **The item's work is committed HERE, and until this existed nothing committed it at all.**
+    //
+    // An implement node is told in as many words to leave its tree uncommitted: `implement_prompt`
+    // says "the job commits for you once the gate agrees", and for a job without a team that is
+    // exactly what happens — `record_gate`'s green arm checkpoints the one shared checkout. A team's
+    // item has a checkout of its own, and its gate runs AFTER the merge rather than before it, so
+    // the moment that used to commit comes too late. The branch stayed empty, the merge below
+    // brought nothing across, and every item passed a gate over a job branch that had never
+    // received its work. Nothing anywhere reported it, because an empty merge succeeds.
+    //
+    // Before the base is read and before anything is recorded, so a checkpoint that fails leaves no
+    // half-finished merge behind it.
+    //
+    // A checkpoint over a tree with nothing in it is a no-op that answers with HEAD — `checkpoint`
+    // commits only when `git status` has something to say — so an item whose node wrote nothing
+    // merges an empty branch, which is the truthful outcome rather than an error.
+    let item_tree: Option<String> = sqlx::query_scalar(
+        "SELECT path FROM worktrees
+         WHERE owner_kind = 'item' AND owner_id = ? AND removed_at IS NULL",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(item_tree) = item_tree else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "no checkout on record for the item being merged"
+        );
+        return Step::Stopped;
+    };
+    if let Err(error) = crate::worktree::checkpoint(Path::new(&item_tree)).await {
+        // Fatal here, where the same failure is survivable in `record_gate`. There the work is
+        // already on the branch and what is lost is the next item's footing; here the work exists
+        // only in a working tree, and merging without it would put a green gate on a branch that is
+        // missing the thing it is measuring.
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not commit an item's work, so nothing was merged");
+        return Step::Stopped;
+    }
+
+    let Ok(base) = crate::worktree::head_sha(&worktree).await else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "could not read where the job's branch stands, so nothing was merged"
+        );
+        return Step::Stopped;
+    };
+    let recorded =
+        sqlx::query("UPDATE job_items SET merge_base_sha = ? WHERE job_id = ? AND ordinal = ?")
+            .bind(&base)
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+    if let Err(error) = recorded {
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not record where a merge would start, so nothing was merged");
+        return Step::Stopped;
+    }
+
+    match crate::worktree::merge_branch(&worktree, &branch).await {
+        Ok(true) => {
+            let _ = sqlx::query(
+                "UPDATE job_items SET status = 'merging' WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+            Step::Continued
+        }
+        Ok(false) => {
+            let _ = sqlx::query(
+                "UPDATE job_items SET status = 'conflicted' WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .execute(pool)
+            .await;
+            say(
+                pool,
+                job,
+                "job_item_conflicted",
+                &format!(
+                    "job {} at item {}: `{branch}` does not merge into the job's branch, so it was                      put down and nothing was published",
+                    job.id,
+                    ordinal + 1
+                ),
+            )
+            .await;
+            Step::Continued
+        }
+        Err(error) => {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not merge an item");
+            Step::Stopped
+        }
+    }
+}
+
 async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize) -> Step {
     let pool = &state.pool;
     let last = ordinal + 1 == items;
@@ -2394,6 +3538,39 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
         .execute(pool)
         .await;
     record_gate(state, job, ordinal, outcome).await
+}
+
+/// Where the job's branch is put back to when this item's work has to come off it.
+///
+/// **Two answers, and which one is right depends on how the work got onto the branch.**
+///
+/// An item that was MERGED has `merge_base_sha`: the commit the branch stood on immediately before
+/// that merge. Resetting there removes that merge and nothing else, whatever order the other items
+/// arrived in — which is the only property that survives items landing out of ordinal order.
+///
+/// An item that was WRITTEN into the shared checkout has no merge and no base, and falls back to
+/// [`footing_for`], which walks back through the ordinals to the nearest item a gate agreed with.
+/// That is still exactly right there, because in a sequential queue the order work reached the
+/// branch IS the order of the ordinals — and it is the only answer available, since nothing recorded
+/// a per-item boundary.
+///
+/// The pair is read here rather than at the call site so that "which reset target" is one decision
+/// with one place to look, instead of a condition threaded through the red-gate arm.
+async fn revert_point(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<String> {
+    let merged: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT merge_base_sha FROM job_items WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    if merged.is_some() {
+        return merged;
+    }
+    footing_for(pool, job, ordinal).await
 }
 
 /// The commit an item at `ordinal` falls back to when its own work has to be undone.
@@ -2671,7 +3848,7 @@ async fn record_gate(
     if matches!(outcome, crate::gate::GateOutcome::Failed { .. }) {
         let reverted = match (
             job_worktree(pool, job.id).await,
-            footing_for(pool, job, ordinal).await,
+            revert_point(pool, job, ordinal).await,
         ) {
             (Ok(Some((worktree, _))), Some(footing)) => {
                 match crate::worktree::revert_to(&worktree, &footing).await {
@@ -2908,7 +4085,8 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     if matches!(next, Next::Wait) {
         return Step::Stopped;
     }
-    if let Next::Finish(outcome) = next {
+    if let Next::Finish(outcome) = &next {
+        let outcome = *outcome;
         if let Err(error) = finish(pool, job.id, outcome).await {
             tracing::warn!(job_id = job.id, %error, "could not finish a job");
             return Step::Stopped;
@@ -2930,8 +4108,53 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     // The gate is a subprocess, not a run: it starts no CLI, consumes no quota and answers to no
     // brake. Refusing to measure an item because the owner sat down would leave the tree holding
     // edits nothing has verified, which is the state decision 10 exists to avoid.
-    if let Next::RunGate { ordinal } = next {
-        return gate_item(state, job, ordinal, view.items.len()).await;
+    if let Next::RunGate { ordinal } = &next {
+        return gate_item(state, job, *ordinal, view.items.len()).await;
+    }
+    // A merge is a subprocess too, and it goes past the brakes for the same reason plus one of its
+    // own: the item's work is already done and paid for, sitting on a branch. Refusing to bring it
+    // in because the owner sat down would leave it there, diverging from the job's branch for as
+    // long as the brake holds — and the divergence is what the retry has to absorb.
+    if let Next::MergeItem { ordinal } = &next {
+        return merge_item(state, job, *ordinal).await;
+    }
+    // Past the brakes with the other two, and it is the cheapest of the three: one UPDATE, no
+    // subprocess and no run. Parking a job rather than writing it would leave the item reading
+    // `pending` — work a person is told is still coming — for as long as the brake holds.
+    if let Next::Orphan { ordinal } = &next {
+        let ordinal = *ordinal;
+        let marked = sqlx::query(
+            "UPDATE job_items SET status = 'orphaned'
+             WHERE job_id = ? AND ordinal = ? AND status = 'pending'",
+        )
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .execute(pool)
+        .await;
+        return match marked {
+            // The compare-and-swap matters for the same reason `spawn_node`'s does: two passes
+            // reaching this at once must not both act, and an item that stopped being `pending` in
+            // between is one somebody else has already decided about.
+            Ok(result) if result.rows_affected() == 1 => {
+                say(
+                    pool,
+                    job,
+                    "job_item_orphaned",
+                    &format!(
+                        "job {} at item {}: something it depends on will not land, so it was put                          down without being attempted",
+                        job.id,
+                        ordinal + 1
+                    ),
+                )
+                .await;
+                Step::Continued
+            }
+            Ok(_) => Step::Continued,
+            Err(error) => {
+                tracing::warn!(job_id = job.id, ordinal, %error, "could not put down an orphaned item");
+                Step::Stopped
+            }
+        };
     }
 
     match brakes(state, job, now).await {
@@ -2953,7 +4176,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                     job.id,
                     view.items
                         .iter()
-                        .filter(|item| item.claimable_as().is_some())
+                        .filter(|item| item.state.claimable_as().is_some())
                         .count()
                 ),
             )
@@ -2981,82 +4204,158 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     match next {
         Next::SpawnPlan => {
             let task = job.prompt.clone().unwrap_or_default();
-            let prompt = plan_prompt(&task, job.max_items.max(0) as usize, &artifacts);
-            spawn_node(state, job, "plan", prompt, None, worktree).await
-        }
-        Next::SpawnImplement { ordinal } => {
-            // What the claim below has to find. Taken from the verdict this pass already reached —
-            // `next_step` named this ordinal precisely because `item_state_from` called it `Pending`
-            // or `GateRetriable` — rather than asked of the database a second time. The alternative
-            // is a `WHERE` clause that re-derives which red gates are retriable, which is the same
-            // rule in a second dialect and drifts the first time either side is edited.
-            let Some(held) = view
-                .items
-                .get(ordinal)
-                .and_then(|state| state.claimable_as())
-            else {
-                tracing::warn!(
-                    job_id = job.id,
-                    ordinal,
-                    "asked to implement an item that is not startable"
-                );
-                return Step::Stopped;
-            };
-            let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-                "SELECT description, files, gate_output FROM job_items
-                 WHERE job_id = ? AND ordinal = ?",
-            )
-            .bind(job.id)
-            .bind(ordinal as i64)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-            // `gate_output` is NULL for every item on its first attempt, which is every item of every
-            // job that never retries anything — so the `None` this reads is the prompt staying
-            // exactly as it was, not a fallback.
-            let Some((description, files, gate_output)) = row else {
-                tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
-                return Step::Stopped;
-            };
-            // A hint that will not parse is no hint. It is an optimisation for where to start
-            // reading, and refusing to run the item over it would fail the work for the sake of the
-            // advice about the work.
-            let files: Vec<String> = files
-                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
-                .unwrap_or_default();
-            let prompt = implement_prompt(
-                &description,
-                ordinal,
-                view.items.len(),
+            let prompt = plan_prompt(
+                &task,
+                job.max_items.max(0) as usize,
                 &artifacts,
-                &files,
-                gate_output.as_deref(),
+                graph_rules(pool, job).await.as_ref(),
             );
-            spawn_node(
-                state,
-                job,
-                "implement",
-                prompt,
-                Some(ItemClaim { ordinal, held }),
-                worktree,
-            )
-            .await
+            spawn_node(state, job, "plan", prompt, None, worktree, NoRoom::Park).await
+        }
+        Next::SpawnImplement(ordinals) => {
+            // One node per ordinal, in order, under the ONE brake reading this pass took. A brake is
+            // a statement about the JOB — its budget, the owner's attention, the window — so
+            // re-reading it between two items of one batch would let the second half be refused
+            // under a rule the first half was allowed under, for the same job at the same moment.
+            let mut step = Step::Stopped;
+            for (position, ordinal) in ordinals.into_iter().enumerate() {
+                // Re-read between items for the reason `drive` re-reads between passes: the item
+                // before this one may have parked the job for want of a slot, or ended it because
+                // its run could not be created at all, and the next item must not be started on top
+                // of either. `is_paused` as well as the live list, because `waiting` IS live — a
+                // parked job is one that will come back, not one that is over.
+                if position > 0 {
+                    let Ok(current) = load_job(pool, job.id).await else {
+                        break;
+                    };
+                    if !LIVE_STATUSES.contains(&current.status.as_str())
+                        || is_paused(&current.status)
+                    {
+                        break;
+                    }
+                }
+                step = start_item(
+                    state,
+                    job,
+                    &view,
+                    &artifacts,
+                    worktree.clone(),
+                    ordinal,
+                    // The first item parks the job when the project has no room, and the ones after
+                    // it do not. With something already started the job is not blocked; it is at the
+                    // project's ceiling, and `waiting` would be a status the next tick has to undo.
+                    if position == 0 {
+                        NoRoom::Park
+                    } else {
+                        NoRoom::ShrinkTheBatch
+                    },
+                )
+                .await;
+            }
+            step
         }
         Next::SpawnReview => {
             let prompt = review_prompt(job.head_sha.as_deref(), &artifacts);
-            spawn_node(state, job, "review", prompt, None, worktree).await
+            spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
         }
         Next::SpawnReplan => {
             // Archived BEFORE the node starts, because the node is about to overwrite `plan.json`
             // with its own answer. The round's plan has to be put aside while it still exists.
             let archives = archive_plans(&worktree.0, view.rounds.round).await;
             let task = job.prompt.clone().unwrap_or_default();
-            let prompt = replan_prompt(&task, view.rounds.round, &archives, &artifacts);
-            spawn_node(state, job, "replan", prompt, None, worktree).await
+            let prompt = replan_prompt(
+                &task,
+                view.rounds.round,
+                &archives,
+                &artifacts,
+                graph_rules(pool, job).await.as_ref(),
+            );
+            spawn_node(state, job, "replan", prompt, None, worktree, NoRoom::Park).await
         }
-        Next::Wait | Next::Finish(_) | Next::RunGate { .. } => Step::Stopped,
+        // All four are answered above, before the brakes and before the worktree is resolved.
+        // Reaching one here means the dispatch above stopped covering something it used to.
+        Next::Wait
+        | Next::Finish(_)
+        | Next::RunGate { .. }
+        | Next::MergeItem { .. }
+        | Next::Orphan { .. } => Step::Stopped,
     }
+}
+
+/// Starts one item's node: the whole of what the batch loop does for one ordinal.
+///
+/// Lifted out of the dispatch rather than left inline, because a batch runs it more than once in a
+/// pass and the alternative was a sixty-line loop body inside a `match` arm.
+async fn start_item(
+    state: &AppState,
+    job: &JobRow,
+    view: &JobView,
+    artifacts: &str,
+    worktree: (PathBuf, String),
+    ordinal: usize,
+    no_room: NoRoom,
+) -> Step {
+    let pool = &state.pool;
+    // What the claim below has to find. Taken from the verdict this pass already reached —
+    // `next_step` named this ordinal precisely because `item_state_from` called it `Pending`
+    // or `GateRetriable` — rather than asked of the database a second time. The alternative
+    // is a `WHERE` clause that re-derives which red gates are retriable, which is the same
+    // rule in a second dialect and drifts the first time either side is edited.
+    let Some(held) = view
+        .items
+        .get(ordinal)
+        .and_then(|item| item.state.claimable_as())
+    else {
+        tracing::warn!(
+            job_id = job.id,
+            ordinal,
+            "asked to implement an item that is not startable"
+        );
+        return Step::Stopped;
+    };
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT description, files, gate_output, agent_id FROM job_items
+             WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    // `gate_output` is NULL for every item on its first attempt, which is every item of every
+    // job that never retries anything — so the `None` this reads is the prompt staying
+    // exactly as it was, not a fallback.
+    let Some((description, files, gate_output, agent_id)) = row else {
+        tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
+        return Step::Stopped;
+    };
+    // A hint that will not parse is no hint. It is an optimisation for where to start
+    // reading, and refusing to run the item over it would fail the work for the sake of the
+    // advice about the work.
+    let files: Vec<String> = files
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .unwrap_or_default();
+    let persona = persona_for(pool, agent_id.as_deref()).await;
+    let prompt = implement_prompt(
+        &description,
+        ordinal,
+        view.items.len(),
+        artifacts,
+        &files,
+        gate_output.as_deref(),
+        persona.as_deref(),
+    );
+    spawn_node(
+        state,
+        job,
+        "implement",
+        prompt,
+        Some(ItemClaim { ordinal, held }),
+        worktree,
+        no_room,
+    )
+    .await
 }
 
 /// Drives one job as far as it will go this pass.
@@ -3732,10 +5031,13 @@ mod tests {
         JobView {
             planned,
             planning: false,
-            items: items.to_vec(),
+            items: items.iter().copied().map(ItemView::plain).collect(),
             review,
             rounds: RoundState::default(),
             has_team: false,
+            // One, which is what a job without a team has and what makes the batch below come out
+            // as a queue of one.
+            max_parallel: 1,
         }
     }
 
@@ -3744,10 +5046,11 @@ mod tests {
         JobView {
             planned: true,
             planning: false,
-            items: items.to_vec(),
+            items: items.iter().copied().map(ItemView::plain).collect(),
             review,
             rounds,
             has_team: false,
+            max_parallel: 1,
         }
     }
 
@@ -3762,6 +5065,281 @@ mod tests {
             has_team: true,
             ..view(true, items, review)
         }
+    }
+
+    /// A team's job that may work on more than one item at once.
+    ///
+    /// Separate again, and for the sibling reason: a team's job with a ceiling of one behaves like
+    /// the queue of today apart from the endings, and most of the tests written for the earlier
+    /// slices mean exactly that. Raising the number is the thing this slice does, so it says so.
+    fn view_with_parallel(items: &[ItemView], max_parallel: usize) -> JobView {
+        JobView {
+            planned: true,
+            planning: false,
+            items: items.to_vec(),
+            review: ReviewState::NotWanted,
+            rounds: RoundState::default(),
+            has_team: true,
+            max_parallel,
+        }
+    }
+
+    /// One item of a team's plan: a state, what it waits for, and what it says it will touch.
+    fn item(state: ItemState, depends_on: &[i64], files: &[&str]) -> ItemView {
+        ItemView {
+            state,
+            depends_on: depends_on.to_vec(),
+            files: files.iter().map(|file| (*file).to_owned()).collect(),
+        }
+    }
+
+    /// Two items that declare the same file are never started together.
+    ///
+    /// The one rule that makes parallel work worth having rather than merely faster to start. Two
+    /// nodes writing one file do not conflict while they are apart — each tree builds, each gate
+    /// could pass — and they collide at the merge, where the loser pays a resolution run and a
+    /// second gate. That is the most expensive step in this design, and this is what avoids it.
+    #[test]
+    fn two_items_declaring_one_file_do_not_come_out_in_the_same_batch() {
+        use ItemState::*;
+        let shared = view_with_parallel(
+            &[
+                item(Pending, &[], &["core/src/job.rs", "core/src/runs.rs"]),
+                item(Pending, &[], &["core/src/job.rs"]),
+                item(Pending, &[], &["shell/src/App.tsx"]),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            next_step(&shared),
+            Next::SpawnImplement(vec![0, 2]),
+            "item 1 shares job.rs with item 0 and waits; item 2 shares nothing and goes"
+        );
+    }
+
+    /// And greedy by ordinal, which can lose — said out loud rather than left to be discovered.
+    ///
+    /// Item 0 declaring both files takes the batch and excludes 1 and 2, which declare one each and
+    /// could have run together. A batch of one where a different choice made two. The alternative is
+    /// a combinatorial search inside a function that runs every thirty seconds for every live job,
+    /// to buy one item's parallelism in a case the director can avoid by splitting differently.
+    #[test]
+    fn the_fold_is_greedy_by_ordinal_and_can_take_the_worse_pair() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Pending, &[], &["a.rs", "b.rs"]),
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0]));
+    }
+
+    /// A `Conflicted` item is work, and it does not block itself.
+    ///
+    /// It is in both lists — the states that hold paths, and the states that owe a run — so a
+    /// candidate checked against the whole blocking set including itself would be permanently
+    /// ineligible, blocked by its own declaration, with nothing anywhere to say why. The exclusion
+    /// of self is what makes a conflict a step rather than a grave.
+    #[test]
+    fn a_conflicted_item_is_startable_and_does_not_block_itself() {
+        use ItemState::*;
+        let job = view_with_parallel(&[item(Conflicted, &[], &["a.rs"])], 2);
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0]));
+    }
+
+    /// But it does block a SIBLING that declares the same file, because its tree holds that work.
+    #[test]
+    fn a_conflicted_item_still_holds_the_paths_it_declared_against_everybody_else() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Conflicted, &[], &["a.rs"]),
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0, 2]));
+    }
+
+    /// An item still running holds its paths, and does not stop the queue.
+    ///
+    /// **Continuous start, in one assertion.** The old line was "anything in flight, wait", and it
+    /// is what made the queue sequential before any rule did: the first item to start stopped the
+    /// search, so a second could not begin until the first had finished. Here item 0 is running and
+    /// item 2 starts beside it, while item 1 waits for the file item 0 is holding.
+    #[test]
+    fn an_item_already_running_holds_its_files_and_does_not_stop_the_queue() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Running, &[], &["a.rs"]),
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert_eq!(next_step(&job), Next::SpawnImplement(vec![2]));
+
+        // And without a team the same queue waits, exactly as it always did.
+        let sequential = JobView {
+            has_team: false,
+            ..job
+        };
+        assert_eq!(next_step(&sequential), Next::Wait);
+    }
+
+    /// The ceiling counts what is running as well as what is being started.
+    ///
+    /// Continuous start is what makes that necessary: this function runs again while earlier items
+    /// are still going, so a batch measured against its own length alone would add `max_parallel`
+    /// more agents every time it was asked.
+    #[test]
+    fn the_ceiling_counts_the_batch_and_what_is_already_running() {
+        use ItemState::*;
+        let running_one = view_with_parallel(
+            &[
+                item(Running, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+                item(Pending, &[], &["c.rs"]),
+            ],
+            2,
+        );
+        assert_eq!(
+            next_step(&running_one),
+            Next::SpawnImplement(vec![1]),
+            "one running plus one started is the ceiling of two"
+        );
+
+        let idle = view_with_parallel(
+            &[
+                item(Pending, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+                item(Pending, &[], &["c.rs"]),
+            ],
+            2,
+        );
+        assert_eq!(next_step(&idle), Next::SpawnImplement(vec![0, 1]));
+    }
+
+    /// A dependency that has not PASSED holds its dependent back, whatever else it has done.
+    #[test]
+    fn an_item_waits_until_everything_it_depends_on_has_passed() {
+        use ItemState::*;
+        for held in [Pending, Running, Merging, Conflicted, GateRetriable] {
+            let job = view_with_parallel(
+                &[item(held, &[], &["a.rs"]), item(Pending, &[0], &["b.rs"])],
+                3,
+            );
+            assert!(
+                !batch_of(&job).contains(&1),
+                "an item started while its dependency was {held:?}"
+            );
+        }
+
+        let landed = view_with_parallel(
+            &[item(Passed, &[], &["a.rs"]), item(Pending, &[0], &["b.rs"])],
+            3,
+        );
+        assert_eq!(batch_of(&landed), vec![1]);
+    }
+
+    /// An exclusive step takes precedence over the batch, and the reason is arithmetic rather than
+    /// taste: an item's divergence from the job's branch grows with every minute it waits, and it is
+    /// the retry — the most expensive step in this design — that has to absorb it. Draining what
+    /// is already in flight before starting more is what keeps that divergence small.
+    #[test]
+    fn a_merge_or_a_gate_outranks_starting_new_work() {
+        use ItemState::*;
+        let to_merge = view_with_parallel(
+            &[
+                item(Implemented, &[], &["a.rs"]),
+                item(Pending, &[], &["b.rs"]),
+            ],
+            3,
+        );
+        assert_eq!(next_step(&to_merge), Next::MergeItem { ordinal: 0 });
+
+        let to_gate = view_with_parallel(
+            &[item(Merging, &[], &["a.rs"]), item(Pending, &[], &["b.rs"])],
+            3,
+        );
+        assert_eq!(next_step(&to_gate), Next::RunGate { ordinal: 0 });
+    }
+
+    /// `Implemented` and `Merging` hold their paths too, and this is asked of the fold directly.
+    ///
+    /// It has to be: the exclusive steps above return before the batch is ever built whenever an
+    /// item is in either state, so `next_step` cannot reach a case that would show it. They are in
+    /// the blocking set anyway, because it is a statement about which states hold paths — and a
+    /// set that is only right because of the order of the checks in front of it is a set that breaks
+    /// in silence the day that order moves.
+    #[test]
+    fn work_waiting_to_merge_holds_its_paths_against_the_batch() {
+        use ItemState::*;
+        for holder in [Implemented, Merging] {
+            let job = view_with_parallel(
+                &[
+                    item(holder, &[], &["a.rs"]),
+                    item(Pending, &[], &["a.rs"]),
+                    item(Pending, &[], &["b.rs"]),
+                ],
+                3,
+            );
+            assert_eq!(
+                batch_of(&job),
+                vec![2],
+                "an item in {holder:?} did not hold the file it is about to merge"
+            );
+        }
+    }
+
+    /// A queue that owes a run and cannot start one says `stopped`, and never `completed`.
+    ///
+    /// The shape is narrow and real: item 0 is skipped — a decision somebody was asked for — and
+    /// item 1 depends on it and has already run, so the orphan step walks past it (its work is in a
+    /// checkout of its own, and whether that work is still worth anything is not a sibling's
+    /// verdict). It can never be selected, because its dependency will never pass. Nothing is in
+    /// flight. Falling through would close the round and report `completed` over an item nobody
+    /// started, which is the one reading that cannot be caught afterwards.
+    #[test]
+    fn a_queue_that_owes_a_run_and_cannot_start_one_is_stopped_and_not_completed() {
+        use ItemState::*;
+        let stuck = view_with_parallel(
+            &[
+                item(Skipped, &[], &["a.rs"]),
+                item(Conflicted, &[0], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert!(batch_of(&stuck).is_empty(), "the fold cannot select it");
+        assert_eq!(next_step(&stuck), Next::Finish(Outcome::Stopped));
+    }
+
+    /// And the same shape with something in flight WAITS, because the thing that lands next is what
+    /// frees it. Told apart from the case above by one item's state, and they are opposite answers.
+    #[test]
+    fn a_batch_that_comes_out_empty_with_work_in_flight_waits() {
+        use ItemState::*;
+        let job = view_with_parallel(
+            &[
+                item(Running, &[], &["a.rs"]),
+                item(Pending, &[0], &["b.rs"]),
+            ],
+            3,
+        );
+
+        assert!(batch_of(&job).is_empty());
+        assert_eq!(next_step(&job), Next::Wait);
     }
 
     /// Seeds a job in a given status.
@@ -3797,6 +5375,7 @@ mod tests {
                 head_sha,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await?;
@@ -3822,7 +5401,7 @@ mod tests {
         );
         assert_eq!(
             next_step(&view(true, &items, ReviewState::Pending)),
-            Next::SpawnImplement { ordinal: 0 }
+            Next::SpawnImplement(vec![0])
         );
 
         items[0] = ItemState::Implemented;
@@ -3834,7 +5413,7 @@ mod tests {
         items[0] = ItemState::Passed;
         assert_eq!(
             next_step(&view(true, &items, ReviewState::Pending)),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
 
         items[1] = ItemState::Passed;
@@ -3903,7 +5482,7 @@ mod tests {
                 &[ItemState::GateFailed, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 },
+            Next::SpawnImplement(vec![1]),
             "the item after a red one is still work worth doing"
         );
     }
@@ -3940,6 +5519,156 @@ mod tests {
             )),
             Next::Finish(Outcome::Completed),
             "and a queue nothing rejected still completes"
+        );
+    }
+
+    /// Where an implemented item goes next, and it is the team that decides.
+    ///
+    /// Without a team the work is already on the job's branch — the items write into the one shared
+    /// checkout — so there is nothing to bring anywhere and the gate follows immediately. With one,
+    /// the work is on a branch of its own and the gate would measure a tree that does not have it.
+    #[test]
+    fn an_implemented_item_is_merged_first_only_when_a_team_wrote_it_elsewhere() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[Implemented], ReviewState::NotWanted)),
+            Next::RunGate { ordinal: 0 }
+        );
+        assert_eq!(
+            next_step(&view_with_team(&[Implemented], ReviewState::NotWanted)),
+            Next::MergeItem { ordinal: 0 }
+        );
+        // And once it has landed, the gate measures the branch it landed on.
+        assert_eq!(
+            next_step(&view_with_team(&[Merging], ReviewState::NotWanted)),
+            Next::RunGate { ordinal: 0 }
+        );
+    }
+
+    /// An item waiting on work that will never land is put down, and the job says so.
+    ///
+    /// Both halves matter. Left `pending` the item is work nothing will start, holding a slot and a
+    /// checkout to the end of the job while a person reading the queue is told it is still coming;
+    /// and reported `completed`, the job claims to have done work it never attempted.
+    #[test]
+    fn an_item_whose_dependency_will_not_land_is_put_down_and_counted() {
+        use ItemState::*;
+        let waiting_on = |state, depends_on: Vec<i64>| ItemView {
+            state,
+            depends_on,
+            files: Vec::new(),
+        };
+
+        for blocker in [Failed, GateFailed, GateErrored, Skipped, Orphaned] {
+            let job = JobView {
+                has_team: true,
+                items: vec![ItemView::plain(blocker), waiting_on(Pending, vec![0])],
+                ..view_with_team(&[], ReviewState::NotWanted)
+            };
+            assert_eq!(
+                next_step(&job),
+                Next::Orphan { ordinal: 1 },
+                "a dependency in {blocker:?} still lets its dependent be started"
+            );
+        }
+
+        // And once it is down, the job does not report itself complete.
+        let done = JobView {
+            has_team: true,
+            items: vec![ItemView::plain(Skipped), ItemView::plain(Orphaned)],
+            ..view_with_team(&[], ReviewState::NotWanted)
+        };
+        assert_eq!(next_step(&done), Next::Finish(Outcome::Failed));
+    }
+
+    /// A dependency that merely has not finished yet is not a reason to put anything down.
+    #[test]
+    fn an_item_waiting_on_work_still_in_flight_is_left_alone() {
+        use ItemState::*;
+        for blocker in [Pending, Implemented, Passed, Merging, GateRetriable] {
+            let job = JobView {
+                has_team: true,
+                items: vec![
+                    ItemView::plain(blocker),
+                    ItemView {
+                        state: Pending,
+                        depends_on: vec![0],
+                        files: Vec::new(),
+                    },
+                ],
+                ..view_with_team(&[], ReviewState::NotWanted)
+            };
+            assert_ne!(
+                next_step(&job),
+                Next::Orphan { ordinal: 1 },
+                "a dependency in {blocker:?} orphaned its dependent"
+            );
+        }
+    }
+
+    /// A skipped item ALONE is still not a failure, which is the reading `ending()` protects.
+    ///
+    /// What changed is only the case where something was waiting for it: there the job did not do
+    /// what was asked, because a person has to decide about the prerequisite first.
+    #[test]
+    fn a_skipped_item_nothing_waited_for_still_completes_the_job() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[Passed, Skipped], ReviewState::Done)),
+            Next::Finish(Outcome::Completed)
+        );
+    }
+
+    /// Without a team nothing depends on anything, so no item is ever put down this way.
+    #[test]
+    fn without_a_team_a_failure_still_stops_the_job_rather_than_orphaning_anything() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(true, &[Failed, Pending], ReviewState::NotWanted)),
+            Next::Finish(Outcome::Failed)
+        );
+    }
+
+    /// A conflicted item is work, not a verdict.
+    ///
+    /// It is found by the same positional search that finds a pending one, because it owes the same
+    /// thing: a run, in the checkout it already has. What that run does differs — it resolves a
+    /// staged merge instead of writing a feature — and that is a difference in the prompt. Leaving
+    /// `Conflicted` out of the search would put the item down for good over two pieces of work
+    /// disagreeing, which is not a judgement about either of them.
+    #[test]
+    fn a_conflicted_item_is_started_again_rather_than_given_up_on() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view_with_team(&[Conflicted], ReviewState::NotWanted)),
+            Next::SpawnImplement(vec![0])
+        );
+        // And it does not jump the queue: the same positional search means an earlier item still
+        // goes first.
+        assert_eq!(
+            next_step(&view_with_team(
+                &[Pending, Conflicted],
+                ReviewState::NotWanted
+            )),
+            Next::SpawnImplement(vec![0])
+        );
+    }
+
+    /// A merge that has landed is measured before another item is brought in.
+    ///
+    /// The order is the design and not an accident of which `if` came first: an item's divergence
+    /// from the job's branch grows with every minute it waits, and the retry that has to absorb it
+    /// is the most expensive step here. Draining what is in flight keeps that divergence small.
+    #[test]
+    fn a_landed_merge_is_gated_before_another_item_is_brought_in() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view_with_team(
+                &[Implemented, Merging],
+                ReviewState::NotWanted
+            )),
+            Next::RunGate { ordinal: 1 },
+            "the merge already on the branch is measured first"
         );
     }
 
@@ -3982,14 +5711,14 @@ mod tests {
     fn without_a_team_every_state_decides_exactly_as_it_did() {
         use ItemState::*;
         for (state, expected) in [
-            (Pending, Next::SpawnImplement { ordinal: 0 }),
+            (Pending, Next::SpawnImplement(vec![0])),
             (Running, Next::Wait),
             (Implemented, Next::RunGate { ordinal: 0 }),
             (Passed, Next::SpawnReview),
             (Failed, Next::Finish(Outcome::Failed)),
             (Cancelled, Next::Finish(Outcome::Cancelled)),
             (GateFailed, Next::SpawnReview),
-            (GateRetriable, Next::SpawnImplement { ordinal: 0 }),
+            (GateRetriable, Next::SpawnImplement(vec![0])),
             (GateErrored, Next::Finish(Outcome::GateErrored)),
             (Skipped, Next::SpawnReview),
         ] {
@@ -4012,14 +5741,14 @@ mod tests {
         use ItemState::*;
         assert_eq!(
             next_step(&view_with_team(&[Failed, Pending], ReviewState::NotWanted)),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
         assert_eq!(
             next_step(&view_with_team(
                 &[GateErrored, Pending],
                 ReviewState::NotWanted
             )),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
         assert_eq!(
             next_step(&view_with_team(
@@ -4063,22 +5792,27 @@ mod tests {
         );
     }
 
-    /// The three non-terminal newcomers are waited for, not walked past.
+    /// A non-terminal state with no step of its own is waited for, never walked past.
     ///
-    /// None of them is reachable in this slice — nothing writes those rows yet — and that is
-    /// exactly why the assertion is worth having: it is the behaviour the merge step will inherit,
-    /// written while it is still cheap to write. Walking past a non-terminal state is how an item
-    /// gets reported finished with its work still in flight.
+    /// `Merging` and `Conflicted` have both left this list, each having been given a step — the
+    /// gate that measures a landed merge, and the run that resolves a staged one. `Reverted` is the
+    /// last one without either, and unreachable because nothing writes it: the red arm records
+    /// `gate_failed` after the reset, exactly as a sequential job always did, and what says the
+    /// branch was put back is `merge_base_sha` being set beside that verdict.
+    ///
+    /// The assertion is kept anyway, because the direction it guards is the expensive one. Walking
+    /// past a non-terminal state is how an item is reported finished with its work still in flight.
     #[test]
     fn an_item_mid_merge_is_work_in_flight() {
         use ItemState::*;
-        for state in [Merging, Conflicted, Reverted] {
-            assert_eq!(
-                next_step(&view_with_team(&[state, Pending], ReviewState::NotWanted)),
-                Next::Wait,
-                "{state:?} must not let the queue move on"
-            );
-        }
+        assert_eq!(
+            next_step(&view_with_team(
+                &[Reverted, Pending],
+                ReviewState::NotWanted
+            )),
+            Next::Wait,
+            "Reverted must not let the queue move on"
+        );
     }
 
     /// A red gate that still has a retry left has not finished with its item.
@@ -4268,7 +6002,7 @@ mod tests {
                 &[ItemState::Passed, ItemState::GateRetriable],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
     }
 
@@ -4287,7 +6021,7 @@ mod tests {
                 &[ItemState::GateRetriable, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 0 }
+            Next::SpawnImplement(vec![0])
         );
     }
 
@@ -4306,7 +6040,7 @@ mod tests {
                 &[ItemState::GateFailed, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
     }
 
@@ -4371,7 +6105,7 @@ mod tests {
                 &[ItemState::Skipped, ItemState::Pending],
                 ReviewState::Pending
             )),
-            Next::SpawnImplement { ordinal: 1 },
+            Next::SpawnImplement(vec![1]),
             "the queue has to move past it"
         );
         assert_eq!(
@@ -4401,7 +6135,7 @@ mod tests {
         let items = [ItemState::Passed, ItemState::Passed, ItemState::Pending];
         assert_eq!(
             next_step(&view(true, &items, ReviewState::Pending)),
-            Next::SpawnImplement { ordinal: 2 }
+            Next::SpawnImplement(vec![2])
         );
     }
 
@@ -4428,7 +6162,7 @@ mod tests {
         // The pair that matters most in this module. "The planner produced nothing" is a failure;
         // "the planner found no work" is a success. Collapsing them would make every crashed plan
         // node look like a quiet, successful night, and teach the reader to ignore the feed.
-        assert!(matches!(parse_plan(None, 5), Err(PlanError::Absent)));
+        assert!(matches!(parse_plan(None, 5, None), Err(PlanError::Absent)));
     }
 
     /// The replan node's other answer, read out of the same file by the same parser.
@@ -4438,7 +6172,8 @@ mod tests {
     #[test]
     fn a_replan_can_say_the_work_is_over() {
         let done = br#"{"done": true, "why": "the task is met and the suite is green"}"#;
-        let plan = parse_plan(Some(done), 5).expect("a done verdict is a result, not an error");
+        let plan =
+            parse_plan(Some(done), 5, None).expect("a done verdict is a result, not an error");
         assert_eq!(
             plan.done.as_deref(),
             Some("the task is met and the suite is green")
@@ -4449,14 +6184,14 @@ mod tests {
         // failing a job over a missing sentence would throw away the answer to keep the explanation.
         let terse = br#"{"done": true}"#;
         assert_eq!(
-            parse_plan(Some(terse), 5).unwrap().done.as_deref(),
+            parse_plan(Some(terse), 5, None).unwrap().done.as_deref(),
             Some("no reason given")
         );
 
         // `done` wins over items alongside it. Honouring the items would queue work the node just
         // said was unnecessary; calling the pair malformed would fail a job over redundancy.
         let both = br#"{"done": true, "items": [{"description": "one more thing"}]}"#;
-        assert!(parse_plan(Some(both), 5).unwrap().done.is_some());
+        assert!(parse_plan(Some(both), 5, None).unwrap().done.is_some());
     }
 
     /// The distinction ending #1 and ending #3 are built on. An empty queue is a round that produced
@@ -4464,13 +6199,13 @@ mod tests {
     /// the other feeds a counter that ends it after two.
     #[test]
     fn an_empty_queue_is_not_a_claim_that_the_work_is_over() {
-        let plan = parse_plan(Some(br#"{"items": []}"#), 5).unwrap();
+        let plan = parse_plan(Some(br#"{"items": []}"#), 5, None).unwrap();
         assert!(plan.items.is_empty());
         assert_eq!(plan.done, None);
 
         // A plan node's file never carries the key at all, and must not read as a failure.
         let ordinary = br#"{"items": [{"description": "a"}]}"#;
-        assert_eq!(parse_plan(Some(ordinary), 5).unwrap().done, None);
+        assert_eq!(parse_plan(Some(ordinary), 5, None).unwrap().done, None);
     }
 
     /// The replan node cannot do its job without the archives, and the prompt has to say so either
@@ -4484,6 +6219,7 @@ mod tests {
             2,
             &["plan-0.json".to_owned(), "plan-1.json".to_owned()],
             "/wt/.nucleos",
+            None,
         );
         assert!(with.contains("plan-0.json, plan-1.json"));
         assert!(with.contains("Do not repropose"));
@@ -4495,7 +6231,7 @@ mod tests {
 
         // No archives is a reachable state — the copy can fail — and the honest thing is to say so.
         // Naming a file that is not there sends the node looking, and what it finds is nothing.
-        let without = replan_prompt("t", 1, &[], "/wt/.nucleos");
+        let without = replan_prompt("t", 1, &[], "/wt/.nucleos", None);
         assert!(without.contains("could not be recovered"));
         assert!(!without.contains("Do not repropose"));
     }
@@ -4509,10 +6245,10 @@ mod tests {
     /// what was wrong is that the item asked for it.
     #[test]
     fn every_node_that_could_reach_for_git_is_told_the_job_commits() {
-        let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos");
-        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos");
+        let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos", None);
+        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos", None);
         // No hint, because what this pins is the paragraph every node gets regardless of one.
-        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None);
+        let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None, None);
 
         for prompt in [&plan, &replan] {
             assert!(
@@ -4535,7 +6271,7 @@ mod tests {
     /// node. `Read`, `Grep` and `Glob` need nobody and were there the whole time.
     #[test]
     fn the_nodes_that_only_look_are_told_what_to_look_with() {
-        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos");
+        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None);
         let review = review_prompt(Some("abc123"), "/wt/.nucleos");
 
         for prompt in [&replan, &review] {
@@ -4550,7 +6286,7 @@ mod tests {
     fn an_unparseable_plan_is_a_planning_failure() {
         let garbage = br#"{"items": [ truncated"#;
         assert!(matches!(
-            parse_plan(Some(garbage), 5),
+            parse_plan(Some(garbage), 5, None),
             Err(PlanError::Unreadable(_))
         ));
     }
@@ -4558,7 +6294,8 @@ mod tests {
     #[test]
     fn an_empty_item_list_is_a_legitimate_result() {
         let empty = br#"{"items": []}"#;
-        let plan = parse_plan(Some(empty), 5).expect("an empty queue is a result, not an error");
+        let plan =
+            parse_plan(Some(empty), 5, None).expect("an empty queue is a result, not an error");
         assert!(plan.items.is_empty());
         assert_eq!(plan.dropped, 0);
     }
@@ -4569,7 +6306,7 @@ mod tests {
                                   {"description":"d"},{"description":"e"},{"description":"f"},
                                   {"description":"g"}]}"#;
         let plan =
-            parse_plan(Some(seven), 5).expect("an oversized plan is truncated, not rejected");
+            parse_plan(Some(seven), 5, None).expect("an oversized plan is truncated, not rejected");
 
         assert_eq!(plan.items.len(), 5);
         // The queue is items, not strings: a description with no file hint is still a whole item,
@@ -4579,11 +6316,216 @@ mod tests {
             PlannedItem {
                 description: "a".to_owned(),
                 files: Vec::new(),
+                depends_on: Vec::new(),
+                agent_id: None,
             }
         );
         // Reported, never silent: a queue quietly cut from seven to five reads downstream as "the
         // planner found five things", which is a different and wrong statement about the work.
         assert_eq!(plan.dropped, 2);
+    }
+
+    /// A team's rules, with a roster of two. Every graph test is held to these.
+    fn directed(first_ordinal: usize) -> Graph {
+        Graph {
+            first_ordinal,
+            roster: vec![
+                TeamMate {
+                    id: "ana".to_owned(),
+                    speciality: "migrations".to_owned(),
+                },
+                TeamMate {
+                    id: "bo".to_owned(),
+                    speciality: "the shell".to_owned(),
+                },
+            ],
+        }
+    }
+
+    /// Every way a team's plan is refused, each named and each a different mistake.
+    ///
+    /// The whole plan is refused for one bad row rather than the row dropped, and that is the
+    /// decision to argue with. A dropped row leaves a queue that looks complete and is missing work
+    /// somebody asked for; a refusal costs a round and says which item and why. A director that
+    /// cannot answer the three questions should stop being run in parallel, not be run in parallel
+    /// badly.
+    ///
+    /// **Every case names all three keys except the one it is about**, which is what stops this
+    /// being a list of plans that merely happen to be refused. A row missing two keys is refused by
+    /// whichever check runs first, and the case for the second key would pass with that check
+    /// deleted.
+    #[test]
+    fn a_teams_plan_is_refused_for_a_graph_that_does_not_hold_up() {
+        let graph = directed(0);
+        for (why, json) in [
+            (
+                "no files",
+                br#"{"items":[{"description":"x","depends_on":[],"agent_id":"ana"}]}"#.as_slice(),
+            ),
+            (
+                "empty files",
+                br#"{"items":[{"description":"x","files":[],"depends_on":[],
+                              "agent_id":"ana"}]}"#
+                    .as_slice(),
+            ),
+            (
+                "no depends_on",
+                br#"{"items":[{"description":"x","files":["a.rs"],"agent_id":"ana"}]}"#.as_slice(),
+            ),
+            (
+                "an ordinal that is not an earlier item",
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[7],
+                              "agent_id":"ana"}]}"#
+                    .as_slice(),
+            ),
+            (
+                "a dependency on itself",
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[0],
+                              "agent_id":"ana"}]}"#
+                    .as_slice(),
+            ),
+            (
+                "a cycle, which pointing forwards already is",
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[1],
+                              "agent_id":"ana"},
+                              {"description":"y","files":["b.rs"],"depends_on":[0],
+                              "agent_id":"bo"}]}"#
+                    .as_slice(),
+            ),
+            (
+                "no agent_id",
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[]}]}"#.as_slice(),
+            ),
+            (
+                "an agent who is not on this team",
+                br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[],
+                              "agent_id":"someone-else"}]}"#
+                    .as_slice(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_plan(Some(json), 5, Some(&graph)),
+                    Err(PlanError::Rejected(_))
+                ),
+                "a plan with {why} was accepted"
+            );
+        }
+
+        // And the shape that holds up: a backwards edge, an explicit "nothing", and two members of
+        // the roster each given something.
+        let good = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[],
+                                  "agent_id":"ana"},
+                                 {"description":"y","files":["b.rs"],"depends_on":[0],
+                                  "agent_id":"bo"}]}"#;
+        let plan = parse_plan(Some(good), 5, Some(&graph)).expect("a plan that holds up");
+        assert_eq!(plan.items[1].depends_on, vec![0]);
+        assert_eq!(plan.items[0].depends_on, Vec::<i64>::new());
+        assert_eq!(plan.items[0].agent_id.as_deref(), Some("ana"));
+        assert_eq!(plan.items[1].agent_id.as_deref(), Some("bo"));
+    }
+
+    /// A refusal names who there IS, because "no such member" without the roster costs a whole
+    /// round to act on: the director's next answer would be another guess at a name.
+    ///
+    /// The empty roster gets its own sentence, and that is not tidiness. It is a different problem
+    /// with a different owner — the director answered as well as it could and there was nobody to
+    /// answer with — and told as "`ana` is not on this team" it reads as the director's fault.
+    #[test]
+    fn a_refusal_over_an_agent_says_who_is_on_the_team() {
+        let json = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[],
+                                  "agent_id":"nobody"}]}"#;
+        let Err(PlanError::Rejected(said)) = parse_plan(Some(json), 5, Some(&directed(0))) else {
+            panic!("a plan naming a stranger was accepted");
+        };
+        assert!(said.contains("ana"), "{said}");
+        assert!(
+            said.contains("migrations"),
+            "the speciality is what to choose on: {said}"
+        );
+        assert!(said.contains("bo"), "{said}");
+
+        let deserted = Graph {
+            first_ordinal: 0,
+            roster: Vec::new(),
+        };
+        let Err(PlanError::Rejected(said)) = parse_plan(Some(json), 5, Some(&deserted)) else {
+            panic!("a plan under an empty roster was accepted");
+        };
+        assert!(
+            said.contains("no members"),
+            "an empty roster is the owner's problem, not the director's: {said}"
+        );
+    }
+
+    /// Ordinals continue across rounds, so a later round's `depends_on` is checked against where
+    /// its own items start — not against zero.
+    ///
+    /// This is the failure that would otherwise be invisible. A director on round 2 writing
+    /// `"depends_on": [0]` to mean "the first item I just listed" names a FINISHED item of round 1.
+    /// Nothing about that is ill-formed; ordinal 0 exists. Checking it against the round's own first
+    /// ordinal is what turns a plan that reads fine into one that is refused with a reason.
+    #[test]
+    fn a_later_rounds_dependencies_are_checked_against_that_rounds_own_ordinals() {
+        let round_two = directed(4);
+        // Item 4 depending on item 3: an item of round 1, which is legitimate and useful.
+        let across = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[3],
+                                    "agent_id":"ana"}]}"#;
+        assert!(parse_plan(Some(across), 5, Some(&round_two)).is_ok());
+
+        // The same plan on round 1 would be nonsense, and is refused there.
+        assert!(matches!(
+            parse_plan(Some(across), 5, Some(&directed(0))),
+            Err(PlanError::Rejected(_))
+        ));
+
+        // And an item of round 2 cannot depend on its own successor.
+        let forwards = br#"{"items":[{"description":"x","files":["a.rs"],"depends_on":[5],
+                                      "agent_id":"ana"},
+                                     {"description":"y","files":["b.rs"],"depends_on":[],
+                                      "agent_id":"bo"}]}"#;
+        assert!(matches!(
+            parse_plan(Some(forwards), 5, Some(&round_two)),
+            Err(PlanError::Rejected(_))
+        ));
+    }
+
+    /// A job without a team reads exactly what it always read.
+    ///
+    /// The strictness is affordable only because it is scoped. Every `plan.json` ever written omits
+    /// all three keys, and reading one has to stay a plan rather than become a refusal.
+    #[test]
+    fn without_a_team_a_plan_missing_both_keys_is_still_a_plan() {
+        let old = br#"{"items":[{"description":"x"},{"description":"y","files":["b.rs"]}]}"#;
+        let plan = parse_plan(Some(old), 5, None).expect("a plan written before the graph existed");
+        assert_eq!(plan.items.len(), 2);
+        assert_eq!(plan.items[0].files, Vec::<String>::new());
+        assert_eq!(plan.items[1].depends_on, Vec::<i64>::new());
+        assert_eq!(
+            plan.items[0].agent_id, None,
+            "there is nobody to name, and inventing one would change every job in the repository"
+        );
+    }
+
+    /// The plan node is told the number its `depends_on` will be checked against.
+    ///
+    /// Without it the rule is unfollowable: the director has no way to know that the items it is
+    /// about to list are numbered from 4, so any dependency it writes is a guess.
+    #[test]
+    fn a_teams_plan_prompt_names_the_ordinal_this_round_starts_at() {
+        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&directed(4)));
+        assert!(prompt.contains("NUMBERED FROM 4"), "{prompt}");
+        assert!(prompt.contains("depends_on"));
+        assert!(prompt.contains("EARLIER ordinal"));
+
+        let replan = replan_prompt("t", 2, &[], "/wt/.nucleos", Some(&directed(9)));
+        assert!(replan.contains("numbered from 9"), "{replan}");
+        assert!(replan.contains("depends_on"));
+
+        // And a job without a team is told none of it, because none of it applies.
+        let plain = plan_prompt("t", 5, "/wt/.nucleos", None);
+        assert!(!plain.contains("depends_on"));
+        assert!(!replan_prompt("t", 2, &[], "/wt/.nucleos", None).contains("depends_on"));
     }
 
     /// The hint is the planner's, and it is optional at both ends: a planner that names files is
@@ -4594,7 +6536,7 @@ mod tests {
     fn parse_plan_reads_optional_file_hints_and_tolerates_their_absence() {
         let mixed = br#"{"items":[{"description":"x","files":["a.rs","b.rs"]},
                                   {"description":"y"}]}"#;
-        let plan = parse_plan(Some(mixed), 5).expect("a plan without hints is still a plan");
+        let plan = parse_plan(Some(mixed), 5, None).expect("a plan without hints is still a plan");
 
         assert_eq!(
             plan.items,
@@ -4602,10 +6544,14 @@ mod tests {
                 PlannedItem {
                     description: "x".to_owned(),
                     files: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+                    depends_on: Vec::new(),
+                    agent_id: None,
                 },
                 PlannedItem {
                     description: "y".to_owned(),
                     files: Vec::new(),
+                    depends_on: Vec::new(),
+                    agent_id: None,
                 },
             ]
         );
@@ -4802,6 +6748,185 @@ mod tests {
         assert!(load_view(&pool, directed).await.unwrap().has_team);
     }
 
+    /// One agent in the catalogue, ready to be put on a team.
+    async fn seed_agent(pool: &sqlx::SqlitePool, id: &str, speciality: &str, prompt: &str) {
+        let now = "2026-08-20T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'claude', 'inherit', ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("Agent {id}"))
+        .bind(speciality)
+        .bind(prompt)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A team, its director, and however many members. `foreign_keys` is on, so the order is not
+    /// optional: agents, then the team that names one of them, then the memberships.
+    async fn seed_crew(pool: &sqlx::SqlitePool, team_id: &str, director: &str, members: &[&str]) {
+        let now = "2026-08-20T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES (?, ?, 'ship it', ?, 3, 2, ?, ?)",
+        )
+        .bind(team_id)
+        .bind(format!("Team {team_id}"))
+        .bind(director)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        for member in members {
+            sqlx::query("INSERT INTO team_members (team_id, agent_id) VALUES (?, ?)")
+                .bind(team_id)
+                .bind(member)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The roster a director chooses from is its members AND itself.
+    ///
+    /// **A team of one would otherwise be dead on arrival**, and silently: a director with no
+    /// members has nobody to name, every plan it writes is refused for naming a stranger, and the
+    /// refusal blames the director for the one answer available to it. A director and no members is
+    /// an ordinary way to ask for parallel work under a single persona, so it has to be a team that
+    /// can plan.
+    ///
+    /// `team.rs` keeps its departments' directors off their rosters, and that is not a
+    /// disagreement: there a director hands work to specialists and does none itself. Here the
+    /// roster answers "who may write code in this job", and the director qualifies.
+    #[tokio::test]
+    async fn a_director_may_give_work_to_itself_and_to_every_member() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "dir", "directing", "lead").await;
+        seed_agent(&pool, "ana", "migrations", "you are careful with schemas").await;
+        seed_crew(&pool, "crew", "dir", &["ana"]).await;
+        seed_agent(&pool, "solo", "everything", "you do it all").await;
+        seed_crew(&pool, "alone", "solo", &[]).await;
+
+        let named = |roster: Vec<TeamMate>| {
+            roster
+                .into_iter()
+                .map(|mate| mate.id)
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            named(roster_of(&pool, "crew").await),
+            vec!["ana".to_owned(), "dir".to_owned()],
+            "the director is on its own roster, and the order is stable"
+        );
+        assert_eq!(
+            named(roster_of(&pool, "alone").await),
+            vec!["solo".to_owned()],
+            "a team of one can still be given work, or it can never plan at all"
+        );
+        assert_eq!(
+            roster_of(&pool, "crew").await[0].speciality,
+            "migrations",
+            "the speciality travels, because it is the whole of what a director chooses on"
+        );
+    }
+
+    /// The roster reaches the plan node, or the director is asked to name somebody it has never
+    /// been told about.
+    #[tokio::test]
+    async fn a_teams_plan_prompt_introduces_the_people_it_may_name() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "dir", "directing", "lead").await;
+        seed_agent(&pool, "ana", "migrations and schema work", "careful").await;
+        seed_crew(&pool, "crew", "dir", &["ana"]).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = live_jobs(&pool).await.unwrap().pop().unwrap();
+
+        let rules = graph_rules(&pool, &job).await.expect("a job with a team");
+        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&rules));
+
+        assert!(prompt.contains("agent_id"), "{prompt}");
+        assert!(prompt.contains("ana"), "{prompt}");
+        assert!(
+            prompt.contains("migrations and schema work"),
+            "the director chooses on the speciality, so it has to be in front of it: {prompt}"
+        );
+        assert!(prompt.contains("dir"), "{prompt}");
+    }
+
+    /// The item's agent is read when the node starts, not copied onto the row when the plan lands.
+    ///
+    /// Which is the behaviour a catalogue is for. An owner who corrects an agent's prompt between
+    /// the plan and the run gets the correction; freezing it at plan time would leave them watching
+    /// the old brief run and unable to say why their edit did nothing.
+    #[tokio::test]
+    async fn an_items_agent_is_read_when_the_node_starts_and_not_frozen_at_plan_time() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "ana", "migrations", "the brief as it was written").await;
+
+        let first = persona_for(&pool, Some("ana")).await.expect("an agent");
+        assert!(first.contains("the brief as it was written"), "{first}");
+        assert!(
+            first.contains("migrations"),
+            "the item is told WHY it was given to this one: {first}"
+        );
+
+        sqlx::query("UPDATE agents SET prompt = 'the brief after the correction' WHERE id = 'ana'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = persona_for(&pool, Some("ana")).await.expect("an agent");
+        assert!(second.contains("after the correction"), "{second}");
+
+        // Two ways there is nobody, and both leave the item running with the brief it would have
+        // had before any of this existed rather than refusing to run it.
+        assert_eq!(persona_for(&pool, None).await, None);
+        assert_eq!(persona_for(&pool, Some("nobody")).await, None);
+    }
+
+    /// The persona goes FIRST, and everything after it is untouched.
+    ///
+    /// The second half is the half that protects every job without a team: `None` has to produce
+    /// the brief this function has always produced, byte for byte, and the `ends_with` is what says
+    /// the assigned one is that brief with something in front of it rather than a rewrite of it.
+    #[test]
+    fn a_teams_item_is_briefed_as_somebody_before_it_is_briefed_about_the_work() {
+        let anybody = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None, None);
+        let ana = implement_prompt(
+            "write the thing",
+            0,
+            3,
+            "/wt/.nucleos",
+            &[],
+            None,
+            Some("You are careful with schemas.\n\n"),
+        );
+
+        assert!(
+            ana.starts_with("You are careful with schemas."),
+            "who is reading comes before what they are reading about: {ana}"
+        );
+        assert!(
+            ana.ends_with(&anybody),
+            "the brief itself is unchanged, and the persona is in front of it: {ana}"
+        );
+        assert!(
+            !anybody.contains("careful"),
+            "a job with no team is told nothing about a team"
+        );
+    }
+
     /// And the two halves joined: a directed job with a failed item keeps going, an undirected one
     /// with the same queue stops. Same rows, same loader, one column apart.
     #[tokio::test]
@@ -4845,7 +6970,7 @@ mod tests {
         );
         assert_eq!(
             next_step(&load_view(&pool, directed).await.unwrap()),
-            Next::SpawnImplement { ordinal: 1 }
+            Next::SpawnImplement(vec![1])
         );
     }
 
@@ -4857,7 +6982,7 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
 
-        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+        assert_eq!(next_step(&view), Next::SpawnImplement(vec![2]));
     }
 
     // ---- rounds (Chunk 3) ------------------------------------------------------------------------
@@ -5029,14 +7154,14 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
         assert_eq!(
-            view.items,
+            view.items.iter().map(|item| item.state).collect::<Vec<_>>(),
             vec![ItemState::Passed, ItemState::Skipped, ItemState::Pending],
             "the earlier round's items stay in the queue, terminal and walked past"
         );
         assert_eq!(view.rounds.round, 1);
         // 2, not 0. This is the number `advance` binds into
         // `SELECT description FROM job_items WHERE job_id = ? AND ordinal = ?`.
-        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 2 });
+        assert_eq!(next_step(&view), Next::SpawnImplement(vec![2]));
     }
 
     /// A NULL `max_rounds` is "nobody asked for rounds", not "use the daemon's ceiling". Resolving it
@@ -5063,7 +7188,7 @@ mod tests {
 
         // Erring toward "not finished" costs a repeated item. Erring the other way skips work the
         // job exists to do and reports it complete, which is the failure nobody sees.
-        assert_eq!(next_step(&view), Next::SpawnImplement { ordinal: 1 });
+        assert_eq!(next_step(&view), Next::SpawnImplement(vec![1]));
     }
 
     #[tokio::test]
@@ -5785,6 +7910,124 @@ mod tests {
             .success()
     }
 
+    /// **The proof of this slice: undoing a red merge takes back that merge and nothing else.**
+    ///
+    /// Two items with checkouts of their own. A lands and is kept; B lands and is rejected. The
+    /// reset has to leave the branch holding A's file and not B's — and the reason it is not
+    /// obvious is the ordinals. `footing_for`, which is what a sequential job reverts by, walks
+    /// BACKWARDS THROUGH ORDINALS to the nearest item a gate agreed with. Here B is ordinal 0 and A
+    /// is ordinal 1, and B merged second: reverting B by ordinal finds nothing before it and falls
+    /// back to the job's `head_sha`, which takes A's merge with it.
+    ///
+    /// So the ordinals are deliberately the reverse of the merge order. That is not a contrived
+    /// case — it is the ordinary one the moment items are allowed to finish at their own speed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reverting_a_red_merge_leaves_the_other_items_work_on_the_branch() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-merge-", "git --version");
+        let trees = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(trees.path());
+        let pool = test_pool().await;
+        let job_id = seed_job_in(
+            &pool,
+            "nucleos",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The job's own checkout, on the job's branch. This is what the merges land in.
+        let job_tree = crate::worktree::create(&repo, crate::worktree::Owner::Job(job_id))
+            .await
+            .expect("the job's checkout");
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Job(job_id),
+            "nucleos",
+            &repo.to_string_lossy(),
+            &job_tree.path.to_string_lossy(),
+            &job_tree.branch,
+            job_tree.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+
+        // Ordinal 0 is the one that will go red, ordinal 1 the one that must survive it.
+        seed_items(&pool, job_id, &["implemented", "implemented"]).await;
+        let items: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        // Each item works in a checkout of its own, born where the job's branch stands, writes one
+        // file there — and LEAVES IT UNCOMMITTED, which is what an implement node is told to do
+        // and therefore what production actually produces.
+        //
+        // It used to commit by hand here, and that hand-commit is what hid the hole this test now
+        // covers: nothing in the daemon committed an item's work, so every merge brought across an
+        // empty branch and succeeded. The fixture was asserting a thing no code did.
+        for (item_id, file) in [(items[0], "red.txt"), (items[1], "green.txt")] {
+            let base = crate::worktree::head_sha(&job_tree.path).await.unwrap();
+            let tree = crate::worktree::adopt_or_create_at(
+                &repo,
+                crate::worktree::Owner::Item(item_id),
+                Some(&base),
+            )
+            .await
+            .expect("the item's checkout");
+            // Recorded, as `create_run_with` records it in production: the merge finds the checkout
+            // to commit through this row, and an item whose tree is not on record has none.
+            crate::worktree::record(
+                &pool,
+                crate::worktree::Owner::Item(item_id),
+                "project-a",
+                &repo.to_string_lossy(),
+                &tree.path.to_string_lossy(),
+                &tree.branch,
+                tree.base_sha.as_deref(),
+            )
+            .await
+            .expect("record the item's checkout");
+            std::fs::write(tree.path.join(file), "work\n").expect("write the item's work");
+        }
+
+        // The green one lands first, and is kept.
+        let state = test_state(pool.clone()).await;
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 1).await,
+            Step::Continued
+        );
+        assert!(job_tree.path.join("green.txt").exists());
+
+        // Then the red one lands, on top of it.
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
+            Step::Continued
+        );
+        assert!(job_tree.path.join("red.txt").exists());
+
+        // And is undone.
+        let target = revert_point(&pool, &load_job(&pool, job_id).await.unwrap(), 0)
+            .await
+            .expect("a red merge knows where it started");
+        crate::worktree::revert_to(&job_tree.path, &target)
+            .await
+            .expect("put the branch back");
+
+        assert!(
+            !job_tree.path.join("red.txt").exists(),
+            "the rejected merge is still on the branch"
+        );
+        assert!(
+            job_tree.path.join("green.txt").exists(),
+            "undoing item 0 took item 1's merge with it — which is what reverting by ordinal does"
+        );
+    }
+
     /// A job nobody scheduled: no rule on the row, and no rule in the line a person reads.
     ///
     /// `rule_name` was `&'a str` until a second caller appeared that has no rule to name. The
@@ -5815,6 +8058,7 @@ mod tests {
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await;
@@ -5892,6 +8136,629 @@ mod tests {
         panic!("a node never finished");
     }
 
+    /// What one walk cost, in the two units that matter.
+    ///
+    /// **Passes and never seconds.** The tick is 30 s and `MAX_STEPS_PER_PASS` is 4, so a job's wall
+    /// clock is how many times the daemon has to come back to it. A stopwatch would measure this
+    /// machine on this afternoon; passes measure the schedule, and answer the same on a busy laptop
+    /// and an idle server.
+    ///
+    /// **And writing rounds, because passes alone cannot see what parallelism buys.** A pass stops
+    /// as soon as it starts a node, so a batch of two costs one pass exactly as a batch of one does
+    /// — and the merges and gates behind them are a queue either way. What the design shortens is
+    /// the WRITING: `24 min -> 8 min (overlapped)` in the design's own table. Here the scripted
+    /// agent returns instantly, so that term weighs nothing and the totals come out equal. Counting
+    /// the passes in which an implement node actually started is how the overlapped term is
+    /// measured at all.
+    #[derive(Debug)]
+    struct Walk {
+        ending: String,
+        /// Every pass the daemon made, which is the wall-clock term the tick dominates.
+        passes: usize,
+        /// The passes that started at least one implement node: how many rounds of WRITING the
+        /// queue took. This is the number a ceiling of two is supposed to shrink.
+        writing: usize,
+        /// How many implement nodes each item cost, by ordinal. A two is an item that was asked
+        /// again, which is the only durable trace an unhappy event leaves: the states it passed
+        /// through are gone by the time the walk ends.
+        attempts: Vec<i64>,
+    }
+
+    async fn walk_counting(state: &AppState, job_id: i64) -> Walk {
+        let started = |pool: sqlx::SqlitePool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM runs WHERE job_id = ? AND stage = 'implement'",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let mut writing = 0;
+        for pass in 1..=40 {
+            let before = started(state.pool.clone()).await;
+            job_tick(state, Utc::now()).await;
+            settle(state, job_id).await;
+            if started(state.pool.clone()).await > before {
+                writing += 1;
+            }
+            let status = job_status(&state.pool, job_id).await;
+            if !LIVE_STATUSES.contains(&status.as_str()) {
+                let attempts = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM runs
+                      WHERE job_id = ? AND stage = 'implement' AND item_id IS NOT NULL
+                      GROUP BY item_id ORDER BY item_id",
+                )
+                .bind(job_id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+                return Walk {
+                    ending: status,
+                    passes: pass,
+                    writing,
+                    attempts,
+                };
+            }
+        }
+        panic!(
+            "the job never reached an ending; last status {}",
+            job_status(&state.pool, job_id).await
+        );
+    }
+
+    /// A team of one, and a job it directs, over a real repository.
+    ///
+    /// The plan goes in through `plan_to_write`, so the queue this walks is one the daemon read off
+    /// disk and put through `Graph::check` — files, dependencies and an agent id all validated —
+    /// rather than three rows a fixture inserted.
+    async fn start_directed_job(
+        state: &AppState,
+        runner: &crate::runner::FakeCommandRunner,
+        repo: &std::path::Path,
+        plan: &str,
+        max_parallel: i64,
+        gate_retries: i64,
+    ) -> i64 {
+        seed_agent(&state.pool, "ana", "everything", "you are careful").await;
+        seed_crew(&state.pool, "crew", "ana", &[]).await;
+        sqlx::query("UPDATE teams SET max_parallel = ? WHERE id = 'crew'")
+            .bind(max_parallel)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        *runner.plan_to_write.lock().unwrap() = Some(plan.to_owned());
+        let root = repo.to_string_lossy().into_owned();
+        let head_sha = crate::repo_trigger::current_branch_sha(repo, "HEAD", false).await;
+        let job_id = crate::job::start(
+            state,
+            &StartRequest {
+                project_id: "project-a",
+                project_root: &root,
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                // Off: a review node is one more pass in both configurations, so it cancels out of
+                // the comparison while adding a node to every walk.
+                review: false,
+                gate_retries,
+                head_sha: head_sha.as_deref(),
+                max_rounds: None,
+                budget_usd: None,
+                team_id: Some("crew"),
+            },
+        )
+        .await;
+        match job_id {
+            crate::job::JobStart::Started(job_id) => job_id,
+            other => panic!("the directed job did not start: {other:?}"),
+        }
+    }
+
+    /// The plan three scripted items produce. Items 1 and 2 both declare `a.rs`, so the fold may
+    /// never start them together; item 3 declares `b.rs` and may run beside either.
+    const THREE_ITEMS: &str = r#"{"items":[
+        {"description":"ITEM-ONE: write alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-TWO: rewrite alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-THREE: write beta","files":["b.rs"],"depends_on":[],"agent_id":"ana"}
+    ]}"#;
+
+    fn three_scripted_agents() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "ITEM-ONE".to_owned(),
+                "a.rs".to_owned(),
+                "alpha\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "a.rs".to_owned(),
+                "alpha, again\n".to_owned(),
+            ),
+            (
+                "ITEM-THREE".to_owned(),
+                "b.rs".to_owned(),
+                "beta\n".to_owned(),
+            ),
+        ]
+    }
+
+    /// **A job with a team runs its queue to the end, and the work is on the branch.**
+    ///
+    /// The first end-to-end walk of the parallel path, and the thing that made it worth building:
+    /// every slice was green and the path as a whole did nothing, because nothing committed an
+    /// item's work and an empty merge succeeds. A test that only ever asserted per-slice behaviour
+    /// could not see that, and this one cannot miss it — the files either reach the job's branch
+    /// or they do not.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_teams_job_walks_its_whole_queue_and_lands_the_work_on_the_branch() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-accept-whole-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_scripted_agents();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
+        let walk = walk_counting(&state, job_id).await;
+
+        assert_eq!(walk.ending, "completed", "the queue did not run to the end");
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"]
+        );
+
+        let (job_tree, _) = job_worktree(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job's checkout");
+        assert!(
+            job_tree.join("b.rs").exists(),
+            "item 3's work never reached the job's branch"
+        );
+        // Trimmed, because git rewrites the line ending on checkout under Windows and this
+        // assertion is about WHOSE alpha is on the branch, not about newlines.
+        assert_eq!(
+            std::fs::read_to_string(job_tree.join("a.rs"))
+                .expect("item 1 and 2 wrote alpha")
+                .trim_end(),
+            "alpha, again",
+            "the later item's alpha is what should be on the branch"
+        );
+    }
+
+    /// One walk of the three items at a given ceiling, and how many passes it took.
+    ///
+    /// A fresh repository and a fresh database each time. Sharing either would let the first walk's
+    /// branches and slots decide the second's, which is the one thing a comparison must not have.
+    async fn passes_at(max_parallel: i64, tag: &str) -> Walk {
+        walk_plan(max_parallel, tag, THREE_ITEMS, three_scripted_agents()).await
+    }
+
+    /// The same, for a plan and a cast of scripted agents of the caller's choosing.
+    async fn walk_plan(
+        max_parallel: i64,
+        tag: &str,
+        plan: &str,
+        agents: Vec<(String, String, String)>,
+    ) -> Walk {
+        walk_measured(Measured {
+            max_parallel,
+            tag,
+            plan,
+            agents,
+            gate: "git --version",
+            gate_retries: 0,
+            seed: &[],
+        })
+        .await
+    }
+
+    /// Everything one walk needs that is not the same for every walk.
+    ///
+    /// A struct because it is seven things and four of them are strings: a call with seven positional
+    /// arguments is a call whose third and fourth get swapped once and never noticed.
+    struct Measured<'a> {
+        max_parallel: i64,
+        tag: &'a str,
+        plan: &'a str,
+        agents: Vec<(String, String, String)>,
+        /// The project's `gate_command`. `git --version` is the gate that always agrees.
+        gate: &'a str,
+        /// How many EXTRA implement runs a red gate may buy. Zero makes the first red terminal.
+        gate_retries: i64,
+        /// Files committed into the repository before the job starts, so the gate has something to
+        /// measure that the queue did not create.
+        seed: &'a [(&'a str, &'a str)],
+    }
+
+    async fn walk_measured(measured: Measured<'_>) -> Walk {
+        let Measured {
+            max_parallel,
+            tag,
+            plan,
+            agents,
+            gate,
+            gate_retries,
+            seed,
+        } = measured;
+        let (_container, repo) = walkable_repo(tag, gate);
+        for (path, contents) in seed {
+            std::fs::write(repo.join(path), contents).expect("seed a file the gate measures");
+            assert!(git_ok(&repo, &["add", path]));
+        }
+        if !seed.is_empty() {
+            assert!(git_ok(&repo, &["commit", "-m", "what the gate measures"]));
+        }
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = agents;
+
+        let job_id =
+            start_directed_job(&state, &runner, &repo, plan, max_parallel, gate_retries).await;
+        let walk = walk_counting(&state, job_id).await;
+
+        assert_eq!(
+            walk.ending, "completed",
+            "the walk at {max_parallel} did not finish"
+        );
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"],
+            "the walk at {max_parallel} did not do all the work"
+        );
+        walk
+    }
+
+    /// Three items whose declarations are honest and still collide.
+    ///
+    /// **A conflict cannot be produced by two items declaring the same file**, because that is
+    /// exactly what the fold refuses to start together — so the design's own §5 names where a real
+    /// one comes from: *"duas famílias que o predicado não vê"*. Two items that declare different
+    /// work and both touch a REGISTRY the director never thought to name — a lock file, a module
+    /// list, a migrations directory. Nobody lied; the declaration simply cannot see it.
+    ///
+    /// Items 1 and 2 declare `a.rs` and `b.rs`, so the fold starts them together, and both write
+    /// `registry.txt`. The first to land is clean; the second conflicts.
+    const THREE_ITEMS_ONE_REGISTRY: &str = r#"{"items":[
+        {"description":"ITEM-ONE: alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-TWO: beta","files":["b.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-THREE: gamma","files":["c.rs"],"depends_on":[],"agent_id":"ana"}
+    ]}"#;
+
+    /// The scripted agents for the plan above, including what the conflicted one does second time.
+    ///
+    /// The last entry is keyed on the catch-up block `catch_up_the_item` appends to a retry's
+    /// prompt, which is the one thing in there that says "you are being asked again because your
+    /// merge conflicted". It is LAST because the entries are applied in order and a retry matches
+    /// both its own marker and this one: a naive agent would rewrite its own line over the conflict
+    /// markers and drop the other item's, which is a resolution git accepts and a person would not.
+    fn three_agents_over_one_registry() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "ITEM-ONE".to_owned(),
+                "a.rs".to_owned(),
+                "alpha\n".to_owned(),
+            ),
+            (
+                "ITEM-ONE".to_owned(),
+                "registry.txt".to_owned(),
+                "one\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "b.rs".to_owned(),
+                "beta\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "registry.txt".to_owned(),
+                "two\n".to_owned(),
+            ),
+            (
+                "ITEM-THREE".to_owned(),
+                "c.rs".to_owned(),
+                "gamma\n".to_owned(),
+            ),
+            (
+                "left STAGED".to_owned(),
+                "registry.txt".to_owned(),
+                "one\ntwo\n".to_owned(),
+            ),
+        ]
+    }
+
+    /// **The parallel path pays for a conflict the sequential one never meets, and still does not
+    /// lose.** §7's first criterion, with its first unhappy event.
+    ///
+    /// The asymmetry is the point and it is not a flaw in the fixture. At a ceiling of one, items 1
+    /// and 2 never overlap, so item 2's checkout is born AFTER item 1's registry line landed and
+    /// its merge is clean — there is no conflict to have. Parallelism is what creates the event,
+    /// which is exactly why the design budgets for it: the saving has to survive the cost it causes.
+    ///
+    /// Measured: five passes either way, and the writing goes from three rounds to two even with the
+    /// conflicted item asked a second time. It fits in two because the retry batches with the item
+    /// that had not started yet — the fold does not care that one of them is going round again.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_parallel_walk_pays_for_its_conflict_and_still_writes_in_fewer_rounds() {
+        let _lock = crate::worktree::test_env_lock();
+
+        let sequential = walk_plan(
+            1,
+            "nucleos-accept-clash-seq-",
+            THREE_ITEMS_ONE_REGISTRY,
+            three_agents_over_one_registry(),
+        )
+        .await;
+        let parallel = walk_plan(
+            2,
+            "nucleos-accept-clash-par-",
+            THREE_ITEMS_ONE_REGISTRY,
+            three_agents_over_one_registry(),
+        )
+        .await;
+
+        assert!(
+            parallel.passes <= sequential.passes,
+            "the conflict made the parallel walk slower: {parallel:?} against {sequential:?}"
+        );
+        assert!(
+            parallel.writing < sequential.writing,
+            "the saving did not survive the conflict it caused: {parallel:?} against {sequential:?}"
+        );
+    }
+
+    /// The gate that reads the tree rather than always agreeing.
+    ///
+    /// `git grep -q good HEAD` exits zero exactly while something on the branch still says `good`,
+    /// which the seeded `marker.txt` does and an item that clobbers it stops doing. No shell and no
+    /// script in the tree: `run_gate` splits the command into words and spawns the program itself,
+    /// and `git` is the one program this suite already cannot run without.
+    ///
+    /// Steered by what the scripted agents WRITE, and never by the harness reaching in between
+    /// passes. A gate a test flips by hand measures the test; this one measures the tree, which is
+    /// what a gate is.
+    ///
+    /// **`-- marker.txt` is deliberately NOT on the end**, and the first attempt at this had it.
+    /// `worktree_scripts` treats every relative path among the command's arguments as a gate script
+    /// living in the tree, and `tampered_gate_script` then refuses to measure when the run rewrote
+    /// one — correctly, and here fatally: naming the very file the queue clobbers turns every red
+    /// gate into `gate_errored`, which is "the measurement did not happen" and not "the code is
+    /// broken". The guard was right and the command was wrong.
+    const GATE_READS_THE_MARKER: &str = "git grep -q good HEAD";
+
+    /// Both unhappy events in one queue.
+    ///
+    /// Item 2 clobbers the registry that item 1 also touches, and neither declared it — the
+    /// conflict. Item 3 clobbers the marker the gate reads, which nobody else touches, so it merges
+    /// cleanly and is refused by the gate — the red. Two different ways for undeclared work to go
+    /// wrong, and the design answers them differently: one is a question about two pieces of work,
+    /// the other is a verdict on one.
+    const THREE_ITEMS_TWO_EVENTS: &str = r#"{"items":[
+        {"description":"ITEM-ONE: alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-TWO: beta","files":["b.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-THREE: gamma","files":["c.rs"],"depends_on":[],"agent_id":"ana"}
+    ]}"#;
+
+    /// The cast for the plan above, and the two last entries are the retries.
+    ///
+    /// `left STAGED` is the sentence `catch_up_the_item` appends when a merge conflicted; `attempted
+    /// before` is the one `implement_prompt` appends when a gate said no. They are the only things
+    /// in a prompt that say WHY an item is being asked again, they are disjoint, and they are last
+    /// because entries are applied in order: a retry matches its own marker too, and what it wrote
+    /// the first time is exactly what has to be overwritten.
+    fn three_agents_with_two_unhappy_events() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "ITEM-ONE".to_owned(),
+                "a.rs".to_owned(),
+                "alpha\n".to_owned(),
+            ),
+            (
+                "ITEM-ONE".to_owned(),
+                "registry.txt".to_owned(),
+                "one\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "b.rs".to_owned(),
+                "beta\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "registry.txt".to_owned(),
+                "two\n".to_owned(),
+            ),
+            (
+                "ITEM-THREE".to_owned(),
+                "c.rs".to_owned(),
+                "gamma\n".to_owned(),
+            ),
+            // The work that breaks the build: the marker the gate reads, clobbered.
+            (
+                "ITEM-THREE".to_owned(),
+                "marker.txt".to_owned(),
+                "clobbered\n".to_owned(),
+            ),
+            // Asked again after a conflict: keep both lines.
+            (
+                "left STAGED".to_owned(),
+                "registry.txt".to_owned(),
+                "one\ntwo\n".to_owned(),
+            ),
+            // Asked again after a red gate: put the marker back.
+            (
+                "attempted before".to_owned(),
+                "marker.txt".to_owned(),
+                "good\n".to_owned(),
+            ),
+        ]
+    }
+
+    /// **Two unhappy events, and the parallel walk still does not lose.** §7's first criterion,
+    /// whole.
+    ///
+    /// The design budgets sixteen minutes of saving against events that cost eight to twelve each,
+    /// and says so plainly: *"um evento deixa-a em 8 ou 4; dois invertem o sinal"*. Two is therefore
+    /// the number the criterion has to be tested at, and one would be a test that agreed with the
+    /// design about the easy case.
+    ///
+    /// Only one of the two is symmetric. The RED gate is caused by item 3's own work, so both
+    /// ceilings meet it. The CONFLICT exists only in the parallel walk: at a ceiling of one, item 2's
+    /// checkout is born after item 1's line landed and there is nothing to conflict with.
+    /// Parallelism causes that event, and the saving has to survive the cost it causes.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_unhappy_events_do_not_make_the_parallel_walk_the_slower_one() {
+        let _lock = crate::worktree::test_env_lock();
+
+        let measured = |max_parallel: i64, tag: &'static str| async move {
+            walk_measured(Measured {
+                max_parallel,
+                tag,
+                plan: THREE_ITEMS_TWO_EVENTS,
+                agents: three_agents_with_two_unhappy_events(),
+                gate: GATE_READS_THE_MARKER,
+                // One extra implement run per item. `0069` defaults this to zero deliberately, so a
+                // job that wants a red gate to be answerable has to say so; this one does.
+                gate_retries: 1,
+                seed: &[("marker.txt", "good\n")],
+            })
+            .await
+        };
+
+        let sequential = measured(1, "nucleos-accept-two-seq-").await;
+        let parallel = measured(2, "nucleos-accept-two-par-").await;
+
+        assert_eq!(sequential.ending, "completed");
+        assert_eq!(parallel.ending, "completed");
+
+        // Both events really happened, or this is a comparison of two happy walks. A `2` is an item
+        // asked a second time: item 3 by the gate in both walks, and item 2 by the conflict only
+        // where there was parallelism to cause one.
+        assert_eq!(
+            sequential.attempts,
+            vec![1, 1, 2],
+            "the red gate did not fire in the sequential walk: {sequential:?}"
+        );
+        assert_eq!(
+            parallel.attempts,
+            vec![1, 2, 2],
+            "the parallel walk did not meet both events: {parallel:?}"
+        );
+        assert!(
+            parallel.passes <= sequential.passes,
+            "two unhappy events made the parallel walk slower: {parallel:?} against {sequential:?}"
+        );
+        assert!(
+            parallel.writing < sequential.writing,
+            "the saving did not survive two unhappy events: {parallel:?} against {sequential:?}"
+        );
+    }
+
+    /// **A conflict is a step, and the queue walks through it.** The first unhappy event of §7.
+    ///
+    /// Everything the design says about conflict happens here in one walk and nowhere else in the
+    /// suite: the merge is refused and the job's checkout is put back clean, the item is put DOWN
+    /// rather than failed, it is asked again in the checkout it already has, the job's branch is
+    /// brought into that checkout with the conflict left staged, and what the second node writes is
+    /// merged and gated.
+    ///
+    /// The registry file is the assertion that matters. `one\ntwo` on the branch means the two
+    /// items' work was really reconciled; either line alone means one of them was silently dropped
+    /// by a merge that reported success.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflict_over_a_file_nobody_declared_is_resolved_and_the_queue_finishes() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-accept-clash-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_agents_over_one_registry();
+
+        let job_id =
+            start_directed_job(&state, &runner, &repo, THREE_ITEMS_ONE_REGISTRY, 2, 0).await;
+        let walk = walk_counting(&state, job_id).await;
+
+        assert_eq!(walk.ending, "completed", "the conflict stopped the queue");
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"]
+        );
+
+        // The item that conflicted was asked again, in a checkout it already had. Counted on the
+        // runs because a status is transient and this is not: one implement node for the first
+        // attempt, one for the resolution.
+        assert_eq!(
+            walk.attempts,
+            vec![1, 2, 1],
+            "exactly one item should have been asked twice"
+        );
+
+        let (job_tree, _) = job_worktree(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job's checkout");
+        let registry = std::fs::read_to_string(job_tree.join("registry.txt"))
+            .expect("the registry both items touched");
+        let lines: Vec<&str> = registry.lines().map(str::trim_end).collect();
+        assert_eq!(
+            lines,
+            vec!["one", "two"],
+            "the resolution did not keep both items' work: {registry:?}"
+        );
+        for file in ["a.rs", "b.rs", "c.rs"] {
+            assert!(
+                job_tree.join(file).exists(),
+                "{file} never reached the job's branch"
+            );
+        }
+    }
+
+    /// **The same work at two ceilings, and the parallel one is not slower.** §7's first criterion.
+    ///
+    /// Two numbers, because one of them cannot see the thing the design changes.
+    ///
+    /// **Total passes: not more.** That is the criterion as §7 words it, and the `<=` is the whole
+    /// of it. The batch buys overlap on the writing; the merges and the gates behind it stay in a
+    /// queue however many items were written at once, so a design that shortened the queue as well
+    /// would be a different design. Asserting a strict `<` here was measured and is FALSE: three
+    /// items cost five passes at either ceiling, because a pass stops as soon as it starts a node
+    /// and the merges cost the same either way.
+    ///
+    /// **Writing rounds: strictly fewer.** This is the term the ceiling shrinks and the reason the
+    /// first assertion is worth having rather than trivially true. §7 says so in as many words: a
+    /// parallelism collapsed to one satisfies "not slower" by being the same thing, which is how an
+    /// earlier draft of this design convinced itself it worked. Two independent items written in one
+    /// round instead of two is the claim, and it is asserted on rounds the daemon really made.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_same_queue_at_two_ceilings_and_the_parallel_one_is_not_slower() {
+        let _lock = crate::worktree::test_env_lock();
+
+        let sequential = passes_at(1, "nucleos-accept-seq-").await;
+        let parallel = passes_at(2, "nucleos-accept-par-").await;
+
+        assert!(
+            parallel.passes <= sequential.passes,
+            "the parallel walk took {parallel:?} against the sequential {sequential:?}"
+        );
+        assert!(
+            parallel.writing < sequential.writing,
+            "two independent items should be written in one round rather than two: {parallel:?} \
+             against {sequential:?}"
+        );
+    }
+
     /// Drives a job to an ending, one pass per loop, exactly as the daemon's tick would.
     async fn walk(state: &AppState, job_id: i64) -> String {
         for _ in 0..20 {
@@ -5935,6 +8802,7 @@ mod tests {
                 head_sha: head_sha.as_deref(),
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -6443,7 +9311,7 @@ mod tests {
         assert_eq!(placed, vec![(0, 0), (1, 0), (2, 1)]);
         assert_eq!(
             next_step(&load_view(&pool, job_id).await.unwrap()),
-            Next::SpawnImplement { ordinal: 2 }
+            Next::SpawnImplement(vec![2])
         );
     }
 
@@ -7073,6 +9941,7 @@ mod tests {
                 head_sha: None,
                 max_rounds: None,
                 budget_usd: None,
+                team_id: None,
             },
         )
         .await
@@ -7149,7 +10018,7 @@ mod tests {
 
         assert_eq!(
             next_step(&load_view(&pool, job_id).await.unwrap()),
-            Next::SpawnImplement { ordinal: 0 },
+            Next::SpawnImplement(vec![0]),
             "the queue has to come back to the same item, not stop and not step over it"
         );
     }
@@ -7170,6 +10039,114 @@ mod tests {
     /// `running` and it has a run attached. The prompt is the third assertion, and it is what makes
     /// the whole chain load-bearing — output stored by `record_gate`, selected by `advance`, appended
     /// by `implement_prompt`, and handed to a node. Any link missing and this says so.
+    /// **Two items of one job are worked on at the same time.** The criterion §7 says the whole
+    /// design rests on.
+    ///
+    /// It exists because the other criterion cannot catch a no-op on its own. "The parallel run is
+    /// not slower than the sequential one" is satisfied trivially by a parallelism that collapsed to
+    /// one — same plan, same order, same timings — and that is exactly how an earlier draft of
+    /// this design convinced itself it worked. This asks the question the timings cannot: were two
+    /// nodes ever going at once.
+    ///
+    /// Deterministic, and it has to be: no sleeping, no wall clock, no ordering between threads. One
+    /// pass of `advance` over a queue of three, and the rows afterwards say how many started. Three
+    /// items and a ceiling of two, so the answer distinguishes "two" from both "one" (no
+    /// parallelism) and "all of them" (no ceiling).
+    ///
+    /// Item 1 declares the same file as item 0 and is the control: it must NOT be in the batch, or
+    /// the two that did start were chosen by counting rather than by the fold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_items_of_a_team_are_started_in_one_pass_and_a_third_is_not() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-parallel-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+
+        seed_agent(&pool, "ana", "migrations", "careful").await;
+        seed_crew(&pool, "crew", "ana", &[]).await;
+        sqlx::query("UPDATE teams SET max_parallel = 2 WHERE id = 'crew'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+
+        // The queue a director's plan produces: three items, and item 1 sharing a file with item 0.
+        for (ordinal, files) in [(0, r#"["a.rs"]"#), (1, r#"["a.rs"]"#), (2, r#"["b.rs"]"#)] {
+            sqlx::query(
+                "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
+                                        agent_id)
+                 VALUES (?, ?, 'an item', 'pending', ?, '[]', 'ana')",
+            )
+            .bind(job_id)
+            .bind(ordinal as i64)
+            .bind(files)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["running", "pending", "running"],
+            "one pass started items 0 and 2 together, and left 1 for the file it shares with 0"
+        );
+
+        // And they are two nodes, in two checkouts, not one node counted twice. `item_id` is what
+        // says so: it is the owner of the worktree each of them opened its editor in.
+        let items: Vec<i64> = sqlx::query_scalar(
+            "SELECT runs.item_id FROM runs
+              WHERE runs.job_id = ? AND runs.item_id IS NOT NULL ORDER BY runs.item_id",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(items.len(), 2, "two runs, one per started item: {items:?}");
+        assert_ne!(items[0], items[1]);
+
+        let trees: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM worktrees WHERE owner_kind = 'item' AND removed_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trees, 2, "each item is writing in a checkout of its own");
+    }
+
     /// A real repository and a real worktree, because a node that cannot be provisioned would leave
     /// the item back where it started for a reason that has nothing to do with the claim — and would
     /// look exactly like the defect this pins.
@@ -7397,7 +10374,7 @@ mod tests {
     /// legitimate answer — otherwise a model asked to plan will find something to plan.
     #[test]
     fn the_plan_node_is_told_the_file_is_the_only_thing_read() {
-        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos");
+        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos", None);
         assert!(prompt.contains("advance the backlog"));
         assert!(prompt.contains("/wt/.nucleos/plan.json"));
         assert!(prompt.contains("at most 5"));
@@ -7410,7 +10387,7 @@ mod tests {
     /// context window in the wrong place.
     #[test]
     fn plan_prompt_asks_for_optional_file_hints() {
-        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos");
+        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos", None);
 
         assert!(
             prompt.contains(r#""files""#),
@@ -7439,7 +10416,7 @@ mod tests {
             "core/src/job.rs".to_owned(),
             "core/migrations/0052.sql".to_owned(),
         ];
-        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints, None);
+        let hinted = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &hints, None, None);
 
         assert!(hinted.contains("core/src/job.rs"));
         assert!(hinted.contains("core/migrations/0052.sql"));
@@ -7448,7 +10425,7 @@ mod tests {
             "the list is a hint, not a boundary: {hinted}"
         );
 
-        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None);
+        let bare = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None, None);
         assert_eq!(
             bare,
             "You are item 1 of 3 in an autonomous job. The working tree already holds the work \
@@ -7496,7 +10473,7 @@ mod tests {
     /// the node was told before it is still there and in the same place.
     #[test]
     fn the_retry_prompt_carries_the_gate_output() {
-        let first = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None);
+        let first = implement_prompt("write the thing", 0, 3, "/wt/.nucleos", &[], None, None);
         let retry = implement_prompt(
             "write the thing",
             0,
@@ -7504,6 +10481,7 @@ mod tests {
             "/wt/.nucleos",
             &[],
             Some("FAILED test_x"),
+            None,
         );
 
         assert!(
@@ -7696,6 +10674,7 @@ mod tests {
                 held: "pending",
             }),
             (PathBuf::from("/project/a/worktree"), "nucleos/job".into()),
+            NoRoom::Park,
         )
         .await;
 
