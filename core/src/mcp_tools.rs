@@ -166,7 +166,9 @@ struct BrowserActParams {
     /// (down, up, top, bottom; down if you say nothing), the url for "goto" - absolute, or
     /// relative to the page you are on - and the file's CONTENTS for "upload". You write the file
     /// here: there is no way to attach one that already exists on this machine, and a path is not
-    /// something this accepts.
+    /// something this accepts. For a file you cannot write out - one already on this machine, a
+    /// PDF, a picture - ask for the wheel with browser_handoff instead and say that is what you
+    /// need it for: the person's own window can attach it.
     text: Option<String>,
 }
 
@@ -707,11 +709,12 @@ impl NucleosTools {
 
     #[tool(
         description = "Ask a person to take over this browsing session — for a login, a captcha, a \
-                       consent screen, anything you are not allowed to do. This does NOT hand \
-                       anything over: it raises a request the person may accept or refuse, and \
-                       they may not be there. From the moment you call this, your own actions on \
-                       the session are refused. Do not wait on it; finish what you can without \
-                       that page. The `reason` is shown to a person, so write it for one."
+                       consent screen, a file that already exists here and has to be attached, \
+                       anything you are not allowed to do. This does NOT hand anything over: it \
+                       raises a request the person may accept or refuse, and they may not be \
+                       there. From the moment you call this, your own actions on the session are \
+                       refused. Do not wait on it; finish what you can without that page. The \
+                       `reason` is shown to a person, so write it for one."
     )]
     async fn browser_handoff(
         &self,
