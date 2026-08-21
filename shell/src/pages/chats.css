@@ -183,6 +183,56 @@
  * `paused` and not `danger`: nothing is broken and nothing is about to go wrong. It is a session
  * that will continue with less than you would expect, and the button beside it is the fix.
  */
+/* What is different in this conversation's project, closed until asked. */
+.chats-changed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.chats-changed-toggle {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.chats-changed-clean {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-diff {
+  max-height: 24rem;
+  overflow: auto;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  white-space: pre;
+}
+
+.chats-diff-added {
+  color: var(--tone-go-text, #2f7d43);
+}
+
+.chats-diff-removed {
+  color: var(--tone-stop-text, #a33a3a);
+}
+
+/* The lines that say WHERE rather than WHAT: file names and hunk headers, faint so the eye goes to
+   the content between them. */
+.chats-diff-meta {
+  color: var(--text-faint);
+}
+
 /* A tool call this conversation is being held on. Drawn where the next thing would have
    appeared, and not tucked away: a turn is stopped while this stands, and the daemon refuses on its
    own in about forty-five seconds. */

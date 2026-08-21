@@ -408,6 +408,28 @@ export function useIdeConversation(sessionId: string | null, watch = false) {
   });
 }
 
+/**
+ * What is different in this conversation's project, as `git diff` writes it.
+ *
+ * **`apiText`, never `apiFetch`**: the route answers with a bare string, and a
+ * clean tree answers with an empty one — which `apiFetch` would try to parse as
+ * JSON and refuse.
+ *
+ * On demand and never polled, and `enabled` is what makes that true: this walks
+ * a working tree, and re-asking it on a timer would do that in the background
+ * forever for a panel nobody has opened. Not cached beyond the open either —
+ * `staleTime: 0` — because the answer changes the moment the conversation does
+ * anything, and a stale diff is a worse answer than a slow one.
+ */
+export function useChatDiff(chatId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: keys.chats.diff(chatId),
+    queryFn: () => apiText(`/assistant/chats/${encodeURIComponent(chatId)}/diff`),
+    enabled,
+    staleTime: 0,
+  });
+}
+
 /* --------------------------------------------------------------- writes -- */
 
 /**

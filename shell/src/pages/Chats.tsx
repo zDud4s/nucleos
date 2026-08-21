@@ -13,6 +13,7 @@ import {
   useWireIdeSessionTools,
   useAnswerAsk,
   useChatCommands,
+  useChatDiff,
   useChatFiles,
   useChatProject,
   useDropQueued,
@@ -49,6 +50,7 @@ import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
 import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
 import { stillGoing } from "../lib/editor";
+import { diffLines } from "../lib/diff";
 import {
   Badge,
   Button,
@@ -597,6 +599,7 @@ function ChatDetail({
           a turn is held while a question stands, and the queue behind it cannot move until it is
           answered. */}
       <Asking asks={transcript.data?.asks ?? []} chatId={chatId} />
+      <Changed chatId={chatId} />
       <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
 
       <Composer chatId={chatId} />
@@ -1031,6 +1034,79 @@ function HowItContinued({
  * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
  * where the next thing would have appeared rather than tucked away somewhere tidy.
  */
+/**
+ * What is different in this conversation's project, without leaving the app.
+ *
+ * The question a person has after a coding turn is "what changed", and the transcript answers it
+ * with the name of a tool and a path. To see what those did you had to go somewhere else, which is
+ * the opposite of what a conversation about code is for.
+ *
+ * **It says what it is, and what it is not.** The daemon takes no snapshot before a turn, so this is
+ * what is different NOW — the same thing after one turn, and not after three. Labelling it as what
+ * the turn did would be the kind of note that reads like a fact and stops being one.
+ *
+ * Closed until asked. Opening it walks a working tree, and a panel that did that on arrival would do
+ * it for every conversation somebody clicked past.
+ */
+function Changed({ chatId }: { chatId: string }) {
+  const [open, setOpen] = useState(false);
+  const diff = useChatDiff(chatId, open);
+
+  return (
+    <div className="chats-changed">
+      <button
+        type="button"
+        className="chats-changed-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((was) => !was)}
+      >
+        {open ? "hide what is different" : "what is different in this project"}
+      </button>
+      {open && diff.isError && (
+        <ChangedRefusal error={diff.error} />
+      )}
+      {open && diff.data === undefined && !diff.isError && (
+        <p className="chats-loading">reading the project…</p>
+      )}
+      {open && diff.data !== undefined && <DiffView diff={diff.data} />}
+    </div>
+  );
+}
+
+/** One `git diff`, coloured. A clean tree is said in words rather than drawn as an empty box. */
+function DiffView({ diff }: { diff: string }) {
+  const lines = diffLines(diff);
+  if (lines.length === 0) {
+    return <p className="chats-changed-clean">nothing in this project has changed</p>;
+  }
+  return (
+    <pre className="chats-diff" aria-label="What is different">
+      {lines.map((line, at) => (
+        // Keyed by position: a diff is read whole and redrawn whole, and nothing reorders inside it.
+        <span key={`diff-${at}`} className={`chats-diff-${line.kind}`}>
+          {line.text}
+          {"\n"}
+        </span>
+      ))}
+    </pre>
+  );
+}
+
+function ChangedRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return <ErrorNote>the núcleo did not answer — nothing could be read</ErrorNote>;
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        conflict: "this conversation has no project, so there is no working tree to compare",
+        not_found: "that conversation is no longer here",
+      }}
+    />
+  );
+}
+
 function Asking({ asks, chatId }: { asks: Ask[]; chatId: string }) {
   const answer = useAnswerAsk(chatId);
   if (asks.length === 0) return null;

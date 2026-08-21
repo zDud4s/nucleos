@@ -431,6 +431,48 @@ describe("Chats - an empty list", () => {
   });
 });
 
+describe("Chats - what is different in the project", () => {
+  // The question a person has after a coding turn. The transcript answers it with the name of a
+  // tool and a path, and to see what those did you had to leave the app.
+  it("shows the project's diff when asked, and not before", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "arranja isso", answer: "feito" })],
+      }),
+    );
+    daemon.apiText.mockResolvedValue(
+      "diff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-let velho = 1;\n+let novo = 2;\n",
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    // Walking a working tree is not something a panel does on arrival.
+    expect(screen.queryByLabelText("What is different")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /what is different in this project/i }));
+
+    const shown = await screen.findByLabelText("What is different");
+    expect(within(shown).getByText(/let novo = 2;/)).toBeTruthy();
+    expect(within(shown).getByText(/let velho = 1;/)).toBeTruthy();
+  });
+
+  // A clean tree is a real answer and not an empty box.
+  it("says so in words when nothing has changed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    daemon.apiText.mockResolvedValue("");
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    fireEvent.click(screen.getByRole("button", { name: /what is different in this project/i }));
+
+    expect(await screen.findByText(/nothing in this project has changed/i)).toBeTruthy();
+  });
+});
+
 describe("Chats - a conversation asking to be allowed something", () => {
   // The wall this removes. The classifier sends everything not provably read-only for approval, and
   // a conversation cannot park a proposal, so the answer used to be a refusal telling the person to

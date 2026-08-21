@@ -233,6 +233,10 @@ pub fn build_router(state: AppState) -> Router {
         // because this is the person speaking, not the CLI: the hook's own half carries a run's key
         // and lives beside the gate.
         .route("/assistant/asks/{ask_id}", post(post_ask_answer))
+        // What is different in this conversation's project. On demand and never polled, for the
+        // reason the projects' own inspect readers give: re-asking it on a timer would walk
+        // somebody's working tree in the background forever.
+        .route("/assistant/chats/{chat_id}/diff", get(get_chat_diff))
         // Where a conversation runs, and whether that gives it tools. Its own read because it is a
         // filesystem question: answering it on the list would be a stat per conversation per poll,
         // for rows nobody is looking at.
@@ -3638,6 +3642,45 @@ async fn get_chat_commands(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(CommandsOut { commands }))
+}
+
+/// What is different in a conversation's project, as `git diff` writes it.
+///
+/// The question a person has after a coding turn is "what changed", and answering it used to mean
+/// leaving the app: the transcript names the tool and the file and stops there.
+///
+/// **Not what the turn did, and never labelled as such.** The daemon takes no snapshot before a
+/// turn, so this is what is different NOW — the same thing after one turn, and not after three. The
+/// honest claim is the one this makes.
+///
+/// `inspect::diff` and not a `git diff` of its own: that one already turns off every setting a
+/// target repository could use to run a command string as the daemon user, and carries the deadline
+/// and output ceiling this needs for exactly the same reasons.
+async fn get_chat_diff(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<String, StatusCode> {
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation's project failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?
+        // 409 and not an empty answer. An empty diff is a claim — "nothing has changed" — and a
+        // conversation with no project is not in a position to make it.
+        .ok_or(StatusCode::CONFLICT)?;
+
+    let root = std::path::PathBuf::from(cwd);
+    tokio::task::spawn_blocking(move || inspect::diff(&root))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        // A directory that is not a repository has nothing to say, which is an empty answer rather
+        // than a refusal: the conversation is fine, its project simply is not under git.
+        .or_else(|error| match error {
+            inspect::InspectError::Io(_) => Ok(String::new()),
+            other => Err(inspect_status(other)),
+        })
 }
 
 /// What the window says when somebody answers for a held tool call.
@@ -9321,6 +9364,68 @@ mod tests {
             .status()
     }
 
+    /// What is different in a conversation's project, read from the conversation.
+    ///
+    /// The question a person has after a coding turn is "what changed", and until now answering it
+    /// meant leaving the app: `WhatItDid` names the tool and the file and stops there. This is the
+    /// project's own `git diff`, which is the honest answer to that question for a working tree
+    /// nobody has committed yet.
+    ///
+    /// Deliberately NOT labelled as what the turn did. The daemon takes no snapshot, so what a
+    /// reader gets is what is different NOW — which is the same thing after one turn and is not
+    /// after three.
+    #[tokio::test]
+    async fn what_is_different_in_a_conversations_project_can_be_read_from_the_conversation() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}/diff"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A directory that is not a repository has nothing to say, which is an empty answer rather
+        // than a refusal: the conversation is fine, its project simply is not under git.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A conversation with no project has no working tree to be different from.
+    ///
+    /// 409 and not an empty diff: an empty diff is a claim — "nothing has changed" — and this
+    /// conversation is not in a position to make it.
+    #[tokio::test]
+    async fn a_conversation_with_no_project_has_no_diff_to_show() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}/diff"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
     /// A held tool call is released by the window, and the hook is told what the person said.
     ///
     /// The whole shape end to end: the gate says `asking` and returns at once, the hook comes back
@@ -9333,15 +9438,21 @@ mod tests {
             let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
                 .await
                 .unwrap();
-            let run_id = sqlx::query(
-                "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
-                 VALUES ('x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
+            // An id of its own, and not the one this pool would hand out. Every test has its own
+            // in-memory database, so every one would call its first run `1` — while the ask
+            // registry is a single process-wide map, exactly as it is in the daemon. Passed alone
+            // this test is right either way; run beside the others it borrows their questions.
+            static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(80_000);
+            let run_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, mode, chat_id, created_at)
+                 VALUES (?, 'x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
             )
+            .bind(run_id)
             .bind(&chat_id)
             .execute(&state.pool)
             .await
-            .unwrap()
-            .last_insert_rowid();
+            .unwrap();
             let key = crate::auth::mint_chat_token(&state.pool, &chat_id)
                 .await
                 .unwrap();
