@@ -3402,11 +3402,15 @@ async fn post_run_message(
     let Some(sender) = sender else {
         return Err(StatusCode::CONFLICT);
     };
-    // Raw text: framing a turn as a `stream-json` line is `runner.rs`'s job, because knowing the
-    // CLI's wire format is what that module is for. A second copy of that shape here would drift the
-    // day the format does.
+    // Raw text, and no pictures: framing a turn as a `stream-json` line is `runner.rs`'s job,
+    // because knowing the CLI's wire format is what that module is for, and a second copy of that
+    // shape here would drift the day the format does. This route takes a message and nothing else —
+    // the door that carries pictures is a conversation's, not a run's.
     sender
-        .send(body.message)
+        .send(crate::runner::LaterTurn {
+            text: body.message,
+            images: Vec::new(),
+        })
         .map_err(|_| StatusCode::CONFLICT)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -11889,7 +11893,10 @@ mod tests {
         status: &str,
         mode: &str,
         steerable: bool,
-    ) -> (i64, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    ) -> (
+        i64,
+        tokio::sync::mpsc::UnboundedReceiver<crate::runner::LaterTurn>,
+    ) {
         let run_id = sqlx::query(
             "INSERT INTO runs (prompt, status, mode, steerable, created_at)
              VALUES ('keep working', ?, ?, ?, '2026-07-30T00:00:00Z')",
@@ -12048,9 +12055,13 @@ mod tests {
             .try_recv()
             .expect("an accepted steer must reach the run");
         assert!(
-            delivered.contains(STEERING_MESSAGE),
-            "the run must receive what was sent: {delivered}"
+            delivered.text.contains(STEERING_MESSAGE),
+            "the run must receive what was sent: {}",
+            delivered.text
         );
+        // This door takes a message and nothing else — the one that carries pictures belongs to a
+        // conversation, not to a run.
+        assert!(delivered.images.is_empty());
     }
 
     /// A preset records WHAT to run, never who may speak into the run afterwards — `run_presets` has
@@ -12116,8 +12127,8 @@ mod tests {
             _transcript: Arc<std::sync::Mutex<String>>,
         ) -> std::io::Result<crate::runner::RunOutcome> {
             if let Some(messages) = request.messages.as_mut() {
-                while let Some(text) = messages.recv().await {
-                    self.heard.lock().unwrap().push(text);
+                while let Some(turn) = messages.recv().await {
+                    self.heard.lock().unwrap().push(turn.text);
                 }
             }
             Ok(crate::runner::RunOutcome {

@@ -1145,7 +1145,8 @@ fn spawn_run(
             // failed is not owed to its retry — and `insert` replaces the previous attempt's sender,
             // so nothing can go on holding a stale one.
             if request.steerable {
-                let (messages_tx, messages_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let (messages_tx, messages_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
                 run_messages.lock().unwrap().insert(id, messages_tx);
                 request.messages = Some(messages_rx);
             }

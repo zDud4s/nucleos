@@ -74,7 +74,7 @@ struct LiveChat {
     ///
     /// Dropping this closes the CLI's stdin, which ends the process *after* it finishes whatever
     /// turn it is on — measured; it is not a way to interrupt one. That is what `abort` is for.
-    messages: tokio::sync::mpsc::UnboundedSender<String>,
+    messages: tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>,
     /// Everything the process says, already split into turns by `runner::TurnSplitter`.
     events: tokio::sync::mpsc::UnboundedReceiver<crate::runner::TurnEvent>,
     /// The session every turn of this process shares, once its first `init` has said what it is.
@@ -85,6 +85,18 @@ struct LiveChat {
     /// How the process is stopped for real, for the turn that was cancelled and cannot wait for a
     /// closed stdin to be honoured.
     abort: tokio::task::AbortHandle,
+    /// Why the process stopped, once it has, or `None` while it is still standing.
+    ///
+    /// The one thing a turn served this way could not say. A turn that ANSWERED has no failure to
+    /// explain, but one whose process died mid-answer has exactly one useful fact and it is in the
+    /// process's stderr — and the case that actually happens is the tool-policy barrier, whose
+    /// message names the offending tools. Without this the conversation showed "the process ended"
+    /// and the reason went to a log nobody reading the chat can see.
+    ///
+    /// A `watch` and not a shared cell: the supervisor sets it at the same moment the stream closes,
+    /// so a turn noticing the close has to be able to WAIT briefly for it rather than read whatever
+    /// happens to be there.
+    stopped_because: tokio::sync::watch::Receiver<Option<String>>,
     /// Where the process is standing, fixed when it was spawned.
     ///
     /// Kept so it can be COMPARED. A conversation's working directory is resolved per turn — an
@@ -115,16 +127,25 @@ enum LiveTurn {
     /// Nothing was written: the process was already gone. The turn can be started fresh, because
     /// as far as anything outside is concerned it never happened.
     NotWritten,
-    /// It was written, and the process died before answering. The turn is lost and must NOT be
-    /// quietly started again — whatever it had already done, a command run or a file written, would
-    /// be done a second time.
-    DiedMidTurn,
+    /// It was written, and the process died before answering, with whatever the process said on
+    /// its way out. The turn is lost and must NOT be quietly started again — whatever it had already
+    /// done, a command run or a file written, would be done a second time.
+    DiedMidTurn(Option<String>),
 }
 
 impl LiveChat {
     /// Says something to this process and gathers the one turn it answers with.
-    async fn turn(&mut self, text: &str, transcript: &std::sync::Arc<Mutex<String>>) -> LiveTurn {
-        if self.messages.send(text.to_owned()).is_err() {
+    async fn turn(
+        &mut self,
+        text: &str,
+        images: &[crate::runner::Attachment],
+        transcript: &std::sync::Arc<Mutex<String>>,
+    ) -> LiveTurn {
+        let said = crate::runner::LaterTurn {
+            text: text.to_owned(),
+            images: images.to_vec(),
+        };
+        if self.messages.send(said).is_err() {
             return LiveTurn::NotWritten;
         }
         self.gather(transcript).await
@@ -156,7 +177,21 @@ impl LiveChat {
                 crate::runner::TurnEvent::Ended(outcome) => return LiveTurn::Answered(outcome),
             }
         }
-        LiveTurn::DiedMidTurn
+        LiveTurn::DiedMidTurn(self.why_it_stopped().await)
+    }
+
+    /// What the process said on its way out, if it manages to say it in time.
+    ///
+    /// Bounded, because this is a diagnosis and not the answer: the stream closing and the
+    /// supervisor recording the reason are the same instant from two sides, so waiting is right and
+    /// waiting long is not. A turn that has already failed must not also hang.
+    async fn why_it_stopped(&mut self) -> Option<String> {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.stopped_because.changed(),
+        )
+        .await;
+        self.stopped_because.borrow().clone()
     }
 }
 
@@ -260,8 +295,11 @@ async fn serve_turn(
             let _ = session_tx.send(session_id.clone());
             // Bound before the match, not inside its scrutinee: a temporary there would hold the
             // borrow of `live` through every arm, and one of them has to hand it back.
-            let served =
-                tokio::time::timeout(run_timeout, live.turn(&request.prompt, transcript)).await;
+            let served = tokio::time::timeout(
+                run_timeout,
+                live.turn(&request.prompt, &request.images, transcript),
+            )
+            .await;
             match served {
                 Ok(LiveTurn::Answered(outcome)) => {
                     let stdout = transcript
@@ -273,11 +311,20 @@ async fn serve_turn(
                     return Ok(Ok(gathered));
                 }
                 // It heard the turn and died before answering. Starting it again would re-run
-                // whatever it had already done, so this is reported as the failure it is.
-                Ok(LiveTurn::DiedMidTurn) => {
-                    return Ok(Err(std::io::Error::other(
-                        "the conversation's process ended in the middle of this turn",
-                    )));
+                // whatever it had already done, so this is reported as the failure it is — with
+                // whatever the process said on its way out, which is what this row's `stderr`
+                // becomes and therefore what the conversation shows.
+                Ok(LiveTurn::DiedMidTurn(why)) => {
+                    return Ok(Err(std::io::Error::other(match why {
+                        Some(why) => {
+                            format!(
+                                "the conversation's process ended in the middle of this turn: {why}"
+                            )
+                        }
+                        None => {
+                            "the conversation's process ended in the middle of this turn".to_owned()
+                        }
+                    })));
                 }
                 // Nothing was written, so as far as anything outside is concerned this turn has not
                 // happened yet, and starting a process for it is safe.
@@ -308,7 +355,7 @@ async fn start_live_chat(
     chat_id: &str,
     run_timeout: std::time::Duration,
 ) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
-    let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (process_session_tx, mut process_session_rx) =
         tokio::sync::mpsc::unbounded_channel::<String>();
@@ -326,6 +373,9 @@ async fn start_live_chat(
     // turn events instead, one turn at a time — a process serving five turns would otherwise hand
     // the fifth the other four.
     let process_transcript = std::sync::Arc::new(Mutex::new(String::new()));
+    // Set once, by the supervisor, at the moment the process stops. A turn watching the stream
+    // close reads it through the other end.
+    let (why_stopped, stopped_because) = tokio::sync::watch::channel(None);
     let runner = std::sync::Arc::clone(runner);
     let named = chat_id.to_owned();
     let supervisor = tokio::spawn(async move {
@@ -350,19 +400,35 @@ async fn start_live_chat(
             // The last few lines rather than the whole stream: it is a process's stderr, it can be
             // long, and what says why something stopped is at the end of it.
             Ok(outcome) if outcome.exit_code != 0 => {
-                let tail = outcome.stderr.lines().rev().take(5).collect::<Vec<_>>();
+                let tail = outcome
+                    .stderr
+                    .lines()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" | ");
                 tracing::warn!(
                     chat_id = %named,
                     exit_code = outcome.exit_code,
-                    stderr = %tail.into_iter().rev().collect::<Vec<_>>().join(" | "),
+                    stderr = %tail,
                     "a conversation's process stopped badly; its turns will each start their own"
                 );
+                // Said to the turn as well as to the log. A turn cut off mid-answer shows this as
+                // its own failure, and "the process ended" on its own is not something anybody can
+                // act on — where the tool-policy barrier is what killed it, this names the tools.
+                let _ = why_stopped.send(Some(tail));
             }
-            Err(error) => tracing::warn!(
-                chat_id = %named,
-                %error,
-                "a conversation's process could not be started; its turns will each start their own"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    chat_id = %named,
+                    %error,
+                    "a conversation's process could not be started; its turns will each start their own"
+                );
+                let _ = why_stopped.send(Some(error.to_string()));
+            }
             Ok(_) => {}
         }
     });
@@ -386,6 +452,7 @@ async fn start_live_chat(
         events,
         session_id: std::sync::Arc::clone(&session_id),
         abort: supervisor.abort_handle(),
+        stopped_because,
         cwd: started_in,
         idle_since: std::time::Instant::now(),
     };
@@ -404,9 +471,13 @@ async fn start_live_chat(
         }
         // A process that fell over without answering. `live` is dropped on the way out, which takes
         // down whatever is left of it.
-        Ok(LiveTurn::NotWritten | LiveTurn::DiedMidTurn) => Ok(Err(std::io::Error::other(
+        Ok(LiveTurn::NotWritten) => Ok(Err(std::io::Error::other(
             "the conversation's process ended without answering",
         ))),
+        Ok(LiveTurn::DiedMidTurn(why)) => Ok(Err(std::io::Error::other(match why {
+            Some(why) => format!("the conversation's process ended without answering: {why}"),
+            None => "the conversation's process ended without answering".to_owned(),
+        }))),
         Err(elapsed) => Err(elapsed),
     }
 }
@@ -1861,15 +1932,14 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // the barrier that makes it safe is the same one that earned it the tools.
         let may_live = matches!(tool_policy, crate::runner::ToolPolicy::Unrestricted);
 
-        // A picture cannot travel a later turn: `messages` carries text, and the opening line is the
-        // only one anything is attached to. So a turn carrying one starts a process of its own,
-        // whose opening line does carry it, rather than being spoken into a process that would drop
-        // it without a word.
-        //
-        // And a turn with no `resume` is a conversation that has rotated onto a fresh context, so a
+        // A turn with no `resume` is a conversation that has rotated onto a fresh context, so a
         // process still holding the old session has to go rather than be spoken to — answering down
         // it would continue exactly the conversation the rotation just ended.
-        if carries_pictures || resume.is_none() {
+        //
+        // Pictures used to be here too, because `messages` carried a bare `String` and a later turn
+        // was written with no attachments. `runner::LaterTurn` carries its own, so a screenshot
+        // pasted into the second turn no longer costs the conversation its process.
+        if resume.is_none() {
             evict_live(&turn.slot.chat_id);
         }
 
@@ -4398,7 +4468,7 @@ mod tests {
     /// The lines it gathers are the turn's own transcript, and the outcome is the turn's own bill.
     #[tokio::test]
     async fn a_living_conversation_answers_a_later_turn_down_the_process_it_already_has() {
-        let (mut live, mut said, events) = live_chat_for_testing();
+        let (mut live, mut said, events, _why) = live_chat_for_testing();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
         events
@@ -4413,13 +4483,16 @@ mod tests {
             ))
             .unwrap();
 
-        let LiveTurn::Answered(outcome) = live.turn("e agora?", &transcript).await else {
+        let LiveTurn::Answered(outcome) = live.turn("e agora?", &[], &transcript).await else {
             panic!("a process with an answer queued must answer");
         };
 
         assert_eq!(outcome.cost_usd, Some(0.08));
         assert_eq!(transcript.lock().unwrap().as_str(), "hello\n");
-        assert_eq!(said.recv().await.as_deref(), Some("e agora?"));
+        assert_eq!(
+            said.recv().await.map(|turn| turn.text).as_deref(),
+            Some("e agora?")
+        );
     }
 
     /// A turn stops at its OWN end, leaving whatever comes after it for the turn that comes after.
@@ -4430,7 +4503,7 @@ mod tests {
     /// somebody else's.
     #[tokio::test]
     async fn a_turn_gathers_its_own_lines_and_leaves_the_next_turns_alone() {
-        let (mut live, _said, events) = live_chat_for_testing();
+        let (mut live, _said, events, _why) = live_chat_for_testing();
         let first = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let second = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
@@ -4444,11 +4517,11 @@ mod tests {
         }
 
         assert!(matches!(
-            live.turn("um", &first).await,
+            live.turn("um", &[], &first).await,
             LiveTurn::Answered(_)
         ));
         assert!(matches!(
-            live.turn("dois", &second).await,
+            live.turn("dois", &[], &second).await,
             LiveTurn::Answered(_)
         ));
 
@@ -4461,7 +4534,7 @@ mod tests {
     /// existed — so the worst case is last week's speed, not a conversation that hangs.
     #[tokio::test]
     async fn a_conversation_whose_process_is_gone_says_so_instead_of_waiting() {
-        let (mut live, said, events) = live_chat_for_testing();
+        let (mut live, said, events, _why) = live_chat_for_testing();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
         // BOTH ends, because that is what a process actually being gone looks like: the runner's
@@ -4474,7 +4547,7 @@ mod tests {
         // start over: nothing reached the process, so as far as anything outside is concerned this
         // turn has not happened yet.
         assert!(matches!(
-            live.turn("estas ai?", &transcript).await,
+            live.turn("estas ai?", &[], &transcript).await,
             LiveTurn::NotWritten
         ));
     }
@@ -4484,7 +4557,7 @@ mod tests {
     /// whatever the first attempt had already done.
     #[tokio::test]
     async fn a_process_that_dies_mid_turn_is_told_apart_from_one_that_never_heard() {
-        let (mut live, said, events) = live_chat_for_testing();
+        let (mut live, said, events, _why) = live_chat_for_testing();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
         events
@@ -4493,8 +4566,8 @@ mod tests {
         drop(events);
 
         assert!(matches!(
-            live.turn("faz isso", &transcript).await,
-            LiveTurn::DiedMidTurn
+            live.turn("faz isso", &[], &transcript).await,
+            LiveTurn::DiedMidTurn(_)
         ));
         // It really was written — which is the whole reason this case may not be retried.
         drop(said);
@@ -4509,11 +4582,15 @@ mod tests {
     /// some other task happened to have run yet.
     fn live_chat_for_testing() -> (
         LiveChat,
-        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::runner::LaterTurn>,
         tokio::sync::mpsc::UnboundedSender<crate::runner::TurnEvent>,
+        tokio::sync::watch::Sender<Option<String>>,
     ) {
-        let (messages, said) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (messages, said) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        // The supervisor's voice: in a real one this is the task that owns the process saying why it
+        // stopped, and here it is whatever the test wants said.
+        let (why_stopped, stopped_because) = tokio::sync::watch::channel(None);
         (
             LiveChat {
                 messages,
@@ -4521,11 +4598,13 @@ mod tests {
                 session_id: std::sync::Arc::new(std::sync::Mutex::new(Some("s-1".to_owned()))),
                 // Nothing to stop, but the field is what stops a real one, so it is not optional.
                 abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                stopped_because,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
             },
             said,
             events_tx,
+            why_stopped,
         )
     }
 
@@ -4561,7 +4640,7 @@ mod tests {
     /// ended, which is the only signal there is that the process behind it is gone.
     #[tokio::test]
     async fn a_process_that_ended_is_not_kept_as_a_handle_to_nothing() {
-        let (live, said, _events) = live_chat_for_testing();
+        let (live, said, _events, _why) = live_chat_for_testing();
         LIVE_CHATS
             .lock()
             .unwrap()
@@ -4582,7 +4661,7 @@ mod tests {
     /// waiting on, and a desktop app is the wrong place to spend the memory.
     #[tokio::test]
     async fn a_process_nobody_came_back_to_is_stopped() {
-        let (mut live, _said, _events) = live_chat_for_testing();
+        let (mut live, _said, _events, _why) = live_chat_for_testing();
         live.idle_since = std::time::Instant::now()
             .checked_sub(LIVE_IDLE * 2)
             .expect("a machine that has been up two minutes");
@@ -4600,7 +4679,7 @@ mod tests {
     /// taking away the thing it exists to protect.
     #[tokio::test]
     async fn a_process_still_standing_and_still_recent_is_left_alone() {
-        let (live, _said, _events) = live_chat_for_testing();
+        let (live, _said, _events, _why) = live_chat_for_testing();
         LIVE_CHATS
             .lock()
             .unwrap()
@@ -4953,6 +5032,171 @@ mod tests {
             model: Some("sonnet".to_owned()),
             allowed_mcp_tools: None,
         }
+    }
+
+    /// A picture on a later turn goes down the process that is already standing.
+    ///
+    /// It used to start a new one. The channel a later turn arrives on carried a `String`, and the
+    /// steering task wrote it with no attachments — so a conversation keeping its process had to
+    /// give it up the moment somebody pasted a screenshot, which is exactly when a coding
+    /// conversation is most alive and the start-up costs most.
+    ///
+    /// The old comment was true when it was written: the channel existed only for the queue drain,
+    /// where a later turn really was text somebody typed while waiting. A conversation that keeps
+    /// its process made every turn after the first a later turn.
+    #[tokio::test]
+    async fn a_picture_on_a_later_turn_goes_down_the_process_that_is_already_standing() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "picture-again").await;
+
+        let first = send_message(&state, "picture-again", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        let images = vec![crate::runner::Attachment {
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }];
+        let second = send_message_with(&state, "picture-again", "e isto?", &images, Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            1,
+            "the picture made the conversation give up its process"
+        );
+        let later = fake.later_turns.lock().unwrap().clone();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].text, "e isto?");
+        assert_eq!(later[0].images.len(), 1, "the picture did not travel");
+        assert_eq!(later[0].images[0].data, "aGVsbG8=");
+    }
+
+    /// Dropping a conversation's `LiveChat` stops the process behind it.
+    ///
+    /// The mechanism the whole lifetime rests on. Closing stdin would let a process finish whatever
+    /// turn it is on first — measured, and not a way to interrupt one — so the handle carries an
+    /// abort and `Drop` is where it is used. Everything else is arranged so that dropping happens:
+    /// a turn holds the only handle while it runs, and hands it back only on the way out.
+    #[tokio::test]
+    async fn dropping_a_conversations_handle_stops_the_process_behind_it() {
+        // Built here rather than adapted from the helper: a type with a `Drop` cannot be moved out
+        // of, which is the same property being tested.
+        let (messages, _said) = tokio::sync::mpsc::unbounded_channel();
+        let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let running = tokio::spawn(std::future::pending::<()>());
+        let live = LiveChat {
+            messages,
+            events,
+            session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            abort: running.abort_handle(),
+            stopped_because: tokio::sync::watch::channel(None).1,
+            cwd: None,
+            idle_since: std::time::Instant::now(),
+        };
+
+        drop(live);
+
+        // A task that would otherwise never finish, finishing — which is only true if it was
+        // aborted. Bounded, because the failure here is a task that never ends: without the clock a
+        // broken `Drop` would hang this test instead of failing it, and a suite that hangs says
+        // less than one that fails.
+        let stopped = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("dropping the handle must stop the process, not leave it running");
+        assert!(stopped.unwrap_err().is_cancelled());
+    }
+
+    /// Cancelling a turn takes its conversation's process with it.
+    ///
+    /// A cancelled turn is one somebody stopped, and the process answering it is mid-answer. Left
+    /// standing it would go on working for a turn nobody is waiting for, and the NEXT turn would
+    /// find its leftovers where its own answer should be — a conversation quietly answered by the
+    /// one before it.
+    ///
+    /// The double here does not end when its stdin closes, which is what makes this observable: a
+    /// real CLI told no more turns are coming finishes the one it is on first, so "the process
+    /// stopped" and "the process was allowed to finish" would otherwise look identical from outside.
+    #[tokio::test]
+    async fn cancelling_a_turn_takes_the_conversations_process_with_it() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "stopped-chat").await;
+
+        let first = send_message(&state, "stopped-chat", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        assert!(LIVE_CHATS.lock().unwrap().contains_key("stopped-chat"));
+
+        // From here the process takes its time, so the second turn can be caught in flight.
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let second = send_message(&state, "stopped-chat", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        // Waited on the turn having TAKEN the process, which is the entry leaving the registry —
+        // not on its task existing. `spawn_registered` inserts the handle before the body runs, so
+        // cancelling on that signal races the turn to the process and usually wins, which proves
+        // nothing: a cancel that lands before a turn picks the process up has no process to stop.
+        for _ in 0..200 {
+            if !LIVE_CHATS.lock().unwrap().contains_key("stopped-chat") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        crate::runs::cancel_run(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(second),
+        )
+        .await;
+        settled_turn(&state.pool, second).await;
+
+        assert!(
+            !LIVE_CHATS.lock().unwrap().contains_key("stopped-chat"),
+            "a cancelled turn left its process where the next one would find it"
+        );
+        for _ in 0..200 {
+            if *fake.stopped_early.lock().unwrap() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            *fake.stopped_early.lock().unwrap(),
+            "the process was left running for a turn nobody is waiting for"
+        );
+    }
+
+    /// A process that dies mid-turn says WHY, in the conversation rather than only in a log.
+    ///
+    /// The case that actually happens is the tool-policy barrier: the runner kills a CLI whose
+    /// `init` advertised tools its policy forbids, and the message it leaves names them. A turn cut
+    /// off by that showed "the conversation's process ended in the middle of this turn" and the one
+    /// useful fact went somewhere only whoever reads the daemon's log can see.
+    #[tokio::test]
+    async fn a_process_that_dies_mid_turn_says_why() {
+        let (mut live, said, events, why) = live_chat_for_testing();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+        // What the supervisor does when the runner hands it back a process that stopped badly.
+        why.send(Some("advertised Bash under McpOnly".to_owned()))
+            .unwrap();
+        drop(events);
+
+        let LiveTurn::DiedMidTurn(reason) = live.turn("faz isso", &[], &transcript).await else {
+            panic!("a process that never answered must not report a turn");
+        };
+
+        assert_eq!(reason.as_deref(), Some("advertised Bash under McpOnly"));
+        // It really was written, which is what makes this the case that may not be retried.
+        drop(said);
     }
 
     /// A conversation with no tools keeps no process, and the reason is not caution.

@@ -179,7 +179,7 @@ pub struct RunRequest {
     /// `None` beside `steerable: true` is a real state, not an oversight: the prompt still travels
     /// stdin as a `user` line, and stdin then closes, which is exactly the one-turn run the argv path
     /// performs. What it costs is the ability to say anything more.
-    pub messages: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    pub messages: Option<tokio::sync::mpsc::UnboundedReceiver<LaterTurn>>,
     /// Whether this run opts in to the operator's ambient MCP surface.
     ///
     /// `false` everywhere today, and that is the point: the strict default closes the exfiltration
@@ -221,6 +221,21 @@ pub struct RunRequest {
 pub struct Attachment {
     pub media_type: String,
     pub data: String,
+}
+
+/// A turn arriving after the one a run was launched with.
+///
+/// Text AND pictures, because for a conversation that keeps its process every turn after the first
+/// is one of these — and a screenshot pasted into the second is the same kind of thing as one
+/// attached to the first. It was a bare `String` while this channel existed only for the queue
+/// drain, where a later turn really was text somebody typed while waiting; a conversation that keeps
+/// its CLI had to give the CLI up the moment anybody pasted an image, which is exactly when a coding
+/// conversation is most alive.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LaterTurn {
+    pub text: String,
+    /// Empty for almost every turn, and the reason this is a struct rather than a `String`.
+    pub images: Vec<Attachment>,
 }
 
 /// One line of `--input-format stream-json` stdin: a single user turn.
@@ -1725,11 +1740,12 @@ impl CommandRunner for ClaudeCliRunner {
                 let Some(messages) = messages.as_mut() else {
                     return;
                 };
-                while let Some(text) = messages.recv().await {
+                while let Some(turn) = messages.recv().await {
+                    // Its own pictures, not none. The opening turn is no longer the only one
+                    // anybody attaches anything to: a conversation that keeps its process makes
+                    // every turn after the first arrive here.
                     if stdin
-                        // A later turn carries no pictures: they belong to the opening one, which
-                        // is the only turn anybody attaches anything to.
-                        .write_all(user_message_line(&text, &[]).as_bytes())
+                        .write_all(user_message_line(&turn.text, &turn.images).as_bytes())
                         .await
                         .is_err()
                     {
@@ -2335,6 +2351,18 @@ pub struct FakeCommandRunner {
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
     pub calls: std::sync::Mutex<u32>,
+    /// Test-only: whether a living process was STOPPED rather than allowed to end.
+    ///
+    /// Set by a guard the fake's own future holds, and disarmed just before that future returns —
+    /// so it says "this was dropped mid-flight" and not merely "this finished". Nothing else can
+    /// tell those apart from outside, and the difference is the whole of what a cancel has to do.
+    pub stopped_early: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// Test-only: the turns written to a living process's stdin after the one it was launched with.
+    ///
+    /// Recorded because a later turn's pictures can only be observed here: they travel down a
+    /// channel into a task that writes them to a pipe, and a run given them and not steerable drops
+    /// them without a word.
+    pub later_turns: std::sync::Mutex<Vec<LaterTurn>>,
     /// Test-only: the queue a plan node writes, taken by the first call that is given a handoff
     /// directory.
     ///
@@ -2378,6 +2406,23 @@ impl CommandRunner for FakeCommandRunner {
             return Ok(outcome);
         };
 
+        /// Records that the future holding it was dropped before it finished.
+        struct Stopped {
+            flag: std::sync::Arc<std::sync::Mutex<bool>>,
+            armed: bool,
+        }
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                if self.armed {
+                    *self.flag.lock().unwrap() = true;
+                }
+            }
+        }
+        let mut stopped = Stopped {
+            flag: std::sync::Arc::clone(&self.stopped_early),
+            armed: true,
+        };
+
         let answer = |stdout: &str| {
             let mut splitter = TurnSplitter::new();
             for line in stdout.lines() {
@@ -2391,10 +2436,19 @@ impl CommandRunner for FakeCommandRunner {
         if let Some(later) = later.as_mut() {
             // Stays alive until its stdin closes, exactly as the process does — which is what makes
             // a test of "the second turn reused the process" mean anything.
-            while later.recv().await.is_some() {
+            while let Some(turn) = later.recv().await {
+                self.later_turns.lock().unwrap().push(turn);
+                // A process that does not answer instantly, so a test can catch a turn in flight.
+                // The delay is the same knob a hung one-shot run uses.
+                let waiting = *self.delay.lock().unwrap();
+                if let Some(waiting) = waiting {
+                    tokio::time::sleep(waiting).await;
+                }
                 answer(&outcome.stdout);
             }
         }
+        // Reached only by ending on its own, which is what makes the flag mean "stopped".
+        stopped.armed = false;
         Ok(outcome)
     }
 
@@ -2833,7 +2887,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "spawns the real Claude CLI and spends money; run with --include-ignored"]
     async fn a_real_cli_answers_a_second_turn_down_the_same_stdin() {
-        let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
         let (turn_events, mut events) = tokio::sync::mpsc::unbounded_channel();
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -2869,7 +2923,10 @@ mod tests {
                 // The second turn, written while the process that answered the first is still
                 // standing. This is the line the whole feature is about.
                 messages
-                    .send("Reply with the single word two.".to_owned())
+                    .send(LaterTurn {
+                        text: "Reply with the single word two.".to_owned(),
+                        images: Vec::new(),
+                    })
                     .unwrap();
             } else {
                 break;
