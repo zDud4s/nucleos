@@ -531,8 +531,11 @@ impl NucleosTools {
                        `state` may say `focused`, which is where a `press` with no ref would \
                        land. If `unread` is there the page shows something the accessibility \
                        tree cannot carry - a canvas, a video, an undescribed drawing: the page \
-                       is NOT empty, you simply cannot read that part, so say so or ask a person \
-                       rather than concluding what you were sent for is absent. \
+                       is NOT empty, and this reading is not the whole of it. browser_look is \
+                       what shows you that part: use it when what you were sent for might be \
+                       in there, and ask a person only if the picture does not answer either. \
+                       Never conclude the thing is absent from a reading that told you it was \
+                       incomplete. \
                        If `still_loading` is there the page had not finished arriving \
                        when this was read: take another snapshot rather than concluding \
                        anything from what is missing. \
@@ -624,7 +627,24 @@ impl NucleosTools {
     }
 
     #[tool(
-        description = "Look at the page: a picture of what is on screen, with your own refs                        drawn on it as labels. The number on a label IS the ref, so acting on                        what you see is browser_act with that ref - there is no clicking by                        coordinate here and there is not going to be.                        WHEN: when a snapshot is not enough to tell you what to act on. A chart,                        a canvas, a map, an icon whose label is a picture, a layout where the                        reading is ambiguous about which of three buttons is the one. Also when                        the snapshot reports `unread` - parts of the page it could not put into                        words.                        COST: an order of magnitude more than browser_snapshot, every time.                        Read first, look only when the reading fell short, and act from the                        reading afterwards.                        Only what is ON SCREEN is drawn and only what is on screen is labelled:                        scroll first to see further down. A ref the session knows but that is                        scrolled out of view gets no label, and `labels` lists the ones that were                        actually drawn.                        Nothing here is labelled unless a snapshot showed it first: on a page you                        have not read, this is a picture with no labels on it."
+        description = "Look at the page: a picture of what is on screen, with your own refs \
+                       drawn on it as labels. The number on a label IS the ref, so acting on what \
+                       you see is browser_act with that ref - there is no clicking by coordinate \
+                       here and there is not going to be. \
+                       WHEN: when a snapshot is not enough to tell you what to act on. A chart, a \
+                       canvas, a map, an icon whose label is a picture, a layout where the reading \
+                       is ambiguous about which of three buttons is the one. Also when the \
+                       snapshot reports `unread` - the parts of the page it could not put into \
+                       words are exactly what this shows you. \
+                       COST: an order of magnitude more than browser_snapshot, every time. Read \
+                       first, look only when the reading fell short, and act from the reading \
+                       afterwards. \
+                       Only what is ON SCREEN is drawn and only what is on screen is labelled: \
+                       scroll first to see further down. A ref the session knows but that is \
+                       scrolled out of view gets no label, and `labels` lists the ones that were \
+                       actually drawn. \
+                       Nothing here is labelled unless a snapshot showed it first: on a page you \
+                       have not read, this is a picture with no labels on it."
     )]
     async fn browser_look(
         &self,
@@ -2314,6 +2334,49 @@ mod tests {
              not match"
         );
     }
+
+    /// Every tool description, read as the model receives it rather than as the source looks.
+    ///
+    /// **This exists because the same mistake was made twice in one afternoon and nothing noticed.**
+    /// A description is written across many source lines joined by a trailing backslash, which Rust
+    /// splices by dropping the newline AND the indentation after it. Lose the backslash and the
+    /// indentation stays: the model is handed a sentence with twenty-four spaces in the middle of
+    /// it, which costs tokens, reads as damage, and is invisible in a diff because the source still
+    /// looks like a paragraph.
+    ///
+    /// The other half is the literal two characters backslash-n, which is what a generator that
+    /// escaped one time too many leaves behind. It renders as `\n` in the middle of a sentence.
+    ///
+    /// Asked of the ROUTER, so a description added tomorrow is covered without anybody remembering
+    /// this test exists. That is the same reason `every_registered_tool_is_classified` reads the
+    /// router rather than a list.
+    #[test]
+    fn no_tool_description_carries_the_marks_of_a_botched_line_join() {
+        for tool in NucleosTools::tool_router().list_all() {
+            let said = tool.description.clone().unwrap_or_default();
+            assert!(
+                !said.is_empty(),
+                "{} has no description, which is the one thing the model reads before choosing it",
+                tool.name
+            );
+            assert!(
+                !said.contains("   "),
+                "{}'s description carries a run of spaces where a line join was lost; the model is \
+                 shown the indentation of this file: {said}",
+                tool.name
+            );
+            assert!(
+                !said.contains(BACKSLASH_N),
+                "{}'s description carries a literal backslash-n, which renders as two characters in \
+                 the middle of a sentence: {said}",
+                tool.name
+            );
+        }
+    }
+
+    /// The two characters a generator leaves when it escapes once too often. Written this way
+    /// because a test for the literal cannot spell it as an escape without becoming a newline.
+    const BACKSLASH_N: &str = "\\n";
 
     /// The legend and the fence have to name the SAME value, and nothing else holds them together.
     ///
