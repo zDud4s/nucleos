@@ -4354,8 +4354,16 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let root = container.path().join("repo");
         crate::git_exec::tests::initialize_repo(&root);
         let trees = crate::git_exec::tests::space_free_tempdir("nucleos-item-trees-");
-        // SAFETY: single-threaded test, and the value is read by `worktree_root` on this task only.
-        unsafe { std::env::set_var("NUCLEOS_WORKTREE_ROOT", trees.path()) };
+        // Through the guard, and never a bare `set_var`. This used to be one, under a comment
+        // claiming the value was "read by `worktree_root` on this task only" — which is not what
+        // an environment variable is. It was never restored, so every test that ran afterwards and
+        // provisioned a worktree WITHOUT setting a root of its own inherited this one: `worktree_root`
+        // returns the variable verbatim and only falls back to a sibling of the project root when it
+        // is unset. They then shared a root that had already been deleted with this test's
+        // `TempDir`, and two of them creating a job with the same id collided on `nucleos/job-<id>`
+        // — a failure that reads as a bug in worktree adoption, arrives about once in a dozen full
+        // runs depending on which order the thread pool picked, and is neither.
+        let _trees_env = WorktreeRootEnv::set(trees.path());
 
         let job_id = crate::job::insert_job(
             &state.pool,
