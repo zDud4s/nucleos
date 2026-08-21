@@ -1134,12 +1134,51 @@ pub async fn post_act(
     }
 }
 
+/// `POST /browser/look` — the annotated picture, for the agent.
+///
+/// Refused while a person has the wheel, and this is the sharpest of the wheel refusals. The reason
+/// the wheel is handed over is almost always a login, so what is on that screen is a password field
+/// with somebody's fingers on it — and a look is precisely the verb that would carry it to a model.
+/// The sidecar's `Human` driver refuses it too; neither layer is redundant, for the reason
+/// [`post_act`] gives about the two processes disagreeing over who is driving.
+///
+/// The refusal is shaped like a fence refusal rather than an error, so an agent reads it with the
+/// vocabulary it already has.
+pub async fn post_look(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SessionBody>,
+) -> axum::response::Response {
+    let Some(row) = live_session(&state, body.session_id).await else {
+        return gone();
+    };
+    if row.mode != mode::AGENT {
+        return axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "wheel-requested",
+                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
+            },
+        }))
+        .into_response();
+    }
+    match state.browser.client.look(&row.sidecar_id).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => browser_error(error),
+    }
+}
+
 /// `POST /browser/screenshot` — pixels, for a person to look at.
 ///
-/// It answers to the shell and not to the agent. Spec §3.5 records why: `filter_outgoing` in
-/// `mcp_tools.rs` redacts text and has never had an image branch, so a screenshot of the owner's
-/// authenticated session handed to a model would leave the machine without passing the redaction
-/// every other answer goes through.
+/// It answers the SHELL, and `/browser/look` above answers the agent. The two are separate routes
+/// rather than one with a flag because they differ in everything that follows from the audience: this
+/// one is a full-page PNG of whatever is there, unlabelled and unbounded, and it is read by a window
+/// a person is looking at.
+///
+/// This comment used to say the agent could not be shown pixels at all, because `filter_outgoing` in
+/// `mcp_tools.rs` redacts text and has no image branch. That reason has not gone away — it is now a
+/// price paid on purpose and written down at the branch itself, where somebody deciding whether to
+/// widen it will actually be standing. What keeps it bounded is that a look is viewport-only, drawn
+/// on a page the fence admitted, and refused outright once a person has the wheel.
 pub async fn post_screenshot(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<SessionBody>,

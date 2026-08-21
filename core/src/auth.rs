@@ -757,6 +757,7 @@ mod tests {
             // classifier, which is the shape of a test that stops noticing.
             .route("/browser/open", post(|| async {}))
             .route("/browser/act", post(|| async {}))
+            .route("/browser/look", post(|| async {}))
             .route("/browser/revoke", post(|| async {}))
             .route("/browser/forget", post(|| async {}))
             .route("/browser/handoff", post(|| async {}))
@@ -1330,6 +1331,7 @@ mod tests {
             // sessions currently open in their name.
             ("POST", "/browser/open"),
             ("POST", "/browser/act"),
+            ("POST", "/browser/look"),
             ("POST", "/browser/revoke"),
             // The wheel. `/keep` is the one that grows the allowlist, and a read-only key reaching
             // it would be a read-only key granting a host permanent access to the profile that

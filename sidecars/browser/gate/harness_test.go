@@ -453,6 +453,31 @@ func newSite(t *testing.T) *site {
 		fmt.Fprint(w, PAGE_CANVAS)
 	})
 
+	// The two halves of the look-at-a-cross-site-frame measurement, and they are laid out with
+	// absolute coordinates on purpose: the assertion is about WHERE a label lands, so the test has to
+	// know where the thing being labelled is without asking the browser — asking would mean asking
+	// the same process boundary the measurement is about.
+	mux.HandleFunc("/lookframe", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, PAGE_LOOKFRAME, r.URL.Query().Get("src"))
+	})
+	mux.HandleFunc("/lookbutton", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_LOOKBUTTON)
+	})
+
+	// A page that can be asked, from inside itself, whether the look left anything behind. The
+	// question has to be answered by the DOM rather than by a snapshot, because the overlay is
+	// aria-hidden — so a snapshot would report a clean page whether or not one was still there,
+	// which is exactly the failure that would go unnoticed.
+	mux.HandleFunc("/lookclean", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_LOOKCLEAN)
+	})
+
 	// An endless list: scrolling is what loads more, which is the case that made excluding scroll
 	// from the wait wrong. Two steps for the same reason as /click-render — the first inside the
 	// reaction window, the last well outside it.
@@ -1066,3 +1091,21 @@ const PAGE_ENDLESS = `<!doctype html><title>endless</title><body>
 		});
 	});
 	</script>`
+
+// PAGE_LOOKFRAME puts a cross-site frame at a known place. margin:0 and border:0 so the numbers in
+// the test are the numbers here, with nothing of the browser's own styling in between.
+const PAGE_LOOKFRAME = `<!doctype html><title>lookframe</title>
+	<style>html,body{margin:0;padding:0;background:#ffffff}</style>
+	<body><iframe src=%q style="position:absolute;left:200px;top:150px;width:300px;height:200px;border:0"></iframe>`
+
+// PAGE_LOOKBUTTON is what goes inside it: one button, at a known offset within its own document.
+const PAGE_LOOKBUTTON = `<!doctype html><title>lookbutton</title>
+	<style>html,body{margin:0;padding:0;background:#ffffff}</style>
+	<body><button style="position:absolute;left:20px;top:30px;width:100px;height:40px">Go</button>`
+
+// PAGE_LOOKCLEAN reports its own DOM when the button is pressed, so the test can ask the page
+// whether the overlay is still there instead of inferring it from a reading that cannot see one.
+const PAGE_LOOKCLEAN = `<!doctype html><title>lookclean</title><body>
+	<h1>Clean</h1>
+	<p id=out>nobody has asked yet</p>
+	<button onclick="out.textContent = 'overlay is ' + (document.getElementById('nucleos-look-overlay') ? 'still here' : 'gone')">Ask</button>`

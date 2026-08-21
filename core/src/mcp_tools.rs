@@ -624,6 +624,54 @@ impl NucleosTools {
     }
 
     #[tool(
+        description = "Look at the page: a picture of what is on screen, with your own refs                        drawn on it as labels. The number on a label IS the ref, so acting on                        what you see is browser_act with that ref - there is no clicking by                        coordinate here and there is not going to be.                        WHEN: when a snapshot is not enough to tell you what to act on. A chart,                        a canvas, a map, an icon whose label is a picture, a layout where the                        reading is ambiguous about which of three buttons is the one. Also when                        the snapshot reports `unread` - parts of the page it could not put into                        words.                        COST: an order of magnitude more than browser_snapshot, every time.                        Read first, look only when the reading fell short, and act from the                        reading afterwards.                        Only what is ON SCREEN is drawn and only what is on screen is labelled:                        scroll first to see further down. A ref the session knows but that is                        scrolled out of view gets no label, and `labels` lists the ones that were                        actually drawn.                        Nothing here is labelled unless a snapshot showed it first: on a page you                        have not read, this is a picture with no labels on it."
+    )]
+    async fn browser_look(
+        &self,
+        Parameters(BrowserSessionParams { session_id }): Parameters<BrowserSessionParams>,
+    ) -> rmcp::model::CallToolResult {
+        let answer = match self.client.browser_look(session_id).await {
+            Ok(answer) => answer,
+            Err(message) => {
+                return rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                    error_json(message),
+                )]);
+            }
+        };
+        // A refusal comes back in the fence's vocabulary rather than as an image, and is passed
+        // through as the text it is — `browser_act` answers refusals the same way, so an agent
+        // reading one here needs no second vocabulary for the same event.
+        let Some(image) = answer.get("image").and_then(serde_json::Value::as_str) else {
+            return rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                answer.to_string(),
+            )]);
+        };
+        let mime = answer
+            .get("mime")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("image/jpeg");
+        let labels = answer
+            .get("labels")
+            .cloned()
+            .unwrap_or(serde_json::json!([]));
+        // Two blocks and in this order: the words first, so that what the model reads before the
+        // picture is the daemon's account of what is in it — how many labels there are, and that
+        // they are refs. `filter_outgoing` fences the text half of this result and cannot fence the
+        // image half; see the image arm there for what that costs and why it is paid.
+        rmcp::model::CallToolResult::success(vec![
+            rmcp::model::ContentBlock::text(
+                serde_json::json!({
+                    "labels": labels,
+                    "width": answer.get("width").cloned().unwrap_or(serde_json::json!(0)),
+                    "height": answer.get("height").cloned().unwrap_or(serde_json::json!(0)),
+                })
+                .to_string(),
+            ),
+            rmcp::model::ContentBlock::image(image, mime),
+        ])
+    }
+
+    #[tool(
         description = "Ask a person to take over this browsing session — for a login, a captcha, a \
                        consent screen, anything you are not allowed to do. This does NOT hand \
                        anything over: it raises a request the person may accept or refuse, and \
@@ -980,11 +1028,36 @@ fn filter_outgoing(
 ) -> rmcp::model::CallToolResult {
     let stranger = tool_effect(called) == ToolEffect::ReadsUntrusted;
     for block in &mut result.content {
-        if let rmcp::model::ContentBlock::Text(text) = block {
-            text.text = redact_rendered(&text.text);
-            if stranger {
-                text.text = fence_untrusted(&text.text);
+        match block {
+            rmcp::model::ContentBlock::Text(text) => {
+                text.text = redact_rendered(&text.text);
+                if stranger {
+                    text.text = fence_untrusted(&text.text);
+                }
             }
+            // **An image crosses untouched, and this arm exists to make that a decision somebody
+            // took rather than a case that fell off the end of a `match`.** It was the latter until
+            // `browser_look` was written; nothing here had ever produced an image, so the silence
+            // cost nothing and said nothing either.
+            //
+            // The price, stated plainly: everything above this arm is a TEXT detector. An API key
+            // drawn on a canvas, a token rendered into a chart, a password visible in a screenshot
+            // of a page — none of them are scanned, because there is nothing here that could scan
+            // them. There is no argument that makes this safe in general, and pretending otherwise
+            // by adding OCR would be a filter whose failures are invisible and whose successes
+            // nobody can enumerate.
+            //
+            // What bounds it instead is everything upstream, and it is worth naming because it is
+            // the actual containment rather than a consolation: a picture only exists for a page
+            // the profile's site list admitted, the list grows only when a person finishes a login
+            // and keeps the chain, the picture is the VIEWPORT and not the document, and a session
+            // a person has taken the wheel of refuses to be looked at at all — which is the case
+            // that would otherwise photograph a password field mid-login.
+            //
+            // Anyone widening what may return an image should widen it here first, and should be
+            // able to say which of those four bounds still holds afterwards.
+            rmcp::model::ContentBlock::Image(_) => {}
+            _ => {}
         }
     }
     if let Some(structured) = &mut result.structured_content {
@@ -1348,6 +1421,7 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("browser_act", ToolEffect::ReadsUntrusted),
     ("browser_close", ToolEffect::ReadsOwn),
     ("browser_handoff", ToolEffect::ReadsUntrusted),
+    ("browser_look", ToolEffect::ReadsUntrusted),
     ("browser_open", ToolEffect::ReadsUntrusted),
     ("browser_snapshot", ToolEffect::ReadsUntrusted),
     ("cancel_run", ToolEffect::Acts),
@@ -2155,6 +2229,47 @@ mod tests {
         );
     }
 
+    /// A look's two halves, and what the filter does to each.
+    ///
+    /// The text is fenced like any other untrusted read; the picture crosses byte for byte, because
+    /// nothing here can read a picture. That is the price named at the image arm, and this is what
+    /// makes it a measured price rather than a claim — if someone later adds an image filter, or
+    /// removes the arm and lets the block fall through some other way, this says which of the two
+    /// happened.
+    ///
+    /// The base64 in the fixture is deliberately something the TEXT detectors would react to: an
+    /// `AKIA`-prefixed string is an AWS key by `redact_secrets`, so a filter that treated the image
+    /// payload as text would visibly eat it. It crosses, which is the honest answer and the whole
+    /// point of the arm.
+    #[test]
+    fn a_look_is_fenced_in_its_words_and_untouched_in_its_pixels() {
+        let drawn = "AKIAIOSFODNN7EXAMPLE";
+        let result = rmcp::model::CallToolResult::success(vec![
+            rmcp::model::ContentBlock::text(r#"{"labels":["e1","e3"]}"#.to_owned()),
+            rmcp::model::ContentBlock::image(drawn.to_owned(), "image/jpeg"),
+        ]);
+
+        let filtered = filter_outgoing("browser_look", result);
+
+        let rmcp::model::ContentBlock::Text(text) = &filtered.content[0] else {
+            panic!("the text block is gone");
+        };
+        assert!(
+            text.text
+                .starts_with(&format!("<<<untrusted:{}>>>", boundary_nonce())),
+            "the words that came with the picture are not delimited: {}",
+            text.text
+        );
+        let rmcp::model::ContentBlock::Image(image) = &filtered.content[1] else {
+            panic!("the image block is gone, so a look now answers with no picture");
+        };
+        assert_eq!(
+            image.data, drawn,
+            "the picture was altered on its way out; there is no image filter here and an image              that changed means one was added without the arm above being rewritten"
+        );
+        assert_eq!(image.mime_type, "image/jpeg");
+    }
+
     /// The control, and it is the half the asymmetry rests on.
     ///
     /// Redaction is NOT keyed on `TOOL_EFFECTS` and the boundary IS, which reads like an
@@ -2208,6 +2323,7 @@ mod tests {
                 "browser_act",
                 "browser_close",
                 "browser_handoff",
+                "browser_look",
                 "browser_open",
                 "browser_snapshot",
                 "cancel_run",
@@ -2303,9 +2419,15 @@ mod tests {
             );
         }
 
-        // And the browser set is exactly five, pinned by name. A forbidden-list alone cannot catch
-        // the tool nobody thought to forbid, and this is the surface where a sixth verb is the
+        // And the browser set is exactly six, pinned by name. A forbidden-list alone cannot catch
+        // the tool nobody thought to forbid, and this is the surface where one more verb is the
         // difference between "the agent looked" and "the agent did something on your account".
+        //
+        // It was five until `browser_look` was added, and the sixth is worth its own sentence
+        // because it is the one that does NOT fit the shape of the other five: it returns pixels,
+        // and pixels are the one carrier `filter_outgoing` cannot inspect. It earns its place by
+        // reading and nothing else — it has no argument but the session, it cannot be aimed at a
+        // coordinate, and the numbers it draws are refs a snapshot already handed out.
         let mut browsing: Vec<&str> = names
             .iter()
             .map(String::as_str)
@@ -2318,15 +2440,17 @@ mod tests {
                 "browser_act",
                 "browser_close",
                 "browser_handoff",
+                "browser_look",
                 "browser_open",
                 "browser_snapshot",
             ],
             "the browser surface changed; spec §6.1a classifies exactly these"
         );
-        // `browser_screenshot` is a ROUTE and not a tool, and its absence is deliberate:
-        // `filter_outgoing` redacts text and has never had an image branch, so a screenshot of the
-        // owner's authenticated session handed to a model would leave this machine without passing
-        // the redaction every other answer goes through.
+        // `browser_screenshot` is a ROUTE and not a tool, and its absence stays deliberate even
+        // now that a tool DOES return an image. The two are not the same picture: a screenshot is
+        // the whole document, unlabelled, taken of any session including one a person has the wheel
+        // of — which is a login screen. A look is the viewport, labelled with refs, and refused
+        // outright the moment the wheel is asked for.
         assert!(!names.iter().any(|name| name == "browser_screenshot"));
     }
 

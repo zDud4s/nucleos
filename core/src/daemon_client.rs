@@ -308,10 +308,14 @@ impl DaemonClient {
     // gets a throwaway of its own rather than sharing its run's, so a run that opens three pages
     // gets three browsers.
     //
-    // **No `browser_screenshot`.** It exists as a route and answers the shell. `filter_outgoing` in
-    // `mcp_tools.rs` redacts text and has never had an image branch, so a screenshot of the owner's
-    // authenticated session handed to a model would leave this machine without passing the redaction
-    // every other answer goes through. Spec §6.1a lists six tools; this is five, deliberately.
+    // **No `browser_screenshot`, and `browser_look` is not it.** The screenshot route answers the
+    // shell: a full-page PNG of whatever is there, for a person's window. What the agent gets is a
+    // LOOK — viewport only, labelled with its own refs, and refused outright once a person has the
+    // wheel. Two routes rather than one with a flag, because the audience decides everything else.
+    //
+    // The reason there was no picture at all still stands and is now a price paid on purpose:
+    // `filter_outgoing` in `mcp_tools.rs` redacts TEXT, so a key drawn on a canvas crosses it. The
+    // argument, and the containment, are written at the image branch itself.
     //
     // **No `browser_grant`, and no route to write one against.** The site list grows when a person
     // finishes a login and keeps the chain, and by no other means (spec §5.2).
@@ -433,6 +437,18 @@ impl DaemonClient {
                 "ref": element_ref,
                 "text": text.unwrap_or_default(),
             }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The annotated picture. Answers with `image`, `mime` and the `labels` drawn on it.
+    pub async fn browser_look(&self, session_id: i64) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/browser/look")
+            .json(&serde_json::json!({ "session_id": session_id }))
             .send()
             .await
             .map_err(|e| e.to_string())?

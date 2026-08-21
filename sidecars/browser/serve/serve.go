@@ -40,6 +40,7 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	mux.HandleFunc("/snapshot", authorized(cfg.DaemonToken, snapshotHandler(driver)))
 	mux.HandleFunc("/act", authorized(cfg.DaemonToken, actHandler(driver)))
 	mux.HandleFunc("/screenshot", authorized(cfg.DaemonToken, screenshotHandler(driver)))
+	mux.HandleFunc("/look", authorized(cfg.DaemonToken, lookHandler(driver)))
 	mux.HandleFunc("/handoff", authorized(cfg.DaemonToken, handoffHandler(driver)))
 	mux.HandleFunc("/close", authorized(cfg.DaemonToken, closeHandler(driver)))
 
@@ -225,6 +226,31 @@ func screenshotHandler(driver browser.Driver) http.HandlerFunc {
 		if _, err := w.Write(image); err != nil {
 			log.Printf("writing screenshot: %v", err)
 		}
+	}
+}
+
+// lookHandler answers the AGENT's picture, and answers it as JSON rather than as image bytes.
+//
+// The difference from /screenshot beside it is not a style choice. That one hands a person's window
+// a PNG and has nothing else to say; this one carries the labels as well, and the labels are the
+// half that makes the picture actionable — an image body with the refs in a header would be the same
+// answer split across two places, one of which nothing else in this sidecar uses.
+func lookHandler(driver browser.Driver) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request SessionRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		if request.SessionID == "" {
+			http.Error(w, "session_id is required", http.StatusBadRequest)
+			return
+		}
+		result, err := driver.Look(r.Context(), browser.SessionID(request.SessionID))
+		if err != nil {
+			writeDriverError(w, "look", err)
+			return
+		}
+		writeJSON(w, result)
 	}
 }
 

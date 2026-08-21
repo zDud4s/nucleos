@@ -372,6 +372,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser/snapshot", post(crate::browser::post_snapshot))
         .route("/browser/act", post(crate::browser::post_act))
         .route("/browser/screenshot", post(crate::browser::post_screenshot))
+        // The agent's picture, beside the person's. Two routes and not one flag, because the two
+        // differ in audience and therefore in everything: what is drawn on it, what it costs, and
+        // which one a session with a person at the wheel refuses.
+        .route("/browser/look", post(crate::browser::post_look))
         .route("/browser/close", post(crate::browser::post_close))
         .route("/browser/revoke", post(crate::browser::post_revoke))
         .route("/browser/readonly", post(crate::browser::post_readonly))

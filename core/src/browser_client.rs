@@ -302,6 +302,27 @@ pub struct ActResult {
     pub writes: Vec<Write>,
 }
 
+/// One annotated picture of a page: what a person would see, with the agent's own refs drawn on it.
+///
+/// The labels ARE the refs. Nothing here is a coordinate, and there is no verb that takes one — see
+/// the sidecar's `browser.LookResult` for why that is the whole design rather than a limitation of
+/// it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LookResult {
+    /// The picture, base64, as it arrived. Never decoded on this side: it is passed to the model as
+    /// an image block, and decoding it here would only be re-encoding it a line later.
+    pub image: String,
+    pub mime: String,
+    /// The refs actually drawn, which is fewer than the session knows: what is scrolled out of the
+    /// viewport gets no label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub width: i64,
+    #[serde(default)]
+    pub height: i64,
+}
+
 /// One form submission that left this machine, as much of it as is safe to keep.
 ///
 /// The names of the fields and how many there were. Never the values — see the sidecar's
@@ -485,6 +506,16 @@ impl BrowserClient {
             }),
         )
         .await
+    }
+
+    /// The annotated picture, for the AGENT to look at.
+    ///
+    /// JSON and not bytes, unlike [`BrowserClient::screenshot`] below, because the labels travel with
+    /// the picture: an image body with the refs in a header would split one answer across two places,
+    /// and the half that makes the picture actionable is the half that would be dropped first.
+    pub async fn look(&self, session_id: &str) -> Result<LookResult, BrowserError> {
+        self.call("/look", &serde_json::json!({ "session_id": session_id }))
+            .await
     }
 
     /// Pixels, for a person to look at. Returns PNG bytes rather than JSON, which is why it does not

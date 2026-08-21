@@ -99,6 +99,10 @@ func (d *deferredDriver) Screenshot(ctx context.Context, id browser.SessionID) (
 	return d.get().Screenshot(ctx, id)
 }
 
+func (d *deferredDriver) Look(ctx context.Context, id browser.SessionID) (browser.LookResult, error) {
+	return d.get().Look(ctx, id)
+}
+
 func (d *deferredDriver) Handoff(ctx context.Context, id browser.SessionID, reason string) (browser.HandoffTicket, error) {
 	return d.get().Handoff(ctx, id, reason)
 }

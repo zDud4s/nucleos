@@ -224,6 +224,14 @@ func (p *Pool) Screenshot(ctx context.Context, id browser.SessionID) ([]byte, er
 	return session.holder.driver.Screenshot(ctx, session.inner)
 }
 
+func (p *Pool) Look(ctx context.Context, id browser.SessionID) (browser.LookResult, error) {
+	session, err := p.lookup(id)
+	if err != nil {
+		return browser.LookResult{}, err
+	}
+	return session.holder.driver.Look(ctx, session.inner)
+}
+
 func (p *Pool) Handoff(ctx context.Context, id browser.SessionID, reason string) (browser.HandoffTicket, error) {
 	session, err := p.lookup(id)
 	if err != nil {

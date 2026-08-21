@@ -263,7 +263,7 @@ func TestServeConfigIsLoopbackOnly(t *testing.T) {
 	}
 }
 
-// halfADriver implements the six verbs and not the wheel — the shape a single chrome.Driver has, and
+// halfADriver implements the driver verbs and not the wheel — the shape a single chrome.Driver has, and
 // the reason serve type-asserts instead of assuming.
 //
 // Spelled out rather than embedding browser.Fake: the Fake DOES implement Wheelhouse, and an
@@ -282,6 +282,9 @@ func (halfADriver) Act(context.Context, browser.SessionID, browser.Action) (brow
 }
 func (halfADriver) Screenshot(context.Context, browser.SessionID) ([]byte, error) {
 	return nil, browser.ErrUnsupported
+}
+func (halfADriver) Look(context.Context, browser.SessionID) (browser.LookResult, error) {
+	return browser.LookResult{}, browser.ErrUnsupported
 }
 func (halfADriver) Handoff(context.Context, browser.SessionID, string) (browser.HandoffTicket, error) {
 	return browser.HandoffTicket{}, browser.ErrUnsupported

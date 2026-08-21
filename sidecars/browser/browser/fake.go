@@ -38,6 +38,8 @@ type Fake struct {
 	ActErr error
 	// Shot is what Screenshot returns.
 	Shot []byte
+	// Looked is what Look returns.
+	Looked LookResult
 
 	// Chain is what ReturnWheel reports as the navigation a person's window recorded (spec §5.3a).
 	Chain []string
@@ -139,6 +141,17 @@ func (f *Fake) Screenshot(_ context.Context, id SessionID) ([]byte, error) {
 	return f.Shot, nil
 }
 
+// Look answers from Looked, and records nothing beyond the session check: a fake that invented an
+// image would let a caller test its own handling of a picture nobody produced.
+func (f *Fake) Look(_ context.Context, id SessionID) (LookResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.sessions[id]; !ok {
+		return LookResult{}, ErrNoSuchSession
+	}
+	return f.Looked, nil
+}
+
 func (f *Fake) Handoff(_ context.Context, id SessionID, reason string) (HandoffTicket, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -197,6 +210,9 @@ func (u Unavailable) Act(context.Context, SessionID, Action) (ActResult, error) 
 }
 func (u Unavailable) Screenshot(context.Context, SessionID) ([]byte, error) {
 	return nil, u.err()
+}
+func (u Unavailable) Look(context.Context, SessionID) (LookResult, error) {
+	return LookResult{}, u.err()
 }
 func (u Unavailable) Handoff(context.Context, SessionID, string) (HandoffTicket, error) {
 	return HandoffTicket{}, u.err()

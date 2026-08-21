@@ -550,7 +550,33 @@ var ErrNotInstalled = errors.New("browser: the pinned chromium is not installed"
 // ErrUnsupported is returned by a driver that cannot do something the contract allows.
 var ErrUnsupported = errors.New("browser: unsupported by this driver")
 
-// Driver is the seam. Six verbs, matching spec §6.1.
+// LookResult is one annotated picture of the page: what a person would see, with the agent's own
+// refs drawn on top of it.
+//
+// The labels ARE the refs — not a second numbering that has to be translated back. That is the whole
+// design, and everything else here follows from it: an agent that can see is not thereby an agent
+// that can click at a coordinate, because there is no verb that takes one. What the picture buys is
+// a way to find the ref worth acting on when the accessibility tree does not say enough — a canvas,
+// a chart, an icon whose label is a sprite.
+type LookResult struct {
+	// Image is the picture, base64 for the JSON hop, and MIME says what it is.
+	Image string `json:"image"`
+	MIME  string `json:"mime"`
+	// Labels are the refs actually DRAWN, which is a smaller set than the refs the session knows:
+	// an element scrolled out of the viewport, or collapsed to nothing, gets no label.
+	//
+	// Reported rather than left to be read off the picture, for the same reason a snapshot reports
+	// what it dropped: an agent comparing what it sees against what it holds needs the difference to
+	// be stated, not inferred from an image it may be reading imperfectly.
+	Labels []string `json:"labels,omitempty"`
+	// Width and Height are the picture's own, after any reduction. Said because a reduction changes
+	// what is legible, and an agent that cannot read a label is better off knowing the picture was
+	// shrunk than concluding the page had nothing written on it.
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+// Driver is the seam. Seven verbs, matching spec §6.1 plus the annotated picture.
 type Driver interface {
 	// Open starts a session. It MUST fail with ErrFenceNotAttached rather than navigate without
 	// the fence in place, in agent mode.
@@ -562,6 +588,10 @@ type Driver interface {
 	Act(ctx context.Context, id SessionID, action Action) (ActResult, error)
 	// Screenshot returns PNG bytes, for a person to look at.
 	Screenshot(ctx context.Context, id SessionID) ([]byte, error)
+	// Look returns the annotated picture, for the AGENT to look at. Distinct from Screenshot in
+	// audience and therefore in everything else: this one is labelled, viewport-only, lossy and
+	// bounded, because it is paid for in an agent's context rather than in a person's window.
+	Look(ctx context.Context, id SessionID) (LookResult, error)
 	// Handoff prepares the session to be driven by a person.
 	Handoff(ctx context.Context, id SessionID, reason string) (HandoffTicket, error)
 	// Close ends the session and releases its profile. It is the only verb of the six that reads
