@@ -43,10 +43,14 @@ pub struct ChatSummary {
     pub created_at: String,
     /// Where this conversation's turns run, or `None` for the daemon's own directory.
     ///
-    /// Set only when the conversation continues a session that was had somewhere else. It travels
-    /// to the list because the window has to show it: two conversations continued from two
-    /// worktrees of the same repository are otherwise indistinguishable by anything a person can
-    /// read.
+    /// Set at creation for a conversation picked up from the editor, and by `set_cwd` for one that
+    /// is told afterwards which project it is about. It used to be the first of those alone, which
+    /// is why a conversation opened in the window could never have tools: `tool_policy_for` grants
+    /// them on a directory, and there was no way to give it one.
+    ///
+    /// It travels to the list because the window has to show it: two conversations continued from
+    /// two worktrees of the same repository are otherwise indistinguishable by anything a person
+    /// can read.
     pub cwd: Option<String>,
     /// Which conversation had in the editor this one was picked up from, or `None` when it was
     /// opened here.
@@ -101,6 +105,23 @@ pub async fn create(
     .execute(pool)
     .await?;
     Ok(chat_id)
+}
+
+/// Points a conversation at the project it is about.
+///
+/// The second writer this column has ever had. The first is the pick-up, at creation, and until now
+/// it was the only one — so a conversation opened in the window had no directory and no way to be
+/// given one, which `tool_policy_for` reads as `McpOnly` for as long as it exists.
+///
+/// The caller has already checked that this is a directory. Here it is a string going into a column,
+/// and a second check would be a second answer to a question the filesystem can change between them.
+pub async fn set_cwd(pool: &SqlitePool, chat_id: &str, cwd: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET cwd = ? WHERE chat_id = ?")
+        .bind(cwd)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Records what a conversation was handed in place of the session it could not resume.

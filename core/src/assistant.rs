@@ -436,6 +436,17 @@ fn gathered(
     }
 }
 
+/// Takes a chat's turn slot and holds it until dropped, for the tests of modules that need one
+/// taken.
+///
+/// Beside the guard rather than reached for through a second copy of `BUSY_CHATS`: what makes the
+/// slot mean anything is that there is exactly one set of busy chats, and a test that inserted into
+/// its own would be testing a set nothing reads.
+#[cfg(test)]
+pub(crate) fn take_the_slot_for_testing(chat_id: &str) -> impl Drop {
+    ChatSlot::acquire(chat_id).expect("the chat should have been free")
+}
+
 /// Whether a turn is in flight for this chat.
 ///
 /// Reads the same set the slot is taken from, so it answers about the LIVE turn rather than about
