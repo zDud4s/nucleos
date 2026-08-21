@@ -8321,14 +8321,24 @@ mod tests {
     /// A fresh repository and a fresh database each time. Sharing either would let the first walk's
     /// branches and slots decide the second's, which is the one thing a comparison must not have.
     async fn passes_at(max_parallel: i64, tag: &str) -> Walk {
+        walk_plan(max_parallel, tag, THREE_ITEMS, three_scripted_agents()).await
+    }
+
+    /// The same, for a plan and a cast of scripted agents of the caller's choosing.
+    async fn walk_plan(
+        max_parallel: i64,
+        tag: &str,
+        plan: &str,
+        agents: Vec<(String, String, String)>,
+    ) -> Walk {
         let (_container, repo) = walkable_repo(tag, "git --version");
         let root = tempfile::tempdir().expect("worktree root");
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
-        *runner.writes.lock().unwrap() = three_scripted_agents();
+        *runner.writes.lock().unwrap() = agents;
 
-        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, max_parallel).await;
+        let job_id = start_directed_job(&state, &runner, &repo, plan, max_parallel).await;
         let walk = walk_counting(&state, job_id).await;
 
         assert_eq!(
@@ -8341,6 +8351,174 @@ mod tests {
             "the walk at {max_parallel} did not do all the work"
         );
         walk
+    }
+
+    /// Three items whose declarations are honest and still collide.
+    ///
+    /// **A conflict cannot be produced by two items declaring the same file**, because that is
+    /// exactly what the fold refuses to start together — so the design's own §5 names where a real
+    /// one comes from: *"duas famílias que o predicado não vê"*. Two items that declare different
+    /// work and both touch a REGISTRY the director never thought to name — a lock file, a module
+    /// list, a migrations directory. Nobody lied; the declaration simply cannot see it.
+    ///
+    /// Items 1 and 2 declare `a.rs` and `b.rs`, so the fold starts them together, and both write
+    /// `registry.txt`. The first to land is clean; the second conflicts.
+    const THREE_ITEMS_ONE_REGISTRY: &str = r#"{"items":[
+        {"description":"ITEM-ONE: alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-TWO: beta","files":["b.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-THREE: gamma","files":["c.rs"],"depends_on":[],"agent_id":"ana"}
+    ]}"#;
+
+    /// The scripted agents for the plan above, including what the conflicted one does second time.
+    ///
+    /// The last entry is keyed on the catch-up block `catch_up_the_item` appends to a retry's
+    /// prompt, which is the one thing in there that says "you are being asked again because your
+    /// merge conflicted". It is LAST because the entries are applied in order and a retry matches
+    /// both its own marker and this one: a naive agent would rewrite its own line over the conflict
+    /// markers and drop the other item's, which is a resolution git accepts and a person would not.
+    fn three_agents_over_one_registry() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "ITEM-ONE".to_owned(),
+                "a.rs".to_owned(),
+                "alpha\n".to_owned(),
+            ),
+            (
+                "ITEM-ONE".to_owned(),
+                "registry.txt".to_owned(),
+                "one\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "b.rs".to_owned(),
+                "beta\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "registry.txt".to_owned(),
+                "two\n".to_owned(),
+            ),
+            (
+                "ITEM-THREE".to_owned(),
+                "c.rs".to_owned(),
+                "gamma\n".to_owned(),
+            ),
+            (
+                "left STAGED".to_owned(),
+                "registry.txt".to_owned(),
+                "one\ntwo\n".to_owned(),
+            ),
+        ]
+    }
+
+    /// **The parallel path pays for a conflict the sequential one never meets, and still does not
+    /// lose.** §7's first criterion, with its first unhappy event.
+    ///
+    /// The asymmetry is the point and it is not a flaw in the fixture. At a ceiling of one, items 1
+    /// and 2 never overlap, so item 2's checkout is born AFTER item 1's registry line landed and
+    /// its merge is clean — there is no conflict to have. Parallelism is what creates the event,
+    /// which is exactly why the design budgets for it: the saving has to survive the cost it causes.
+    ///
+    /// Measured: five passes either way, and the writing goes from three rounds to two even with the
+    /// conflicted item asked a second time. It fits in two because the retry batches with the item
+    /// that had not started yet — the fold does not care that one of them is going round again.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_parallel_walk_pays_for_its_conflict_and_still_writes_in_fewer_rounds() {
+        let _lock = crate::worktree::test_env_lock();
+
+        let sequential = walk_plan(
+            1,
+            "nucleos-accept-clash-seq-",
+            THREE_ITEMS_ONE_REGISTRY,
+            three_agents_over_one_registry(),
+        )
+        .await;
+        let parallel = walk_plan(
+            2,
+            "nucleos-accept-clash-par-",
+            THREE_ITEMS_ONE_REGISTRY,
+            three_agents_over_one_registry(),
+        )
+        .await;
+
+        assert!(
+            parallel.passes <= sequential.passes,
+            "the conflict made the parallel walk slower: {parallel:?} against {sequential:?}"
+        );
+        assert!(
+            parallel.writing < sequential.writing,
+            "the saving did not survive the conflict it caused: {parallel:?} against {sequential:?}"
+        );
+    }
+
+    /// **A conflict is a step, and the queue walks through it.** The first unhappy event of §7.
+    ///
+    /// Everything the design says about conflict happens here in one walk and nowhere else in the
+    /// suite: the merge is refused and the job's checkout is put back clean, the item is put DOWN
+    /// rather than failed, it is asked again in the checkout it already has, the job's branch is
+    /// brought into that checkout with the conflict left staged, and what the second node writes is
+    /// merged and gated.
+    ///
+    /// The registry file is the assertion that matters. `one\ntwo` on the branch means the two
+    /// items' work was really reconciled; either line alone means one of them was silently dropped
+    /// by a merge that reported success.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflict_over_a_file_nobody_declared_is_resolved_and_the_queue_finishes() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-accept-clash-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        *runner.writes.lock().unwrap() = three_agents_over_one_registry();
+
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS_ONE_REGISTRY, 2).await;
+        let walk = walk_counting(&state, job_id).await;
+
+        assert_eq!(walk.ending, "completed", "the conflict stopped the queue");
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["passed", "passed", "passed"]
+        );
+
+        // The item that conflicted was asked again, in a checkout it already had. Counted on the
+        // runs because a status is transient and this is not: one implement node for the first
+        // attempt, one for the resolution.
+        let attempts: Vec<i64> = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs
+              WHERE job_id = ? AND stage = 'implement' AND item_id IS NOT NULL
+              GROUP BY item_id ORDER BY item_id",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attempts,
+            vec![1, 2, 1],
+            "exactly one item should have been asked twice"
+        );
+
+        let (job_tree, _) = job_worktree(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job's checkout");
+        let registry = std::fs::read_to_string(job_tree.join("registry.txt"))
+            .expect("the registry both items touched");
+        let lines: Vec<&str> = registry.lines().map(str::trim_end).collect();
+        assert_eq!(
+            lines,
+            vec!["one", "two"],
+            "the resolution did not keep both items' work: {registry:?}"
+        );
+        for file in ["a.rs", "b.rs", "c.rs"] {
+            assert!(
+                job_tree.join(file).exists(),
+                "{file} never reached the job's branch"
+            );
+        }
     }
 
     /// **The same work at two ceilings, and the parallel one is not slower.** §7's first criterion.
