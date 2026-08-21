@@ -196,7 +196,7 @@ function chatsFetch(
       const told = opts.projects?.[chatId];
       if (told !== undefined) return told;
       const row = chats.find((chat) => chat.chat_id === chatId);
-      return { cwd: row?.cwd ?? null, tools: row?.cwd != null };
+      return { cwd: row?.cwd ?? null, tools: row?.cwd != null, session: null, planning: false };
     }
     const wireChat = /^\/assistant\/chats\/([^/?]+)\/tools$/.exec(path);
     if (wireChat !== null && init?.method === "POST") {
@@ -431,6 +431,55 @@ describe("Chats - an empty list", () => {
   });
 });
 
+describe("Chats - planning without acting", () => {
+  // Every kind of run in this daemon could be put in `--permission-mode plan` except the kind a
+  // person is watching — which is the one where it matters most, because it is the mode you reach
+  // for before letting an agent near a codebase.
+  it("can be turned on, and says so to the daemon", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const toggle = await screen.findByLabelText(/plan only/i);
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "PATCH",
+      );
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({ plan_only: true });
+    });
+  });
+
+  it("shows a conversation that is already planning as planning", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              planning: true,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const toggle = await screen.findByLabelText(/plan only/i);
+    await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true));
+  });
+});
+
 describe("Chats - what is different in the project", () => {
   // The question a person has after a coding turn. The transcript answers it with the name of a
   // tool and a path, and to see what those did you had to leave the app.
@@ -610,7 +659,7 @@ describe("Chats - giving a conversation a project", () => {
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        { projects: { "c-1": { cwd: "C:/Projects/fresh-worktree", tools: false } } },
+        { projects: { "c-1": { cwd: "C:/Projects/fresh-worktree", tools: false, session: null, planning: false } } },
       ),
     );
     await renderChats("/chats/c-1");
@@ -628,12 +677,48 @@ describe("Chats - giving a conversation a project", () => {
     });
   });
 
+  // The loop closes both ways and always did — the id simply appeared nowhere a person could read,
+  // which made the way back one only somebody who reads the daemon could find.
+  it("says how to carry the conversation on at a terminal", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: "sess-42", planning: false },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const carry = await screen.findByText(/claude --resume sess-42/);
+    expect(carry.textContent).toContain("C:/Projects/nucleos");
+  });
+
+  // A conversation the daemon would not resume itself offers nothing, rather than an id that leads
+  // somewhere it will not go.
+  it("offers no way back when the daemon would not resume it either", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByText(/claude --resume/)).toBeNull();
+  });
+
   it("says none of it when the conversation has a project and the tools that come with it", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true } } },
+        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false } } },
       ),
     );
     await renderChats("/chats/c-1");

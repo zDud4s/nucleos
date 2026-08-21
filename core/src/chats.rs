@@ -107,6 +107,29 @@ pub async fn create(
     Ok(chat_id)
 }
 
+/// Whether this conversation plans without acting.
+///
+/// Read on the turn path rather than carried on the summary, for the reason `cwd_of` is read there:
+/// it decides what the run is LAUNCHED with, and a value that travelled through the window and back
+/// would be a second copy of it free to disagree.
+pub async fn plans_only(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, i64>("SELECT plan_only FROM chats WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await
+        .map(|found| found.unwrap_or(0) != 0)
+}
+
+/// Puts a conversation into planning, or takes it out.
+pub async fn set_plan_only(pool: &SqlitePool, chat_id: &str, planning: bool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET plan_only = ? WHERE chat_id = ?")
+        .bind(i64::from(planning))
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Points a conversation at the project it is about.
 ///
 /// The second writer this column has ever had. The first is the pick-up, at creation, and until now

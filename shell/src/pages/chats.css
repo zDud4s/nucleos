@@ -292,6 +292,29 @@
   font-size: var(--text-xs);
 }
 
+/* Answering with a plan and changing nothing. Beside the brain picker, because both are choices
+   about how this conversation answers. */
+.chats-planning {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* The way back to a terminal, which existed long before anything said so. */
+.chats-project-carry {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.chats-project-command {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
 /* The quiet half: a conversation that has what it needs says where it is and nothing else, so
    pressing the button leaves proof rather than silence. */
 .chats-project-where {

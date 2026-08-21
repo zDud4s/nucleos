@@ -97,6 +97,12 @@ struct LiveChat {
     /// so a turn noticing the close has to be able to WAIT briefly for it rather than read whatever
     /// happens to be there.
     stopped_because: tokio::sync::watch::Receiver<Option<String>>,
+    /// Whether the process was started to plan rather than to act, fixed when it was spawned.
+    ///
+    /// `--permission-mode plan` is an argument, so a process started to act cannot be asked to stop
+    /// acting — and one started to plan cannot be let loose. Kept so it can be COMPARED, exactly as
+    /// `cwd` is: a conversation that changed its mind gets a new process rather than a wrong one.
+    planning: bool,
     /// Where the process is standing, fixed when it was spawned.
     ///
     /// Kept so it can be COMPARED. A conversation's working directory is resolved per turn — an
@@ -289,7 +295,7 @@ async fn serve_turn(
         // folder wins over the chat's, and a rotation abandons the session — so a process that no
         // longer matches this turn is not a process this turn may be answered by. It falls through
         // and is dropped, which stops it, and a new one is started to the turn's own shape.
-        let same_ground = live.cwd == request.cwd;
+        let same_ground = live.cwd == request.cwd && live.planning == request.plan_only;
         let same_conversation = known.is_some() && request.resume_session_id == known;
         if let Some(session_id) = known.filter(|_| same_ground && same_conversation) {
             let _ = session_tx.send(session_id.clone());
@@ -361,8 +367,10 @@ async fn start_live_chat(
         tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Read before the request is handed over, because that is what carries it, and kept so a later
-    // turn wanting a different directory can be told this process is the wrong one.
+    // turn wanting a different directory — or a different mode — can be told this process is the
+    // wrong one.
     let started_in = request.cwd.clone();
+    let was_planning = request.plan_only;
 
     // stdin IS the channel a later turn arrives on, so a process meant to serve more than one has to
     // take that door whether or not this turn carries anything that could only fit through it.
@@ -453,6 +461,7 @@ async fn start_live_chat(
         session_id: std::sync::Arc::clone(&session_id),
         abort: supervisor.abort_handle(),
         stopped_because,
+        planning: was_planning,
         cwd: started_in,
         idle_since: std::time::Instant::now(),
     };
@@ -1932,6 +1941,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // the barrier that makes it safe is the same one that earned it the tools.
         let may_live = matches!(tool_policy, crate::runner::ToolPolicy::Unrestricted);
 
+        // Read here rather than carried in from the request that started the turn: it is a property
+        // of the conversation at the moment it answers, and somebody who pressed "plan" while
+        // reading the last reply means this turn.
+        let planning = crate::chats::plans_only(&pool, &turn.slot.chat_id)
+            .await
+            .unwrap_or(false);
+
         // A turn with no `resume` is a conversation that has rotated onto a fresh context, so a
         // process still holding the old session has to go rather than be spoken to — answering down
         // it would continue exactly the conversation the rotation just ended.
@@ -1953,7 +1969,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // because one quietly given a working directory is one whose relative paths
             // moved.
             cwd,
-            plan_only: false,
+            plan_only: planning,
             resume_session_id: resume,
             mcp_config: Some(turn.mcp_path.clone()),
             // Decided by `tool_policy_for`, which is where the rule is written out. The
@@ -4599,6 +4615,7 @@ mod tests {
                 // Nothing to stop, but the field is what stops a real one, so it is not optional.
                 abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 stopped_because,
+                planning: false,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
             },
@@ -5096,6 +5113,7 @@ mod tests {
             session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
             abort: running.abort_handle(),
             stopped_because: tokio::sync::watch::channel(None).1,
+            planning: false,
             cwd: None,
             idle_since: std::time::Instant::now(),
         };
@@ -5197,6 +5215,65 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("advertised Bash under McpOnly"));
         // It really was written, which is what makes this the case that may not be retried.
         drop(said);
+    }
+
+    /// A conversation in planning launches a run that cannot act.
+    ///
+    /// `plan_only` has existed since the runs pillar was built and every conversation passed
+    /// `false`. `cli_args` turns it into `--permission-mode plan`, written FIRST and in an `else`,
+    /// so a planning run can never also be handed `bypassPermissions` — which is why the one mode a
+    /// person reaches for before letting an agent near a codebase was reachable by every kind of run
+    /// here except the kind a person is watching.
+    #[tokio::test]
+    async fn a_conversation_in_planning_launches_a_run_that_cannot_act() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "planning-chat").await;
+        crate::chats::set_plan_only(&state.pool, "planning-chat", true)
+            .await
+            .unwrap();
+
+        let id = send_message(&state, "planning-chat", "como farias isto?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(*fake.last_plan_only.lock().unwrap(), Some(true));
+    }
+
+    /// A conversation that changed its mind is not answered by the process it changed it from.
+    ///
+    /// `--permission-mode plan` is an argument, fixed when the process was spawned: one started to
+    /// act cannot be asked to stop, and one started to plan cannot be let loose. Speaking down the
+    /// old one would answer under the mode somebody had just turned off — and the transcript would
+    /// look exactly right.
+    #[tokio::test]
+    async fn a_conversation_that_changed_its_mind_is_not_answered_by_the_old_process() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "mind-changed").await;
+
+        let first = send_message(&state, "mind-changed", "faz isso", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        crate::chats::set_plan_only(&state.pool, "mind-changed", true)
+            .await
+            .unwrap();
+        let second = send_message(&state, "mind-changed", "afinal planeia", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the turn was answered by a process started in the other mode"
+        );
+        assert_eq!(*fake.last_plan_only.lock().unwrap(), Some(true));
     }
 
     /// A conversation with no tools keeps no process, and the reason is not caution.

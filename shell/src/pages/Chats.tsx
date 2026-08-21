@@ -9,6 +9,7 @@ import {
   useIdeConversation,
   useIdeSessions,
   useSetChatProject,
+  useSetPlanning,
   useWireChatTools,
   useWireIdeSessionTools,
   useAnswerAsk,
@@ -570,6 +571,7 @@ function ChatDetail({
         <div className="chats-detail-head">
           <TitleEditor chatId={chatId} title={summary.title} />
           <BrainPicker chatId={chatId} brain={summary.brain} />
+          <Planning chatId={chatId} />
           <ArchiveControl chatId={chatId} />
         </div>
       )}
@@ -628,11 +630,74 @@ function Project({ chatId }: { chatId: string }) {
   // Nothing at all until it is known. A conversation is not "without a project" because the answer
   // has not arrived yet, and a note that appears and then retracts itself is worse than a late one.
   if (project.data === undefined) return null;
-  if (project.data.cwd === null) return <NoProject chatId={chatId} />;
-  if (!project.data.tools) {
-    return <ProjectWithoutTools chatId={chatId} cwd={project.data.cwd} />;
-  }
-  return <p className="chats-project-where">this conversation is about {project.data.cwd}</p>;
+  const { cwd, tools, session } = project.data;
+
+  return (
+    <>
+      {cwd === null && <NoProject chatId={chatId} />}
+      {cwd !== null && !tools && <ProjectWithoutTools chatId={chatId} cwd={cwd} />}
+      {cwd !== null && tools && (
+        <p className="chats-project-where">this conversation is about {cwd}</p>
+      )}
+      {cwd !== null && session !== null && <CarryOn cwd={cwd} session={session} />}
+    </>
+  );
+}
+
+/**
+ * Whether this conversation plans without acting.
+ *
+ * `--permission-mode plan` is what the daemon launches with, and it has always been able to — every
+ * kind of run in this house could be put in planning except the kind a person is watching, which is
+ * the one where it matters most. It is the mode you reach for before letting an agent near a
+ * codebase.
+ *
+ * A state on the conversation rather than a choice per message: somebody says "plan this", reads
+ * it, then says "go". Making it per-message would turn one decision into a thing to remember every
+ * time.
+ */
+function Planning({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+  const set = useSetPlanning(chatId);
+  const planning = project.data?.planning ?? false;
+
+  return (
+    <label className="chats-planning" title="answer with a plan, and change nothing">
+      <input
+        type="checkbox"
+        checked={planning}
+        disabled={project.data === undefined || set.isPending}
+        onChange={(event) => set.mutate(event.target.checked)}
+      />
+      Plan only
+    </label>
+  );
+}
+
+/**
+ * How to carry this conversation on at a terminal.
+ *
+ * The loop closes both ways and always did: the daemon runs the CLI with a session id of its own, in
+ * the conversation's directory, and the CLI keeps its transcripts one folder per project — so
+ * `claude --resume <id>` from there continues it. Measured, with a word said only to the daemon
+ * coming back out of a fresh CLI.
+ *
+ * What was missing was anybody being told. The id lived in a table and appeared nowhere a person
+ * could read, which made the way back one only somebody who reads the daemon's source could find.
+ *
+ * Shown only where there is a directory to stand in, and only while the daemon would resume it
+ * itself — a rotated conversation offers nothing rather than an id that leads somewhere it will not
+ * go.
+ */
+function CarryOn({ cwd, session }: { cwd: string; session: string }) {
+  return (
+    <p className="chats-project-carry">
+      to carry this on at a terminal:{" "}
+      <code className="chats-project-command">
+        cd {cwd} &amp;&amp; claude --resume {session}
+      </code>
+    </p>
+  );
 }
 
 /**

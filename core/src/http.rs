@@ -3750,6 +3750,20 @@ async fn post_ask_wait(
 struct ChatProjectOut {
     /// The project this conversation is about, or `null` for one that has none.
     cwd: Option<String>,
+    /// The session a terminal standing in `cwd` could carry this conversation on in, or `null`.
+    ///
+    /// `claude --resume <this>` from that directory continues it — measured, with a word said only
+    /// to the daemon coming back out of the CLI. The way back was always there and nothing said so.
+    ///
+    /// `null` when the daemon itself would not resume it: a rotated conversation, or one that has
+    /// read a stranger's text. Offering an id the daemon has refused would be sending somebody
+    /// somewhere it will not go.
+    session: Option<String>,
+    /// Whether this conversation plans without acting.
+    ///
+    /// Beside the tools and not beside the title, because it is the same question in the other
+    /// direction: one says what this conversation CAN do, the other says what it will choose not to.
+    planning: bool,
     /// Whether a turn here would actually get Bash, Read and Write.
     ///
     /// Not the same fact as having a directory, which is why both travel. `tool_policy_for` wants
@@ -3775,9 +3789,20 @@ async fn read_chat_project(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Read for both answers below, because a conversation with no directory can still be carried
+    // on somewhere — the terminal just has to be standing where it was had.
+    let session = crate::assistant::get_session(&state.pool, &chat_id)
+        .await
+        .unwrap_or(None);
+    let planning = crate::chats::plans_only(&state.pool, &chat_id)
+        .await
+        .unwrap_or(false);
+
     let Some(cwd) = opened_in else {
         return Ok(Json(ChatProjectOut {
             cwd: None,
+            session,
+            planning,
             tools: false,
         }));
     };
@@ -3799,6 +3824,8 @@ async fn read_chat_project(
 
     Ok(Json(ChatProjectOut {
         cwd: Some(cwd),
+        session,
+        planning,
         tools,
     }))
 }
@@ -4315,6 +4342,11 @@ async fn create_chat(
 struct PatchChatRequest {
     title: Option<String>,
     brain: Option<String>,
+    /// Whether this conversation plans without acting.
+    ///
+    /// The one mode a person reaches for before letting an agent touch a codebase, and the only
+    /// kind of run in this daemon that could not be put in it.
+    plan_only: Option<bool>,
     /// The project this conversation is about, as an absolute path to a directory.
     ///
     /// The only way a conversation opened in the window ever gets tools: `tool_policy_for` grants
@@ -4346,15 +4378,17 @@ async fn patch_chat(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Both of these move something a turn in flight is already using, and nothing else records
-    // either. `answered_by` is written when a turn's row is born, so changing the brain under a live
+    // All three move something a turn in flight is already using, and nothing else records any of
+    // them. `answered_by` is written when a turn's row is born, so changing the brain under a live
     // turn makes that column lie about who answered it; the chat's `cwd` is the ONLY record of where
     // a turn ran — the assistant path never writes `runs.cwd` — so moving it under a live turn makes
     // the row the wrong answer to "where did this happen". 409 rather than a queue: the same answer
     // `POST /assistant/message` gives for the same reason.
     //
     // A rename moves neither and is left alone.
-    if (body.brain.is_some() || body.cwd.is_some()) && crate::assistant::is_busy(&chat_id) {
+    if (body.brain.is_some() || body.cwd.is_some() || body.plan_only.is_some())
+        && crate::assistant::is_busy(&chat_id)
+    {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -4409,6 +4443,15 @@ async fn patch_chat(
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "forgetting a chat's session failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(planning) = body.plan_only {
+        crate::chats::set_plan_only(&state.pool, &chat_id, planning)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing whether a conversation plans failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }
@@ -9524,6 +9567,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(answered.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A conversation says how to carry it on somewhere else.
+    ///
+    /// MEASURED, and it was the measurement that made this worth adding: a conversation the daemon
+    /// had with `--session-id <uuid>` in a directory really can be picked up from a terminal
+    /// standing there — `claude --resume <uuid>` answered with a word said only to the daemon. The
+    /// loop closes in both directions and always did.
+    ///
+    /// What was missing was anybody being told. The session id lives in `assistant_sessions` and
+    /// appeared nowhere a person could read, so the way back existed and could not be found.
+    ///
+    /// `get_session` and not the raw column: it is the id the daemon ITSELF would resume, so a
+    /// conversation it has refused to resume — rotated, or having read a stranger's text — offers
+    /// nothing rather than an id that would carry somebody somewhere the daemon would not go.
+    #[tokio::test]
+    async fn a_conversation_says_the_session_it_could_be_carried_on_in() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let before = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert!(
+            before["session"].is_null(),
+            "a conversation nobody has spoken to resumes nowhere"
+        );
+
+        crate::assistant::upsert_session(
+            &state.pool,
+            &chat_id,
+            "a-session",
+            "2026-08-21T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let after = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert_eq!(after["session"], "a-session");
     }
 
     /// A conversation says where it is and whether that actually gives it tools.

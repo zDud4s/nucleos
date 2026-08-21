@@ -1,0 +1,15 @@
+-- A conversation that plans without acting.
+--
+-- `RunRequest.plan_only` has existed since the runs pillar was built, and `cli_args` turns it into
+-- `--permission-mode plan` — first, and in an `else`, so a planning run can never also be handed
+-- `bypassPermissions`. Every conversation passed `false` and nothing could change that: the one
+-- mode a person reaches for before letting an agent touch a codebase was reachable by every kind of
+-- run in this daemon except the kind a person is watching.
+--
+-- On the CHAT and not on the turn, because that is the shape the gesture has. Somebody planning
+-- says "plan this", reads it, and then says "go" — two turns, one decision, held between them. A
+-- per-turn flag would make it a thing to remember every time instead of a state to be in.
+--
+-- `NOT NULL DEFAULT 0`: every conversation that already exists was not planning, which is exactly
+-- what it did.
+ALTER TABLE chats ADD COLUMN plan_only INTEGER NOT NULL DEFAULT 0;

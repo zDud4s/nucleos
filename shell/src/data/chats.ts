@@ -59,6 +59,23 @@ export interface ChatSummary {
 export interface ChatProject {
   cwd: string | null;
   tools: boolean;
+  /**
+   * The session a terminal standing in `cwd` could carry this conversation on
+   * in, or `null` when the daemon itself would not resume it.
+   *
+   * Measured: `claude --resume <this>` from that directory really does continue
+   * a conversation the daemon had. The way back was always there — nothing said
+   * so, which made it a way back only somebody who reads the daemon could find.
+   */
+  session: string | null;
+  /**
+   * Whether this conversation plans without acting.
+   *
+   * Beside the tools and not beside the title, because it is the same question
+   * in the other direction: one says what this conversation CAN do, the other
+   * what it will choose not to.
+   */
+  planning: boolean;
 }
 
 /** A conversation already had in the IDE that this daemon could continue. */
@@ -639,6 +656,32 @@ export function useSetChatProject(chatId: string) {
       apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
         method: "PATCH",
         body: JSON.stringify({ cwd }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Put this conversation into planning, or take it out.
+ *
+ * A state and not a per-turn choice, because that is the shape the gesture has:
+ * somebody says "plan this", reads it, then says "go". Two turns, one decision,
+ * held between them.
+ *
+ * The project read is invalidated because it carries the flag, and the chat list
+ * because a conversation that will not act is a different thing to be looking at.
+ */
+export function useSetPlanning(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (planning: boolean) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ plan_only: planning }),
       }),
     retry: false,
     onSettled: () => {
