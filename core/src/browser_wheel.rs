@@ -507,7 +507,7 @@ mod tests {
 
     const NOW: &str = "2026-08-16T10:00:00Z";
 
-    /// A sidecar that answers the six verbs and the two wheel ones, and records every call.
+    /// A sidecar that answers the driver's verbs and the two wheel ones, and records every call.
     ///
     /// It answers `/wheel/return` with a chain the test chooses, because the chain is the only thing
     /// a handover produces that outlives it â€” everything else here is a window that closes.

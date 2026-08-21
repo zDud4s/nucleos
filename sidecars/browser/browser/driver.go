@@ -634,8 +634,8 @@ type Driver interface {
 	Look(ctx context.Context, id SessionID) (LookResult, error)
 	// Handoff prepares the session to be driven by a person.
 	Handoff(ctx context.Context, id SessionID, reason string) (HandoffTicket, error)
-	// Close ends the session and releases its profile. It is the only verb of the six that reads
-	// nothing from the page, which is why it is the only ReadsOwn tool of the set (spec §6.1a).
+	// Close ends the session and releases its profile. It is the only verb here that reads nothing
+	// from the page, which is why it is the only ReadsOwn tool of the set (spec §6.1a).
 	Close(ctx context.Context, id SessionID) error
 	// Name identifies the driver in logs and in the health readout.
 	Name() string

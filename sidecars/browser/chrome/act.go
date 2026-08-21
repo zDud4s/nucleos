@@ -63,9 +63,9 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		), nil
 	}
 
-	// A ref is resolved when one was given, and three of the six verbs do not give one: back never
-	// names an element, a page scroll moves what is not in a snapshot yet, and a key goes wherever
-	// focus already is.
+	// A ref is resolved when one was given, and half the verbs do not give one: back and goto name
+	// no element at all, a page scroll moves what is not in a snapshot yet, and a key goes wherever
+	// focus already is. `needsRef` is the list; this comment is the reason.
 	var objectID string
 	if action.Ref != "" {
 		if !known {

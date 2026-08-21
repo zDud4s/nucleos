@@ -850,8 +850,8 @@ mod tests {
         );
     }
 
-    /// A sidecar that answers the six routes the way the Go one does, so the client can be driven
-    /// over a real socket instead of only being reasoned about.
+    /// A sidecar that answers the driver's routes the way the Go one does, so the client can be
+    /// driven over a real socket instead of only being reasoned about.
     ///
     /// It records what ARRIVED, which is the half that matters: the shapes on this wire are written
     /// twice, in two languages, and the failure mode is a field that serialises under a name the far

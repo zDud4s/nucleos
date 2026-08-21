@@ -61,8 +61,13 @@ func TestOpenFailsClosedWithoutFence(t *testing.T) {
 	}
 }
 
-// TestUnavailableRefusesEverything: the stand-in driver answers closed on all six verbs. A single
-// verb that answered "fine" would be a hole open exactly when nothing is set up.
+// TestUnavailableRefusesEverything: the stand-in driver answers closed on every verb. A single one
+// that answered "fine" would be a hole open exactly when nothing is set up.
+//
+// Enumerated by hand below rather than reflected over, which means a verb ADDED to Driver has to be
+// added here too — and the compiler does not say so, because a missing case is simply a case nobody
+// wrote. That is the cost of the shape; the guard against it is that Driver is a small interface
+// somebody reads in full before adding to.
 func TestUnavailableRefusesEverything(t *testing.T) {
 	var driver Driver = Unavailable{}
 	ctx := context.Background()

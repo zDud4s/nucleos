@@ -20,8 +20,9 @@ import (
 // # Why a Driver that cannot do this is not a broken Driver
 //
 // The Fake implements Wheelhouse, and so does the pool. A single chrome.Driver does not, and serve
-// answers 501 for it rather than pretending. The six verbs are the agent's surface and work with any
-// driver; the wheel is the person's, and it needs the half of the system that can start processes.
+// answers 501 for it rather than pretending. Driver's verbs are the agent's surface and work with
+// any driver; the wheel is the person's, and it needs the half of the system that can start
+// processes.
 
 // ErrPersonIsDriving is returned for an agent operation on a profile a person holds.
 //
