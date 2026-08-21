@@ -9103,6 +9103,7 @@ mod tests {
             "send_email",
             "this turn has read third-party content and can no longer act",
             Some(r#"{"to":"stand@example"}"#),
+            None,
         )
         .await
         .unwrap();

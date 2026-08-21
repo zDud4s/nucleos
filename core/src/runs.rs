@@ -361,6 +361,75 @@ pub(crate) async fn mark_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> 
         .map(|_| ())
 }
 
+/// Writes down WHICH stranger, once [`mark_untrusted_context`] has recorded that there was one.
+///
+/// Separate from the marking above, and the separation is the security argument rather than tidiness.
+/// The mark fails closed: `hooks.rs` refuses the read when it cannot be written, because a turn
+/// holding a stranger's words with no record of it is the state every later refusal depends on not
+/// existing. This one must NOT fail closed — a provenance able to refuse a read would be a
+/// convenience holding a veto over the pillar's main verb — so it is called after the mark, its
+/// error is logged by the caller, and the read proceeds either way.
+///
+/// The cost is stated where it is paid: a run can carry the mark and no rows here, and a reader has
+/// to say "not recorded" instead of "read nothing". Those are different facts and only one of them
+/// is ever true of a turn the barrier refused.
+///
+/// `arguments` is the call's arguments verbatim. Not prettied into a source string: `browser_open`
+/// and `web_read` both carry the url that decides the question, and a per-tool extractor would be a
+/// second per-tool table beside `TOOL_EFFECTS` for someone to keep in step by hand. `None` is for
+/// the entries that come from no call at all — an errand turn carries its notebook in before it
+/// spawns — and `tool` there names the source in words rather than borrowing a tool name for a call
+/// that never happened.
+pub(crate) async fn record_untrusted_read(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    tool: &str,
+    arguments: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO run_untrusted_reads (run_id, tool, arguments, at) VALUES (?, ?, ?, ?)")
+        .bind(id)
+        .bind(tool)
+        .bind(arguments)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// What this run has read, oldest first, as the JSON a proposal carries away.
+///
+/// `None` when nothing was recorded, which a caller must not render as "read nothing" — see
+/// [`record_untrusted_read`] for why the two are different and why the empty case is real.
+///
+/// Read once, at the moment a refusal is written, and copied onto the proposal: `runs` rows are
+/// pruned on their own schedule, and a record answering "where did this idea come from" with a
+/// dangling id answers nothing.
+pub(crate) async fn untrusted_reads_json(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+) -> sqlx::Result<Option<String>> {
+    let rows = sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT tool, arguments, at FROM run_untrusted_reads WHERE run_id = ? ORDER BY rowid",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    // Silence and an empty answer are not the same fact, so they do not share a representation. A
+    // turn refused by the barrier read something by definition; an empty list here means the
+    // recording failed, and handing that back as `Some("[]")` would let a reader print "read
+    // nothing" over a turn that read plenty.
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let listed: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(tool, arguments, at)| {
+            serde_json::json!({ "tool": tool, "arguments": arguments, "at": at })
+        })
+        .collect();
+    Ok(Some(serde_json::Value::Array(listed).to_string()))
+}
+
 /// Whether this run has read third-party text.
 ///
 /// A row that is not there answers `true`. The callers use this to decide whether to REFUSE

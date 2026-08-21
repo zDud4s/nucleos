@@ -113,6 +113,7 @@ export function proposal(overrides: Partial<Proposal> = {}): Proposal {
     tool_name: null,
     reasoning: "",
     tool_input: null,
+    read_from: null,
     created_at: "2026-08-17T09:00:00Z",
     decided_at: null,
     ...overrides,
