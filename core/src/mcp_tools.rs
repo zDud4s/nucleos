@@ -1484,13 +1484,19 @@ pub enum ToolEffect {
 /// here. `vcs_ticket` reads back what the owner's own queue did, and acts on nothing.
 const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("approve_proposal", ToolEffect::Acts),
-    // The browser's five, all `ReadsUntrusted`, and the classification is an ASSERTION ABOUT THE
+    // The browser's six, all `ReadsUntrusted`, and the classification is an ASSERTION ABOUT THE
     // FENCE rather than an observation about the verbs (spec §6.1a). `browser_act` clicks and types;
     // under the fence of §6.2 nothing it does leaves the machine with a consequence — no non-GET
     // request, no download, no WebSocket, no new window — so what it produces is more of a
     // stranger's prose and no effect on the world. If the fence stops holding, this line becomes a
     // lie, which is why the gate group against a real Chrome is a gate on this registration and not
     // a nice-to-have.
+    //
+    // "More of a stranger's prose" went literally false for one of the six, and the correction is
+    // worth making rather than reading past: `browser_look` produces a stranger's PICTURE. Same
+    // classification for the same reason — it reads, and there is no verb on it that acts — but the
+    // carrier is the one thing nothing downstream can inspect, where prose meets a redactor.
+    // `filter_outgoing`'s image arm is where that price is argued and bounded.
     //
     // "No form submission" was on that list and was taken off, and a loosening gets spelled out
     // rather than quietly edited: a GET form submits now. It IS a document GET to a host the profile
