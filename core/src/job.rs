@@ -8158,6 +8158,10 @@ mod tests {
         /// The passes that started at least one implement node: how many rounds of WRITING the
         /// queue took. This is the number a ceiling of two is supposed to shrink.
         writing: usize,
+        /// How many implement nodes each item cost, by ordinal. A two is an item that was asked
+        /// again, which is the only durable trace an unhappy event leaves: the states it passed
+        /// through are gone by the time the walk ends.
+        attempts: Vec<i64>,
     }
 
     async fn walk_counting(state: &AppState, job_id: i64) -> Walk {
@@ -8180,10 +8184,20 @@ mod tests {
             }
             let status = job_status(&state.pool, job_id).await;
             if !LIVE_STATUSES.contains(&status.as_str()) {
+                let attempts = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM runs
+                      WHERE job_id = ? AND stage = 'implement' AND item_id IS NOT NULL
+                      GROUP BY item_id ORDER BY item_id",
+                )
+                .bind(job_id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
                 return Walk {
                     ending: status,
                     passes: pass,
                     writing,
+                    attempts,
                 };
             }
         }
@@ -8204,6 +8218,7 @@ mod tests {
         repo: &std::path::Path,
         plan: &str,
         max_parallel: i64,
+        gate_retries: i64,
     ) -> i64 {
         seed_agent(&state.pool, "ana", "everything", "you are careful").await;
         seed_crew(&state.pool, "crew", "ana", &[]).await;
@@ -8228,7 +8243,7 @@ mod tests {
                 // Off: a review node is one more pass in both configurations, so it cancels out of
                 // the comparison while adding a node to every walk.
                 review: false,
-                gate_retries: 0,
+                gate_retries,
                 head_sha: head_sha.as_deref(),
                 max_rounds: None,
                 budget_usd: None,
@@ -8288,7 +8303,7 @@ mod tests {
         let (state, runner) = test_state_with_runner(pool.clone()).await;
         *runner.writes.lock().unwrap() = three_scripted_agents();
 
-        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2).await;
+        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS, 2, 0).await;
         let walk = walk_counting(&state, job_id).await;
 
         assert_eq!(walk.ending, "completed", "the queue did not run to the end");
@@ -8331,14 +8346,62 @@ mod tests {
         plan: &str,
         agents: Vec<(String, String, String)>,
     ) -> Walk {
-        let (_container, repo) = walkable_repo(tag, "git --version");
+        walk_measured(Measured {
+            max_parallel,
+            tag,
+            plan,
+            agents,
+            gate: "git --version",
+            gate_retries: 0,
+            seed: &[],
+        })
+        .await
+    }
+
+    /// Everything one walk needs that is not the same for every walk.
+    ///
+    /// A struct because it is seven things and four of them are strings: a call with seven positional
+    /// arguments is a call whose third and fourth get swapped once and never noticed.
+    struct Measured<'a> {
+        max_parallel: i64,
+        tag: &'a str,
+        plan: &'a str,
+        agents: Vec<(String, String, String)>,
+        /// The project's `gate_command`. `git --version` is the gate that always agrees.
+        gate: &'a str,
+        /// How many EXTRA implement runs a red gate may buy. Zero makes the first red terminal.
+        gate_retries: i64,
+        /// Files committed into the repository before the job starts, so the gate has something to
+        /// measure that the queue did not create.
+        seed: &'a [(&'a str, &'a str)],
+    }
+
+    async fn walk_measured(measured: Measured<'_>) -> Walk {
+        let Measured {
+            max_parallel,
+            tag,
+            plan,
+            agents,
+            gate,
+            gate_retries,
+            seed,
+        } = measured;
+        let (_container, repo) = walkable_repo(tag, gate);
+        for (path, contents) in seed {
+            std::fs::write(repo.join(path), contents).expect("seed a file the gate measures");
+            assert!(git_ok(&repo, &["add", path]));
+        }
+        if !seed.is_empty() {
+            assert!(git_ok(&repo, &["commit", "-m", "what the gate measures"]));
+        }
         let root = tempfile::tempdir().expect("worktree root");
         let _env = WorktreeRootEnv::set(root.path());
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
         *runner.writes.lock().unwrap() = agents;
 
-        let job_id = start_directed_job(&state, &runner, &repo, plan, max_parallel).await;
+        let job_id =
+            start_directed_job(&state, &runner, &repo, plan, max_parallel, gate_retries).await;
         let walk = walk_counting(&state, job_id).await;
 
         assert_eq!(
@@ -8452,6 +8515,154 @@ mod tests {
         );
     }
 
+    /// The gate that reads the tree rather than always agreeing.
+    ///
+    /// `git grep -q good HEAD` exits zero exactly while something on the branch still says `good`,
+    /// which the seeded `marker.txt` does and an item that clobbers it stops doing. No shell and no
+    /// script in the tree: `run_gate` splits the command into words and spawns the program itself,
+    /// and `git` is the one program this suite already cannot run without.
+    ///
+    /// Steered by what the scripted agents WRITE, and never by the harness reaching in between
+    /// passes. A gate a test flips by hand measures the test; this one measures the tree, which is
+    /// what a gate is.
+    ///
+    /// **`-- marker.txt` is deliberately NOT on the end**, and the first attempt at this had it.
+    /// `worktree_scripts` treats every relative path among the command's arguments as a gate script
+    /// living in the tree, and `tampered_gate_script` then refuses to measure when the run rewrote
+    /// one — correctly, and here fatally: naming the very file the queue clobbers turns every red
+    /// gate into `gate_errored`, which is "the measurement did not happen" and not "the code is
+    /// broken". The guard was right and the command was wrong.
+    const GATE_READS_THE_MARKER: &str = "git grep -q good HEAD";
+
+    /// Both unhappy events in one queue.
+    ///
+    /// Item 2 clobbers the registry that item 1 also touches, and neither declared it — the
+    /// conflict. Item 3 clobbers the marker the gate reads, which nobody else touches, so it merges
+    /// cleanly and is refused by the gate — the red. Two different ways for undeclared work to go
+    /// wrong, and the design answers them differently: one is a question about two pieces of work,
+    /// the other is a verdict on one.
+    const THREE_ITEMS_TWO_EVENTS: &str = r#"{"items":[
+        {"description":"ITEM-ONE: alpha","files":["a.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-TWO: beta","files":["b.rs"],"depends_on":[],"agent_id":"ana"},
+        {"description":"ITEM-THREE: gamma","files":["c.rs"],"depends_on":[],"agent_id":"ana"}
+    ]}"#;
+
+    /// The cast for the plan above, and the two last entries are the retries.
+    ///
+    /// `left STAGED` is the sentence `catch_up_the_item` appends when a merge conflicted; `attempted
+    /// before` is the one `implement_prompt` appends when a gate said no. They are the only things
+    /// in a prompt that say WHY an item is being asked again, they are disjoint, and they are last
+    /// because entries are applied in order: a retry matches its own marker too, and what it wrote
+    /// the first time is exactly what has to be overwritten.
+    fn three_agents_with_two_unhappy_events() -> Vec<(String, String, String)> {
+        vec![
+            (
+                "ITEM-ONE".to_owned(),
+                "a.rs".to_owned(),
+                "alpha\n".to_owned(),
+            ),
+            (
+                "ITEM-ONE".to_owned(),
+                "registry.txt".to_owned(),
+                "one\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "b.rs".to_owned(),
+                "beta\n".to_owned(),
+            ),
+            (
+                "ITEM-TWO".to_owned(),
+                "registry.txt".to_owned(),
+                "two\n".to_owned(),
+            ),
+            (
+                "ITEM-THREE".to_owned(),
+                "c.rs".to_owned(),
+                "gamma\n".to_owned(),
+            ),
+            // The work that breaks the build: the marker the gate reads, clobbered.
+            (
+                "ITEM-THREE".to_owned(),
+                "marker.txt".to_owned(),
+                "clobbered\n".to_owned(),
+            ),
+            // Asked again after a conflict: keep both lines.
+            (
+                "left STAGED".to_owned(),
+                "registry.txt".to_owned(),
+                "one\ntwo\n".to_owned(),
+            ),
+            // Asked again after a red gate: put the marker back.
+            (
+                "attempted before".to_owned(),
+                "marker.txt".to_owned(),
+                "good\n".to_owned(),
+            ),
+        ]
+    }
+
+    /// **Two unhappy events, and the parallel walk still does not lose.** §7's first criterion,
+    /// whole.
+    ///
+    /// The design budgets sixteen minutes of saving against events that cost eight to twelve each,
+    /// and says so plainly: *"um evento deixa-a em 8 ou 4; dois invertem o sinal"*. Two is therefore
+    /// the number the criterion has to be tested at, and one would be a test that agreed with the
+    /// design about the easy case.
+    ///
+    /// Only one of the two is symmetric. The RED gate is caused by item 3's own work, so both
+    /// ceilings meet it. The CONFLICT exists only in the parallel walk: at a ceiling of one, item 2's
+    /// checkout is born after item 1's line landed and there is nothing to conflict with.
+    /// Parallelism causes that event, and the saving has to survive the cost it causes.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_unhappy_events_do_not_make_the_parallel_walk_the_slower_one() {
+        let _lock = crate::worktree::test_env_lock();
+
+        let measured = |max_parallel: i64, tag: &'static str| async move {
+            walk_measured(Measured {
+                max_parallel,
+                tag,
+                plan: THREE_ITEMS_TWO_EVENTS,
+                agents: three_agents_with_two_unhappy_events(),
+                gate: GATE_READS_THE_MARKER,
+                // One extra implement run per item. `0069` defaults this to zero deliberately, so a
+                // job that wants a red gate to be answerable has to say so; this one does.
+                gate_retries: 1,
+                seed: &[("marker.txt", "good\n")],
+            })
+            .await
+        };
+
+        let sequential = measured(1, "nucleos-accept-two-seq-").await;
+        let parallel = measured(2, "nucleos-accept-two-par-").await;
+
+        assert_eq!(sequential.ending, "completed");
+        assert_eq!(parallel.ending, "completed");
+
+        // Both events really happened, or this is a comparison of two happy walks. A `2` is an item
+        // asked a second time: item 3 by the gate in both walks, and item 2 by the conflict only
+        // where there was parallelism to cause one.
+        assert_eq!(
+            sequential.attempts,
+            vec![1, 1, 2],
+            "the red gate did not fire in the sequential walk: {sequential:?}"
+        );
+        assert_eq!(
+            parallel.attempts,
+            vec![1, 2, 2],
+            "the parallel walk did not meet both events: {parallel:?}"
+        );
+        assert!(
+            parallel.passes <= sequential.passes,
+            "two unhappy events made the parallel walk slower: {parallel:?} against {sequential:?}"
+        );
+        assert!(
+            parallel.writing < sequential.writing,
+            "the saving did not survive two unhappy events: {parallel:?} against {sequential:?}"
+        );
+    }
+
     /// **A conflict is a step, and the queue walks through it.** The first unhappy event of §7.
     ///
     /// Everything the design says about conflict happens here in one walk and nowhere else in the
@@ -8474,7 +8685,8 @@ mod tests {
         let (state, runner) = test_state_with_runner(pool.clone()).await;
         *runner.writes.lock().unwrap() = three_agents_over_one_registry();
 
-        let job_id = start_directed_job(&state, &runner, &repo, THREE_ITEMS_ONE_REGISTRY, 2).await;
+        let job_id =
+            start_directed_job(&state, &runner, &repo, THREE_ITEMS_ONE_REGISTRY, 2, 0).await;
         let walk = walk_counting(&state, job_id).await;
 
         assert_eq!(walk.ending, "completed", "the conflict stopped the queue");
@@ -8486,17 +8698,8 @@ mod tests {
         // The item that conflicted was asked again, in a checkout it already had. Counted on the
         // runs because a status is transient and this is not: one implement node for the first
         // attempt, one for the resolution.
-        let attempts: Vec<i64> = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM runs
-              WHERE job_id = ? AND stage = 'implement' AND item_id IS NOT NULL
-              GROUP BY item_id ORDER BY item_id",
-        )
-        .bind(job_id)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
         assert_eq!(
-            attempts,
+            walk.attempts,
             vec![1, 2, 1],
             "exactly one item should have been asked twice"
         );
