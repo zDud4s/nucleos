@@ -567,6 +567,17 @@ pub const ERRAND_MAY_NOT_ACT: &str =
 /// act while nothing third-party has entered the turn — but not both, and not in that order. It is
 /// deliberately not a hard split of the tool set, because reading mail from a phone is the feature,
 /// and the ordering costs the owner one extra message rather than the tool.
+/// The conversation a run belongs to, or `None` for a run that is nobody's turn.
+async fn chat_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+}
+
 /// The directory a turn is rooted in, or `None` when it is an ordinary orchestrator turn.
 ///
 /// Read from the CHAT and not from the run, because it is a property of the conversation: every
@@ -582,6 +593,120 @@ async fn rooted_turn(state: &AppState, run_id: i64) -> Option<String> {
     .ok()
     .flatten()
     .flatten()
+}
+
+/// How long a tool call waits for somebody to answer for it.
+///
+/// Forty-five seconds, and the number is not a preference. The CLI holds the hook call open while
+/// this waits and kills it at its own ceiling — sixty seconds unless the settings entry says
+/// otherwise, and the entries already written into people's projects do not. Raising that would
+/// help only the projects wired after the change and leave every existing one being cut off
+/// mid-question, so the window is chosen to fit the ceiling that is actually out there.
+///
+/// Long enough for somebody looking at the window to read a command and decide; short enough that
+/// stepping away costs one refused tool call rather than a conversation that hangs.
+pub(crate) const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// One tool call a conversation is waiting to be allowed.
+///
+/// In memory and nowhere else, deliberately. A proposal is a durable row because the run it belongs
+/// to is not being watched; this exists only while a hook call is blocked on it, and a daemon that
+/// restarts has killed the turn that was asking. A question outliving the turn that asked it is a
+/// question about nothing.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Ask {
+    pub id: String,
+    pub chat_id: String,
+    pub run_id: i64,
+    pub tool: String,
+    /// The one argument that says what this is about, or `None` when none of them does.
+    ///
+    /// Deliberately not the whole input, for the reason `runner::ToolCall` gives about its own: a
+    /// `Write` carries the file it is writing, and a window that printed that argument would print
+    /// the file.
+    pub detail: Option<String>,
+}
+
+struct Pending {
+    ask: Ask,
+    /// Handed to whoever answers, and taken when they do — so a second answer finds nothing rather
+    /// than overwriting the first.
+    answer: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// Handed to the hook call that waits, and taken for the same reason.
+    heard: Option<tokio::sync::oneshot::Receiver<bool>>,
+}
+
+static ASKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Pending>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Records that this turn is waiting to be allowed something, and returns the question's name.
+pub(crate) fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {
+    let id = crate::auth::generate_uuid_v4();
+    let (answer, heard) = tokio::sync::oneshot::channel();
+    ASKS.lock().unwrap().insert(
+        id.clone(),
+        Pending {
+            ask: Ask {
+                id: id.clone(),
+                chat_id: chat_id.to_owned(),
+                run_id,
+                tool: tool.to_owned(),
+                detail,
+            },
+            answer: Some(answer),
+            heard: Some(heard),
+        },
+    );
+    id
+}
+
+/// What this conversation is waiting to be allowed, which is nearly always nothing or one thing.
+pub fn asks_for(chat_id: &str) -> Vec<Ask> {
+    ASKS.lock()
+        .unwrap()
+        .values()
+        .filter(|pending| pending.ask.chat_id == chat_id)
+        .map(|pending| pending.ask.clone())
+        .collect()
+}
+
+/// Answers one question. `false` when there was nothing to answer, which is a race a person loses
+/// harmlessly: the turn moved on, or somebody answered a moment sooner.
+pub fn answer_ask(id: &str, allow: bool) -> bool {
+    let answer = ASKS
+        .lock()
+        .unwrap()
+        .get_mut(id)
+        .and_then(|pending| pending.answer.take());
+    match answer {
+        Some(answer) => answer.send(allow).is_ok(),
+        None => false,
+    }
+}
+
+/// Waits for this RUN's question to be answered. `None` means refuse, whatever the reason.
+///
+/// Keyed on the run and not on the question's name, which is what keeps it honest without a second
+/// check: a run has at most one tool call in flight, because the hook that asks is synchronous and
+/// the CLI is sitting on it. So "this run's ask" names exactly one thing, and no run can name
+/// another's.
+///
+/// The question is taken down either way. A turn whose call was refused has moved on, and a
+/// question still standing in the window would be about something that is no longer happening.
+pub(crate) async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
+    let (id, heard) = {
+        let mut asks = ASKS.lock().unwrap();
+        let (id, pending) = asks
+            .iter_mut()
+            .find(|(_, pending)| pending.ask.run_id == run_id)?;
+        (id.clone(), pending.heard.take()?)
+    };
+    let answer = tokio::time::timeout(window, heard)
+        .await
+        .ok()
+        .and_then(|heard| heard.ok());
+    ASKS.lock().unwrap().remove(&id);
+    answer
 }
 
 /// What the owner is told when a rooted turn asks for something that would need approving.
@@ -612,6 +737,9 @@ async fn rooted_decision(
     payload: &PreToolUsePayload,
     root: &str,
 ) -> Json<Decision> {
+    // Corrected in the handler before this is called, so it is the turn that is actually running
+    // rather than the one a living process was spawned for.
+    let run_id = payload.run_id;
     if payload.tool_name.starts_with("mcp__") {
         return assistant_decision(state, payload).await;
     }
@@ -676,6 +804,32 @@ async fn rooted_decision(
         });
     }
 
+    // Asked about, rather than refused. `ROOTED_APPROVAL_DENY_REASON` said "do it in the window" and
+    // there was nowhere in the window to do it — which made a coding conversation stop at the first
+    // action the classifier did not recognise as read-only.
+    //
+    // `asking` and not a verdict, because the hook has five seconds and a person does not. The fast
+    // path stays fast; the waiting happens on a second call the hook makes only when it hears this.
+    // A script too old to know the word fails closed on an unrecognised verdict, which is the same
+    // refusal it gave before.
+    //
+    // `detail_of` and not the whole input, for the reason it exists: a `Write` carries the file it
+    // is writing, and a window that printed that argument would print the file.
+    if let Some(chat_id) = chat_of_run(&state.pool, run_id).await {
+        crate::hooks::ask_about(
+            &chat_id,
+            run_id,
+            &payload.tool_name,
+            crate::runner::detail_of(&payload.tool_input),
+        );
+        return Json(Decision {
+            decision: "asking".to_owned(),
+            reason: classification.reason,
+        });
+    }
+
+    // No conversation to ask — which is not a state a rooted turn can be in, since being rooted is a
+    // property of its chat. Refused the way it always was rather than allowed on a technicality.
     Json(Decision {
         decision: "deny".to_owned(),
         reason: ROOTED_APPROVAL_DENY_REASON.to_owned(),
@@ -1443,6 +1597,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::post;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     async fn test_state() -> AppState {
@@ -1633,6 +1788,138 @@ mod tests {
             .await
             .unwrap();
         token
+    }
+
+    /// A rooted turn that needs approving is ASKED about, rather than refused outright.
+    ///
+    /// This is the wall a coding conversation hits. The classifier sends everything not provably
+    /// read-only for approval, and a chat turn cannot park a proposal — one expects a worktree run
+    /// to resume into and a conversation has none — so the answer was a refusal telling the person
+    /// to go and do it somewhere else. There is nowhere else: it is their window, they are watching
+    /// it, and the useful reply to somebody watching is a question.
+    ///
+    /// `asking` and not a verdict, because the hook has five seconds and a person does not. The
+    /// fast path stays fast and the waiting happens on a second call.
+    #[tokio::test]
+    async fn a_rooted_turn_that_needs_approving_is_asked_about_rather_than_refused() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+        let key = crate::auth::mint_chat_token(&state.pool, &chat_id)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = decide_as(
+            &app,
+            &key,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"npm publish"}}}}"#
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "asking");
+        let waiting = asks_for(&chat_id);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].tool, "Bash");
+        assert_eq!(waiting[0].detail.as_deref(), Some("npm publish"));
+        answer_ask(&waiting[0].id, false);
+    }
+
+    /// Saying yes lets the call through; saying no refuses it. The waiting call is what the hook is
+    /// sitting on, and its answer is what the CLI is finally told.
+    #[tokio::test]
+    async fn what_the_person_says_is_what_the_tool_call_is_told() {
+        for (allowed, expected) in [(true, "allow"), (false, "deny")] {
+            let state = test_state().await;
+            let root = tempfile::TempDir::new().unwrap();
+            let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+            let id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+            let waiting =
+                tokio::spawn(async move { wait_for_run(run_id, Duration::from_secs(5)).await });
+
+            // The window answering, a moment later, as a person does.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(answer_ask(&id, allowed));
+
+            let answer = waiting.await.unwrap();
+            assert_eq!(
+                answer.map(|yes| if yes { "allow" } else { "deny" }),
+                Some(expected)
+            );
+        }
+    }
+
+    /// An ask nobody answers is refused, not left open.
+    ///
+    /// The CLI is holding a hook call while this waits, and the model is holding a turn behind that.
+    /// Fail closed and say why: a person who stepped away gets a refused tool call, not a
+    /// conversation that hangs until something else times it out.
+    #[tokio::test]
+    async fn an_ask_nobody_answers_is_refused() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let _id = ask_about(&chat_id, run_id, "Bash", None);
+        let answer = wait_for_run(run_id, Duration::from_millis(30)).await;
+
+        assert_eq!(answer, None);
+        // And it is gone, rather than sitting in the window as a question about a turn that has
+        // already moved on.
+        assert!(asks_for(&chat_id).is_empty());
+    }
+
+    /// A run waits on ITS OWN ask and can reach no other, which is what stops one turn answering
+    /// for another — or consuming the question somebody else is being asked.
+    #[tokio::test]
+    async fn a_run_waits_on_its_own_ask_and_reaches_no_other() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let id = ask_about(&chat_id, run_id, "Bash", None);
+
+        // A different run, waiting: there is nothing of its own to wait for.
+        assert_eq!(
+            wait_for_run(run_id + 1, Duration::from_millis(30)).await,
+            None
+        );
+        // And the question that was not theirs is still standing.
+        assert_eq!(asks_for(&chat_id).len(), 1);
+        answer_ask(&id, false);
+    }
+
+    /// A conversation with a directory and a running turn, which is what `rooted_decision` needs.
+    async fn rooted_conversation(state: &AppState, root: &tempfile::TempDir) -> (String, i64) {
+        let chat_id = format!("asking-{}", crate::auth::generate_uuid_v4());
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES (?, 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(&chat_id)
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        // An id of its own, and not the one this pool would hand out. Every test has its own
+        // in-memory database, so every one of them would call its first run `1` — while the ask
+        // registry is a single process-wide map, exactly as it is in the daemon. Real run ids are
+        // unique because there is one database; here they have to be made so.
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(90_000);
+        let run_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, chat_id, created_at)
+             VALUES (?, 'x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(&chat_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (chat_id, run_id)
     }
 
     /// A living conversation's turn is judged on what IT read, not on what its first turn read.
@@ -2960,12 +3247,19 @@ mod tests {
         assert_eq!(decision.decision, "deny");
     }
 
-    /// Refused, and NOT parked. Parking mints a proposal that expects a worktree run to resume into,
-    /// and a conversation has none — the turn would die owing an approval nobody can grant. It is
-    /// also the right answer on its own terms: a rooted turn requires `Origin::Shell`, so the owner
-    /// is at the window while this is being asked.
+    /// ASKED about, and still NOT parked. The two are separate facts and both matter.
+    ///
+    /// Parking mints a proposal that expects a worktree run to resume into, and a conversation has
+    /// none — the turn would die owing an approval nobody can grant. That has not changed and is
+    /// asserted below.
+    ///
+    /// What changed is the other half. A rooted turn requires `Origin::Shell`, so the owner IS at
+    /// the window while this is being decided — and the honest thing to do with somebody who is
+    /// watching is ask them. It used to be refused with a sentence telling them to do it somewhere
+    /// else, and there was nowhere else, which stopped a coding conversation at the first action
+    /// the classifier did not recognise as read-only.
     #[tokio::test]
-    async fn a_rooted_turn_is_refused_rather_than_parked_when_something_needs_approving() {
+    async fn a_rooted_turn_is_asked_about_rather_than_parked_when_something_needs_approving() {
         let state = test_state().await;
         let app = test_router(state.clone());
         let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
@@ -2978,7 +3272,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.decision, "asking");
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
             .fetch_one(&state.pool)
@@ -2986,13 +3280,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             status, "running",
-            "the conversation was terminated by a refusal"
+            "the conversation was terminated by a question"
         );
         let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(proposals, 0, "a refusal left a proposal nobody can resume");
+        assert_eq!(proposals, 0, "a question left a proposal nobody can resume");
     }
 
     /// The barrier follows the tools. Without this the rule would hold on the MCP side and be walked

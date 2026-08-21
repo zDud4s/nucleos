@@ -168,6 +168,29 @@ export interface Transcript {
    * exist. They leave this list by becoming turns, on their own.
    */
   queued: Waiting[];
+  /**
+   * What this conversation is waiting to be allowed to do, which is nearly
+   * always nothing.
+   *
+   * A turn is HELD while one of these stands: the CLI is sitting on a hook call
+   * and the model behind it, so answering is not a preference somebody gets to
+   * at their leisure. It travels on the transcript because that is what polls at
+   * a turn's own speed while a turn is live, which is exactly when one appears.
+   */
+  asks: Ask[];
+}
+
+/**
+ * One tool call this conversation is being held on.
+ *
+ * `detail` is the one argument worth showing beside the name — a command, a
+ * path — and deliberately not the whole input: a `Write` carries the file it is
+ * writing, and a window that printed that argument would print the file.
+ */
+export interface Ask {
+  id: string;
+  tool: string;
+  detail: string | null;
 }
 
 /**
@@ -286,6 +309,7 @@ export function useChatTranscript(chatId: string | null) {
         handed: Exchange[];
         turns: AssistantTurnRow[];
         queued: Waiting[];
+        asks: Ask[];
       }>(
         `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
       );
@@ -297,6 +321,7 @@ export function useChatTranscript(chatId: string | null) {
       return {
         handed: read.handed ?? [],
         queued: read.queued ?? [],
+        asks: read.asks ?? [],
         turns: merge(fresh, local),
       };
     },
@@ -447,6 +472,10 @@ export function useSendMessage(chatId: string) {
       queryClient.setQueryData<Transcript>(keys.chats.detail(chatId), (current) => ({
         handed: current?.handed ?? [],
         queued: current?.queued ?? [],
+        // Carried through for the reason the two above are, and it matters more: a question this
+        // conversation is being HELD on, blanked by an optimistic write, would take the answer
+        // buttons off the screen while the turn behind them went on waiting.
+        asks: current?.asks ?? [],
         turns: merge(current?.turns ?? [], [optimistic]),
       }));
       // The list's "thinking…" reading and its `waiting` count both depend on
@@ -611,6 +640,30 @@ export function useWireChatTools(chatId: string) {
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+    },
+  });
+}
+
+/**
+ * Say whether a held tool call may go ahead.
+ *
+ * There is a turn waiting on this answer, and a window of about forty-five
+ * seconds before the daemon refuses on its own — so the transcript is
+ * invalidated at once rather than on the next poll, and a 404 (the question
+ * timed out, or the turn moved on) is not worth showing: the refetch that
+ * follows says so by the question no longer being there.
+ */
+export function useAnswerAsk(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, allow }: { id: string; allow: boolean }) =>
+      apiFetch<void>(`/assistant/asks/${encodeURIComponent(id)}`, {
+        method: "POST",
+        body: JSON.stringify({ allow }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
     },
   });
 }

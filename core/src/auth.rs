@@ -120,6 +120,17 @@ impl ApiTokenLevel {
 /// The only route a run token opens, and the reason a run token exists.
 const HOOK_ROUTE: &str = "/hooks/pretooluse-decision";
 
+/// The second half of the same conversation, and the only other door a run has.
+///
+/// The gate above answers in milliseconds because the hook can only wait five seconds. A tool call
+/// somebody has to say yes to cannot be answered in five seconds, so the gate says `asking` and the
+/// hook comes back here to wait — which is a call that BLOCKS, and therefore had to be its own
+/// route rather than a slower version of the first.
+///
+/// A run reaches only its own question: `hooks::wait_for_run` finds the ask by the run id the key
+/// names, and a run has at most one tool call in flight because the hook that asks is synchronous.
+const ASK_WAIT_ROUTE: &str = "/hooks/ask-wait";
+
 /// The email sidecar's whole daemon surface: report what it fetched, and ask where it got to.
 ///
 /// Two routes, and that is not a simplification — `daemon/client.go` builds a URL in exactly two
@@ -287,7 +298,7 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     match scope {
         Scope::Control => true,
-        Scope::Run(_) => method == Method::POST && path == HOOK_ROUTE,
+        Scope::Run(_) => method == Method::POST && (path == HOOK_ROUTE || path == ASK_WAIT_ROUTE),
         Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
         Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
         Scope::TeamRun(_) => route_is_listed(TEAM_ROUTES, method, path),
@@ -771,6 +782,7 @@ mod tests {
             // A stand-in for the real gate route: these tests are about who may reach it, and the
             // path is what `permits` matches on.
             .route(HOOK_ROUTE, post(|| async { "decided" }))
+            .route(ASK_WAIT_ROUTE, post(|| async { "waited" }))
             .route("/proposals/{id}/approve", post(|| async {}))
             .route("/worktrees/{run_id}/release", post(|| async {}))
             // All three, because the point of the test below is that they are graded differently:
@@ -1041,6 +1053,14 @@ mod tests {
             status_of(&app, "POST", HOOK_ROUTE, &run_token).await,
             StatusCode::OK,
             "a run must still be able to ask the gate about its own tool call"
+        );
+        // The second half of that same question. The gate answers in milliseconds because the hook
+        // can only wait five seconds; a call somebody has to say yes to comes back here instead, and
+        // this call blocks until they do.
+        assert_eq!(
+            status_of(&app, "POST", ASK_WAIT_ROUTE, &run_token).await,
+            StatusCode::OK,
+            "a run must be able to wait for the answer it was told to wait for"
         );
         // 403, not 401: it authenticated. It is simply not allowed to approve anything.
         assert_eq!(

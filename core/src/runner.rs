@@ -644,7 +644,7 @@ const DETAIL_LIMIT: usize = 120;
 /// A fixed list of keys tried in order, rather than "the first string in the object": the input
 /// keys belong to the tools, and an unknown tool would otherwise contribute whichever field
 /// happened to be ordered first — a different answer between two runs of the same call.
-fn detail_of(input: &serde_json::Value) -> Option<String> {
+pub(crate) fn detail_of(input: &serde_json::Value) -> Option<String> {
     // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
     // and a tool that also says where it acted must answer with that instead. A key ordered above
     // it would make the sentence a model wrote win over the file it opened.

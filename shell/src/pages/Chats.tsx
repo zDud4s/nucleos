@@ -11,6 +11,7 @@ import {
   useSetChatProject,
   useWireChatTools,
   useWireIdeSessionTools,
+  useAnswerAsk,
   useChatCommands,
   useChatFiles,
   useChatProject,
@@ -27,6 +28,7 @@ import {
   type ChatSummary,
   type Command,
   type Exchange,
+  type Ask,
   type Mention,
   type Waiting,
   type IdeSession,
@@ -591,6 +593,10 @@ function ChatDetail({
       )}
       {/* Below the transcript and above the box, which is where these words are in time: said
           after everything above them, and not yet said at all. */}
+      {/* Above what is waiting to be said, because this is what everything else is waiting ON:
+          a turn is held while a question stands, and the queue behind it cannot move until it is
+          answered. */}
+      <Asking asks={transcript.data?.asks ?? []} chatId={chatId} />
       <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
 
       <Composer chatId={chatId} />
@@ -1012,6 +1018,58 @@ function HowItContinued({
  * No control to cancel one, and that is a gap rather than a decision: the daemon can drop a queued
  * message, nothing here asks it to yet.
  */
+/**
+ * What this conversation is waiting to be allowed to do.
+ *
+ * The wall this removes: the classifier sends everything not provably read-only for approval, a
+ * conversation cannot park a proposal — one expects a worktree run to resume into and a chat has
+ * none — so the answer used to be a refusal telling the person to go and do it somewhere else.
+ * There was nowhere else. It is their window and they are looking at it, and the honest reply to
+ * somebody who is watching is a question.
+ *
+ * Urgent on purpose. A turn is held while this stands and the daemon refuses on its own after about
+ * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
+ * where the next thing would have appeared rather than tucked away somewhere tidy.
+ */
+function Asking({ asks, chatId }: { asks: Ask[]; chatId: string }) {
+  const answer = useAnswerAsk(chatId);
+  if (asks.length === 0) return null;
+  return (
+    <ul className="chats-asking" aria-label="Waiting to be allowed">
+      {asks.map((ask) => (
+        <li key={ask.id} className="chats-asking-line">
+          <p className="chats-asking-what" role="status">
+            this conversation wants to run <b>{ask.tool}</b>
+            {ask.detail !== null && (
+              <>
+                {" "}
+                — <code className="chats-asking-detail">{ask.detail}</code>
+              </>
+            )}
+          </p>
+          <div className="chats-asking-answer">
+            <Button
+              type="button"
+              intent="go"
+              disabled={answer.isPending}
+              onClick={() => answer.mutate({ id: ask.id, allow: true })}
+            >
+              Allow it
+            </Button>
+            <Button
+              type="button"
+              disabled={answer.isPending}
+              onClick={() => answer.mutate({ id: ask.id, allow: false })}
+            >
+              Refuse
+            </Button>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
   const drop = useDropQueued(chatId);
   if (queued.length === 0) return null;

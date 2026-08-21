@@ -28,6 +28,7 @@ import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
+  Ask,
   ChatProject,
   ChatSummary,
   Command,
@@ -132,6 +133,8 @@ function chatsFetch(
     commands?: Record<string, Command[]>;
     /** What is waiting to be said to each conversation, by chat id. */
     queued?: Record<string, Array<{ id: number; text: string }>>;
+    /** What each conversation is being held on, by chat id. */
+    asks?: Record<string, Ask[]>;
     /**
      * Where each conversation runs and whether that gives it tools, by chat id.
      *
@@ -219,6 +222,7 @@ function chatsFetch(
       return {
         handed: opts.handed?.[match[1]] ?? [],
         queued: opts.queued?.[match[1]] ?? [],
+        asks: opts.asks?.[match[1]] ?? [],
         turns: transcripts[match[1]] ?? [],
       };
     }
@@ -424,6 +428,70 @@ describe("Chats - an empty list", () => {
 
     expect(await screen.findByRole("heading", { name: "No conversations yet" })).toBeDefined();
     expect(await screen.findByText(/Telegram/)).toBeDefined();
+  });
+});
+
+describe("Chats - a conversation asking to be allowed something", () => {
+  // The wall this removes. The classifier sends everything not provably read-only for approval, and
+  // a conversation cannot park a proposal, so the answer used to be a refusal telling the person to
+  // go and do it somewhere else — with nowhere else to go.
+  it("shows what it wants to run, and sends the answer", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, asked: "publica isto", status: "running" })] },
+        { asks: { "c-1": [{ id: "ask-1", tool: "Bash", detail: "npm publish" }] } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const asking = await screen.findByRole("list", { name: "Waiting to be allowed" });
+    expect(within(asking).getByText("Bash")).toBeTruthy();
+    expect(within(asking).getByText("npm publish")).toBeTruthy();
+
+    fireEvent.click(within(asking).getByRole("button", { name: /allow it/i }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/asks/ask-1",
+      );
+      expect(sent).toBeDefined();
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({ allow: true });
+    });
+  });
+
+  it("sends a refusal when that is the answer", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, asked: "publica isto", status: "running" })] },
+        { asks: { "c-1": [{ id: "ask-1", tool: "Bash", detail: "npm publish" }] } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const asking = await screen.findByRole("list", { name: "Waiting to be allowed" });
+    fireEvent.click(within(asking).getByRole("button", { name: /refuse/i }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/asks/ask-1",
+      );
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({ allow: false });
+    });
+  });
+
+  // A question on every conversation would be a window nobody can read. Most turns ask nothing.
+  it("says nothing at all when nothing is being asked", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByRole("list", { name: "Waiting to be allowed" })).toBeNull();
   });
 });
 

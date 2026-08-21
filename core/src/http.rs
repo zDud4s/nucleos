@@ -229,6 +229,10 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/chats/{chat_id}/commands",
             get(get_chat_commands),
         )
+        // Answering a question a turn is being held on. Under `assistant` and not under `hooks`
+        // because this is the person speaking, not the CLI: the hook's own half carries a run's key
+        // and lives beside the gate.
+        .route("/assistant/asks/{ask_id}", post(post_ask_answer))
         // Where a conversation runs, and whether that gives it tools. Its own read because it is a
         // filesystem question: answering it on the list would be a stat per conversation per poll,
         // for rows nobody is looking at.
@@ -466,6 +470,9 @@ pub fn build_router(state: AppState) -> Router {
             post(post_file_upload).layer(DefaultBodyLimit::max(crate::files::MAX_UPLOAD_BYTES)),
         )
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+        // The blocking half of the same conversation. Beside the gate because it carries the same
+        // key and answers the same question, a moment later.
+        .route("/hooks/ask-wait", post(post_ask_wait))
         // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
         // construction rather than by a list: `permits` gives `Control` everything and answers every
         // other scope from an allowlist, so a route absent from all of them is reachable by the
@@ -3552,6 +3559,12 @@ struct TranscriptOut {
     /// Here rather than on its own route because it belongs to the same picture and moves on the
     /// same poll: the window draws it under the last turn, where the answer will land.
     queued: Vec<crate::chats::Waiting>,
+    /// What this conversation is waiting to be allowed to do, which is nearly always nothing.
+    ///
+    /// Here for the reason `queued` is, and one more: this is polled at a turn's own cadence while a
+    /// turn is live, which is exactly when a question can appear — a route of its own would need a
+    /// second poll at the same speed to say "nothing" almost every time.
+    asks: Vec<crate::hooks::Ask>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3625,6 +3638,68 @@ async fn get_chat_commands(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(CommandsOut { commands }))
+}
+
+/// What the window says when somebody answers for a held tool call.
+#[derive(serde::Deserialize)]
+struct AskAnswer {
+    allow: bool,
+}
+
+/// Answers a tool call a conversation is being held on.
+///
+/// 404 when there was nothing to answer, which covers both ways that happens: the window is a poll
+/// behind and the turn has moved on, or the question timed out while somebody was reading it. The
+/// same answer on purpose — the caller's next read tells them which.
+async fn post_ask_answer(
+    Path(ask_id): Path<String>,
+    Json(body): Json<AskAnswer>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::hooks::answer_ask(&ask_id, body.allow) {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// What the hook says while it waits.
+#[derive(serde::Deserialize)]
+struct AskWaitRequest {
+    run_id: i64,
+}
+
+/// Holds the hook's call open until somebody answers for this turn's tool call.
+///
+/// The one route here that is SUPPOSED to block. The CLI is sitting on a hook call, the model is
+/// sitting behind that, and a person is being asked a question — so the honest shape is a call that
+/// does not return until there is an answer or the window closes.
+///
+/// Refuses on every path that is not a clear yes: nobody answered, the question is gone, this run
+/// has none. A turn that cannot be allowed is refused, never allowed by default.
+async fn post_ask_wait(
+    Extension(scope): Extension<crate::auth::Scope>,
+    Json(body): Json<AskWaitRequest>,
+) -> Json<crate::hooks::Decision> {
+    // The key decides which turn this is, for the reason `pretooluse_decision` gives at length: the
+    // body is a claim, and a CLI kept alive across turns claims whatever it was spawned with.
+    let run_id = match scope {
+        crate::auth::Scope::Run(id) => id,
+        _ => body.run_id,
+    };
+
+    match crate::hooks::wait_for_run(run_id, crate::hooks::ASK_WINDOW).await {
+        Some(true) => Json(crate::hooks::Decision {
+            decision: "allow".to_owned(),
+            reason: "you allowed this".to_owned(),
+        }),
+        Some(false) => Json(crate::hooks::Decision {
+            decision: "deny".to_owned(),
+            reason: "you refused this".to_owned(),
+        }),
+        None => Json(crate::hooks::Decision {
+            decision: "deny".to_owned(),
+            reason: "nobody answered for this in time".to_owned(),
+        }),
+    }
 }
 
 /// Where a conversation runs, and whether that gives its turns tools.
@@ -3839,6 +3914,7 @@ async fn get_assistant_chat(
     Ok(Json(TranscriptOut {
         handed,
         queued,
+        asks: crate::hooks::asks_for(&chat_id),
         turns: turns
             .into_iter()
             .map(|turn| {
@@ -9243,6 +9319,100 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    /// A held tool call is released by the window, and the hook is told what the person said.
+    ///
+    /// The whole shape end to end: the gate says `asking` and returns at once, the hook comes back
+    /// to wait, the window answers, and the waiting call is what carries that answer to the CLI. It
+    /// is the one route in this daemon that is supposed to block, so the test blocks too.
+    #[tokio::test]
+    async fn a_held_tool_call_is_released_by_the_window() {
+        for (allowed, expected) in [(true, "allow"), (false, "deny")] {
+            let state = test_state().await;
+            let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+                .await
+                .unwrap();
+            let run_id = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+                 VALUES ('x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
+            )
+            .bind(&chat_id)
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let key = crate::auth::mint_chat_token(&state.pool, &chat_id)
+                .await
+                .unwrap();
+            let ask_id =
+                crate::hooks::ask_about(&chat_id, run_id, "Bash", Some("npm publish".into()));
+
+            // The hook, sitting on its call.
+            let waiting = tokio::spawn({
+                let state = state.clone();
+                let key = key.clone();
+                async move {
+                    let response = build_router(state)
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/hooks/ask-wait")
+                                .header("Authorization", format!("Bearer {key}"))
+                                .header("content-type", "application/json")
+                                .body(Body::from(format!(r#"{{"run_id":{run_id}}}"#)))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    json_body(response).await
+                }
+            });
+
+            // The person, a moment later.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let answered = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/assistant/asks/{ask_id}"))
+                        .header("Authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"allow":{allowed}}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(answered.status(), StatusCode::NO_CONTENT);
+
+            let decision = waiting.await.unwrap();
+            assert_eq!(decision["decision"], expected);
+        }
+    }
+
+    /// Answering a question that is no longer there is a 404 and not a silent success.
+    ///
+    /// It happens both ways round — the window is a poll behind and the turn moved on, or the
+    /// question timed out while somebody was reading it — and a `204` over nothing would be the API
+    /// saying "done" about a tool call that was refused a moment earlier.
+    #[tokio::test]
+    async fn answering_a_question_that_is_gone_says_so() {
+        let state = test_state().await;
+
+        let answered = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/asks/no-such-question")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"allow":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answered.status(), StatusCode::NOT_FOUND);
     }
 
     /// A conversation says where it is and whether that actually gives it tools.

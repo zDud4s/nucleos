@@ -183,6 +183,38 @@
  * `paused` and not `danger`: nothing is broken and nothing is about to go wrong. It is a session
  * that will continue with less than you would expect, and the button beside it is the fix.
  */
+/* A tool call this conversation is being held on. Drawn where the next thing would have
+   appeared, and not tucked away: a turn is stopped while this stands, and the daemon refuses on its
+   own in about forty-five seconds. */
+.chats-asking {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--tone-attention-border, var(--tone-paused-border));
+  border-radius: var(--radius-md);
+  background: var(--tone-attention-bg, var(--tone-paused-bg));
+  list-style: none;
+}
+
+.chats-asking-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.chats-asking-detail {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.chats-asking-answer {
+  display: flex;
+  gap: var(--space-2);
+}
+
 /* What a conversation can do, said in the conversation itself. The same frame as the editor door's
    warning, because it is the same situation reached from the other side. */
 .chats-project {
