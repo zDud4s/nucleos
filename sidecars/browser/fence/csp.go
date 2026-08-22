@@ -16,9 +16,29 @@ const HeaderName = "Content-Security-Policy"
 //     measured 'none' holding for both, and measured a blob: document inheriting it from its parent,
 //     which is the only thing that contains a blob: navigation at all.
 //
-//   - form-action 'none' closes form submission, which spec §6.2 blocks by name and independently of
-//     method. Belt to the method filter's braces: a GET form is still a submission, and the method
-//     filter would wave it through.
+//   - form-action http: https: is the one directive here that was LOOSENED, and the sentence it
+//     replaces is worth keeping: it read 'none', and called itself "belt to the method filter's
+//     braces: a GET form is still a submission, and the method filter would wave it through".
+//
+//     That belt was the only part of §6.2 decided by what an element IS rather than by what leaves
+//     the machine, inside a section titled "the boundary is the network, not the intent". It made
+//     <a href="/delete?id=1"> allowed and <form method=get action="/search"> refused, though both
+//     are a GET to a listed origin and neither can send a byte the other cannot. Submitting a GET
+//     form is navigating to action?fields, which the agent could already do with goto if it were
+//     willing to build the url by hand — so what the belt cost was every search box, filter and
+//     pager on the web, and what it bought was a url the agent had to assemble itself.
+//
+//     It also cost determinism. A POST form was stopped twice, here and by the method filter, and
+//     the two raced inside Chrome: when this one won, the renderer abandoned the submission before
+//     a request existed, so Fetch never paused and the agent heard the weaker of the two refusals
+//     (chrome/csp.go exists because of that). A same-origin POST now meets exactly one rule.
+//
+//     What is left is a scheme rule with a thin, stated job: a form may only submit somewhere the
+//     fence can SEE it. Where it may go stays the allowlist's decision, and whether the method has
+//     a consequence stays the method filter's — both of which govern a form submission exactly as
+//     they govern a goto. Chrome already refuses javascript: and data: form actions on its own, so
+//     on today's build this closes blob: and nothing else. Kept for the same reason as webrtc
+//     'block' below: one directive is cheap, and a redundant one costs nothing but this paragraph.
 //
 //   - object-src 'none' and base-uri 'none' are the two directives whose absence quietly re-opens the
 //     others: a plugin document is not governed by connect-src, and a rewritten <base> changes what
@@ -32,7 +52,7 @@ const HeaderName = "Content-Security-Policy"
 // What is deliberately NOT here: script-src, img-src, style-src. The fence bounds what leaves the
 // machine, not what the page renders. A page that cannot run its own scripts is a page the agent
 // cannot read, and the taint barrier of §6.0 already assumes everything it reads is hostile.
-const Directives = "connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'; webrtc 'block'"
+const Directives = "connect-src 'none'; form-action http: https:; object-src 'none'; base-uri 'none'; webrtc 'block'"
 
 // Header is one response header, in the shape CDP's Fetch.continueResponse wants.
 type Header struct {

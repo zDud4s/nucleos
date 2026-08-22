@@ -19,6 +19,10 @@ func snapshotFrom(nodes []axNode) ([]browser.Element, map[string]int64, bool) {
 	return elements, backends(entry.refs), truncated
 }
 
+// testPage is where these trees pretend to have come from, which is what a link's address is
+// shortened against.
+const testPage = "https://example.org/here"
+
 // oneDocument wraps a node list as a page with nothing framed in it, which is what every test in
 // this file is about — the framing is measured against real Chromium in the gate, because a fake
 // tree cannot have a process boundary in it.
@@ -282,19 +286,19 @@ func TestAChangesOnlyReadCarriesWhatMovedAndWhatLeft(t *testing.T) {
 // sliceFrom is snapshotFrom with the prose cursor, for the tests that are about continuation.
 // collectParts keeps the older tests reading the way they did, before one snapshot had two budgets.
 func collectParts(root *tree, req browser.SnapshotRequest) ([]found, bool) {
-	read := collect(root, req)
+	read := collect(root, req, testPage)
 	return read.elements, read.truncated
 }
 
 func sliceFrom(nodes []axNode, textFrom int) ([]browser.Element, bool, int) {
-	read := collect(oneDocument(nodes), browser.SnapshotRequest{TextFrom: textFrom})
+	read := collect(oneDocument(nodes), browser.SnapshotRequest{TextFrom: textFrom}, testPage)
 	elements, _ := (&Driver{}).name(newTestSession(), read.elements, false)
 	return elements, read.truncated, read.textNext
 }
 
 // controlsFrom is sliceFrom for the other budget.
 func controlsFrom(nodes []axNode, from int) ([]browser.Element, bool, int) {
-	read := collect(oneDocument(nodes), browser.SnapshotRequest{ControlsFrom: from})
+	read := collect(oneDocument(nodes), browser.SnapshotRequest{ControlsFrom: from}, testPage)
 	elements, _ := (&Driver{}).name(newTestSession(), read.elements, false)
 	return elements, read.truncated, read.controlsNext
 }
@@ -550,5 +554,86 @@ func TestALinkInACellKeepsItsRefAndItsPlaceInTheRow(t *testing.T) {
 	}
 	if linkRef == "" {
 		t.Error("the link inside the cell lost its ref, so the table can be read and not used")
+	}
+}
+
+// A row whose only editable cell has no label, which is what an ordinary application's table looks
+// like: the item names the row and the box holds a number.
+func unnamedCell() []axNode {
+	return []axNode{
+		{NodeID: "r", Role: axValue{Value: "row"}, ChildIDs: []string{"c1", "c2", "c3"}, BackendDOMNodeID: 1},
+		{NodeID: "c1", Role: axValue{Value: "cell"}, ChildIDs: []string{"t1"}, BackendDOMNodeID: 2},
+		{NodeID: "t1", Role: axValue{Value: "StaticText"}, Name: axValue{Value: "Cabo HDMI"}, BackendDOMNodeID: 3},
+		{NodeID: "c2", Role: axValue{Value: "cell"}, ChildIDs: []string{"in"}, BackendDOMNodeID: 4},
+		{NodeID: "in", Role: axValue{Value: "textbox"}, Value: axValue{Value: "7"}, BackendDOMNodeID: 5},
+		{NodeID: "c3", Role: axValue{Value: "cell"}, ChildIDs: []string{"b"}, BackendDOMNodeID: 6},
+		{NodeID: "b", Role: axValue{Value: "button"}, Name: axValue{Value: "x"}, BackendDOMNodeID: 7},
+	}
+}
+
+// TestAnUnnamedBoxStillEarnsARef.
+//
+// The rule used to be "no accessible name, no ref", and its comment argued the case of an unnamed
+// BUTTON: nothing to say about what pressing it does, so offering it invites a guess. True there,
+// and applied to a class it does not fit. A quantity field in a table row is not ambiguous — the row
+// says what it is — and dropping it left the agent with no way to type in it and no way to report
+// that a field was there.
+//
+// Both directions asserted, because the fix is a line and the wrong version of it lets everything
+// through: the unnamed box comes back, the unnamed button still does not.
+func TestAnUnnamedBoxStillEarnsARef(t *testing.T) {
+	nodes := append(unnamedCell(), axNode{
+		NodeID: "ghost", Role: axValue{Value: "button"}, BackendDOMNodeID: 8,
+	})
+
+	collected, _ := collectParts(oneDocument(nodes), browser.SnapshotRequest{})
+	elements, _ := (&Driver{}).name(newTestSession(), collected, false)
+
+	var boxes, buttons int
+	for _, one := range elements {
+		if one.Ref == "" {
+			continue
+		}
+		switch one.Role {
+		case "textbox":
+			boxes++
+			if one.Value != "7" {
+				t.Fatalf("the box came back without what is in it: %+v", one)
+			}
+		case "button":
+			buttons++
+			if one.Name == "" {
+				t.Fatal("an unnamed button earned a ref; there is nothing to say about what " +
+					"pressing it would do, which is the whole reason the name rule exists")
+			}
+		}
+	}
+	if boxes != 1 {
+		t.Fatalf("the unnamed box earned no ref, so there is no way to type in it: %+v", elements)
+	}
+	if buttons != 1 {
+		t.Fatalf("buttons = %d, want the one named x: %+v", buttons, elements)
+	}
+}
+
+// TestARowSaysWhatIsInItsUnnamedBox.
+//
+// The other half of the same change, and without it the fix trades one hole for another. rowLine's
+// own comment says a row with a gap where a control was is worse than a word repeated — and letting
+// unnamed controls through reintroduced exactly that gap, because a control contributes its NAME to
+// the row and these have none. They contribute what they HOLD instead.
+func TestARowSaysWhatIsInItsUnnamedBox(t *testing.T) {
+	collected, _ := collectParts(oneDocument(unnamedCell()), browser.SnapshotRequest{})
+
+	var row string
+	for _, one := range collected {
+		if one.element.Role == "row" {
+			row = one.element.Name
+		}
+	}
+
+	if row != "Cabo HDMI | 7 | x" {
+		t.Fatalf("row = %q, want the box's contents where the box is; a row that reads "+
+			"\"Cabo HDMI |  | x\" hides the field it is about", row)
 	}
 }

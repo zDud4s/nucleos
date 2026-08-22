@@ -69,17 +69,42 @@ func (d *Driver) onFetchPaused(event cdp.Event) {
 	d.answerRequest(ctx, event.Session, paused)
 }
 
-func (d *Driver) answerRequest(ctx context.Context, session cdp.SessionID, paused fetchPaused) {
-	verdict := fence.Decide(d.policy, fence.Request{
+func (d *Driver) answerRequest(ctx context.Context, on cdp.SessionID, paused fetchPaused) {
+	request := fence.Request{
 		Method:       paused.Request.Method,
 		URL:          paused.Request.URL,
 		ResourceType: paused.ResourceType,
 		Headers:      paused.Request.Headers,
-	})
+	}
+
+	// The write rule's fifth condition, and the only part of the fence that is about an instant
+	// rather than about configuration: was this submission caused by an act? Looked up before the
+	// decision and CONSUMED after it, so a POST refused for something else — the wrong origin, a
+	// profile with no grant — does not also burn the window the act opened.
+	//
+	// NeedsWriteWindow rather than a method check written out here, so this side cannot drift from
+	// the side that judges: a request Decide judges by the write rule and that arrives with Armed
+	// unfilled would be refused for a reason that is true of the field and false of the world.
+	var owner *session
+	var window *writeWindow
+	if fence.NeedsWriteWindow(request) {
+		owner, window = d.armedWrite(paused.FrameID, fence.WriteOriginOf(request.URL))
+		if window != nil {
+			request.Armed = window.origin
+		}
+	}
+
+	verdict := fence.Decide(d.policy, request)
 	if !verdict.Allow {
-		d.recordRefusal(session, verdict)
-		d.failRequest(ctx, session, paused.RequestID)
+		d.recordRefusal(on, verdict)
+		d.failRequest(ctx, on, paused.RequestID)
 		return
+	}
+	if window != nil {
+		// Only now, and only here. What is written down is what LEFT — a submission the fence
+		// stopped is a refusal, and the record of what an agent did as the person must not contain
+		// things it did not do.
+		d.takeWrite(owner, window, request.Method, request.URL)
 	}
 
 	params := map[string]any{"requestId": paused.RequestID}
@@ -90,7 +115,7 @@ func (d *Driver) answerRequest(ctx context.Context, session cdp.SessionID, pause
 		// asset would double the interception cost of every page for a check that cannot fire.
 		params["interceptResponse"] = true
 	}
-	d.answerOrFail(ctx, session, paused.RequestID, "Fetch.continueRequest", params)
+	d.answerOrFail(ctx, on, paused.RequestID, "Fetch.continueRequest", params)
 }
 
 func (d *Driver) answerResponse(ctx context.Context, session cdp.SessionID, paused fetchPaused) {
@@ -103,6 +128,14 @@ func (d *Driver) answerResponse(ctx context.Context, session cdp.SessionID, paus
 		d.recordRefusal(session, verdict)
 		d.failRequest(ctx, session, paused.RequestID)
 		return
+	}
+
+	// Before the CSP branch and on a condition of its own, because the two ask different questions:
+	// the header goes on a document that has not got one yet, and the status is worth keeping from
+	// EVERY document response — including one already carrying the fence, which is the same page
+	// coming through a second time.
+	if isDocumentType(paused.ResourceType) && paused.ResponseStatusCode != nil {
+		d.recordStatus(paused.FrameID, *paused.ResponseStatusCode)
 	}
 
 	params := map[string]any{"requestId": paused.RequestID}
@@ -169,6 +202,47 @@ type recordedRefusal struct {
 // refusalCap bounds the record for the same reason the proxy's does: a page in a loop generates
 // refusals faster than anything reads them.
 const refusalCap = 256
+
+// recordStatus keeps the HTTP status of the PAGE.
+//
+// # Why the frame id and not the session
+//
+// Every other recorder here resolves cdpToSession[event.Session] and this one cannot: Fetch.enable
+// is on the BROWSER session (Connect, and spec §5.8 for why it has to be), so every paused request
+// in the whole browser arrives under that one id. It names no page. A first version looked the
+// session up anyway, found nothing, and quietly recorded no status at all — which the gate caught
+// only because it asserted a number rather than the absence of one.
+//
+// The frame id does name a page, and it is the only thing in the event that does. It is minted per
+// frame across the browser, and a session's main frame is fixed when the session is created and
+// never reassigned, so matching on it keeps meaning the same thing for the life of the session and
+// across every navigation in it.
+//
+// # Why no match is the right answer for a frame
+//
+// The status is the PAGE's. An advertisement, a widget or a tracker that 404s inside an iframe says
+// nothing about whether the article loaded, and reporting it as the page's status would be worse
+// than reporting nothing: the agent would abandon a page that is perfectly fine, with the reading
+// agreeing. A subframe's id matches no session's main frame, so it falls out of this loop unrecorded
+// — the exclusion is the loop's ordinary behaviour rather than a rule that could be forgotten.
+func (d *Driver) recordStatus(frame string, status int) {
+	if frame == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, entry := range d.sessions {
+		if entry.frameID != frame {
+			continue
+		}
+		// Overwritten rather than accumulated, and deliberately NOT cleared when the document
+		// changes: a redirect is two document responses on one frame and the last one is what
+		// arrived, and the response reaches here BEFORE the navigation finishes — so clearing on
+		// navigation would throw away the status of the page being navigated to.
+		entry.status = status
+		return
+	}
+}
 
 func (d *Driver) recordRefusal(session cdp.SessionID, verdict fence.Verdict) {
 	d.mu.Lock()

@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +104,200 @@ func newSite(t *testing.T) *site {
 		s.note(r)
 		fmt.Fprint(w, "ok")
 	})
+	// A menu that opens on pointerdown and on nothing else, which is how a great many real components
+	// are built: it is what makes them feel immediate. Under a click synthesised by calling
+	// element.click() this menu never opened, and the act still said done.
+	mux.HandleFunc("/pointer", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>pointer</title><body>
+			<h1>Messages</h1>
+			<button id=go>Actions</button>
+			<div id=menu></div>
+			<script>
+			document.getElementById('go').addEventListener('pointerdown', () => {
+				document.getElementById('menu').innerHTML = '<button id=item>Archive</button>';
+			});
+			</script>`)
+	})
+
+	// A menu that opens on hover and on nothing else. There is no hover verb, and this page is the
+	// reason one is not needed: moving the pointer onto the parent before pressing it is part of
+	// clicking it, so the submenu is open by the time the next reading is taken.
+	mux.HandleFunc("/hover", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>hover</title><body>
+			<h1>Documents</h1>
+			<button id=parent>File</button>
+			<div id=menu></div>
+			<script>
+			document.getElementById('parent').addEventListener('mouseover', () => {
+				document.getElementById('menu').innerHTML = '<button id=item>Export</button>';
+			});
+			</script>`)
+	})
+
+	// A button under a consent banner. The accessibility tree carries the button either way — an
+	// overlay is a painting decision and the tree is not about painting — so the reading shows a
+	// button the agent cannot actually reach.
+	mux.HandleFunc("/covered", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>covered</title><body>
+			<h1>Settings</h1>
+			<button id=go onclick="document.title = 'saved'">Save</button>
+			<div id=banner style="position:fixed; inset:0; background:rgba(0,0,0,0.6); color:white">
+				We use cookies
+			</div>`)
+	})
+
+	// A 404 that looks like a page, because that is what a 404 IS. A heading, a sentence, a search
+	// box — nothing about the reading of it says the request failed, which is the entire reason the
+	// status has to be carried separately.
+	mux.HandleFunc("/missing", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `<!doctype html><title>Not found</title><body>
+			<h1>We could not find that</h1>
+			<p>Try searching for it instead.</p>
+			<label>Search <input id=q name=q></label>`)
+	})
+
+	// A page that asks the PERSON a question, which is a thing the agent is not. confirm() blocks the
+	// renderer until somebody answers the dialog, and with Page.enable on (chrome/driver.go) that
+	// somebody has to be this driver: Chromium hands the dialog to the attached client and waits.
+	//
+	// The title says which way it was answered, because "the dialog went away" is not the fact worth
+	// measuring — WHICH answer the page received is, and a wrong one confirms deletions.
+	mux.HandleFunc("/dialog", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>dialog</title><body>
+			<h1>Settings</h1>
+			<button id=go onclick="document.title = confirm('Delete everything?') ? 'accepted' : 'dismissed'">Delete</button>`)
+	})
+	// The other half of the same rule: a search box. Same page shape as /form, same button, and the
+	// only difference is the one the fence is supposed to care about. It carries a filled field
+	// rather than an empty form because what has to arrive at the server is the FIELD — a submission
+	// that navigates to /found and loses the query is a submission in name only.
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>search</title>
+			<form id=f method=get action="/found">
+				<label>Query <input id=q name=q value="invoices"></label>
+				<button id=go type=submit>Search</button>
+			</form>`)
+	})
+	mux.HandleFunc("/found", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>found</title><h1>Results for %s</h1>`,
+			template.HTMLEscapeString(r.URL.Query().Get("q")))
+	})
+	// ---- writing ---------------------------------------------------------------------------
+	//
+	// The pages the write rule is measured against. Every one of them is a form that would be
+	// perfectly ordinary on a real site — a reply box, a page that saves itself, a form aimed
+	// somewhere else — and the only thing separating them is which of the five conditions holds.
+
+	// A reply form. The password field is not decoration: it is what the record has to name and must
+	// never carry, and a form with one is the ordinary case rather than an exotic one.
+	mux.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>write</title>
+			<form id=f method=post action="/wrote">
+				<label>Body <input id=body name=body value="looks fine to me"></label>
+				<label>Secret <input type=password name=secret value="hunter2"></label>
+				<input type=hidden name=csrf value="t0ken">
+				<button id=go type=submit>Send reply</button>
+			</form>`)
+	})
+	mux.HandleFunc("/wrote", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>wrote</title><h1 id=here>Reply delivered</h1>`)
+	})
+
+	// The same form, submitted by the PAGE and not by anybody acting on it. This is what hostile
+	// content inside an origin the person granted looks like from the fence's side, and it is the
+	// only reason the grant is not the whole rule.
+	mux.HandleFunc("/selfwrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>selfwrite</title><h1 id=here>selfwrite</h1>
+			<form id=f method=post action="/wrote"><input name=body value="x"></form>
+			<script>setTimeout(() => document.getElementById('f').submit(), 50);</script>`)
+	})
+
+	// A form on this origin aimed at another one. The exfiltration shape §6.2 exists to close, and
+	// the one no grant turns into something else.
+	mux.HandleFunc("/crosswrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>crosswrite</title>
+			<form id=f method=post action=%q>
+				<input name=body value="everything I just read">
+				<button id=go type=submit>Send reply</button>
+			</form>`, r.URL.Query().Get("to"))
+	})
+
+	// One act, two forms. What makes the window a window and not a switch: the click submits the form
+	// the button belongs to, and that form's own handler slips a second submission through behind it.
+	//
+	// Both target iframes, so neither navigates the page away and both are observable. The button is
+	// INSIDE the first form and is a real submit button, because a button sitting outside every form
+	// arms nothing at all — which is a different rule, tested elsewhere, and would make this page
+	// measure that one instead.
+	mux.HandleFunc("/twowrites", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>twowrites</title>
+			<form id=a method=post action="/wrote" target=one>
+				<input name=body value="one">
+				<button id=go type=submit>Send reply</button>
+			</form>
+			<form id=b method=post action="/alsowrote" target=two><input name=body value="two"></form>
+			<iframe name=one></iframe><iframe name=two></iframe>
+			<script>
+				document.getElementById('a').addEventListener('submit', () => {
+					document.getElementById('b').submit();
+				});
+			</script>`)
+	})
+	mux.HandleFunc("/alsowrote", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		fmt.Fprint(w, "also")
+	})
+
+	// A search that posts. The shape of every chat box and half the search boxes on the web: one
+	// field, no visible button, and Enter is how it is sent.
+	mux.HandleFunc("/keywrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>keywrite</title>
+			<form id=f method=post action="/wrote">
+				<label>Message <input id=q name=message value="on my way"></label>
+			</form>`)
+	})
+
+	// A POST from a script rather than from a form. The path an injection takes without passing
+	// through any act at all, and the reason the ferry stayed GET-only.
+	mux.HandleFunc("/fetchwrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>fetchwrite</title><h1 id=here>fetchwrite</h1>
+			<button id=go>Send reply</button>
+			<script>
+				document.getElementById('go').addEventListener('click', () => {
+					fetch('/wrote', {method: 'POST', body: 'body=x'}).catch(() => {});
+				});
+			</script>`)
+	})
+
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Disposition", `attachment; filename="report.txt"`)
@@ -156,11 +352,13 @@ func newSite(t *testing.T) *site {
 	})
 
 	// A page with one link to wherever the query string says. It exists for the reporting half of
-	// spec §6.2 and not for the blocking half, and the distinction is the whole reason it is a link
-	// and not the form above: the injected CSP carries `form-action 'none'`, so a form POST is
-	// stopped twice over and the two stops race. Nothing in `fence.Directives` bounds a top-level
-	// navigation — there is no `navigate-to` in it — so a click here leaves exactly one mechanism
-	// standing, which is the only way an assertion about WHAT THE AGENT IS TOLD can be deterministic.
+	// spec §6.2 and not for the blocking half, and it was a link and not the form above because the
+	// injected CSP carried `form-action 'none'`, so a form POST was stopped twice over and the two
+	// stops raced. That is no longer true — the directive admits http: and https: now, and a
+	// same-origin POST meets the method rule alone — so the form would serve here too. It stays a
+	// link because nothing in `fence.Directives` bounds a top-level navigation at all (there is no
+	// `navigate-to` in it), which makes this the one channel with a single mechanism standing by
+	// construction rather than by the current value of a directive.
 	// A page with prose, a filled box and a ticked control, for the snapshot group. It is deliberately
 	// ordinary HTML with no ARIA: what matters is what Chromium's own accessibility tree makes of a
 	// page nobody wrote for a machine, which is every page the agent will actually meet.
@@ -222,13 +420,115 @@ func newSite(t *testing.T) *site {
 			<script>
 			document.getElementById('load').addEventListener('click', () => {
 				setTimeout(() => {
-					fetch('/content').then(r => r.text())
+					fetch('/slow-content').then(r => r.text())
 						.then(t => { document.getElementById('app').innerHTML = t; })
 						.catch(e => { new Image().src = '/beacon?what=click-fetch-failed'; });
 				}, 30);
 			});
 			</script>`)
 	})
+	// Two links with the same words and different destinations, which is what a directory looks
+	// like. Plus one that leaves the host, because that is the case where the whole address is the
+	// news rather than the path.
+	mux.HandleFunc("/links", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, PAGE_LINKS, otherHostOf(r))
+	})
+
+	// A box that has the keyboard from the moment the page loads. `press` with no ref goes wherever
+	// focus is, so this is the page that says whether the reading can name it.
+	mux.HandleFunc("/focus", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_FOCUS)
+	})
+
+	// A page whose content is drawn, not written: nothing of it reaches the accessibility tree. A
+	// chart, a map, a PDF viewer. The heading is there so the reading is not empty — an empty one
+	// would be ambiguous with a page that failed to load, and the claim is about a page that
+	// loaded fine and still cannot be read.
+	mux.HandleFunc("/canvas", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_CANVAS)
+	})
+
+	// The two halves of the look-at-a-cross-site-frame measurement, and they are laid out with
+	// absolute coordinates on purpose: the assertion is about WHERE a label lands, so the test has to
+	// know where the thing being labelled is without asking the browser — asking would mean asking
+	// the same process boundary the measurement is about.
+	mux.HandleFunc("/lookframe", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, PAGE_LOOKFRAME, r.URL.Query().Get("src"))
+	})
+	mux.HandleFunc("/lookbutton", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_LOOKBUTTON)
+	})
+
+	// A multipart form with a file input, and a server that records what actually ARRIVED. The whole
+	// upload verb is only worth anything if bytes reach the other end, and the only witness that can
+	// say so is the server — the same rule the write group already follows.
+	mux.HandleFunc("/attach", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_ATTACH)
+	})
+	mux.HandleFunc("/attached", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		if err := r.ParseMultipartForm(4 << 20); err != nil {
+			s.record("attach-not-multipart")
+			http.Error(w, "not multipart", http.StatusBadRequest)
+			return
+		}
+		file, header, err := r.FormFile("document")
+		if err != nil {
+			s.record("attach-no-file")
+			http.Error(w, "no file", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		body, _ := io.ReadAll(file)
+		// The name AND the bytes, so a test can tell "a file arrived" from "the right file arrived".
+		s.record("attach-name=" + header.Filename)
+		s.record("attach-body=" + string(body))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<!doctype html><title>attached</title><h1>Attached</h1>")
+	})
+
+	// A page as crowded as a real application's toolbar: small buttons packed close together, a form
+	// beside them, and a table of rows that each carry their own control. It exists to answer a
+	// question the tidy fixtures cannot — whether the labels a look draws are still LEGIBLE once
+	// there are many of them near each other, which is the failure mode every set-of-marks design
+	// runs into and which no test of "was it labelled" can see.
+	mux.HandleFunc("/dense", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_DENSE)
+	})
+
+	// A page that can be asked, from inside itself, whether the look left anything behind. The
+	// question has to be answered by the DOM rather than by a snapshot, because the overlay is
+	// aria-hidden — so a snapshot would report a clean page whether or not one was still there,
+	// which is exactly the failure that would go unnoticed.
+	mux.HandleFunc("/lookclean", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_LOOKCLEAN)
+	})
+
+	// An endless list: scrolling is what loads more, which is the case that made excluding scroll
+	// from the wait wrong. Two steps for the same reason as /click-render — the first inside the
+	// reaction window, the last well outside it.
+	mux.HandleFunc("/endless", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, PAGE_ENDLESS)
+	})
+
 	// A click that changes the page and asks for NOTHING, which is the half the ferry cannot see: no
 	// request, no navigation, just the page redrawing itself. A menu opening, a route rendering from
 	// data already in memory, a list filtering. The delay is short and real — a framework does not
@@ -251,7 +551,7 @@ func newSite(t *testing.T) *site {
 				setTimeout(() => {
 					app.innerHTML =
 						'<p>Revenue fell by eleven percent, which nobody had forecast.</p>';
-				}, 600);
+				}, 450);
 			});
 			</script>`)
 	})
@@ -275,6 +575,28 @@ func newSite(t *testing.T) *site {
 			flusher.Flush()
 		}
 		<-r.Context().Done()
+	})
+
+	// The same content as /content, and slow on purpose, for the tests whose claim is about WAITING
+	// rather than about reading. An act already spends up to a second and a half waiting for a fence
+	// refusal, so anything a page finishes inside that window is covered whether the wait after it
+	// works or not — and a test written against such a page passes either way.
+	mux.HandleFunc("/slow-content", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		time.Sleep(2500 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<p>Revenue fell by eleven percent, which nobody had forecast.</p>"+
+			"<button id=ok>Approve the write-down</button>")
+	})
+
+	// The rows an endless list loads, and slowly on purpose: longer than the window an act already
+	// spends waiting for a fence refusal. A wait that did not drain what the ferry is carrying returns
+	// before this answers, and the reading shows the list exactly as it was.
+	mux.HandleFunc("/slow-rows", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		time.Sleep(2500 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<p>Revenue fell by eleven percent, which nobody had forecast.</p>")
 	})
 
 	// A neighbouring service, which is what the modern web actually looks like: the page is
@@ -440,9 +762,39 @@ func (s *site) note(r *http.Request) {
 	if r.Header.Get("Upgrade") != "" {
 		label = "UPGRADE " + r.URL.Path
 	}
+	s.record(label)
+}
+
+// record puts an arbitrary observation on the same channel the arrivals go to.
+//
+// A handler that wants to say more than "something reached me" — which part arrived, what it was
+// called, what it contained — says it here, so a test asks one question of one place. Non-blocking
+// like note is, and for the same reason: a server that stalls because nobody is reading is a server
+// that changes the thing the test is measuring.
+func (s *site) record(label string) {
 	select {
 	case s.arrived <- label:
 	default:
+	}
+}
+
+// arrivals collects everything that reached the server within a window.
+//
+// The plural of `reached`, and needed where the claim is about a COUNT rather than about one label:
+// asking `reached` twice would consume the answer to the second question while looking for the
+// first. "Exactly one of these two forms was sent" is that kind of claim, and it is also the only
+// race-free way to state it — which of the two wins the window is up to Chromium's ordering, and the
+// rule never said which.
+func (s *site) arrivals(within time.Duration) []string {
+	var seen []string
+	deadline := time.After(within)
+	for {
+		select {
+		case got := <-s.arrived:
+			seen = append(seen, got)
+		case <-deadline:
+			return seen
+		}
 	}
 }
 
@@ -534,6 +886,18 @@ func admitting(s *site) fence.Policy {
 		Origins:  []string{"https://nucleos.invalid"},
 		Loopback: []string{s.origin()},
 	}
+}
+
+// admittingWritable is `admitting` plus the grant a person gives at the login: this profile may also
+// submit forms to that origin.
+//
+// A separate helper and not a flag, so every test that uses it says in its own first line which of
+// the two permissions it is about — and so the pair of tests that differ only in this call is a pair
+// a reader can see is a pair.
+func admittingWritable(s *site) fence.Policy {
+	policy := admitting(s)
+	policy.Writable = []string{s.origin()}
+	return policy
 }
 
 // fenced launches a browser with the fence attached and returns the driver.
@@ -728,3 +1092,112 @@ func evaluate(t *testing.T, conn *cdp.Conn, session cdp.SessionID, expression st
 	}
 	return payload.Result.Value
 }
+
+// otherHostOf is this same server under the name Chromium calls a different site, built from the
+// request so the page does not have to be told its own address.
+func otherHostOf(r *http.Request) string {
+	return "http://localhost:" + portOf(r.Host) + "/reading"
+}
+
+func portOf(hostPort string) string {
+	if _, port, err := net.SplitHostPort(hostPort); err == nil {
+		return port
+	}
+	return "80"
+}
+
+const PAGE_LINKS = `<!doctype html><title>links</title><body>
+	<h1>Invoices</h1>
+	<ul>
+		<li>March <a href="/invoices/1">Details</a></li>
+		<li>April <a href="/invoices/2?open=1">Details</a></li>
+		<li><a href="%s">Details</a></li>
+	</ul>`
+
+const PAGE_FOCUS = `<!doctype html><title>focus</title><body>
+	<h1>Search</h1>
+	<label>Query <input id=q autofocus></label>
+	<label>Notes <input id=n></label>`
+
+const PAGE_CANVAS = `<!doctype html><title>canvas</title><body>
+	<h1>Quarterly</h1>
+	<canvas id=chart width=600 height=400></canvas>
+	<script>
+	const ink = document.getElementById('chart').getContext('2d');
+	ink.fillStyle = '#333';
+	ink.fillRect(20, 20, 120, 300);
+	ink.fillText('Revenue fell by eleven percent', 200, 200);
+	</script>`
+
+const PAGE_ENDLESS = `<!doctype html><title>endless</title><body>
+	<h1>Everything</h1>
+	<div id=list><p>Row one.</p></div>
+	<div style="height: 4000px"></div>
+	<script>
+	let loading = false;
+	window.addEventListener('scroll', () => {
+		if (loading || window.scrollY < 100) { return; }
+		loading = true;
+		fetch('/slow-rows').then(r => r.text()).then(t => {
+			document.getElementById('list').insertAdjacentHTML('beforeend', t);
+		});
+	});
+	</script>`
+
+// PAGE_LOOKFRAME puts a cross-site frame at a known place. margin:0 and border:0 so the numbers in
+// the test are the numbers here, with nothing of the browser's own styling in between.
+const PAGE_LOOKFRAME = `<!doctype html><title>lookframe</title>
+	<style>html,body{margin:0;padding:0;background:#ffffff}</style>
+	<body><iframe src=%q style="position:absolute;left:200px;top:150px;width:300px;height:200px;border:0"></iframe>`
+
+// PAGE_LOOKBUTTON is what goes inside it: one button, at a known offset within its own document.
+const PAGE_LOOKBUTTON = `<!doctype html><title>lookbutton</title>
+	<style>html,body{margin:0;padding:0;background:#ffffff}</style>
+	<body><button style="position:absolute;left:20px;top:30px;width:100px;height:40px">Go</button>`
+
+// PAGE_LOOKCLEAN reports its own DOM when the button is pressed, so the test can ask the page
+// whether the overlay is still there instead of inferring it from a reading that cannot see one.
+const PAGE_LOOKCLEAN = `<!doctype html><title>lookclean</title><body>
+	<h1>Clean</h1>
+	<p id=out>nobody has asked yet</p>
+	<button onclick="out.textContent = 'overlay is ' + (document.getElementById('nucleos-look-overlay') ? 'still here' : 'gone')">Ask</button>`
+
+// PAGE_DENSE is the crowded case: a toolbar of small buttons two pixels apart, a form, and a table
+// whose every row has a control of its own. Roughly thirty labels in one viewport, which is an
+// ordinary application screen and about a quarter of what the label budget allows.
+const PAGE_DENSE = `<!doctype html><title>dense</title>
+	<style>
+	body { font: 13px system-ui, sans-serif; margin: 8px; background: #fff }
+	.bar button { width: 26px; height: 24px; margin: 0 1px; padding: 0 }
+	td, th { border: 1px solid #ccc; padding: 2px 6px; font-size: 12px }
+	</style>
+	<body>
+	<div class=bar>
+	<button>B</button><button>I</button><button>U</button><button>S</button><button>A</button>
+	<button>1</button><button>2</button><button>3</button><button>4</button><button>5</button>
+	</div>
+	<p><label>Name <input size=12></label>
+	<label>Email <input size=14></label>
+	<label>City <select><option>Lisboa</option><option>Porto</option></select></label>
+	<button>Save</button> <button>Cancel</button></p>
+	<table>
+	<tr><th>Item</th><th>Qty</th><th></th></tr>
+	<tr><td>Cabo HDMI</td><td><input size=2 value=1></td><td><button>x</button></td></tr>
+	<tr><td>Rato sem fios</td><td><input size=2 value=2></td><td><button>x</button></td></tr>
+	<tr><td>Teclado</td><td><input size=2 value=1></td><td><button>x</button></td></tr>
+	<tr><td>Monitor 27</td><td><input size=2 value=3></td><td><button>x</button></td></tr>
+	<tr><td>Suporte</td><td><input size=2 value=1></td><td><button>x</button></td></tr>
+	</table>
+	<p><a href=/reading>Ver tudo</a> &middot; <a href=/canvas>Grafico</a> &middot;
+	<a href=/focus>Procurar</a></p>`
+
+// PAGE_ATTACH is one multipart form with one file input and one submit button. Deliberately plain:
+// the question is whether an attachment survives the fence and reaches the server, and every extra
+// control on the page is a way for the test to end up about something else.
+const PAGE_ATTACH = `<!doctype html><title>attach</title><body>
+	<h1>Send a document</h1>
+	<form method=post enctype="multipart/form-data" action=/attached>
+	<label>Document <input type=file name=document></label>
+	<label>Note <input name=note value=hello></label>
+	<button type=submit>Send</button>
+	</form>`

@@ -48,6 +48,12 @@ func TestAProjectProfileNeedsAUsableList(t *testing.T) {
 // try again.
 func TestDecide(t *testing.T) {
 	listed := project("https://example.org", "https://jira.example.com")
+	// The same profile with a write grant on one of the two. One and not both, so every row below
+	// carries its own control: whatever the write rule does for example.org, jira is the site the
+	// same profile may read and not write to.
+	writable := Policy{Profile: Project,
+		Origins:  []string{"https://example.org", "https://jira.example.com"},
+		Writable: []string{"https://example.org"}}
 
 	cases := []struct {
 		name    string
@@ -66,10 +72,29 @@ func TestDecide(t *testing.T) {
 			request: Request{Method: "HEAD", URL: "https://example.org/page", ResourceType: "Document"},
 		},
 		{
+			// A search box, a filter, a pager. Indistinguishable from the row above it and from a
+			// link, which is the point: the fence judges the method and the origin, and a GET form
+			// has the same two as a GET anything. It was refused for years by `form-action 'none'`
+			// in the CSP rather than by anything here, and see csp.go for why that stopped.
+			name:    "a GET form submission is a GET",
+			policy:  listed,
+			request: Request{Method: "GET", URL: "https://example.org/search?q=invoices", ResourceType: "Document"},
+		},
+		{
+			// The rule that actually bounds a form, and now the ONLY one: with the CSP loosened this
+			// is what stops a same-origin POST, alone and therefore deterministically.
 			name:    "a POST that would produce a document is a form submission",
 			policy:  listed,
 			request: Request{Method: "POST", URL: "https://example.org/save", ResourceType: "Document"},
 			want:    browser.ConsequenceForm,
+		},
+		{
+			// The other one: a GET form aimed off the allowlist is refused for where it goes, exactly
+			// as a link there would be. Nothing about it being a form enters into it.
+			name:    "a GET form to a host the profile does not admit is off-allowlist",
+			policy:  listed,
+			request: Request{Method: "GET", URL: "https://stranger.example.net/search?q=invoices", ResourceType: "Document"},
+			want:    browser.ConsequenceOffAllowlist,
 		},
 		{
 			name:    "a POST from a script is reported as the method",
@@ -230,6 +255,109 @@ func TestDecide(t *testing.T) {
 			name:    "case in the host does not matter",
 			policy:  listed,
 			request: Request{Method: "GET", URL: "https://EXAMPLE.org/page", ResourceType: "Document"},
+		},
+
+		// ---- the write rule (spec §6.2, extended) ----------------------------------------------
+		//
+		// Five conditions, and the table has one row per WAY OF FAILING as well as the row where all
+		// five hold. A rule that is only tested in its allowing direction is a rule whose refusals
+		// nobody has read.
+		{
+			// The one that leaves. Every condition holds: a POST, a document, back to the origin the
+			// act was on, an origin a person granted write to, and an act that caused it.
+			name:   "a POST form to a granted origin, caused by an act, leaves",
+			policy: writable,
+			request: Request{Method: "POST", URL: "https://example.org/reply", ResourceType: "Document",
+				Armed: "https://example.org:443"},
+		},
+		{
+			// Condition 5. The form is on a granted origin and the page submitted it by itself —
+			// which is what an injection inside a granted origin would do, and the reason the grant
+			// alone is not the whole rule.
+			name:    "the same form, submitted by the page rather than by an act",
+			policy:  writable,
+			request: Request{Method: "POST", URL: "https://example.org/reply", ResourceType: "Document"},
+			want:    browser.ConsequenceForm,
+		},
+		{
+			// Condition 4. An act on one origin does not carry to another, whatever both are.
+			name:   "an act on one origin does not submit a form to a different one",
+			policy: writable,
+			request: Request{Method: "POST", URL: "https://jira.example.com/create", ResourceType: "Document",
+				Armed: "https://example.org:443"},
+			want: browser.ConsequenceForm,
+		},
+		{
+			// Condition 5 again, from the other side: the grant exists and the act is on the right
+			// origin, but the submission goes somewhere the profile may read and not write.
+			name:   "a form to an origin the profile reads and may not write to",
+			policy: writable,
+			request: Request{Method: "POST", URL: "https://jira.example.com/create", ResourceType: "Document",
+				Armed: "https://jira.example.com:443"},
+			want: browser.ConsequenceForm,
+		},
+		{
+			// Condition 2, and the load-bearing one: this is the path an injection takes without
+			// passing through any act at all. Reported as the METHOD and not as a form, because
+			// nothing on the page was submitted.
+			name:   "a scripted POST on a writable origin is still a POST",
+			policy: writable,
+			request: Request{Method: "POST", URL: "https://example.org/graphql", ResourceType: "XHR",
+				Armed: "https://example.org:443"},
+			want: browser.ConsequenceMethod,
+		},
+		{
+			// Condition 1. The grant is for FORMS, and the smallest opening that covers them.
+			name:   "a write grant does not open PUT, PATCH or DELETE",
+			policy: writable,
+			request: Request{Method: "DELETE", URL: "https://example.org/thing/1", ResourceType: "Document",
+				Armed: "https://example.org:443"},
+			want: browser.ConsequenceForm,
+		},
+		{
+			// The ordering that makes fence.Policy's "not by construction" safe. An origin that is
+			// writable and NOT admitted is inert, because the allowlist check below the write rule
+			// refuses the document anyway — measured here rather than forbidden in Validate, so a
+			// reordering of Decide's checks cannot quietly make it live.
+			name: "write without read is still off the allowlist",
+			policy: Policy{Profile: Project,
+				Origins:  []string{"https://example.org"},
+				Writable: []string{"https://stranger.example.net"}},
+			request: Request{Method: "POST", URL: "https://stranger.example.net/post", ResourceType: "Document",
+				Armed: "https://stranger.example.net:443"},
+			want: browser.ConsequenceOffAllowlist,
+		},
+		{
+			// A throwaway has no login in it, so there is nobody for a form to be submitted AS.
+			// Validate refuses to build one with a write list at all; this is what happens when the
+			// request arrives anyway.
+			name:   "an ephemeral profile writes nowhere",
+			policy: Policy{Profile: Ephemeral},
+			request: Request{Method: "POST", URL: "https://example.org/reply", ResourceType: "Document",
+				Armed: "https://example.org:443"},
+			want: browser.ConsequenceForm,
+		},
+		{
+			// A local service admitted by name, written to by name. The write list keeps the scheme
+			// on loopback for the same reason Loopback does — there is no session on it to lose.
+			name: "an admitted local service can be written to when it is on the write list",
+			policy: Policy{Profile: Project,
+				Origins:  []string{"https://example.org"},
+				Loopback: []string{"http://localhost:3000"},
+				Writable: []string{"http://localhost:3000"}},
+			request: Request{Method: "POST", URL: "http://localhost:3000/save", ResourceType: "Document",
+				Armed: "http://localhost:3000"},
+		},
+		{
+			// And the control for it: admitted to read is not admitted to write, on loopback exactly
+			// as everywhere else.
+			name: "an admitted local service with no write grant is not written to",
+			policy: Policy{Profile: Project,
+				Origins:  []string{"https://example.org"},
+				Loopback: []string{"http://localhost:3000"}},
+			request: Request{Method: "POST", URL: "http://localhost:3000/save", ResourceType: "Document",
+				Armed: "http://localhost:3000"},
+			want: browser.ConsequenceForm,
 		},
 	}
 

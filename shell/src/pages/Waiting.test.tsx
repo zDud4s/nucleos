@@ -567,6 +567,57 @@ describe("Waiting - the sections that are not there", () => {
     expect(within(list).getByText("billing@example.com")).toBeDefined();
     expect(within(list).queryByText(/[{}]/)).toBeNull();
   });
+
+  it("says which stranger the turn had read", async () => {
+    const world = waitingWorld({
+      refused: [
+        proposal({
+          id: 52,
+          kind: "refused-action",
+          tool_name: "send_email",
+          tool_input: JSON.stringify({ to: "billing@example.com" }),
+          read_from: JSON.stringify([
+            {
+              tool: "browser_open",
+              arguments: JSON.stringify({ url: "https://fornecedor.example/fatura" }),
+              at: "2026-08-21T09:00:00Z",
+            },
+          ]),
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+
+    // The tool that brought the words in, and the url — which is the half that
+    // decides whether this was the owner's idea or the page's.
+    expect(within(list).getByText("browser_open")).toBeDefined();
+    expect(within(list).getByText("https://fornecedor.example/fatura")).toBeDefined();
+  });
+
+  it("says nothing at all when nothing was recorded", async () => {
+    // The guard, and the direction it guards is the one that matters. `null`
+    // covers a refusal that fired on whose work it is rather than on what was
+    // read, AND a recording that failed — indistinguishable from here. A card
+    // that filled the silence with "this turn read nothing" would be wrong in
+    // the second case, in the direction that makes a contaminated action look
+    // clean.
+    const world = waitingWorld({
+      refused: [
+        proposal({ id: 53, kind: "refused-action", tool_name: "create_run", read_from: null }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+
+    expect(within(list).getByText("create_run")).toBeDefined();
+    expect(within(list).queryByText(/read nothing|nothing was read/i)).toBeNull();
+    expect(within(list).queryByText("this turn had read")).toBeNull();
+  });
 });
 
 /* ----------------------------------------------------------- the two doors -- */

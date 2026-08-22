@@ -81,6 +81,47 @@ export interface Site {
   granted_at: string;
   /** The destination whose login brought an idp in. `null` when this row IS the destination. */
   granted_for: string | null;
+  /**
+   * Whether an agent may SUBMIT FORMS here, and not merely read.
+   *
+   * Never true on an `idp` row: the forms on an identity provider are login
+   * forms, which are exactly the forms an agent must not submit
+   * (`core/src/browser.rs`, `grant`).
+   */
+  writable: boolean;
+}
+
+/**
+ * One form submission an agent sent — `browser::Written`, `GET
+ * /browser/writes/{project_id}`.
+ *
+ * Field NAMES and never values, by design rather than by omission: a form
+ * carries passwords, tokens and private text, and keeping what was submitted
+ * would make the database the place every credential an agent types comes to
+ * rest (migration 0097). `field_count` disagrees with `fields.length` when a
+ * long form was truncated, which is why it is its own number.
+ */
+export interface Written {
+  id: number;
+  session_id: number;
+  origin: string;
+  /** The form's action with its query removed, and the method it went with. */
+  action: string;
+  method: string;
+  fields: string[];
+  field_count: number;
+  /** The act that caused it: the ref from the snapshot, and the verb. */
+  element_ref: string;
+  verb: string;
+  /**
+   * The names of any files this submission carried, and never their contents.
+   *
+   * Empty for a submission that carried none, and also for every row written before uploads
+   * existed. The database keeps those apart (migration 0098) and this screen does not, because
+   * there is nothing it would show differently.
+   */
+  files: string[];
+  written_at: string;
 }
 
 /**
@@ -218,6 +259,16 @@ export function useReturnWheel() {
 export interface KeepChainInput {
   sessionId: number;
   keep: boolean;
+  /**
+   * May an agent also submit forms where this login landed?
+   *
+   * The second half of the same question, asked at the same moment. Separate
+   * from `keep` because the two are wanted in different combinations — read
+   * the Jira and open no tickets, read the inbox and answer nothing — and it
+   * reaches only the destination, never the identity providers the login
+   * passed through.
+   */
+  writable: boolean;
 }
 
 /** What `POST /browser/keep` hands back — the origins actually granted (empty when `keep` was false). */
@@ -238,12 +289,35 @@ export function useKeepChain() {
     mutationFn: (input: KeepChainInput) =>
       apiFetch<KeptGrants>("/browser/keep", {
         method: "POST",
-        body: JSON.stringify({ session_id: input.sessionId, keep: input.keep }),
+        body: JSON.stringify({
+          session_id: input.sessionId,
+          keep: input.keep,
+          writable: input.writable,
+        }),
       }),
     retry: false,
     onSettled: () => {
       for (const key of browserKeys()) void queryClient.invalidateQueries({ queryKey: key });
     },
+  });
+}
+
+/**
+ * What a project has written, most recent first.
+ *
+ * Read beside {@link useBrowserSites} on the same screen, and that pairing is
+ * the whole point of the route: a grant with no record of what was done under
+ * it is a permission nobody can review, and the review is what makes this
+ * arrangement supervisable at all — the agent works alone inside the grant, so
+ * the supervision is necessarily afterwards.
+ */
+export function useBrowserWrites(projectId: string | undefined) {
+  return useQuery({
+    queryKey: keys.browser.writes(projectId ?? ""),
+    queryFn: () => apiFetch<Written[]>(`/browser/writes/${encodeURIComponent(projectId ?? "")}`),
+    enabled: projectId !== undefined,
+    refetchInterval: POLL.queue,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -258,6 +332,29 @@ export function useRevokeSite() {
   return useMutation({
     mutationFn: (input: RevokeSiteInput) =>
       apiFetch<void>("/browser/revoke", {
+        method: "POST",
+        body: JSON.stringify({ project_id: input.projectId, origin: input.origin }),
+      }),
+    retry: false,
+    onSettled: (_data, _error, input) => {
+      void queryClient.invalidateQueries({ queryKey: keys.browser.sites(input.projectId) });
+    },
+  });
+}
+
+/**
+ * Take one origin's WRITE grant back, leaving it readable.
+ *
+ * It carries no boolean, and the absence is the invariant: there is no request
+ * this hook can make that WIDENS a permission. Grants are made in one place,
+ * by a person answering for a login they have just performed
+ * ({@link useKeepChain}); this only ever narrows.
+ */
+export function useMakeReadonly() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: RevokeSiteInput) =>
+      apiFetch<void>("/browser/readonly", {
         method: "POST",
         body: JSON.stringify({ project_id: input.projectId, origin: input.origin }),
       }),

@@ -25,6 +25,20 @@ pub struct Proposal {
     pub tool_name: Option<String>,
     pub reasoning: String,
     pub tool_input: Option<String>,
+    /// What the turn had read when it reached for this, as JSON, copied off `run_untrusted_reads`
+    /// at the moment the refusal was written.
+    ///
+    /// Selected by every query rather than by the ones that care, which is the opposite of what
+    /// `errand_name` above does — and deliberately. `errand_name` is a join, so `NULL AS
+    /// errand_name` honestly means "this query did not ask" and the id is still there to ask with.
+    /// This is a column; `NULL` in it already means "nothing was recorded", and there is nothing to
+    /// ask with afterwards because the run may have been pruned. A second meaning for the same
+    /// `NULL` would make an unasked question indistinguishable from an answered one.
+    ///
+    /// `None` is a legitimate state and not a defect: `ERRAND_MAY_NOT_ACT` refuses on whose work it
+    /// is rather than on what the turn read, and an errand's first message has read nothing at all.
+    /// A reader must not present its absence as contamination.
+    pub read_from: Option<String>,
     pub created_at: String,
     pub decided_at: Option<String>,
 }
@@ -99,6 +113,18 @@ pub async fn create_action_approval(
 /// So nothing resumes here either, exactly as for [`create_skipped_item`]. What the record buys is
 /// that somebody finds out: they do the thing themselves, or they ask the errand again, and the new
 /// turn starts clean and may act. The door is a person, not a button.
+///
+/// **`read_from` is what makes that door usable rather than merely open.** Deciding whether to do
+/// the thing yourself means deciding whether the idea was the agent's or the page's, and the row
+/// could not answer that: it said what was going to happen and never where it came from. An email
+/// to accounts asking for the bank details to change reads identically either way. It is a copy and
+/// not a join because `runs` rows are pruned, and `None` means nothing was recorded — which is the
+/// normal state for the OTHER refusal this kind carries, where an errand was stopped for whose work
+/// it is rather than for anything it read.
+// Eight, and the eighth is `read_from`. Bundling them into a struct to satisfy the lint would put a
+// type between the caller and a row it is spelling out field by field, which is what the sibling
+// constructors above all do; the shape stays consistent with them rather than with the count.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_refused_action(
     pool: &SqlitePool,
     run_id: i64,
@@ -107,13 +133,14 @@ pub async fn create_refused_action(
     tool_name: &str,
     reasoning: &str,
     tool_input: Option<&str>,
+    read_from: Option<&str>,
 ) -> sqlx::Result<i64> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         "INSERT INTO proposals
-         (kind, status, run_id, session_id, errand_id, tool_name, reasoning, tool_input, created_at, decided_at)
-         VALUES ('refused-action', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL)",
+         (kind, status, run_id, session_id, errand_id, tool_name, reasoning, tool_input, read_from, created_at, decided_at)
+         VALUES ('refused-action', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
     )
     .bind(run_id)
     .bind(session_id)
@@ -121,6 +148,7 @@ pub async fn create_refused_action(
     .bind(tool_name)
     .bind(reasoning)
     .bind(tool_input)
+    .bind(read_from)
     .bind(&now)
     .execute(&mut *transaction)
     .await?;
@@ -152,7 +180,7 @@ pub async fn list_refused_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposa
         // that read its mail and then reached for a control) still appears, unnamed.
         "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.errand_id,
                 e.name AS errand_name, p.tool_name, p.reasoning,
-                p.tool_input, p.created_at, p.decided_at
+                p.tool_input, p.read_from, p.created_at, p.decided_at
          FROM proposals p
          LEFT JOIN errands e ON e.id = p.errand_id
          WHERE p.status = 'pending' AND p.kind = 'refused-action'
@@ -585,7 +613,7 @@ pub async fn list_pending_recruits(
         // one is not a compile error; it is a row that fails to decode at runtime.
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, created_at, decided_at
+                tool_input, read_from, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'agent-recruit'
          ORDER BY id ASC",
@@ -630,7 +658,7 @@ pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Pr
         // one is not a compile error; it is a row that fails to decode at runtime.
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, created_at, decided_at
+                tool_input, read_from, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'team-action'
          ORDER BY id ASC",
@@ -660,7 +688,7 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     sqlx::query_as::<_, Proposal>(
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, created_at, decided_at
+                tool_input, read_from, created_at, decided_at
          FROM proposals WHERE id = ?",
     )
     .bind(id)
@@ -672,7 +700,7 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, created_at, decided_at
+                tool_input, read_from, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'action-approval'
          ORDER BY id ASC",
@@ -697,7 +725,7 @@ pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>
     sqlx::query_as::<_, Proposal>(
         "SELECT id, kind, status, run_id, session_id, project_id, errand_id,
                 NULL AS errand_name, tool_name, reasoning,
-                tool_input, created_at, decided_at
+                tool_input, read_from, created_at, decided_at
          FROM proposals
          WHERE status = 'pending' AND kind = 'skipped-item'
          ORDER BY id DESC",

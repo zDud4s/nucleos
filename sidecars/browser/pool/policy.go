@@ -42,8 +42,9 @@ func Policy(placement browser.Placement) (fence.Policy, error) {
 	}
 
 	policy := fence.Policy{
-		Profile: kind,
-		Origins: placement.Origins,
+		Profile:  kind,
+		Origins:  placement.Origins,
+		Writable: placement.Writable,
 		// Loopback stays empty, which means the fence admits none of it. Spec §6.2's loopback rule
 		// exists because this machine's own services — the núcleo's API, the other sidecars, and the
 		// browser's own token-less debugging port — are reachable from a page unless something

@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"nucleosbrowser/browser"
@@ -128,6 +131,97 @@ func TestRefusalIsTwoHundred(t *testing.T) {
 	}
 }
 
+// TestUploadCrossesTheWireWithBothOfItsArguments.
+//
+// **The gap this closes was live for the length of an afternoon.** The gate exercises upload against
+// a real Chromium by calling `driver.Act` directly, so it never touches this package — and this
+// package's request struct had no `filename` at all, while `parseKind` had never heard of the verb.
+// Every test in the repository was green, and through the daemon the upload would have been rejected
+// at the door.
+//
+// It is the failure `Asked` was added for one struct over: a field a wire shape is MISSING does not
+// error. The sender fills it, the decoder finds no home for it, and the driver answers a request
+// nobody made.
+func TestUploadCrossesTheWireWithBothOfItsArguments(t *testing.T) {
+	driver := &browser.Fake{FenceAttached: true}
+	server := testServer(t, driver)
+
+	var session browser.Session
+	response := post(t, server, "/open", opening("https://example.org/"), true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("open: got %d", response.StatusCode)
+	}
+	if err := json.NewDecoder(response.Body).Decode(&session); err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+
+	response = post(t, server, "/act", ActRequest{
+		SessionID: string(session.ID),
+		Kind:      "upload",
+		Ref:       "e5",
+		Text:      "linha um",
+		Filename:  "relatorio.txt",
+	}, true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; upload is a kind this server has to know", response.StatusCode)
+	}
+
+	if len(driver.Actions) != 1 {
+		t.Fatalf("actions = %+v, want the one upload", driver.Actions)
+	}
+	got := driver.Actions[0]
+	if got.Kind != browser.ActionUpload {
+		t.Fatalf("kind = %q", got.Kind)
+	}
+	if got.Filename != "relatorio.txt" {
+		t.Fatalf("filename = %q: it did not survive the wire, so the driver was handed a file with "+
+			"no name and would refuse it for having none", got.Filename)
+	}
+	if got.Text != "linha um" {
+		t.Fatalf("text = %q: the contents did not survive the wire", got.Text)
+	}
+}
+
+// TestTheCeilingSaysItIsTheCeiling.
+//
+// **Found by driving a live daemon, not by any test here.** A third session was asked for against a
+// real Chromium and the caller was told `502: open failed`, while the sidecar's own log, one
+// process away, said `pool: too many sessions open: 2 of 2`. The reason was written and then
+// dropped: `writeDriverError`'s default arm logs the error and sends the verb plus "failed".
+//
+// That default is right for errors a caller cannot act on. The ceiling is not one of those — the
+// answer is to close a session — and a refusal that leaves the owner guessing is the one they
+// resolve by raising the limit, which is the argument `.ai/browser.yaml` already makes about
+// `max_profiles`.
+//
+// The status is asserted as well as the body, and 409 is forced rather than chosen: the núcleo's
+// `classify` maps 503 to `FenceDown`, so answering a ceiling with 503 would reach a person as
+// "browsing is fenced off" — a pillar-level failure that did not happen.
+func TestTheCeilingSaysItIsTheCeiling(t *testing.T) {
+	driver := &browser.Fake{
+		FenceAttached: true,
+		OpenErr:       fmt.Errorf("%w: %d of %d", browser.ErrTooManySessions, 2, 2),
+	}
+	server := testServer(t, driver)
+
+	response := post(t, server, "/open", opening("https://example.org/"), true)
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: 503 would reach the núcleo as a fence failure",
+			response.StatusCode)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "too many sessions") {
+		t.Fatalf("body = %q, want it to say what the refusal was", body)
+	}
+	if !strings.Contains(string(body), "2 of 2") {
+		t.Fatalf("body = %q: without the counts it says you are at the ceiling and never what the "+
+			"ceiling is, which is the half a person can act on", body)
+	}
+}
+
 // TestUnknownActionKindIsRefusedAtTheDoor. The vocabulary is closed (spec §6.2, consequence-free in
 // v1); an unknown verb must not reach a driver that might interpret it generously.
 func TestUnknownActionKindIsRefusedAtTheDoor(t *testing.T) {
@@ -197,6 +291,11 @@ func TestThePlacementReachesTheDriverUnchanged(t *testing.T) {
 		Placement: browser.Placement{
 			Profile: profile.Ref{Kind: profile.Project, ID: "acme"},
 			Origins: []string{"https://jira.example.org", "https://accounts.google.com"},
+			// One of the two, so the assertion below can tell a list that travelled from a list that
+			// was copied off the other one. A write grant dropped on the wire would be a fence that
+			// refuses every submission a person granted, and nothing would report it: the agent would
+			// simply be told no, correctly, about a rule nobody wrote.
+			Writable: []string{"https://jira.example.org"},
 		},
 	}
 	if response := post(t, server, "/open", sent, true); response.StatusCode != http.StatusOK {
@@ -214,6 +313,9 @@ func TestThePlacementReachesTheDriverUnchanged(t *testing.T) {
 	}
 	if !slices.Equal(got.Placement.Origins, sent.Placement.Origins) {
 		t.Errorf("origins: got %v, want %v", got.Placement.Origins, sent.Placement.Origins)
+	}
+	if !slices.Equal(got.Placement.Writable, sent.Placement.Writable) {
+		t.Errorf("writable: got %v, want %v", got.Placement.Writable, sent.Placement.Writable)
 	}
 }
 
@@ -255,7 +357,7 @@ func TestServeConfigIsLoopbackOnly(t *testing.T) {
 	}
 }
 
-// halfADriver implements the six verbs and not the wheel — the shape a single chrome.Driver has, and
+// halfADriver implements the driver verbs and not the wheel — the shape a single chrome.Driver has, and
 // the reason serve type-asserts instead of assuming.
 //
 // Spelled out rather than embedding browser.Fake: the Fake DOES implement Wheelhouse, and an
@@ -274,6 +376,9 @@ func (halfADriver) Act(context.Context, browser.SessionID, browser.Action) (brow
 }
 func (halfADriver) Screenshot(context.Context, browser.SessionID) ([]byte, error) {
 	return nil, browser.ErrUnsupported
+}
+func (halfADriver) Look(context.Context, browser.SessionID) (browser.LookResult, error) {
+	return browser.LookResult{}, browser.ErrUnsupported
 }
 func (halfADriver) Handoff(context.Context, browser.SessionID, string) (browser.HandoffTicket, error) {
 	return browser.HandoffTicket{}, browser.ErrUnsupported

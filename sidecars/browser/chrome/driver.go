@@ -122,6 +122,26 @@ type session struct {
 	// browser's network stack, so `networkAlmostIdle` fires while it is still on its way.
 	ferried  int
 	carrying int
+	// dialogs are the questions THIS document put to a person and the answers it was given in their
+	// place. Per document and reset with the rest: "the page asked me to confirm something" is a fact
+	// about the page being read, not about the one before it.
+	dialogs []browser.Dialog
+	// status is the HTTP status of the last main-frame document response, or 0 for a page that never
+	// produced one. See recordStatus for why it is not reset with the rest of this struct.
+	status int
+	// mayWrite is the write window one act opens: the permission for a single form submission, for
+	// as long as that act lasts. Nil the rest of the time, which is the ordinary state — see
+	// chrome/write.go for why the lifetime is the act's and not a number of milliseconds.
+	mayWrite *writeWindow
+	// attachDir is where this session's uploads were written, or empty until one is. Per session
+	// and not per act, because Chromium reads a file input's file when the FORM IS SUBMITTED — a
+	// later act than the one that attached it — so a directory cleaned up when the upload returned
+	// would be a form that submits nothing and reports success. Removed by Close.
+	attachDir string
+	// writes are the form submissions this session has actually sent and not yet reported. NOT reset
+	// with the rest of the per-document state: a submission navigates, so resetting on navigation
+	// would throw away the record of the very thing that caused it.
+	writes []browser.Write
 }
 
 // contextKey names one execution context. The id is unique within a target and not across them, so
@@ -211,6 +231,10 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	conn.OnEvent(driver.onFetchPaused)
 	conn.OnEvent(driver.onLogEntry)
 	conn.OnEvent(driver.onRuntimeEvent)
+	// Subscribed here, with the others, and not when a page opens: a dialog that arrives with nobody
+	// listening leaves the renderer frozen for the life of the session, and there is no later moment
+	// from which that can be recovered.
+	conn.OnEvent(driver.onDialog)
 	driver.startSweep()
 	return driver, nil
 }
@@ -431,7 +455,15 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		FinalURL:     entry.final,
 		Title:        entry.title,
 		StillLoading: stillLoading,
+		Status:       d.statusOf(entry),
 	}, nil
+}
+
+// statusOf is the page's HTTP status under the lock, or 0 when nothing said it.
+func (d *Driver) statusOf(entry *session) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return entry.status
 }
 
 // readTargetInfo asks the browser where the target actually ended up.
@@ -601,6 +633,10 @@ func (d *Driver) Close(ctx context.Context, id browser.SessionID) error {
 	_, callErr := d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{
 		"targetId": entry.target,
 	})
+	// Before the session is forgotten, because forgetAttachments reads it. A session that closes
+	// without this leaves the agent's own words on the disk of a machine it was never asked to
+	// write to.
+	d.forgetAttachments(entry)
 	d.mu.Lock()
 	delete(d.sessions, id)
 	delete(d.targets, entry.target)

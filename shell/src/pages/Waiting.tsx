@@ -398,6 +398,65 @@ function ToolInput({ raw }: { raw: string | null }) {
   );
 }
 
+/** One thing a turn read before it reached for an action. */
+interface ReadEntry {
+  tool?: unknown;
+  arguments?: unknown;
+}
+
+/**
+ * Where the idea came from, under the record of what it was.
+ *
+ * `ToolInput` above answers what was going to happen; this answers who put it in
+ * the turn's head, and only the second one decides. "Email accounts and ask them
+ * to change the bank details" reads identically whether the owner asked for it
+ * or a page did, so a card carrying only the first question gets answered by
+ * guessing.
+ *
+ * **Absent renders as nothing, never as "read nothing".** `null` covers two
+ * cases the row cannot tell apart — a refusal that fired on whose work it is
+ * rather than on what was read, and a recording that failed — and a card that
+ * printed "this turn read nothing" would be wrong in the second one, in the
+ * direction that makes a contaminated action look clean.
+ */
+function ReadFrom({ raw }: { raw: string | null }) {
+  if (raw === null || raw.trim() === "") return null;
+  let entries: ReadEntry[];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    entries = parsed as ReadEntry[];
+  } catch {
+    return null;
+  }
+  return (
+    <div className="waiting-provenance">
+      <p className="waiting-provenance-head">this turn had read</p>
+      <ul className="waiting-provenance-list">
+        {entries.map((entry, index) => {
+          const tool = typeof entry.tool === "string" ? entry.tool : "something unnamed";
+          // The arguments are stored as the daemon received them, so the url that
+          // decides the question is in there and nowhere else. Flattened through
+          // the same reader the action's own input uses, for the same reason:
+          // braces are characters between a person and a decision.
+          const detail =
+            typeof entry.arguments === "string"
+              ? (readToolInput(entry.arguments) ?? [])
+                  .map((field) => field.value)
+                  .join(", ")
+              : "";
+          return (
+            <li className="waiting-provenance-line" key={`${tool}-${index}`}>
+              <span className="waiting-provenance-tool">{tool}</span>
+              {detail !== "" && <span className="waiting-provenance-detail">{detail}</span>}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 /* ------------------------------------------------------- 1. wheel requests -- */
 
 function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
@@ -1228,7 +1287,8 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
       <p className="waiting-note">
         The barrier stopped these before they happened, in turns that have since ended. There is
         nothing here to allow: what they were going to do is written out so you can decide whether
-        to do it yourself.
+        to do it yourself, and under it what the turn had read when it decided to — which is usually
+        the half that answers whether the idea was the agent's or a stranger's.
       </p>
       <ReadingNotes view={view} what="the refused actions" />
       {view.rows !== undefined && rows.length === 0 && (
@@ -1252,6 +1312,7 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
                 {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
               </p>
               <ToolInput raw={proposal.tool_input} />
+              <ReadFrom raw={proposal.read_from} />
             </li>
           ))}
         </ul>

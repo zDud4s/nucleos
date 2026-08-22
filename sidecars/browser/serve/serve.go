@@ -40,6 +40,7 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	mux.HandleFunc("/snapshot", authorized(cfg.DaemonToken, snapshotHandler(driver)))
 	mux.HandleFunc("/act", authorized(cfg.DaemonToken, actHandler(driver)))
 	mux.HandleFunc("/screenshot", authorized(cfg.DaemonToken, screenshotHandler(driver)))
+	mux.HandleFunc("/look", authorized(cfg.DaemonToken, lookHandler(driver)))
 	mux.HandleFunc("/handoff", authorized(cfg.DaemonToken, handoffHandler(driver)))
 	mux.HandleFunc("/close", authorized(cfg.DaemonToken, closeHandler(driver)))
 
@@ -107,6 +108,12 @@ type ActRequest struct {
 	Kind      string `json:"kind"`
 	Ref       string `json:"ref"`
 	Text      string `json:"text,omitempty"`
+	// Filename is upload's second argument. A field a wire shape is missing is the one thing that
+	// fails in total silence — the sender fills it, the decoder finds no home for it, and the
+	// driver answers a request nobody made. That happened once already on this struct, with
+	// `controls_from`, and it is why `browser.Fake` records the whole request rather than the
+	// pieces a caller happened to check.
+	Filename string `json:"filename,omitempty"`
 }
 
 // HandoffRequest asks for the session to be made ready for a person.
@@ -182,13 +189,14 @@ func actHandler(driver browser.Driver) http.HandlerFunc {
 		if !ok {
 			// A closed vocabulary, refused at the door. An unknown verb must not reach a driver
 			// that might interpret it generously (spec §6.2: consequence-free in v1).
-			http.Error(w, "unknown action kind: expected click, type, scroll, select, press, back or goto", http.StatusBadRequest)
+			http.Error(w, "unknown action kind: expected click, type, scroll, select, press, back, goto or upload", http.StatusBadRequest)
 			return
 		}
 		result, err := driver.Act(r.Context(), browser.SessionID(request.SessionID), browser.Action{
-			Kind: kind,
-			Ref:  request.Ref,
-			Text: request.Text,
+			Kind:     kind,
+			Ref:      request.Ref,
+			Text:     request.Text,
+			Filename: request.Filename,
 		})
 		if err != nil {
 			writeDriverError(w, "act", err)
@@ -225,6 +233,31 @@ func screenshotHandler(driver browser.Driver) http.HandlerFunc {
 		if _, err := w.Write(image); err != nil {
 			log.Printf("writing screenshot: %v", err)
 		}
+	}
+}
+
+// lookHandler answers the AGENT's picture, and answers it as JSON rather than as image bytes.
+//
+// The difference from /screenshot beside it is not a style choice. That one hands a person's window
+// a PNG and has nothing else to say; this one carries the labels as well, and the labels are the
+// half that makes the picture actionable — an image body with the refs in a header would be the same
+// answer split across two places, one of which nothing else in this sidecar uses.
+func lookHandler(driver browser.Driver) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request SessionRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		if request.SessionID == "" {
+			http.Error(w, "session_id is required", http.StatusBadRequest)
+			return
+		}
+		result, err := driver.Look(r.Context(), browser.SessionID(request.SessionID))
+		if err != nil {
+			writeDriverError(w, "look", err)
+			return
+		}
+		writeJSON(w, result)
 	}
 }
 
@@ -362,7 +395,8 @@ func forgetHandler(profiles browser.Profiles) http.HandlerFunc {
 func parseKind(raw string) (browser.ActionKind, bool) {
 	switch kind := browser.ActionKind(raw); kind {
 	case browser.ActionClick, browser.ActionType, browser.ActionScroll,
-		browser.ActionSelect, browser.ActionPress, browser.ActionBack, browser.ActionGoto:
+		browser.ActionSelect, browser.ActionPress, browser.ActionBack, browser.ActionGoto,
+		browser.ActionUpload:
 		return kind, true
 	default:
 		return "", false
@@ -404,6 +438,18 @@ func writeDriverError(w http.ResponseWriter, verb string, err error) {
 		// 409 and not 403: nothing is wrong with the request, and it may well succeed later. The
 		// wheel is with a person, and spec §4.4 rule 2 puts no bound on how long that lasts.
 		http.Error(w, "a person is driving this profile", http.StatusConflict)
+	case errors.Is(err, browser.ErrTooManySessions):
+		// The REASON in the body, like ErrNotInstalled above, because the ceiling is something the
+		// caller can act on: close a session. `.ai/browser.yaml` makes the same argument about
+		// `max_profiles` — a refusal that leaves the owner guessing is one they resolve by raising
+		// the limit. `err.Error()` carries the counts the pool wrapped in.
+		//
+		// 409 and not 503, and the choice is forced rather than tasteful: the núcleo's `classify`
+		// maps 503 to `FenceDown`, so a ceiling answered with 503 would reach a person as "browsing
+		// is fenced off" — a different, pillar-level failure, and untrue. 409 lands in `Failed`,
+		// which keeps the body. It is also the right shape by the arm above: nothing is wrong with
+		// the request, and it succeeds the moment a session closes.
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, browser.ErrNoWheelToReturn):
 		http.Error(w, "this session is not a person's to give back", http.StatusConflict)
 	case errors.Is(err, browser.ErrNotAProjectProfile):

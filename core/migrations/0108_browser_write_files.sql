@@ -1,0 +1,33 @@
+-- What a form submission carried as an attachment: the file's NAME, and never a byte of it.
+--
+-- `browser_writes` already records which fields a submission had and how many. A file input is a
+-- field like any other as far as that record went — its name appeared in `fields` and nothing said
+-- that anything left the machine but text. That was a hole in the one record the owner has: "a
+-- comment was posted" and "a document was posted" are the same row, and they are not the same event.
+--
+-- # Why a name and not the contents, which is the same rule as 0107 and sharper
+--
+-- 0107 argues that a form's VALUES are not written down because a form carries passwords, tokens and
+-- private text, and a record of them would make this database where every credential an agent types
+-- comes to rest. A file is that argument concentrated: it is the largest, densest thing an agent can
+-- send, and it is the one an owner is most likely to have forgotten they still had a copy of.
+--
+-- So the row says a file left and what it was called. What it said is between the owner and the site
+-- they sent it to, which is exactly where it was already.
+--
+-- # A column on the existing row and not a table of its own
+--
+-- One submission is one row. A file that left is a property of that submission, not an event beside
+-- it, and putting it in a second table would mean the screen that shows what an agent did has to
+-- join to find out whether it attached anything — which is the join somebody eventually forgets, on
+-- the question that matters most.
+--
+-- JSON in a TEXT column, like `fields` beside it. Same reason: SQLite has no array, the list is
+-- short and bounded (16 names, 128 characters each, capped in the sidecar), and nothing ever queries
+-- INTO it — the screen reads the row and renders the list.
+--
+-- NULL for every row written before this migration, and that is the honest value. Those submissions
+-- were recorded by a version that could not attach anything at all, so an empty list would be a
+-- claim the record cannot support: "no files" and "this predates files" are different facts, and
+-- only one of them is true of a row from yesterday.
+ALTER TABLE browser_writes ADD COLUMN files TEXT;

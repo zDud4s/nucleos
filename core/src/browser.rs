@@ -65,6 +65,12 @@ pub struct Site {
     pub granted_at: String,
     /// The destination whose login brought this origin in, or `None` when this is the destination.
     pub granted_for: Option<String>,
+    /// Whether an agent may SUBMIT A FORM to this origin, and not merely read it.
+    ///
+    /// Granted at the login, next to the read grant and separately from it, and never true on an
+    /// `idp` row — see [`grant`] for why the identity providers in a login chain are the one place
+    /// this must not reach.
+    pub writable: bool,
 }
 
 /// One browsing session as the núcleo remembers it.
@@ -120,22 +126,44 @@ pub enum Opened {
     Refused { rule: String, recoverable: bool },
 }
 
-/// The origins a project's profile admits, in the shape `browser_policy::decide` takes.
-pub async fn admitted_origins(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<String>> {
-    let rows = sqlx::query("SELECT origin FROM browser_sites WHERE project_id = ? ORDER BY origin")
-        .bind(project_id)
-        .fetch_all(pool)
-        .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| row.get::<String, _>("origin"))
-        .collect())
+/// What a project's profile may do: the origins it admits, and which of those it may write to.
+///
+/// One value and one query rather than two of each, for the reason [`Placement`] carries the profile
+/// and the sites together: they are one decision, and a caller holding half of it has a browser with
+/// logins and an incomplete rule about what may be done with them. Two reads could also disagree —
+/// a grant landing between them — and there is no moment at which that disagreement would be seen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Allowed {
+    /// Every admitted origin, in the shape `browser_policy::decide` takes.
+    pub read: Vec<String>,
+    /// The subset that may also be submitted to. A subset in practice and not by construction — the
+    /// fence says the same thing about its own two lists, and for the same reason.
+    pub write: Vec<String>,
+}
+
+/// The origins a project's profile admits, and which of them a form may be submitted to.
+pub async fn admitted_origins(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Allowed> {
+    let rows = sqlx::query(
+        "SELECT origin, writable FROM browser_sites WHERE project_id = ? ORDER BY origin",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    let mut allowed = Allowed::default();
+    for row in rows {
+        let origin: String = row.get("origin");
+        if row.get::<i64, _>("writable") != 0 {
+            allowed.write.push(origin.clone());
+        }
+        allowed.read.push(origin);
+    }
+    Ok(allowed)
 }
 
 /// The same list with everything a person needs to decide whether to revoke one.
 pub async fn list_sites(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<Site>> {
     let rows = sqlx::query(
-        "SELECT origin, kind, granted_at, granted_for FROM browser_sites \
+        "SELECT origin, kind, granted_at, granted_for, writable FROM browser_sites \
          WHERE project_id = ? ORDER BY kind DESC, origin",
     )
     .bind(project_id)
@@ -148,6 +176,7 @@ pub async fn list_sites(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
             kind: row.get("kind"),
             granted_at: row.get("granted_at"),
             granted_for: row.get("granted_for"),
+            writable: row.get::<i64, _>("writable") != 0,
         })
         .collect())
 }
@@ -174,6 +203,7 @@ pub async fn grant(
     pool: &SqlitePool,
     project_id: &str,
     chain: &[String],
+    writable: bool,
     now: &str,
 ) -> sqlx::Result<Vec<String>> {
     let origins = browser_policy::granted_origins(chain);
@@ -207,18 +237,40 @@ pub async fn grant(
         } else {
             ("idp", Some(destination.as_str()))
         };
-        // ON CONFLICT DO NOTHING rather than UPDATE: a host granted earlier keeps the date and the
-        // reason it was granted for. Overwriting them would rewrite the audit trail of a permission
-        // every time somebody logged in again.
+        // Writing is granted to the DESTINATION and never to an identity provider, and this is the
+        // one line where that is decided. An idp in a login chain is a stepping stone the person did
+        // not choose to browse — and the forms on it are login forms, which are precisely the forms
+        // an agent must never submit. So the box the person ticked applies to where they landed, and
+        // the hosts they passed through stay readable and nothing more.
+        let writes = i64::from(writable && kind == "destination");
+        // The date and the reason a host was first granted for are NEVER overwritten: rewriting
+        // them every time somebody logged in again would rewrite the audit trail of a permission.
+        // What the upsert does touch is `writable`, and only on the destination row.
+        //
+        // # Why the answer at the login is authoritative, including when it narrows
+        //
+        // The person is looking at the origin they just logged into and answering whether an
+        // agent may submit forms there. Treating that as "grant if ticked, leave alone if not"
+        // would mean a write permission could be added by an answer and never removed by one,
+        // which is how a list of permissions stops matching what anyone believes it says. So an
+        // unticked box on the destination takes the grant away — the narrowing direction, which
+        // is the one an ambiguous answer should fall in.
+        //
+        // An idp row is left entirely alone on conflict, because this answer is not about it: the
+        // same host can be a stepping stone here and somewhere the person deliberately granted
+        // writing over there, and one login must not reach into the other.
         sqlx::query(
-            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, granted_for) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, origin) DO NOTHING",
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, granted_for, writable) \
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, origin) DO UPDATE SET \
+             writable = CASE WHEN excluded.kind = 'destination' \
+                        THEN excluded.writable ELSE browser_sites.writable END",
         )
         .bind(project_id)
         .bind(origin)
         .bind(kind)
         .bind(now)
         .bind(granted_for)
+        .bind(writes)
         .execute(&mut *transaction)
         .await?;
     }
@@ -246,6 +298,163 @@ pub async fn revoke(pool: &SqlitePool, project_id: &str, origin: &str) -> sqlx::
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Take back one origin's WRITE grant, leaving it readable.
+///
+/// The narrower half of [`revoke`], and it only ever narrows: there is no argument, no
+/// `writable: bool`, and therefore no way to spell "grant" with it. That is deliberate, and it is
+/// the same invariant `POST /browser/grant` does not exist for — a route that can widen a permission
+/// is a route the confused deputy of spec §5.2 could be aimed at, and this one has nothing to aim.
+///
+/// Widening happens in exactly one place, [`grant`], reached from a person answering for a login
+/// they have just performed themselves.
+pub async fn make_readonly(
+    pool: &SqlitePool,
+    project_id: &str,
+    origin: &str,
+) -> sqlx::Result<bool> {
+    // Normalised through the rule that stored it, for revoke's reason: the stored form carries its
+    // port explicitly, so a caller passing the shorter spelling of the same origin would otherwise
+    // get a silent no-op on the one screen where "nothing happened" and "access withdrawn" look
+    // exactly alike.
+    let normalised = browser_policy::granted_origins(std::slice::from_ref(&origin.to_string()));
+    let Some(origin) = normalised.first() else {
+        return Ok(false);
+    };
+    let result = sqlx::query(
+        "UPDATE browser_sites SET writable = 0 \
+         WHERE project_id = ? AND origin = ? AND writable = 1",
+    )
+    .bind(project_id)
+    .bind(origin)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// One form submission an agent sent, as this database keeps it.
+///
+/// See migration 0107 for what is deliberately absent and why: the field NAMES, and never the
+/// values. The cost is stated there and accepted — knowing that something was submitted to a reply
+/// form does not say what the reply said — and the alternative is a database where every credential
+/// an agent ever types comes to rest.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Written {
+    pub id: i64,
+    pub session_id: i64,
+    pub origin: String,
+    /// The form's action with the query removed, and the method it went with.
+    pub action: String,
+    pub method: String,
+    /// The names of the fields submitted, and how many there were in total. The two disagree when a
+    /// form was long enough for the names to be truncated, which is why the count is its own number.
+    pub fields: Vec<String>,
+    pub field_count: i64,
+    /// The act that caused it: the ref from the snapshot, and the verb.
+    pub element_ref: String,
+    pub verb: String,
+    /// The names of any files that went with it. Empty is "none went"; the column is NULL for rows
+    /// written before attachments existed, and both read as empty here — the distinction lives in
+    /// the database, where migration 0108 explains it, and there is nothing a screen would do
+    /// differently with it.
+    pub files: Vec<String>,
+    pub written_at: String,
+}
+
+/// File what an act sent. Called with whatever the sidecar reported, which is only what LEFT.
+///
+/// Failures are logged and swallowed rather than returned, and that is a decision worth defending:
+/// the submission has already happened by the time this runs, so turning a database error into an
+/// error for the caller would tell an agent its form was not sent when it was. What it must never do
+/// is be silent — a write that reached nobody's record is exactly the state that makes this
+/// arrangement unsupervisable — so it goes to the log at error level.
+pub async fn record_writes(
+    pool: &SqlitePool,
+    session_id: i64,
+    project_id: Option<&str>,
+    writes: &[crate::browser_client::Write],
+    now: &str,
+) {
+    for wrote in writes {
+        let fields = serde_json::to_string(&wrote.fields).unwrap_or_else(|_| "[]".to_string());
+        // `None` when nothing was attached, and not an empty list. Migration 0108 asks for the
+        // distinction: a row that predates attachments and a submission that carried none are
+        // different facts, and a column that says "[]" for both loses the only one it could tell.
+        let files = if wrote.files.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&wrote.files).unwrap_or_else(|_| "[]".to_string()))
+        };
+        let outcome = sqlx::query(
+            "INSERT INTO browser_writes \
+             (session_id, project_id, origin, action, method, fields, field_count, ref, verb, \
+              files, written_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(project_id)
+        .bind(&wrote.origin)
+        .bind(&wrote.action)
+        .bind(&wrote.method)
+        .bind(&fields)
+        .bind(wrote.field_count)
+        .bind(&wrote.r#ref)
+        .bind(&wrote.verb)
+        .bind(&files)
+        .bind(now)
+        .execute(pool)
+        .await;
+        if let Err(error) = outcome {
+            tracing::error!(
+                session = session_id,
+                origin = %wrote.origin,
+                %error,
+                "a form submission left the machine and was not recorded"
+            );
+        }
+    }
+}
+
+/// What a project has written, most recent first.
+///
+/// Read next to the revocation, and that is what makes it supervision rather than decoration: on the
+/// screen where the grant comes off, "this origin writes, and here is what it has written".
+pub async fn list_writes(
+    pool: &SqlitePool,
+    project_id: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<Written>> {
+    let rows = sqlx::query(
+        "SELECT id, session_id, origin, action, method, fields, field_count, ref, verb, files, \
+         written_at FROM browser_writes WHERE project_id = ? ORDER BY written_at DESC, id DESC \
+         LIMIT ?",
+    )
+    .bind(project_id)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| Written {
+            id: row.get("id"),
+            session_id: row.get("session_id"),
+            origin: row.get("origin"),
+            action: row.get("action"),
+            method: row.get("method"),
+            // A row whose JSON will not parse still reports its count, because the count is the part
+            // that says something was submitted at all. Dropping the row would hide a write.
+            fields: serde_json::from_str(&row.get::<String, _>("fields")).unwrap_or_default(),
+            field_count: row.get("field_count"),
+            element_ref: row.get::<Option<String>, _>("ref").unwrap_or_default(),
+            verb: row.get::<Option<String>, _>("verb").unwrap_or_default(),
+            files: row
+                .get::<Option<String>, _>("files")
+                .and_then(|said| serde_json::from_str(&said).ok())
+                .unwrap_or_default(),
+            written_at: row.get("written_at"),
+        })
+        .collect())
 }
 
 /// Everything about one request to open a session, apart from where it will be sent.
@@ -294,7 +503,7 @@ pub async fn open(
     // Decided on the requested url alone, because the profile has to be chosen before the page runs
     // and the destination after a redirect is not knowable yet. The redirect case is handled below,
     // after the fence has already refused the document.
-    let decision = browser_policy::decide(url, url, surface, requester, &sites);
+    let decision = browser_policy::decide(url, url, surface, requester, &sites.read);
     let profile = match decision.outcome {
         Outcome::Open(profile) => profile,
         Outcome::Refused { recoverable } => {
@@ -324,7 +533,8 @@ pub async fn open(
     // was placed in the project profile and landed off the list, the fence refused the document —
     // nothing from that host ran in the profile — and the url is handed to a throwaway instead.
     if profile == Profile::Project {
-        let after = browser_policy::decide(url, &session.final_url, surface, requester, &sites);
+        let after =
+            browser_policy::decide(url, &session.final_url, surface, requester, &sites.read);
         if matches!(after.outcome, Outcome::Open(Profile::Ephemeral)) {
             let _ = runtime.client.close(&session.id).await;
             let _ = close_row(pool, row_id, after.rule, now).await;
@@ -360,7 +570,17 @@ async fn reopen_ephemeral(
     )
     .await
     .map_err(|error| BrowserError::Failed(error.to_string()))?;
-    let placement = placement_for(Profile::Ephemeral, ask.project_id, ask.run_id, row_id, &[]);
+    // No lists at all, and never read from the database: a throwaway admits every document and
+    // writes nowhere, so consulting the project's grants here would only create a way for them
+    // to leak into a profile that is deleted at the end of the run.
+    let nothing = Allowed::default();
+    let placement = placement_for(
+        Profile::Ephemeral,
+        ask.project_id,
+        ask.run_id,
+        row_id,
+        &nothing,
+    );
 
     let session = match runtime.client.open(ask.url, &placement).await {
         Ok(session) => session,
@@ -386,10 +606,14 @@ fn placement_for(
     project_id: &str,
     run_id: Option<i64>,
     row_id: i64,
-    sites: &[String],
+    sites: &Allowed,
 ) -> Placement {
     match profile {
-        Profile::Project => Placement::project(project_id, sites.to_vec()),
+        // Both lists, always together. A placement carrying the sites and not the write grants would
+        // be a fence enforcing half a decision, and the half it dropped is the permissive one.
+        Profile::Project => {
+            Placement::project(project_id, sites.read.clone()).writing_to(sites.write.clone())
+        }
         Profile::Ephemeral => match run_id {
             Some(run) => Placement::ephemeral(&format!("r{run}")),
             None => Placement::ephemeral(&format!("s{row_id}")),
@@ -797,6 +1021,11 @@ pub struct ActBody {
     pub element_ref: String,
     #[serde(default)]
     pub text: String,
+    /// Upload's second argument: what the file is called. A NAME, judged as one by the sidecar
+    /// before anything touches a disk — the daemon does not resolve it, because resolving is
+    /// deciding and there is nothing here for it to decide against.
+    #[serde(default)]
+    pub filename: String,
 }
 
 /// `POST /browser/open`.
@@ -841,6 +1070,27 @@ pub async fn post_snapshot(
     let Some(row) = live_session(&state, body.session_id).await else {
         return gone();
     };
+    // A read is still a read of THEIR screen. The tree is not pixels, but a login form's tree names
+    // the fields and carries their values, so "it is only the accessibility tree" is not a reason to
+    // let it through while somebody else is driving.
+    //
+    // This guard was missing, and the way it was missing is the interesting part: the sidecar's
+    // `Human` driver refuses `Snapshot`, `Act` and `Screenshot`, and says in its own comment that
+    // "the núcleo already refuses them from its own record (spec §4.4 rule 1), so this is the second
+    // layer". The núcleo refused two of the three. Nothing was exploitable — the second layer held —
+    // but the sentence vouching for the first one was false, which is precisely the state
+    // [`post_act`] warns about: the daemon-side guard exists for the case where the two processes
+    // DISAGREE about who is driving, and a layer that is only believed in cannot do that.
+    if row.mode != mode::AGENT {
+        return axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "wheel-requested",
+                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
+            },
+        }))
+        .into_response();
+    }
     match state
         .browser
         .client
@@ -889,7 +1139,13 @@ pub async fn post_act(
     match state
         .browser
         .client
-        .act(&row.sidecar_id, &body.kind, &body.element_ref, &body.text)
+        .act(
+            &row.sidecar_id,
+            &body.kind,
+            &body.element_ref,
+            &body.text,
+            &body.filename,
+        )
         .await
     {
         Ok(result) => {
@@ -907,18 +1163,73 @@ pub async fn post_act(
                     "the fence refused an action"
                 );
             }
+            // Before the answer goes back, and that ordering is the point. What the sidecar reports
+            // here is what LEFT the machine as the person, so the record of it must not depend on
+            // the caller reading the reply, on the run surviving, or on anything else happening
+            // afterwards. The agent works alone inside its grant; this is the whole of what makes
+            // that supervisable later.
+            if !result.writes.is_empty() {
+                let now = chrono::Utc::now().to_rfc3339();
+                record_writes(
+                    &state.pool,
+                    row.id,
+                    row.project_id.as_deref(),
+                    &result.writes,
+                    &now,
+                )
+                .await;
+            }
             axum::Json(result).into_response()
         }
         Err(error) => browser_error(error),
     }
 }
 
+/// `POST /browser/look` — the annotated picture, for the agent.
+///
+/// Refused while a person has the wheel, and this is the sharpest of the wheel refusals. The reason
+/// the wheel is handed over is almost always a login, so what is on that screen is a password field
+/// with somebody's fingers on it — and a look is precisely the verb that would carry it to a model.
+/// The sidecar's `Human` driver refuses it too; neither layer is redundant, for the reason
+/// [`post_act`] gives about the two processes disagreeing over who is driving.
+///
+/// The refusal is shaped like a fence refusal rather than an error, so an agent reads it with the
+/// vocabulary it already has.
+pub async fn post_look(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SessionBody>,
+) -> axum::response::Response {
+    let Some(row) = live_session(&state, body.session_id).await else {
+        return gone();
+    };
+    if row.mode != mode::AGENT {
+        return axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "wheel-requested",
+                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
+            },
+        }))
+        .into_response();
+    }
+    match state.browser.client.look(&row.sidecar_id).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => browser_error(error),
+    }
+}
+
 /// `POST /browser/screenshot` — pixels, for a person to look at.
 ///
-/// It answers to the shell and not to the agent. Spec §3.5 records why: `filter_outgoing` in
-/// `mcp_tools.rs` redacts text and has never had an image branch, so a screenshot of the owner's
-/// authenticated session handed to a model would leave the machine without passing the redaction
-/// every other answer goes through.
+/// It answers the SHELL, and `/browser/look` above answers the agent. The two are separate routes
+/// rather than one with a flag because they differ in everything that follows from the audience: this
+/// one is a full-page PNG of whatever is there, unlabelled and unbounded, and it is read by a window
+/// a person is looking at.
+///
+/// This comment used to say the agent could not be shown pixels at all, because `filter_outgoing` in
+/// `mcp_tools.rs` redacts text and has no image branch. That reason has not gone away — it is now a
+/// price paid on purpose and written down at the branch itself, where somebody deciding whether to
+/// widen it will actually be standing. What keeps it bounded is that a look is viewport-only, drawn
+/// on a page the fence admitted, and refused outright once a person has the wheel.
 pub async fn post_screenshot(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<SessionBody>,
@@ -926,6 +1237,20 @@ pub async fn post_screenshot(
     let Some(row) = live_session(&state, body.session_id).await else {
         return gone();
     };
+    // The same refusal [`post_look`] carries, and for a stronger version of the same reason: this
+    // one returns raw pixels of whatever is on the screen. The sidecar's `Human` driver singles it
+    // out — "the layer that matters most: the page in front of the person during a handover is a
+    // login form, with a password half-typed into it."
+    if row.mode != mode::AGENT {
+        return axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "wheel-requested",
+                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
+            },
+        }))
+        .into_response();
+    }
     match state.browser.client.screenshot(&row.sidecar_id).await {
         Ok(image) => ([(axum::http::header::CONTENT_TYPE, "image/png")], image).into_response(),
         Err(error) => browser_error(error),
@@ -987,6 +1312,49 @@ pub async fn post_revoke(
     match revoke(&state.pool, &body.project_id, &body.origin).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such site").into_response(),
+        Err(error) => db_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadonlyBody {
+    pub project_id: String,
+    pub origin: String,
+}
+
+/// `POST /browser/readonly` — take back one origin's write grant, leaving it readable.
+///
+/// It carries no boolean, and that absence is the invariant. A body of `{origin, writable}` would be
+/// a route that can WIDEN a permission, which is the thing this surface deliberately does not have:
+/// the list grows in one place, when a person finishes a login and answers for the chain they just
+/// walked (spec §5.2). This one only ever narrows, so there is nothing here for a confused deputy to
+/// aim.
+pub async fn post_readonly(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<ReadonlyBody>,
+) -> axum::response::Response {
+    match make_readonly(&state.pool, &body.project_id, &body.origin).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            "no such site, or it was already read-only",
+        )
+            .into_response(),
+        Err(error) => db_error(error),
+    }
+}
+
+/// `GET /browser/writes/{project_id}` — what agents have submitted in this project's profile.
+///
+/// Admin scope, like everything else on this surface, and for a sharper reason than the rest: these
+/// rows say which forms a person's own logged-in identity was used to submit, which is a more
+/// intimate readout than the list of hosts beside it.
+pub async fn get_writes(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> axum::response::Response {
+    match list_writes(&state.pool, &project_id, 100).await {
+        Ok(writes) => axum::Json(writes).into_response(),
         Err(error) => db_error(error),
     }
 }
@@ -1145,6 +1513,7 @@ mod tests {
                 "https://accounts.google.com/o/oauth2/auth".into(),
                 "https://jira.example.org/browse/X-1".into(),
             ],
+            false,
             NOW,
         )
         .await
@@ -1183,13 +1552,20 @@ mod tests {
     #[tokio::test]
     async fn a_second_login_does_not_rewrite_the_first_grant() {
         let db = TempDb::new().await;
-        grant(&db.pool, "acme", &["https://jira.example.org/".into()], NOW)
-            .await
-            .expect("first");
         grant(
             &db.pool,
             "acme",
             &["https://jira.example.org/".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("first");
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/".into()],
+            false,
             "2027-01-01T00:00:00Z",
         )
         .await
@@ -1212,7 +1588,9 @@ mod tests {
             vec!["not a url".to_string()],
             vec!["http://jira.example.org/".to_string()],
         ] {
-            let granted = grant(&db.pool, "acme", &chain, NOW).await.expect("grant");
+            let granted = grant(&db.pool, "acme", &chain, false, NOW)
+                .await
+                .expect("grant");
             assert!(granted.is_empty(), "{chain:?} granted {granted:?}");
         }
         assert!(
@@ -1224,15 +1602,422 @@ mod tests {
         db.close().await;
     }
 
+    // ---- writing (spec §6.2, extended) ---------------------------------------------------
+
+    /// The one line in `grant` that decides who may be written to, measured on its own.
+    ///
+    /// Writing reaches the DESTINATION and never an identity provider, and this is not a tidy
+    /// distinction: the forms on an identity provider are LOGIN forms, which are precisely the forms
+    /// an agent must never submit. A grant that spread across the chain the way the read grant does
+    /// would put the one dangerous form in the set on the first login anyone performed.
+    #[tokio::test]
+    async fn a_write_grant_reaches_the_destination_and_never_an_identity_provider() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &[
+                "https://jira.example.org/login".into(),
+                "https://accounts.google.com/o/oauth2/auth".into(),
+                "https://jira.example.org/browse/X-1".into(),
+            ],
+            true,
+            NOW,
+        )
+        .await
+        .expect("grant");
+
+        let sites = list_sites(&db.pool, "acme").await.expect("sites");
+        for site in &sites {
+            let expected = site.kind == "destination";
+            assert_eq!(
+                site.writable, expected,
+                "{} is a {} and writable is {}",
+                site.origin, site.kind, site.writable
+            );
+        }
+        let allowed = admitted_origins(&db.pool, "acme").await.expect("allowed");
+        assert_eq!(allowed.read.len(), 2, "both origins are readable");
+        assert_eq!(allowed.write, vec!["https://jira.example.org:443"]);
+        db.close().await;
+    }
+
+    /// The control that gives the test above its meaning: the same login with the box unticked
+    /// grants reading and nothing else. Without this, "writable" could be a column that is always 1.
+    #[tokio::test]
+    async fn a_login_answered_without_the_box_grants_reading_only() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/browse/X-1".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("grant");
+
+        let allowed = admitted_origins(&db.pool, "acme").await.expect("allowed");
+        assert_eq!(allowed.read, vec!["https://jira.example.org:443"]);
+        assert!(
+            allowed.write.is_empty(),
+            "reading a site granted writing to it: {:?}",
+            allowed.write
+        );
+        db.close().await;
+    }
+
+    /// A later login answers for the destination, in BOTH directions.
+    ///
+    /// The narrowing half is the one worth pinning. A permission that an answer can add and no
+    /// answer can remove is how a list stops matching what anyone believes it says — so an unticked
+    /// box on a host that was writable takes the grant away. The date and the reason it was first
+    /// granted for are untouched either way, because those are the audit trail.
+    #[tokio::test]
+    async fn a_later_login_answers_for_the_destination_in_both_directions() {
+        let db = TempDb::new().await;
+        let chain = vec!["https://jira.example.org/browse/X-1".to_string()];
+        grant(&db.pool, "acme", &chain, true, NOW)
+            .await
+            .expect("first");
+        assert_eq!(
+            admitted_origins(&db.pool, "acme")
+                .await
+                .expect("allowed")
+                .write,
+            vec!["https://jira.example.org:443"]
+        );
+
+        grant(&db.pool, "acme", &chain, false, "2027-01-01T00:00:00Z")
+            .await
+            .expect("second");
+
+        let allowed = admitted_origins(&db.pool, "acme").await.expect("allowed");
+        assert!(
+            allowed.write.is_empty(),
+            "an unticked box left the write grant standing: {:?}",
+            allowed.write
+        );
+        let sites = list_sites(&db.pool, "acme").await.expect("sites");
+        assert_eq!(sites[0].granted_at, NOW, "the audit trail was rewritten");
+        db.close().await;
+    }
+
+    /// An identity provider is left alone by a login that is not about it.
+    ///
+    /// The same host can be a stepping stone into one destination and somewhere a person
+    /// deliberately granted writing over there. One login reaching into the other would take away a
+    /// permission nobody answered about.
+    #[tokio::test]
+    async fn a_login_through_a_provider_does_not_answer_for_that_provider() {
+        let db = TempDb::new().await;
+        // Granted deliberately, as a destination, with writing.
+        grant(
+            &db.pool,
+            "acme",
+            &["https://accounts.google.com/settings".into()],
+            true,
+            NOW,
+        )
+        .await
+        .expect("first");
+
+        // And now it appears as a stepping stone in somebody else's login, answered without the box.
+        grant(
+            &db.pool,
+            "acme",
+            &[
+                "https://jira.example.org/login".into(),
+                "https://accounts.google.com/o/oauth2/auth".into(),
+                "https://jira.example.org/browse/X-1".into(),
+            ],
+            false,
+            "2027-01-01T00:00:00Z",
+        )
+        .await
+        .expect("second");
+
+        let allowed = admitted_origins(&db.pool, "acme").await.expect("allowed");
+        assert_eq!(
+            allowed.write,
+            vec!["https://accounts.google.com:443"],
+            "a login that passed through a host answered for it"
+        );
+        db.close().await;
+    }
+
+    /// Taking the write back without taking the site back — the narrower of the two revocations.
+    ///
+    /// It exists because they are two permissions and a person may want to end only the larger one:
+    /// "this has been useful and I would rather it stopped pressing Send". And it only ever narrows,
+    /// which is why there is no boolean on it to pass the other way.
+    #[tokio::test]
+    async fn an_origin_is_made_readonly_without_losing_the_reading() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/browse/X-1".into()],
+            true,
+            NOW,
+        )
+        .await
+        .expect("grant");
+
+        // The shorter spelling of the same origin, because that is what a screen sends and the
+        // stored form carries the port. A silent no-op here would be indistinguishable from success
+        // on the one screen where that matters.
+        assert!(
+            make_readonly(&db.pool, "acme", "https://jira.example.org")
+                .await
+                .expect("readonly")
+        );
+
+        let allowed = admitted_origins(&db.pool, "acme").await.expect("allowed");
+        assert_eq!(allowed.read, vec!["https://jira.example.org:443"]);
+        assert!(allowed.write.is_empty());
+
+        // Twice is not an error and is not a lie either: the second answer says nothing changed.
+        assert!(
+            !make_readonly(&db.pool, "acme", "https://jira.example.org")
+                .await
+                .expect("readonly")
+        );
+        db.close().await;
+    }
+
+    /// The write list travels with the placement, or the fence has nothing to enforce.
+    ///
+    /// The half that would fail silently: a placement carrying the sites and not the grants is a
+    /// browser that refuses every submission while the database says the permission was given, and
+    /// nothing anywhere would report a problem — the agent would simply be told no, correctly, about
+    /// a rule nobody wrote.
+    #[tokio::test]
+    async fn the_write_list_travels_with_the_placement() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/browse/X-1".into()],
+            true,
+            NOW,
+        )
+        .await
+        .expect("grant");
+        let (runtime, seen) = stub_sidecar("https://jira.example.org/browse/X-1").await;
+
+        open(
+            &db.pool,
+            &runtime,
+            Ask {
+                project_id: "acme",
+                run_id: Some(7),
+                url: "https://jira.example.org/browse/X-1",
+                surface: Surface::Assistant,
+                requester: Requester::Owner,
+                now: NOW,
+            },
+        )
+        .await
+        .expect("open");
+
+        let sent = placements(&seen);
+        assert_eq!(sent[0]["origins"][0], "https://jira.example.org:443");
+        assert_eq!(sent[0]["writable"][0], "https://jira.example.org:443");
+        db.close().await;
+    }
+
+    /// A throwaway carries no write grant, whatever the project has been given.
+    ///
+    /// The profile has no login in it, so there is nobody for a form to be submitted AS — and the
+    /// grants belong to a directory that is deleted at the end of the run. The sidecar's fence
+    /// refuses a write list on an ephemeral profile outright, so sending one would not merely be
+    /// wrong: it would fail the open.
+    #[tokio::test]
+    async fn a_throwaway_carries_no_write_grant() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/browse/X-1".into()],
+            true,
+            NOW,
+        )
+        .await
+        .expect("grant");
+        let (runtime, seen) = stub_sidecar("https://news.example.net/").await;
+
+        open(
+            &db.pool,
+            &runtime,
+            Ask {
+                project_id: "acme",
+                run_id: Some(7),
+                url: "https://news.example.net/",
+                surface: Surface::Assistant,
+                requester: Requester::Owner,
+                now: NOW,
+            },
+        )
+        .await
+        .expect("open");
+
+        let sent = placements(&seen);
+        assert_eq!(sent[0]["profile"]["kind"], "ephemeral");
+        assert!(sent[0].get("writable").is_none(), "{:?}", sent[0]);
+        db.close().await;
+    }
+
+    /// What the record keeps, and what it refuses to keep.
+    ///
+    /// The names of the fields and the count, and nowhere in the row a place for a value. This is
+    /// the assertion that the price stated in migration 0107 is actually paid: a `password` field is
+    /// named and its contents are not in this table at all, because there is no column for them.
+    #[tokio::test]
+    async fn a_submission_is_recorded_by_its_field_names_and_never_its_values() {
+        let db = TempDb::new().await;
+        record_writes(
+            &db.pool,
+            42,
+            Some("acme"),
+            &[crate::browser_client::Write {
+                origin: "https://jira.example.org:443".into(),
+                action: "https://jira.example.org/browse/X-1/comment".into(),
+                method: "POST".into(),
+                fields: vec!["body".into(), "password".into()],
+                field_count: 9,
+                r#ref: "e7".into(),
+                verb: "click".into(),
+                files: Vec::new(),
+            }],
+            NOW,
+        )
+        .await;
+
+        let written = list_writes(&db.pool, "acme", 100).await.expect("writes");
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].session_id, 42);
+        assert_eq!(written[0].origin, "https://jira.example.org:443");
+        assert_eq!(written[0].fields, vec!["body", "password"]);
+        // Nine were submitted and two names were kept. The two numbers disagree on purpose, and a
+        // count that had quietly become "the ones we kept" would be the confident wrongness this
+        // whole pillar spent itself removing.
+        assert_eq!(written[0].field_count, 9);
+        assert_eq!(written[0].element_ref, "e7");
+        assert_eq!(written[0].verb, "click");
+        db.close().await;
+    }
+
+    /// One project does not read another's record. The revocation screen is per project, and so is
+    /// the profile whose logins were spent.
+    #[tokio::test]
+    async fn a_projects_record_is_its_own() {
+        let db = TempDb::new().await;
+        let wrote = |origin: &str| crate::browser_client::Write {
+            origin: origin.into(),
+            action: format!("{origin}/x"),
+            method: "POST".into(),
+            fields: vec!["q".into()],
+            field_count: 1,
+            r#ref: "e1".into(),
+            verb: "click".into(),
+            files: Vec::new(),
+        };
+        record_writes(
+            &db.pool,
+            1,
+            Some("acme"),
+            &[wrote("https://a.example:443")],
+            NOW,
+        )
+        .await;
+        record_writes(
+            &db.pool,
+            2,
+            Some("other"),
+            &[wrote("https://b.example:443")],
+            NOW,
+        )
+        .await;
+
+        let mine = list_writes(&db.pool, "acme", 100).await.expect("writes");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].origin, "https://a.example:443");
+        db.close().await;
+    }
+
+    /// Forgetting a profile takes the PERMISSIONS and leaves the RECORD.
+    ///
+    /// The two are different kinds of thing, and this is the same line `browser_sessions` already
+    /// sits on: forgetting closes the sessions and does not delete them. A gesture that erased what
+    /// an agent had already done under a grant would make "forget this profile" the way to clear the
+    /// evidence, which is the opposite of what §10 asks it to be.
+    #[tokio::test]
+    async fn forgetting_a_profile_keeps_the_record_of_what_was_written() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/browse/X-1".into()],
+            true,
+            NOW,
+        )
+        .await
+        .expect("grant");
+        record_writes(
+            &db.pool,
+            1,
+            Some("acme"),
+            &[crate::browser_client::Write {
+                origin: "https://jira.example.org:443".into(),
+                action: "https://jira.example.org/comment".into(),
+                method: "POST".into(),
+                fields: vec!["body".into()],
+                field_count: 1,
+                r#ref: "e1".into(),
+                verb: "click".into(),
+                files: Vec::new(),
+            }],
+            NOW,
+        )
+        .await;
+        let (runtime, _) = stub_sidecar("https://jira.example.org/").await;
+
+        forget(&db.pool, &runtime, "acme").await.expect("forget");
+
+        assert!(
+            list_sites(&db.pool, "acme")
+                .await
+                .expect("sites")
+                .is_empty(),
+            "forgetting left a permission standing"
+        );
+        assert_eq!(
+            list_writes(&db.pool, "acme", 100)
+                .await
+                .expect("writes")
+                .len(),
+            1,
+            "forgetting erased what had already been done"
+        );
+        db.close().await;
+    }
+
     /// A listed host opens in the project profile, and the site list travels with it. Without the
     /// list on the wire the sidecar's fence would have nothing to enforce, and would refuse the
     /// session it was opened for.
     #[tokio::test]
     async fn a_listed_host_opens_in_the_project_profile() {
         let db = TempDb::new().await;
-        grant(&db.pool, "acme", &["https://jira.example.org/".into()], NOW)
-            .await
-            .expect("grant");
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("grant");
         let (runtime, seen) = stub_sidecar("https://jira.example.org/browse/X-1").await;
 
         let opened = open(
@@ -1270,9 +2055,15 @@ mod tests {
     #[tokio::test]
     async fn an_unlisted_host_opens_in_a_throwaway() {
         let db = TempDb::new().await;
-        grant(&db.pool, "acme", &["https://jira.example.org/".into()], NOW)
-            .await
-            .expect("grant");
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("grant");
         let (runtime, seen) = stub_sidecar("https://news.example.net/").await;
 
         let opened = open(
@@ -1315,9 +2106,15 @@ mod tests {
     #[tokio::test]
     async fn a_redirect_off_the_list_is_reopened_in_a_throwaway() {
         let db = TempDb::new().await;
-        grant(&db.pool, "acme", &["https://jira.example.org/".into()], NOW)
-            .await
-            .expect("grant");
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("grant");
         let (runtime, seen) = stub_sidecar("https://evil.example.net/").await;
 
         let opened = open(
@@ -1548,9 +2345,15 @@ mod tests {
     #[tokio::test]
     async fn revoking_a_site_moves_it_back_to_a_throwaway() {
         let db = TempDb::new().await;
-        grant(&db.pool, "acme", &["https://jira.example.org/".into()], NOW)
-            .await
-            .expect("grant");
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("grant");
         let (runtime, _) = stub_sidecar("https://jira.example.org/").await;
 
         assert!(

@@ -884,6 +884,28 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                         .to_owned(),
                 });
             }
+            // And WHICH stranger, which is a different question with a different failure policy.
+            // The mark above fails closed because the barrier reads it; this is read only by a
+            // person deciding whether to finish a refused action by hand, so failing closed here
+            // would give a convenience a veto over every read the daemon does. Logged and carried
+            // on: the cost is a refusal that has to say "not recorded", which is worse than knowing
+            // and better than a browsing session that cannot open a page because a log line would
+            // not write.
+            if let Err(error) = crate::runs::record_untrusted_read(
+                &state.pool,
+                payload.run_id,
+                tool,
+                Some(&payload.tool_input.to_string()),
+            )
+            .await
+            {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool,
+                    %error,
+                    "pretooluse-decision: the turn is marked but what it read could not be written down"
+                );
+            }
             Json(Decision {
                 decision: "allow".to_owned(),
                 reason: "orchestrator NucleOS tool".to_owned(),
@@ -994,6 +1016,14 @@ async fn record_refused_action(
             .flatten()
             .flatten();
 
+    // Read here and copied onto the row, rather than joined at display time: `runs` rows are pruned
+    // on their own schedule and this record is meant to outlive the turn. An error is `None` for the
+    // same reason the write was best-effort — a person reading "not recorded" still has the action
+    // in front of them, where a refusal that failed to be written down at all leaves them nothing.
+    let read_from = crate::runs::untrusted_reads_json(&state.pool, payload.run_id)
+        .await
+        .unwrap_or_default();
+
     match crate::proposals::create_refused_action(
         &state.pool,
         payload.run_id,
@@ -1002,6 +1032,7 @@ async fn record_refused_action(
         tool,
         UNTRUSTED_CONTEXT_DENY_REASON,
         Some(&payload.tool_input.to_string()),
+        read_from.as_deref(),
     )
     .await
     {
@@ -3687,6 +3718,115 @@ mod tests {
             .unwrap();
         assert_eq!(refused[0].errand_id, Some(errand_id));
         assert_eq!(refused[0].errand_name.as_deref(), Some("carros"));
+    }
+
+    /// The record says what the turn was going to do; this says where the idea came from.
+    ///
+    /// Those are different questions and only the second one decides. "Send an email to accounts
+    /// asking them to change the bank details" reads identically whether the owner asked for it or
+    /// a page did, and a person handed only the first question answers it by guessing.
+    #[tokio::test]
+    async fn a_refused_action_says_which_stranger_put_the_idea_there() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:12").await;
+        let app = test_router(state.clone());
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "encomendar o Golf"}),
+        )
+        .await;
+
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        let read_from = refused[0]
+            .read_from
+            .as_deref()
+            .expect("a turn refused by the barrier read SOMETHING, and the row should say what");
+        assert!(
+            read_from.contains("web_read"),
+            "the provenance names no tool: {read_from}"
+        );
+        assert!(
+            read_from.contains("stand.example/anuncio"),
+            "the provenance does not reach the url, which is the only part that decides: {read_from}"
+        );
+    }
+
+    /// Every stranger, not the first one.
+    ///
+    /// A browsing turn opens, snapshots, acts and snapshots again, and the page that planted an idea
+    /// is as likely to be the fourth as the first. Showing one and calling it the provenance would
+    /// be worse than showing none: it reads as complete.
+    #[tokio::test]
+    async fn every_stranger_the_turn_read_is_listed_and_not_just_the_first() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:13").await;
+        let app = test_router(state.clone());
+
+        for url in [
+            "https://stand.example/primeiro",
+            "https://outro.example/segundo",
+        ] {
+            orchestrator_tool(&app, run_id, "web_read", serde_json::json!({"url": url})).await;
+        }
+        orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        let read_from = refused[0].read_from.as_deref().unwrap_or_default();
+        assert!(
+            read_from.contains("primeiro") && read_from.contains("segundo"),
+            "one of the two reads is missing: {read_from}"
+        );
+    }
+
+    /// An absent provenance is a legitimate answer, and the case that proves it is the OTHER
+    /// refusal this kind carries.
+    ///
+    /// `ERRAND_MAY_NOT_ACT` fires on whose work it is, not on what was read — an errand's first
+    /// message has read nothing at all. A reader that treats `None` as "contaminated by something
+    /// we failed to log" would show a warning about a turn that was clean.
+    #[tokio::test]
+    async fn an_errand_refused_for_whose_work_it_is_carries_no_provenance() {
+        let state = test_state().await;
+        let (_errand_id, run_id) = errand_bound_run(&state, "-1002003004:14").await;
+        let app = test_router(state.clone());
+
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "deny");
+        assert_eq!(act.reason, ERRAND_MAY_NOT_ACT, "a different rule fired");
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused[0].read_from, None,
+            "this turn read nothing, and the row must not imply it did"
+        );
     }
 
     /// The guard. If this fails, piece 5 has put a human step in front of everything that worked

@@ -49,10 +49,26 @@ pub struct Placement {
     /// control that does nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origins: Vec<String>,
+    /// Which of those origins this profile may also SUBMIT A FORM to.
+    ///
+    /// A second list rather than a flag on the first, and the separation is the same argument the
+    /// fence makes: reading a site and acting as the person on it are different permissions, wanted
+    /// in different combinations — read the Jira and open no tickets, read the inbox and answer
+    /// nothing. A person grants the second at the login, next to the first and separately from it.
+    ///
+    /// Empty for an ephemeral profile for a reason narrower than `origins`': a throwaway has no
+    /// login in it, so there is nobody for a form to be submitted AS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable: Vec<String>,
 }
 
 impl Placement {
-    /// The placement for a project profile and the sites it admits.
+    /// The placement for a project profile and the sites it admits, none of which it may write to.
+    ///
+    /// Read-only by default, and every caller that means otherwise says so with
+    /// [`Placement::writing_to`]. The permissive spelling is the one that has to be typed out: a
+    /// constructor whose default granted writing would put the whole of this permission behind
+    /// somebody remembering to pass an empty vector.
     pub fn project(project_id: &str, origins: Vec<String>) -> Self {
         Self {
             profile: ProfileRef {
@@ -60,7 +76,14 @@ impl Placement {
                 id: slug(project_id),
             },
             origins,
+            writable: Vec::new(),
         }
+    }
+
+    /// The same placement, naming which of its origins may be submitted to.
+    pub fn writing_to(mut self, writable: Vec<String>) -> Self {
+        self.writable = writable;
+        self
     }
 
     /// The placement for a throwaway. No origin list, by construction rather than by discipline.
@@ -73,6 +96,7 @@ impl Placement {
                 id: slug(run_id),
             },
             origins: Vec::new(),
+            writable: Vec::new(),
         }
     }
 }
@@ -126,6 +150,14 @@ pub struct Session {
     /// and a page that had not got there yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub still_loading: bool,
+    /// The HTTP status the page came back with, and 0 when nothing said.
+    ///
+    /// A 404 is a page: heading, sentence, search box, and every other signal saying it is fine. An
+    /// agent sent to find something reads it correctly and concludes the thing is not there, when
+    /// what happened is that the request failed. 0 means nothing said — a document from the
+    /// back-forward cache never produces a response — and never "fine".
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub status: i64,
 }
 
 /// One thing on the page the agent may refer to.
@@ -147,9 +179,21 @@ pub struct Element {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub value: String,
     /// The accessibility properties that change what an act would MEAN: `checked`/`unchecked`,
-    /// `disabled`, `expanded`/`collapsed`, `selected`, `required`.
+    /// `disabled`, `expanded`/`collapsed`, `selected`, `required`, `focused`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub state: Vec<String>,
+    /// Where a link goes — a path when it points at the page's own origin, the whole address
+    /// otherwise. Without it two links called "Details" are one link, and a link that opens in a
+    /// window (which the fence refuses) has no way onward, because `goto` needs an address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+}
+
+/// One kind of thing on the page that the accessibility tree does not carry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Unread {
+    pub kind: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -181,6 +225,15 @@ pub struct Snapshot {
     /// This is what stops the agent concluding the page is blank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Blocked>,
+    /// What is ON the page that the accessibility tree cannot express: a canvas, a video, an
+    /// undescribed drawing or image.
+    ///
+    /// A page drawn into a canvas — a chart, a map, a PDF viewer — loads perfectly and leaves
+    /// nothing in the tree, so the reading comes back short and with nothing to doubt. This does not
+    /// make the drawing readable; it makes the absence legible, which is the difference between an
+    /// agent concluding the answer is not there and knowing to ask a person.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<Unread>,
     /// The page had not finished arriving when this reading was taken.
     ///
     /// It is here because otherwise the flag could be raised and never lowered: opening said it,
@@ -188,6 +241,28 @@ pub struct Snapshot {
     /// nothing at all. There is no `wait` verb on purpose, so the reading has to carry it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub still_loading: bool,
+    /// Questions the page put to a PERSON, and the answers it was given instead.
+    ///
+    /// `alert`, `confirm`, `prompt` and `beforeunload` freeze the renderer until the attached
+    /// debugger answers them, and the sidecar answers no — accepting would be a decision taken on
+    /// somebody's behalf, on a surface the page controls. Carried here because otherwise the agent
+    /// reads a page where its click did nothing and concludes the button is broken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dialogs: Vec<Dialog>,
+    /// The HTTP status of the page being read, and 0 when nothing said. Same meaning as on
+    /// `Session`, and here because a click or a goto replaces the document without producing a new
+    /// session — so the reading is the only place the current page's status can arrive.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub status: i64,
+}
+
+/// One question the page asked a person, and the answer given on their behalf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dialog {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    pub answer: String,
 }
 
 /// What the injected CSP stopped: how many, and the most recent one.
@@ -218,6 +293,68 @@ pub struct ActResult {
     /// The page it moved to had not finished arriving. Same meaning as on [`Session`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub still_loading: bool,
+    /// The form submissions this act actually SENT — the ones the fence let through.
+    ///
+    /// Only what left. A submission the fence stopped is a refusal and not a write, and conflating
+    /// the two would make the record of what an agent did as the person contain things it did not
+    /// do. `browser::post_act` files these in `browser_writes` before answering the caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<Write>,
+}
+
+/// One annotated picture of a page: what a person would see, with the agent's own refs drawn on it.
+///
+/// The labels ARE the refs. Nothing here is a coordinate, and there is no verb that takes one — see
+/// the sidecar's `browser.LookResult` for why that is the whole design rather than a limitation of
+/// it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LookResult {
+    /// The picture, base64, as it arrived. Never decoded on this side: it is passed to the model as
+    /// an image block, and decoding it here would only be re-encoding it a line later.
+    pub image: String,
+    pub mime: String,
+    /// The refs actually drawn, which is fewer than the session knows: what is scrolled out of the
+    /// viewport gets no label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub width: i64,
+    #[serde(default)]
+    pub height: i64,
+}
+
+/// One form submission that left this machine, as much of it as is safe to keep.
+///
+/// The names of the fields and how many there were. Never the values — see the sidecar's
+/// `browser.Write` and migration 0107 for the argument, which is the same one in both places: a form
+/// carries passwords, tokens and private text, and a record of what was submitted would turn this
+/// database into where every credential an agent ever types comes to rest.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Write {
+    /// Where it went, in the shape `browser_sites.origin` is written in — so the join a person makes
+    /// by eye is the join the database would make.
+    pub origin: String,
+    /// The form's action with its query removed, and the method it went with.
+    pub action: String,
+    pub method: String,
+    /// The NAMES of the fields submitted, in document order, and how many there were in total. Two
+    /// numbers on purpose: a long form is truncated to a readable list of names while the count
+    /// stays true.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub field_count: i64,
+    /// The act that caused it — the ref from the snapshot and the verb. The write rule's fifth
+    /// condition written down rather than asserted.
+    #[serde(default)]
+    pub r#ref: String,
+    #[serde(default)]
+    pub verb: String,
+    /// The NAMES of any files this submission carried, and never their contents. Migration 0108
+    /// carries the argument; it is `fields`' argument concentrated, because a file is the densest
+    /// thing an agent can send and the one an owner is most likely to have forgotten they had.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 impl ActResult {
@@ -363,6 +500,7 @@ impl BrowserClient {
         kind: &str,
         element_ref: &str,
         text: &str,
+        filename: &str,
     ) -> Result<ActResult, BrowserError> {
         self.call(
             "/act",
@@ -371,9 +509,23 @@ impl BrowserClient {
                 "kind": kind,
                 "ref": element_ref,
                 "text": text,
+                // Only upload reads it, and it travels on every act for the reason every other
+                // argument does: a shape that changes with the verb is a shape each end has to agree
+                // about twice.
+                "filename": filename,
             }),
         )
         .await
+    }
+
+    /// The annotated picture, for the AGENT to look at.
+    ///
+    /// JSON and not bytes, unlike [`BrowserClient::screenshot`] below, because the labels travel with
+    /// the picture: an image body with the refs in a header would split one answer across two places,
+    /// and the half that makes the picture actionable is the half that would be dropped first.
+    pub async fn look(&self, session_id: &str) -> Result<LookResult, BrowserError> {
+        self.call("/look", &serde_json::json!({ "session_id": session_id }))
+            .await
     }
 
     /// Pixels, for a person to look at. Returns PNG bytes rather than JSON, which is why it does not
@@ -698,8 +850,8 @@ mod tests {
         );
     }
 
-    /// A sidecar that answers the six routes the way the Go one does, so the client can be driven
-    /// over a real socket instead of only being reasoned about.
+    /// A sidecar that answers the driver's routes the way the Go one does, so the client can be
+    /// driven over a real socket instead of only being reasoned about.
     ///
     /// It records what ARRIVED, which is the half that matters: the shapes on this wire are written
     /// twice, in two languages, and the failure mode is a field that serialises under a name the far
@@ -800,7 +952,7 @@ mod tests {
             .expect("snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
 
-        let result = client.act("s1", "click", "e5", "").await.expect("act");
+        let result = client.act("s1", "click", "e5", "", "").await.expect("act");
         assert!(result.refused(), "a refusal must survive as a value");
 
         let ticket = client.handoff("s1", "login").await.expect("handoff");

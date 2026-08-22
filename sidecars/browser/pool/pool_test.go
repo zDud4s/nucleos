@@ -338,6 +338,45 @@ func TestAChangedSiteListRelaunchesWhenIdleAndRefusesWhenNot(t *testing.T) {
 	}
 }
 
+// TestAWithdrawnWriteGrantIsADifferentPolicy.
+//
+// The hole this was written for, and it was a real one while the fingerprint was made from the
+// origins alone: taking a write grant back changes NO origin, so the fingerprint matched, so the
+// pool handed back a browser still fenced by the permission that had just been withdrawn. A
+// revocation that does not reach the process enforcing it is a revocation in name — and it would
+// have looked correct everywhere a person could see, the row gone from the screen and the grant gone
+// from the database, while the browser kept submitting forms.
+//
+// It is measured with a session still OPEN, which is the only place the fingerprint is observable at
+// all: a browser whose last session closes is retired outright (see release), so a close-then-reopen
+// launches a second browser whatever the fingerprint said. The first half of this test is what makes
+// the second half mean something — the identical placement finds the running browser, so the changed
+// one being refused is about the change and not about pooling.
+func TestAWithdrawnWriteGrantIsADifferentPolicy(t *testing.T) {
+	launcher := &fakeLauncher{}
+	pool, _ := testPool(t, launcher, 4)
+
+	writing := project("acme", "https://jira.example.org")
+	writing.Writable = []string{"https://jira.example.org"}
+	mustOpen(t, pool, writing)
+
+	// The control: the same two lists find the browser that is already up.
+	mustOpen(t, pool, writing)
+	if len(launcher.launched()) != 1 {
+		t.Fatalf("an unchanged placement launched %d browsers", len(launcher.launched()))
+	}
+
+	// And the withdrawal, which changes no origin at all.
+	_, err := pool.Open(context.Background(), browser.OpenRequest{
+		URL:       "https://example.org/",
+		Placement: project("acme", "https://jira.example.org"),
+	})
+	if !errors.Is(err, ErrPolicyChanged) {
+		t.Fatalf("opening after a write grant was withdrawn = %v, want ErrPolicyChanged;"+
+			" the browser enforcing it was never told", err)
+	}
+}
+
 // TestTheSameListInAnotherOrderIsTheSamePolicy. Nothing promises the núcleo sends a list in a stable
 // order, and tearing down a working browser because a slice was shuffled would be a restart nobody
 // asked for — visible to the person as a page that closed itself.
@@ -452,5 +491,68 @@ func TestShutdownStopsEveryBrowserAndSweepsTheProfiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(store.Root, "project-acme")); err != nil {
 		t.Errorf("shutdown took a project profile: %v", err)
+	}
+}
+
+// TestAProfileIsChasedUntilTheHandlesGo.
+//
+// The failure this guards is not a slow disk. Stop() issues `taskkill /T /F` and then waits on the
+// launcher's pid, which spec §9.3 says is not the browser — so the renderers it killed can still be
+// exiting, still holding handles into the profile, when RemoveAll walks it. On Windows an open handle
+// is enough to make a file undeletable. The removal used to be one call with the error thrown away,
+// so spec §5.1's promise that an ephemeral profile dies with its run stopped holding and nothing
+// anywhere said so.
+//
+// Two failures then a success is the shape measured against the gate: the window is short, because
+// what closes it is a handful of processes finishing.
+func TestAProfileIsChasedUntilTheHandlesGo(t *testing.T) {
+	tries := 0
+	err := chase(func() error {
+		tries++
+		if tries < 3 {
+			return errors.New("the directory is not empty")
+		}
+		return nil
+	}, time.Second, time.Millisecond)
+
+	if err != nil {
+		t.Fatalf("the profile survived a window that was long enough: %v", err)
+	}
+	if tries != 3 {
+		t.Errorf("it asked %d times; asking once is the bug this replaced", tries)
+	}
+}
+
+// TestChasingAProfileGivesUpRatherThanHanging.
+//
+// The other half, and the one that matters more. A directory something holds open FOREVER is a
+// different fault — a browser that did not die, a handle nobody owns — and a chase with no bound
+// would wear this one's clothes while hanging the session that closed.
+func TestChasingAProfileGivesUpRatherThanHanging(t *testing.T) {
+	held := errors.New("something still has it open")
+	tries := 0
+	began := time.Now()
+	err := chase(func() error { tries++; return held }, 50*time.Millisecond, time.Millisecond)
+
+	if !errors.Is(err, held) {
+		t.Fatalf("giving up reported %v rather than what actually went wrong", err)
+	}
+	if tries < 2 {
+		t.Errorf("it gave up after %d attempt(s), so the window bought nothing", tries)
+	}
+	if elapsed := time.Since(began); elapsed > time.Second {
+		t.Errorf("it held the caller for %s; the bound is what stops this being a hang", elapsed)
+	}
+}
+
+// TestAnAttemptIsMadeEvenWithNoWindowToChaseIn. A caller that passed no window meant "try", not
+// "do nothing" — and a zero here would otherwise silently stop deleting profiles altogether.
+func TestAnAttemptIsMadeEvenWithNoWindowToChaseIn(t *testing.T) {
+	tries := 0
+	if err := chase(func() error { tries++; return nil }, 0, time.Millisecond); err != nil {
+		t.Fatalf("the one attempt failed: %v", err)
+	}
+	if tries != 1 {
+		t.Errorf("a zero window produced %d attempts", tries)
 	}
 }

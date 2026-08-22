@@ -214,6 +214,14 @@ func (h *Human) Screenshot(context.Context, browser.SessionID) ([]byte, error) {
 	return nil, browser.ErrPersonIsDriving
 }
 
+// Look is refused for the same reason Screenshot beside it is, and more so: a look is the picture an
+// AGENT would receive. The wheel is handed over for a login, so what is on the screen is a password
+// field with a person's fingers on it, and a labelled version of that would be the same pixels with
+// an index attached.
+func (h *Human) Look(context.Context, browser.SessionID) (browser.LookResult, error) {
+	return browser.LookResult{}, browser.ErrPersonIsDriving
+}
+
 // Handoff is refused: the person already has it.
 func (h *Human) Handoff(context.Context, browser.SessionID, string) (browser.HandoffTicket, error) {
 	return browser.HandoffTicket{}, browser.ErrPersonIsDriving

@@ -127,8 +127,11 @@ pub async fn open_window(
     // The project's profile, never a throwaway — the same reason `accept` re-places a handover
     // (§4.5). A login made in a directory that is deleted afterwards is a login nobody keeps, and
     // this function's whole point is the login.
+    // `.read` and no write list, because this is the PERSON's window: headful, with no fence
+    // attached at all (spec §4.1), so a write grant here would be a field nothing consults. The read
+    // list travels because the sidecar uses it to place the profile, not to police it.
     let sites = browser::admitted_origins(&state.pool, project_id).await?;
-    let placement = Placement::project(project_id, sites);
+    let placement = Placement::project(project_id, sites.read);
 
     let now = chrono::Utc::now().to_rfc3339();
     let row_id = browser::insert_person_window(&state.pool, project_id, url, &now).await?;
@@ -227,7 +230,7 @@ pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, Whe
     // proposal outlives the run, so it would point at a directory that no longer exists.
     let project = row.project_id.clone().unwrap_or_default();
     let sites = browser::admitted_origins(&state.pool, &project).await?;
-    let placement = Placement::project(&project, sites);
+    let placement = Placement::project(&project, sites.read);
     let url = landing(&row);
 
     let wheel = match state
@@ -332,10 +335,23 @@ pub async fn give_back(state: &AppState, session_id: i64) -> Result<Vec<String>,
 /// It names no host. It answers yes or no to a chain recorded by a browser under the person's own
 /// hands, which is why there is no `POST /browser/grant`: a route that took hosts would be a route
 /// the confused deputy of §5.2 could aim, and this one has nothing to aim.
+///
+/// # Two answers, because reading and writing are two permissions
+///
+/// `writable` is the second half of the same question, asked at the same moment and about the same
+/// chain: may an agent also SUBMIT FORMS where this login landed. It is a separate field rather than
+/// a wider `keep` because the two are wanted in different combinations — read the Jira and open no
+/// tickets, read the inbox and answer nothing — and it applies only to the destination, never to the
+/// identity providers the login passed through (see [`browser::grant`], where that is decided).
+///
+/// `writable` without `keep` grants nothing at all: there is no writing to a site the profile may
+/// not load. The combination is not rejected, because there is nothing to reject — the early return
+/// below never reaches the grant.
 pub async fn keep(
     state: &AppState,
     session_id: i64,
     keep: bool,
+    writable: bool,
 ) -> Result<Vec<String>, WheelError> {
     let Some(row) = browser::session_row(&state.pool, session_id).await? else {
         return Err(WheelError::NoSuchSession);
@@ -351,7 +367,7 @@ pub async fn keep(
         return Ok(Vec::new());
     }
     let project = row.project_id.clone().unwrap_or_default();
-    Ok(browser::grant(&state.pool, &project, &chain, &now).await?)
+    Ok(browser::grant(&state.pool, &project, &chain, writable, &now).await?)
 }
 
 /// Where the session actually is: the landing url when there is one, the requested one otherwise.
@@ -402,6 +418,11 @@ pub struct WheelBody {
 pub struct KeepBody {
     pub session_id: i64,
     pub keep: bool,
+    /// May an agent also submit forms where this login landed? Defaults to FALSE, so a caller that
+    /// has never heard of writing grants none — the direction an omitted field has to fail in when
+    /// the field is a permission.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,7 +473,7 @@ pub async fn post_keep(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<KeepBody>,
 ) -> axum::response::Response {
-    match keep(&state, body.session_id, body.keep).await {
+    match keep(&state, body.session_id, body.keep, body.writable).await {
         Ok(granted) => axum::Json(serde_json::json!({ "granted": granted })).into_response(),
         Err(error) => wheel_error(error),
     }
@@ -486,7 +507,7 @@ mod tests {
 
     const NOW: &str = "2026-08-16T10:00:00Z";
 
-    /// A sidecar that answers the six verbs and the two wheel ones, and records every call.
+    /// A sidecar that answers the driver's verbs and the two wheel ones, and records every call.
     ///
     /// It answers `/wheel/return` with a chain the test chooses, because the chain is the only thing
     /// a handover produces that outlives it â€” everything else here is a window that closes.
@@ -636,6 +657,75 @@ mod tests {
         row.id
     }
 
+    /// The daemon-side guard on the READ verbs, and the reason it has to be on this side at all.
+    ///
+    /// **Found by driving a live daemon, not by this suite.** A session was handed off and then
+    /// asked for a snapshot, and it answered — with the page. `post_act` and `post_look` refuse once
+    /// the session is not the agent's; `post_snapshot` and `post_screenshot` did not.
+    ///
+    /// Nothing was exploitable, and that is the part worth keeping. The sidecar's `Human` driver
+    /// refuses all three, so the second layer held. But its comment says the núcleo "already refuses
+    /// them from its own record (spec §4.4 rule 1), so this is the second layer" — and the núcleo
+    /// refused two of the three. A first layer that is only believed in cannot do the job it exists
+    /// for, which `post_act` states exactly: it holds when the two processes DISAGREE about who is
+    /// driving, the state a crash between the request and the handover produces.
+    ///
+    /// A tree is not pixels, and that is not a defence. A login form's accessibility tree names the
+    /// fields and carries their values.
+    #[tokio::test]
+    async fn the_read_verbs_leave_the_agent_with_the_session() {
+        // Spelled out rather than defaulted: `SessionBody` has no `Default`, and giving it one
+        // for a test would put a "session 0" into production code.
+        fn reading(session_id: i64) -> crate::browser::SessionBody {
+            crate::browser::SessionBody {
+                session_id,
+                changes_only: false,
+                text_from: 0,
+                controls_from: 0,
+                find: String::new(),
+            }
+        }
+
+        let (db, state, _) = wheeled(vec![], false).await;
+        let session = a_session(&state).await;
+        request(&state, session, "there is a login here")
+            .await
+            .expect("request");
+
+        for (verb, response) in [
+            (
+                "snapshot",
+                crate::browser::post_snapshot(
+                    axum::extract::State(state.clone()),
+                    axum::Json(reading(session)),
+                )
+                .await,
+            ),
+            (
+                "screenshot",
+                crate::browser::post_screenshot(
+                    axum::extract::State(state.clone()),
+                    axum::Json(reading(session)),
+                )
+                .await,
+            ),
+        ] {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("refused"),
+                "{verb} answered a session that is not the agent's: {text}"
+            );
+            assert!(
+                text.contains("theirs"),
+                "{verb} refused without saying whose the screen is: {text}"
+            );
+        }
+        db.close().await;
+    }
+
     /// Spec Â§4.4 rule 3, and the first half of rule 1. Asking raises a proposal â€” the daemon runs
     /// without a shell, so the request has to survive the window being closed â€” and the session
     /// leaves the agent's hands in the same breath.
@@ -771,7 +861,7 @@ mod tests {
             "handing the wheel back must not grant anything on its own"
         );
 
-        let granted = keep(&state, session, true).await.expect("keep");
+        let granted = keep(&state, session, true, false).await.expect("keep");
         assert_eq!(
             granted,
             vec![
@@ -782,9 +872,71 @@ mod tests {
 
         // And it can only be answered once: the permission belongs to the moment of the login.
         assert!(matches!(
-            keep(&state, session, true).await,
+            keep(&state, session, true, false).await,
             Err(WheelError::WrongState(_))
         ));
+        db.close().await;
+    }
+
+    /// The second answer on the same screen: writing, granted where the login landed.
+    ///
+    /// It rides the same act as the read grant and reaches a strictly smaller set — the destination
+    /// only. The identity provider in this chain is the assertion that matters: its forms are login
+    /// forms, and those are exactly the forms an agent must never submit.
+    #[tokio::test]
+    async fn the_login_can_also_grant_writing_and_only_where_it_landed() {
+        let (db, state, _) = wheeled(
+            vec![
+                "https://jira.example.org/login",
+                "https://accounts.google.com/o/oauth2/auth",
+                "https://jira.example.org/browse/X-1",
+            ],
+            false,
+        )
+        .await;
+        let session = a_session(&state).await;
+        request(&state, session, "login").await.expect("request");
+        accept(&state, session).await.expect("accept");
+        give_back(&state, session).await.expect("give back");
+
+        keep(&state, session, true, true).await.expect("keep");
+
+        let allowed = crate::browser::admitted_origins(&db.pool, "acme")
+            .await
+            .expect("allowed");
+        assert_eq!(allowed.read.len(), 2, "both origins are readable");
+        assert_eq!(
+            allowed.write,
+            vec!["https://jira.example.org:443"],
+            "writing reached somewhere other than where the login landed"
+        );
+        db.close().await;
+    }
+
+    /// Saying no to the chain while ticking the write box grants nothing at all.
+    ///
+    /// Not rejected, because there is nothing to reject: there is no writing to a site the profile
+    /// may not even load, and the early return in `keep` never reaches the grant. Asserted rather
+    /// than reasoned about, because "impossible by construction" is a claim that has to be true of
+    /// the code and not only of the paragraph describing it.
+    #[tokio::test]
+    async fn ticking_the_write_box_while_keeping_nothing_grants_nothing() {
+        let (db, state, _) = wheeled(vec!["https://jira.example.org/login"], false).await;
+        let session = a_session(&state).await;
+        request(&state, session, "login").await.expect("request");
+        accept(&state, session).await.expect("accept");
+        give_back(&state, session).await.expect("give back");
+
+        assert!(
+            keep(&state, session, false, true)
+                .await
+                .expect("keep")
+                .is_empty()
+        );
+        let allowed = crate::browser::admitted_origins(&db.pool, "acme")
+            .await
+            .expect("allowed");
+        assert!(allowed.read.is_empty() && allowed.write.is_empty());
         db.close().await;
     }
 
@@ -798,7 +950,12 @@ mod tests {
         accept(&state, session).await.expect("accept");
         give_back(&state, session).await.expect("give back");
 
-        assert!(keep(&state, session, false).await.expect("keep").is_empty());
+        assert!(
+            keep(&state, session, false, false)
+                .await
+                .expect("keep")
+                .is_empty()
+        );
         assert!(
             crate::browser::list_sites(&db.pool, "acme")
                 .await
@@ -806,7 +963,7 @@ mod tests {
                 .is_empty()
         );
         assert!(matches!(
-            keep(&state, session, true).await,
+            keep(&state, session, true, false).await,
             Err(WheelError::WrongState(_))
         ));
         db.close().await;
@@ -831,7 +988,7 @@ mod tests {
         ));
         // Keeping a chain that was never recorded.
         assert!(matches!(
-            keep(&state, session, true).await,
+            keep(&state, session, true, false).await,
             Err(WheelError::WrongState(_))
         ));
         // And none of it works on a session that does not exist.

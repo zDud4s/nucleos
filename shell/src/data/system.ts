@@ -63,6 +63,18 @@ export interface Proposal {
   tool_name: string | null;
   reasoning: string;
   tool_input: string | null;
+  /**
+   * What the turn had read when it reached for this, as a JSON array of
+   * `{tool, arguments, at}` — the daemon's `run_untrusted_reads`, copied onto
+   * the row so it survives the run being pruned.
+   *
+   * `null` is a legitimate answer and must never be rendered as "read nothing".
+   * A refusal that fired on whose work it is rather than on what was read has no
+   * provenance to carry, and neither does one whose recording failed; the two
+   * are indistinguishable from here, which is why the card shows nothing rather
+   * than a claim.
+   */
+  read_from: string | null;
   created_at: string;
   decided_at: string | null;
 }

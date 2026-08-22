@@ -1431,6 +1431,24 @@ async fn mark_if_remembering(
         .await;
         return Err("could not record that this turn carries the errand's notebook".to_string());
     }
+    // Written down beside the mark, and this is the one entry that comes from no tool call.
+    //
+    // Without it the provenance a refusal carries would be complete-looking and wrong in exactly the
+    // case that matters most. An errand turn is marked HERE, before it spawns, and then reads a page
+    // through `hooks.rs`; a list built only from tool calls would show the page and omit the
+    // notebook, so a person deciding whether the idea was the agent's or a stranger's would be
+    // shown the wrong stranger. Naming it plainly rather than borrowing `errand_notebook_read` —
+    // no tool was called, and a real tool name here would be a call that never happened.
+    if let Err(error) =
+        crate::runs::record_untrusted_read(&state.pool, id, "the errand's notebook", None).await
+    {
+        tracing::warn!(
+            run_id = id,
+            errand_id = turn.errand.id,
+            %error,
+            "the turn is marked as carrying the notebook but that could not be written down"
+        );
+    }
     Ok(())
 }
 

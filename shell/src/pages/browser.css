@@ -178,6 +178,24 @@
   background: var(--surface-sunken);
 }
 
+/* The second answer on that screen: may an agent submit forms where this login
+   landed. A row rather than a column, because it is one short question and not
+   a field with a value — and it sits between the chain and the buttons so it
+   is read before either of them is pressed. */
+.browser-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.browser-check input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--accent);
+}
+
 /* ========================================================= open a window == */
 
 /* Two fields and a button. The plainness is the argument — see `OpenAWindow`. */
@@ -206,6 +224,27 @@
   gap: var(--space-2);
 }
 
+/* What has been submitted under the grants above. Set apart from the grants by
+   a rule rather than by a panel of its own: it is the same decision seen from
+   the other side, and a person looking at "revoke" should not have to go
+   anywhere to see what they would be revoking. */
+.browser-writes {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.browser-subhead {
+  margin: 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
 .browser-forget {
   margin-top: var(--space-4);
   padding-top: var(--space-3);
@@ -220,4 +259,14 @@
   align-items: center;
   gap: var(--space-2);
   margin: 0 0 var(--space-3);
+}
+
+/* A submission that carried a file, on the record screen.
+   Toned rather than plain, and it is the only line in this list that is: "a
+   comment was posted" and "a document was posted" are not the same event, and
+   somebody scanning the record for something they did not expect is looking
+   for exactly that difference. The names are here; what the file said is
+   deliberately nowhere (migration 0098). */
+.browser-files {
+  color: var(--tone-danger-fg);
 }

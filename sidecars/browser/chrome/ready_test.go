@@ -32,7 +32,24 @@ func connected(t *testing.T) (*cdptest.Browser, *Driver) {
 	driver.readyWithin = 150 * time.Millisecond
 	driver.idleGrace = 30 * time.Millisecond
 	driver.settleWithin = 30 * time.Millisecond
+	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) { return reachable(), nil })
 	return fake, driver
+}
+
+// reachable is the fake's answer to "where is this element, and what is on top of it".
+//
+// A click asks the page that before it presses anything (chrome/click.go), and the fake's own
+// default — an empty result — reads as a page that answered nothing at all. Every test here that
+// clicks needs an answer and none of them is ABOUT the answer, so it belongs with the rest of the
+// setup rather than in each of them.
+//
+// A test that overrides Runtime.callFunctionOn for its own purposes has to return this as well, or
+// the click it is not testing fails first and hides the thing it is.
+func reachable() map[string]any {
+	return map[string]any{"result": map[string]any{
+		"type":  "string",
+		"value": `{"x":10,"y":10,"sized":true,"reached":true,"on_top":""}`,
+	}}
 }
 
 // TestOpeningWaitsForThePageToArrive.
@@ -103,7 +120,7 @@ func TestAnActThatMovesThePageSaysSo(t *testing.T) {
 	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) {
 		fake.Emit("S1", "Page.frameNavigated", map[string]any{"frame": map[string]any{"id": "F1"}})
 		fake.Emit("S1", "Page.lifecycleEvent", map[string]any{"name": "networkAlmostIdle"})
-		return map[string]any{}, nil
+		return reachable(), nil
 	})
 
 	result, err := driver.Act(context.Background(), session.ID, browser.Action{

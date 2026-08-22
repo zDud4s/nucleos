@@ -7,12 +7,15 @@ import {
   useBrowserSites,
   useCloseSession,
   useForgetProfile,
+  useBrowserWrites,
   useKeepChain,
+  useMakeReadonly,
   useOpenWindow,
   useRevokeSite,
   useReturnWheel,
   type BrowserSession,
   type Site,
+  type Written,
 } from "../data/browser";
 import { useProjects } from "../data/system";
 import {
@@ -250,6 +253,10 @@ function ChainDialogue({
   onSettled: () => void;
 }) {
   const keepChain = useKeepChain();
+  // Unticked, and it stays unticked until a person says otherwise. The permissive answer is the one
+  // that has to be chosen; a box that arrived ticked would make writing something granted by not
+  // reading the screen.
+  const [writable, setWritable] = useState(false);
 
   return (
     <Panel title="Keep these?">
@@ -264,19 +271,37 @@ function ChainDialogue({
           </li>
         ))}
       </ol>
+      <label className="browser-check">
+        <input
+          type="checkbox"
+          checked={writable}
+          disabled={keepChain.isPending}
+          onChange={(event) => setWritable(event.target.checked)}
+        />
+        <span>Let agents submit forms here, as you</span>
+      </label>
+      <p className="browser-note">
+        The second half of the same question, and a narrower one. Keeping the chain lets an agent
+        READ these sites; this lets it press Send on a form it can see — a reply, a ticket, a saved
+        filter — on the site you just logged into, and never on the identity providers the login
+        passed through. It works without asking you again, so what you get instead is a record: every
+        submission is listed under Site grants, by the names of the fields and never their contents.
+      </p>
       <div className="browser-actions">
         <ConfirmButton
           label="Keep them"
           confirmLabel="Grant these origins"
           variant="approve"
           disabled={keepChain.isPending}
-          onConfirm={() => keepChain.mutate({ sessionId, keep: true }, { onSuccess: onSettled })}
+          onConfirm={() => keepChain.mutate({ sessionId, keep: true, writable }, { onSuccess: onSettled })}
         />
         <ConfirmButton
           label="Keep none"
           confirmLabel="Discard the chain"
           disabled={keepChain.isPending}
-          onConfirm={() => keepChain.mutate({ sessionId, keep: false }, { onSuccess: onSettled })}
+          onConfirm={() =>
+            keepChain.mutate({ sessionId, keep: false, writable: false }, { onSuccess: onSettled })
+          }
         />
       </div>
       {keepChain.isError && <MutationNote error={keepChain.error} what="that answer was not recorded" />}
@@ -390,6 +415,7 @@ function SiteGrants() {
   const projectId = chosen ?? options[0]?.project_id;
   const sites = useBrowserSites(projectId);
   const revoke = useRevokeSite();
+  const readonly = useMakeReadonly();
   const forget = useForgetProfile();
   const rows = sites.data ?? [];
 
@@ -431,12 +457,18 @@ function SiteGrants() {
                   key={site.origin}
                   site={site}
                   onRevoke={() => revoke.mutate({ projectId, origin: site.origin })}
-                  pending={revoke.isPending}
+                  onReadonly={() => readonly.mutate({ projectId, origin: site.origin })}
+                  pending={revoke.isPending || readonly.isPending}
                 />
               ))}
             </ul>
           )}
           {revoke.isError && <MutationNote error={revoke.error} what="that site could not be revoked" />}
+          {readonly.isError && (
+            <MutationNote error={readonly.error} what="that grant could not be narrowed" />
+          )}
+
+          <WriteRecord projectId={projectId} />
 
           <div className="browser-forget">
             <ConfirmButton
@@ -458,16 +490,120 @@ function SiteGrants() {
   );
 }
 
-function SiteRow({ site, onRevoke, pending }: { site: Site; onRevoke: () => void; pending: boolean }) {
+/**
+ * One granted origin, with both ways of taking something back.
+ *
+ * Two buttons and not one, because there are two permissions and a person may
+ * want to end only the larger. Revoking removes the site outright — the agent
+ * cannot even load it. Making it read-only leaves the reading and ends the
+ * submitting, which is the answer to "this has been useful and I would rather
+ * it stopped pressing Send".
+ */
+function SiteRow({
+  site,
+  onRevoke,
+  onReadonly,
+  pending,
+}: {
+  site: Site;
+  onRevoke: () => void;
+  onReadonly: () => void;
+  pending: boolean;
+}) {
   return (
     <li className="browser-row">
       <div className="browser-row-head">
         <span className="browser-url">{site.origin}</span>
         <Badge tone={site.kind === "destination" ? "info" : "shadow"}>{site.kind}</Badge>
+        {site.writable && <Badge tone="danger">submits forms</Badge>}
         <RelativeTime at={site.granted_at} />
       </div>
       {site.granted_for !== null && <p className="browser-meta">brought in by {site.granted_for}</p>}
-      <ConfirmButton label="Revoke" confirmLabel="Revoke this origin" disabled={pending} onConfirm={onRevoke} />
+      <div className="browser-actions">
+        <ConfirmButton label="Revoke" confirmLabel="Revoke this origin" disabled={pending} onConfirm={onRevoke} />
+        {site.writable && (
+          <ConfirmButton
+            label="Read-only"
+            confirmLabel="Stop agents submitting forms here"
+            disabled={pending}
+            onConfirm={onReadonly}
+          />
+        )}
+      </div>
+    </li>
+  );
+}
+
+/**
+ * What agents have actually submitted, under the grants above.
+ *
+ * It sits here rather than on a page of its own, and that placement is the
+ * argument for the whole feature: a write grant works without asking anyone,
+ * so the supervision it allows is necessarily afterwards — and supervision
+ * that lives somewhere else is supervision nobody performs. On the screen
+ * where the grant comes off, this is what it has been used for.
+ *
+ * Field names and never values. A form carries passwords, tokens and private
+ * text, and the record deliberately cannot say what was typed — only that
+ * something was.
+ */
+function WriteRecord({ projectId }: { projectId: string }) {
+  const writes = useBrowserWrites(projectId);
+  const rows = writes.data ?? [];
+
+  return (
+    <div className="browser-writes">
+      <h3 className="browser-subhead">Submitted</h3>
+      {writes.isError && rows.length === 0 && (
+        <MutationNote error={writes.error} what="the record of submissions could not be read" />
+      )}
+      {writes.data !== undefined && rows.length === 0 && (
+        <p className="browser-empty">nothing has been submitted from this profile.</p>
+      )}
+      {rows.length > 0 && (
+        <ul className="browser-list" aria-label="Submitted forms">
+          {rows.map((wrote) => (
+            <WriteRow key={wrote.id} wrote={wrote} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function WriteRow({ wrote }: { wrote: Written }) {
+  // The names that were kept, and the count that is true. They disagree when a long form was
+  // truncated, and saying so is better than a list that quietly became "the first few".
+  const shown = wrote.fields.join(", ");
+  const more = wrote.field_count - wrote.fields.length;
+
+  return (
+    <li className="browser-row">
+      <div className="browser-row-head">
+        <span className="browser-url">{wrote.action}</span>
+        <Badge tone="info">{wrote.method}</Badge>
+        <RelativeTime at={wrote.written_at} />
+      </div>
+      <p className="browser-meta">
+        {wrote.field_count} field{wrote.field_count === 1 ? "" : "s"}
+        {shown !== "" && <>: {shown}</>}
+        {more > 0 && <> and {more} more</>}
+      </p>
+      {wrote.files.length > 0 && (
+        // Its own line, and toned as a warning rather than as detail. "A comment was posted" and
+        // "a document was posted" are not the same event, and a person scanning this list for
+        // something they did not expect is looking for exactly this difference.
+        <p className="browser-meta browser-files">
+          with {wrote.files.length === 1 ? "a file" : `${wrote.files.length} files`}:{" "}
+          {wrote.files.join(", ")}
+        </p>
+      )}
+      {wrote.verb !== "" && (
+        <p className="browser-meta">
+          sent by a {wrote.verb}
+          {wrote.element_ref !== "" && <> on {wrote.element_ref}</>}
+        </p>
+      )}
     </li>
   );
 }

@@ -252,6 +252,56 @@
 }
 
 /**
+ * Where a refused action's idea came from.
+ *
+ * Sits under the action's own input and is deliberately quieter than it: the
+ * action is what the person is deciding about, this is what they decide with.
+ * Quieter and not hidden — it carries the url, which is the part that settles
+ * whether the idea was the agent's or a page's.
+ */
+.waiting-provenance {
+  margin-top: var(--space-2);
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border);
+}
+
+.waiting-provenance-head {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.waiting-provenance-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.waiting-provenance-line {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.waiting-provenance-tool {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.waiting-provenance-detail {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/**
  * A payload that could not be parsed a second time, shown rather than hidden.
  *
  * The daemon's own re-serialisation should always parse; this is the fallback

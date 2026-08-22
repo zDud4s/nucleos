@@ -276,6 +276,14 @@ export const keys = {
     sessions: ["browser", "sessions"] as const,
     sites: (projectId: string) => ["browser", "sites", projectId] as const,
     /**
+     * `GET /browser/writes/{project_id}` — what agents have submitted in
+     * this project's profile. Its own entry and not folded into `sites`,
+     * because the two are read together on one screen and refetched by
+     * different things: a grant changes when a person answers a login, and
+     * this changes every time an agent presses Send.
+     */
+    writes: (projectId: string) => ["browser", "writes", projectId] as const,
+    /**
      * Health used to live here as `browser.health`, its own cache entry. It is
      * `keys.system.health` now — the ONE health query in the app, not one per
      * pillar — the same retirement `WAITING_KEYS.contactMerges` and

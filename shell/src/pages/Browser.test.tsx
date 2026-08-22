@@ -11,7 +11,7 @@ vi.mock("../data/client", async (original) => ({
 
 import { Browser } from "./Browser";
 import { ApiRefusal } from "../data/client";
-import type { BrowserSession, SidecarState, SubsystemReadout } from "../data/browser";
+import type { BrowserSession, Site, SidecarState, SubsystemReadout, Written } from "../data/browser";
 import { daemonFetch, daemonState, project, renderWithRouter } from "../test/harness";
 
 beforeEach(() => {
@@ -44,13 +44,46 @@ function session(overrides: Partial<BrowserSession> = {}): BrowserSession {
   };
 }
 
+function site(overrides: Partial<Site> = {}): Site {
+  return {
+    origin: "https://jira.example.org:443",
+    kind: "destination",
+    granted_at: "2026-08-17T09:00:00Z",
+    granted_for: null,
+    writable: false,
+    ...overrides,
+  };
+}
+
+function written(overrides: Partial<Written> = {}): Written {
+  return {
+    id: 1,
+    session_id: 5,
+    origin: "https://jira.example.org:443",
+    action: "https://jira.example.org/browse/X-1/comment",
+    method: "POST",
+    fields: ["body", "password"],
+    field_count: 2,
+    element_ref: "e7",
+    verb: "click",
+    files: [],
+    written_at: "2026-08-17T09:30:00Z",
+    ...overrides,
+  };
+}
+
 interface BrowserWorld {
   sessions: BrowserSession[];
   readout: { status: string; subsystems: SubsystemReadout[] };
   sidecars: SidecarState[];
   projects: ReturnType<typeof project>[];
+  /** What `GET /browser/sites/{id}` and `GET /browser/writes/{id}` answer. */
+  sites: Site[];
+  writes: Written[];
   /** What `POST /browser/window` answers. Throw an `ApiRefusal` to refuse. */
   onWindow: (body: string) => unknown;
+  /** Every non-GET body this page sent, by path, so a test can assert what left. */
+  posted: { path: string; body: string }[];
 }
 
 function browserWorld(overrides: Partial<BrowserWorld> = {}): BrowserWorld {
@@ -59,7 +92,10 @@ function browserWorld(overrides: Partial<BrowserWorld> = {}): BrowserWorld {
     readout: { status: "ok", subsystems: [{ name: "browser_sidecar", status: "ok" }] },
     sidecars: [],
     projects: [],
+    sites: [],
+    writes: [],
     onWindow: () => session({ id: 9 }),
+    posted: [],
     ...overrides,
   };
 }
@@ -73,9 +109,17 @@ function browserFetch(world: BrowserWorld): (path: string, init?: RequestInit) =
   const shared = daemonFetch(daemonState({ projects: world.projects }));
   return async (path, init) => {
     if (init?.method !== undefined && init.method !== "GET") {
+      world.posted.push({ path, body: String(init.body ?? "") });
       if (path === "/browser/window" && init.method === "POST") {
         return world.onWindow(String(init.body));
       }
+      if (path === "/browser/return") {
+        return { chain: ["https://jira.example.org/login", "https://jira.example.org/browse/X-1"] };
+      }
+      if (path === "/browser/keep") {
+        return { granted: ["https://jira.example.org:443"] };
+      }
+      if (path === "/browser/readonly") return undefined;
       return await shared(path, init);
     }
     switch (path) {
@@ -88,7 +132,8 @@ function browserFetch(world: BrowserWorld): (path: string, init?: RequestInit) =
       default:
         // Site grants render as soon as a project exists; answer them so that panel
         // does not error into this file's output.
-        if (path.startsWith("/browser/sites/")) return [];
+        if (path.startsWith("/browser/sites/")) return world.sites;
+        if (path.startsWith("/browser/writes/")) return world.writes;
         return await shared(path, init);
     }
   };
@@ -200,6 +245,180 @@ describe("Browser - health", () => {
     // `GET /sidecars` answered with a second row, "web", and only one
     // "sidecar state" fact is on the page — the other row left no trace.
     expect(panel?.textContent?.match(/sidecar state/g)).toHaveLength(1);
+  });
+});
+
+/** The dwell `ConfirmButton` needs between arming and confirming — a real gap. */
+function afterDwell(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 350));
+}
+
+/* ------------------------------------------------------------- writing -- */
+
+describe("Browser - the write grant", () => {
+  const withProject = (overrides: Partial<BrowserWorld> = {}) =>
+    browserWorld({ projects: [project({ project_id: "alpha" })], ...overrides });
+
+  /**
+   * The permissive answer is the one a person has to choose.
+   *
+   * A box that arrived ticked would make writing something granted by not
+   * reading the screen, which is the shape of consent that is not consent. The
+   * assertion is on the BODY that leaves, not on the checkbox: what the daemon
+   * receives is the permission, and a box wired to nothing would look identical
+   * on screen.
+   */
+  it("keeps the chain without granting writing until somebody ticks the box", async () => {
+    const world = withProject({ sessions: [session({ id: 3, mode: "human" })] });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+    fireEvent.click(await screen.findByRole("button", { name: "Give the wheel back" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Close the window and bring the chain back" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Keep them" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Grant these origins" }));
+
+    await waitFor(() => {
+      expect(world.posted.some((one) => one.path === "/browser/keep")).toBe(true);
+    });
+    const kept = world.posted.find((one) => one.path === "/browser/keep");
+    expect(JSON.parse(kept?.body ?? "{}")).toEqual({
+      session_id: 3,
+      keep: true,
+      writable: false,
+    });
+  });
+
+  /** And the same act with the box ticked, which is the other half of the pair. */
+  it("grants writing when the box is ticked, in the same answer", async () => {
+    const world = withProject({ sessions: [session({ id: 3, mode: "human" })] });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+    fireEvent.click(await screen.findByRole("button", { name: "Give the wheel back" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Close the window and bring the chain back" }));
+
+    fireEvent.click(await screen.findByLabelText(/submit forms here/i));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep them" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Grant these origins" }));
+
+    await waitFor(() => {
+      expect(world.posted.some((one) => one.path === "/browser/keep")).toBe(true);
+    });
+    const kept = world.posted.find((one) => one.path === "/browser/keep");
+    expect(JSON.parse(kept?.body ?? "{}").writable).toBe(true);
+  });
+
+  /**
+   * Two permissions, two ways of taking one back.
+   *
+   * A person may want to end only the larger one — "this has been useful and I
+   * would rather it stopped pressing Send" — and a screen where the only door
+   * is Revoke turns that into a choice between keeping too much and losing the
+   * site. The read-only door is offered ONLY where there is something to
+   * narrow, which is the other half of this assertion.
+   */
+  it("offers to narrow a writable grant, and offers nothing to narrow on a read-only one", async () => {
+    const world = withProject({
+      sites: [
+        site({ origin: "https://jira.example.org:443", writable: true }),
+        site({ origin: "https://docs.example.org:443", writable: false }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    // One badge and one door, for the one site that has something to narrow.
+    expect(await screen.findByText("submits forms")).toBeDefined();
+    expect(screen.getAllByRole("button", { name: "Read-only" })).toHaveLength(1);
+    // Both sites can still be revoked outright; narrowing is the extra door.
+    expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Read-only" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Stop agents submitting forms here" }));
+
+    await waitFor(() => {
+      expect(world.posted.some((one) => one.path === "/browser/readonly")).toBe(true);
+    });
+    const narrowed = world.posted.find((one) => one.path === "/browser/readonly");
+    expect(JSON.parse(narrowed?.body ?? "{}")).toEqual({
+      project_id: "alpha",
+      origin: "https://jira.example.org:443",
+    });
+  });
+
+  /**
+   * The record, on the screen where the grant comes off.
+   *
+   * This is the whole argument for the feature being supervisable: the agent
+   * works alone inside the grant, so the supervision is afterwards, and
+   * supervision that lives on another page is supervision nobody performs.
+   *
+   * The password field is why the fixture has one. Its NAME belongs here — a
+   * person reviewing this needs to know a form with a password in it was
+   * submitted — and there is nowhere in the shape for its contents, which is
+   * the price this design pays and states.
+   */
+  it("shows what was submitted beside the grant, by field name", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written()],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText("https://jira.example.org/browse/X-1/comment")).toBeDefined();
+    expect(screen.getByText(/2 fields: body, password/)).toBeDefined();
+    expect(screen.getByText(/sent by a click on e7/)).toBeDefined();
+  });
+
+  /**
+   * A submission that carried a document is not the same event as one that carried a comment, and
+   * the record is the only place the owner ever sees either. The names show; what the file said is
+   * deliberately not in the database at all (migration 0098), so there is nothing here to leak.
+   */
+  it("says when a submission carried a file, and says what it was called", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written({ files: ["relatorio.txt"] })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/with a file: relatorio.txt/)).toBeDefined();
+  });
+
+  /** And a submission that carried none says nothing about files, rather than "0 files". */
+  it("stays quiet about files when none went", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written()],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/2 fields: body, password/)).toBeDefined();
+    expect(screen.queryByText(/with a file/)).toBeNull();
+    expect(screen.queryByText(/with 0 files/)).toBeNull();
+  });
+
+  /** A profile that has written nothing says so, rather than showing an empty box. */
+  it("says plainly when nothing has been submitted", async () => {
+    daemon.apiFetch.mockImplementation(browserFetch(withProject({ sites: [site()] })));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/nothing has been submitted from this profile/i)).toBeDefined();
   });
 });
 

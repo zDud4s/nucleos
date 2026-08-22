@@ -28,10 +28,22 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/fence"
 	"nucleosbrowser/profile"
+)
+
+const (
+	// discardWithin bounds how long an ephemeral profile's directory is chased. Generous against a
+	// slow machine and free against a person, because nothing is waiting on it: release runs after
+	// the caller already has its answer. What it must not do is wait for ever, and see discard for
+	// why a directory held open for ever is a different fault wearing this one's clothes.
+	discardWithin = 5 * time.Second
+	// discardRetry is the gap between attempts. Short, because what it waits out is a handful of
+	// processes finishing their exit, not an interval anybody chose.
+	discardRetry = 100 * time.Millisecond
 )
 
 // Instance is one running browser: a driver, plus the ability to be shut down gracefully.
@@ -60,9 +72,10 @@ type Launcher interface {
 	Name() string
 }
 
-// ErrTooManySessions is spec §9.6's ceiling. A browser is hundreds of megabytes and a GPU consumer
-// competing with the local model on the same card, so this refuses rather than degrades.
-var ErrTooManySessions = errors.New("pool: too many sessions open")
+// ErrTooManySessions is spec §9.6's ceiling, and it lives in `browser` now — see the comment there
+// for why moving it was a bug fix rather than tidying. Kept as an alias so a caller that already
+// names it keeps compiling, and so this package still reads as the thing that enforces the ceiling.
+var ErrTooManySessions = browser.ErrTooManySessions
 
 // ErrPolicyChanged means the núcleo sent a site list that differs from the one the live browser for
 // that profile was launched with.
@@ -109,11 +122,16 @@ type placed struct {
 // waits on it instead of launching in parallel — see the package comment on why two Chromes over one
 // profile directory is worse than slow.
 type entry struct {
-	ref     profile.Ref
-	origins string
-	ready   chan struct{}
-	driver  Instance
-	err     error
+	ref profile.Ref
+	// fenced is the whole placement reduced to one comparable string — the sites this browser
+	// admits AND the ones it may submit a form to. Both, and it used to be only the first: a write
+	// grant withdrawn while a browser was up changed no origin, so the fingerprint matched, and the
+	// pool handed back a browser still fenced by the permission that had just been taken away. A
+	// revocation that does not reach the process enforcing it is a revocation in name.
+	fenced string
+	ready  chan struct{}
+	driver Instance
+	err    error
 	// human marks the browser a person is driving. It is not a property of the session but of the
 	// BROWSER, because that is what spec §4.1 bounds: one process per profile, and while it is the
 	// headful one there is nowhere for an agent session on that profile to be put.
@@ -207,6 +225,14 @@ func (p *Pool) Screenshot(ctx context.Context, id browser.SessionID) ([]byte, er
 	return session.holder.driver.Screenshot(ctx, session.inner)
 }
 
+func (p *Pool) Look(ctx context.Context, id browser.SessionID) (browser.LookResult, error) {
+	session, err := p.lookup(id)
+	if err != nil {
+		return browser.LookResult{}, err
+	}
+	return session.holder.driver.Look(ctx, session.inner)
+}
+
 func (p *Pool) Handoff(ctx context.Context, id browser.SessionID, reason string) (browser.HandoffTicket, error) {
 	session, err := p.lookup(id)
 	if err != nil {
@@ -275,7 +301,7 @@ func (p *Pool) unreserve() {
 
 // acquire returns the browser for a placement, launching it if it is not already up.
 func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy fence.Policy) (*entry, error) {
-	fingerprint := fingerprintOf(placement.Origins)
+	fingerprint := fingerprintOf(placement)
 
 	for {
 		p.mu.Lock()
@@ -283,7 +309,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 		if !running {
 			starting := &entry{
 				ref:      placement.Profile,
-				origins:  fingerprint,
+				fenced:   fingerprint,
 				ready:    make(chan struct{}),
 				sessions: map[browser.SessionID]struct{}{},
 			}
@@ -311,7 +337,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			// for as long as a person takes, which spec §4.4 rule 2 says has no bound at all.
 			return nil, fmt.Errorf("%w: %s", browser.ErrPersonIsDriving, placement.Profile)
 		}
-		if existing.origins == fingerprint {
+		if existing.fenced == fingerprint {
 			return existing, nil
 		}
 
@@ -394,11 +420,50 @@ func (p *Pool) release(ctx context.Context, holder *entry, id browser.SessionID)
 
 // discard removes an ephemeral profile from disk. A project profile is left alone by
 // profile.Store.Discard itself, which is where that refusal belongs.
+//
+// # Why it chases instead of asking once
+//
+// It used to be one call with the error thrown away, and the promise underneath it — spec §5.1, an
+// ephemeral profile dies with its run — quietly did not hold. The removal RACES the browser's own
+// death. Stop() issues `taskkill /T /F` and then waits on the launcher's pid, which spec §9.3 says
+// is not the browser: the renderers it just killed can still be exiting, still holding handles into
+// the profile directory, when RemoveAll walks it. On Windows an open handle is enough to make a file
+// undeletable, so the call fails, and `_ =` meant nothing anywhere said so.
+//
+// MEASURED against the gate: the assertion that the directory is gone the instant the last session
+// closes fails intermittently and passes in isolation, which is the shape of a race and not of a
+// slow machine. The window is short — the handles go as the processes finish — so this asks again
+// rather than waiting once for a guessed interval, and the total is bounded because a profile that
+// something is holding open FOREVER is a different fault and must not become a hang here.
+//
+// The final failure is still swallowed, and that is a decision rather than an oversight: this
+// package has nowhere to report to, and Store.SweepEphemeral takes the leftovers at the next start.
+// It is a backstop and not a fix — until that start, a profile the spec says is gone is on disk.
 func (p *Pool) discard(ref profile.Ref) {
 	if ref.Persistent() {
 		return
 	}
-	_ = p.store.Discard(ref)
+	_ = chase(func() error { return p.store.Discard(ref) }, discardWithin, discardRetry)
+}
+
+// chase repeats an attempt until it succeeds or the window closes, and hands back the last error.
+//
+// A free function taking the attempt rather than a loop inside discard, because the thing worth
+// testing is the chasing and the caller it exists for cannot be made to fail on demand: profile.Store
+// is a concrete type over a real directory, so a test that went in through discard would be a test of
+// the filesystem's mood on the day it ran.
+//
+// It always attempts at least once, including when the window is zero or negative. A caller that
+// passed no window meant "try", not "do nothing".
+func chase(attempt func() error, within, gap time.Duration) error {
+	deadline := time.Now().Add(within)
+	for {
+		err := attempt()
+		if err == nil || !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(gap)
+	}
 }
 
 func (p *Pool) lookup(id browser.SessionID) (placed, error) {
@@ -411,13 +476,21 @@ func (p *Pool) lookup(id browser.SessionID) (placed, error) {
 	return session, nil
 }
 
-// fingerprintOf reduces a site list to something comparable.
+// fingerprintOf reduces a placement's two lists to something comparable.
 //
 // Normalised and sorted, so that a list the núcleo happened to send in a different order does not
 // look like a different policy and tear down a working browser. Entries that normalise to nothing are
 // dropped here for the same reason fence.Policy rejects them: they must not be the difference between
 // two fingerprints when they are not the difference between two policies.
-func fingerprintOf(origins []string) string {
+//
+// BOTH lists, and they are kept apart by the separator rather than merged: a profile that may read
+// two sites and write to neither must not fingerprint the same as one that may read one and write to
+// the other, and concatenating the two lists into one bag is exactly how it would.
+func fingerprintOf(placement browser.Placement) string {
+	return normalisedList(placement.Origins) + " | " + normalisedList(placement.Writable)
+}
+
+func normalisedList(origins []string) string {
 	normalised := make([]string, 0, len(origins))
 	for _, origin := range origins {
 		if entry := fence.NormaliseEntry(origin); entry != "" {

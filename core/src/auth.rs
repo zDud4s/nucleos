@@ -826,13 +826,16 @@ mod tests {
             // classifier, which is the shape of a test that stops noticing.
             .route("/browser/open", post(|| async {}))
             .route("/browser/act", post(|| async {}))
+            .route("/browser/look", post(|| async {}))
             .route("/browser/revoke", post(|| async {}))
             .route("/browser/forget", post(|| async {}))
             .route("/browser/handoff", post(|| async {}))
             .route("/browser/return", post(|| async {}))
             .route("/browser/keep", post(|| async {}))
             .route("/browser/sessions", get(|| async {}))
+            .route("/browser/readonly", post(|| async {}))
             .route("/browser/sites/{project_id}", get(|| async {}))
+            .route("/browser/writes/{project_id}", get(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -1536,6 +1539,7 @@ mod tests {
             // sessions currently open in their name.
             ("POST", "/browser/open"),
             ("POST", "/browser/act"),
+            ("POST", "/browser/look"),
             ("POST", "/browser/revoke"),
             // The wheel. `/keep` is the one that grows the allowlist, and a read-only key reaching
             // it would be a read-only key granting a host permanent access to the profile that
@@ -1546,6 +1550,11 @@ mod tests {
             ("POST", "/browser/keep"),
             ("GET", "/browser/sessions"),
             ("GET", "/browser/sites/demo"),
+            // Withdrawing a write grant, and the record of what was written with it. The
+            // record is the sharper of the two: the site list says which hosts a person has
+            // accounts on, and this says which forms their own identity was used to submit.
+            ("POST", "/browser/readonly"),
+            ("GET", "/browser/writes/demo"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,

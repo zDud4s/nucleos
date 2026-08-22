@@ -393,8 +393,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser/snapshot", post(crate::browser::post_snapshot))
         .route("/browser/act", post(crate::browser::post_act))
         .route("/browser/screenshot", post(crate::browser::post_screenshot))
+        // The agent's picture, beside the person's. Two routes and not one flag, because the two
+        // differ in audience and therefore in everything: what is drawn on it, what it costs, and
+        // which one a session with a person at the wheel refuses.
+        .route("/browser/look", post(crate::browser::post_look))
         .route("/browser/close", post(crate::browser::post_close))
         .route("/browser/revoke", post(crate::browser::post_revoke))
+        .route("/browser/readonly", post(crate::browser::post_readonly))
         .route("/browser/forget", post(crate::browser::post_forget))
         // The wheel (spec §4.4). `/handoff` is the agent asking; there is deliberately no route that
         // ACCEPTS — accepting is `POST /proposals/{id}/approve`, the same door every other decision
@@ -415,6 +420,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/browser/sites/{project_id}",
             get(crate::browser::get_sites),
+        )
+        .route(
+            "/browser/writes/{project_id}",
+            get(crate::browser::get_writes),
         )
         .route("/voice/config", get(crate::voice::get_config))
         .route("/voice/memos", get(crate::voice::list_memos))
@@ -9966,6 +9975,7 @@ mod tests {
             "send_email",
             "this turn has read third-party content and can no longer act",
             Some(r#"{"to":"stand@example"}"#),
+            None,
         )
         .await
         .unwrap();
