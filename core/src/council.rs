@@ -881,12 +881,22 @@ impl Drop for McpConfigGuard {
 /// no untrusted string to encode — but it is filtered anyway rather than trusted, because the cost
 /// is one line and the failure it prevents (a `Path::join` that discards its base when the joined
 /// component is absolute) is an arbitrary write and delete.
+///
+/// **The process id is in the name, and it is not decoration.** The temp directory is shared by
+/// every process on the machine, so a name built only from the id is the SAME path in two of them
+/// — and both write it and both delete it. On this machine that is not hypothetical: the daemon
+/// runs while suites run, and several checkouts run suites at once, each with tests that use fixed
+/// ids. One deleting the other's config mid-turn is a failure with no cause visible anywhere near
+/// it. `transcribe.rs` already names its recordings this way, for the same reason.
 fn mcp_config_path(council_id: &str) -> std::path::PathBuf {
     let safe: String = council_id
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
         .collect();
-    std::env::temp_dir().join(format!("nucleos-council-{safe}.json"))
+    std::env::temp_dir().join(format!(
+        "nucleos-council-{}-{safe}.json",
+        std::process::id()
+    ))
 }
 
 /// Starts a council: validates, checks the budget once, writes the record, and spawns the driver.

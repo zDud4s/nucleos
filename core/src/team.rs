@@ -2261,12 +2261,20 @@ async fn open_run(
 ///
 /// One per team run rather than one per invocation: every agent of a run holds the same key and the
 /// same tool list, so a file per node would be the same bytes written a dozen times.
+/// Where a team run's throwaway MCP config lives.
+///
+/// **The process id is in the name, and it is not decoration.** The temp directory is shared by
+/// every process on the machine, so a name built only from the id is the SAME path in two of them
+/// — and both write it and both delete it. On this machine that is not hypothetical: the daemon
+/// runs while suites run, and several checkouts run suites at once, each with tests that use fixed
+/// ids. One deleting the other's config mid-turn is a failure with no cause visible anywhere near
+/// it. `transcribe.rs` already names its recordings this way, for the same reason.
 fn mcp_config_path(team_run_id: &str) -> std::path::PathBuf {
     let safe: String = team_run_id
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
         .collect();
-    std::env::temp_dir().join(format!("nucleos-team-{safe}.json"))
+    std::env::temp_dir().join(format!("nucleos-team-{}-{safe}.json", std::process::id()))
 }
 
 fn write_mcp_config(team_run_id: &str) -> std::io::Result<std::path::PathBuf> {
