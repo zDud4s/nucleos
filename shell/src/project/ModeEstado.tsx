@@ -1,4 +1,12 @@
 import type { ReactNode } from "react";
+import {
+  compactTokens,
+  efficiencyTrend,
+  gateShare,
+  humanMinutes,
+  useProjectReadings,
+  type ProjectReadings,
+} from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { Occupancy } from "./Occupancy";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
@@ -6,17 +14,15 @@ import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } fr
 /**
  * "How is this now?"
  *
- * The antidote to a junk drawer is not fewer things — it is that one of them
- * always leads. Two of the design's principles force that together: every screen
- * answers *is everything all right?* first, and exceptions dominate while the
- * normal disappears. A fixed hero card can do neither, so the top of this page
- * depends on the state.
+ * The antidote to a junk drawer is not fewer things — it is that one of them always leads. Two of
+ * the design's principles force that together: every screen answers *is everything all right?*
+ * first, and exceptions dominate while the normal disappears. A fixed hero card can do neither, so
+ * the top of this page depends on the state.
  *
- * **The invariant that makes it safe to read:** the sections below are in the
- * same order and all present whatever the state is. Only the weight of the top
- * one changes. That is what stops the page from jumping under somebody's eyes
- * when a proposal arrives while they are halfway down it, and there is a test
- * that renders both states and compares the set of panels.
+ * **The invariant that makes it safe to read:** the sections below are in the same order and all
+ * present whatever the state is. Only the weight of the top one changes. That is what stops the
+ * page from jumping under somebody's eyes when a proposal arrives while they are halfway down it,
+ * and there is a test that renders both states and compares the set of panels.
  */
 
 export interface ModeEstadoProps {
@@ -35,12 +41,14 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
   /**
    * What is known, and only what is known.
    *
-   * Three of the six are real today. The other three need núcleo routes that do
-   * not exist yet — the gate tally and the delivered count come with the
-   * readings endpoint, workflow drift with the bundle library — and they are
-   * passed as "nothing seen" rather than left out, which is a difference the
-   * calm sentence below has to be careful about: a concern that cannot be
-   * measured must not make the page *claim* the project is fine on that count.
+   * Three of the six are real. The other three are passed as "nothing seen" because no route
+   * answers them yet, and the calm sentence below is written to claim nothing about them.
+   *
+   * **The readings endpoint does not fill the gate one, and that is deliberate.** It reports how
+   * many gates failed in thirty days, which is a tally and not a live concern: a failure from three
+   * weeks ago that was rescued the same afternoon would make this page shout for the rest of the
+   * month. The concern needs failures nothing has picked up, which is a different question about
+   * different rows.
    */
   const concerns: ProjectConcerns | null =
     !answered || project === undefined
@@ -61,7 +69,7 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
       <Leading concern={leading} project={projectId} budgetReason={budget.data?.reason ?? null} />
 
       <Section label="Readings">
-        <Readings />
+        <Readings projectId={projectId} />
       </Section>
 
       <Section label="Occupancy">
@@ -95,10 +103,9 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
 /**
  * A panel of the page.
  *
- * The `aria-label` is not decoration: it is the handle the composition test
- * grabs the page by, and it is the same handle a screen reader uses. Protecting
- * the structure somebody hears and the structure somebody sees with one
- * assertion is worth more than protecting either alone.
+ * The `aria-label` is not decoration: it is the handle the composition test grabs the page by, and
+ * it is the same handle a screen reader uses. Protecting the structure somebody hears and the
+ * structure somebody sees with one assertion is worth more than protecting either alone.
  */
 function Section({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -123,14 +130,13 @@ const CONCERN_TEXT: Record<string, string> = {
 /**
  * The first paragraph — the one section whose weight changes.
  *
- * Calm is a sentence with air around it: no box, no border, no colour, because
- * the design says the normal disappears. Anything demanding a decision becomes
- * the page's **one** elevated layer — glass, shadow, a border in the state's
- * tone — which is the rule the whole visual language rests on: elevation is
- * scarce, so it means something.
+ * Calm is a sentence with air around it: no box, no border, no colour, because the design says the
+ * normal disappears. Anything demanding a decision becomes the page's **one** elevated layer —
+ * glass, shadow, a border in the state's tone — which is the rule the whole visual language rests
+ * on: elevation is scarce, so it means something.
  *
- * `unknown` is neither. A project the shell has not heard about is not calm, and
- * saying it is would be reporting a measurement nobody took.
+ * `unknown` is neither. A project the shell has not heard about is not calm, and saying it is would
+ * be reporting a measurement nobody took.
  */
 function Leading({
   concern,
@@ -149,10 +155,10 @@ function Leading({
         <p className="font-display text-lg text-text-faint">Reading {project}…</p>
       ) : concern.kind === "calm" ? (
         /*
-          What it does NOT say matters as much as what it does. There is no "gate
-          green" and no "delivered on time" here, because neither is measured
-          yet — and a calm line that lists reassurances it did not check is the
-          exact failure §12 is about.
+          What it does NOT say matters as much as what it does. There is no "gate green" and no
+          "delivered on time" here. Those readings exist now, but they are thirty-day tallies, and a
+          calm line that turned a month's average into a claim about right now would be reassuring
+          about something it did not check.
         */
         <p className="font-display text-lg leading-snug text-text-muted">
           Nothing waiting on you in {project}.
@@ -177,49 +183,231 @@ function Leading({
 }
 
 /**
- * Four readings, at three sizes.
+ * Four readings, at two sizes.
  *
- * One principal and three supporting, never four identical cards: equal cards
- * are a grid you scan and forget, and the point of this row is that one number
- * is the one worth knowing. They are empty until the núcleo has a route that
- * aggregates a project's runs — and "not measured" is the state they will keep
- * having afterwards, for a project too new to have thirty days behind it.
+ * One principal and three supporting, never four identical cards: equal cards are a grid you scan
+ * and forget, and the point of this row is that one number is the one worth knowing.
+ *
+ * Every one of them can be absent, and absent is drawn as an em dash with a reason under it. A
+ * project too new to have a month behind it is the ordinary case, not the edge one.
  */
-function Readings() {
+function Readings({ projectId }: { projectId: string }) {
+  const readings = useProjectReadings(projectId);
+  const data = readings.data;
+
   return (
     <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-      <Reading label="Token efficiency" span />
-      <Reading label="Cost, 30 days" />
-      <Reading label="Gate, last 30 runs" />
-      <Reading label="Delivered, 30 days" />
+      <EfficiencyReading data={data} />
+      <CostReading data={data} />
+      <GateReading data={data} />
+      <DeliveredReading data={data} />
     </div>
   );
 }
 
-function Reading({ label, span = false }: { label: string; span?: boolean }) {
+/** The frame every reading shares, so that four of them cannot drift into four layouts. */
+function Card({
+  label,
+  span = false,
+  children,
+}: {
+  label: string;
+  span?: boolean;
+  children: ReactNode;
+}) {
   return (
-    <div
-      className={`rounded-lg border border-border bg-surface p-4 ${span ? "md:col-span-3" : ""}`}
-    >
+    <div className={`rounded-lg border border-border bg-surface p-4 ${span ? "md:col-span-3" : ""}`}>
       <p className="text-xs uppercase tracking-wide text-text-faint">{label}</p>
-      {/*
-        An em dash and a reason, never a zero. A reading nobody has taken and a
-        reading that came back zero are opposite facts, and the whole §7 contract
-        is that the second must never be able to impersonate the first.
-      */}
-      <p className={`mt-1 font-display ${span ? "text-3xl" : "text-xl"} text-text-faint`}>—</p>
-      <p className="mt-1 text-xs text-text-faint">not measured yet</p>
+      {children}
     </div>
+  );
+}
+
+/**
+ * An em dash and a reason, never a zero.
+ *
+ * A reading nobody took and a reading that came back zero are opposite facts, and the whole point
+ * of the never-collapse contract is that the second must not be able to impersonate the first.
+ */
+function Absent({ why, big = false }: { why: string; big?: boolean }) {
+  return (
+    <>
+      <p className={`mt-1 font-display ${big ? "text-3xl" : "text-xl"} text-text-faint`}>—</p>
+      <p className="mt-1 text-xs text-text-faint">{why}</p>
+    </>
+  );
+}
+
+const TREND_TEXT = {
+  improved: "fewer tokens than the month before",
+  worsened: "more tokens than the month before",
+  level: "level with the month before",
+  unknown: "",
+} as const;
+
+function EfficiencyReading({ data }: { data: ProjectReadings | undefined }) {
+  if (data === undefined) {
+    return (
+      <Card label="Token efficiency" span>
+        <Absent why="reading…" big />
+      </Card>
+    );
+  }
+
+  const { efficiency } = data;
+  if (efficiency.median_total_tokens === null) {
+    return (
+      <Card label="Token efficiency" span>
+        <Absent
+          big
+          why={
+            efficiency.unmeasured_runs > 0
+              ? `${efficiency.unmeasured_runs} runs in the last ${data.window_days} days, none reporting usage`
+              : `nothing finished in the last ${data.window_days} days`
+          }
+        />
+      </Card>
+    );
+  }
+
+  const trend = efficiencyTrend(efficiency);
+  return (
+    <Card label="Token efficiency" span>
+      <p className="mt-1 font-display text-3xl text-text">
+        {compactTokens(efficiency.median_total_tokens)}
+        <span className="ml-2 text-sm text-text-faint">median per session</span>
+      </p>
+      <p className="mt-1 text-xs text-text-muted">
+        {efficiency.measured_runs} measured
+        {/*
+          Said out loud whenever there are any. Silence about the runs that reported nothing would
+          let the median look as though it covered everything.
+        */}
+        {efficiency.unmeasured_runs > 0 ? `, ${efficiency.unmeasured_runs} reporting no usage` : ""}
+        {trend === "unknown" ? "" : ` · ${TREND_TEXT[trend]}`}
+      </p>
+    </Card>
+  );
+}
+
+function CostReading({ data }: { data: ProjectReadings | undefined }) {
+  if (data === undefined) {
+    return (
+      <Card label="Cost">
+        <Absent why="reading…" />
+      </Card>
+    );
+  }
+  if (data.cost.runs === 0) {
+    return (
+      <Card label="Cost">
+        <Absent why={`nothing started in the last ${data.window_days} days`} />
+      </Card>
+    );
+  }
+  return (
+    <Card label="Cost">
+      <p className="mt-1 font-display text-xl text-text">$ {data.cost.usd.toFixed(2)}</p>
+      <p className="mt-1 text-xs text-text-muted">
+        over {data.cost.runs} {data.cost.runs === 1 ? "run" : "runs"}, {data.window_days} days
+      </p>
+    </Card>
+  );
+}
+
+/**
+ * The gate, as a proportion of what was actually judged.
+ *
+ * `no_gate` is outside the bar and stated separately. A project with fifty ungated runs and two
+ * failures is not 96% green: it is two failures out of two measurements, and the fifty are a
+ * different fact — nobody ever defined green here — which deserves its own sentence rather than a
+ * silent cushion.
+ */
+function GateReading({ data }: { data: ProjectReadings | undefined }) {
+  if (data === undefined) {
+    return (
+      <Card label="Gate">
+        <Absent why="reading…" />
+      </Card>
+    );
+  }
+
+  const share = gateShare(data.gate);
+  if (share.judged === 0) {
+    return (
+      <Card label="Gate">
+        <Absent
+          why={
+            data.gate.no_gate > 0
+              ? `${data.gate.no_gate} runs, no gate command configured`
+              : `nothing judged in the last ${data.window_days} days`
+          }
+        />
+      </Card>
+    );
+  }
+
+  return (
+    <Card label="Gate">
+      <p className="mt-1 font-display text-xl text-text">
+        {Math.round(share.passed * 100)}%
+        <span className="ml-2 text-sm text-text-faint">of {share.judged} judged</span>
+      </p>
+      <div className="mt-2 flex h-1.5 overflow-hidden rounded-pill bg-surface-sunken">
+        <span style={{ width: `${share.passed * 100}%` }} className="bg-tone-active-fg" />
+        <span style={{ width: `${share.failed * 100}%` }} className="bg-tone-danger-fg" />
+        {/*
+          A third colour, not a second. A gate that could not run is not a gate that said no, and
+          the two sharing a red would tell somebody their tests broke when the measurement did.
+        */}
+        <span style={{ width: `${share.errored * 100}%` }} className="bg-tone-paused-fg" />
+      </div>
+      <p className="mt-1 text-xs text-text-muted">
+        {data.gate.failed > 0 ? `${data.gate.failed} failed` : "none failed"}
+        {data.gate.errored > 0 ? ` · ${data.gate.errored} could not run` : ""}
+        {data.gate.no_gate > 0 ? ` · ${data.gate.no_gate} ungated` : ""}
+      </p>
+    </Card>
+  );
+}
+
+function DeliveredReading({ data }: { data: ProjectReadings | undefined }) {
+  if (data === undefined) {
+    return (
+      <Card label="Delivered">
+        <Absent why="reading…" />
+      </Card>
+    );
+  }
+  if (data.delivered.landed === 0) {
+    return (
+      <Card label="Delivered">
+        <Absent why={`nothing landed in the last ${data.window_days} days`} />
+      </Card>
+    );
+  }
+  return (
+    <Card label="Delivered">
+      <p className="mt-1 font-display text-xl text-text">
+        {data.delivered.landed}
+        <span className="ml-2 text-sm text-text-faint">landed</span>
+      </p>
+      <p className="mt-1 text-xs text-text-muted">
+        {data.delivered.median_minutes === null
+          ? "none of them had a run to time from"
+          : `${humanMinutes(data.delivered.median_minutes)} median, over ${data.delivered.timed} of ${data.delivered.landed}`}
+      </p>
+    </Card>
   );
 }
 
 /**
  * A panel that is designed and not yet served.
  *
- * Dimmed and explained, never hidden. The reason names the *núcleo* rather than
- * this machine — the same rule the sidebar's disabled items follow — because
- * "not built" and "not configured here" send somebody to two different places,
- * and only one of them is something they can do anything about.
+ * Dimmed and explained, never hidden. The reason names the *núcleo* rather than this machine — the
+ * same rule the sidebar's disabled items follow — because "not built" and "not configured here"
+ * send somebody to two different places, and only one of them is something they can do anything
+ * about.
  */
 function NotServedYet({ what, why }: { what: string; why: string }) {
   return (

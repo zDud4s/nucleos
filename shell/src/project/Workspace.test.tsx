@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { screen } from "@testing-library/react";
-import { daemonFetch, daemonState, project, renderApp, renderWithQuery } from "../test/harness";
+import {
+  daemonFetch,
+  daemonState,
+  project,
+  readings,
+  renderApp,
+  renderWithQuery,
+} from "../test/harness";
+import type { ProjectReadings } from "../data/project-readings";
 import { ModeEstado } from "./ModeEstado";
 import { normaliseMode } from "./Workspace";
 
@@ -16,12 +24,14 @@ async function openWorkspace(options: {
   openProposals?: number;
   engaged?: boolean;
   mode?: string;
+  readings?: ProjectReadings;
 } = {}) {
   const state = daemonState({
     kill: { engaged: options.engaged === true },
     projects: [
       project({ project_id: "nucleos", mode: "shadow", open_proposals: options.openProposals ?? 0 }),
     ],
+    ...(options.readings === undefined ? {} : { readings: options.readings }),
   });
   daemon.apiFetch.mockImplementation(daemonFetch(state));
   daemon.probeHealth.mockResolvedValue(true);
@@ -145,14 +155,19 @@ describe("the project workspace", () => {
     // must not be confused with calm.
     await screen.findByText(/Nothing waiting on you/);
 
-    expect(screen.getAllByText("not measured yet").length).toBe(4);
+    // Four readings, four em dashes, four reasons — and not one zero among them. The harness's
+    // default project is the ordinary case this has to survive: brand new, nothing behind it.
+    expect(screen.getAllByText("—").length).toBe(4);
+    expect(screen.getByText("nothing finished in the last 30 days")).toBeTruthy();
+    expect(screen.getByText("nothing started in the last 30 days")).toBeTruthy();
+    expect(screen.getByText("nothing judged in the last 30 days")).toBeTruthy();
+    expect(screen.getByText("nothing landed in the last 30 days")).toBeTruthy();
 
     /*
-      The calm line is deliberately narrow. The design's own example sentence
-      reads "gate green on the last 12" — and that clause cannot be written yet,
-      because nothing counts gates per project. Naming a reading in a panel that
-      says "not measured" is honest; asserting it is fine in the sentence at the
-      top is the thing §12 forbids, so the ban is on the sentence, not the page.
+      The calm line is deliberately narrow. The design's own example sentence reads "gate green on
+      the last 12" — and the readings that could support it are thirty-day tallies, so putting one
+      in this sentence would turn a month's average into a claim about right now. The ban is on the
+      sentence, not on the page: naming a reading in a panel that shows its window is honest.
     */
     const leading = container.querySelector('section[aria-label="Leading"]');
     expect(leading?.textContent).toBe("Nothing waiting on you in nucleos.");
@@ -183,6 +198,41 @@ describe("the project workspace", () => {
       "Workflow",
       "Commands",
     ]);
+  });
+
+  it("shows the four readings when the núcleo has numbers for them", async () => {
+    await openWorkspace({
+      readings: readings({
+        efficiency: {
+          measured_runs: 41,
+          unmeasured_runs: 7,
+          median_total_tokens: 84_210,
+          previous_median_total_tokens: 112_000,
+        },
+        cost: { usd: 128.4, runs: 48 },
+        gate: { passed: 26, failed: 3, errored: 1, no_gate: 12 },
+        delivered: { landed: 22, timed: 18, median_minutes: 74 },
+      }),
+    });
+
+    expect(await screen.findByText("84k")).toBeTruthy();
+    expect(screen.getByText("$ 128.40")).toBeTruthy();
+
+    // 26 of 30 judged — the twelve ungated runs are NOT in the denominator, so this is 87% and not
+    // 62%. Getting that wrong is the whole reason `gateShare` exists.
+    expect(screen.getByText("87%")).toBeTruthy();
+    expect(screen.getByText("of 30 judged")).toBeTruthy();
+
+    // The three gate facts stay three sentences, and the ungated runs are stated rather than hidden.
+    expect(screen.getByText(/3 failed · 1 could not run · 12 ungated/)).toBeTruthy();
+
+    // The runs that reported nothing are said out loud beside the median they are not in.
+    expect(screen.getByText(/41 measured, 7 reporting no usage/)).toBeTruthy();
+    // Fewer tokens than before is an improvement, and the page says which way it went.
+    expect(screen.getByText(/fewer tokens than the month before/)).toBeTruthy();
+
+    // A median over 18 of 22 is shown as a median over 18 of 22.
+    expect(screen.getByText(/1.2 h median, over 18 of 22/)).toBeTruthy();
   });
 
   it("shows the other two modes as designed and not yet served", async () => {

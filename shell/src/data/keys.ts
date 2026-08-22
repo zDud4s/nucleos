@@ -123,6 +123,7 @@ export const keys = {
     grep: (projectId: string, q: string, path: string) =>
       ["projects", projectId, "grep", q, path] as const,
     diff: (projectId: string, path: string) => ["projects", projectId, "diff", path] as const,
+    readings: (projectId: string) => ["projects", projectId, "readings"] as const,
   },
 
   proposals: {

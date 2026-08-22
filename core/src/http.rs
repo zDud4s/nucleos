@@ -85,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/fleet/exclusions/{id}", delete(delete_fleet_exclusion))
         .route("/projects/{id}/rules", get(get_project_rules))
+        .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -767,6 +768,12 @@ struct RunsQuery {
 #[derive(Deserialize)]
 struct PathQuery {
     path: Option<String>,
+}
+
+/// How far back a reading looks. Absent is the default window, not zero days.
+#[derive(Deserialize)]
+struct WindowQuery {
+    days: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2621,6 +2628,31 @@ async fn get_concurrency(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// The four readings the project workspace leads with, in one answer.
+///
+/// One route and not four because all four are aggregations over the same rows in the same window —
+/// this project's finished runs — and four routes would be four walks of one table for one panel.
+///
+/// No 404 for a project with no root. Unlike `ls` and `cat`, this asks nothing of the disk: a
+/// project whose folder has moved still has a history of runs, and a reading of it is exactly what
+/// somebody looking at a broken project wants. `resolve_project_root` would refuse it.
+async fn get_project_readings(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<WindowQuery>,
+) -> Result<Json<crate::project_readings::Readings>, StatusCode> {
+    let days = query
+        .days
+        .unwrap_or(crate::project_readings::DEFAULT_WINDOW_DAYS);
+    crate::project_readings::readings(&state.pool, &id, days, chrono::Utc::now())
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "project readings failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn get_project_ls(

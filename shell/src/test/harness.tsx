@@ -13,6 +13,7 @@ import { NAV_PATHS } from "../app/nav";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
 import type { Concurrency } from "../data/fleet";
+import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
 /**
@@ -73,6 +74,17 @@ export interface DaemonState {
    * a shape the daemon cannot produce.
    */
   concurrency: Concurrency;
+  /**
+   * A project's four readings.
+   *
+   * One payload for every project rather than a map: no test so far needs two projects to read
+   * differently, and a map would be scaffolding for a case nobody has.
+   *
+   * The default is a project with nothing behind it — every count zero, every median `null` — which
+   * is both the honest empty answer and the state most worth having under a test by default, since
+   * it is what a new project looks like for its first month.
+   */
+  readings: ProjectReadings;
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -92,6 +104,24 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     projects: [],
     proposals: [],
     concurrency: { house: { limit: 4, held: 0 }, projects: [] },
+    readings: readings(),
+    ...overrides,
+  };
+}
+
+/** A project's readings, empty unless a test says otherwise. */
+export function readings(overrides: Partial<ProjectReadings> = {}): ProjectReadings {
+  return {
+    window_days: 30,
+    efficiency: {
+      measured_runs: 0,
+      unmeasured_runs: 0,
+      median_total_tokens: null,
+      previous_median_total_tokens: null,
+    },
+    cost: { usd: 0, runs: 0 },
+    gate: { passed: 0, failed: 0, errored: 0, no_gate: 0 },
+    delivered: { landed: 0, timed: 0, median_minutes: null },
     ...overrides,
   };
 }
@@ -149,6 +179,10 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       }
       return undefined;
     }
+
+    // Parameterised before the exact matches: the readings route carries a project id, which a
+    // `switch` over literals cannot express.
+    if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
 
     switch (path) {
       case "/autopilot/kill":

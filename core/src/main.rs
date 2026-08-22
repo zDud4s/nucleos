@@ -45,6 +45,7 @@ mod pii_shadow;
 mod presets;
 mod priority;
 mod process_tree;
+mod project_readings;
 mod proposals;
 mod recurrence;
 mod redact;
