@@ -326,7 +326,7 @@ pub struct LookResult {
 /// One form submission that left this machine, as much of it as is safe to keep.
 ///
 /// The names of the fields and how many there were. Never the values — see the sidecar's
-/// `browser.Write` and migration 0097 for the argument, which is the same one in both places: a form
+/// `browser.Write` and migration 0107 for the argument, which is the same one in both places: a form
 /// carries passwords, tokens and private text, and a record of what was submitted would turn this
 /// database into where every credential an agent ever types comes to rest.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -350,7 +350,7 @@ pub struct Write {
     pub r#ref: String,
     #[serde(default)]
     pub verb: String,
-    /// The NAMES of any files this submission carried, and never their contents. Migration 0098
+    /// The NAMES of any files this submission carried, and never their contents. Migration 0108
     /// carries the argument; it is `fields`' argument concentrated, because a file is the densest
     /// thing an agent can send and the one an owner is most likely to have forgotten they had.
     #[serde(default)]

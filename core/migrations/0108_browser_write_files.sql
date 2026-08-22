@@ -5,9 +5,9 @@
 -- that anything left the machine but text. That was a hole in the one record the owner has: "a
 -- comment was posted" and "a document was posted" are the same row, and they are not the same event.
 --
--- # Why a name and not the contents, which is the same rule as 0097 and sharper
+-- # Why a name and not the contents, which is the same rule as 0107 and sharper
 --
--- 0097 argues that a form's VALUES are not written down because a form carries passwords, tokens and
+-- 0107 argues that a form's VALUES are not written down because a form carries passwords, tokens and
 -- private text, and a record of them would make this database where every credential an agent types
 -- comes to rest. A file is that argument concentrated: it is the largest, densest thing an agent can
 -- send, and it is the one an owner is most likely to have forgotten they still had a copy of.

@@ -335,7 +335,7 @@ pub async fn make_readonly(
 
 /// One form submission an agent sent, as this database keeps it.
 ///
-/// See migration 0097 for what is deliberately absent and why: the field NAMES, and never the
+/// See migration 0107 for what is deliberately absent and why: the field NAMES, and never the
 /// values. The cost is stated there and accepted — knowing that something was submitted to a reply
 /// form does not say what the reply said — and the alternative is a database where every credential
 /// an agent ever types comes to rest.
@@ -356,7 +356,7 @@ pub struct Written {
     pub verb: String,
     /// The names of any files that went with it. Empty is "none went"; the column is NULL for rows
     /// written before attachments existed, and both read as empty here — the distinction lives in
-    /// the database, where migration 0098 explains it, and there is nothing a screen would do
+    /// the database, where migration 0108 explains it, and there is nothing a screen would do
     /// differently with it.
     pub files: Vec<String>,
     pub written_at: String,
@@ -378,7 +378,7 @@ pub async fn record_writes(
 ) {
     for wrote in writes {
         let fields = serde_json::to_string(&wrote.fields).unwrap_or_else(|_| "[]".to_string());
-        // `None` when nothing was attached, and not an empty list. Migration 0098 asks for the
+        // `None` when nothing was attached, and not an empty list. Migration 0108 asks for the
         // distinction: a row that predates attachments and a submission that carried none are
         // different facts, and a column that says "[]" for both loses the only one it could tell.
         let files = if wrote.files.is_empty() {
@@ -1871,7 +1871,7 @@ mod tests {
     /// What the record keeps, and what it refuses to keep.
     ///
     /// The names of the fields and the count, and nowhere in the row a place for a value. This is
-    /// the assertion that the price stated in migration 0097 is actually paid: a `password` field is
+    /// the assertion that the price stated in migration 0107 is actually paid: a `password` field is
     /// named and its contents are not in this table at all, because there is no column for them.
     #[tokio::test]
     async fn a_submission_is_recorded_by_its_field_names_and_never_its_values() {

@@ -21,9 +21,19 @@
 -- extractor would be a second per-tool table beside `TOOL_EFFECTS`, kept in step by hand, which is
 -- the drift `core/AGENTS.md` exists to prevent.
 --
--- 0105 and not 0099: 0097 and 0098 are claimed twice over, by this branch and by
--- `feat/tab-de-chats`, which holds 0099 through 0101 as well; `master` and `feat/equipa-por-job`
--- hold 0101 through 0104. 0105 is free on every branch this repository currently has.
+-- 0109, and the number has already moved once. It was written as 0105 because 0105 was free on
+-- every branch in the repository that day; `feat/tab-de-chats` landed on master the next morning
+-- carrying 0097, 0098, 0099, 0105 and 0106, and took all three of this branch's numbers with it.
+--
+-- The lesson is not "pick a higher number". A free number is a fact about a moment, and an unmerged
+-- branch holds its numbers against a master that is still moving, so the collision is discovered at
+-- merge no matter how carefully the number was chosen. What made this one expensive was that a
+-- daemon had already APPLIED 0097, 0098 and 0105 from this branch to a real database: the numbers
+-- were then taken on both sides with different contents, and sqlx compares version AND checksum, so
+-- neither build could open it. The database was restored from a copy taken before that daemon ran.
+--
+-- So: renumbering an unmerged migration is routine, and running an unmerged migration against the
+-- database you rely on is not.
 CREATE TABLE run_untrusted_reads (
   -- A logical reference and not a declared one, for the reason `errand_artifacts.written_by`
   -- gives: `runs` rows are pruned on their own schedule, and what is copied out of here outlives
