@@ -62,13 +62,27 @@ export function relativeText(when: number, now: number): string {
 
 export interface CostLineProps {
   costUsd: number | null;
-  inputTokens: number | null;
-  outputTokens: number | null;
-  cachedTokens: number | null;
+  /**
+   * The three counts, and all three optional together.
+   *
+   * A caller that HAS this breakdown passes what it has, and a count missing
+   * from a row it otherwise reports is an em dash — absent, not zero, which is
+   * the distinction `tokenCount` exists to keep. A caller whose source does not
+   * carry the breakdown at all passes none of them, and the group is not drawn.
+   *
+   * The difference matters because it was got wrong: the chat transcript passed
+   * three explicit `null`s, and every turn on the page ended in `— in — out —
+   * cached`, three dashes standing in for a reading its source has no column
+   * for. `AssistantTurnRow` carries `cost_usd`, `context_fill` and
+   * `thought_tokens` — never these.
+   */
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cachedTokens?: number | null;
 }
 
 /**
- * What a run spent, in money and in tokens.
+ * What a run spent, in money and — when the source reports it — in tokens.
  *
  * Four decimal places on the money because a single run costs cents, and a
  * two-decimal `$ 0.00` for a run that really spent $0.004 reads as free. Cached
@@ -76,15 +90,25 @@ export interface CostLineProps {
  * the cheap part, and a run whose input is mostly cache is a different fact
  * about cost than one that paid full price for the same window.
  */
-export function CostLine({ costUsd, inputTokens, outputTokens, cachedTokens }: CostLineProps) {
+export function CostLine({
+  costUsd,
+  inputTokens = null,
+  outputTokens = null,
+  cachedTokens = null,
+}: CostLineProps) {
+  const counted = inputTokens !== null || outputTokens !== null || cachedTokens !== null;
   return (
     <p className="ui-cost">
       <span className="ui-cost-money">
         {costUsd === null ? "cost not recorded" : `$ ${costUsd.toFixed(4)}`}
       </span>
-      <span className="ui-cost-tokens">{tokenCount(inputTokens)} in</span>
-      <span className="ui-cost-tokens">{tokenCount(outputTokens)} out</span>
-      <span className="ui-cost-tokens">{tokenCount(cachedTokens)} cached</span>
+      {counted && (
+        <>
+          <span className="ui-cost-tokens">{tokenCount(inputTokens)} in</span>
+          <span className="ui-cost-tokens">{tokenCount(outputTokens)} out</span>
+          <span className="ui-cost-tokens">{tokenCount(cachedTokens)} cached</span>
+        </>
+      )}
     </p>
   );
 }

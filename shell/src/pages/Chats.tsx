@@ -1,5 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "../ui/vendor/dropdown-menu";
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "../ui/vendor/command";
 import { isApiRefusal } from "../data/client";
 import {
   useArchiveChat,
@@ -95,20 +110,86 @@ export function Chats() {
   const selectedLive = chatId !== null && anyTurnLive(transcript.data?.turns);
   const summary = chatId === null ? undefined : rows.find((row) => row.chat_id === chatId);
 
+  /**
+   * The list is a panel you open, not a column you live with.
+   *
+   * Open by default, because somebody arriving at this page for the first time has to
+   * be able to find a conversation without knowing a shortcut. Closed, the transcript
+   * gets the whole width, which is what a page made of prose wants.
+   */
+  const [railOpen, setRailOpen] = useState(true);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const unseen = rows.reduce((total, row) => total + row.waiting, 0);
+
+  /**
+   * Ctrl+K, and Cmd+K for the same fingers on a Mac keyboard.
+   *
+   * On `window` rather than on a container because the point of it is to work while
+   * the caret is in the composer, which is where it will be nearly every time.
+   * `preventDefault` because Ctrl+K is a browser shortcut and the webview would
+   * otherwise act on it as well.
+   */
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      setPaletteOpen((open) => !open);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   return (
     <>
-      <PageHeader title="Chats" headline={headlineFor(rows, chats.data !== undefined)} />
+      <PageHeader
+        title="Chats"
+        headline={headlineFor(rows, chats.data !== undefined)}
+        actions={
+          <>
+            <Button
+              variant="ghost"
+              aria-pressed={railOpen}
+              /* Spelled out rather than left to the name computation over the
+                 children, for the same reason the nav items and the chat rows are:
+                 "Conversations" and a count in an adjacent span concatenate with no
+                 separator, and a screen reader would announce "Conversations5". */
+              aria-label={
+                railOpen
+                  ? "Hide conversations"
+                  : unseen > 0
+                    ? `Conversations, ${unseen} unseen`
+                    : "Conversations"
+              }
+              onClick={() => setRailOpen((open) => !open)}
+            >
+              {railOpen ? "Hide conversations" : "Conversations"}
+              {/* Answers that landed while you were elsewhere. Shown on the button
+                  precisely because the list they are in may be closed — a count that
+                  only appears once the list is open tells you what you already see. */}
+              {!railOpen && unseen > 0 && <span className="chats-unseen">{unseen}</span>}
+            </Button>
+            <Button variant="ghost" onClick={() => setPaletteOpen(true)}>
+              Find a conversation
+              <kbd className="chats-kbd">Ctrl K</kbd>
+            </Button>
+          </>
+        }
+      />
 
       {stale && <StaleNote dataUpdatedAt={chats.dataUpdatedAt} />}
       {chats.isError && chats.data === undefined && <ListError error={chats.error} />}
 
-      <div className="chats-layout">
-        <ChatListPanel
-          rows={rows}
-          answered={chats.data !== undefined}
-          selected={chatId}
-          selectedLive={selectedLive}
-        />
+      <ConversationPalette rows={rows} open={paletteOpen} onOpenChange={setPaletteOpen} />
+
+      <div className={railOpen ? "chats-layout" : "chats-layout chats-layout-alone"}>
+        {railOpen && (
+          <ChatListPanel
+            rows={rows}
+            answered={chats.data !== undefined}
+            selected={chatId}
+            selectedLive={selectedLive}
+          />
+        )}
 
         <div className="chats-detail">
           {chatId === null && (
@@ -144,6 +225,65 @@ function ListError({ error }: { error: unknown }) {
 }
 
 /* --------------------------------------------------------------- the list -- */
+
+/**
+ * Find a conversation by typing its name, rather than by reading down a list.
+ *
+ * The list panel answers "what have I got"; this answers "where is the one I mean",
+ * and past a couple of dozen conversations those stop being the same question. It is
+ * also what makes closing the list a real option rather than a way to lose things.
+ *
+ * The searchable text is the title AND the directory, because half of these are
+ * remembered as "the one about the shell" rather than by whatever the daemon titled
+ * them.
+ */
+function ConversationPalette({
+  rows,
+  open,
+  onOpenChange,
+}: {
+  rows: ChatSummary[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const navigate = useNavigate();
+
+  return (
+    <CommandDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Find a conversation"
+      description="Type to narrow the list. Enter opens the one highlighted."
+      /* Escape closes it, and a palette is a thing you dismiss rather than
+         close — the corner X is clutter that also has to be styled. */
+      showCloseButton={false}
+    >
+      <CommandInput placeholder="Find a conversation…" />
+      <CommandList>
+        <CommandEmpty>No conversation matches that.</CommandEmpty>
+        <CommandGroup>
+          {rows.map((row) => {
+            const name = row.title ?? row.first_message ?? "New conversation";
+            return (
+              <CommandItem
+                key={row.chat_id}
+                value={`${name} ${row.cwd ?? ""}`}
+                onSelect={() => {
+                  onOpenChange(false);
+                  void navigate({ to: `/chats/${row.chat_id}` });
+                }}
+              >
+                <span className="chats-palette-title">{name}</span>
+                {row.cwd !== null && <span className="chats-palette-where">{row.cwd}</span>}
+                {row.waiting > 0 && <span className="chats-palette-waiting">{row.waiting}</span>}
+              </CommandItem>
+            );
+          })}
+        </CommandGroup>
+      </CommandList>
+    </CommandDialog>
+  );
+}
 
 function ChatListPanel({
   rows,
@@ -570,9 +710,7 @@ function ChatDetail({
       {summary !== undefined && (
         <div className="chats-detail-head">
           <TitleEditor chatId={chatId} title={summary.title} />
-          <BrainPicker chatId={chatId} brain={summary.brain} />
-          <Planning chatId={chatId} />
-          <ArchiveControl chatId={chatId} />
+          <ChatMeta chatId={chatId} brain={summary.brain} />
         </div>
       )}
 
@@ -624,6 +762,59 @@ function ChatDetail({
  * Read on demand and not polled: it changes when somebody changes it, and both of the somethings
  * are mutations in this window.
  */
+/**
+ * What this conversation is, in one quiet line, and everything else behind a menu.
+ *
+ * The line carries only what is consulted constantly — the directory it runs in, which
+ * model answers, and whether it is in plan-only mode — because those three are what make
+ * an answer make sense, and reaching for a menu to find out which model wrote something
+ * is a click too many on every single read.
+ *
+ * Plan-only appears only while it is on. Silence is the normal state and the normal state
+ * says nothing; a line that always reads "plan only: no" is a line nobody reads by the
+ * second day.
+ *
+ * **Archive is inside the menu but is not a menu item, and that is not an oversight.**
+ * `ArchiveControl` is a `ConfirmButton`, which is this app's one interlock: two clicks
+ * with a dwell between them. A `DropdownMenuItem` closes the menu the moment it is
+ * chosen, so the first click would dismiss the control before the second could confirm —
+ * turning a deliberate two-step into a one-click irreversible action. Rendered as plain
+ * content, the menu stays open and both clicks land.
+ */
+function ChatMeta({ chatId, brain }: { chatId: string; brain: Brain }) {
+  const project = useChatProject(chatId);
+  const cwd = project.data?.cwd ?? null;
+  const tools = project.data?.tools ?? false;
+  const planning = project.data?.planning ?? false;
+
+  return (
+    <div className="chats-meta">
+      <p className="chats-meta-line">
+        {/* The directory is named here only when it is settled. While it is unknown, or
+            while it is a state that needs teaching, `Project` below says so in full — a
+            summary line is the wrong place to explain something. */}
+        {cwd !== null && tools && <span className="chats-meta-where">{cwd}</span>}
+        <span className="chats-meta-brain">{brain}</span>
+        {planning && <span className="chats-meta-planning">plan only</span>}
+      </p>
+
+      <DropdownMenu>
+        <DropdownMenuTrigger className="chats-meta-more" aria-label="Conversation settings">
+          ⋯
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="chats-meta-menu">
+          <DropdownMenuLabel>Which model answers</DropdownMenuLabel>
+          <BrainPicker chatId={chatId} brain={brain} />
+          <DropdownMenuSeparator />
+          <Planning chatId={chatId} />
+          <DropdownMenuSeparator />
+          <ArchiveControl chatId={chatId} />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
 function Project({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
 
@@ -634,11 +825,12 @@ function Project({ chatId }: { chatId: string }) {
 
   return (
     <>
+      {/* Only the states that need saying. The settled one — a directory, with tools
+          wired — is named by `ChatMeta`'s quiet line instead of by a sentence of its
+          own, because "exceptions dominate, the normal disappears" and a conversation
+          that is set up correctly is the normal case. */}
       {cwd === null && <NoProject chatId={chatId} />}
       {cwd !== null && !tools && <ProjectWithoutTools chatId={chatId} cwd={cwd} />}
-      {cwd !== null && tools && (
-        <p className="chats-project-where">this conversation is about {cwd}</p>
-      )}
       {cwd !== null && session !== null && <CarryOn cwd={cwd} session={session} />}
     </>
   );
@@ -1335,7 +1527,8 @@ function TurnBlock({
         <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
       )}
       <div className="chats-turn-foot">
-        <CostLine costUsd={turn.cost_usd} inputTokens={null} outputTokens={null} cachedTokens={null} />
+        {/* Money only. The daemon's turn rows carry no token breakdown — see `CostLineProps`. */}
+        <CostLine costUsd={turn.cost_usd} />
         <ContextFill fill={turn.contextFill} rotatesAt={turn.rotatesAt} />
         <span className="chats-turn-id">#{turn.id}</span>
       </div>
@@ -1389,7 +1582,11 @@ function RichLineOut({ line }: { line: RichLine }) {
     return (
       <p className="chats-rich-bullet">
         <span aria-hidden="true">•</span>
-        {inner}
+        {/* One flex item, not one per span. The row exists to hang the marker beside the text;
+            left unwrapped, every word and every `code` chip became its own flex item — gapped
+            apart and shrinkable on its own, so `budget_usd` was squeezed until it broke mid-name
+            and stacked vertically. Seen in the app, in a bulleted answer. */}
+        <span className="chats-rich-bullet-text">{inner}</span>
       </p>
     );
   }

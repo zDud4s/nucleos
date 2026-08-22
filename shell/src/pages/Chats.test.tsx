@@ -285,6 +285,7 @@ describe("Chats - a turn already in flight", () => {
 
     // The brain picker is a different mutation and was never touched by the
     // composer's failure — it still takes a click and still writes.
+    await openConversationSettings();
     fireEvent.click(await screen.findByRole("button", { name: "Local" }));
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
@@ -398,12 +399,27 @@ function afterDwell(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 350));
 }
 
+/**
+ * Open the conversation's `⋯` menu.
+ *
+ * Which model answers, plan-only and archive all moved behind it when the header was
+ * reduced to one quiet line, so every test that touches one has to open it first.
+ * Radix opens on `pointerdown`, not on `click`, which is why firing a click alone
+ * leaves the menu shut and the control absent rather than merely hidden.
+ */
+async function openConversationSettings(): Promise<void> {
+  const more = await screen.findByRole("button", { name: "Conversation settings" });
+  fireEvent.pointerDown(more, { pointerType: "mouse", button: 0 });
+  fireEvent.click(more);
+}
+
 describe("Chats - archiving a conversation", () => {
   it("arms and then confirms in two separate waits, with copy that says the turns are kept", async () => {
     const summary = chatSummary({ chat_id: "c-1" });
     daemon.apiFetch.mockImplementation(chatsFetch([summary], { "c-1": [] }));
 
     await renderChats("/chats/c-1");
+    await openConversationSettings();
     fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
 
     // First wait: the interlock has armed and swapped its own label.
@@ -443,6 +459,7 @@ describe("Chats - planning without acting", () => {
     );
     await renderChats("/chats/c-1");
 
+    await openConversationSettings();
     const toggle = await screen.findByLabelText(/plan only/i);
     expect((toggle as HTMLInputElement).checked).toBe(false);
 
@@ -475,6 +492,7 @@ describe("Chats - planning without acting", () => {
     );
     await renderChats("/chats/c-1");
 
+    await openConversationSettings();
     const toggle = await screen.findByLabelText(/plan only/i);
     await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true));
   });
@@ -2065,5 +2083,101 @@ describe("stopping a turn", () => {
 
     await screen.findByRole("list", { name: "Transcript" });
     expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+});
+
+/* ------------------------------------------- the quiet header and the finder -- */
+
+describe("Chats - what the header says without being asked", () => {
+  it("names the directory, the model and plan-only in one line, and nothing else", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", brain: "cloud", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: true },
+          },
+        },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    // The list shows each conversation's directory too, so it is closed here to
+    // leave exactly one place the path can be coming from: the header line.
+    fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
+
+    expect(await screen.findByText("C:/Projects/nucleos")).toBeDefined();
+    expect(await screen.findByText("cloud")).toBeDefined();
+    expect(await screen.findByText("plan only")).toBeDefined();
+
+    // The settings themselves stay behind the menu — that is the whole point of
+    // reducing the header to a line.
+    expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
+  });
+
+  it("says nothing about plan-only while it is off", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false },
+          },
+        },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
+
+    await screen.findByText("C:/Projects/nucleos");
+    expect(screen.queryByText("plan only")).toBeNull();
+  });
+});
+
+describe("Chats - closing the list", () => {
+  it("hides the conversations and moves the unseen count onto the button that brings them back", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", waiting: 3 }), chatSummary({ chat_id: "c-2", waiting: 2 })],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide conversations" }));
+
+    expect(screen.queryByRole("list", { name: "Conversations" })).toBeNull();
+    // Five answers landed across two conversations, and the list they are in is shut.
+    expect(await screen.findByRole("button", { name: "Conversations, 5 unseen" })).toBeDefined();
+  });
+});
+
+describe("Chats - finding a conversation by typing", () => {
+  it("opens on Ctrl+K and lists what there is", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "rewrite the gate" }),
+          chatSummary({ chat_id: "c-2", title: "bump dependencies" }),
+        ],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    expect(screen.queryByRole("dialog", { name: /find a conversation/i })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    expect(within(palette).getByText("rewrite the gate")).toBeDefined();
+    expect(within(palette).getByText("bump dependencies")).toBeDefined();
   });
 });
