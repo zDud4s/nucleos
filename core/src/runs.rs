@@ -4469,9 +4469,19 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         // provisioned a worktree WITHOUT setting a root of its own inherited this one: `worktree_root`
         // returns the variable verbatim and only falls back to a sibling of the project root when it
         // is unset. They then shared a root that had already been deleted with this test's
-        // `TempDir`, and two of them creating a job with the same id collided on `nucleos/job-<id>`
-        // — a failure that reads as a bug in worktree adoption, arrives about once in a dozen full
-        // runs depending on which order the thread pool picked, and is neither.
+        // `TempDir`, and two of them creating a job with the same id would land on one
+        // `nucleos/job-<id>`.
+        //
+        // **Corrected 2026-08-22: this said the leak "arrives about once in a dozen full runs", and
+        // that number was never measured.** It was written while hunting a red assumed to be
+        // intermittent, which turned out not to be — it was
+        // `the_module_map_matches_the_files_on_disk`, failing deterministically wherever
+        // `core/AGENTS.md` exists and passing wherever it does not, because the file is gitignored
+        // and the test returns early when it is absent. Thirteen archived full runs were green and
+        // the only two reds in any of them were that test. Nine more runs since, six of them at
+        // `--test-threads=32`, have never produced this one. The hazard is real and reads straight
+        // off `worktree_root`; its rate is unknown, and stating one sent the next reader looking
+        // for a race nobody had seen.
         let _trees_env = WorktreeRootEnv::set(trees.path());
 
         let job_id = crate::job::insert_job(
@@ -4572,8 +4582,6 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             "the slot is held by the item, which is what gives it back when the item is over"
         );
 
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("NUCLEOS_WORKTREE_ROOT") };
     }
 
     async fn grants_for(state: &AppState, run_id: i64) -> i64 {

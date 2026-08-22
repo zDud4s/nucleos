@@ -2359,20 +2359,57 @@ mod tests {
 
     /// Polls until the turn leaves `running`, the way every other test in this module waits for a
     /// spawned turn, and returns its status and reply.
+    /// Waits for a turn to be over in BOTH senses, because they are not the same moment.
+    ///
+    /// A turn ends twice. The `runs` row reaches a terminal status inside the turn's task; the
+    /// [`TurnGuard`] holding the chat's slot drops when that task ENDS, which is strictly later.
+    /// In between, the row says settled and `send_message` still answers "a turn is already in
+    /// progress for this chat" — so a test that sends its second message on the row alone is
+    /// racing the guard's drop and will lose it sometimes.
+    ///
+    /// **Measured, 2026-08-22, and this is how it was found.** Six full suite runs at the default
+    /// thread count were green; three more at `--test-threads=32` produced one failure, on the
+    /// `unwrap` of the second `send_message` in
+    /// `a_conversation_without_tools_starts_a_process_for_every_turn`. Four times the cores is what
+    /// widens the window: the task is descheduled between writing the row and dropping the guard
+    /// for long enough that the next send sees the slot still held. Seven other tests in this
+    /// module send a second message to one chat behind this same helper, so the race was theirs
+    /// too — it simply landed on that one first.
+    ///
+    /// [`is_busy`] is the answer to the right question, and its own doc already says why the row is
+    /// not: asking `runs` is "wrong in both directions". The chat is read OFF the row rather than
+    /// passed in, so that no call site can forget to wait for it.
     async fn settled_turn(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
+        let mut settled = None;
         for _ in 0..100 {
-            let row: (String, Option<String>) =
-                sqlx::query_as("SELECT status, stdout FROM runs WHERE id = ?")
+            let row: (String, Option<String>, Option<String>) =
+                sqlx::query_as("SELECT status, stdout, chat_id FROM runs WHERE id = ?")
                     .bind(id)
                     .fetch_one(pool)
                     .await
                     .unwrap();
             if row.0 != "running" {
-                return row;
+                settled = Some(row);
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        panic!("turn {id} never left running");
+        let Some((status, stdout, chat_id)) = settled else {
+            panic!("turn {id} never left running");
+        };
+
+        // The second ending. A run with no chat is not an assistant turn and holds no slot to wait
+        // on — the column is nullable precisely because most runs are not turns.
+        let Some(chat_id) = chat_id else {
+            return (status, stdout);
+        };
+        for _ in 0..100 {
+            if !is_busy(&chat_id) {
+                return (status, stdout);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("turn {id} settled but chat {chat_id} was never released");
     }
 
     /// What `FakeCommandRunner::default` answers, so a test can say "this went down the CLI path"
