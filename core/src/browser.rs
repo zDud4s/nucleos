@@ -1070,6 +1070,27 @@ pub async fn post_snapshot(
     let Some(row) = live_session(&state, body.session_id).await else {
         return gone();
     };
+    // A read is still a read of THEIR screen. The tree is not pixels, but a login form's tree names
+    // the fields and carries their values, so "it is only the accessibility tree" is not a reason to
+    // let it through while somebody else is driving.
+    //
+    // This guard was missing, and the way it was missing is the interesting part: the sidecar's
+    // `Human` driver refuses `Snapshot`, `Act` and `Screenshot`, and says in its own comment that
+    // "the núcleo already refuses them from its own record (spec §4.4 rule 1), so this is the second
+    // layer". The núcleo refused two of the three. Nothing was exploitable — the second layer held —
+    // but the sentence vouching for the first one was false, which is precisely the state
+    // [`post_act`] warns about: the daemon-side guard exists for the case where the two processes
+    // DISAGREE about who is driving, and a layer that is only believed in cannot do that.
+    if row.mode != mode::AGENT {
+        return axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "wheel-requested",
+                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
+            },
+        }))
+        .into_response();
+    }
     match state
         .browser
         .client
@@ -1216,6 +1237,20 @@ pub async fn post_screenshot(
     let Some(row) = live_session(&state, body.session_id).await else {
         return gone();
     };
+    // The same refusal [`post_look`] carries, and for a stronger version of the same reason: this
+    // one returns raw pixels of whatever is on the screen. The sidecar's `Human` driver singles it
+    // out — "the layer that matters most: the page in front of the person during a handover is a
+    // login form, with a password half-typed into it."
+    if row.mode != mode::AGENT {
+        return axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "wheel-requested",
+                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
+            },
+        }))
+        .into_response();
+    }
     match state.browser.client.screenshot(&row.sidecar_id).await {
         Ok(image) => ([(axum::http::header::CONTENT_TYPE, "image/png")], image).into_response(),
         Err(error) => browser_error(error),

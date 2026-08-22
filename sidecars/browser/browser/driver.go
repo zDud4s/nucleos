@@ -590,6 +590,19 @@ var ErrNotInstalled = errors.New("browser: the pinned chromium is not installed"
 // ErrUnsupported is returned by a driver that cannot do something the contract allows.
 var ErrUnsupported = errors.New("browser: unsupported by this driver")
 
+// ErrTooManySessions is spec §9.6's ceiling. A browser is hundreds of megabytes and a GPU consumer
+// competing with the local model on the same card, so this refuses rather than degrades.
+//
+// Here and not in `pool`, where it lived, for the reason `ErrPersonIsDriving` is here: `serve`
+// translates what comes out of a `Driver`, and a sentinel it cannot name falls into the default arm
+// and loses its text. That is not hypothetical. A live session asked for a third tab and the caller
+// was told `502: open failed` while the log, one process away, said
+// `pool: too many sessions open: 2 of 2`. The reason was written and then dropped at the boundary.
+//
+// Wrapped with the counts by whoever returns it, because "you are at the ceiling" and "the ceiling
+// is two" are different sentences and only the second tells a person what to change.
+var ErrTooManySessions = errors.New("browser: too many sessions open")
+
 // LookResult is one annotated picture of the page: what a person would see, with the agent's own
 // refs drawn on top of it.
 //

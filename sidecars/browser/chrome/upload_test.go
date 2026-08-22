@@ -124,6 +124,38 @@ func TestUploadingToSomethingThatIsNotAFileInputSaysWhatItIs(t *testing.T) {
 	}
 }
 
+// TestTheRefusalReadsAsASentenceWhenTheTagIsOneLetter.
+//
+// The guard for a defect no test here could have caught, because every one of them happened to use
+// a multi-letter tag. The message was built with an article — "that is a %s" — and the commonest
+// wrong target for an upload is a LINK, whose tag is "a". A real session pointed upload at one and
+// was told "that is a a, not a file input".
+//
+// Nothing broke. The refusal was right, the file went nowhere, and the only casualty was a sentence
+// a model reads to decide what to do next. That is the class of defect a suite of `Contains`
+// assertions cannot see: they check that a message names the thing, never that it reads as language.
+func TestTheRefusalReadsAsASentenceWhenTheTagIsOneLetter(t *testing.T) {
+	fake, driver := connected(t)
+	session := opened(t, driver)
+	answersFileInput(fake, "not-a-file-input:a")
+	driver.mu.Lock()
+	entry := driver.sessions[session.ID]
+	entry.refs["e1"] = nodeKey{session: entry.cdp, backend: 42}
+	driver.mu.Unlock()
+
+	result, err := driver.Act(context.Background(), session.ID, uploading("report.txt", "hello"))
+	if err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	detail := result.Refusal.Detail
+	if strings.Contains(detail, " a a") {
+		t.Fatalf("detail = %q: the article and the tag collided", detail)
+	}
+	if !strings.Contains(detail, "<a>") {
+		t.Fatalf("detail = %q, want the tag named as a tag", detail)
+	}
+}
+
 // TestTheAttachmentGoesAwayWithTheSession.
 //
 // The file has to outlive the ACT — Chromium reads it when the form is submitted, which is a later

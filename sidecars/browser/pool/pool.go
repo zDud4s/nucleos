@@ -72,9 +72,10 @@ type Launcher interface {
 	Name() string
 }
 
-// ErrTooManySessions is spec §9.6's ceiling. A browser is hundreds of megabytes and a GPU consumer
-// competing with the local model on the same card, so this refuses rather than degrades.
-var ErrTooManySessions = errors.New("pool: too many sessions open")
+// ErrTooManySessions is spec §9.6's ceiling, and it lives in `browser` now — see the comment there
+// for why moving it was a bug fix rather than tidying. Kept as an alias so a caller that already
+// names it keeps compiling, and so this package still reads as the thing that enforces the ceiling.
+var ErrTooManySessions = browser.ErrTooManySessions
 
 // ErrPolicyChanged means the núcleo sent a site list that differs from the one the live browser for
 // that profile was launched with.

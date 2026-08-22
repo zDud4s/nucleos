@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"nucleosbrowser/browser"
@@ -176,6 +179,46 @@ func TestUploadCrossesTheWireWithBothOfItsArguments(t *testing.T) {
 	}
 	if got.Text != "linha um" {
 		t.Fatalf("text = %q: the contents did not survive the wire", got.Text)
+	}
+}
+
+// TestTheCeilingSaysItIsTheCeiling.
+//
+// **Found by driving a live daemon, not by any test here.** A third session was asked for against a
+// real Chromium and the caller was told `502: open failed`, while the sidecar's own log, one
+// process away, said `pool: too many sessions open: 2 of 2`. The reason was written and then
+// dropped: `writeDriverError`'s default arm logs the error and sends the verb plus "failed".
+//
+// That default is right for errors a caller cannot act on. The ceiling is not one of those — the
+// answer is to close a session — and a refusal that leaves the owner guessing is the one they
+// resolve by raising the limit, which is the argument `.ai/browser.yaml` already makes about
+// `max_profiles`.
+//
+// The status is asserted as well as the body, and 409 is forced rather than chosen: the núcleo's
+// `classify` maps 503 to `FenceDown`, so answering a ceiling with 503 would reach a person as
+// "browsing is fenced off" — a pillar-level failure that did not happen.
+func TestTheCeilingSaysItIsTheCeiling(t *testing.T) {
+	driver := &browser.Fake{
+		FenceAttached: true,
+		OpenErr:       fmt.Errorf("%w: %d of %d", browser.ErrTooManySessions, 2, 2),
+	}
+	server := testServer(t, driver)
+
+	response := post(t, server, "/open", opening("https://example.org/"), true)
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: 503 would reach the núcleo as a fence failure",
+			response.StatusCode)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "too many sessions") {
+		t.Fatalf("body = %q, want it to say what the refusal was", body)
+	}
+	if !strings.Contains(string(body), "2 of 2") {
+		t.Fatalf("body = %q: without the counts it says you are at the ceiling and never what the "+
+			"ceiling is, which is the half a person can act on", body)
 	}
 }
 

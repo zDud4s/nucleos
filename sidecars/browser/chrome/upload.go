@@ -60,7 +60,12 @@ func (d *Driver) attach(ctx context.Context, entry *session, on cdp.SessionID, o
 	case strings.HasPrefix(outcome, "not-a-file-input:"):
 		return &browser.Refusal{
 			Consequence: browser.ConsequenceNotApplicable,
-			Detail: fmt.Sprintf("that is a %s, not a file input; upload attaches to <input type=file>",
+			// Named as a tag rather than with an article, because the tag can BE "a" — a link
+			// refused this way read "that is a a, not a file input", which is what a real session
+			// produced the first time this refusal fired against a live page. Angle brackets also
+			// pair it with the `<input type=file>` at the end, so the two halves are the same kind
+			// of thing.
+			Detail: fmt.Sprintf("that ref names <%s>, not a file input; upload attaches to <input type=file>",
 				strings.TrimPrefix(outcome, "not-a-file-input:")),
 		}, nil
 	default:

@@ -657,6 +657,75 @@ mod tests {
         row.id
     }
 
+    /// The daemon-side guard on the READ verbs, and the reason it has to be on this side at all.
+    ///
+    /// **Found by driving a live daemon, not by this suite.** A session was handed off and then
+    /// asked for a snapshot, and it answered — with the page. `post_act` and `post_look` refuse once
+    /// the session is not the agent's; `post_snapshot` and `post_screenshot` did not.
+    ///
+    /// Nothing was exploitable, and that is the part worth keeping. The sidecar's `Human` driver
+    /// refuses all three, so the second layer held. But its comment says the núcleo "already refuses
+    /// them from its own record (spec §4.4 rule 1), so this is the second layer" — and the núcleo
+    /// refused two of the three. A first layer that is only believed in cannot do the job it exists
+    /// for, which `post_act` states exactly: it holds when the two processes DISAGREE about who is
+    /// driving, the state a crash between the request and the handover produces.
+    ///
+    /// A tree is not pixels, and that is not a defence. A login form's accessibility tree names the
+    /// fields and carries their values.
+    #[tokio::test]
+    async fn the_read_verbs_leave_the_agent_with_the_session() {
+        // Spelled out rather than defaulted: `SessionBody` has no `Default`, and giving it one
+        // for a test would put a "session 0" into production code.
+        fn reading(session_id: i64) -> crate::browser::SessionBody {
+            crate::browser::SessionBody {
+                session_id,
+                changes_only: false,
+                text_from: 0,
+                controls_from: 0,
+                find: String::new(),
+            }
+        }
+
+        let (db, state, _) = wheeled(vec![], false).await;
+        let session = a_session(&state).await;
+        request(&state, session, "there is a login here")
+            .await
+            .expect("request");
+
+        for (verb, response) in [
+            (
+                "snapshot",
+                crate::browser::post_snapshot(
+                    axum::extract::State(state.clone()),
+                    axum::Json(reading(session)),
+                )
+                .await,
+            ),
+            (
+                "screenshot",
+                crate::browser::post_screenshot(
+                    axum::extract::State(state.clone()),
+                    axum::Json(reading(session)),
+                )
+                .await,
+            ),
+        ] {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("refused"),
+                "{verb} answered a session that is not the agent's: {text}"
+            );
+            assert!(
+                text.contains("theirs"),
+                "{verb} refused without saying whose the screen is: {text}"
+            );
+        }
+        db.close().await;
+    }
+
     /// Spec Â§4.4 rule 3, and the first half of rule 1. Asking raises a proposal â€” the daemon runs
     /// without a shell, so the request has to survive the window being closed â€” and the session
     /// leaves the agent's hands in the same breath.

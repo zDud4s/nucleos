@@ -438,6 +438,18 @@ func writeDriverError(w http.ResponseWriter, verb string, err error) {
 		// 409 and not 403: nothing is wrong with the request, and it may well succeed later. The
 		// wheel is with a person, and spec §4.4 rule 2 puts no bound on how long that lasts.
 		http.Error(w, "a person is driving this profile", http.StatusConflict)
+	case errors.Is(err, browser.ErrTooManySessions):
+		// The REASON in the body, like ErrNotInstalled above, because the ceiling is something the
+		// caller can act on: close a session. `.ai/browser.yaml` makes the same argument about
+		// `max_profiles` — a refusal that leaves the owner guessing is one they resolve by raising
+		// the limit. `err.Error()` carries the counts the pool wrapped in.
+		//
+		// 409 and not 503, and the choice is forced rather than tasteful: the núcleo's `classify`
+		// maps 503 to `FenceDown`, so a ceiling answered with 503 would reach a person as "browsing
+		// is fenced off" — a different, pillar-level failure, and untrue. 409 lands in `Failed`,
+		// which keeps the body. It is also the right shape by the arm above: nothing is wrong with
+		// the request, and it succeeds the moment a session closes.
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, browser.ErrNoWheelToReturn):
 		http.Error(w, "this session is not a person's to give back", http.StatusConflict)
 	case errors.Is(err, browser.ErrNotAProjectProfile):
