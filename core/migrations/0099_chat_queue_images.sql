@@ -1,0 +1,19 @@
+-- The pictures a message was waiting with.
+--
+-- `chat_queue` kept the words a person typed while a turn was running. A message with a screenshot
+-- pasted into it would have kept the words and lost the screenshot -- and losing half of what
+-- somebody sent, silently, is worse than refusing the whole of it.
+--
+-- BYTES here, unlike `runs.prompt_images`, which keeps paths. The two rows have opposite lives: a
+-- run is read on every transcript poll and lives for ever, so megabytes on it would be dragged
+-- through every query that wants a prompt and a status. A queued message is read once, by the drain
+-- that sends it, and is deleted in the same statement -- so the bytes are here for as long as it
+-- takes to send them, and then they are not.
+--
+-- Naming them is what makes the difference: a picture on a run is named after the turn that carries
+-- it, and a waiting message has no turn yet. It gets one by being sent, which is where
+-- `send_message_with` writes the files and records their paths.
+--
+-- JSON: an array of `{media_type, data}`, data base64, in the order they were attached. NULL means
+-- a message queued before this column, which is a different fact from one that carried none.
+ALTER TABLE chat_queue ADD COLUMN images TEXT;

@@ -160,6 +160,8 @@ export const keys = {
     all: ["chats"] as const,
     detail: (chatId: string) => ["chats", "detail", chatId] as const,
     localModel: ["chats", "local-model"] as const,
+    project: (chatId: string) => ["chats", "project", chatId] as const,
+    diff: (chatId: string) => ["chats", "diff", chatId] as const,
     ideSessions: ["chats", "ide-sessions"] as const,
     ideSession: (sessionId: string) => ["chats", "ide-session", sessionId] as const,
     live: (turnId: number) => ["chats", "live", turnId] as const,

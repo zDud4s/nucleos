@@ -1,0 +1,22 @@
+-- The pictures a turn was sent with.
+--
+-- Asked of the CLI before any of this was built, because nothing here could answer it: a `user`
+-- line on `--input-format stream-json` whose content is an ARRAY with an `image` block in it is
+-- accepted, and the model SEES it -- sent a solid magenta square and asked what colour it was, it
+-- answered "Magenta", which is not a thing anybody guesses. That is why an attached picture travels
+-- inside the message rather than as a path for the model to go and read: it is part of what was
+-- said, not an errand.
+--
+-- PATHS and not bytes. `runs` is read on every transcript poll and on every list, and a column
+-- holding base64 screenshots would be megabytes dragged through queries that want a prompt and a
+-- status. The bytes live in the files pillar, under `chats/`, named after the turn that carries
+-- them -- so the record is a short string and the picture is a file somebody can open.
+--
+-- JSON: an array of paths relative to the files root, in the order they were attached. NULL means a
+-- turn from before this column; `[]` means a turn that carried none. The two are different facts
+-- and only the second is knowable, which is why nothing writes `[]` for the first.
+--
+-- Nothing deletes these. A turn is a run and stays readable for ever, so the picture it was sent
+-- with does too -- and that is a decision with a cost, written down here rather than discovered
+-- later as a disk filling up.
+ALTER TABLE runs ADD COLUMN prompt_images TEXT;

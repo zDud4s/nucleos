@@ -43,10 +43,14 @@ pub struct ChatSummary {
     pub created_at: String,
     /// Where this conversation's turns run, or `None` for the daemon's own directory.
     ///
-    /// Set only when the conversation continues a session that was had somewhere else. It travels
-    /// to the list because the window has to show it: two conversations continued from two
-    /// worktrees of the same repository are otherwise indistinguishable by anything a person can
-    /// read.
+    /// Set at creation for a conversation picked up from the editor, and by `set_cwd` for one that
+    /// is told afterwards which project it is about. It used to be the first of those alone, which
+    /// is why a conversation opened in the window could never have tools: `tool_policy_for` grants
+    /// them on a directory, and there was no way to give it one.
+    ///
+    /// It travels to the list because the window has to show it: two conversations continued from
+    /// two worktrees of the same repository are otherwise indistinguishable by anything a person
+    /// can read.
     pub cwd: Option<String>,
     /// Which conversation had in the editor this one was picked up from, or `None` when it was
     /// opened here.
@@ -103,6 +107,46 @@ pub async fn create(
     Ok(chat_id)
 }
 
+/// Whether this conversation plans without acting.
+///
+/// Read on the turn path rather than carried on the summary, for the reason `cwd_of` is read there:
+/// it decides what the run is LAUNCHED with, and a value that travelled through the window and back
+/// would be a second copy of it free to disagree.
+pub async fn plans_only(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, i64>("SELECT plan_only FROM chats WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await
+        .map(|found| found.unwrap_or(0) != 0)
+}
+
+/// Puts a conversation into planning, or takes it out.
+pub async fn set_plan_only(pool: &SqlitePool, chat_id: &str, planning: bool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET plan_only = ? WHERE chat_id = ?")
+        .bind(i64::from(planning))
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Points a conversation at the project it is about.
+///
+/// The second writer this column has ever had. The first is the pick-up, at creation, and until now
+/// it was the only one — so a conversation opened in the window had no directory and no way to be
+/// given one, which `tool_policy_for` reads as `McpOnly` for as long as it exists.
+///
+/// The caller has already checked that this is a directory. Here it is a string going into a column,
+/// and a second check would be a second answer to a question the filesystem can change between them.
+pub async fn set_cwd(pool: &SqlitePool, chat_id: &str, cwd: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET cwd = ? WHERE chat_id = ?")
+        .bind(cwd)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Records what a conversation was handed in place of the session it could not resume.
 pub async fn set_handover(pool: &SqlitePool, chat_id: &str, handover: &str) -> sqlx::Result<()> {
     sqlx::query("UPDATE chats SET handover = ? WHERE chat_id = ?")
@@ -133,6 +177,93 @@ pub async fn handover_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Optio
 /// every single turn, and `get` walks the whole list to answer.
 pub async fn cwd_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
     opened_in(pool, chat_id).await.map(Option::flatten)
+}
+
+/// One message waiting to be said, and the name it can be taken back by.
+///
+/// An id and not a position: the drain removes the front of the queue while a person is looking at
+/// it, so "the second one" means something different a moment later — and taking one back by
+/// position would take back a message nobody pointed at.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct Waiting {
+    pub id: i64,
+    pub text: String,
+}
+
+/// What is waiting to be said to this conversation, oldest first.
+///
+/// Ordered by `id` and never by `created_at`: two messages typed in the same second must not swap
+/// places, and a queue that reorders itself is one nobody can predict.
+pub async fn queued(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<Waiting>> {
+    sqlx::query_as("SELECT id, text FROM chat_queue WHERE chat_id = ? ORDER BY id")
+        .bind(chat_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// Takes a waiting message back off the queue, answering whether there was one to take.
+///
+/// The chat is part of the WHERE and not merely checked first. A delete that finds the row by id
+/// alone and trusts the caller about whose it is has no defence at all, and the two-step version —
+/// read it, check the chat, delete it — has a window between the check and the delete.
+///
+/// `false` rather than an error when nothing matched: the drain may have sent that message a moment
+/// ago, and losing that race is a thing a person does harmlessly, not a fault to report.
+pub async fn drop_queued(pool: &SqlitePool, chat_id: &str, id: i64) -> sqlx::Result<bool> {
+    sqlx::query("DELETE FROM chat_queue WHERE id = ? AND chat_id = ?")
+        .bind(id)
+        .bind(chat_id)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() > 0)
+}
+
+/// Keeps a message, and whatever was attached to it, until the conversation has a turn free.
+///
+/// The pictures travel as bytes here, unlike on a run, which keeps paths. The two rows have
+/// opposite lives: a run is read on every poll and lives for ever, a queued message is read once by
+/// the drain that sends it and is deleted in the same statement. Keeping the words and losing the
+/// screenshot would be losing half of what somebody sent, without saying so.
+pub async fn enqueue(
+    pool: &SqlitePool,
+    chat_id: &str,
+    text: &str,
+    origin: &str,
+    images: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO chat_queue (chat_id, text, origin, images, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(chat_id)
+    .bind(text)
+    .bind(origin)
+    .bind(images)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Takes the oldest waiting message off this conversation's queue, or `None` when there is none.
+///
+/// Deleted as it is read, in one statement, rather than read and then deleted after it has been
+/// sent. Two drains racing the same row is the failure that matters here — the same words sent
+/// twice, billed twice — and `RETURNING` makes the row belong to exactly one of them. The other
+/// order would be safer against a message lost to a crash mid-send, and that is the wrong trade:
+/// one lost message is a person retyping a sentence, one duplicated message is a turn nobody asked
+/// for acting on a conversation twice.
+pub async fn take_queued(
+    pool: &SqlitePool,
+    chat_id: &str,
+) -> sqlx::Result<Option<(String, Option<String>, Option<String>)>> {
+    sqlx::query_as(
+        "DELETE FROM chat_queue
+          WHERE id = (SELECT id FROM chat_queue WHERE chat_id = ? ORDER BY id LIMIT 1)
+      RETURNING text, origin, images",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Where this conversation runs, keeping "no such conversation" apart from "no directory".
@@ -293,6 +424,73 @@ pub async fn archive(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
         .execute(pool)
         .await
         .map(|_| ())
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    async fn pool_with_a_queue() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    /// A message that waits must be nameable, or nothing can take it back.
+    ///
+    /// By id and not by position: the drain removes the front of the queue while a person is
+    /// looking at it, so "the second one" means something different a moment later — and deleting
+    /// by position would take back a message somebody never pointed at.
+    #[tokio::test]
+    async fn what_waits_can_be_named_and_taken_back() {
+        let pool = pool_with_a_queue().await;
+        for text in ["primeiro", "segundo"] {
+            enqueue(&pool, "c-1", text, "shell", "[]").await.unwrap();
+        }
+
+        let waiting = queued(&pool, "c-1").await.unwrap();
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(waiting[0].text, "primeiro");
+
+        assert!(drop_queued(&pool, "c-1", waiting[0].id).await.unwrap());
+
+        let left = queued(&pool, "c-1").await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].text, "segundo");
+    }
+
+    /// One conversation must not be able to take a message out of another's queue.
+    ///
+    /// The chat is part of the WHERE and not merely checked first: a delete that finds the row by
+    /// id alone and trusts the caller about whose it is has no defence at all, and the two-step
+    /// version has a window between the check and the delete.
+    #[tokio::test]
+    async fn a_conversation_cannot_take_a_message_out_of_another_ones_queue() {
+        let pool = pool_with_a_queue().await;
+        enqueue(&pool, "mine", "meu", "shell", "[]").await.unwrap();
+        let mine = queued(&pool, "mine").await.unwrap()[0].id;
+
+        assert!(!drop_queued(&pool, "somebody-else", mine).await.unwrap());
+
+        assert_eq!(queued(&pool, "mine").await.unwrap().len(), 1);
+    }
+
+    /// Taking back something already gone is `false`, never an error: the drain may have sent it a
+    /// moment ago, and that is a race a person loses harmlessly rather than a fault.
+    #[tokio::test]
+    async fn taking_back_something_already_gone_says_so_without_failing() {
+        let pool = pool_with_a_queue().await;
+
+        assert!(!drop_queued(&pool, "c-1", 999).await.unwrap());
+    }
 }
 
 #[cfg(test)]

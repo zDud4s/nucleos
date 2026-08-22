@@ -49,6 +49,35 @@ export interface ChatSummary {
   waiting: number;
 }
 
+/**
+ * Where a conversation runs, and whether that gives its turns tools.
+ *
+ * Two facts and not one, because a directory alone is not enough: the daemon grants tools on a
+ * directory whose classifier hook is wired, and every fresh worktree lacks one. A window that read
+ * only `cwd` would say "this conversation has a project" about one that still cannot open a file.
+ */
+export interface ChatProject {
+  cwd: string | null;
+  tools: boolean;
+  /**
+   * The session a terminal standing in `cwd` could carry this conversation on
+   * in, or `null` when the daemon itself would not resume it.
+   *
+   * Measured: `claude --resume <this>` from that directory really does continue
+   * a conversation the daemon had. The way back was always there — nothing said
+   * so, which made it a way back only somebody who reads the daemon could find.
+   */
+  session: string | null;
+  /**
+   * Whether this conversation plans without acting.
+   *
+   * Beside the tools and not beside the title, because it is the same question
+   * in the other direction: one says what this conversation CAN do, the other
+   * what it will choose not to.
+   */
+  planning: boolean;
+}
+
 /** A conversation already had in the IDE that this daemon could continue. */
 export interface IdeSession {
   session_id: string;
@@ -147,6 +176,51 @@ export type Exchange = [string, string];
 export interface Transcript {
   handed: Exchange[];
   turns: Turn[];
+  /**
+   * What was said to this conversation while it was busy and has not been sent
+   * yet, oldest first, each with the name it can be taken back by.
+   *
+   * Not turns and never drawn as ones: nothing has run, nothing is billed, and
+   * a bubble that looked like a turn would be claiming a run that does not
+   * exist. They leave this list by becoming turns, on their own.
+   */
+  queued: Waiting[];
+  /**
+   * What this conversation is waiting to be allowed to do, which is nearly
+   * always nothing.
+   *
+   * A turn is HELD while one of these stands: the CLI is sitting on a hook call
+   * and the model behind it, so answering is not a preference somebody gets to
+   * at their leisure. It travels on the transcript because that is what polls at
+   * a turn's own speed while a turn is live, which is exactly when one appears.
+   */
+  asks: Ask[];
+}
+
+/**
+ * One tool call this conversation is being held on.
+ *
+ * `detail` is the one argument worth showing beside the name — a command, a
+ * path — and deliberately not the whole input: a `Write` carries the file it is
+ * writing, and a window that printed that argument would print the file.
+ */
+export interface Ask {
+  id: string;
+  tool: string;
+  detail: string | null;
+}
+
+/**
+ * One message waiting to be said, and the name it can be taken back by.
+ *
+ * An id and not a position: the daemon sends the front of the queue while a
+ * person is looking at it, so "the second one" means something different a
+ * moment later — and taking one back by position would take back a message
+ * nobody pointed at.
+ */
+export interface Waiting {
+  id: number;
+  text: string;
 }
 
 /** One name a conversation offers for an `@`, relative to its own directory. */
@@ -171,6 +245,12 @@ export interface Mentions {
   hits: Mention[];
   /** True when a ceiling cut the list, so the window never implies the file is simply not there. */
   truncated: boolean;
+}
+
+/** A picture on its way out: base64, with what the browser said it is. */
+export interface Attachment {
+  media_type: string;
+  data: string;
 }
 
 /** Where a command came from, which is the only thing explaining two of the same name. */
@@ -242,7 +322,12 @@ export function useChatTranscript(chatId: string | null) {
   return useQuery({
     queryKey,
     queryFn: async ({ client }): Promise<Transcript> => {
-      const read = await apiFetch<{ handed: Exchange[]; turns: AssistantTurnRow[] }>(
+      const read = await apiFetch<{
+        handed: Exchange[];
+        turns: AssistantTurnRow[];
+        queued: Waiting[];
+        asks: Ask[];
+      }>(
         `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
       );
       const fresh = read.turns.map(turnFromRow);
@@ -250,7 +335,12 @@ export function useChatTranscript(chatId: string | null) {
       // Defaulted rather than trusted, exactly as the turn fields are: a daemon older than the
       // column answers with turns and no `handed`, and a conversation that will not draw over a
       // missing field is a worse answer than one that draws without the note.
-      return { handed: read.handed ?? [], turns: merge(fresh, local) };
+      return {
+        handed: read.handed ?? [],
+        queued: read.queued ?? [],
+        asks: read.asks ?? [],
+        turns: merge(fresh, local),
+      };
     },
     enabled: chatId !== null,
     refetchInterval: (query) => (anyTurnLive(query.state.data?.turns) ? POLL.turn : POLL.fast),
@@ -278,11 +368,37 @@ export function useLocalModel() {
  * conversation" picker, and asking for it on every visit to this page would
  * be a directory scan nobody is looking at.
  */
-export function useIdeSessions(enabled: boolean) {
+export function useIdeSessions(enabled: boolean, watch = false) {
   return useQuery({
     queryKey: keys.chats.ideSessions,
     queryFn: () => apiFetch<IdeSession[]>("/assistant/ide-sessions"),
     enabled,
+    // The daemon re-reads the CLI's own store on every request, deliberately uncached, because it
+    // changes whenever a session is typed into. That made the DATA live and left the window showing
+    // a photograph: whichever sessions existed at the moment the door was opened, forever.
+    //
+    // `POLL.fast` is the cadence for "the state of the machine right now", which is what a
+    // conversation somebody is in the middle of having is.
+    //
+    // Opt-in, because the two callers want different things from the same list. The editor door is
+    // watching conversations that may be happening; the project form wants the directories in it as
+    // suggestions, and a list of folders does not need re-reading every three seconds.
+    refetchInterval: watch ? POLL.fast : false,
+  });
+}
+
+/**
+ * Where this conversation runs, and whether that gives it tools.
+ *
+ * Not polled: it changes when somebody changes it — points the conversation at a project, or wires
+ * that project's hook — and both of those are mutations in this window that invalidate it. A timer
+ * would be re-stating a filesystem to itself.
+ */
+export function useChatProject(chatId: string) {
+  return useQuery({
+    queryKey: keys.chats.project(chatId),
+    queryFn: () =>
+      apiFetch<ChatProject>(`/assistant/chats/${encodeURIComponent(chatId)}/project`),
   });
 }
 
@@ -295,12 +411,39 @@ export function useIdeSessions(enabled: boolean) {
  * not a queue — but the key does sit under `keys.chats.all`, so a mutation in this
  * conversation refetches it, which is the direction that stays right.
  */
-export function useIdeConversation(sessionId: string | null) {
+export function useIdeConversation(sessionId: string | null, watch = false) {
   return useQuery({
     queryKey: keys.chats.ideSession(sessionId ?? ""),
     queryFn: () =>
       apiFetch<Conversation>(`/assistant/ide-sessions/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null,
+    // Opt-in, because the two callers are asking different questions. The editor door is looking at
+    // a conversation that may be happening right now and wants to see it move; a conversation that
+    // was already picked up is showing where it CAME from, which is settled — polling that would be
+    // re-reading somebody's history every few seconds to watch it not change.
+    refetchInterval: watch ? POLL.fast : false,
+  });
+}
+
+/**
+ * What is different in this conversation's project, as `git diff` writes it.
+ *
+ * **`apiText`, never `apiFetch`**: the route answers with a bare string, and a
+ * clean tree answers with an empty one — which `apiFetch` would try to parse as
+ * JSON and refuse.
+ *
+ * On demand and never polled, and `enabled` is what makes that true: this walks
+ * a working tree, and re-asking it on a timer would do that in the background
+ * forever for a panel nobody has opened. Not cached beyond the open either —
+ * `staleTime: 0` — because the answer changes the moment the conversation does
+ * anything, and a stale diff is a worse answer than a slow one.
+ */
+export function useChatDiff(chatId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: keys.chats.diff(chatId),
+    queryFn: () => apiText(`/assistant/chats/${encodeURIComponent(chatId)}/diff`),
+    enabled,
+    staleTime: 0,
   });
 }
 
@@ -318,13 +461,25 @@ export function useIdeConversation(sessionId: string | null) {
 export function useSendMessage(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (text: string) =>
-      apiFetch<{ turn_id: number }>("/assistant/message", {
+    mutationFn: ({ text, images }: { text: string; images: Attachment[] }) =>
+      // `wait_if_busy` is what turns the old 409 into a place in the queue. A person looking at the
+      // window would rather their words were kept than be told no and handed back an empty box —
+      // the Telegram sidecar, which gives up on a turn after a timeout, would rather be refused,
+      // and so it does not ask.
+      apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",
-        body: JSON.stringify({ chat_id: chatId, text }),
+        body: JSON.stringify({ chat_id: chatId, text, images, wait_if_busy: true }),
       }),
     retry: false,
-    onSuccess: (result, text) => {
+    onSuccess: (result, { text }) => {
+      // Kept rather than sent: there is no turn to draw, and inventing one would put a bubble on
+      // screen for a run that does not exist. The transcript's own read carries what is waiting, so
+      // asking for it again is the whole of what this side has to do.
+      if (result.turn_id === undefined) {
+        void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+        void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+        return;
+      }
       const optimistic: Turn = {
         id: result.turn_id,
         asked: text,
@@ -333,6 +488,10 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // Not the pictures that were just sent: those are on disk under names only the daemon
+        // knows, because it names them after the turn's own id. They arrive with the next read,
+        // which is a beat later — and a wrong guess at a path would draw a broken image instead.
+        images: [],
         // Nothing has run and nothing has been thought: this turn has not started.
         thought: [],
         thoughtTokens: null,
@@ -344,9 +503,20 @@ export function useSendMessage(chatId: string) {
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],
       };
-      queryClient.setQueryData<Turn[]>(keys.chats.detail(chatId), (current) =>
-        merge(current ?? [], [optimistic]),
-      );
+      // A `Transcript`, because that is what this key holds. It used to hold a bare array, and
+      // writing the old shape here does not fail a type check — `setQueryData` is TOLD the type —
+      // it fails at runtime inside `merge`, on the one gesture the page exists for. What is handed
+      // and what is queued are carried through untouched: neither is this write's business, and
+      // dropping them would blank the notes above and below the transcript on every send.
+      queryClient.setQueryData<Transcript>(keys.chats.detail(chatId), (current) => ({
+        handed: current?.handed ?? [],
+        queued: current?.queued ?? [],
+        // Carried through for the reason the two above are, and it matters more: a question this
+        // conversation is being HELD on, blanked by an optimistic write, would take the answer
+        // buttons off the screen while the turn behind them went on waiting.
+        asks: current?.asks ?? [],
+        turns: merge(current?.turns ?? [], [optimistic]),
+      }));
       // The list's "thinking…" reading and its `waiting` count both depend on
       // this conversation's state, and a person who just sent a message is
       // looking straight at it — a three-second wait for the badge to agree
@@ -443,6 +613,123 @@ export function useChatCommands(chatId: string, query: string | null) {
     // the disk between keystrokes and short enough that a new command shows up while you look.
     staleTime: 10_000,
     retry: false,
+  });
+}
+
+/**
+ * Takes a message back off the queue before it is sent.
+ *
+ * A 404 is not an error worth showing: it means the daemon sent that message a moment before the
+ * click landed, which is a race a person loses harmlessly. Either way the transcript is asked
+ * again, and either way what is on screen becomes true.
+ */
+export function useDropQueued(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (queuedId: number) =>
+      apiFetch<void>(
+        `/assistant/chats/${encodeURIComponent(chatId)}/queue/${queuedId}`,
+        { method: "DELETE" },
+      ),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Point a conversation at the project it is about.
+ *
+ * The only way a conversation opened here ever gets tools. The daemon refuses a path that is not an
+ * absolute directory, so a typo comes back as a refusal rather than as a conversation that looks
+ * fine until somebody asks it to read a file.
+ *
+ * It also drops the session the conversation was on, which is why the transcript is invalidated
+ * too: the next turn starts a fresh one, in the new tree.
+ */
+export function useSetChatProject(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (cwd: string) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ cwd }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Put this conversation into planning, or take it out.
+ *
+ * A state and not a per-turn choice, because that is the shape the gesture has:
+ * somebody says "plan this", reads it, then says "go". Two turns, one decision,
+ * held between them.
+ *
+ * The project read is invalidated because it carries the flag, and the chat list
+ * because a conversation that will not act is a different thing to be looking at.
+ */
+export function useSetPlanning(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (planning: boolean) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ plan_only: planning }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Wire the classifier hook in this conversation's project, which is what turns talk into tools.
+ *
+ * The same act the editor door offers before a pick-up, reached from the other side: there it is a
+ * session that has a directory, here a conversation that was given one.
+ */
+export function useWireChatTools(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/tools`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+    },
+  });
+}
+
+/**
+ * Say whether a held tool call may go ahead.
+ *
+ * There is a turn waiting on this answer, and a window of about forty-five
+ * seconds before the daemon refuses on its own — so the transcript is
+ * invalidated at once rather than on the next poll, and a 404 (the question
+ * timed out, or the turn moved on) is not worth showing: the refetch that
+ * follows says so by the question no longer being there.
+ */
+export function useAnswerAsk(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, allow }: { id: string; allow: boolean }) =>
+      apiFetch<void>(`/assistant/asks/${encodeURIComponent(id)}`, {
+        method: "POST",
+        body: JSON.stringify({ allow }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+    },
   });
 }
 

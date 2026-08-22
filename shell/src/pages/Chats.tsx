@@ -8,9 +8,16 @@ import {
   useCreateChat,
   useIdeConversation,
   useIdeSessions,
+  useSetChatProject,
+  useSetPlanning,
+  useWireChatTools,
   useWireIdeSessionTools,
+  useAnswerAsk,
   useChatCommands,
+  useChatDiff,
   useChatFiles,
+  useChatProject,
+  useDropQueued,
   useLiveTurn,
   useLocalModel,
   usePatchChat,
@@ -19,10 +26,13 @@ import {
   useSendMessage,
   useStopTurn,
   type Brain,
+  type Attachment,
   type ChatSummary,
   type Command,
   type Exchange,
+  type Ask,
   type Mention,
+  type Waiting,
   type IdeSession,
   type ToolCall,
   type Turn,
@@ -38,6 +48,10 @@ import {
 } from "../lib/turns";
 import { blocks, lines, type Line as RichLine } from "../lib/rich";
 import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
+import { fetchFileBlob } from "../data/files";
+import { attachmentFrom, isPicture } from "../lib/picture";
+import { stillGoing } from "../lib/editor";
+import { diffLines } from "../lib/diff";
 import {
   Badge,
   Button,
@@ -388,9 +402,11 @@ function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
  * quietly starts a fresh conversation instead of the one you chose.
  */
 function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
-  const sessions = useIdeSessions(true);
+  const sessions = useIdeSessions(true, true);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const said = useIdeConversation(sessionId);
+  // Watched, not merely read: this is the one panel where the conversation on screen may be being
+  // typed into while somebody looks at it.
+  const said = useIdeConversation(sessionId, true);
   const create = useCreateChat();
   const chosen = (sessions.data ?? []).find((session) => session.session_id === sessionId);
 
@@ -427,6 +443,11 @@ function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
               >
                 <span className="chats-editor-title">{session.title ?? session.session_id}</span>
                 <span className="chats-editor-where">{session.cwd}</span>
+                {/* Inside the button, so the mark is part of the row's own name and a screen reader
+                    hears "happening now" along with the title rather than after a silence. */}
+                {stillGoing(session.last_activity, Date.now()) && (
+                  <span className="chats-editor-live">happening now</span>
+                )}
               </button>
             </li>
           ))}
@@ -550,9 +571,12 @@ function ChatDetail({
         <div className="chats-detail-head">
           <TitleEditor chatId={chatId} title={summary.title} />
           <BrainPicker chatId={chatId} brain={summary.brain} />
+          <Planning chatId={chatId} />
           <ArchiveControl chatId={chatId} />
         </div>
       )}
+
+      <Project chatId={chatId} />
 
       {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
@@ -571,9 +595,216 @@ function ChatDetail({
           chatId={chatId}
         />
       )}
+      {/* Below the transcript and above the box, which is where these words are in time: said
+          after everything above them, and not yet said at all. */}
+      {/* Above what is waiting to be said, because this is what everything else is waiting ON:
+          a turn is held while a question stands, and the queue behind it cannot move until it is
+          answered. */}
+      <Asking asks={transcript.data?.asks ?? []} chatId={chatId} />
+      <Changed chatId={chatId} />
+      <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
 
       <Composer chatId={chatId} />
     </Panel>
+  );
+}
+
+/**
+ * Where this conversation runs, and what that lets it do.
+ *
+ * Three states and each says a different thing, because they are three different situations and
+ * running them together is how a person ends up guessing:
+ *
+ * - **no project** — it can talk and nothing else, and here is how to change that;
+ * - **a project with no wired hook** — it has a tree and still cannot touch it, and here is the one
+ *   press that fixes it;
+ * - **both** — a quiet line naming the folder, so pressing the button leaves visible proof rather
+ *   than silence.
+ *
+ * Read on demand and not polled: it changes when somebody changes it, and both of the somethings
+ * are mutations in this window.
+ */
+function Project({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+
+  // Nothing at all until it is known. A conversation is not "without a project" because the answer
+  // has not arrived yet, and a note that appears and then retracts itself is worse than a late one.
+  if (project.data === undefined) return null;
+  const { cwd, tools, session } = project.data;
+
+  return (
+    <>
+      {cwd === null && <NoProject chatId={chatId} />}
+      {cwd !== null && !tools && <ProjectWithoutTools chatId={chatId} cwd={cwd} />}
+      {cwd !== null && tools && (
+        <p className="chats-project-where">this conversation is about {cwd}</p>
+      )}
+      {cwd !== null && session !== null && <CarryOn cwd={cwd} session={session} />}
+    </>
+  );
+}
+
+/**
+ * Whether this conversation plans without acting.
+ *
+ * `--permission-mode plan` is what the daemon launches with, and it has always been able to — every
+ * kind of run in this house could be put in planning except the kind a person is watching, which is
+ * the one where it matters most. It is the mode you reach for before letting an agent near a
+ * codebase.
+ *
+ * A state on the conversation rather than a choice per message: somebody says "plan this", reads
+ * it, then says "go". Making it per-message would turn one decision into a thing to remember every
+ * time.
+ *
+ * **It is not "changes nothing", and this said so until it was measured.** A planning turn still
+ * reaches for tools — `Glob`, `Read`, and a `Write` that RAN, which the daemon's gate saw and the
+ * transcript recorded. What it wrote was its own plan, as a document in the working directory;
+ * what it did not do was the work. The label says that now, because a control promising more than
+ * the mode delivers is worse than no control.
+ */
+function Planning({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+  const set = useSetPlanning(chatId);
+  const planning = project.data?.planning ?? false;
+
+  return (
+    <label
+      className="chats-planning"
+      title="answer with a plan instead of doing the work — it may still write the plan down"
+    >
+      <input
+        type="checkbox"
+        checked={planning}
+        disabled={project.data === undefined || set.isPending}
+        onChange={(event) => set.mutate(event.target.checked)}
+      />
+      Plan only
+    </label>
+  );
+}
+
+/**
+ * How to carry this conversation on at a terminal.
+ *
+ * The loop closes both ways and always did: the daemon runs the CLI with a session id of its own, in
+ * the conversation's directory, and the CLI keeps its transcripts one folder per project — so
+ * `claude --resume <id>` from there continues it. Measured, with a word said only to the daemon
+ * coming back out of a fresh CLI.
+ *
+ * What was missing was anybody being told. The id lived in a table and appeared nowhere a person
+ * could read, which made the way back one only somebody who reads the daemon's source could find.
+ *
+ * Shown only where there is a directory to stand in, and only while the daemon would resume it
+ * itself — a rotated conversation offers nothing rather than an id that leads somewhere it will not
+ * go.
+ */
+function CarryOn({ cwd, session }: { cwd: string; session: string }) {
+  return (
+    <p className="chats-project-carry">
+      to carry this on at a terminal:{" "}
+      <code className="chats-project-command">
+        cd {cwd} &amp;&amp; claude --resume {session}
+      </code>
+    </p>
+  );
+}
+
+/**
+ * What a conversation started here cannot do, and the way to change it.
+ *
+ * A conversation's working directory used to be written once, at creation, out of the editor
+ * session it was picked up from — so one started here had none, and `tool_policy_for` answered
+ * `McpOnly` for as long as it existed. No Bash, no Read, no Write, and nothing said so: you would
+ * ask it to fix a file, watch it not fix the file, and have nowhere to find out why.
+ *
+ * The suggestions are the folders the editor's own sessions were had in, which is where somebody
+ * asking this question almost always means. Typed rather than picked from a dialog because a native
+ * folder picker is a Tauri plugin this app does not carry, and the daemon refuses a path that is not
+ * an absolute directory — so a typo comes back as a sentence instead of as a broken conversation.
+ */
+function NoProject({ chatId }: { chatId: string }) {
+  const point = useSetChatProject(chatId);
+  // Not watched: these are wanted as a list of folders, and a list of folders does not need
+  // re-reading every three seconds.
+  const sessions = useIdeSessions(true);
+  const [path, setPath] = useState("");
+
+  const folders = Array.from(new Set((sessions.data ?? []).map((session) => session.cwd)));
+
+  return (
+    <div className="chats-project">
+      <p className="chats-new-warning" role="status">
+        this conversation has no project — it can talk about code and remember what was said, but it{" "}
+        <b>cannot open a file, run a command, or change anything</b> on this machine.
+      </p>
+      <form
+        className="chats-project-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (point.isPending) return;
+          point.mutate(path.trim());
+        }}
+      >
+        <label htmlFor="chat-project">Project folder</label>
+        <input
+          id="chat-project"
+          list="chat-project-folders"
+          className="chats-project-path"
+          placeholder="C:/Projects/something"
+          value={path}
+          onChange={(event) => setPath(event.target.value)}
+        />
+        <datalist id="chat-project-folders">
+          {folders.map((folder) => (
+            <option key={folder} value={folder} />
+          ))}
+        </datalist>
+        <Button type="submit" intent="go" disabled={point.isPending || path.trim() === ""}>
+          Use this project
+        </Button>
+      </form>
+      {point.isError && <ProjectRefusal error={point.error} />}
+    </div>
+  );
+}
+
+/**
+ * A conversation that has a tree and still cannot touch it.
+ *
+ * The daemon grants tools on a directory whose classifier hook is wired, and a fresh worktree has
+ * none — `.claude/` is not committed. Same words as the editor door's own warning, because it is the
+ * same situation reached from the other side.
+ */
+function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
+  const wire = useWireChatTools(chatId);
+
+  return (
+    <div className="chats-project">
+      <p className="chats-new-warning" role="status">
+        this conversation is about {cwd}, which has no núcleo hook — it can talk about the code but{" "}
+        <b>cannot read or change any file</b>, and cannot run anything
+      </p>
+      <Button type="button" disabled={wire.isPending} onClick={() => wire.mutate()}>
+        Give it the tools
+      </Button>
+      {wire.isError && <WireRefusal error={wire.error} cwd={cwd} />}
+    </div>
+  );
+}
+
+function ProjectRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return <ErrorNote>the núcleo did not answer — the conversation was left as it was</ErrorNote>;
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        bad_request: "that has to be an absolute path to a folder that exists on this machine",
+        conflict: "this conversation is answering — wait for the turn to end, then move it",
+        not_found: "that conversation is no longer here",
+      }}
+    />
   );
 }
 
@@ -853,6 +1084,171 @@ function HowItContinued({
   );
 }
 
+/**
+ * What is different in this conversation's project, without leaving the app.
+ *
+ * The question a person has after a coding turn is "what changed", and the transcript answers it
+ * with the name of a tool and a path. To see what those did you had to go somewhere else, which is
+ * the opposite of what a conversation about code is for.
+ *
+ * **It says what it is, and what it is not.** The daemon takes no snapshot before a turn, so this is
+ * what is different NOW — the same thing after one turn, and not after three. Labelling it as what
+ * the turn did would be the kind of note that reads like a fact and stops being one.
+ *
+ * Closed until asked. Opening it walks a working tree, and a panel that did that on arrival would do
+ * it for every conversation somebody clicked past.
+ */
+function Changed({ chatId }: { chatId: string }) {
+  const [open, setOpen] = useState(false);
+  const diff = useChatDiff(chatId, open);
+
+  return (
+    <div className="chats-changed">
+      <button
+        type="button"
+        className="chats-changed-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((was) => !was)}
+      >
+        {open ? "hide what is different" : "what is different in this project"}
+      </button>
+      {open && diff.isError && (
+        <ChangedRefusal error={diff.error} />
+      )}
+      {open && diff.data === undefined && !diff.isError && (
+        <p className="chats-loading">reading the project…</p>
+      )}
+      {open && diff.data !== undefined && <DiffView diff={diff.data} />}
+    </div>
+  );
+}
+
+/** One `git diff`, coloured. A clean tree is said in words rather than drawn as an empty box. */
+function DiffView({ diff }: { diff: string }) {
+  const lines = diffLines(diff);
+  if (lines.length === 0) {
+    return <p className="chats-changed-clean">nothing in this project has changed</p>;
+  }
+  return (
+    <pre className="chats-diff" aria-label="What is different">
+      {lines.map((line, at) => (
+        // Keyed by position: a diff is read whole and redrawn whole, and nothing reorders inside it.
+        <span key={`diff-${at}`} className={`chats-diff-${line.kind}`}>
+          {line.text}
+          {"\n"}
+        </span>
+      ))}
+    </pre>
+  );
+}
+
+function ChangedRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return <ErrorNote>the núcleo did not answer — nothing could be read</ErrorNote>;
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        conflict: "this conversation has no project, so there is no working tree to compare",
+        not_found: "that conversation is no longer here",
+      }}
+    />
+  );
+}
+
+/**
+ * What this conversation is waiting to be allowed to do.
+ *
+ * The wall this removes: the classifier sends everything not provably read-only for approval, a
+ * conversation cannot park a proposal — one expects a worktree run to resume into and a chat has
+ * none — so the answer used to be a refusal telling the person to go and do it somewhere else.
+ * There was nowhere else. It is their window and they are looking at it, and the honest reply to
+ * somebody who is watching is a question.
+ *
+ * Urgent on purpose. A turn is held while this stands and the daemon refuses on its own after about
+ * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
+ * where the next thing would have appeared rather than tucked away somewhere tidy.
+ */
+function Asking({ asks, chatId }: { asks: Ask[]; chatId: string }) {
+  const answer = useAnswerAsk(chatId);
+  if (asks.length === 0) return null;
+  return (
+    <ul className="chats-asking" aria-label="Waiting to be allowed">
+      {asks.map((ask) => (
+        <li key={ask.id} className="chats-asking-line">
+          <p className="chats-asking-what" role="status">
+            this conversation wants to run <b>{ask.tool}</b>
+            {ask.detail !== null && (
+              <>
+                {" "}
+                — <code className="chats-asking-detail">{ask.detail}</code>
+              </>
+            )}
+          </p>
+          <div className="chats-asking-answer">
+            <Button
+              type="button"
+              intent="go"
+              disabled={answer.isPending}
+              onClick={() => answer.mutate({ id: ask.id, allow: true })}
+            >
+              Allow it
+            </Button>
+            <Button
+              type="button"
+              disabled={answer.isPending}
+              onClick={() => answer.mutate({ id: ask.id, allow: false })}
+            >
+              Refuse
+            </Button>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * What was said to this conversation while it was busy, and has not been sent yet.
+ *
+ * Outside the transcript, deliberately. A turn is a run: it has an id, it has a cost, and it is in
+ * the history for ever. These have none of that — nothing has been spawned, nothing is billed, and
+ * a bubble that looked like a turn would be claiming one that does not exist. They leave this list
+ * by becoming turns, on their own, the moment the conversation has a slot free.
+ *
+ * One can be taken back, by its own id and never by its place in the line. The front of this list
+ * is sent while somebody is looking at it, so a position names a different message by the time the
+ * button is pressed.
+ */
+function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
+  const drop = useDropQueued(chatId);
+  if (queued.length === 0) return null;
+  return (
+    <ul className="chats-waiting" aria-label="Waiting to be sent">
+      {queued.map((message) => (
+        // Keyed by the daemon's own id, not by position: the front of this list is sent while it
+        // is on screen, and a key that moved with it would redraw the wrong row.
+        <li key={message.id} className="chats-waiting-line">
+          <span className="chats-waiting-who">you · waiting</span>
+          {/* Verbatim, and not through `Rich`: it is what a person typed, and a message redrawn
+              as bold is a message they did not write. */}
+          <p className="chats-waiting-text">{message.text}</p>
+          <button
+            type="button"
+            className="chats-waiting-drop"
+            aria-label={`Do not send: ${message.text}`}
+            disabled={drop.isPending}
+            onClick={() => drop.mutate(message.id)}
+          >
+            don't send this
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /* ------------------------------------------------------------ transcript -- */
 
 function Transcript({
@@ -926,6 +1322,7 @@ function TurnBlock({
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
+      <TurnPictures paths={turn.images} />
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} />}
@@ -1026,25 +1423,6 @@ function ContextFill({ fill, rotatesAt }: { fill: number | null; rotatesAt: numb
 }
 
 /**
- * The brain and restart marks a transcript draws above one turn.
- *
- * The brain mark's copy is deliberately asymmetric: moving *to* the cloud is
- * about where what you type now goes, and moving *to* the local model is
- * about where the answer comes from — the two directions are not mirror
- * images of the same fact.
- */
-/**
- * A turn as it happens: the words so far, and what it is doing between them.
- *
- * Its own component so the poll lives and dies with the live turn — mounted only where `TurnBlock`
- * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all.
- *
- * Three states, and they are different claims. Nothing written and no tool is "thinking…", which is
- * what this said before and is still the honest answer while the daemon has nothing to show. A tool
- * running is named, because "thinking" over a command that is compiling something is the wrong word
- * for the wait. And words already written are shown as they arrive.
- */
-/**
  * The way out of a turn that is going nowhere.
  *
  * Offered only while the turn is live, because that is the only time it means anything: cancelling
@@ -1063,6 +1441,17 @@ function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
   );
 }
 
+/**
+ * A turn as it happens: the words so far, and what it is doing between them.
+ *
+ * Its own component so the poll lives and dies with the live turn — mounted only where `TurnBlock`
+ * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all.
+ *
+ * Three states, and they are different claims. Nothing written and no tool is "thinking…", which is
+ * what this said before and is still the honest answer while the daemon has nothing to show. A tool
+ * running is named, because "thinking" over a command that is compiling something is the wrong word
+ * for the wait. And words already written are shown as they arrive.
+ */
 function LiveAnswer({ turnId }: { turnId: number }) {
   const live = useLiveTurn(turnId, true);
   const text = live.data?.text ?? "";
@@ -1085,6 +1474,119 @@ function LiveAnswer({ turnId }: { turnId: number }) {
         {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
       </p>
     </>
+  );
+}
+
+/**
+ * The pictures a turn was sent with, drawn under what was typed.
+ *
+ * Fetched one at a time, by path, from the files route — the bytes are on disk under the daemon's
+ * own root and never on the transcript, so a conversation of forty turns costs forty short strings
+ * to read and only the pictures actually on screen to draw.
+ */
+function TurnPictures({ paths }: { paths: string[] }) {
+  if (paths.length === 0) return null;
+  return (
+    <ul className="chats-pictures" aria-label="Pictures sent with this message">
+      {paths.map((path) => (
+        <li key={path}>
+          <TurnPicture path={path} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * One picture, fetched as bytes and held as an object URL for as long as it is on screen.
+ *
+ * Not an `<img src>` pointed at the route: every request to the daemon carries a token, and a
+ * browser fetching an image never sends one. So the bytes come through the same door as everything
+ * else and become a URL this document owns — revoked on the way out, because an object URL nobody
+ * releases is a leak that lasts as long as the window does.
+ */
+function TurnPicture({ path }: { path: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [gone, setGone] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    let made: string | null = null;
+    void fetchFileBlob(path)
+      .then((blob) => {
+        if (!live) return;
+        made = URL.createObjectURL(blob);
+        setUrl(made);
+      })
+      .catch(() => {
+        if (live) setGone(true);
+      });
+    return () => {
+      live = false;
+      if (made !== null) URL.revokeObjectURL(made);
+    };
+  }, [path]);
+
+  // Said, not left blank: a picture that was sent and can no longer be read is a fact about the
+  // record, and an empty space where one was is indistinguishable from a turn that had none.
+  if (gone) return <p className="chats-picture-gone">a picture sent here can no longer be read</p>;
+  if (url === null) return <p className="chats-picture-gone">reading a picture…</p>;
+  return (
+    <>
+      {/* A button and not a bare image: opening one is an action, and an image that grows when
+          clicked without ever saying it could is a thing people find by accident. */}
+      <button
+        type="button"
+        className="chats-picture-open"
+        aria-label={`Open picture ${path}`}
+        onClick={() => setOpen(true)}
+      >
+        <img className="chats-picture" src={url} alt={`sent with this message: ${path}`} />
+      </button>
+      {open && <PictureOverlay url={url} path={path} onClose={() => setOpen(false)} />}
+    </>
+  );
+}
+
+/**
+ * One picture, filling the window, until it is dismissed.
+ *
+ * Escape closes it as well as the button, because a thing that covers the page and can only be left
+ * by finding a small target is a thing that traps people. The same object URL the thumbnail is
+ * already holding — fetching the bytes a second time to show the same picture larger would be
+ * paying twice for one file.
+ */
+function PictureOverlay({
+  url,
+  path,
+  onClose,
+}: {
+  url: string;
+  path: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="chats-picture-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Picture ${path}`}
+      onClick={onClose}
+    >
+      <img className="chats-picture-full" src={url} alt={path} />
+      <button type="button" className="chats-picture-close" aria-label="Close picture">
+        close
+      </button>
+    </div>
   );
 }
 
@@ -1185,6 +1687,13 @@ function WhatItDid({ did }: { did: ToolCall[] }) {
   );
 }
 
+/**
+ * The brain and restart marks a transcript draws above one turn.
+ *
+ * The brain mark's copy is deliberately asymmetric: moving *to* the cloud is about where what you
+ * type now goes, and moving *to* the local model is about where the answer comes from — the two
+ * directions are not mirror images of the same fact.
+ */
 function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "restart") {
     return (
@@ -1215,6 +1724,15 @@ const MESSAGE_SENTENCES: Record<string, string> = {
 };
 
 /**
+ * How many pictures one message may carry.
+ *
+ * The daemon's own ceiling, said again here so the window stops before the refusal rather than
+ * after it. A number duplicated across two codebases is one that drifts, and this one is worth the
+ * risk: the alternative is letting somebody attach nine screenshots and telling them at Send.
+ */
+const MAX_PICTURES = 5;
+
+/**
  * One thing the list can offer, whichever gesture opened it.
  *
  * A `@` and a `/` are the same move — type a sigil, narrow a list, choose — and the arrows, the
@@ -1236,8 +1754,19 @@ function Composer({ chatId }: { chatId: string }) {
   // opens it again rather than leaving somebody stuck with a feature they turned off.
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [highlight, setHighlight] = useState(0);
+  const [attached, setAttached] = useState<Attachment[]>([]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
+
+  // A picture is read here, in the window, and travels as base64 inside the message. Not as a path
+  // for the model to go and read: it is part of what was said, and the CLI takes it that way —
+  // measured, with a magenta square it correctly named.
+  const attach = async (files: FileList | File[] | null) => {
+    const pictures = Array.from(files ?? []).filter(isPicture);
+    if (pictures.length === 0) return;
+    const read = await Promise.all(pictures.map(attachmentFrom));
+    setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
+  };
 
   // Never both: a command is only ever the first character of the box, and a mention needs
   // whitespace before it, so a live `/` means everything up to the caret has no space in it and
@@ -1292,9 +1821,20 @@ function Composer({ chatId }: { chatId: string }) {
 
   // One place, two ways in: the button and the key. Duplicating the guards into the key handler is
   // how one of them ends up sending an empty turn six months from now.
+  // A picture on its own is a message: "what is this?" is a reasonable thing to send with nothing
+  // typed, and refusing it because the box is empty would be the window deciding what counts.
+  const sayable = (text.trim() !== "" || attached.length > 0) && !send.isPending;
   const say = () => {
-    if (text.trim() === "" || send.isPending) return;
-    send.mutate(text.trim(), { onSuccess: () => setText("") });
+    if (!sayable) return;
+    send.mutate(
+      { text: text.trim(), images: attached },
+      {
+        onSuccess: () => {
+          setText("");
+          setAttached([]);
+        },
+      },
+    );
   };
 
   return (
@@ -1318,10 +1858,40 @@ function Composer({ chatId }: { chatId: string }) {
           truncated={command === null && files.data?.truncated === true}
         />
       )}
+      {attached.length > 0 && (
+        <ul className="chats-attached" aria-label="Attached pictures">
+          {attached.map((picture, index) => (
+            <li key={`attached-${index}`} className="chats-attached-item">
+              <img
+                className="chats-attached-thumb"
+                alt={`attached picture ${index + 1}`}
+                src={`data:${picture.media_type};base64,${picture.data}`}
+              />
+              <button
+                type="button"
+                className="chats-attached-drop"
+                aria-label={`Remove attached picture ${index + 1}`}
+                onClick={() => setAttached((was) => was.filter((_, at) => at !== index))}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
       <label className="chats-field">
         <span>Message</span>
         <textarea
           ref={box}
+          // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
+          // anything that made you save it to a file first would be a step nobody takes.
+          onPaste={(event) => {
+            const pictures = Array.from(event.clipboardData.files).filter(isPicture);
+            if (pictures.length === 0) return;
+            // Only when there IS a picture: a plain text paste must stay a text paste.
+            event.preventDefault();
+            void attach(pictures);
+          }}
           rows={3}
           aria-label="Message"
           value={text}
@@ -1372,7 +1942,23 @@ function Composer({ chatId }: { chatId: string }) {
         />
       </label>
       <div className="chats-composer-actions">
-        <Button type="submit" intent="go" disabled={text.trim() === "" || send.isPending}>
+        {/* The way in for anything not on the clipboard. Hidden behind its own label because a bare
+            file input is the one control on this page nobody can style into the others. */}
+        <label className="chats-attach">
+          <span>Attach a picture</span>
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            aria-label="Attach a picture"
+            onChange={(event) => {
+              void attach(event.target.files);
+              // Cleared so the same file chosen twice in a row is heard the second time.
+              event.target.value = "";
+            }}
+          />
+        </label>
+        <Button type="submit" intent="go" disabled={!sayable}>
           Send
         </Button>
       </div>

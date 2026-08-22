@@ -13,7 +13,12 @@ import {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
+const daemon = vi.hoisted(() => ({
+  apiFetch: vi.fn(),
+  apiText: vi.fn(),
+  apiBlob: vi.fn(),
+  probeHealth: vi.fn(),
+}));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
   ...daemon,
@@ -22,7 +27,15 @@ vi.mock("../data/client", async (original) => ({
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { ChatSummary, Command, Conversation, IdeSession, Mention } from "../data/chats";
+import type {
+  Ask,
+  ChatProject,
+  ChatSummary,
+  Command,
+  Conversation,
+  IdeSession,
+  Mention,
+} from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
@@ -30,6 +43,8 @@ import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
+  daemon.apiBlob.mockReset();
+  daemon.apiBlob.mockResolvedValue(new Blob(["hello"], { type: "image/png" }));
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();
   daemon.probeHealth.mockResolvedValue(true);
@@ -66,6 +81,7 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     session_id: "s-1",
     created_at: "2026-08-18T09:00:00Z",
     did: [],
+    images: [],
     thought: [],
     thought_tokens: null,
     context_fill: null,
@@ -115,6 +131,18 @@ function chatsFetch(
     files?: Record<string, Mention[]>;
     /** The slash commands each conversation offers, by chat id. */
     commands?: Record<string, Command[]>;
+    /** What is waiting to be said to each conversation, by chat id. */
+    queued?: Record<string, Array<{ id: number; text: string }>>;
+    /** What each conversation is being held on, by chat id. */
+    asks?: Record<string, Ask[]>;
+    /**
+     * Where each conversation runs and whether that gives it tools, by chat id.
+     *
+     * Absent means "read it off the summary and assume the hook is wired", which is the ordinary
+     * case: a test that cares about a conversation with a directory and NO tools is testing that
+     * distinction and says so.
+     */
+    projects?: Record<string, ChatProject>;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -162,6 +190,22 @@ function chatsFetch(
       const query = decodeURIComponent(commands[2]).toLowerCase();
       return { commands: offered.filter((hit) => hit.name.toLowerCase().includes(query)) };
     }
+    const project = /^\/assistant\/chats\/([^/?]+)\/project$/.exec(path);
+    if (project !== null) {
+      const chatId = decodeURIComponent(project[1]);
+      const told = opts.projects?.[chatId];
+      if (told !== undefined) return told;
+      const row = chats.find((chat) => chat.chat_id === chatId);
+      return { cwd: row?.cwd ?? null, tools: row?.cwd != null, session: null, planning: false };
+    }
+    const wireChat = /^\/assistant\/chats\/([^/?]+)\/tools$/.exec(path);
+    if (wireChat !== null && init?.method === "POST") {
+      // What the daemon does: the hook goes into that conversation's project, and the next read
+      // says so.
+      const told = opts.projects?.[decodeURIComponent(wireChat[1])];
+      if (told !== undefined) told.tools = true;
+      return undefined;
+    }
     const files = /^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
     if (files !== null) {
       const offered = opts.files?.[decodeURIComponent(files[1])];
@@ -175,7 +219,12 @@ function chatsFetch(
     }
     const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
     if (match !== null) {
-      return { handed: opts.handed?.[match[1]] ?? [], turns: transcripts[match[1]] ?? [] };
+      return {
+        handed: opts.handed?.[match[1]] ?? [],
+        queued: opts.queued?.[match[1]] ?? [],
+        asks: opts.asks?.[match[1]] ?? [],
+        turns: transcripts[match[1]] ?? [],
+      };
     }
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
     return undefined;
@@ -379,6 +428,324 @@ describe("Chats - an empty list", () => {
 
     expect(await screen.findByRole("heading", { name: "No conversations yet" })).toBeDefined();
     expect(await screen.findByText(/Telegram/)).toBeDefined();
+  });
+});
+
+describe("Chats - planning without acting", () => {
+  // Every kind of run in this daemon could be put in `--permission-mode plan` except the kind a
+  // person is watching — which is the one where it matters most, because it is the mode you reach
+  // for before letting an agent near a codebase.
+  it("can be turned on, and says so to the daemon", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const toggle = await screen.findByLabelText(/plan only/i);
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "PATCH",
+      );
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({ plan_only: true });
+    });
+  });
+
+  it("shows a conversation that is already planning as planning", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              planning: true,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const toggle = await screen.findByLabelText(/plan only/i);
+    await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true));
+  });
+});
+
+describe("Chats - what is different in the project", () => {
+  // The question a person has after a coding turn. The transcript answers it with the name of a
+  // tool and a path, and to see what those did you had to leave the app.
+  it("shows the project's diff when asked, and not before", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "arranja isso", answer: "feito" })],
+      }),
+    );
+    daemon.apiText.mockResolvedValue(
+      "diff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-let velho = 1;\n+let novo = 2;\n",
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    // Walking a working tree is not something a panel does on arrival.
+    expect(screen.queryByLabelText("What is different")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /what is different in this project/i }));
+
+    const shown = await screen.findByLabelText("What is different");
+    expect(within(shown).getByText(/let novo = 2;/)).toBeTruthy();
+    expect(within(shown).getByText(/let velho = 1;/)).toBeTruthy();
+  });
+
+  // A clean tree is a real answer and not an empty box.
+  it("says so in words when nothing has changed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    daemon.apiText.mockResolvedValue("");
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    fireEvent.click(screen.getByRole("button", { name: /what is different in this project/i }));
+
+    expect(await screen.findByText(/nothing in this project has changed/i)).toBeTruthy();
+  });
+});
+
+describe("Chats - a conversation asking to be allowed something", () => {
+  // The wall this removes. The classifier sends everything not provably read-only for approval, and
+  // a conversation cannot park a proposal, so the answer used to be a refusal telling the person to
+  // go and do it somewhere else — with nowhere else to go.
+  it("shows what it wants to run, and sends the answer", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, asked: "publica isto", status: "running" })] },
+        { asks: { "c-1": [{ id: "ask-1", tool: "Bash", detail: "npm publish" }] } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const asking = await screen.findByRole("list", { name: "Waiting to be allowed" });
+    expect(within(asking).getByText("Bash")).toBeTruthy();
+    expect(within(asking).getByText("npm publish")).toBeTruthy();
+
+    fireEvent.click(within(asking).getByRole("button", { name: /allow it/i }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/asks/ask-1",
+      );
+      expect(sent).toBeDefined();
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({ allow: true });
+    });
+  });
+
+  it("sends a refusal when that is the answer", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, asked: "publica isto", status: "running" })] },
+        { asks: { "c-1": [{ id: "ask-1", tool: "Bash", detail: "npm publish" }] } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const asking = await screen.findByRole("list", { name: "Waiting to be allowed" });
+    fireEvent.click(within(asking).getByRole("button", { name: /refuse/i }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/asks/ask-1",
+      );
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({ allow: false });
+    });
+  });
+
+  // A question on every conversation would be a window nobody can read. Most turns ask nothing.
+  it("says nothing at all when nothing is being asked", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByRole("list", { name: "Waiting to be allowed" })).toBeNull();
+  });
+});
+
+/* ---------------------------------------------- a conversation with no project -- */
+
+describe("Chats - what a conversation without a project can do", () => {
+  // A conversation gets its working directory from the session it was picked up from, and there is
+  // no other way to get one — `cwd` is written once, at creation, from a pick-up. So a conversation
+  // started here has none, which means `tool_policy_for` answers `McpOnly`: no Bash, no Read, no
+  // Write, for as long as it exists.
+  //
+  // Nothing said so. You would ask it to fix a file, watch it not fix the file, and have nowhere to
+  // find out why — which is the same silence `NoTools` was written to end on the other side of the
+  // pick-up.
+  it("says what one started here cannot do, rather than letting somebody find out", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/cannot open a file/i)).toBeTruthy();
+  });
+
+  it("says nothing of the sort about one that has a project", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Waited on the transcript rather than on a word in it: what matters here is that the page has
+    // finished drawing, and a note that appears late would otherwise pass this by not existing yet.
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByText(/cannot open a file/i)).toBeNull();
+  });
+});
+
+describe("Chats - giving a conversation a project", () => {
+  // The other half of saying it. A conversation started here had no directory and no way to be
+  // given one, so the note was a diagnosis with no treatment.
+  it("offers a way to say which project it is about, and sends it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const field = await screen.findByLabelText(/project/i);
+    fireEvent.change(field, { target: { value: "C:/Projects/nucleos" } });
+    fireEvent.click(screen.getByRole("button", { name: /use this project/i }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "PATCH",
+      );
+      expect(sent).toBeDefined();
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({
+        cwd: "C:/Projects/nucleos",
+      });
+    });
+  });
+
+  // A directory is not the whole of it: the daemon grants tools on a directory whose classifier
+  // hook is wired, and every fresh worktree lacks one. Saying "it has a project" and stopping there
+  // would be true and misleading at once.
+  it("says when it has a project and still no tools, and offers to give it them", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        { projects: { "c-1": { cwd: "C:/Projects/fresh-worktree", tools: false, session: null, planning: false } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/cannot read or change any file/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /give it the tools/i }));
+
+    await waitFor(() => {
+      expect(
+        daemon.apiFetch.mock.calls.some(
+          (call) =>
+            String(call[0]) === "/assistant/chats/c-1/tools" && call[1]?.method === "POST",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  // The loop closes both ways and always did — the id simply appeared nowhere a person could read,
+  // which made the way back one only somebody who reads the daemon could find.
+  it("says how to carry the conversation on at a terminal", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: "sess-42", planning: false },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const carry = await screen.findByText(/claude --resume sess-42/);
+    expect(carry.textContent).toContain("C:/Projects/nucleos");
+  });
+
+  // A conversation the daemon would not resume itself offers nothing, rather than an id that leads
+  // somewhere it will not go.
+  it("offers no way back when the daemon would not resume it either", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByText(/claude --resume/)).toBeNull();
+  });
+
+  it("says none of it when the conversation has a project and the tools that come with it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByText(/cannot open a file/i)).toBeNull();
+    expect(screen.queryByText(/cannot read or change any file/i)).toBeNull();
+  });
+
+  // The daemon refuses a path that is not an absolute directory. A refusal that reached the person
+  // as nothing at all would leave them looking at a form that did not work and no reason why.
+  it("says so when the path is refused", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (String(path) === "/assistant/chats/c-1" && init?.method === "PATCH") {
+        throw new ApiRefusal(400, "bad_request", "Bad Request");
+      }
+      return chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      })(path, init);
+    });
+    await renderChats("/chats/c-1");
+
+    const field = await screen.findByLabelText(/project/i);
+    fireEvent.change(field, { target: { value: "not a real folder" } });
+    fireEvent.click(screen.getByRole("button", { name: /use this project/i }));
+
+    expect(await screen.findByText(/absolute path to a folder/i)).toBeTruthy();
   });
 });
 
@@ -602,6 +969,50 @@ describe("the editor's sessions, and the door to them", () => {
     expect(await screen.findByRole("button", { name: /arranja o parser de datas/i })).toBeTruthy();
   });
 
+  // Half of watching is the mark; the other half is that the list keeps up. The daemon re-reads the
+  // CLI's store on every request precisely because it changes while somebody types, and a door that
+  // asked once turned that live data back into a photograph.
+  it("follows the editor's sessions instead of photographing them once", async () => {
+    const { queryClient } = await openTheEditorDoor([ideSession()]);
+    await screen.findByRole("button", { name: /arranja o parser de datas/i });
+
+    const query = queryClient
+      .getQueryCache()
+      .find({ queryKey: keys.chats.ideSessions, exact: true });
+    if (query === undefined) throw new Error("the editor's sessions were never asked for");
+    // See the note in the transcript's own cadence test: `refetchInterval` lives on the observer's
+    // options, which is not what `Query.options` is typed as.
+    const interval = (query.options as { refetchInterval?: number | false }).refetchInterval;
+
+    expect(interval).toBe(POLL.fast);
+  });
+
+  // The list already carried the fact and nothing read it: a conversation somebody is typing into
+  // this second was drawn exactly like one from last Tuesday, so the door answered "which of these
+  // is live?" with a wall of identical rows.
+  it("says which of them is happening right now", async () => {
+    const now = Date.now();
+    await openTheEditorDoor([
+      ideSession({
+        session_id: "live-1",
+        title: "a mexer nisto agora",
+        last_activity: new Date(now - 10_000).toISOString(),
+      }),
+      ideSession({
+        session_id: "old-1",
+        title: "isto foi na terca",
+        last_activity: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
+      }),
+    ]);
+
+    const live = await screen.findByRole("button", { name: /a mexer nisto agora/i });
+    expect(within(live).getByText(/happening now/i)).toBeTruthy();
+
+    // And the one nobody is in says nothing, because a mark on every row is a mark on none.
+    const old = await screen.findByRole("button", { name: /isto foi na terca/i });
+    expect(within(old).queryByText(/happening now/i)).toBeNull();
+  });
+
   it("shows a sample and not the whole conversation, which does not fit in a picker", async () => {
     // The picker is a 20rem column. Drawing two hundred messages into it made the panel taller than
     // the page and spilled the preview out from under its own border.
@@ -781,6 +1192,236 @@ describe("where a subagent worked", () => {
     const row = note.closest("li") as HTMLElement;
     expect(within(row).queryByText("núcleo")).toBeNull();
     expect(row.className).toContain("aside");
+  });
+});
+
+describe("opening a picture", () => {
+  it("fills the window, and Escape leaves it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "que cor e esta?", answer: "magenta", images: ["chats/1-0.png"] }),
+        ],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open picture chats/1-0.png" }));
+
+    const shown = await screen.findByRole("dialog", { name: "Picture chats/1-0.png" });
+    expect(shown).toBeTruthy();
+
+    // A thing that covers the page and can only be left by finding a small target is a trap.
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Picture chats/1-0.png" })).toBeNull();
+    });
+  });
+});
+
+describe("taking a waiting message back", () => {
+  const waiting = () =>
+    chatsFetch(
+      [chatSummary({ chat_id: "c-1" })],
+      { "c-1": [turnRow({ id: 1, asked: "arranja", status: "running", answer: null })] },
+      { queued: { "c-1": [{ id: 7, text: "deixa estar" }] } },
+    );
+
+  it("asks the daemon to drop it by its own id", async () => {
+    daemon.apiFetch.mockImplementation(waiting());
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Do not send: deixa estar" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/queue/7", {
+        method: "DELETE",
+      });
+    });
+  });
+});
+
+/* -------------------------------------------------------------- pictures -- */
+
+describe("sending a picture", () => {
+  const picture = () =>
+    new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" });
+
+  const open = () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })],
+      }),
+    );
+    return renderChats("/chats/c-1");
+  };
+
+  it("attaches one and sends it inside the message", async () => {
+    await open();
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, { target: { files: [picture()] } });
+
+    // It is shown before it is sent: attaching and sending are two gestures, and a picture that
+    // vanished between them would leave nothing to say what is about to go.
+    const attached = await screen.findByRole("list", { name: "Attached pictures" });
+    expect(within(attached).getAllByRole("img")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/message",
+      );
+      expect(sent).toBeDefined();
+      const body = JSON.parse(String((sent?.[1] as RequestInit)?.body));
+      expect(body.images).toHaveLength(1);
+      expect(body.images[0].media_type).toBe("image/png");
+      // Base64, with no data-URL prefix left in it: a payload carrying one is valid base64 of the
+      // wrong bytes, and reaches the model as a picture that will not decode.
+      expect(String(body.images[0].data)).not.toContain("base64,");
+    });
+  });
+
+  // A picture on its own is a message. "what is this?" is a reasonable thing to send with nothing
+  // typed, and refusing it because the box is empty would be the window deciding what counts.
+  it("can be sent with nothing typed", async () => {
+    await open();
+
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, { target: { files: [picture()] } });
+
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(
+        false,
+      );
+    });
+  });
+
+  it("can be taken back off before it is sent", async () => {
+    await open();
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, { target: { files: [picture()] } });
+    await screen.findByRole("list", { name: "Attached pictures" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove attached picture 1" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("list", { name: "Attached pictures" })).toBeNull();
+    });
+  });
+
+  // Refused in the window rather than accepted, uploaded, and refused at the far end after the
+  // person has waited for it.
+  it("ignores a file the API could not carry", async () => {
+    await open();
+
+    const input = await screen.findByLabelText("Attach a picture");
+    fireEvent.change(input, {
+      target: { files: [new File([""], "notes.pdf", { type: "application/pdf" })] },
+    });
+
+    await screen.findByLabelText("Message");
+    expect(screen.queryByRole("list", { name: "Attached pictures" })).toBeNull();
+  });
+
+  // The bytes are on disk under the daemon's root and never on the transcript, so the window asks
+  // for them by path — through the same door as everything else, because an `<img src>` pointed at
+  // the daemon would carry no token.
+  it("draws what a turn was sent with, fetched by path", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "que cor e esta?", answer: "magenta", images: ["chats/1-0.png"] }),
+        ],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const sent = await screen.findByRole("list", { name: "Pictures sent with this message" });
+    await waitFor(() => {
+      expect(within(sent).getByRole("img")).toBeTruthy();
+    });
+    expect(daemon.apiBlob).toHaveBeenCalledWith("/files/download?path=chats%2F1-0.png");
+  });
+});
+
+/* --------------------------------------------------------------- sending -- */
+
+describe("sending a message from a conversation already on screen", () => {
+  // The optimistic write lands in the transcript's cache, and that cache stopped holding a bare
+  // array the day it started carrying what the conversation was handed. Writing the old shape into
+  // it does not fail a type check -- `setQueryData` is TOLD the shape -- it throws at runtime
+  // inside `merge`, on the one gesture the page exists for, and the message never appears.
+  //
+  // What this does NOT hold: that the write keeps the turns already drawn. Dropping them is
+  // repaired by the next poll, so it costs a flicker only a person sees. The assertion below is a
+  // cheap guard, not proof — checked by breaking it and watching this test stay green.
+  it("shows a message that was just sent, under the turns already drawn", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "arranja o parser", answer: "arranjado" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    // The transcript is on screen before anything is sent: this is the state the bug needs.
+    const turns = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(turns).getByText("arranja o parser")).toBeTruthy();
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "e os testes tambem", selectionStart: 18 } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(
+        daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/message"),
+      ).toBe(true);
+    });
+    // Both of them: the one that was there, and the one just sent.
+    const after = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(after).getByText("arranja o parser")).toBeTruthy();
+    await waitFor(() => {
+      expect(within(after).getByText("e os testes tambem")).toBeTruthy();
+    });
+  });
+});
+
+describe("what is waiting to be said", () => {
+  it("is drawn under the turns, marked as not sent yet", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 1, asked: "arranja o parser", status: "running", answer: null })] },
+        { queued: { "c-1": [{ id: 7, text: "e os testes tambem" }] } },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const waiting = await screen.findByRole("list", { name: "Waiting to be sent" });
+    expect(within(waiting).getByText("e os testes tambem")).toBeTruthy();
+    // Not a turn: no run exists, nothing is billed, and a bubble that looked like one would be
+    // claiming a turn nobody has paid for. It lives outside the transcript for exactly that reason.
+    const turns = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(turns).queryByText("e os testes tambem")).toBeNull();
+  });
+
+  it("says nothing at all when nothing is waiting", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByRole("list", { name: "Waiting to be sent" })).toBeNull();
   });
 });
 

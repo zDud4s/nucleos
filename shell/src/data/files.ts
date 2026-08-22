@@ -282,6 +282,17 @@ export function useDelete() {
  * `application/octet-stream`, always, and both of those would either fail to
  * parse it or silently mangle any byte that is not valid UTF-8.
  */
+/**
+ * One file's bytes, for a caller that wants to draw them rather than save them.
+ *
+ * The same door `downloadFile` goes through, and for the same reason: every request to the daemon
+ * carries a token, and a browser fetching an `<img src>` never sends one. So a picture reaches the
+ * page as bytes and becomes an object URL the document owns.
+ */
+export function fetchFileBlob(path: string): Promise<Blob> {
+  return apiBlob(`/files/download?path=${encodeURIComponent(path)}`);
+}
+
 export async function downloadFile(path: string): Promise<void> {
   const blob = await apiBlob(`/files/download?path=${encodeURIComponent(path)}`);
   const url = URL.createObjectURL(blob);

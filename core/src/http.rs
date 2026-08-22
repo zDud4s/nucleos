@@ -229,6 +229,27 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/chats/{chat_id}/commands",
             get(get_chat_commands),
         )
+        // Answering a question a turn is being held on. Under `assistant` and not under `hooks`
+        // because this is the person speaking, not the CLI: the hook's own half carries a run's key
+        // and lives beside the gate.
+        .route("/assistant/asks/{ask_id}", post(post_ask_answer))
+        // What is different in this conversation's project. On demand and never polled, for the
+        // reason the projects' own inspect readers give: re-asking it on a timer would walk
+        // somebody's working tree in the background forever.
+        .route("/assistant/chats/{chat_id}/diff", get(get_chat_diff))
+        // Where a conversation runs, and whether that gives it tools. Its own read because it is a
+        // filesystem question: answering it on the list would be a stat per conversation per poll,
+        // for rows nobody is looking at.
+        .route("/assistant/chats/{chat_id}/project", get(read_chat_project))
+        // The act that turns a conversation with a directory into one with tools. The same thing
+        // `wire_ide_session_tools` does before a pick-up, reached from the other side.
+        .route("/assistant/chats/{chat_id}/tools", post(wire_chat_tools))
+        // Taking back something that has not been sent. A segment deeper than the chat, and named
+        // for the thing it removes rather than for the chat it removes it from.
+        .route(
+            "/assistant/chats/{chat_id}/queue/{queued_id}",
+            delete(delete_queued),
+        )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
         .route("/assistant/{turn_id}", get(get_run))
@@ -462,6 +483,9 @@ pub fn build_router(state: AppState) -> Router {
             post(post_file_upload).layer(DefaultBodyLimit::max(crate::files::MAX_UPLOAD_BYTES)),
         )
         .route("/hooks/pretooluse-decision", post(pretooluse_decision))
+        // The blocking half of the same conversation. Beside the gate because it carries the same
+        // key and answers the same question, a moment later.
+        .route("/hooks/ask-wait", post(post_ask_wait))
         // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
         // construction rather than by a list: `permits` gives `Control` everything and answers every
         // other scope from an allowlist, so a route absent from all of them is reachable by the
@@ -760,6 +784,24 @@ struct AssistantMessageRequest {
     /// existed means too.
     #[serde(default)]
     origin: Option<String>,
+    /// Whether this caller would rather wait than be refused while a turn is already running.
+    ///
+    /// Opted into, never assumed. The Telegram sidecar gives up on a turn after a timeout and would
+    /// rather be told no than be answered ten minutes late into a conversation that has moved on;
+    /// the window in front of a person would rather keep the words. Absent means refuse, which is
+    /// what every caller written before this field existed expects.
+    #[serde(default)]
+    wait_if_busy: bool,
+    /// The pictures attached to this message. Empty for every caller that attaches none.
+    #[serde(default)]
+    images: Vec<ImageIn>,
+}
+
+/// One picture as the window sends it: base64, with the sender's claim about what it is.
+#[derive(Deserialize)]
+struct ImageIn {
+    media_type: String,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -1885,15 +1927,46 @@ async fn post_assistant_message(
     // two leaves a `running` assistant row with no task and no abort handle — `/assistant/{id}`
     // reports it running forever and `/cancel` answers 404. The Telegram sidecar is the caller, and
     // it gives up on a turn after a timeout, so the disconnect is routine rather than theoretical.
+    let wait = body.wait_if_busy;
     let outcome = uncancellable(async move {
         let origin = crate::assistant::Origin::from_wire(body.origin.as_deref());
-        crate::assistant::send_message(&state, &body.chat_id, &body.text, origin).await
+        // The window's shape becomes the runner's here, at the edge, so nothing inside the daemon
+        // has to know what a request body looks like.
+        let images: Vec<crate::runner::Attachment> = body
+            .images
+            .into_iter()
+            .map(|image| crate::runner::Attachment {
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect();
+        match wait {
+            true => {
+                crate::assistant::send_or_queue(&state, &body.chat_id, &body.text, &images, origin)
+                    .await
+            }
+            false => crate::assistant::send_message_with(
+                &state,
+                &body.chat_id,
+                &body.text,
+                &images,
+                origin,
+            )
+            .await
+            .map(crate::assistant::Sent::Turn),
+        }
     })
     .await
     .map_err(|status| refusal(status, "internal"))?;
 
     match outcome {
-        Ok(turn_id) => Ok(Json(serde_json::json!({ "turn_id": turn_id }))),
+        Ok(crate::assistant::Sent::Turn(turn_id)) => {
+            Ok(Json(serde_json::json!({ "turn_id": turn_id })))
+        }
+        // Not a turn id and not a refusal: the words were kept and will be sent without anybody
+        // pressing anything again. `queued` rather than a null id, because a caller has something
+        // different to do about each and a null says neither.
+        Ok(crate::assistant::Sent::Queued) => Ok(Json(serde_json::json!({ "queued": true }))),
         // Clears by waiting, which is what makes it the one refusal here that needs no gesture from
         // anybody — and what makes it dangerous to confuse with the one below.
         Err(msg) if msg == crate::assistant::TURN_IN_PROGRESS => {
@@ -3349,11 +3422,15 @@ async fn post_run_message(
     let Some(sender) = sender else {
         return Err(StatusCode::CONFLICT);
     };
-    // Raw text: framing a turn as a `stream-json` line is `runner.rs`'s job, because knowing the
-    // CLI's wire format is what that module is for. A second copy of that shape here would drift the
-    // day the format does.
+    // Raw text, and no pictures: framing a turn as a `stream-json` line is `runner.rs`'s job,
+    // because knowing the CLI's wire format is what that module is for, and a second copy of that
+    // shape here would drift the day the format does. This route takes a message and nothing else —
+    // the door that carries pictures is a conversation's, not a run's.
     sender
-        .send(body.message)
+        .send(crate::runner::LaterTurn {
+            text: body.message,
+            images: Vec::new(),
+        })
         .map_err(|_| StatusCode::CONFLICT)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -3434,6 +3511,10 @@ struct AssistantTurn {
     /// What the turn thought, as the JSON `thought` holds. Not serialized, for the reason above it.
     #[serde(skip)]
     thought: Option<String>,
+    /// Where the turn's pictures were kept, as the JSON `prompt_images` holds. Not serialized, for
+    /// the reason above it.
+    #[serde(skip)]
+    prompt_images: Option<String>,
     /// Roughly how many tokens the turn spent thinking, or null when it did not think and on every
     /// turn from before the column. Serialized as it stands: it is a number, not a private shape.
     thought_tokens: Option<i64>,
@@ -3450,6 +3531,11 @@ struct AssistantTurnOut {
     #[serde(flatten)]
     turn: AssistantTurn,
     did: Vec<crate::runner::ToolCall>,
+    /// The pictures this turn was sent with, as paths under the files root.
+    ///
+    /// Paths and not bytes, all the way to the window: it asks the files route for each one, which
+    /// means a transcript of forty turns costs forty short strings rather than forty screenshots.
+    images: Vec<String>,
     /// What the turn thought before it answered, oldest first.
     ///
     /// Empty both for a turn that thought nothing and for a turn from before the column. The two
@@ -3480,6 +3566,18 @@ struct TranscriptOut {
     /// is most of them, and empty rather than absent so a reader never has to branch on missing.
     handed: Vec<(String, String)>,
     turns: Vec<AssistantTurnOut>,
+    /// What was said to this conversation while it was busy, and has not been sent yet, each with
+    /// the name it can be taken back by.
+    ///
+    /// Here rather than on its own route because it belongs to the same picture and moves on the
+    /// same poll: the window draws it under the last turn, where the answer will land.
+    queued: Vec<crate::chats::Waiting>,
+    /// What this conversation is waiting to be allowed to do, which is nearly always nothing.
+    ///
+    /// Here for the reason `queued` is, and one more: this is polled at a turn's own cadence while a
+    /// turn is live, which is exactly when a question can appear — a route of its own would need a
+    /// second poll at the same speed to say "nothing" almost every time.
+    asks: Vec<crate::hooks::Ask>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -3555,7 +3653,241 @@ async fn get_chat_commands(
     Ok(Json(CommandsOut { commands }))
 }
 
-/// Names under this conversation's own working directory, for completing an `@`.
+/// What is different in a conversation's project, as `git diff` writes it.
+///
+/// The question a person has after a coding turn is "what changed", and answering it used to mean
+/// leaving the app: the transcript names the tool and the file and stops there.
+///
+/// **Not what the turn did, and never labelled as such.** The daemon takes no snapshot before a
+/// turn, so this is what is different NOW — the same thing after one turn, and not after three. The
+/// honest claim is the one this makes.
+///
+/// `inspect::diff` and not a `git diff` of its own: that one already turns off every setting a
+/// target repository could use to run a command string as the daemon user, and carries the deadline
+/// and output ceiling this needs for exactly the same reasons.
+async fn get_chat_diff(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<String, StatusCode> {
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation's project failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?
+        // 409 and not an empty answer. An empty diff is a claim — "nothing has changed" — and a
+        // conversation with no project is not in a position to make it.
+        .ok_or(StatusCode::CONFLICT)?;
+
+    let root = std::path::PathBuf::from(cwd);
+    tokio::task::spawn_blocking(move || inspect::diff(&root))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        // A directory that is not a repository has nothing to say, which is an empty answer rather
+        // than a refusal: the conversation is fine, its project simply is not under git.
+        .or_else(|error| match error {
+            inspect::InspectError::Io(_) => Ok(String::new()),
+            other => Err(inspect_status(other)),
+        })
+}
+
+/// What the window says when somebody answers for a held tool call.
+#[derive(serde::Deserialize)]
+struct AskAnswer {
+    allow: bool,
+}
+
+/// Answers a tool call a conversation is being held on.
+///
+/// 404 when there was nothing to answer, which covers both ways that happens: the window is a poll
+/// behind and the turn has moved on, or the question timed out while somebody was reading it. The
+/// same answer on purpose — the caller's next read tells them which.
+async fn post_ask_answer(
+    Path(ask_id): Path<String>,
+    Json(body): Json<AskAnswer>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::hooks::answer_ask(&ask_id, body.allow) {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// What the hook says while it waits.
+#[derive(serde::Deserialize)]
+struct AskWaitRequest {
+    run_id: i64,
+}
+
+/// Holds the hook's call open until somebody answers for this turn's tool call.
+///
+/// The one route here that is SUPPOSED to block. The CLI is sitting on a hook call, the model is
+/// sitting behind that, and a person is being asked a question — so the honest shape is a call that
+/// does not return until there is an answer or the window closes.
+///
+/// Refuses on every path that is not a clear yes: nobody answered, the question is gone, this run
+/// has none. A turn that cannot be allowed is refused, never allowed by default.
+async fn post_ask_wait(
+    Extension(scope): Extension<crate::auth::Scope>,
+    Json(body): Json<AskWaitRequest>,
+) -> Json<crate::hooks::Decision> {
+    // The key decides which turn this is, for the reason `pretooluse_decision` gives at length: the
+    // body is a claim, and a CLI kept alive across turns claims whatever it was spawned with.
+    let run_id = match scope {
+        crate::auth::Scope::Run(id) => id,
+        _ => body.run_id,
+    };
+
+    match crate::hooks::wait_for_run(run_id, crate::hooks::ASK_WINDOW).await {
+        Some(true) => Json(crate::hooks::Decision {
+            decision: "allow".to_owned(),
+            reason: "you allowed this".to_owned(),
+        }),
+        Some(false) => Json(crate::hooks::Decision {
+            decision: "deny".to_owned(),
+            reason: "you refused this".to_owned(),
+        }),
+        None => Json(crate::hooks::Decision {
+            decision: "deny".to_owned(),
+            reason: "nobody answered for this in time".to_owned(),
+        }),
+    }
+}
+
+/// Where a conversation runs, and whether that gives its turns tools.
+#[derive(serde::Serialize)]
+struct ChatProjectOut {
+    /// The project this conversation is about, or `null` for one that has none.
+    cwd: Option<String>,
+    /// The session a terminal standing in `cwd` could carry this conversation on in, or `null`.
+    ///
+    /// `claude --resume <this>` from that directory continues it — measured, with a word said only
+    /// to the daemon coming back out of the CLI. The way back was always there and nothing said so.
+    ///
+    /// `null` when the daemon itself would not resume it: a rotated conversation, or one that has
+    /// read a stranger's text. Offering an id the daemon has refused would be sending somebody
+    /// somewhere it will not go.
+    session: Option<String>,
+    /// Whether this conversation plans without acting.
+    ///
+    /// Beside the tools and not beside the title, because it is the same question in the other
+    /// direction: one says what this conversation CAN do, the other says what it will choose not to.
+    planning: bool,
+    /// Whether a turn here would actually get Bash, Read and Write.
+    ///
+    /// Not the same fact as having a directory, which is why both travel. `tool_policy_for` wants
+    /// the classifier hook wired in that directory too — every fresh worktree lacks it, since
+    /// `.claude/` is not committed — so a conversation pointed at one still cannot open a file, and
+    /// a window that reported only the directory would be telling the truth and misleading at once.
+    tools: bool,
+}
+
+/// Where a conversation runs, and whether that gives it tools.
+async fn read_chat_project(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<Json<ChatProjectOut>, StatusCode> {
+    // `opened_in` and not `cwd_of`, because the two absences are different answers: a chat that is
+    // not there is a 404, and one with no directory is a conversation this route has something to
+    // say about.
+    let opened_in = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation's project failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Read for both answers below, because a conversation with no directory can still be carried
+    // on somewhere — the terminal just has to be standing where it was had.
+    let session = crate::assistant::get_session(&state.pool, &chat_id)
+        .await
+        .unwrap_or(None);
+    let planning = crate::chats::plans_only(&state.pool, &chat_id)
+        .await
+        .unwrap_or(false);
+
+    let Some(cwd) = opened_in else {
+        return Ok(Json(ChatProjectOut {
+            cwd: None,
+            session,
+            planning,
+            tools: false,
+        }));
+    };
+
+    let dir = std::path::PathBuf::from(&cwd);
+    let wired =
+        tokio::task::spawn_blocking(move || crate::autopilot::classifier_hook_is_wired(&dir))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Asked of the same function the turn path asks, rather than restated here. A second copy of
+    // this rule would be a second thing to keep true, and the one that answers the window is the
+    // one that must agree with the one that launches the run.
+    let tools = crate::assistant::tool_policy_for(
+        Some(cwd.as_str()),
+        crate::assistant::Origin::Shell,
+        wired,
+    ) == crate::runner::ToolPolicy::Unrestricted;
+
+    Ok(Json(ChatProjectOut {
+        cwd: Some(cwd),
+        session,
+        planning,
+        tools,
+    }))
+}
+
+/// Wires the classifier hook in a conversation's project, which is what gives its turns tools.
+async fn wire_chat_tools(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation's project failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?
+        // Nothing to wire and nothing to guess. A silent success here would be this route reporting
+        // "done" about a directory nobody has named.
+        .ok_or(StatusCode::CONFLICT)?;
+
+    let dir = std::path::PathBuf::from(&cwd);
+    tokio::task::spawn_blocking(move || crate::autopilot::wire_classifier_hook(&dir))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            tracing::warn!(%error, cwd = %cwd, "could not wire a conversation's project");
+            StatusCode::CONFLICT
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Takes a message back off a conversation's queue before it is sent.
+///
+/// 404 when there was nothing to take, which covers both of the ways that happens: a message the
+/// drain sent a moment ago, and one that belongs to a different conversation. They are the same
+/// answer on purpose — a caller learning which of the two it was would be learning something about
+/// somebody else's queue.
+async fn delete_queued(
+    State(state): State<AppState>,
+    Path((chat_id, queued_id)): Path<(String, i64)>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::chats::drop_queued(&state.pool, &chat_id, queued_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, "taking a message off a queue failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Names under this conversation's own working directory, for completing an `@'`.
 ///
 /// The root comes from the chat's row and never from the caller. A route that took a directory
 /// would be a route that reads any directory — and there is nothing to gain by it: the only
@@ -3632,7 +3964,7 @@ async fn get_assistant_chat(
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
                 answered_by, session_id, created_at, context_fill, tools_used, thought,
-                thought_tokens
+                thought_tokens, prompt_images
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -3652,8 +3984,16 @@ async fn get_assistant_chat(
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
     // every ordinary conversation.
     let handed = crate::assistant::handed_over(&state.pool, &chat_id).await;
+    // Empty on a failure rather than a 500: the transcript is the point of this request, and a
+    // conversation nobody can read because its queue would not load is a worse answer than one
+    // drawn without a note about what is waiting.
+    let queued = crate::chats::queued(&state.pool, &chat_id)
+        .await
+        .unwrap_or_default();
     Ok(Json(TranscriptOut {
         handed,
+        queued,
+        asks: crate::hooks::asks_for(&chat_id),
         turns: turns
             .into_iter()
             .map(|turn| {
@@ -3667,9 +4007,15 @@ async fn get_assistant_chat(
                     .as_deref()
                     .and_then(|json| serde_json::from_str(json).ok())
                     .unwrap_or_default();
+                let images = turn
+                    .prompt_images
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
                 AssistantTurnOut {
                     turn,
                     did,
+                    images,
                     thought,
                     context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
                 }
@@ -4005,6 +4351,17 @@ async fn create_chat(
 struct PatchChatRequest {
     title: Option<String>,
     brain: Option<String>,
+    /// Whether this conversation plans without acting.
+    ///
+    /// The one mode a person reaches for before letting an agent touch a codebase, and the only
+    /// kind of run in this daemon that could not be put in it.
+    plan_only: Option<bool>,
+    /// The project this conversation is about, as an absolute path to a directory.
+    ///
+    /// The only way a conversation opened in the window ever gets tools: `tool_policy_for` grants
+    /// them on a directory plus a wired classifier hook, and without this there was no directory to
+    /// give it.
+    cwd: Option<String>,
 }
 
 /// Renames a conversation, changes which model answers it, or both.
@@ -4030,13 +4387,61 @@ async fn patch_chat(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    if let Some(brain) = body.brain.as_deref() {
-        // `answered_by` is written when a turn's row is born, so moving the brain under a live turn
-        // would make that column lie about who answered it. 409 rather than a queue: the same
-        // answer `POST /assistant/message` gives for the same reason.
-        if crate::assistant::is_busy(&chat_id) {
-            return Err(StatusCode::CONFLICT);
+    // All three move something a turn in flight is already using, and nothing else records any of
+    // them. `answered_by` is written when a turn's row is born, so changing the brain under a live
+    // turn makes that column lie about who answered it; the chat's `cwd` is the ONLY record of where
+    // a turn ran — the assistant path never writes `runs.cwd` — so moving it under a live turn makes
+    // the row the wrong answer to "where did this happen". 409 rather than a queue: the same answer
+    // `POST /assistant/message` gives for the same reason.
+    //
+    // A rename moves neither and is left alone.
+    if (body.brain.is_some() || body.cwd.is_some() || body.plan_only.is_some())
+        && crate::assistant::is_busy(&chat_id)
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    if let Some(cwd) = body.cwd.as_deref() {
+        // Absolute, and a directory that is there. Checked HERE rather than at the first turn: a
+        // conversation pointed at a typo would look exactly like one pointed at a project until
+        // somebody asked it to read a file, and the answer would arrive as a model's confusion
+        // rather than as a refusal anybody could act on.
+        //
+        // Absolute because a relative path would be resolved against the DAEMON's working
+        // directory, which is not a place the caller knows or meant. Stored as given rather than
+        // canonicalised: on Windows a canonical path carries a `\\?\` prefix that a raw one does
+        // not, and this string is handed to the CLI as its working directory and compared against a
+        // living process's own.
+        let path = std::path::Path::new(cwd);
+        let is_directory = tokio::fs::metadata(path)
+            .await
+            .map(|found| found.is_dir())
+            .unwrap_or(false);
+        if !path.is_absolute() || !is_directory {
+            return Err(StatusCode::BAD_REQUEST);
         }
+
+        crate::chats::set_cwd(&state.pool, &chat_id, cwd)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "pointing a conversation at a project failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // For the reason the brain does, and one more. The CLI keeps its transcripts as
+        // `<root>/<project>/<session>.jsonl` — one directory per project — so a session had in one
+        // tree is not somewhere a run in another tree would look for it. And its context is about
+        // the old tree regardless: continuing it here would answer questions about this project out
+        // of the last one's files.
+        crate::assistant::forget_session(&state.pool, &chat_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "forgetting a moved conversation's session failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(brain) = body.brain.as_deref() {
         crate::chats::set_brain(&state.pool, &chat_id, crate::chats::Brain::from_wire(brain))
             .await
             .map_err(|error| {
@@ -4047,6 +4452,15 @@ async fn patch_chat(
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "forgetting a chat's session failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(planning) = body.plan_only {
+        crate::chats::set_plan_only(&state.pool, &chat_id, planning)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing whether a conversation plans failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }
@@ -9037,6 +9451,455 @@ mod tests {
             .status()
     }
 
+    /// What is different in a conversation's project, read from the conversation.
+    ///
+    /// The question a person has after a coding turn is "what changed", and until now answering it
+    /// meant leaving the app: `WhatItDid` names the tool and the file and stops there. This is the
+    /// project's own `git diff`, which is the honest answer to that question for a working tree
+    /// nobody has committed yet.
+    ///
+    /// Deliberately NOT labelled as what the turn did. The daemon takes no snapshot, so what a
+    /// reader gets is what is different NOW — which is the same thing after one turn and is not
+    /// after three.
+    #[tokio::test]
+    async fn what_is_different_in_a_conversations_project_can_be_read_from_the_conversation() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}/diff"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A directory that is not a repository has nothing to say, which is an empty answer rather
+        // than a refusal: the conversation is fine, its project simply is not under git.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A conversation with no project has no working tree to be different from.
+    ///
+    /// 409 and not an empty diff: an empty diff is a claim — "nothing has changed" — and this
+    /// conversation is not in a position to make it.
+    #[tokio::test]
+    async fn a_conversation_with_no_project_has_no_diff_to_show() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}/diff"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// A held tool call is released by the window, and the hook is told what the person said.
+    ///
+    /// The whole shape end to end: the gate says `asking` and returns at once, the hook comes back
+    /// to wait, the window answers, and the waiting call is what carries that answer to the CLI. It
+    /// is the one route in this daemon that is supposed to block, so the test blocks too.
+    #[tokio::test]
+    async fn a_held_tool_call_is_released_by_the_window() {
+        for (allowed, expected) in [(true, "allow"), (false, "deny")] {
+            let state = test_state().await;
+            let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+                .await
+                .unwrap();
+            // An id of its own, and not the one this pool would hand out. Every test has its own
+            // in-memory database, so every one would call its first run `1` — while the ask
+            // registry is a single process-wide map, exactly as it is in the daemon. Passed alone
+            // this test is right either way; run beside the others it borrows their questions.
+            static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(80_000);
+            let run_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, mode, chat_id, created_at)
+                 VALUES (?, 'x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(&chat_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            let key = crate::auth::mint_chat_token(&state.pool, &chat_id)
+                .await
+                .unwrap();
+            let ask_id =
+                crate::hooks::ask_about(&chat_id, run_id, "Bash", Some("npm publish".into()));
+
+            // The hook, sitting on its call.
+            let waiting = tokio::spawn({
+                let state = state.clone();
+                let key = key.clone();
+                async move {
+                    let response = build_router(state)
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/hooks/ask-wait")
+                                .header("Authorization", format!("Bearer {key}"))
+                                .header("content-type", "application/json")
+                                .body(Body::from(format!(r#"{{"run_id":{run_id}}}"#)))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    json_body(response).await
+                }
+            });
+
+            // The person, a moment later.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let answered = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/assistant/asks/{ask_id}"))
+                        .header("Authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"allow":{allowed}}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(answered.status(), StatusCode::NO_CONTENT);
+
+            let decision = waiting.await.unwrap();
+            assert_eq!(decision["decision"], expected);
+        }
+    }
+
+    /// Answering a question that is no longer there is a 404 and not a silent success.
+    ///
+    /// It happens both ways round — the window is a poll behind and the turn moved on, or the
+    /// question timed out while somebody was reading it — and a `204` over nothing would be the API
+    /// saying "done" about a tool call that was refused a moment earlier.
+    #[tokio::test]
+    async fn answering_a_question_that_is_gone_says_so() {
+        let state = test_state().await;
+
+        let answered = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/asks/no-such-question")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"allow":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answered.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A conversation says how to carry it on somewhere else.
+    ///
+    /// MEASURED, and it was the measurement that made this worth adding: a conversation the daemon
+    /// had with `--session-id <uuid>` in a directory really can be picked up from a terminal
+    /// standing there — `claude --resume <uuid>` answered with a word said only to the daemon. The
+    /// loop closes in both directions and always did.
+    ///
+    /// What was missing was anybody being told. The session id lives in `assistant_sessions` and
+    /// appeared nowhere a person could read, so the way back existed and could not be found.
+    ///
+    /// `get_session` and not the raw column: it is the id the daemon ITSELF would resume, so a
+    /// conversation it has refused to resume — rotated, or having read a stranger's text — offers
+    /// nothing rather than an id that would carry somebody somewhere the daemon would not go.
+    #[tokio::test]
+    async fn a_conversation_says_the_session_it_could_be_carried_on_in() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let before = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert!(
+            before["session"].is_null(),
+            "a conversation nobody has spoken to resumes nowhere"
+        );
+
+        crate::assistant::upsert_session(
+            &state.pool,
+            &chat_id,
+            "a-session",
+            "2026-08-21T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let after = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert_eq!(after["session"], "a-session");
+    }
+
+    /// A conversation says where it is and whether that actually gives it tools.
+    ///
+    /// The two are not the same fact and the window needs both. A directory alone is `McpOnly` —
+    /// `tool_policy_for` wants the classifier hook wired in it too — so a conversation pointed at a
+    /// fresh worktree still cannot open a file, and saying "this one has a project" would be true
+    /// and misleading in the same breath.
+    ///
+    /// Its own read rather than a field on the list: this is a filesystem question, and answering it
+    /// for every conversation on every poll would be a stat per row per three seconds for rows
+    /// nobody is looking at.
+    #[tokio::test]
+    async fn a_conversation_says_where_it_is_and_whether_that_gives_it_tools() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let before = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert_eq!(before["cwd"], root.path().to_str().unwrap());
+        assert_eq!(before["tools"], false);
+
+        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+
+        let after = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert_eq!(after["tools"], true);
+    }
+
+    /// A conversation with no project says so as an absence rather than as an empty string, because
+    /// the window says different things about the two and one of them is a whole panel.
+    #[tokio::test]
+    async fn a_conversation_with_no_project_says_it_has_none() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let body = json_body(project_request(state.clone(), &chat_id).await).await;
+
+        assert!(body["cwd"].is_null());
+        assert_eq!(body["tools"], false);
+    }
+
+    /// Wiring a conversation's project is what turns it from talk into tools.
+    ///
+    /// The same act `wire_ide_session_tools` performs before a pick-up, reached the other way round:
+    /// there it is a session that has a directory, here it is a conversation that was given one.
+    #[tokio::test]
+    async fn wiring_a_conversations_project_gives_its_next_turn_tools() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(!crate::autopilot::classifier_hook_is_wired(root.path()));
+
+        let status = wire_tools_request(state.clone(), &chat_id).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(crate::autopilot::classifier_hook_is_wired(root.path()));
+    }
+
+    /// A conversation with no project has nothing to wire, and is told that rather than being given
+    /// a silent success over a directory nobody named.
+    #[tokio::test]
+    async fn a_conversation_with_no_project_has_nothing_to_wire() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wire_tools_request(state, &chat_id).await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    async fn project_request(state: AppState, chat_id: &str) -> axum::response::Response {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}/project"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn wire_tools_request(state: AppState, chat_id: &str) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{chat_id}/tools"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A conversation can be told which project it is about, which is the only way one started here
+    /// ever gets tools.
+    ///
+    /// `chats.cwd` had exactly one writer — the pick-up, at creation — so a conversation opened in
+    /// the window had no directory and `tool_policy_for` answered `McpOnly` for as long as it
+    /// existed. No Bash, no Read, no Write, and no way to change that short of starting again from
+    /// a session that happened to exist in the right folder.
+    #[tokio::test]
+    async fn a_conversation_can_be_told_which_project_it_is_about() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(
+            state.clone(),
+            &chat_id,
+            &serde_json::json!({ "cwd": root.path().to_str().unwrap() }).to_string(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let stored = crate::chats::cwd_of(&state.pool, &chat_id).await.unwrap();
+        assert_eq!(stored.as_deref(), root.path().to_str());
+    }
+
+    /// Moving a conversation forgets the session it was on, for the reason changing its model does
+    /// and one more.
+    ///
+    /// The CLI keeps its transcripts as `<root>/<project>/<session>.jsonl` — one directory per
+    /// project — so a session had in one tree is not somewhere a run in another tree would look.
+    /// And the context of that session is about the old tree anyway: continuing it after a move
+    /// would answer questions about this project out of the last one's files.
+    #[tokio::test]
+    async fn moving_a_conversation_forgets_the_session_it_was_having_elsewhere() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::upsert_session(
+            &state.pool,
+            &chat_id,
+            "a-session-had-elsewhere",
+            "2026-08-20T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        let status = patch_chat_request(
+            state.clone(),
+            &chat_id,
+            &serde_json::json!({ "cwd": root.path().to_str().unwrap() }).to_string(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            crate::assistant::get_session(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A path that is not a directory is refused, and the conversation is left where it was.
+    ///
+    /// Refused HERE rather than at the first turn: a conversation pointed at a typo would look
+    /// exactly like one pointed at a project until somebody asked it to read a file, and the answer
+    /// would arrive as a model's confusion rather than as the daemon's refusal.
+    #[tokio::test]
+    async fn a_conversation_is_not_pointed_at_something_that_is_not_a_directory() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let file = root.path().join("notes.txt");
+        std::fs::write(&file, "not a directory").unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        for bad in [
+            file.to_str().unwrap().to_owned(),
+            root.path()
+                .join("nothing-here")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            String::new(),
+        ] {
+            let status = patch_chat_request(
+                state.clone(),
+                &chat_id,
+                &serde_json::json!({ "cwd": bad }).to_string(),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} was accepted");
+            assert!(
+                crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{bad} moved the conversation anyway"
+            );
+        }
+    }
+
+    /// A conversation is not moved while it is answering.
+    ///
+    /// Nothing records where a turn ran except the chat's own row — `runs` has a `cwd` column and
+    /// the assistant path does not write it — so moving the row under a turn in flight makes it the
+    /// wrong answer to "where did this run". The same lie `answered_by` would tell if the model
+    /// changed mid-turn, and refused for the same reason.
+    #[tokio::test]
+    async fn a_conversation_is_not_moved_while_it_is_answering() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let _busy = crate::assistant::take_the_slot_for_testing(&chat_id);
+
+        let status = patch_chat_request(
+            state.clone(),
+            &chat_id,
+            &serde_json::json!({ "cwd": root.path().to_str().unwrap() }).to_string(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn changing_the_brain_forgets_the_session_the_other_model_left_behind() {
         let state = test_state().await;
@@ -9526,6 +10389,156 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Typing while it works keeps the words, for a caller that said it could wait.
+    #[tokio::test]
+    async fn a_message_sent_to_a_busy_conversation_is_kept_when_the_caller_can_wait() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &chat_id,
+            "arranja o parser",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "chat_id": chat_id,
+                            "text": "e os testes tambem",
+                            "wait_if_busy": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["queued"], true);
+        // And no turn id was invented for something that is not a turn yet.
+        assert!(body["turn_id"].is_null());
+    }
+
+    /// A caller that said nothing about waiting is still refused, exactly as it was.
+    #[tokio::test]
+    async fn a_message_sent_to_a_busy_conversation_is_refused_when_nobody_asked_to_wait() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &chat_id,
+            "arranja o parser",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "chat_id": chat_id, "text": "e os testes" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// What waits reaches the window, or nothing on screen says the words were kept.
+    #[tokio::test]
+    async fn a_transcript_carries_what_is_still_waiting_to_be_said() {
+        let state = test_state().await;
+        crate::chats::enqueue(&state.pool, "waiting", "e os testes tambem", "shell", "[]")
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/waiting")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["queued"][0]["text"], "e os testes tambem");
+        // Named, so it can be taken back: a position would mean something different the moment the
+        // drain sends whatever is in front of it.
+        assert!(body["queued"][0]["id"].is_i64());
+    }
+
+    /// Taking back a message that has not been sent, and being told when there was nothing to take.
+    #[tokio::test]
+    async fn a_message_can_be_taken_back_off_the_queue_before_it_is_sent() {
+        let state = test_state().await;
+        crate::chats::enqueue(&state.pool, "waiting", "deixa estar", "shell", "[]")
+            .await
+            .unwrap();
+        let id = crate::chats::queued(&state.pool, "waiting").await.unwrap()[0].id;
+
+        let taken = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assistant/chats/waiting/queue/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(taken.status(), StatusCode::NO_CONTENT);
+        assert!(
+            crate::chats::queued(&state.pool, "waiting")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // And again, on the same id: the drain may have sent it a moment ago, which is the same
+        // answer as it never having been this conversation's.
+        let again = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assistant/chats/waiting/queue/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    }
+
     /// A conversation offers the commands in its own directory, by the name they are typed as.
     ///
     /// Asked of the CLI before any of it was built: `claude -p "/thing"` EXPANDS the command rather
@@ -9663,6 +10676,34 @@ mod tests {
 
         let body = json_body(response).await;
         assert_eq!(body["handed"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// The pictures reach the window, or a conversation shows a question about one nobody can see.
+    #[tokio::test]
+    async fn a_transcript_says_which_pictures_a_turn_was_sent_with() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, stdout, prompt_images, created_at)
+             VALUES ('que cor e esta?', 'completed', 'assistant', 'pictured', 'magenta', ?, '2026-08-20T10:00:00Z')",
+        )
+        .bind(r#"["chats/7-0.png"]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/pictured")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        assert_eq!(body["turns"][0]["images"][0], "chats/7-0.png");
     }
 
     /// The measurement reaches the window, or the column that stores it is write-only.
@@ -11402,7 +12443,10 @@ mod tests {
         status: &str,
         mode: &str,
         steerable: bool,
-    ) -> (i64, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    ) -> (
+        i64,
+        tokio::sync::mpsc::UnboundedReceiver<crate::runner::LaterTurn>,
+    ) {
         let run_id = sqlx::query(
             "INSERT INTO runs (prompt, status, mode, steerable, created_at)
              VALUES ('keep working', ?, ?, ?, '2026-07-30T00:00:00Z')",
@@ -11561,9 +12605,13 @@ mod tests {
             .try_recv()
             .expect("an accepted steer must reach the run");
         assert!(
-            delivered.contains(STEERING_MESSAGE),
-            "the run must receive what was sent: {delivered}"
+            delivered.text.contains(STEERING_MESSAGE),
+            "the run must receive what was sent: {}",
+            delivered.text
         );
+        // This door takes a message and nothing else — the one that carries pictures belongs to a
+        // conversation, not to a run.
+        assert!(delivered.images.is_empty());
     }
 
     /// A preset records WHAT to run, never who may speak into the run afterwards — `run_presets` has
@@ -11629,8 +12677,8 @@ mod tests {
             _transcript: Arc<std::sync::Mutex<String>>,
         ) -> std::io::Result<crate::runner::RunOutcome> {
             if let Some(messages) = request.messages.as_mut() {
-                while let Some(text) = messages.recv().await {
-                    self.heard.lock().unwrap().push(text);
+                while let Some(turn) = messages.recv().await {
+                    self.heard.lock().unwrap().push(turn.text);
                 }
             }
             Ok(crate::runner::RunOutcome {

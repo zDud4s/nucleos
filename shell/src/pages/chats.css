@@ -183,6 +183,147 @@
  * `paused` and not `danger`: nothing is broken and nothing is about to go wrong. It is a session
  * that will continue with less than you would expect, and the button beside it is the fix.
  */
+/* What is different in this conversation's project, closed until asked. */
+.chats-changed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.chats-changed-toggle {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.chats-changed-clean {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-diff {
+  max-height: 24rem;
+  overflow: auto;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  white-space: pre;
+}
+
+.chats-diff-added {
+  color: var(--tone-go-text, #2f7d43);
+}
+
+.chats-diff-removed {
+  color: var(--tone-stop-text, #a33a3a);
+}
+
+/* The lines that say WHERE rather than WHAT: file names and hunk headers, faint so the eye goes to
+   the content between them. */
+.chats-diff-meta {
+  color: var(--text-faint);
+}
+
+/* A tool call this conversation is being held on. Drawn where the next thing would have
+   appeared, and not tucked away: a turn is stopped while this stands, and the daemon refuses on its
+   own in about forty-five seconds. */
+.chats-asking {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--tone-attention-border, var(--tone-paused-border));
+  border-radius: var(--radius-md);
+  background: var(--tone-attention-bg, var(--tone-paused-bg));
+  list-style: none;
+}
+
+.chats-asking-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.chats-asking-detail {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.chats-asking-answer {
+  display: flex;
+  gap: var(--space-2);
+}
+
+/* What a conversation can do, said in the conversation itself. The same frame as the editor door's
+   warning, because it is the same situation reached from the other side. */
+.chats-project {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+}
+
+.chats-project-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.chats-project-path {
+  flex: 1 1 18rem;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* Answering with a plan and changing nothing. Beside the brain picker, because both are choices
+   about how this conversation answers. */
+.chats-planning {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* The way back to a terminal, which existed long before anything said so. */
+.chats-project-carry {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.chats-project-command {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* The quiet half: a conversation that has what it needs says where it is and nothing else, so
+   pressing the button leaves proof rather than silence. */
+.chats-project-where {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
 .chats-new-notools {
   display: flex;
   flex-direction: column;
@@ -511,6 +652,20 @@
   font-size: var(--text-xs);
   color: var(--text-faint);
   overflow-wrap: anywhere;
+}
+
+/* A conversation somebody is in the middle of having, right now. Words and not a coloured dot: a
+   dot means whatever the reader guesses, and the whole point of this mark is to say a thing that
+   was previously unsayable from the list. */
+.chats-editor-live {
+  align-self: flex-start;
+  margin-top: 0.25rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft, rgba(120, 200, 140, 0.16));
+  color: var(--accent, #4c9a63);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
 }
 
 .chats-editor-chosen {
@@ -877,4 +1032,192 @@
 .chats-mentions-cut {
   margin: 0;
   background: none;
+}
+
+/* What was said while it was busy and has not been sent yet.
+ *
+ * Deliberately unlike a turn: no ground of its own, dashed down the side, and quieter than either
+ * speaker. A turn is a run — it has an id and a cost — and these have neither. */
+.chats-waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-waiting-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border-left: 2px dashed var(--border);
+}
+
+.chats-waiting-who {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.chats-waiting-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* Pictures on their way out, above the box. Small: they are a reminder of what is attached, not a
+ * viewer, and a full-size screenshot here would push the box off the panel. */
+.chats-attached {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-attached-item {
+  position: relative;
+}
+
+.chats-attached-thumb {
+  display: block;
+  width: 4rem;
+  height: 4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+}
+
+.chats-attached-drop {
+  position: absolute;
+  top: -0.4rem;
+  right: -0.4rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* The file input itself is the one control here nobody can style into the others, so it is hidden
+ * and its label carries the whole button. */
+.chats-attach {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.chats-attach input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.chats-attach:hover {
+  color: var(--text-muted);
+}
+
+/* Pictures a turn was sent with, under what was typed. Bounded so a tall screenshot does not turn
+ * one turn into the whole page. */
+.chats-pictures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.chats-picture {
+  display: block;
+  max-width: 18rem;
+  max-height: 14rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  object-fit: contain;
+}
+
+/* Said rather than left blank: an empty space where a picture was reads as a turn that had none. */
+.chats-picture-gone {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-style: italic;
+}
+
+/* Taking a waiting message back. Quiet: it is an escape hatch, not the thing to reach for. */
+.chats-waiting-drop {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.chats-waiting-drop:hover:not(:disabled) {
+  color: var(--tone-warn-fg);
+}
+
+.chats-waiting-drop:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* A picture opens. The button carries no chrome of its own — the image IS the target. */
+.chats-picture-open {
+  display: block;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: zoom-in;
+}
+
+.chats-picture-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: rgb(0 0 0 / 0.82);
+  cursor: zoom-out;
+}
+
+.chats-picture-full {
+  max-width: 100%;
+  max-height: 85vh;
+  object-fit: contain;
+}
+
+.chats-picture-close {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  cursor: pointer;
 }

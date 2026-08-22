@@ -145,6 +145,12 @@ pub struct RunRequest {
     pub session_id: Option<String>,
     pub fork_session: bool,
     pub include_partial_messages: bool,
+    /// Pictures travelling with this run's opening turn. Empty for every run that carries none.
+    ///
+    /// Only ever read on the stdin path: an argument vector holds a string and there is nowhere in
+    /// it for bytes to go. A run given images and not `steerable` would silently drop them, so the
+    /// two are decided together at the one place that builds a turn with a picture in it.
+    pub images: Vec<Attachment>,
     /// Whether this run's turns arrive on stdin instead of in its argument vector.
     ///
     /// The opt-in is made once, here, because it decides the shape of the launch and cannot be
@@ -173,7 +179,7 @@ pub struct RunRequest {
     /// `None` beside `steerable: true` is a real state, not an oversight: the prompt still travels
     /// stdin as a `user` line, and stdin then closes, which is exactly the one-turn run the argv path
     /// performs. What it costs is the ability to say anything more.
-    pub messages: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    pub messages: Option<tokio::sync::mpsc::UnboundedReceiver<LaterTurn>>,
     /// Whether this run opts in to the operator's ambient MCP surface.
     ///
     /// `false` everywhere today, and that is the point: the strict default closes the exfiltration
@@ -202,16 +208,73 @@ pub struct RunRequest {
     pub allowed_mcp_tools: Option<&'static [&'static str]>,
 }
 
+/// A picture travelling with a turn, as the API carries one.
+///
+/// Base64 rather than bytes, because base64 is what goes on the wire in both directions: it arrives
+/// that way from the window and leaves that way to the CLI, and decoding in between would be work
+/// done only to be undone.
+///
+/// `media_type` is the sender's claim about what these bytes are, and it is passed on as a claim.
+/// Nothing here sniffs the content: a run reading a picture is reading it either way, and a daemon
+/// that second-guessed the label would be deciding on behalf of a model that can see the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// A turn arriving after the one a run was launched with.
+///
+/// Text AND pictures, because for a conversation that keeps its process every turn after the first
+/// is one of these — and a screenshot pasted into the second is the same kind of thing as one
+/// attached to the first. It was a bare `String` while this channel existed only for the queue
+/// drain, where a later turn really was text somebody typed while waiting; a conversation that keeps
+/// its CLI had to give the CLI up the moment anybody pasted an image, which is exactly when a coding
+/// conversation is most alive.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LaterTurn {
+    pub text: String,
+    /// Empty for almost every turn, and the reason this is a struct rather than a `String`.
+    pub images: Vec<Attachment>,
+}
+
 /// One line of `--input-format stream-json` stdin: a single user turn.
 ///
 /// Measured against CLI 2.1.198, this shape is accepted and the run proceeds — the `init` event fires
 /// and the process exits 0. Built through `serde_json` rather than `format!` because a turn is
 /// delimited by a newline: a prompt containing one, or a quote, would otherwise arrive as two
 /// half-parsed lines instead of the single instruction it is.
-pub(crate) fn user_message_line(text: &str) -> String {
+pub(crate) fn user_message_line(text: &str, images: &[Attachment]) -> String {
+    // A plain string when there is nothing to carry, and that is not tidiness: the string form is
+    // the one measured working, and every run in this daemon that is not a chat uses it. Rewriting
+    // them all as arrays to make one new case uniform would change what is proven to make room for
+    // what is not.
+    //
+    // An array when there is. The image comes first and the words after — the order the API
+    // documents for a question about a picture, and the order a person types in.
+    let content = match images.is_empty() {
+        true => serde_json::Value::String(text.to_string()),
+        false => {
+            let mut blocks: Vec<serde_json::Value> = images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        },
+                    })
+                })
+                .collect();
+            blocks.push(serde_json::json!({ "type": "text", "text": text }));
+            serde_json::Value::Array(blocks)
+        }
+    };
     let mut line = serde_json::json!({
         "type": "user",
-        "message": { "role": "user", "content": text },
+        "message": { "role": "user", "content": content },
     })
     .to_string();
     line.push('\n');
@@ -581,7 +644,7 @@ const DETAIL_LIMIT: usize = 120;
 /// A fixed list of keys tried in order, rather than "the first string in the object": the input
 /// keys belong to the tools, and an unknown tool would otherwise contribute whichever field
 /// happened to be ordered first — a different answer between two runs of the same call.
-fn detail_of(input: &serde_json::Value) -> Option<String> {
+pub(crate) fn detail_of(input: &serde_json::Value) -> Option<String> {
     // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
     // and a tool that also says where it acted must answer with that instead. A key ordered above
     // it would make the sentence a model wrote win over the file it opened.
@@ -814,6 +877,118 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
 ///
 /// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
 /// result event itself; the token counts live under its `usage` object.
+/// The processes kept alive between a conversation's turns, held so the kernel takes them down if
+/// this daemon goes without getting the chance to.
+///
+/// A `Litter` and not a `TreeKiller`: the two are the same primitive with opposite flags, and this
+/// is the one whose promise survives the daemon being killed rather than asked to stop.
+static KEPT_ALIVE: std::sync::LazyLock<crate::process_tree::Litter> =
+    std::sync::LazyLock::new(crate::process_tree::Litter::new);
+
+/// One turn's own numbers, out of a process that may answer more than once.
+///
+/// `RunOutcome` describes a PROCESS — its exit code, its whole stdout, everything it spent. This
+/// describes one answer inside it, which is the unit a conversation is billed and recorded by. The
+/// two coincide exactly as long as a process serves one turn, and stop coinciding the moment one
+/// serves two.
+// `cost_usd` is an `f64`, which is not `Eq`, for the reason `RunOutcome` gives above its own derive.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnOutcome {
+    pub session_id: Option<String>,
+    /// What THIS turn added, never what the process has spent altogether.
+    pub cost_usd: Option<f64>,
+    pub usage: RunUsage,
+}
+
+/// What one line of a live process's stream means to whoever is recording turns.
+///
+/// A process that serves one turn needs none of this — its stream IS the turn, and `RunOutcome`
+/// describes it. A process that serves several needs somebody to say where one answer ends and the
+/// next begins, because the CLI itself only says so in passing, with a `result` line that looks like
+/// any other line until it is parsed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnEvent {
+    /// One line belonging to the turn that has not ended yet.
+    Line(String),
+    /// The turn that was in flight has ended, with its own numbers.
+    Ended(TurnOutcome),
+}
+
+/// Splits one process's stdout into turns, a line at a time.
+///
+/// It exists so the rule lives in one place that a test can reach without a subprocess: `execute`
+/// feeds it every line and reads back both what to forward and what the turn cost, and nothing else
+/// in the daemon has to know that a `result` is a boundary or that the cost on it is cumulative.
+pub(crate) struct TurnSplitter {
+    spent: f64,
+}
+
+impl TurnSplitter {
+    pub(crate) fn new() -> Self {
+        Self { spent: 0.0 }
+    }
+
+    /// The events this line produces, in the order a consumer must see them.
+    ///
+    /// A `result` line produces BOTH — it is the last line of the turn it ends, and it carries the
+    /// answer, so a consumer told the turn had ended before being given that line would close every
+    /// turn one line short of what it said.
+    pub(crate) fn line(&mut self, line: String) -> Vec<TurnEvent> {
+        match turn_from_result(&line, self.spent) {
+            Some((turn, total)) => {
+                self.spent = total;
+                vec![TurnEvent::Line(line), TurnEvent::Ended(turn)]
+            }
+            None => vec![TurnEvent::Line(line)],
+        }
+    }
+
+    /// Everything the process has reported spending so far, which is what bills the PROCESS rather
+    /// than any one turn inside it.
+    pub(crate) fn spent(&self) -> f64 {
+        self.spent
+    }
+}
+
+/// What one `result` line added, given what the process has already reported spending — and the new
+/// running total to carry into the next one. `None` for every line that does not end a turn.
+///
+/// The two halves are read differently ON PURPOSE, and the reason is measured rather than assumed.
+/// Two turns fed down one stdin reported `total_cost_usd` 0.1046 and then 0.2024 — a running total
+/// over the process — while `num_turns` read 1 on both and `usage` described only the turn that had
+/// just ended. So the cost is differenced and nothing beside it is: differencing the counts would
+/// produce a negative number the first time a turn used fewer tokens than the one before it, and
+/// recording the cost verbatim would bill each turn for every turn that preceded it.
+///
+/// The session id is read here as well because a turn is where it becomes true: measured on the same
+/// two turns, a live process keeps ONE session across all of them, which is what lets a conversation
+/// still be resumed by it after the process is gone.
+pub(crate) fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOutcome, f64)> {
+    let line = line.trim();
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("result") {
+        return None;
+    }
+    // `cost_usd` as the fallback spelling for the same reason the stdout loop accepts both: older
+    // CLI builds emit it, and a turn whose cost silently read `None` would be a free turn in the
+    // ledger.
+    let spent = value
+        .get("total_cost_usd")
+        .or_else(|| value.get("cost_usd"))
+        .and_then(serde_json::Value::as_f64);
+    let turn = TurnOutcome {
+        session_id: value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        cost_usd: spent.map(|total| total - already_spent),
+        usage: extract_usage(line),
+    };
+    // A result carrying no cost at all must not reset the total: the next turn would then be
+    // differenced against zero and billed for the whole conversation.
+    Some((turn, spent.unwrap_or(already_spent)))
+}
+
 pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
     let mut usage = RunUsage::default();
     for line in stdout.lines() {
@@ -1033,6 +1208,26 @@ pub trait CommandRunner: Send + Sync {
         _context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
     ) -> std::io::Result<RunOutcome> {
         self.run_prompt(request, session_tx, transcript).await
+    }
+
+    /// Runs a prompt while also reporting where one turn ends and the next begins.
+    ///
+    /// Only ever `Some` for a process meant to serve more than one turn. Everything else keeps the
+    /// default and never learns that turns exist, which is right: for a process that answers once,
+    /// the turn and the process are the same thing and `RunOutcome` already describes it.
+    ///
+    /// A channel rather than a return value because a caller has to act on a turn while the process
+    /// it belongs to is still running — that is the entire point of keeping it running.
+    async fn run_prompt_with_turns(
+        &self,
+        request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+        _turns: Option<UnboundedSender<TurnEvent>>,
+    ) -> std::io::Result<RunOutcome> {
+        self.run_prompt_with_context_fill(request, session_tx, transcript, context_fill)
+            .await
     }
 
     /// The per-role model for a job node's stage, or `None` for the runner's own model.
@@ -1437,10 +1632,23 @@ impl CommandRunner for ClaudeCliRunner {
 
     async fn run_prompt_with_context_fill(
         &self,
+        request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    ) -> std::io::Result<RunOutcome> {
+        // Nobody listening for turns, which is every caller but a conversation keeping its process.
+        self.run_prompt_with_turns(request, session_tx, transcript, context_fill, None)
+            .await
+    }
+
+    async fn run_prompt_with_turns(
+        &self,
         mut request: RunRequest,
         session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
         context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+        turn_events: Option<UnboundedSender<TurnEvent>>,
     ) -> std::io::Result<RunOutcome> {
         // The Claude Code CLI binary. Overridable via `NUCLEOS_CLAUDE_BIN` because on Windows the
         // npm-installed `claude` is a `.cmd` shim that Rust's `Command` can't spawn by name — the
@@ -1488,6 +1696,23 @@ impl CommandRunner for ClaudeCliRunner {
         // exactly what makes `git worktree remove` fail through its whole backoff afterwards.
         let mut tree_killer = child.id().map(TreeKiller::new);
 
+        // A process meant to outlive its TURN must not outlive the DAEMON.
+        //
+        // `TreeKiller` above covers being dropped, which is a thing that happens in a program that
+        // is still running. It does nothing for `TerminateProcess` — what Task Manager,
+        // `Stop-Process` and a crash all do — which runs no destructor and leaves every child
+        // alive. `process_tree` records what that costs, measured this month: two days of daemon
+        // restarts left 31 orphaned sidecars, each holding the loopback port its own replacement
+        // then died trying to bind.
+        //
+        // A one-turn run is already bounded by its turn and is not enrolled. A CLI held idle
+        // between a conversation's turns is exactly the shape of thing that incident was about.
+        if turn_events.is_some()
+            && let Some(pid) = child.id()
+        {
+            KEPT_ALIVE.adopt(pid);
+        }
+
         // A steerable run's turns are written in their OWN task, concurrently with the stdout loop
         // below, for the same reason stderr is drained in one: a turn written while the CLI is
         // mid-answer must not stop anything reading what it is saying.
@@ -1502,7 +1727,7 @@ impl CommandRunner for ClaudeCliRunner {
                 .stdin
                 .take()
                 .expect("stdin piped above when steerable");
-            let opening = user_message_line(&request.prompt);
+            let opening = user_message_line(&request.prompt, &request.images);
             let mut messages = request.messages.take();
             steering_task = Some(tokio::spawn(async move {
                 // `ChildStdin` writes straight to the OS pipe, so a completed `write_all` has
@@ -1515,9 +1740,12 @@ impl CommandRunner for ClaudeCliRunner {
                 let Some(messages) = messages.as_mut() else {
                     return;
                 };
-                while let Some(text) = messages.recv().await {
+                while let Some(turn) = messages.recv().await {
+                    // Its own pictures, not none. The opening turn is no longer the only one
+                    // anybody attaches anything to: a conversation that keeps its process makes
+                    // every turn after the first arrive here.
                     if stdin
-                        .write_all(user_message_line(&text).as_bytes())
+                        .write_all(user_message_line(&turn.text, &turn.images).as_bytes())
                         .await
                         .is_err()
                     {
@@ -1547,6 +1775,9 @@ impl CommandRunner for ClaudeCliRunner {
             .or_else(|| request.resume_session_id.clone());
         let mut cli_session_seen = false;
         let mut cost_usd: Option<f64> = None;
+        // Where one answer ends and the next begins. Held across the whole stream because that is
+        // the only place the running total lives.
+        let mut splitter = TurnSplitter::new();
         let mut usage = RunUsage::default();
         let mut running_context_fill: Option<i64> = None;
 
@@ -1617,14 +1848,26 @@ impl CommandRunner for ClaudeCliRunner {
                         break;
                     }
                 }
-                if v.get("type").and_then(|x| x.as_str()) == Some("result") {
-                    usage = extract_usage(&line);
-                    if let Some(c) = v
-                        .get("total_cost_usd")
-                        .or_else(|| v.get("cost_usd"))
-                        .and_then(|x| x.as_f64())
-                    {
-                        cost_usd = Some(c);
+                // Every `result` is the end of a TURN, which is the same thing as the end of the
+                // process only while a process serves one. `TurnSplitter` is where that distinction
+                // is written down — the cost a result carries is a running total and the counts
+                // beside it are not — so it is read here even when nobody is listening for turns,
+                // rather than kept as a second account that can drift from this one.
+                //
+                // What this loop reports is unchanged: `cost_usd` is still the process's whole bill,
+                // and `usage` still describes the turn that ended last.
+                for event in splitter.line(line.clone()) {
+                    if let TurnEvent::Ended(turn) = &event {
+                        usage = turn.usage;
+                        if turn.cost_usd.is_some() {
+                            cost_usd = Some(splitter.spent());
+                        }
+                    }
+                    // Best-effort, like `session_tx` above it: a listener that has gone away is a
+                    // conversation that stopped caring, and this stream has a process to keep
+                    // draining either way.
+                    if let Some(turn_events) = &turn_events {
+                        let _ = turn_events.send(event);
                     }
                 }
             }
@@ -2107,6 +2350,10 @@ pub struct FakeCommandRunner {
     /// reason `last_tool_policy` is: it decides what a run CAN have done to it, so which value
     /// reached the runner is a safety property rather than a detail of the request.
     pub last_steerable: std::sync::Mutex<Option<bool>>,
+    /// The pictures the launch was handed. Recorded because bytes can only travel the stdin path,
+    /// so a run given images and not `steerable` drops them without a word — a failure invisible
+    /// from everywhere except here.
+    pub last_images: std::sync::Mutex<Option<Vec<Attachment>>>,
     /// Whether the launch handed the run the classifier's permission surface instead of the CLI's.
     /// Recorded for the same reason `last_tool_policy` is: it decides what a run CAN do.
     pub last_classifier_governs_tools: std::sync::Mutex<Option<bool>>,
@@ -2125,6 +2372,18 @@ pub struct FakeCommandRunner {
     /// session shape, so a run inheriting everything looked exactly like one inheriting nothing. It
     /// took a live CLI to notice.
     pub last_launch: std::sync::Mutex<Option<Launch>>,
+    /// Test-only: whether a living process was STOPPED rather than allowed to end.
+    ///
+    /// Set by a guard the fake's own future holds, and disarmed just before that future returns —
+    /// so it says "this was dropped mid-flight" and not merely "this finished". Nothing else can
+    /// tell those apart from outside, and the difference is the whole of what a cancel has to do.
+    pub stopped_early: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// Test-only: the turns written to a living process's stdin after the one it was launched with.
+    ///
+    /// Recorded because a later turn's pictures can only be observed here: they travel down a
+    /// channel into a task that writes them to a pipe, and a run given them and not steerable drops
+    /// them without a word.
+    pub later_turns: std::sync::Mutex<Vec<LaterTurn>>,
     /// Test-only: the queue a plan node writes, taken by the first call that is given a handoff
     /// directory.
     ///
@@ -2152,6 +2411,81 @@ pub struct FakeCommandRunner {
 #[cfg(test)]
 #[async_trait]
 impl CommandRunner for FakeCommandRunner {
+    /// The live-process door, so a conversation that keeps its CLI is exercised in tests rather than
+    /// only in production.
+    ///
+    /// Without this the default would delegate to `run_prompt`, which sends no turn events at all —
+    /// and a rooted chat turn would sit waiting for a boundary that never came, fail, and still let
+    /// every existing assertion pass, because those look at what the runner was HANDED. That is the
+    /// worst shape a gap can have.
+    ///
+    /// It answers the opening turn and then one more for every line written to its stdin, which is
+    /// what a real process does. A fresh `TurnSplitter` per turn, unlike the CLI runner's one across
+    /// the whole stream: a canned outcome is one answer repeated, so a shared splitter would report
+    /// every turn after the first as having cost nothing — true of the CLI's running total, and
+    /// nonsense for a double whose whole job is to be legible.
+    async fn run_prompt_with_turns(
+        &self,
+        mut request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+        _context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+        turn_events: Option<UnboundedSender<TurnEvent>>,
+    ) -> std::io::Result<RunOutcome> {
+        // Taken before the request is handed over, because the request is what carries it.
+        let mut later = request.messages.take();
+        let outcome = self.run_prompt(request, session_tx, transcript).await?;
+
+        let Some(turn_events) = turn_events else {
+            return Ok(outcome);
+        };
+
+        /// Records that the future holding it was dropped before it finished.
+        struct Stopped {
+            flag: std::sync::Arc<std::sync::Mutex<bool>>,
+            armed: bool,
+        }
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                if self.armed {
+                    *self.flag.lock().unwrap() = true;
+                }
+            }
+        }
+        let mut stopped = Stopped {
+            flag: std::sync::Arc::clone(&self.stopped_early),
+            armed: true,
+        };
+
+        let answer = |stdout: &str| {
+            let mut splitter = TurnSplitter::new();
+            for line in stdout.lines() {
+                for event in splitter.line(line.to_owned()) {
+                    let _ = turn_events.send(event);
+                }
+            }
+        };
+
+        answer(&outcome.stdout);
+        if let Some(later) = later.as_mut() {
+            // Stays alive until its stdin closes, exactly as the process does — which is what makes
+            // a test of "the second turn reused the process" mean anything.
+            while let Some(turn) = later.recv().await {
+                self.later_turns.lock().unwrap().push(turn);
+                // A process that does not answer instantly, so a test can catch a turn in flight.
+                // The delay is the same knob a hung one-shot run uses.
+                let waiting = *self.delay.lock().unwrap();
+                if let Some(waiting) = waiting {
+                    tokio::time::sleep(waiting).await;
+                }
+                answer(&outcome.stdout);
+            }
+        }
+        // Reached only by ending on its own, which is what makes the flag mean "stopped".
+        stopped.armed = false;
+        Ok(outcome)
+    }
+
     async fn run_prompt(
         &self,
         request: RunRequest,
@@ -2204,6 +2538,7 @@ impl CommandRunner for FakeCommandRunner {
             }
         }
         *self.last_prompt.lock().unwrap() = Some(request.prompt.clone());
+        *self.last_images.lock().unwrap() = Some(request.images.clone());
         *self.last_cwd.lock().unwrap() = request.cwd.clone();
         *self.last_plan_only.lock().unwrap() = Some(request.plan_only);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
@@ -2468,7 +2803,7 @@ mod tests {
     fn a_steering_turn_is_one_json_user_line_whatever_its_text_contains() {
         let text = "stop after this file\nand say \"done\"";
 
-        let line = user_message_line(text);
+        let line = user_message_line(text, &[]);
 
         assert!(line.ends_with('\n'), "a turn is terminated: {line:?}");
         let body = line.strip_suffix('\n').unwrap();
@@ -2576,6 +2911,7 @@ mod tests {
             session_id: Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
             fork_session: false,
             include_partial_messages: false,
+            images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
             ambient_mcp: false,
@@ -2583,6 +2919,98 @@ mod tests {
             messages: None,
             allowed_mcp_tools: None,
         }
+    }
+
+    /// Two turns down one REAL CLI, through the argument vector this daemon actually builds.
+    ///
+    /// `#[ignore]` because it needs the Claude Code CLI installed, an authenticated session, and
+    /// about twenty cents of somebody's money. Everything else about a conversation keeping its
+    /// process is tested against `FakeCommandRunner`, which proves the wiring and proves nothing
+    /// about whether the CLI serves a second turn down a stdin this code built.
+    ///
+    /// That exact gap has already bitten once, this month: the fake did not implement
+    /// `run_prompt_with_turns` at all, so every rooted chat turn in the suite took a path that could
+    /// not work — and every assertion still passed, because they all look at what the runner was
+    /// HANDED rather than at what came back.
+    ///
+    /// What it pins: one process answering twice, one session across both, and the two turns' costs
+    /// adding up to the process's own. That last one is the whole of `TurnSplitter`'s reason to
+    /// exist — the CLI prints a RUNNING TOTAL on every `result`, so a second turn recorded verbatim
+    /// bills the first one again, and a third bills the first two.
+    #[tokio::test]
+    #[ignore = "spawns the real Claude CLI and spends money; run with --include-ignored"]
+    async fn a_real_cli_answers_a_second_turn_down_the_same_stdin() {
+        let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        let (turn_events, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let mut request = test_run_request("Reply with the single word one.");
+        request.steerable = true;
+        request.messages = Some(incoming);
+        request.model = Some("sonnet".to_owned());
+
+        let runner = ClaudeCliRunner {
+            model: "sonnet".to_owned(),
+            plan_model: None,
+            review_model: None,
+        };
+        let process = tokio::spawn(async move {
+            runner
+                .run_prompt_with_turns(
+                    request,
+                    session_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                    std::sync::Arc::new(std::sync::Mutex::new(None)),
+                    Some(turn_events),
+                )
+                .await
+        });
+
+        let mut ended = Vec::new();
+        while let Some(event) = events.recv().await {
+            let TurnEvent::Ended(turn) = event else {
+                continue;
+            };
+            ended.push(turn);
+            if ended.len() == 1 {
+                // The second turn, written while the process that answered the first is still
+                // standing. This is the line the whole feature is about.
+                messages
+                    .send(LaterTurn {
+                        text: "Reply with the single word two.".to_owned(),
+                        images: Vec::new(),
+                    })
+                    .unwrap();
+            } else {
+                break;
+            }
+        }
+        // Closing stdin is how a steerable run is told no more turns are coming.
+        drop(messages);
+        let outcome = process.await.unwrap().expect("the CLI should have run");
+
+        assert_eq!(ended.len(), 2, "one process must have answered twice");
+
+        let summed: f64 = ended.iter().filter_map(|turn| turn.cost_usd).sum();
+        let whole = outcome
+            .cost_usd
+            .expect("a finished process reports what it spent");
+        assert!(
+            (summed - whole).abs() < 1e-6,
+            "the turns must add up to the process: {summed} against {whole}"
+        );
+
+        // One session across both turns, which is what lets the conversation be resumed by it after
+        // the process is gone — so losing the process costs speed and never continuity.
+        let announced = session_rx
+            .recv()
+            .await
+            .expect("the CLI announces its session");
+        assert!(!announced.is_empty());
+        assert!(
+            session_rx.try_recv().is_err(),
+            "a second session was started"
+        );
     }
 
     fn test_run_request(prompt: &str) -> RunRequest {
@@ -2599,6 +3027,7 @@ mod tests {
             session_id: None,
             fork_session: false,
             include_partial_messages: false,
+            images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
             ambient_mcp: false,
@@ -2825,6 +3254,57 @@ mod tests {
         let did = live_from_stream(&stream).did;
 
         assert_eq!(did[0].detail.as_deref(), Some("C:/x.rs"));
+    }
+
+    /// A turn carrying a picture is a content ARRAY, which is the API's own shape for one.
+    ///
+    /// Asked of the CLI before this existed, because nothing here could answer it: a `user` line
+    /// whose content is an array with an `image` block in it is accepted by
+    /// `--input-format stream-json`, and the model SEES it — sent a solid magenta square and asked
+    /// what colour it was, it answered "Magenta", which is not a thing anybody guesses.
+    ///
+    /// The image comes FIRST and the words after. That is the order the API documents for a
+    /// question about a picture, and the order a person types in: the screenshot, then what they
+    /// want to know about it.
+    #[test]
+    fn a_turn_carrying_a_picture_is_written_as_a_content_array() {
+        let line = user_message_line(
+            "what colour is this?",
+            &[Attachment {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        );
+
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let content = value
+            .pointer("/message/content")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "aGVsbG8=");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "what colour is this?");
+    }
+
+    /// A turn carrying nothing keeps the plain string it has always been.
+    ///
+    /// Not tidiness: the string form is the one measured working against the CLI, and every run in
+    /// this daemon that is not a chat uses it. Rewriting them all as arrays to make one new case
+    /// uniform would be changing what is proven to make room for what is not.
+    #[test]
+    fn a_turn_carrying_nothing_is_written_as_the_plain_string_it_has_always_been() {
+        let line = user_message_line("arranja o parser", &[]);
+
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            value.pointer("/message/content").unwrap(),
+            "arranja o parser"
+        );
     }
 
     /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.
@@ -3136,6 +3616,111 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(500));
         assert_eq!(usage.cache_read_tokens, None);
         assert_eq!(usage.num_turns, Some(12));
+    }
+
+    /// A turn's own lines must arrive before the word that it ended.
+    ///
+    /// The order is the whole contract. A consumer builds each turn's transcript out of the lines
+    /// and closes it on `Ended`, so an end delivered before its own `result` line would close every
+    /// turn one line short of what it actually said — and that line is the one carrying the answer.
+    #[test]
+    fn a_turns_lines_arrive_before_the_word_that_it_ended() {
+        let mut splitter = TurnSplitter::new();
+        let mut events = Vec::new();
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.10}"#,
+        ] {
+            events.extend(splitter.line(line.to_string()));
+        }
+
+        assert!(matches!(events[0], TurnEvent::Line(_)));
+        assert!(matches!(events[1], TurnEvent::Line(_)));
+        // The result line belongs to the turn it ends, so it is a `Line` too — and only then `Ended`.
+        assert!(matches!(events[2], TurnEvent::Line(_)));
+        assert!(matches!(events[3], TurnEvent::Ended(_)));
+        assert_eq!(events.len(), 4);
+    }
+
+    /// One process, two answers, two turns — and the second one billed for what it added rather than
+    /// for everything the process had spent by then.
+    #[test]
+    fn two_answers_down_one_process_are_two_turns() {
+        let mut splitter = TurnSplitter::new();
+        let mut ended = Vec::new();
+        for line in [
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1046}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.2024}"#,
+        ] {
+            for event in splitter.line(line.to_string()) {
+                if let TurnEvent::Ended(turn) = event {
+                    ended.push(turn);
+                }
+            }
+        }
+
+        assert_eq!(ended.len(), 2);
+        assert_eq!(ended[0].cost_usd, Some(0.1046));
+        assert!((ended[1].cost_usd.unwrap() - 0.0978).abs() < 1e-9);
+        // And the process's own total is still available to whoever is billing the process.
+        assert!((splitter.spent() - 0.2024).abs() < 1e-9);
+    }
+
+    /// A process that answers twice reports what it has spent in total, not what the last turn
+    /// added. Measured on the real CLI, two turns down one stdin: `total_cost_usd` read 0.1046 and
+    /// then 0.2024, so recording the second `result` verbatim bills that turn for the first one as
+    /// well — and every turn after it, compounding.
+    #[test]
+    fn a_later_turns_cost_is_what_it_added_not_what_the_process_has_spent() {
+        let first =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1046,"num_turns":1}"#;
+        let second =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.2024,"num_turns":1}"#;
+
+        let (one, spent) = turn_from_result(first, 0.0).unwrap();
+        assert_eq!(one.cost_usd, Some(0.1046));
+
+        let (two, spent) = turn_from_result(second, spent).unwrap();
+        assert!(
+            (two.cost_usd.unwrap() - 0.0978).abs() < 1e-9,
+            "expected the difference, got {:?}",
+            two.cost_usd
+        );
+        assert!((spent - 0.2024).abs() < 1e-9);
+    }
+
+    /// The counts beside the cost are the turn's OWN — `num_turns` read 1 on both of those two
+    /// results rather than 1 and 2 — so differencing them would turn a correct number into a
+    /// negative one the moment a turn used fewer tokens than the turn before it.
+    #[test]
+    fn a_turns_token_counts_are_its_own_and_are_not_differenced() {
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.30,"num_turns":1,"usage":{"input_tokens":40,"output_tokens":500,"cache_read_input_tokens":32194,"cache_creation_input_tokens":0}}"#;
+
+        let (turn, _) = turn_from_result(line, 0.25).unwrap();
+
+        assert_eq!(turn.usage.input_tokens, Some(40));
+        assert_eq!(turn.usage.output_tokens, Some(500));
+        assert_eq!(turn.usage.cache_read_tokens, Some(32194));
+        assert_eq!(turn.usage.num_turns, Some(1));
+    }
+
+    /// Everything else on the stream is not a turn ending, and a boundary drawn on the wrong line
+    /// would close a run row while the CLI was still mid-answer.
+    #[test]
+    fn only_a_result_line_ends_a_turn() {
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            "not json at all",
+            "",
+        ] {
+            assert!(
+                turn_from_result(line, 0.0).is_none(),
+                "{line} must not be read as the end of a turn"
+            );
+        }
     }
 
     #[test]

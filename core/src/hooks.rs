@@ -189,35 +189,44 @@ fn deny_with(reason: &str) -> Decision {
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
-    Json(payload): Json<PreToolUsePayload>,
+    Json(mut payload): Json<PreToolUsePayload>,
 ) -> Json<Decision> {
-    // `run_id` arrives in the body, which makes it a claim the caller makes about itself. With a
-    // scoped key the daemon can check that claim against something the caller cannot choose: a run
-    // token names its own run. Without this, a run could ask for a decision under another run's id
-    // — a `shadow` run borrowing a `worktree` run's rules, or an in-flight run's id being used to
-    // terminate it — and every branch below reads `mode` from exactly that id.
-    if let Scope::Run(id) = scope
-        && id != payload.run_id
-    {
-        tracing::warn!(
-            token_run_id = id,
-            claimed_run_id = payload.run_id,
-            "pretooluse-decision: a run asked for a decision under another run's id"
-        );
-        return Json(Decision {
-            decision: "deny".to_owned(),
-            reason: "a run may only ask about itself".to_owned(),
-        });
-    }
+    // `run_id` arrives in the body, which makes it a claim the caller makes about itself, and every
+    // branch below reads `mode` from it. A scoped key names its own run, and the daemon resolved
+    // that name from its own state rather than from anything the caller chose — so the key decides
+    // and the claim is dropped. A run cannot borrow another run's rules, or spend another run's
+    // denial allowance to have it stopped, because it has no way to say which run it is.
+    //
+    // Dropped rather than compared-and-refused, which is what this was. The guarantee is the same
+    // one, kept by construction instead of by inspection; the difference is that a stale claim is
+    // now irrelevant instead of fatal. A CLI kept alive across turns is handed its environment once,
+    // at spawn, and `ask_daemon.py` echoes `NUCLEOS_RUN_ID` out of it — so from the second turn on,
+    // a comparison would refuse every tool call the conversation made.
+    //
+    // A key that names no run — the control token an orchestrator turn carries, which it can hold
+    // because `ToolPolicy::McpOnly` leaves it no way to read its own environment — leaves the claim
+    // as the only identifier there is. Hence the fallback, and hence no `deny` here: the claim is
+    // still the truth for exactly the callers that cannot usefully lie about it.
+    let run_id = match scope {
+        Scope::Run(id) => id,
+        _ => payload.run_id,
+    };
+    // Corrected IN the payload, and not merely beside it. Every branch below is handed `&payload`
+    // and several read the id back out of it — `rooted_decision` checks the read-untrusted barrier
+    // with it, `assistant_decision` both checks and SETS it — so leaving the claim in place would
+    // fix the id in this function and leave it stale in the ones that decide with it.
+    //
+    // Which is the hole a kept process opens, and it is not the one the key closed: a CLI is handed
+    // its environment once, so from the second turn on `ask_daemon.py` echoes the FIRST turn's id
+    // for the rest of the conversation. A turn that read a stranger's text is marked on its own row;
+    // a barrier reading the first turn's row finds nothing there, and the ordering rule holds on
+    // turn one and is walked around on every turn after it.
+    payload.run_id = run_id;
 
     // Validate run_id against runs actually in flight before trusting anything derived from it (spec
     // §3.4 — the hook's environment sits inside the same cooperative trust model as the token, so the
     // core never blindly trusts what the hook sends).
-    let is_in_flight = state
-        .run_handles
-        .lock()
-        .unwrap()
-        .contains_key(&payload.run_id);
+    let is_in_flight = state.run_handles.lock().unwrap().contains_key(&run_id);
 
     // `mode` is resolved for EVERY request, in flight or not, because it decides WHICH set of rules
     // applies — and a run that has left `run_handles` is exactly when defaulting to `real` is most
@@ -228,7 +237,7 @@ pub async fn pretooluse_decision(
     let (cwd, mode) = match sqlx::query_as::<_, (Option<String>, String)>(
         "SELECT cwd, mode FROM runs WHERE id = ?",
     )
-    .bind(payload.run_id)
+    .bind(run_id)
     .fetch_optional(&state.pool)
     .await
     {
@@ -242,7 +251,7 @@ pub async fn pretooluse_decision(
         // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
         Err(error) => {
             tracing::warn!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 %error,
                 "pretooluse-decision: failed to resolve the run's mode — failing closed"
             );
@@ -266,13 +275,13 @@ pub async fn pretooluse_decision(
         // single boot — and an alarm that cries wolf at startup is one nobody reads when it matters.
         if is_in_flight {
             tracing::warn!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 tool = %payload.tool_name,
                 "pretooluse-decision: a triage run attempted a tool — barrier 1 is not in force"
             );
         } else {
             tracing::debug!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 tool = %payload.tool_name,
                 "pretooluse-decision: denied a tool for a triage run that is not in flight"
             );
@@ -294,7 +303,7 @@ pub async fn pretooluse_decision(
         // `ToolPolicy::Unrestricted` precisely so it can touch the code the conversation is about,
         // and the branch below would deny every one of those calls — leaving it holding tools it can
         // never use, which is worse than not having them.
-        if let Some(root) = rooted_turn(&state, payload.run_id).await {
+        if let Some(root) = rooted_turn(&state, run_id).await {
             return rooted_decision(&state, &payload, &root).await;
         }
         return assistant_decision(&state, &payload).await;
@@ -346,7 +355,7 @@ pub async fn pretooluse_decision(
         if is_in_flight
             && let Err(error) = shadow::record_decision(
                 &state.pool,
-                payload.run_id,
+                run_id,
                 &payload.tool_name,
                 &payload.tool_input,
                 &classification,
@@ -355,7 +364,7 @@ pub async fn pretooluse_decision(
             .await
         {
             tracing::warn!(
-                run_id = payload.run_id,
+                run_id = run_id,
                 %error,
                 "pretooluse-decision: failed to record shadow decision"
             );
@@ -380,7 +389,7 @@ pub async fn pretooluse_decision(
         && is_in_flight
         && let Err(error) = shadow::record_decision(
             &state.pool,
-            payload.run_id,
+            run_id,
             &payload.tool_name,
             &payload.tool_input,
             &classification,
@@ -389,7 +398,7 @@ pub async fn pretooluse_decision(
         .await
     {
         tracing::warn!(
-            run_id = payload.run_id,
+            run_id = run_id,
             %error,
             "pretooluse-decision: failed to record shadow decision"
         );
@@ -417,7 +426,7 @@ pub async fn pretooluse_decision(
         // message spends none of it.
         match crate::proposals::matching_queued_request(
             &state.pool,
-            payload.run_id,
+            run_id,
             &payload.tool_name,
             &payload.tool_input.to_string(),
         )
@@ -425,11 +434,11 @@ pub async fn pretooluse_decision(
         {
             Ok(Some(request_id)) => {
                 tracing::info!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     request_id,
                     "pretooluse-decision: the action is already queued — refusing the retry"
                 );
-                count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+                count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
                 return Json(Decision {
                     decision: "deny".to_owned(),
                     reason: format!(
@@ -444,23 +453,19 @@ pub async fn pretooluse_decision(
             // a pause and a question for a person, which is what happened before any of this.
             Err(error) => {
                 tracing::warn!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     %error,
                     "pretooluse-decision: could not tell whether this action is already queued"
                 );
             }
         }
 
-        match crate::proposals::grant_covers_class(
-            &state.pool,
-            payload.run_id,
-            classification.action_class,
-        )
-        .await
+        match crate::proposals::grant_covers_class(&state.pool, run_id, classification.action_class)
+            .await
         {
             Ok(true) => {
                 tracing::info!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     tool = %payload.tool_name,
                     action_class = classification.action_class,
                     "pretooluse-decision: a grant covers this action class — authorizing the action"
@@ -471,9 +476,9 @@ pub async fn pretooluse_decision(
                     "action_authorized",
                     &format!(
                         "authorized approved {} action for run {}",
-                        payload.tool_name, payload.run_id
+                        payload.tool_name, run_id
                     ),
-                    Some(payload.run_id),
+                    Some(run_id),
                 )
                 .await;
                 return Json(Decision {
@@ -487,7 +492,7 @@ pub async fn pretooluse_decision(
             Ok(false) => {}
             Err(error) => {
                 tracing::warn!(
-                    run_id = payload.run_id,
+                    run_id = run_id,
                     %error,
                     "pretooluse-decision: grant lookup failed; falling back to the classifier decision"
                 );
@@ -501,7 +506,7 @@ pub async fn pretooluse_decision(
     // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
     // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
     if classification.decision.decision == "deny" && is_in_flight {
-        count_denial_and_stop_a_prober(&state, payload.run_id, &payload.tool_name).await;
+        count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
     }
 
     if classification.decision.decision == "pending_approval" {
@@ -515,7 +520,7 @@ pub async fn pretooluse_decision(
             // detaches its task, so the pause still gets recorded when the request goes away.
             let _ = tokio::spawn(pause_for_approval(
                 state.clone(),
-                payload.run_id,
+                run_id,
                 payload.tool_name.clone(),
                 payload.tool_input.to_string(),
                 classification.reason.clone(),
@@ -524,7 +529,7 @@ pub async fn pretooluse_decision(
         } else {
             tracing::warn!(
                 "pretooluse-decision: pending_approval for unknown/finished run_id {} — not terminating",
-                payload.run_id
+                run_id
             );
         }
     }
@@ -562,6 +567,17 @@ pub const ERRAND_MAY_NOT_ACT: &str =
 /// act while nothing third-party has entered the turn — but not both, and not in that order. It is
 /// deliberately not a hard split of the tool set, because reading mail from a phone is the feature,
 /// and the ordering costs the owner one extra message rather than the tool.
+/// The conversation a run belongs to, or `None` for a run that is nobody's turn.
+async fn chat_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+}
+
 /// The directory a turn is rooted in, or `None` when it is an ordinary orchestrator turn.
 ///
 /// Read from the CHAT and not from the run, because it is a property of the conversation: every
@@ -577,6 +593,120 @@ async fn rooted_turn(state: &AppState, run_id: i64) -> Option<String> {
     .ok()
     .flatten()
     .flatten()
+}
+
+/// How long a tool call waits for somebody to answer for it.
+///
+/// Forty-five seconds, and the number is not a preference. The CLI holds the hook call open while
+/// this waits and kills it at its own ceiling — sixty seconds unless the settings entry says
+/// otherwise, and the entries already written into people's projects do not. Raising that would
+/// help only the projects wired after the change and leave every existing one being cut off
+/// mid-question, so the window is chosen to fit the ceiling that is actually out there.
+///
+/// Long enough for somebody looking at the window to read a command and decide; short enough that
+/// stepping away costs one refused tool call rather than a conversation that hangs.
+pub(crate) const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// One tool call a conversation is waiting to be allowed.
+///
+/// In memory and nowhere else, deliberately. A proposal is a durable row because the run it belongs
+/// to is not being watched; this exists only while a hook call is blocked on it, and a daemon that
+/// restarts has killed the turn that was asking. A question outliving the turn that asked it is a
+/// question about nothing.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Ask {
+    pub id: String,
+    pub chat_id: String,
+    pub run_id: i64,
+    pub tool: String,
+    /// The one argument that says what this is about, or `None` when none of them does.
+    ///
+    /// Deliberately not the whole input, for the reason `runner::ToolCall` gives about its own: a
+    /// `Write` carries the file it is writing, and a window that printed that argument would print
+    /// the file.
+    pub detail: Option<String>,
+}
+
+struct Pending {
+    ask: Ask,
+    /// Handed to whoever answers, and taken when they do — so a second answer finds nothing rather
+    /// than overwriting the first.
+    answer: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// Handed to the hook call that waits, and taken for the same reason.
+    heard: Option<tokio::sync::oneshot::Receiver<bool>>,
+}
+
+static ASKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Pending>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Records that this turn is waiting to be allowed something, and returns the question's name.
+pub(crate) fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {
+    let id = crate::auth::generate_uuid_v4();
+    let (answer, heard) = tokio::sync::oneshot::channel();
+    ASKS.lock().unwrap().insert(
+        id.clone(),
+        Pending {
+            ask: Ask {
+                id: id.clone(),
+                chat_id: chat_id.to_owned(),
+                run_id,
+                tool: tool.to_owned(),
+                detail,
+            },
+            answer: Some(answer),
+            heard: Some(heard),
+        },
+    );
+    id
+}
+
+/// What this conversation is waiting to be allowed, which is nearly always nothing or one thing.
+pub fn asks_for(chat_id: &str) -> Vec<Ask> {
+    ASKS.lock()
+        .unwrap()
+        .values()
+        .filter(|pending| pending.ask.chat_id == chat_id)
+        .map(|pending| pending.ask.clone())
+        .collect()
+}
+
+/// Answers one question. `false` when there was nothing to answer, which is a race a person loses
+/// harmlessly: the turn moved on, or somebody answered a moment sooner.
+pub fn answer_ask(id: &str, allow: bool) -> bool {
+    let answer = ASKS
+        .lock()
+        .unwrap()
+        .get_mut(id)
+        .and_then(|pending| pending.answer.take());
+    match answer {
+        Some(answer) => answer.send(allow).is_ok(),
+        None => false,
+    }
+}
+
+/// Waits for this RUN's question to be answered. `None` means refuse, whatever the reason.
+///
+/// Keyed on the run and not on the question's name, which is what keeps it honest without a second
+/// check: a run has at most one tool call in flight, because the hook that asks is synchronous and
+/// the CLI is sitting on it. So "this run's ask" names exactly one thing, and no run can name
+/// another's.
+///
+/// The question is taken down either way. A turn whose call was refused has moved on, and a
+/// question still standing in the window would be about something that is no longer happening.
+pub(crate) async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
+    let (id, heard) = {
+        let mut asks = ASKS.lock().unwrap();
+        let (id, pending) = asks
+            .iter_mut()
+            .find(|(_, pending)| pending.ask.run_id == run_id)?;
+        (id.clone(), pending.heard.take()?)
+    };
+    let answer = tokio::time::timeout(window, heard)
+        .await
+        .ok()
+        .and_then(|heard| heard.ok());
+    ASKS.lock().unwrap().remove(&id);
+    answer
 }
 
 /// What the owner is told when a rooted turn asks for something that would need approving.
@@ -607,6 +737,9 @@ async fn rooted_decision(
     payload: &PreToolUsePayload,
     root: &str,
 ) -> Json<Decision> {
+    // Corrected in the handler before this is called, so it is the turn that is actually running
+    // rather than the one a living process was spawned for.
+    let run_id = payload.run_id;
     if payload.tool_name.starts_with("mcp__") {
         return assistant_decision(state, payload).await;
     }
@@ -671,6 +804,32 @@ async fn rooted_decision(
         });
     }
 
+    // Asked about, rather than refused. `ROOTED_APPROVAL_DENY_REASON` said "do it in the window" and
+    // there was nowhere in the window to do it — which made a coding conversation stop at the first
+    // action the classifier did not recognise as read-only.
+    //
+    // `asking` and not a verdict, because the hook has five seconds and a person does not. The fast
+    // path stays fast; the waiting happens on a second call the hook makes only when it hears this.
+    // A script too old to know the word fails closed on an unrecognised verdict, which is the same
+    // refusal it gave before.
+    //
+    // `detail_of` and not the whole input, for the reason it exists: a `Write` carries the file it
+    // is writing, and a window that printed that argument would print the file.
+    if let Some(chat_id) = chat_of_run(&state.pool, run_id).await {
+        crate::hooks::ask_about(
+            &chat_id,
+            run_id,
+            &payload.tool_name,
+            crate::runner::detail_of(&payload.tool_input),
+        );
+        return Json(Decision {
+            decision: "asking".to_owned(),
+            reason: classification.reason,
+        });
+    }
+
+    // No conversation to ask — which is not a state a rooted turn can be in, since being rooted is a
+    // property of its chat. Refused the way it always was rather than allowed on a technicality.
     Json(Decision {
         decision: "deny".to_owned(),
         reason: ROOTED_APPROVAL_DENY_REASON.to_owned(),
@@ -1469,6 +1628,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::post;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     async fn test_state() -> AppState {
@@ -1661,36 +1821,270 @@ mod tests {
         token
     }
 
-    /// `run_id` comes from the request body, so it is a claim the caller makes about itself. Every
-    /// branch in this handler reads `mode` from that id, so a run able to name another run's id
-    /// picks which rules it is judged by — a `shadow` run could ask under a `worktree` run's id and
-    /// be handed the worktree ruleset, and an in-flight run's id could be used to terminate it.
+    /// A rooted turn that needs approving is ASKED about, rather than refused outright.
+    ///
+    /// This is the wall a coding conversation hits. The classifier sends everything not provably
+    /// read-only for approval, and a chat turn cannot park a proposal — one expects a worktree run
+    /// to resume into and a conversation has none — so the answer was a refusal telling the person
+    /// to go and do it somewhere else. There is nowhere else: it is their window, they are watching
+    /// it, and the useful reply to somebody watching is a question.
+    ///
+    /// `asking` and not a verdict, because the hook has five seconds and a person does not. The
+    /// fast path stays fast and the waiting happens on a second call.
     #[tokio::test]
-    async fn a_run_may_only_ask_the_gate_about_itself() {
+    async fn a_rooted_turn_that_needs_approving_is_asked_about_rather_than_refused() {
         let state = test_state().await;
-        let mine = in_flight_run(&state, "shadow", None, None, None).await;
-        let other = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
-        let my_key = key_for(&state, mine).await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+        let key = crate::auth::mint_chat_token(&state.pool, &chat_id)
+            .await
+            .unwrap();
         let app = test_router(state.clone());
 
         let decision = decide_as(
+            &app,
+            &key,
+            &format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"npm publish"}}}}"#
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "asking");
+        let waiting = asks_for(&chat_id);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].tool, "Bash");
+        assert_eq!(waiting[0].detail.as_deref(), Some("npm publish"));
+        answer_ask(&waiting[0].id, false);
+    }
+
+    /// Saying yes lets the call through; saying no refuses it. The waiting call is what the hook is
+    /// sitting on, and its answer is what the CLI is finally told.
+    #[tokio::test]
+    async fn what_the_person_says_is_what_the_tool_call_is_told() {
+        for (allowed, expected) in [(true, "allow"), (false, "deny")] {
+            let state = test_state().await;
+            let root = tempfile::TempDir::new().unwrap();
+            let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+            let id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+            let waiting =
+                tokio::spawn(async move { wait_for_run(run_id, Duration::from_secs(5)).await });
+
+            // The window answering, a moment later, as a person does.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(answer_ask(&id, allowed));
+
+            let answer = waiting.await.unwrap();
+            assert_eq!(
+                answer.map(|yes| if yes { "allow" } else { "deny" }),
+                Some(expected)
+            );
+        }
+    }
+
+    /// An ask nobody answers is refused, not left open.
+    ///
+    /// The CLI is holding a hook call while this waits, and the model is holding a turn behind that.
+    /// Fail closed and say why: a person who stepped away gets a refused tool call, not a
+    /// conversation that hangs until something else times it out.
+    #[tokio::test]
+    async fn an_ask_nobody_answers_is_refused() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let _id = ask_about(&chat_id, run_id, "Bash", None);
+        let answer = wait_for_run(run_id, Duration::from_millis(30)).await;
+
+        assert_eq!(answer, None);
+        // And it is gone, rather than sitting in the window as a question about a turn that has
+        // already moved on.
+        assert!(asks_for(&chat_id).is_empty());
+    }
+
+    /// A run waits on ITS OWN ask and can reach no other, which is what stops one turn answering
+    /// for another — or consuming the question somebody else is being asked.
+    #[tokio::test]
+    async fn a_run_waits_on_its_own_ask_and_reaches_no_other() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let id = ask_about(&chat_id, run_id, "Bash", None);
+
+        // A different run, waiting: there is nothing of its own to wait for.
+        assert_eq!(
+            wait_for_run(run_id + 1, Duration::from_millis(30)).await,
+            None
+        );
+        // And the question that was not theirs is still standing.
+        assert_eq!(asks_for(&chat_id).len(), 1);
+        answer_ask(&id, false);
+    }
+
+    /// A conversation with a directory and a running turn, which is what `rooted_decision` needs.
+    async fn rooted_conversation(state: &AppState, root: &tempfile::TempDir) -> (String, i64) {
+        let chat_id = format!("asking-{}", crate::auth::generate_uuid_v4());
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES (?, 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(&chat_id)
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        // An id of its own, and not the one this pool would hand out. Every test has its own
+        // in-memory database, so every one of them would call its first run `1` — while the ask
+        // registry is a single process-wide map, exactly as it is in the daemon. Real run ids are
+        // unique because there is one database; here they have to be made so.
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(90_000);
+        let run_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, chat_id, created_at)
+             VALUES (?, 'x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(&chat_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (chat_id, run_id)
+    }
+
+    /// A living conversation's turn is judged on what IT read, not on what its first turn read.
+    ///
+    /// This is the hole a kept process opens, and it is not the one the key closed. `ask_daemon.py`
+    /// echoes `NUCLEOS_RUN_ID` out of an environment fixed at spawn, so from the second turn on the
+    /// claim in the body names the FIRST turn — for the rest of the conversation. The handler
+    /// resolves the real turn from the key; every branch it hands the payload to was still reading
+    /// the claim.
+    ///
+    /// What that costs is the ordering rule: read what you like, act while nothing third-party has
+    /// entered the turn, but not both and not in that order. A turn that read a stranger's text is
+    /// marked on ITS row, and a barrier checking the first turn's row finds nothing there — so the
+    /// rule holds on turn one and is walked around on every turn after it, in the exact
+    /// conversations that were given Bash, Read and Write.
+    #[tokio::test]
+    async fn a_living_conversations_turn_is_judged_on_what_it_read_not_on_what_its_first_turn_did()
+    {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES ('live-chat', 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // The turn the process was started for, long finished — and clean.
+        let first = turn_of(&state, "live-chat").await;
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        // The turn being answered right now, down the same living process, which has read a
+        // stranger's text.
+        let now = turn_of(&state, "live-chat").await;
+        crate::runs::mark_untrusted_context(&state.pool, now)
+            .await
+            .unwrap();
+
+        let key = crate::auth::mint_chat_token(&state.pool, "live-chat")
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        // The process still echoes the id it was spawned with, because that is the only id it has.
+        let decision = decide_as(
+            &app,
+            &key,
+            &format!(
+                r#"{{"run_id":{first},"tool_name":"Bash","tool_input":{{"command":"echo hi"}}}}"#
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, UNTRUSTED_CONTEXT_DENY_REASON);
+    }
+
+    /// One running turn of a conversation, the shape a chat turn's row actually has.
+    async fn turn_of(state: &AppState, chat_id: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('x', 'running', 'assistant', ?, '2026-07-17T00:00:00Z')",
+        )
+        .bind(chat_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// `run_id` comes from the request body, so it is a claim the caller makes about itself. Every
+    /// branch in this handler reads `mode` from that id, so a run able to name another run's id
+    /// picks which rules it is judged by — a `shadow` run could ask under a `worktree` run's id and
+    /// be handed the worktree ruleset — and could spend another run's denial allowance to have it
+    /// stopped.
+    ///
+    /// So the key decides and the claim is ignored, rather than the two being compared and a
+    /// mismatch refused. The guarantee is the same one, kept by construction instead of by
+    /// inspection; what changes is that a stale claim is now merely irrelevant rather than fatal,
+    /// which is what a CLI kept alive across turns needs — it is handed its environment once, at
+    /// spawn, and would echo the first turn's id for the rest of the conversation.
+    #[tokio::test]
+    async fn the_gate_judges_a_turn_by_its_key_and_not_by_the_id_it_claims() {
+        let state = test_state().await;
+        // A `worktree` run borrowing a `shadow` run's id, because that is the direction with
+        // something to gain: shadow's whole premise is that it records what it WOULD have done and
+        // is never stopped for it, so a real run judged by shadow's rules would be a run that can
+        // probe the classifier forever.
+        let mine = in_flight_run(&state, "worktree", Some("proj-1"), None, None).await;
+        let other = in_flight_run(&state, "shadow", None, None, None).await;
+        let my_key = key_for(&state, mine).await;
+        let app = test_router(state.clone());
+
+        // Naming the shadow run does not buy shadow's ruleset: the answer is the one this run's own
+        // mode earns, whichever id it wrote down.
+        let claimed = decide_as(
             &app,
             &my_key,
             &format!(r#"{{"run_id":{other},"tool_name":"Read","tool_input":{{}}}}"#),
         )
         .await;
-        assert_eq!(decision.decision, "deny");
-        assert_eq!(decision.reason, "a run may only ask about itself");
-
-        // And the same key asking about its own run is answered normally — the check is about the
-        // id, not about run tokens being second-class.
         let own = decide_as(
             &app,
             &my_key,
             &format!(r#"{{"run_id":{mine},"tool_name":"Read","tool_input":{{}}}}"#),
         )
         .await;
+        assert_eq!(claimed.decision, own.decision);
         assert_eq!(own.decision, "allow");
+
+        // And the denials it spends are its own — counted against the run that actually made them,
+        // not against the one it named. Otherwise borrowing an id would be a way to stop any run in
+        // the house from behind a key that governs one.
+        let probe = format!(
+            r#"{{"run_id":{other},"tool_name":"Bash","tool_input":{{"command":"rm -rf /"}}}}"#
+        );
+        for _ in 0..DENIAL_LIMIT {
+            assert_eq!(decide_as(&app, &my_key, &probe).await.decision, "deny");
+        }
+        let handles = state.run_handles.lock().unwrap();
+        assert!(
+            !handles.contains_key(&mine),
+            "the prober's own run is stopped"
+        );
+        assert!(
+            handles.contains_key(&other),
+            "the run whose id it borrowed is untouched"
+        );
     }
 
     /// A `deny` used to cost the run nothing, so a lexical classifier could be searched: try a
@@ -2884,12 +3278,19 @@ mod tests {
         assert_eq!(decision.decision, "deny");
     }
 
-    /// Refused, and NOT parked. Parking mints a proposal that expects a worktree run to resume into,
-    /// and a conversation has none — the turn would die owing an approval nobody can grant. It is
-    /// also the right answer on its own terms: a rooted turn requires `Origin::Shell`, so the owner
-    /// is at the window while this is being asked.
+    /// ASKED about, and still NOT parked. The two are separate facts and both matter.
+    ///
+    /// Parking mints a proposal that expects a worktree run to resume into, and a conversation has
+    /// none — the turn would die owing an approval nobody can grant. That has not changed and is
+    /// asserted below.
+    ///
+    /// What changed is the other half. A rooted turn requires `Origin::Shell`, so the owner IS at
+    /// the window while this is being decided — and the honest thing to do with somebody who is
+    /// watching is ask them. It used to be refused with a sentence telling them to do it somewhere
+    /// else, and there was nowhere else, which stopped a coding conversation at the first action
+    /// the classifier did not recognise as read-only.
     #[tokio::test]
-    async fn a_rooted_turn_is_refused_rather_than_parked_when_something_needs_approving() {
+    async fn a_rooted_turn_is_asked_about_rather_than_parked_when_something_needs_approving() {
         let state = test_state().await;
         let app = test_router(state.clone());
         let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
@@ -2902,7 +3303,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.decision, "asking");
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
             .fetch_one(&state.pool)
@@ -2910,13 +3311,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             status, "running",
-            "the conversation was terminated by a refusal"
+            "the conversation was terminated by a question"
         );
         let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(proposals, 0, "a refusal left a proposal nobody can resume");
+        assert_eq!(proposals, 0, "a question left a proposal nobody can resume");
     }
 
     /// The barrier follows the tools. Without this the rule would hold on the MCP side and be walked

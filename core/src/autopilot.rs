@@ -259,12 +259,19 @@ const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
 /// This daemon's classifier hook, carried inside the binary so it can be installed anywhere.
 ///
+/// **Under `core/hooks/` and not under `.claude/`, which is where it used to live.** This is the
+/// source of an artefact the daemon SHIPS — it is written into every project that asks for tools —
+/// and `.claude/` is a directory this repository's own pre-commit guard refuses to let anything be
+/// staged into. A build input that cannot be changed is not a build input, and the contradiction was
+/// not theoretical: the daemon wiring THIS repository overwrites the copy under `.claude/`, which
+/// then shows as a modified tracked file that nothing is allowed to commit.
+///
 /// `include_str!` rather than a path resolved at runtime: the daemon that ANSWERS the hook and the
 /// script that ASKS it are two halves of one protocol. A copy read off disk at install time could
 /// be any version — including one left behind by a daemon that is no longer running — and the two
 /// disagreeing is a gate that fails open or a session that cannot act, neither of which announces
 /// itself.
-const HOOK_SOURCE: &str = include_str!("../../.claude/hooks/ask_daemon.py");
+const HOOK_SOURCE: &str = include_str!("../hooks/ask_daemon.py");
 
 /// How the hook is registered, spelled exactly as `classifier_hook_is_wired` looks for it.
 ///
@@ -486,6 +493,27 @@ pub async fn list_scoped_kills(pool: &SqlitePool) -> sqlx::Result<Vec<ScopedKill
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The script the daemon SHIPS knows the verdict the daemon GIVES.
+    ///
+    /// `hooks.rs` answers `asking` for a tool call somebody has to allow, and comes back to
+    /// `/hooks/ask-wait` for the answer. A script that does not know either word fails closed on an
+    /// unrecognised verdict — a refusal with a worse message than the one it replaced, and no way
+    /// for anybody to say yes.
+    ///
+    /// The two halves live in different files and are only true together. Asserted here rather than
+    /// left to whoever next edits one of them.
+    #[test]
+    fn the_shipped_hook_knows_how_to_wait_for_an_answer() {
+        assert!(
+            HOOK_SOURCE.contains("asking"),
+            "the shipped hook does not know the verdict this daemon gives"
+        );
+        assert!(
+            HOOK_SOURCE.contains("/hooks/ask-wait"),
+            "the shipped hook does not know where to wait for an answer"
+        );
+    }
     use std::fs;
     use tempfile::TempDir;
 

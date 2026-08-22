@@ -48,7 +48,11 @@ pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(900);
 pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
 
 /// In-flight steerable runs' turn channels, keyed by `runs.id`.
-pub type RunMessages = Arc<Mutex<HashMap<i64, tokio::sync::mpsc::UnboundedSender<String>>>>;
+///
+/// `LaterTurn` and not `String`: a turn arriving after the one a run was launched with can carry
+/// pictures too, which is what lets a conversation keep its process when somebody pastes one.
+pub type RunMessages =
+    Arc<Mutex<HashMap<i64, tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>>>>;
 
 /// In-flight runs' transcripts as they fill, keyed by `runs.id`.
 ///

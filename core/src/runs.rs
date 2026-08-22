@@ -1286,6 +1286,8 @@ fn spawn_run(
                 mirror_context_fill(&pool, id, std::sync::Arc::clone(&context_fill));
             let mut request = crate::runner::RunRequest {
                 prompt: prompt.clone(),
+                // A background run carries no pictures: nobody is here to attach one.
+                images: Vec::new(),
                 env: env.clone(),
                 cwd: spawn_cwd.clone(),
                 plan_only,
@@ -1322,7 +1324,8 @@ fn spawn_run(
             // failed is not owed to its retry — and `insert` replaces the previous attempt's sender,
             // so nothing can go on holding a stale one.
             if request.steerable {
-                let (messages_tx, messages_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let (messages_tx, messages_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
                 run_messages.lock().unwrap().insert(id, messages_tx);
                 request.messages = Some(messages_rx);
             }
