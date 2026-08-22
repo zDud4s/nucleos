@@ -639,6 +639,13 @@ pub async fn upsert_session(
 /// Encoding, not validating: the id stays opaque (chats are not required to look like numbers, and
 /// the tests rely on that), and the mapping stays injective, so two chats differing only in an
 /// escaped character cannot collide onto one file and clobber each other's config mid-turn.
+///
+/// **The process id is in the name, and it is not decoration.** The temp directory is shared by
+/// every process on the machine, so a name built only from the id is the SAME path in two of them
+/// — and both write it and both delete it. On this machine that is not hypothetical: the daemon
+/// runs while suites run, and several checkouts run suites at once, each with tests that use fixed
+/// ids. One deleting the other's config mid-turn is a failure with no cause visible anywhere near
+/// it. `transcribe.rs` already names its recordings this way, for the same reason.
 fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
     let mut safe = String::with_capacity(chat_id.len());
     for byte in chat_id.bytes() {
@@ -648,7 +655,7 @@ fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
             other => safe.push_str(&format!("%{other:02x}")),
         }
     }
-    std::env::temp_dir().join(format!("nucleos-mcp-{safe}.json"))
+    std::env::temp_dir().join(format!("nucleos-mcp-{}-{safe}.json", std::process::id()))
 }
 
 fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
@@ -3506,10 +3513,14 @@ mod tests {
         assert_ne!(mcp_config_path("a%2fb"), mcp_config_path("a/b"));
 
         // The ordinary case stays readable rather than being hex soup: a real Telegram group id.
+        // Asserted around the process id rather than over it — pinning the whole name would pin
+        // this process's pid, which is a different number every run.
+        let readable = mcp_config_path("-1001234567890");
+        let readable = readable.to_string_lossy();
+        assert!(readable.ends_with("--1001234567890.json"), "got {readable}");
         assert!(
-            mcp_config_path("-1001234567890")
-                .to_string_lossy()
-                .ends_with("nucleos-mcp--1001234567890.json")
+            readable.contains(&format!("nucleos-mcp-{}-", std::process::id())),
+            "the config has to be this process's, or two suites share one file: {readable}"
         );
     }
 

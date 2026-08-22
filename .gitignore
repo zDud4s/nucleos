@@ -89,3 +89,4 @@ memory-archive.md
 design/
 docs/*
 !docs/.gitkeep
+shell/target-test/
