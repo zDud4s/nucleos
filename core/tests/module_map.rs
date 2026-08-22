@@ -8,6 +8,12 @@ fn the_module_map_matches_the_files_on_disk() {
     let map_path = manifest_dir.join("AGENTS.md");
 
     // AGENTS.md is ignored, so its absence means this checkout does not carry the map to check.
+    //
+    // **This early return is why a stale map imitates a flake, and it cost a diagnosis.** The file
+    // exists in the main checkout and in no worktree, so the same commit is GREEN wherever the gate
+    // happens to run from a worktree and RED from the checkout — intermittent-looking, entirely
+    // deterministic, and nothing in the output says which of the two just happened. A red here is
+    // never a race: it is two modules added without a row, and the fix is to write the rows.
     if !map_path.exists() {
         return;
     }
@@ -58,9 +64,13 @@ fn the_module_map_matches_the_files_on_disk() {
 /// `TempDir` that has since been deleted. They then share a root, and two of them creating a job
 /// with the same id collide on `nucleos/job-<id>`.
 ///
-/// The failure that produces reads as a bug in worktree adoption, arrives about once in a dozen full
-/// runs depending on the order the thread pool happened to pick, and is neither. It cost this
-/// repository a diagnosis it could not reproduce.
+/// The failure that would produce reads as a bug in worktree adoption and is not one.
+///
+/// **Corrected 2026-08-22: this said it "arrives about once in a dozen full runs", and that rate
+/// was never measured.** It was inferred while hunting a red that was assumed intermittent and was
+/// not — see the note on the early return above. Twenty-two archived full runs, six of them at
+/// `--test-threads=32`, have never produced this failure. The hazard is real and reads straight off
+/// `worktree_root`; how often it would bite is unknown.
 ///
 /// Each module that needs the variable carries its own `WorktreeRootEnv` guard, which records the
 /// previous value and restores it on drop — two `set_var` calls, one in `set` and one in `drop`. So
@@ -82,14 +92,23 @@ fn nothing_sets_the_worktree_root_without_restoring_it() {
             continue;
         }
         let text = fs::read_to_string(entry.path()).expect("a source file should be readable");
+        // BOTH verbs, and counting `remove_var` is not symmetry for its own sake: the guard's
+        // `drop` restores by SETTING the old value or by REMOVING it when there was none, so a
+        // module that only ever removed the variable would have zero `set_var` and slip past this
+        // check entirely. One had exactly that — a bare `remove_var` left behind in `runs.rs`
+        // when the guard went in — and this test called the module clean.
         let sets = text.matches(r#"set_var("NUCLEOS_WORKTREE_ROOT""#).count();
-        if sets == 0 {
+        let removes = text
+            .matches(r#"remove_var("NUCLEOS_WORKTREE_ROOT""#)
+            .count();
+        if sets == 0 && removes == 0 {
             continue;
         }
+        // Two sets and one remove: `set` writes once, `drop` writes once or removes once.
         let guards = text.contains("struct WorktreeRootEnv");
-        if !guards || sets > 2 {
+        if !guards || sets > 2 || removes > 1 {
             offenders.push(format!(
-                "{name}: {sets} bare set(s), guard present: {guards}"
+                "{name}: {sets} set(s), {removes} remove(s), guard present: {guards}"
             ));
         }
     }
