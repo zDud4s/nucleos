@@ -52,6 +52,8 @@ import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
 import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
+import { useVoiceConversation } from "../data/conversation";
+import type { ConversationPhase } from "../lib/conversation";
 import {
   Badge,
   Button,
@@ -1958,6 +1960,7 @@ function Composer({ chatId }: { chatId: string }) {
             }}
           />
         </label>
+        <HandsFree chatId={chatId} />
         <Button type="submit" intent="go" disabled={!sayable}>
           Send
         </Button>
@@ -1966,6 +1969,63 @@ function Composer({ chatId }: { chatId: string }) {
     </form>
   );
 }
+
+/**
+ * Talking to this chat instead of typing to it.
+ *
+ * Lives beside Send rather than in the Voice tab, because it belongs to a CONVERSATION and the Voice
+ * tab has none: a spoken turn has to name the chat it joins, and `core/src/voice.rs` refuses one that
+ * does not rather than guessing. The Voice tab still owns the chord that toggles this, for the
+ * unrelated reason that registering hotkeys is indivisible — see the effect there.
+ *
+ * Every decision the button appears to make is somewhere else: `lib/conversation.ts` decides what the
+ * phases are, `lib/vad.ts` decides when somebody is talking, and `data/conversation.ts` runs the
+ * microphone. What is here is a label and two sentences.
+ */
+function HandsFree({ chatId }: { chatId: string }) {
+  const voice = useVoiceConversation(chatId);
+  const on = voice.phase !== "off";
+
+  return (
+    <div className="chats-handsfree">
+      <Button
+        type="button"
+        intent={on ? "stop" : "go"}
+        aria-pressed={on}
+        onClick={voice.toggle}
+      >
+        {on ? "Stop talking" : "Talk"}
+      </Button>
+      {on && <span className="chats-handsfree-phase">{HANDS_FREE_PHASES[voice.phase]}</span>}
+      {/* Shown as soon as it is heard and BEFORE the answer, because a misheard question that only
+          becomes visible once it has been answered is a question nobody got to correct. */}
+      {voice.heard !== null && (
+        <span className="chats-handsfree-heard">heard: “{voice.heard}”</span>
+      )}
+      {on && !voice.hasVoice && (
+        <span className="chats-handsfree-phase">
+          no voice on this machine — the answer will be written
+        </span>
+      )}
+      {voice.trouble !== null && <ErrorNote>{voice.trouble}</ErrorNote>}
+    </div>
+  );
+}
+
+/**
+ * What each phase is called on screen.
+ *
+ * `speaking` says "answering" rather than "speaking" so the two participants are never described
+ * with the same word — with the microphone open during the answer, which of the two is talking is
+ * exactly what a person needs to be able to tell at a glance.
+ */
+const HANDS_FREE_PHASES: Record<ConversationPhase, string> = {
+  off: "",
+  listening: "listening",
+  hearing: "hearing you",
+  thinking: "thinking",
+  speaking: "answering",
+};
 
 /**
  * What the caret is offering, above the box rather than below it.

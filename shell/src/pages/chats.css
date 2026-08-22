@@ -593,6 +593,37 @@
 .chats-composer-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* ------------------------------------------------------------- hands free -- */
+
+/* Pushed to the left of Send, and wrapping rather than growing: the transcript it shows is a whole
+   spoken sentence, and a row that widened for it would move the Send button as somebody talks. */
+.chats-handsfree {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-right: auto;
+  min-width: 0;
+}
+
+.chats-handsfree-phase {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* The transcript, kept to one line. What matters is being able to see AT A GLANCE that the question
+   was heard wrong; reading all of a long one back is what the chat's own transcript is for. */
+.chats-handsfree-heard {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  max-width: 32ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ----------------------------------------------- picked up from the editor -- */

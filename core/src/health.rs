@@ -141,7 +141,12 @@ async fn collect_readout(state: AppState) -> HealthReadout {
     let github_binary = state.github.binary.clone();
     let voice_armed = state.voice.armed;
     let stt_command = state.voice.stt_command.clone();
-    let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice, github) = tokio::join!(
+    // `speaker.is_some()` and not `!tts_command.is_empty()`: `speaker_for` is the one place that
+    // decides whether a command becomes a capability, and a probe that re-derives that condition is a
+    // second opinion about it. The transcriber probe learned this the hard way with `split_command`.
+    let voice_speaks = state.voice.speaker.is_some();
+    let tts_command = state.voice.tts_command.clone();
+    let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice, speaker, github) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
         run_subsystem("credential_manager", credential_manager_probe()),
@@ -170,6 +175,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             sidecar_probe("browser_sidecar", crate::sidecar::BROWSER, browser_enabled),
         ),
         run_subsystem("voice_transcriber", voice_probe(voice_armed, stt_command)),
+        run_subsystem("voice_speaker", speaker_probe(voice_speaks, tts_command)),
         run_subsystem("github", github_probe(github_asked_for, github_binary)),
     );
     let subsystems = vec![
@@ -183,6 +189,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         web,
         browser,
         voice,
+        speaker,
         github,
     ];
 
@@ -270,6 +277,38 @@ async fn cli_probe() -> SubsystemReadout {
 async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
     run_probe("voice_transcriber", async move {
         if !armed {
+            return Ok(HealthState::Ok);
+        }
+        let program = crate::transcribe::split_command(&command)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let resolved =
+            tokio::task::spawn_blocking(move || resolve_program(std::ffi::OsStr::new(&program)))
+                .await
+                .map_err(classify_error)?
+                .ok_or(FailureCategory::Missing)?;
+        exec_probe(resolved.to_string_lossy().into_owned(), "--help").await
+    })
+    .await
+}
+
+/// Whether the configured speaker is a program that runs here.
+///
+/// The transcriber probe's twin, down to splitting through the same `split_command` for the same
+/// reason — a probe that parses its subject differently from the code that spawns it raises the alarm
+/// on exactly the configuration it was added to bless.
+///
+/// One difference, and it is the whole reason this is a separate row rather than a second check
+/// inside `voice_probe`: a missing SPEAKER is not a missing pillar. Voice with no TTS still hears the
+/// question and still answers it, in writing. Folding the two together would paint a working
+/// conversation red for lacking a voice, and this module's header says what that costs — it teaches
+/// people to ignore the readout when it matters.
+///
+/// Not configured is `Ok`. A núcleo that does not speak is a choice, not a fault.
+async fn speaker_probe(configured: bool, command: String) -> SubsystemReadout {
+    run_probe("voice_speaker", async move {
+        if !configured {
             return Ok(HealthState::Ok);
         }
         let program = crate::transcribe::split_command(&command)

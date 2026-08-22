@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "./client";
+import { apiBlob, apiFetch, ApiRefusal } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
 
@@ -43,6 +43,17 @@ export interface VoiceConfigView {
   hotkey: string;
   /** `""` when unconfigured — never `null`. */
   memo_hotkey: string;
+  /** The chord that toggles hands-free conversation. `""` when unconfigured. */
+  conversation_hotkey: string;
+  /**
+   * Whether an answer can be SPOKEN, as opposed to merely arrived at.
+   *
+   * Deliberately not folded into `armed`: a machine with an STT engine and no
+   * TTS one has a working conversation that is READ rather than heard, and a
+   * single flag would hide the working half behind the missing one. The window
+   * uses this to decide whether to poll for audio at all.
+   */
+  speaks: boolean;
   max_capture_seconds: number;
   max_body_bytes: number;
 }
@@ -73,6 +84,37 @@ export interface CaptureResult {
   text: string;
   state: "cleaned" | "raw" | "shrunk";
 }
+
+/**
+ * What `POST /voice/capture?kind=conversation` answers — `voice.rs`'s `Conversed`.
+ *
+ * `turn_id` is `null` exactly when `queued` is true: the chat already had a
+ * turn in flight and the núcleo kept this one. There is no answer to poll for
+ * yet, and the one that eventually arrives belongs to the queued message.
+ */
+export interface ConversedResult {
+  /** What the transcriber heard, so the window can show it without waiting for the answer. */
+  text: string;
+  turn_id: number | null;
+  queued: boolean;
+}
+
+/**
+ * What one request for a unit of spoken answer came back as.
+ *
+ * Three outcomes and not two, because the caller does three different things
+ * with them and collapsing "not yet" into "no more" is how a client comes to
+ * poll a finished turn forever. Mirrors the three statuses `voice.rs`'s
+ * `get_turn_speech` documents: 200, 204, 404.
+ */
+export type SpeechUnit =
+  | { type: "audio"; wav: Blob }
+  /** The turn is still thinking. Ask again. */
+  | { type: "notYet" }
+  /** The answer ran out, or there was never one. Stop asking. */
+  | { type: "ended" }
+  /** This machine has no TTS engine. Stop asking, and read the answer instead. */
+  | { type: "noVoice" };
 
 /** The pillar's own configuration — read-only from this page. */
 export function useVoiceConfig() {
@@ -167,6 +209,80 @@ export function postCapture(
     headers: { "Content-Type": "application/octet-stream" },
     body: bytes,
   });
+}
+
+/**
+ * Post one conversation turn. `POST /voice/capture?kind=conversation&chat_id=&duration_ms=&format=`
+ *
+ * Separate from {@link postCapture} rather than a third `kind` on it, because
+ * the two answer different shapes: a dictation comes back as text to paste,
+ * and this comes back as a place to listen. A union return would make every
+ * caller narrow a type it already knew.
+ *
+ * `chatId` is required by the route and has no default — `voice.rs` refuses a
+ * turn that names no chat rather than guessing one, because a daemon with no
+ * window has no idea which conversation is open.
+ *
+ * Returns `undefined` on `204`, which here means the microphone heard nothing.
+ */
+export function postConversation(
+  bytes: Uint8Array,
+  chatId: string,
+  durationMs: number,
+  format = "wav",
+): Promise<ConversedResult | undefined> {
+  const params = new URLSearchParams({
+    kind: CONVERSATION_KIND,
+    chat_id: chatId,
+    duration_ms: String(Math.max(0, Math.round(durationMs))),
+    format,
+  });
+  return apiFetch<ConversedResult | undefined>(`/voice/capture?${params.toString()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: bytes,
+  });
+}
+
+/**
+ * The wire spelling of the third kind.
+ *
+ * A constant because it is a contract with `core/src/voice.rs`'s `Kind`, which
+ * serialises `rename_all = "lowercase"`, and the value travels as a query
+ * string — so a mismatch is a runtime refusal and nothing at compile time. The
+ * other two spellings are pinned by a test in `shell/src-tauri/src/dictation.rs`
+ * because Rust produces them; this one is produced here, so it is pinned here.
+ */
+export const CONVERSATION_KIND = "conversation";
+
+/**
+ * One unit of a turn's answer, as audio. `GET /voice/turns/{id}/speech/{index}`
+ *
+ * Written against {@link apiBlob} and its refusals rather than with a bespoke
+ * fetch, so this route inherits the daemon token and the transport handling
+ * every other call has. The three statuses come back as three outcomes:
+ *
+ * - **204** reaches us as an empty blob, because `request` treats it as success.
+ *   An empty body cannot be confused with real audio: `speak.rs` refuses to
+ *   return zero bytes precisely so that silence is never a valid answer.
+ * - **404** and **503** arrive as {@link ApiRefusal}, and the status tells them
+ *   apart — one means this answer is over, the other that this machine has no
+ *   voice at all. A caller that treated both as "stop" would stop for the right
+ *   reason and show the wrong one.
+ *
+ * Anything else is rethrown. A daemon that is down is not an answer that ended.
+ */
+export async function fetchSpeechUnit(turnId: number, index: number): Promise<SpeechUnit> {
+  try {
+    const wav = await apiBlob(`/voice/turns/${turnId}/speech/${index}`);
+    return wav.size === 0 ? { type: "notYet" } : { type: "audio", wav };
+  } catch (error) {
+    if (error instanceof ApiRefusal) {
+      if (error.status === 404) return { type: "ended" };
+      if (error.status === 503) return { type: "noVoice" };
+    }
+    throw error;
+  }
 }
 
 /* ------------------------------------------------------- capture phases -- */
