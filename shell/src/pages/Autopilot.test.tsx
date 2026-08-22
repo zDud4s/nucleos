@@ -283,6 +283,42 @@ describe("Autopilot - the trigger brakes say which of them the núcleo reads", (
     expect(within(team).queryByText(/nothing in it reads the value/)).toBeNull();
   });
 
+  /**
+   * A job with a team and a job without one ran the same list line, and they are
+   * not the same thing: one is a queue in a single checkout, the other is a
+   * checkout per item with several moving at once. The ceiling travels with the
+   * name because the name alone does not say what having a team buys.
+   */
+  it("says which jobs in flight a team is directing, and how wide they may go", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha" })],
+      jobs: [
+        {
+          id: 41,
+          project_id: "alpha",
+          rule_name: null,
+          status: "implementing",
+          wait_reason: null,
+          max_items: 4,
+          created_at: "2026-08-21T09:00:00Z",
+          completed_at: null,
+          slot: 0,
+          round: 0,
+          max_rounds: 3,
+          team_id: "infra",
+          team_name: "Infra",
+          team_max_parallel: 3,
+        },
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const list = await screen.findByRole("list", { name: "Jobs in flight" });
+    expect(within(list).getByText(/Infra, up to 3 at once/)).toBeDefined();
+  });
+
   it("holds and releases the team trigger scope", async () => {
     const world = cockpitWorld({ projects: [project({ project_id: "alpha" })] });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));

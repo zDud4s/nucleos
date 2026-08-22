@@ -168,8 +168,33 @@
   letter-spacing: normal;
 }
 
+/**
+ * The team picker sits on its own line rather than in the fields row.
+ *
+ * Its options are sentences -- a name and a ceiling -- where budget and rounds
+ * are two-character numbers, so sharing that row would either truncate the
+ * option text or stretch the row to the width of the longest team name.
+ */
+.fleet-new-job-team {
+  flex: none;
+}
+
+.fleet-new-job-field select {
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
 .fleet-new-job-prompt:focus-visible,
-.fleet-new-job-field input:focus-visible {
+.fleet-new-job-field input:focus-visible,
+.fleet-new-job-field select:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
@@ -407,6 +432,33 @@
 .fleet-item-why {
   margin: 0 0 0 var(--space-4);
   font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* Said once above the queue: it is a fact about the job, not about a row. */
+.fleet-items-team {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/**
+ * Who has the item, what it waits for, what it will touch.
+ *
+ * Indented under the row it belongs to and set in the muted colour, because it
+ * explains a row rather than being one -- the same relationship, and the same
+ * indent, `.fleet-item-why` already has to its own row.
+ */
+.fleet-item-direction {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 0 var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.fleet-item-agent {
   color: var(--text-muted);
 }
 

@@ -61,11 +61,13 @@ import type {
   HeldSlot,
   Job,
   JobDetail,
+  JobItem,
   ProjectConcurrency,
   RunSearchResult,
 } from "../data/fleet";
 import { daemonFetch, daemonState, project, proposal, renderWithRouter } from "../test/harness";
 import type { Proposal } from "../data/system";
+import type { TeamView } from "../data/teams";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -87,6 +89,56 @@ function slot(overrides: Partial<HeldSlot> = {}): HeldSlot {
     job_id: null,
     ordinal: null,
     item_status: null,
+    ...overrides,
+  };
+}
+
+/**
+ * One item of a job's queue.
+ *
+ * The four directed fields default to *nobody was asked*, which is what the
+ * daemon really sends for every item of every job without a team. A fixture
+ * that filled them in would make every test in this file read as a directed
+ * job, and the two are supposed to look different.
+ */
+function item(overrides: Partial<JobItem> = {}): JobItem {
+  return {
+    ordinal: 0,
+    description: "rename the module",
+    status: "passed",
+    round: 0,
+    run_id: 100,
+    gate_status: "passed",
+    agent_id: null,
+    agent_name: null,
+    depends_on: [],
+    files: [],
+    ...overrides,
+  };
+}
+
+/**
+ * One team of the house catalogue, as `/teams` sends it.
+ *
+ * Local rather than shared with `Teams.test.tsx` for the reason `fleetFetch`
+ * gives about routes: the shared harness is the floor, and a fixture that only
+ * two suites want does not belong in it.
+ */
+function teamView(overrides: Partial<TeamView> = {}): TeamView {
+  return {
+    id: "atendimento",
+    name: "Atendimento",
+    mission: "answer the customers who write in",
+    director_agent_id: "ana",
+    max_rounds: 3,
+    max_parallel: 2,
+    budget_usd: 10,
+    max_open_actions: 5,
+    max_live_runs: 1,
+    created_at: "2026-08-18T09:00:00Z",
+    updated_at: "2026-08-18T09:00:00Z",
+    members: [],
+    grants: [],
     ...overrides,
   };
 }
@@ -117,6 +169,12 @@ function job(overrides: Partial<Job> = {}): Job {
     slot: 0,
     round: 0,
     max_rounds: 3,
+    // Nearly every job. A team is what makes the other three fields non-null,
+    // and the default fixture is the queue in one checkout that the product
+    // has always run.
+    team_id: null,
+    team_name: null,
+    team_max_parallel: null,
     ...overrides,
   };
 }
@@ -142,6 +200,8 @@ interface FleetState {
   exclusions: FleetExclusion[];
   requests: Proposal[];
   details: Record<number, JobDetail>;
+  /** The house catalogue the new-job form offers. Empty in a house with none. */
+  teams: TeamView[];
 }
 
 function fleetState(overrides: Partial<FleetState> = {}): FleetState {
@@ -152,6 +212,10 @@ function fleetState(overrides: Partial<FleetState> = {}): FleetState {
     exclusions: [],
     requests: [],
     details: {},
+    // Empty by default, which is what most of this suite is about: with no
+    // teams the picker is not drawn at all, so every test written before it
+    // existed still describes the page it describes.
+    teams: [],
     ...overrides,
   };
 }
@@ -179,6 +243,8 @@ function fleetFetch(state: FleetState): (path: string, init?: RequestInit) => Pr
         return state.exclusions;
       case "/fleet/exclusions/requests":
         return state.requests;
+      case "/teams":
+        return state.teams;
       default: {
         const detail = /^\/jobs\/(\d+)$/.exec(path);
         if (detail !== null) return state.details[Number(detail[1])];
@@ -494,6 +560,99 @@ describe("Fleet — asking for a job", () => {
     expect(said).toBeDefined();
     expect(said.textContent).not.toMatch(/kill switch/);
   });
+
+  /**
+   * **The gap this closes.** `POST /jobs` has taken a `team_id` since the
+   * parallel work landed and nothing in the product ever sent one, so a job
+   * could only be directed by writing JSON by hand or a `graph:` rule into a
+   * config file. Every job started from the app was the sequential one,
+   * whatever teams the house had.
+   */
+  it("offers the house's teams and sends the one chosen", async () => {
+    const state = fleetState({
+      concurrency: { house: { limit: 4, held: 0 }, projects: [column({ slots: [] })] },
+      teams: [teamView(), teamView({ id: "infra", name: "Infra", max_parallel: 3 })],
+    });
+    daemon.apiFetch.mockImplementation(fleetFetch(state));
+
+    await renderWithRouter(<Fleet />);
+    const picker = await screen.findByLabelText("Team to direct the job in alpha");
+    // The ceiling is on the option and not only the name, because it is the
+    // whole difference between the two choices: a team is what the job runs
+    // items *at once* with, and the number is how many.
+    expect(within(picker as HTMLElement).getByText(/Infra — up to 3 at once/)).toBeDefined();
+
+    fireEvent.change(picker, { target: { value: "infra" } });
+    fireEvent.change(screen.getByLabelText("What to work on in alpha"), {
+      target: { value: "tidy the imports" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "alpha",
+          prompt: "tidy the imports",
+          budget_usd: null,
+          max_rounds: null,
+          team_id: "infra",
+        }),
+      });
+    });
+  });
+
+  /**
+   * Blank is a real choice on this field and not an unfilled one — it is how
+   * every job in the product has always run — so it travels as `null` and never
+   * as `""`. The daemon reads a team it cannot find as a 422, and an empty
+   * string is a team it cannot find.
+   */
+  it("sends no team when none is picked, and draws no picker in a house with none", async () => {
+    const state = fleetState({
+      concurrency: { house: { limit: 4, held: 0 }, projects: [column({ slots: [] })] },
+      teams: [teamView()],
+    });
+    daemon.apiFetch.mockImplementation(fleetFetch(state));
+
+    await renderWithRouter(<Fleet />);
+    fireEvent.change(await screen.findByLabelText("What to work on in alpha"), {
+      target: { value: "tidy the imports" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "alpha",
+          prompt: "tidy the imports",
+          budget_usd: null,
+          max_rounds: null,
+          team_id: null,
+        }),
+      });
+    });
+  });
+
+  /**
+   * Gone rather than disabled, for the reason `max_items` has no field at all:
+   * a control whose only option is the default does nothing, and drawing it
+   * would advertise a feature whose first step is on another page.
+   */
+  it("draws no team picker in a house that has no teams", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: { house: { limit: 4, held: 0 }, projects: [column({ slots: [] })] },
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    await screen.findByLabelText("What to work on in alpha");
+    expect(screen.queryByLabelText("Team to direct the job in alpha")).toBeNull();
+  });
 });
 
 /* ----------------------------------------------------- taking a slot back -- */
@@ -641,24 +800,16 @@ describe("Fleet — a job's items", () => {
               ...job({ round: 1 }),
               branch: "nucleos/job-41",
               items: [
-                {
-                  ordinal: 0,
-                  description: "rename the module",
-                  status: "passed",
-                  round: 0,
-                  run_id: 100,
-                  gate_status: "passed",
-                },
-                {
+                item(),
+                item({
                   ordinal: 1,
                   description: "update the callers",
-                  status: "passed",
                   round: 1,
                   run_id: 101,
                   // Nothing measured this one. `passed` with a NULL gate is
                   // "no gate configured", not "the tests passed".
                   gate_status: null,
-                },
+                }),
               ],
             },
           },
@@ -673,6 +824,99 @@ describe("Fleet — a job's items", () => {
     expect(within(items).getByText("round 2")).toBeDefined();
     expect(within(items).getByText(/no gate configured/i)).toBeDefined();
     expect(within(items).getByText(/gate passed/i)).toBeDefined();
+  });
+
+  /**
+   * **Why these two and not those.** The question a parallel queue provokes and
+   * a sequential one never did — and until the daemon put `agent_id`,
+   * `depends_on` and `files` on the wire, the answer lived only inside the fold
+   * that made the batch. A person watching two of three items move could see
+   * which two and nothing about why.
+   *
+   * The ordinals are shown `+1`, matching the number on the row above them: a
+   * `depends_on` of `[0]` refers to the item drawn as `1`, and printing the raw
+   * value would name a row that is not on screen.
+   */
+  it("a directed job's queue says who has each item and what it waits for", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 1 },
+            projects: [column({ slots: [slot()] })],
+          },
+          jobs: [job()],
+          details: {
+            41: {
+              ...job({ team_id: "infra", team_name: "Infra", team_max_parallel: 3 }),
+              branch: "nucleos/job-41",
+              items: [
+                item({
+                  description: "widen the column",
+                  agent_id: "ana",
+                  agent_name: "Ana Field",
+                  files: ["core/src/job.rs"],
+                }),
+                item({
+                  ordinal: 1,
+                  description: "update the callers",
+                  status: "pending",
+                  gate_status: null,
+                  agent_id: "bo",
+                  agent_name: "Bo Rivers",
+                  depends_on: [0],
+                  files: ["shell/src/data/fleet.ts"],
+                }),
+              ],
+            },
+          },
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    fireEvent.click(await screen.findByRole("button", { name: "Show items" }));
+
+    // The ceiling is said once, above the queue: it is a fact about the job, and
+    // it is what makes two rows running at once legible rather than alarming.
+    expect(await screen.findByText(/up to 3 items at once/)).toBeDefined();
+    expect(screen.getByRole("link", { name: "Infra" }).getAttribute("href")).toBe("/teams/infra");
+
+    const items = screen.getByRole("list", { name: "items of job 41" });
+    expect(within(items).getByText("Ana Field")).toBeDefined();
+    expect(within(items).getByText("core/src/job.rs")).toBeDefined();
+    // `after 1` and not `after 0` — the row it names is the one drawn as `1`.
+    expect(within(items).getByText(/after 1 · shell\/src\/data\/fleet\.ts/)).toBeDefined();
+  });
+
+  /**
+   * A job nobody directs has no answer to give, which is different from an
+   * answer of nothing — so the line is absent rather than empty, and the team
+   * heading with it.
+   */
+  it("says none of that about a job no team directs", async () => {
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          concurrency: {
+            house: { limit: 4, held: 1 },
+            projects: [column({ slots: [slot()] })],
+          },
+          jobs: [job()],
+          details: {
+            41: { ...job(), branch: "nucleos/job-41", items: [item()] },
+          },
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    fireEvent.click(await screen.findByRole("button", { name: "Show items" }));
+
+    await screen.findByRole("list", { name: "items of job 41" });
+    expect(screen.queryByText(/directed by/)).toBeNull();
+    expect(screen.queryByText(/items at once/)).toBeNull();
+    expect(screen.queryByText(/^after /)).toBeNull();
   });
 
   it("says which of two excluded jobs is the one that waits", async () => {

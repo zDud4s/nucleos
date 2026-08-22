@@ -4554,10 +4554,36 @@ pub struct JobSummary {
     /// number back. Copying the slot onto `jobs` would give two truths that can disagree, and the
     /// one the daemon obeys would be the other.
     pub slot: Option<i64>,
+    /// The team directing this job, or `None` for the sequential job in one shared checkout.
+    ///
+    /// Carried on the SUMMARY and not only on the detail, because it changes how every other number
+    /// beside it reads. Three items `running` at once is a stuck queue in a job without a team and
+    /// the entire point of one with it, and nothing else in this struct tells a reader which of the
+    /// two they are looking at.
+    pub team_id: Option<String>,
+    /// The team's name, joined so that nothing downstream has to render an id.
+    ///
+    /// `teams.id` is slugged from the name and then survives a rename — the same promise
+    /// `agent.rs:203` makes about agents, for the same reason — so the two really are different
+    /// strings, and the one a person recognises is this one. A shell holding only the id would have
+    /// to fetch the whole catalogue to draw one label.
+    pub team_name: Option<String>,
+    /// How many of this job's items the team allows at once.
+    ///
+    /// The number that answers the first question this feature provokes — *why is only one item
+    /// moving?* — and it belongs to the team rather than to the job, which is exactly why it is read
+    /// at the moment the job is looked at rather than copied onto `jobs` when it started. A ceiling
+    /// raised this morning applies to the job running now, and `job_view` already reads it that way.
+    pub team_max_parallel: Option<i64>,
 }
 
 /// One item of a job's queue, as the shell shows it.
-#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+///
+/// **Not `FromRow` any more.** Two of these fields are JSON text in the database, so the mapping is
+/// spelled out in `detail` beside the parse — the same shape `job_view` uses for the same two
+/// columns, and for the same reason: a list that will not parse has to be given a meaning, and a
+/// derive has nowhere to put one.
+#[derive(Debug, serde::Serialize)]
 pub struct JobItemView {
     pub ordinal: i64,
     pub description: String,
@@ -4573,6 +4599,26 @@ pub struct JobItemView {
     /// `passed` with no gate status was never measured — the project has no gate command, or this
     /// was an intermediate item under `gate_after_each_item: false`.
     pub gate_status: Option<String>,
+    /// Which agent of the team was given this item, and what they are called.
+    ///
+    /// `None` for every item of every job without a team, which is what `0103` says the NULL means:
+    /// nobody was asked. Both halves are carried for the reason `team_name` gives — the id is a slug
+    /// and the name is what a person recognises — and they are separate fields rather than one
+    /// because only the id is a stable handle to link by.
+    pub agent_id: Option<String>,
+    pub agent_name: Option<String>,
+    /// The ordinals this item may not start before, and the paths its director said it would touch.
+    ///
+    /// Empty for a job without a team, where the columns are NULL and mean *nobody was asked*.
+    /// `JobSummary::team_id` is what separates that from a genuine `[]`, so nothing here has to: an
+    /// item of a directed job with an empty `depends_on` really does wait for nobody, and that is
+    /// worth showing.
+    ///
+    /// The two lists are the whole explanation of why a queue is running the items it is running,
+    /// and until now they existed only inside the fold. A person watching two of five items move
+    /// could see WHICH two and never why those two.
+    pub depends_on: Vec<i64>,
+    pub files: Vec<String>,
 }
 
 /// A job with its queue.
@@ -4594,16 +4640,34 @@ pub struct JobDetail {
     pub notes: Vec<crate::notes::Note>,
 }
 
-/// The owner-kind predicate belongs in the `ON` clause and not in a `WHERE`. In a `WHERE` it would
-/// turn the left join into an inner one and drop every job holding no slot — which is most of them.
-const ONE_SUMMARY_SQL: &str =
+/// Every column of a [`JobSummary`], and the two joins that produce the four it does not own.
+///
+/// **One constant rather than the four copies that were here.** The same column list was written out
+/// in `ONE_SUMMARY_SQL`, twice in `list` and in `LIVE_LIST_SQL`, and `query_as` matches a row to a
+/// struct BY NAME at run time — so a field added to three of the four does not fail to compile. It
+/// fails on whichever route was forgotten, the first time somebody calls it, with a
+/// `ColumnNotFound`. Adding `team_id` would have made that four copies of fourteen columns; this
+/// makes it one of fourteen.
+///
+/// Both joins are LEFT and both predicates belong in the `ON` clause. In a `WHERE` the first would
+/// turn into an inner join and drop every job holding no slot — most of them — and the second would
+/// drop every job without a team, which is nearly all of them.
+const SUMMARY_SQL: &str =
     "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
             jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at, jobs.completed_at,
-            project_slots.slot AS slot
+            project_slots.slot AS slot,
+            jobs.team_id, teams.name AS team_name, teams.max_parallel AS team_max_parallel
      FROM jobs
      LEFT JOIN project_slots
        ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
-     WHERE jobs.id = ?";
+     LEFT JOIN teams ON teams.id = jobs.team_id";
+
+/// `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str` and these are assembled. Everything
+/// interpolated is a constant of this module; every caller value is a bind parameter, so none of
+/// them ever reaches the string. Same reasoning, and same shape, as `runs::purge`.
+fn summary_query(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!("{SUMMARY_SQL} {tail}"))
+}
 
 /// The most recent jobs, newest first.
 ///
@@ -4616,33 +4680,19 @@ pub async fn list(
 ) -> sqlx::Result<Vec<JobSummary>> {
     match project_id {
         Some(project_id) => {
-            sqlx::query_as(
-                "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
-                        jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at,
-                        jobs.completed_at, project_slots.slot AS slot
-                 FROM jobs
-                 LEFT JOIN project_slots
-                   ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
-                 WHERE jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?",
-            )
+            sqlx::query_as(summary_query(
+                "WHERE jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?",
+            ))
             .bind(project_id)
             .bind(limit)
             .fetch_all(pool)
             .await
         }
         None => {
-            sqlx::query_as(
-                "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
-                        jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at,
-                        jobs.completed_at, project_slots.slot AS slot
-                 FROM jobs
-                 LEFT JOIN project_slots
-                   ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
-                 ORDER BY jobs.id DESC LIMIT ?",
-            )
-            .bind(limit)
-            .fetch_all(pool)
-            .await
+            sqlx::query_as(summary_query("ORDER BY jobs.id DESC LIMIT ?"))
+                .bind(limit)
+                .fetch_all(pool)
+                .await
         }
     }
 }
@@ -4650,15 +4700,12 @@ pub async fn list(
 /// Spelled out rather than assembled from `LIVE_STATUSES`, because sqlx refuses SQL built at
 /// runtime — the same trade `LIVE_JOBS_SQL` makes, with the same guard:
 /// `the_live_listing_names_every_live_status` compares this text against the constant.
-const LIVE_LIST_SQL: &str =
-    "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
-            jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at, jobs.completed_at,
-            project_slots.slot AS slot
-     FROM jobs
-     LEFT JOIN project_slots
-       ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
-     WHERE jobs.status IN ('planning','implementing','gating','reviewing',
-                           'awaiting_approval','waiting')";
+///
+/// Only the predicate, now that the columns live in `SUMMARY_SQL`. That is what the guard wanted all
+/// along: it used to count quoted words in the whole statement and carry a `+1` for the `'job'` in
+/// the slot join, which is a test that had to know about a join it was not about.
+const LIVE_WHERE_SQL: &str = "WHERE jobs.status IN ('planning','implementing','gating','reviewing',
+                                                    'awaiting_approval','waiting')";
 
 /// The live jobs, optionally filtered to one project.
 ///
@@ -4666,10 +4713,6 @@ const LIVE_LIST_SQL: &str =
 /// project*, and its own comment says why it does not filter to live ones — a job that stopped for
 /// the budget is exactly what the user needs to see. This answers a different question, *what is in
 /// flight now*, and it is the only one the canvas asks.
-///
-/// `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str`. The one interpolated thing is
-/// `LIVE_LIST_SQL`, a constant of this module; the project filter is a bind parameter, so no caller
-/// value ever reaches the string. Same reasoning, and same shape, as `runs::purge`.
 pub async fn list_live(
     pool: &SqlitePool,
     project_id: Option<&str>,
@@ -4677,8 +4720,8 @@ pub async fn list_live(
 ) -> sqlx::Result<Vec<JobSummary>> {
     match project_id {
         Some(project_id) => {
-            sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "{LIVE_LIST_SQL} AND jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?"
+            sqlx::query_as(summary_query(&format!(
+                "{LIVE_WHERE_SQL} AND jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?"
             )))
             .bind(project_id)
             .bind(limit)
@@ -4686,8 +4729,8 @@ pub async fn list_live(
             .await
         }
         None => {
-            sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "{LIVE_LIST_SQL} ORDER BY jobs.id DESC LIMIT ?"
+            sqlx::query_as(summary_query(&format!(
+                "{LIVE_WHERE_SQL} ORDER BY jobs.id DESC LIMIT ?"
             )))
             .bind(limit)
             .fetch_all(pool)
@@ -4697,7 +4740,7 @@ pub async fn list_live(
 }
 
 pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDetail>> {
-    let Some(job): Option<JobSummary> = sqlx::query_as(ONE_SUMMARY_SQL)
+    let Some(job): Option<JobSummary> = sqlx::query_as(summary_query("WHERE jobs.id = ?"))
         .bind(job_id)
         .fetch_optional(pool)
         .await?
@@ -4705,13 +4748,70 @@ pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDe
         return Ok(None);
     };
 
-    let items: Vec<JobItemView> = sqlx::query_as(
-        "SELECT ordinal, description, status, round, run_id, gate_status
-         FROM job_items WHERE job_id = ? ORDER BY ordinal",
+    // LEFT JOIN, because `agent_id` is NULL for every item of every job without a team and an inner
+    // join would return an empty queue for all of them — the whole listing gone, not one column.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT job_items.ordinal, job_items.description, job_items.status, job_items.round,
+                job_items.run_id, job_items.gate_status, job_items.agent_id, agents.name,
+                job_items.depends_on, job_items.files
+         FROM job_items
+         LEFT JOIN agents ON agents.id = job_items.agent_id
+         WHERE job_items.job_id = ? ORDER BY job_items.ordinal",
     )
     .bind(job_id)
     .fetch_all(pool)
     .await?;
+
+    let items: Vec<JobItemView> = rows
+        .into_iter()
+        .map(
+            |(
+                ordinal,
+                description,
+                status,
+                round,
+                run_id,
+                gate_status,
+                agent_id,
+                agent_name,
+                depends_on,
+                files,
+            )| JobItemView {
+                ordinal,
+                description,
+                status,
+                round,
+                run_id,
+                gate_status,
+                agent_id,
+                agent_name,
+                // A list that will not parse is read as no list, in both directions, and here that
+                // is safe in a way it is not in `job_view`: this is a thing to look at, not a thing
+                // to schedule on. The worst an unreadable list costs a reader is a row that
+                // explains itself less well; there it would start work early.
+                depends_on: depends_on
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<Vec<i64>>(json).ok())
+                    .unwrap_or_default(),
+                files: files
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+                    .unwrap_or_default(),
+            },
+        )
+        .collect();
 
     let branch: Option<String> = sqlx::query_scalar(
         "SELECT branch FROM worktrees WHERE owner_kind = 'job' AND owner_id = ?",
@@ -4796,7 +4896,7 @@ async fn cancel_parked_node(pool: &SqlitePool, run_id: i64) -> sqlx::Result<()> 
 /// live node in a job nothing drives.
 pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome> {
     let pool = &state.pool;
-    let Some(job): Option<JobSummary> = sqlx::query_as(ONE_SUMMARY_SQL)
+    let Some(job): Option<JobSummary> = sqlx::query_as(summary_query("WHERE jobs.id = ?"))
         .bind(job_id)
         .fetch_optional(pool)
         .await?
@@ -6558,6 +6658,116 @@ mod tests {
         assert_eq!(plan.dropped, 0);
     }
 
+    /// **A directed job says so, everywhere a job is read.**
+    ///
+    /// Three routes and one join, which is the point of the test rather than an economy of it: the
+    /// summary columns were four copies of one list until `SUMMARY_SQL`, and `query_as` matches a
+    /// row to a struct by NAME at run time — a copy that missed a column compiles and then fails on
+    /// whichever route was forgotten, the first time somebody calls it.
+    ///
+    /// The name and the ceiling travel beside the id because neither is derivable from it. `teams.id`
+    /// is slugged from the name and then outlives it, so a shell holding only the id would render a
+    /// slug or fetch the whole catalogue; and the ceiling belongs to the team, so it has to be read
+    /// when the job is looked at rather than copied onto `jobs` when it started.
+    #[tokio::test]
+    async fn a_directed_job_says_which_team_directs_it_and_how_wide_it_may_go() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "dir", "directing", "lead").await;
+        seed_crew(&pool, "crew", "dir", &[]).await;
+        let alone = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let directed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(directed)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let view = detail(&pool, directed).await.unwrap().expect("it exists");
+        assert_eq!(view.job.team_id.as_deref(), Some("crew"));
+        assert_eq!(view.job.team_name.as_deref(), Some("Team crew"));
+        assert_eq!(view.job.team_max_parallel, Some(2));
+
+        // The LEFT of the join, and the case that is nearly every job: an undirected one still
+        // comes back. An inner join here would have dropped it from every listing in the product.
+        let plain = detail(&pool, alone).await.unwrap().expect("it exists");
+        assert_eq!(plain.job.team_id, None);
+        assert_eq!(plain.job.team_name, None);
+        assert_eq!(plain.job.team_max_parallel, None);
+
+        let listed = list(&pool, Some("project-b"), 20).await.unwrap();
+        assert_eq!(listed[0].team_name.as_deref(), Some("Team crew"));
+        let live = list_live(&pool, None, 20).await.unwrap();
+        assert_eq!(live.len(), 2, "both jobs are live");
+        let names: Vec<Option<&str>> = live.iter().map(|job| job.team_name.as_deref()).collect();
+        assert!(names.contains(&Some("Team crew")) && names.contains(&None));
+    }
+
+    /// **An item of a directed job says who has it, what it waits for, and what it will touch.**
+    ///
+    /// The three facts that only exist once a job has a team, and the three that until now lived
+    /// nowhere but inside the fold. A person watching two of five items move could see WHICH two and
+    /// never why those two — the queue was a list of statuses with the reasoning removed.
+    ///
+    /// `agent_name` and not just the id, for the reason `agents.name` exists at all. And an
+    /// undirected job's items come back with all three empty, which is what `0103` and `0102` say
+    /// their NULL means: nobody was asked.
+    #[tokio::test]
+    async fn an_item_of_a_directed_job_says_who_has_it_and_why_it_may_start() {
+        let pool = test_pool().await;
+        seed_agent(&pool, "dir", "directing", "lead").await;
+        seed_agent(&pool, "ana", "the database layer", "you are careful").await;
+        seed_crew(&pool, "crew", "dir", &["ana"]).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["passed", "running"]).await;
+        sqlx::query(
+            "UPDATE job_items SET agent_id = 'ana', depends_on = '[]', files = '[\"a.rs\"]'
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_items SET agent_id = 'dir', depends_on = '[0]', files = '[\"b.rs\",\"c.rs\"]'
+             WHERE job_id = ? AND ordinal = 1",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let view = detail(&pool, job_id).await.unwrap().expect("it exists");
+
+        assert_eq!(view.items[0].agent_id.as_deref(), Some("ana"));
+        assert_eq!(view.items[0].agent_name.as_deref(), Some("Agent ana"));
+        // An empty `depends_on` on a DIRECTED job is a real answer — this item waits for nobody —
+        // and `team_id` beside it is what separates that from the NULL of a job nobody directs.
+        assert_eq!(view.items[0].depends_on, Vec::<i64>::new());
+        assert_eq!(view.items[0].files, vec!["a.rs".to_owned()]);
+        assert_eq!(view.items[1].agent_name.as_deref(), Some("Agent dir"));
+        assert_eq!(view.items[1].depends_on, vec![0]);
+        assert_eq!(
+            view.items[1].files,
+            vec!["b.rs".to_owned(), "c.rs".to_owned()]
+        );
+
+        // The LEFT of the other join. Every item of every job without a team has a NULL `agent_id`,
+        // and an inner join would have returned an empty queue for all of them.
+        let plain_job = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        seed_items(&pool, plain_job, &["pending"]).await;
+        let plain = detail(&pool, plain_job).await.unwrap().expect("it exists");
+        assert_eq!(plain.items.len(), 1);
+        assert_eq!(plain.items[0].agent_id, None);
+        assert_eq!(plain.items[0].agent_name, None);
+        assert!(plain.items[0].depends_on.is_empty());
+        assert!(plain.items[0].files.is_empty());
+    }
+
     async fn seed_items(pool: &sqlx::SqlitePool, job_id: i64, statuses: &[&str]) {
         for (ordinal, status) in statuses.iter().enumerate() {
             sqlx::query(
@@ -7332,11 +7542,11 @@ mod tests {
     fn the_live_listing_names_every_live_status() {
         for status in LIVE_STATUSES {
             assert!(
-                LIVE_LIST_SQL.contains(&format!("'{status}'")),
+                LIVE_WHERE_SQL.contains(&format!("'{status}'")),
                 "the live listing does not know `{status}`"
             );
         }
-        let named = LIVE_LIST_SQL
+        let named = LIVE_WHERE_SQL
             .split('\'')
             .skip(1)
             .step_by(2)
@@ -7344,8 +7554,8 @@ mod tests {
             .count();
         assert_eq!(
             named,
-            LIVE_STATUSES.len() + 1,
-            "the listing names a status nothing drives (the +1 is the join's 'job')"
+            LIVE_STATUSES.len(),
+            "the listing names a status nothing drives"
         );
     }
 
