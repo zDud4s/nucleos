@@ -316,7 +316,7 @@ pub struct HeldSlot {
 /// Every slot taken right now, in project and number order.
 ///
 /// The owner-kind predicate is in the `ON` clause and not in a `WHERE`, for the reason
-/// `ONE_SUMMARY_SQL` gives about its own join: in a `WHERE` it would turn the left join into an
+/// `job::SUMMARY_SQL` gives about both of its own: in a `WHERE` it would turn the left join into an
 /// inner one and drop every slot held by a run or a job — which is nearly all of them.
 pub async fn held_slots(pool: &SqlitePool) -> sqlx::Result<Vec<HeldSlot>> {
     sqlx::query_as(

@@ -836,7 +836,17 @@ function JobsPanel({ rows, selected }: { rows: ProjectSummary[]; selected: strin
           onClick={() => {
             if (selected === null) return;
             create.mutate(
-              { project_id: selected, prompt: prompt.trim(), budget_usd: null, max_rounds: null },
+              {
+                project_id: selected,
+                prompt: prompt.trim(),
+                budget_usd: null,
+                max_rounds: null,
+                // No picker here, exactly as there is none for budget or rounds:
+                // this panel is the one-line "start something" and the Fleet page
+                // is where a job is specified. Sending null keeps it the queue in
+                // one checkout, which is what this button has always started.
+                team_id: null,
+              },
               { onSuccess: () => setPrompt("") },
             );
           }}
@@ -874,6 +884,11 @@ function JobRow({ job }: { job: Job }) {
       <p className="ap-meta">
         round {job.round + 1} of {job.max_rounds}
         {job.rule_name === null ? "" : ` — ${job.rule_name}`}
+        {/* A directed job looks nothing like a sequential one from the inside
+            and looked exactly like it from here. Said with the ceiling, because
+            the team's name alone does not say what having one buys. */}
+        {job.team_id !== null &&
+          ` — ${job.team_name ?? job.team_id}, up to ${job.team_max_parallel ?? 1} at once`}
       </p>
     </li>
   );

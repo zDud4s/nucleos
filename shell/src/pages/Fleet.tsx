@@ -13,6 +13,7 @@ import {
   type Concurrency,
 } from "../data/fleet";
 import { useBudget, useProjects, type BudgetView } from "../data/system";
+import { useTeams } from "../data/teams";
 import {
   FleetActionsProvider,
   FleetCanvas,
@@ -214,12 +215,23 @@ function ProjectColumn({ column, canStart }: { column: FleetColumn; canStart: bo
  * silently does nothing. Budget and rounds *are* the caller's to choose, and
  * both are optional — blank means "the daemon's default", which is a different
  * request from zero.
+ *
+ * **The team is the fourth, and it is the only one of the four that changes how
+ * the job runs rather than how long it may run for.** With one, the job gets a
+ * director, a checkout per item and items that go at once; without one it is the
+ * queue in a single checkout it has always been. The daemon has taken `team_id`
+ * on this route since the parallel work landed and nothing sent it, so the
+ * feature was reachable only by writing JSON by hand or a `graph:` rule into a
+ * config file.
  */
 function NewJobForm({ projectId }: { projectId: string }) {
   const create = useCreateJob();
+  const teams = useTeams();
   const [prompt, setPrompt] = useState("");
   const [budget, setBudget] = useState("");
   const [rounds, setRounds] = useState("");
+  const [team, setTeam] = useState("");
+  const roster = teams.data ?? [];
 
   return (
     <form
@@ -233,6 +245,11 @@ function NewJobForm({ projectId }: { projectId: string }) {
             prompt: prompt.trim(),
             budget_usd: optionalNumber(budget),
             max_rounds: optionalNumber(rounds),
+            // Blank is *no team*, which on this field is a real choice and not
+            // an unfilled one — it is how every job in the product has always
+            // run. `null` and never `""`: the daemon reads an unknown team as a
+            // 422, and an empty string is an unknown team.
+            team_id: team === "" ? null : team,
           },
           { onSuccess: () => setPrompt("") },
         );
@@ -245,6 +262,27 @@ function NewJobForm({ projectId }: { projectId: string }) {
         aria-label={`What to work on in ${projectId}`}
         onChange={(event) => setPrompt(event.target.value)}
       />
+      {/* Gone rather than disabled in a house with no teams, for the reason
+          `max_items` has no field at all: a control whose only option is the
+          default is a control that does nothing, and it would advertise a
+          feature whose first step is on another page. */}
+      {roster.length > 0 && (
+        <label className="fleet-new-job-field fleet-new-job-team">
+          <span>Team</span>
+          <select
+            value={team}
+            aria-label={`Team to direct the job in ${projectId}`}
+            onChange={(event) => setTeam(event.target.value)}
+          >
+            <option value="">nobody — one checkout, one item at a time</option>
+            {roster.map((row) => (
+              <option key={row.id} value={row.id}>
+                {row.name} — up to {row.max_parallel} at once
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       <div className="fleet-new-job-fields">
         <label className="fleet-new-job-field">
           <span>Budget $</span>
@@ -293,13 +331,17 @@ function optionalNumber(raw: string): number | null {
 /**
  * Why `POST /jobs` said no.
  *
- * **Both of its refusals are a 409**, and they are different facts with
+ * **Two of its refusals share a 409**, and they are different facts with
  * different remedies: the kill switch is engaged, or that project is already
  * full. The status cannot tell them apart, and neither can `client.ts`'s
  * status-derived code — so the daemon's own sentence is what is shown, because
  * on this route the daemon wrote a better one than we would. Mapping `conflict`
  * to a sentence of our own here would render both refusals identically, which
  * is the exact collapse this page is meant not to make.
+ *
+ * The third is the 422 for a team that does not exist, and it needs nothing
+ * added here for the same reason: the daemon names the team it could not find,
+ * and `daemonProse` puts that sentence on screen whatever the code.
  */
 function NewJobRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {

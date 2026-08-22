@@ -319,32 +319,80 @@ function JobItemsPanel({ jobId }: { jobId: number }) {
     return <p className="fleet-items-note">its planner looked and found no work</p>;
   }
 
+  const detail = job.data;
+
   return (
-    <ol className="fleet-items" aria-label={`items of job ${jobId}`}>
-      {job.data.items.map((item, index) => (
-        <li key={item.ordinal} className="fleet-item">
-          {/* The mark goes on the FIRST item of a new round, which is the
-              boundary a reader is looking for. Ordinals carry on across rounds,
-              so the number itself says nothing about where one ended. */}
-          {index > 0 && item.round !== job.data.items[index - 1].round && (
-            <p className="fleet-item-round">round {item.round + 1}</p>
-          )}
-          <div className="fleet-item-row">
-            <span className="fleet-item-ordinal">{item.ordinal + 1}</span>
-            <span className="fleet-item-what">{item.description}</span>
-            <span className="fleet-item-state">{itemReading(item)}</span>
-            {/* Two columns, two questions: what the item did, and whether
-                anything measured it. A NULL gate is *no gate configured*. */}
-            <StateBadge domain="gate" state={item.gate_status} />
-          </div>
-          {item.status === "skipped" && (
-            <p className="fleet-item-why">
-              skipped — <Link to="/waiting">the proposal that explains it is in Waiting</Link>
-            </p>
-          )}
-        </li>
-      ))}
-    </ol>
+    <>
+      {/* Said once above the queue rather than on every row, because it is a
+          fact about the job. It is also what makes the rows below legible: two
+          items running at once is a stuck queue in a job nobody directs, and the
+          entire point of one that is directed. */}
+      {detail.team_id !== null && (
+        <p className="fleet-items-team">
+          directed by <Link to={`/teams/${detail.team_id}`}>{detail.team_name ?? detail.team_id}</Link>
+          {detail.team_max_parallel !== null && ` — up to ${detail.team_max_parallel} items at once`}
+        </p>
+      )}
+      <ol className="fleet-items" aria-label={`items of job ${jobId}`}>
+        {detail.items.map((item, index) => (
+          <li key={item.ordinal} className="fleet-item">
+            {/* The mark goes on the FIRST item of a new round, which is the
+                boundary a reader is looking for. Ordinals carry on across rounds,
+                so the number itself says nothing about where one ended. */}
+            {index > 0 && item.round !== detail.items[index - 1].round && (
+              <p className="fleet-item-round">round {item.round + 1}</p>
+            )}
+            <div className="fleet-item-row">
+              <span className="fleet-item-ordinal">{item.ordinal + 1}</span>
+              <span className="fleet-item-what">{item.description}</span>
+              <span className="fleet-item-state">{itemReading(item)}</span>
+              {/* Two columns, two questions: what the item did, and whether
+                  anything measured it. A NULL gate is *no gate configured*. */}
+              <StateBadge domain="gate" state={item.gate_status} />
+            </div>
+            <ItemDirection item={item} />
+            {item.status === "skipped" && (
+              <p className="fleet-item-why">
+                skipped — <Link to="/waiting">the proposal that explains it is in Waiting</Link>
+              </p>
+            )}
+          </li>
+        ))}
+      </ol>
+    </>
+  );
+}
+
+/**
+ * Who was given this item, what it waits for, and what it said it would touch.
+ *
+ * **The three facts that answer the question a parallel queue provokes and a
+ * sequential one never did:** why are *these* items moving and not those. Two of
+ * five running used to be a list of statuses with the reasoning taken out — the
+ * fold knew about the dependencies and the declared paths, and nothing outside
+ * it did.
+ *
+ * Nothing at all for a job without a team, where all three are empty because
+ * nobody was asked. Not "none" and not an empty line: a job that was never
+ * directed has no answer to give, which is different from an answer of nothing.
+ *
+ * Ordinals are shown `+1` here for the same reason the row above shows them that
+ * way — a `depends_on` of `[0]` is a reference to the item drawn as `1`, and
+ * printing the raw number would name a row that is not on screen.
+ */
+function ItemDirection({ item }: { item: JobItem }) {
+  const parts: string[] = [];
+  if (item.depends_on.length > 0) {
+    parts.push(`after ${item.depends_on.map((ordinal) => ordinal + 1).join(", ")}`);
+  }
+  if (item.files.length > 0) parts.push(item.files.join(", "));
+  if (item.agent_name === null && parts.length === 0) return null;
+
+  return (
+    <p className="fleet-item-direction">
+      {item.agent_name !== null && <span className="fleet-item-agent">{item.agent_name}</span>}
+      {parts.join(" · ")}
+    </p>
   );
 }
 

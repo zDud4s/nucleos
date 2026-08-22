@@ -134,12 +134,37 @@ export interface Job {
   /** The round it is on, counted from zero, and how many it may run. */
   round: number;
   max_rounds: number;
+  /**
+   * The team directing this job, or null for the sequential job in one shared
+   * checkout — which is nearly every job.
+   *
+   * It changes how everything beside it reads: three items running at once is a
+   * stuck queue without a team and the entire point of one with it.
+   */
+  team_id: string | null;
+  /** The team's name. `team_id` is a slug that outlives renames, so the two differ. */
+  team_name: string | null;
+  /**
+   * How many of this job's items the team allows at once.
+   *
+   * The team's number rather than the job's, read when the job is looked at, so
+   * a ceiling raised this morning shows against the job running now.
+   */
+  team_max_parallel: number | null;
 }
 
 export interface JobItem {
   ordinal: number;
   description: string;
-  /** `pending` | `running` | `implemented` | `passed` | `failed` | `skipped` | `cancelled` | `gate_*`. */
+  /**
+   * `pending` | `running` | `implemented` | `passed` | `failed` | `skipped` |
+   * `cancelled` | `gate_*`, and — only in a job a team directs — `merging` |
+   * `conflicted` | `reverted` | `orphaned`.
+   *
+   * Those last four had been left out of this list while `itemReading` already
+   * rendered them, which is the wrong way round: the type is what a reader
+   * checks before writing the switch.
+   */
   status: string;
   /**
    * The round this item was queued in. `ordinal` is no substitute: ordinals
@@ -154,6 +179,24 @@ export interface JobItem {
    * status was never measured.
    */
   gate_status: string | null;
+  /**
+   * Which agent of the team was given this item, and what they are called.
+   *
+   * Null for every item of every job without a team: nobody was asked. The name
+   * travels because the id is a slug, exactly as with `team_name`.
+   */
+  agent_id: string | null;
+  agent_name: string | null;
+  /**
+   * The ordinals this item may not start before, and the paths its director
+   * said it would touch.
+   *
+   * Both empty for a job without a team. Together they are the whole answer to
+   * *why are these two items running and not those two* — until they were on
+   * the wire, the queue was a list of statuses with the reasoning removed.
+   */
+  depends_on: number[];
+  files: string[];
 }
 
 export interface JobDetail extends Job {
@@ -219,6 +262,17 @@ export interface NewJob {
   /** `null` is "no job budget", which is a different fact from a budget of zero. */
   budget_usd: number | null;
   max_rounds: number | null;
+  /**
+   * The team to direct this job, or null for the sequential job in one shared
+   * checkout.
+   *
+   * A team that does not exist is a **422 and never a fallback**. The daemon
+   * refuses rather than quietly running the job the old way, because a person
+   * who asked for parallel work and silently got a queue would have no way of
+   * telling from the outside — which is the whole reason `JobStart::NoTeam`
+   * exists on that route.
+   */
+  team_id: string | null;
 }
 
 /** Who holds a slot, for the one action that takes it back. */
