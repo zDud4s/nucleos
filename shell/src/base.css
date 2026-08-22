@@ -27,6 +27,11 @@ html {
      painting it here keeps a white flash out of a dark app. */
   background: var(--bg);
   -webkit-text-size-adjust: 100%;
+  /* Reserved so that locking the page behind an overlay does not shift the
+     layout sideways by the width of a scrollbar. See the scroll-lock block at
+     the end of this file for why that compensation cannot come from the
+     library that normally does it. */
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -131,4 +136,45 @@ svg {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ------------------------------------------------ overlay scroll lock -- */
+
+/**
+ * The rules `react-remove-scroll` cannot install here, written where the CSP
+ * allows them.
+ *
+ * Radix's Dialog and DropdownMenu both lock the page behind them through
+ * `react-remove-scroll`, which sets `data-scroll-locked` on `<body>` with
+ * `setAttribute` — a DOM call, which no CSP governs — and then injects the rules
+ * for it in a `<style>` element. This app's production CSP is `style-src 'self'`
+ * with no `unsafe-inline` (`src-tauri/tauri.conf.json`), so that element is
+ * refused. The attribute lands, the rules do not, and the lock silently does
+ * nothing: the menu opens, and the page keeps scrolling behind it.
+ *
+ * Measured in a spike against the real header, in the same Chromium the webview
+ * runs: `body { overflow: visible }` with a dialog open. Writing the rules here,
+ * at build time, restores the lock without loosening the CSP on a window that
+ * holds a token granting full control of the daemon.
+ *
+ * The class names come from `react-remove-scroll-bar/constants`. `scrollbar-gutter`
+ * stands in for the gap the library measures at runtime and compensates for with
+ * inline padding — a measured value, which is also why adding a CSP hash for the
+ * injected style was never an option: the hash would change with the scrollbar.
+ */
+body[data-scroll-locked] {
+  overflow: hidden !important;
+  overscroll-behavior: contain;
+}
+
+.with-scroll-bars-hidden {
+  overflow: hidden !important;
+}
+
+.right-scroll-bar-position {
+  right: 0 !important;
+}
+
+.width-before-scroll-bar {
+  margin-right: 0 !important;
 }

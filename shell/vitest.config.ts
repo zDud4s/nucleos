@@ -1,6 +1,19 @@
 import { defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
 
 export default defineConfig({
+  /**
+   * The third place the `@/` alias has to be spelled out.
+   *
+   * `tsconfig.json` teaches it to TypeScript, `vite.config.ts` to the bundler,
+   * and this file to the test runner — vitest reads its own config and inherits
+   * nothing from the other two. Components copied from a registry import by
+   * `@/lib/cn`, so without this line every suite that renders one fails to
+   * resolve rather than to assert, which reads like a missing file.
+   */
+  resolve: {
+    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+  },
   test: {
     // jsdom, not node: the safety interlocks this app is made of — the two-step
     // confirm, the approval queue, the token handshake — are components, and a
