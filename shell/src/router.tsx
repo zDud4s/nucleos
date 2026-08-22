@@ -24,8 +24,10 @@ import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
+import { Workspace } from "./project/Workspace";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
+import { SmokeCsp } from "./pages/SmokeCsp";
 import { System } from "./pages/System";
 import { TeamRunDetail } from "./pages/TeamRunDetail";
 import { Teams } from "./pages/Teams";
@@ -106,17 +108,22 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * TanStack spells a parameter `$runId`; the page reads it back under that name.
  *
  * `/projects/$projectId/$view` is the second, and it carries a parameter that is
- * not an id: the view a project is being looked at through — `browse`, `search`,
- * `diff` or `rules`. It is in the location rather than in component state
- * because a folder somebody is reading should survive a reload and be
- * linkable, and it is **not** a search param because it is not a filter: there
- * is exactly one of it and it always has a value.
+ * not an id: the mode a project is being looked at through — `estado`, `codigo`
+ * or `workflows`. It is in the location rather than in component state because
+ * a project somebody is working in should survive a reload and be linkable, and
+ * it is **not** a search param because it is not a filter: there is exactly one
+ * of it and it always has a value.
  *
  * There is no validator for it. A route parameter is a string, anybody can type
- * one, and `Projects` answers an unrecognised view with `browse` rather than a
+ * one, and `Workspace` answers an unrecognised mode with `estado` rather than a
  * dead end — a typo in a path is not a missing page. Registering a validator
- * here would move that decision away from the page that knows what the views
+ * here would move that decision away from the page that knows what the modes
  * are.
+ *
+ * The mode names are the design's, and they are the one place in this app where
+ * a route segment is not English. They are identifiers in a URL rather than
+ * copy on a screen — the tabs above them read State, Code and Workflows — and
+ * renaming them later would break every link somebody kept.
  *
  * `/system/$view` is the same idiom again: like `/projects/$projectId/$view`, the
  * view is a path parameter and not a search param — there is exactly one of it, it
@@ -130,7 +137,18 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  */
 const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/runs/$runId", component: RunDetail },
-  { path: "/projects/$projectId/$view", component: Projects },
+  { path: "/projects/$projectId/$view", component: Workspace },
+  /**
+   * The read-only inspector, on a path of its own until the Code mode replaces it.
+   *
+   * It used to share `/projects/$projectId/$view` with nothing else, and the
+   * workspace took that path over. Moving it here rather than deleting it is
+   * deliberate: `browse`, `search` and `diff` are superseded by the Code mode
+   * and `rules` is superseded by the config editor, and neither of those exists
+   * yet. Removing a working capability because its replacement is designed is
+   * how a rewrite loses things quietly.
+   */
+  { path: "/projects/$projectId/inspect/$view", component: Projects },
   { path: "/chats/$chatId", component: Chats },
   { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },
@@ -139,6 +157,8 @@ const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
   { path: "/mail/$emailId", component: MailDetail },
   { path: "/web/pages/$pageId", component: Web },
   { path: "/system/$view", component: System },
+  // TEMPORARY — fatia 0 only, removed with the page itself.
+  { path: "/smoke-csp", component: SmokeCsp },
 ];
 
 export function createAppRouter(initialPath = "/") {

@@ -53,6 +53,16 @@ import "./projects.css";
  * string, anybody can type one, and a typo in a path is not a missing page.
  */
 
+/**
+ * Where this inspector lives, now that the workspace owns the shorter path.
+ *
+ * One function rather than three template literals, because the two callers
+ * below drifted apart the moment there was a prefix to forget.
+ */
+function inspectPath(projectId: string, view: ProjectView): string {
+  return `/projects/${projectId}/inspect/${view}`;
+}
+
 /** The four views, in the order the tabs read. */
 const VIEWS = ["browse", "search", "diff", "rules"] as const;
 export type ProjectView = (typeof VIEWS)[number];
@@ -197,7 +207,7 @@ function ProjectChip({
 
   return (
     <li className={active ? "pj-chip pj-chip-active" : "pj-chip"}>
-      <Link className="pj-chip-link" to={`/projects/${project.project_id}/${view}`}>
+      <Link className="pj-chip-link" to={inspectPath(project.project_id, view)}>
         <span className="pj-chip-name">{project.project_id}</span>
       </Link>
       <Badge tone={project.mode === "active" ? "active" : project.mode === "shadow" ? "shadow" : "off"}>
@@ -217,7 +227,7 @@ function ViewTabs({ projectId, view }: { projectId: string; view: ProjectView })
         <Link
           key={candidate}
           className={candidate === view ? "pj-tab pj-tab-active" : "pj-tab"}
-          to={`/projects/${projectId}/${candidate}`}
+          to={inspectPath(projectId, candidate)}
           aria-current={candidate === view ? "page" : undefined}
         >
           {VIEW_LABEL[candidate]}

@@ -19,7 +19,51 @@ describe("Sidebar", () => {
     const rendered = Array.from(container.querySelectorAll<HTMLElement>("[data-nav-path]")).map(
       (link) => link.dataset.navPath,
     );
+    // No `projects` prop, so the roster contributes nothing and the rail is
+    // exactly the table. The roster's own rendering is four tests above.
     expect(rendered).toEqual(NAV_ITEMS.map((item) => item.path));
+  });
+
+  /**
+   * The roster group is the one part of the rail that is not in the nav table,
+   * so it is the one part a table test cannot defend. These four are its
+   * replacement.
+   */
+  it("lists the projects it is given, under the group that declares the position", async () => {
+    await renderWithRouter(
+      <Sidebar projects={[{ id: "nucleos", mode: "active", pending: 0 }, { id: "sidecar", mode: "shadow", pending: 2 }]} />,
+    );
+
+    expect(screen.getByRole("link", { name: "nucleos" }).getAttribute("href")).toContain(
+      "/projects/nucleos/estado",
+    );
+    // The roster page keeps its place at the head of the group: it answers a
+    // fleet-wide question no single workspace can.
+    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+  });
+
+  it("draws no roster rows when the roster has not answered yet", async () => {
+    await renderWithRouter(<Sidebar />);
+
+    // Not an empty group with a heading and nothing under it, and not a
+    // "no projects" line either: the daemon has not spoken, and inventing a
+    // sentence about what it did not say is the failure mode this guards.
+    expect(screen.queryByRole("link", { name: "nucleos" })).toBeNull();
+    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+  });
+
+  it("says a project's pending count out loud, since the badge is only drawn", async () => {
+    await renderWithRouter(<Sidebar projects={[{ id: "sidecar", mode: "shadow", pending: 2 }]} />);
+
+    expect(screen.getByRole("link", { name: "sidecar, 2 waiting" })).toBeTruthy();
+  });
+
+  it("keeps a project lit while you are in any of its three modes", async () => {
+    await renderWithRouter(<Sidebar projects={[{ id: "nucleos", mode: "active", pending: 0 }]} />, {
+      initialPath: "/projects/nucleos/workflows",
+    });
+
+    expect(screen.getByRole("link", { name: "nucleos" }).getAttribute("aria-current")).toBe("page");
   });
 
   it("marks the page you are on, and only that one", async () => {

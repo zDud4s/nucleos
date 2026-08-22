@@ -12,6 +12,7 @@ import { render, type RenderResult } from "@testing-library/react";
 import { NAV_PATHS } from "../app/nav";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
+import type { Concurrency } from "../data/fleet";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
 /**
@@ -62,6 +63,16 @@ export interface DaemonState {
   budget: BudgetView;
   projects: ProjectSummary[];
   proposals: Proposal[];
+  /**
+   * Capacity, which the workspace reads as its occupancy panel.
+   *
+   * Defaults to an empty house rather than being absent, because absent is not
+   * a thing this route does: `concurrency::readout` unions the roster with
+   * everything holding a slot precisely so that capacity can never vanish
+   * quietly, and a fake that could return nothing would let a test pass against
+   * a shape the daemon cannot produce.
+   */
+  concurrency: Concurrency;
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -80,6 +91,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     },
     projects: [],
     proposals: [],
+    concurrency: { house: { limit: 4, held: 0 }, projects: [] },
     ...overrides,
   };
 }
@@ -147,6 +159,8 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         return state.projects;
       case "/proposals":
         return state.proposals;
+      case "/concurrency":
+        return state.concurrency;
       default:
         return undefined;
     }

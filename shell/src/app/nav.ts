@@ -12,8 +12,15 @@
  * and cannot appear in the sidebar without being reachable.
  */
 
-/** The three fixed groups of the design's §3.1. Order is the reading order. */
-export type NavGroupId = "operate" | "work" | "pillars";
+/**
+ * The groups of the rail, in reading order.
+ *
+ * Three of them are the design's §3.1 and are fixed lists. `projects` is the
+ * fourth and is a different kind of thing: it declares a *position* and is
+ * filled from the daemon's roster, because a project's path is not knowable
+ * when this file is compiled.
+ */
+export type NavGroupId = "operate" | "projects" | "work" | "pillars";
 
 /**
  * Where an item's count comes from.
@@ -58,6 +65,21 @@ export interface NavGroup {
   /** Shown in small caps above the group. */
   label: string;
   items: NavItem[];
+  /**
+   * This group's items are the project roster, not the list above.
+   *
+   * A marker rather than a check on the id, so that whoever renders the rail
+   * asks *what kind of group is this* instead of knowing one id by heart — and
+   * so that `items: []` reads as "filled elsewhere" rather than as an oversight.
+   *
+   * The consequence worth stating: entries in a roster group are deliberately
+   * NOT in {@link NAV_PATHS}. That list is the route list, one route built per
+   * entry, and it can only contain paths that exist at compile time. A project
+   * is reached through the parameterised route in `router.tsx` instead, so the
+   * "no page outside the sidebar" invariant still holds — projects are in the
+   * sidebar, just not by this mechanism.
+   */
+  roster?: true;
 }
 
 /**
@@ -79,7 +101,6 @@ export const NAV: NavGroup[] = [
       { id: "waiting", label: "Waiting", path: "/waiting", glyph: "Wt", badge: "proposals" },
       { id: "runs", label: "Runs", path: "/runs", glyph: "Ru" },
       { id: "feed", label: "Feed", path: "/feed", glyph: "Fd" },
-      { id: "projects", label: "Projects", path: "/projects", glyph: "Pj" },
       /**
        * Under Operate and not under Work, although it is the closest thing the
        * app has to a document: what the agent has been told is a fact about the
@@ -88,6 +109,26 @@ export const NAV: NavGroup[] = [
        */
       { id: "learned", label: "Learned", path: "/learned", glyph: "Ln" },
     ],
+  },
+  /**
+   * Projects by name, between the machine's state and the work being done in it.
+   *
+   * A group and not an item, and it is the item promoted rather than a new
+   * neighbour for it: with one item, reaching a project costs opening a list and
+   * then choosing from it, on every single entry, and the workspace is where a
+   * day is spent. Leaving both would have put two things called Projects in one
+   * rail, which is the collision that settles the question.
+   *
+   * `All projects` is the old item, kept as this group's first entry: the roster
+   * answers "how are all of them doing" and holds the WIP ceiling, which is a
+   * fleet-wide reading and not a thing any single workspace can say. The roster
+   * rows follow it — one per project, from the daemon.
+   */
+  {
+    id: "projects",
+    label: "Projects",
+    items: [{ id: "projects", label: "All projects", path: "/projects", glyph: "Pj" }],
+    roster: true,
   },
   {
     id: "work",
