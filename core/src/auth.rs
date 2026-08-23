@@ -177,6 +177,31 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/cat"),
     (Method::GET, "/projects/{id}/grep"),
     (Method::GET, "/projects/{id}/diff"),
+    // The rest of the same family, added when the workspace gave them callers. Each is strictly
+    // less than one already here: `blame` is metadata about lines `cat` returns whole, `log` and
+    // `branches` are the history behind the `diff`, and `changed` is a file list plus a count. A
+    // reader that may read the files and may not learn who last touched a line is a distinction
+    // with nothing behind it.
+    //
+    // `readings` is thirty days of this project's own tallies — cost, gate, tokens, time to land —
+    // and belongs beside `/projects` for the reason `/concurrency` does: it describes the shape of
+    // the work and changes none of it.
+    //
+    // `worktree` hands back an absolute path on this machine. Listed anyway, and the argument is
+    // the same one `/runs/{id}/tail` is listed under: the holder can already read every file in
+    // that checkout through `cat?run=`, so withholding where it sits protects nothing and would
+    // make the door to an editor the one thing a reader had to be an admin to open.
+    //
+    // `ownership` is the write boundary, read. Knowing which files the app would write is not
+    // permission to write one — `POST /projects/{id}/write` is in no table at all — and a fence
+    // only a privileged caller can see is a fence nobody can argue with.
+    (Method::GET, "/projects/{id}/readings"),
+    (Method::GET, "/projects/{id}/log"),
+    (Method::GET, "/projects/{id}/branches"),
+    (Method::GET, "/projects/{id}/blame"),
+    (Method::GET, "/projects/{id}/changed"),
+    (Method::GET, "/projects/{id}/worktree"),
+    (Method::GET, "/projects/{id}/ownership"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),
@@ -2024,6 +2049,51 @@ mod tests {
         for (method, pattern) in READ_ONLY_ROUTES {
             assert!(!permits(&run, method, pattern));
         }
+    }
+
+    /// Writing a project's own rules is the owner's, and nobody else's.
+    ///
+    /// The file behind this route is `.ai/autopilot.yaml`, and it carries `gate_command` — the
+    /// command whose exit code decides what *green* means for every run in the project. A key that
+    /// could rewrite it could set the gate to `true` and pass every gate it will ever face, which
+    /// makes this the one write on the project surface where the blast radius is the whole quality
+    /// bar rather than one file.
+    ///
+    /// Asserted as membership rather than through a request, like `POST /email/send` above and for
+    /// the same reason: `permits` is default-deny, so the route is safe today by being in no table.
+    /// What that does not survive is somebody adding it to `READ_ONLY_ROUTES` beside the six reads
+    /// that share its URL prefix, which would read as tidying up. This is the test that says no.
+    #[test]
+    fn writing_a_projects_rules_is_in_no_scope_table() {
+        const WRITE_ROUTE: &str = "/projects/{id}/write";
+
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(RUN_CREATING_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(TEAM_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(EMAIL_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(COUNCIL_ROUTES, &Method::POST, WRITE_ROUTE),
+            "deciding what green means must stay out of every scope table"
+        );
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, "/projects/7/write"),
+                "{scope:?} must not be able to rewrite a project's gate command"
+            );
+        }
+
+        // The reads beside it stay reads. A boundary a reader cannot see is a boundary nobody can
+        // argue with, and seeing it is not permission to cross it.
+        assert!(permits(
+            &Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            &Method::GET,
+            "/projects/7/ownership"
+        ));
     }
 
     /// A department's key lives for hours and crosses dozens of subprocesses, which makes it the

@@ -94,6 +94,48 @@ fn resolved_within(root: &Path, rel: &str) -> Result<PathBuf, InspectError> {
     Ok(resolved)
 }
 
+/// Where a WRITE of `rel` should land, refused unless it lands inside the project.
+///
+/// [`resolved_within`] cannot answer this, and the reason is the whole point of a second function:
+/// it canonicalizes the target, and a write's target routinely does not exist yet. `.ai/` itself may
+/// not exist in a project that has never been given rules.
+///
+/// So this resolves the deepest ancestor that DOES exist and requires that to be inside the root.
+/// That is the same guarantee for the same threat — a directory symlink or a junction inside the
+/// project has only `Normal` components and still lands outside it, and on Windows `mklink /J`
+/// needs no elevation, so a run allowed to write inside its own worktree could build one — while
+/// staying answerable for a path that is about to be created.
+///
+/// The root itself must exist; a project whose recorded root is gone from disk is a different
+/// failure and gets [`InspectError::NotFound`] here rather than a write into a directory this
+/// function would otherwise create.
+pub fn safe_write_target(root: &Path, rel: &str) -> Result<PathBuf, InspectError> {
+    let joined = safe_join(root, rel)?;
+    // The root itself is not a file, and `safe_join` returns it for an empty path. Refusing here
+    // rather than at the caller keeps every writer honest about it.
+    if joined == root {
+        return Err(InspectError::UnsafePath);
+    }
+    let resolved_root = std::fs::canonicalize(root).map_err(io_err)?;
+    let mut existing = joined.as_path();
+    let resolved = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match existing.parent() {
+                Some(parent) => existing = parent,
+                // Walked past the root without finding anything that exists. Only reachable if the
+                // root vanished between the check above and here.
+                None => return Err(InspectError::NotFound),
+            },
+            Err(error) => return Err(io_err(error)),
+        }
+    };
+    if !resolved.starts_with(&resolved_root) {
+        return Err(InspectError::UnsafePath);
+    }
+    Ok(joined)
+}
+
 fn io_err(e: std::io::Error) -> InspectError {
     if e.kind() == std::io::ErrorKind::NotFound {
         InspectError::NotFound
@@ -877,6 +919,99 @@ pub(crate) mod tests {
         .trim()
         .to_owned();
         (repo, base)
+    }
+
+    /* --------------------------------------------------- the write target -- */
+
+    /// A file that does not exist yet is a legitimate write target, and this is the case
+    /// `resolved_within` cannot serve: it canonicalizes the target, and there is nothing to
+    /// canonicalize. A project that has never been given rules has no `.ai/` either, so the missing
+    /// ancestor is the ordinary case rather than the edge one.
+    #[test]
+    fn a_file_that_does_not_exist_yet_is_a_target() {
+        let root = tempdir().unwrap();
+        let target = safe_write_target(root.path(), ".ai/autopilot.yaml")
+            .expect("a path under the root is writable whether or not it is there yet");
+        assert_eq!(target, root.path().join(".ai").join("autopilot.yaml"));
+        assert!(!target.exists(), "the guard must not create anything");
+    }
+
+    /// Traversal is refused before anything else looks at the path, and with `UnsafePath` rather
+    /// than `NotFound` — the caller turns those into different statuses, and "there is no such
+    /// file" would send somebody looking for a file when the answer is that they may not ask.
+    #[test]
+    fn a_write_cannot_traverse_out_of_the_project() {
+        let root = tempdir().unwrap();
+        for rel in ["../escape.yaml", ".ai/../../escape.yaml", "/etc/passwd"] {
+            assert!(
+                matches!(
+                    safe_write_target(root.path(), rel),
+                    Err(InspectError::UnsafePath)
+                ),
+                "{rel} must be refused as unsafe"
+            );
+        }
+    }
+
+    /// The root is not a file. `safe_join` answers the root for an empty path — which is right for
+    /// `ls` and catastrophic for a write, so the refusal lives here where every writer gets it
+    /// rather than in whichever caller remembers.
+    #[test]
+    fn the_project_root_itself_is_not_a_write_target() {
+        let root = tempdir().unwrap();
+        for rel in ["", ".", "   "] {
+            assert!(
+                matches!(
+                    safe_write_target(root.path(), rel),
+                    Err(InspectError::UnsafePath)
+                ),
+                "{rel:?} names the root, which is a directory"
+            );
+        }
+    }
+
+    /// A link that leaves the project is refused even though every component of the path is
+    /// `Normal` — the lexical filter cannot see it, which is the entire reason this function
+    /// resolves anything at all.
+    ///
+    /// Skipped where the platform will not make the link without privileges: on Windows a symlink
+    /// needs Developer Mode or elevation, and a test that failed on an ordinary developer's machine
+    /// would be read as a broken repository. The threat it guards is real on both platforms (a
+    /// junction needs no elevation at all), so the guard is unconditional and only the proof is
+    /// conditional.
+    #[test]
+    fn a_link_out_of_the_project_is_not_a_write_target() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let link = root.path().join("elsewhere");
+
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok();
+
+        if !made {
+            return;
+        }
+        assert!(
+            matches!(
+                safe_write_target(root.path(), "elsewhere/autopilot.yaml"),
+                Err(InspectError::UnsafePath)
+            ),
+            "a directory link that leaves the project is not inside it"
+        );
+    }
+
+    /// A project whose recorded root is gone from disk gets `NotFound`, not a write that silently
+    /// recreates the folder somebody deleted.
+    #[test]
+    fn a_root_that_is_not_there_is_not_a_place_to_write() {
+        let root = tempdir().unwrap();
+        let gone = root.path().join("no-such-project");
+        assert!(matches!(
+            safe_write_target(&gone, ".ai/autopilot.yaml"),
+            Err(InspectError::NotFound)
+        ));
     }
 
     /* ------------------------------------------------ history and branches -- */

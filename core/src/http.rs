@@ -96,6 +96,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/blame", get(get_project_blame))
         .route("/projects/{id}/changed", get(get_project_changed))
         .route("/projects/{id}/worktree", get(get_project_worktree))
+        // The write boundary, read and exercised. They sit together because the second is
+        // unintelligible without the first: `POST /write` refuses everything the table does not
+        // name, so a client that cannot read the table can only discover the fence by hitting it.
+        .route("/projects/{id}/ownership", get(get_project_ownership))
+        .route("/projects/{id}/write", post(post_project_write))
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
         .route(
@@ -2815,6 +2820,174 @@ async fn get_project_worktree(
         base_sha,
         created_at,
     }))
+}
+
+/// One row of the write boundary, as the page draws it.
+///
+/// Every field is `&'static str` because every field comes off `ownership::CLAIMS`, which is a
+/// `static` — there is nothing here computed per project yet, and when a workflow's claims arrive
+/// they will arrive as rows rather than as a different shape.
+#[derive(serde::Serialize)]
+struct ClaimView {
+    path: &'static str,
+    owner: &'static str,
+    what: &'static str,
+}
+
+/// Which files in this project the app is the legitimate author of.
+///
+/// **Served rather than hard-coded in the shell, and that is the point of §7.3.** A boundary the
+/// client carries its own copy of is a boundary that goes out of date silently: the page would
+/// offer an editor for a file the daemon refuses, or hide one for a file it would accept. Here the
+/// only thing that decides is `ownership.rs`, and the page draws what it is told.
+///
+/// The root is resolved even though the table does not depend on it. A fence drawn for a project
+/// the daemon has no folder for is a fence around nothing, and the write route answers 404 on the
+/// same call — so this fails in the same place rather than showing an editor that cannot save.
+async fn get_project_ownership(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ClaimView>>, StatusCode> {
+    resolve_project_root(&state, &id).await?;
+    Ok(Json(
+        crate::ownership::CLAIMS
+            .iter()
+            .map(|claim| ClaimView {
+                path: claim.path,
+                owner: claim.owner,
+                what: claim.what,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct WriteRequest {
+    /// Relative to the project root, forward slashes. Only ever compared — never joined; see below.
+    path: String,
+    contents: String,
+}
+
+/// Writes one file the app declares itself the author of.
+///
+/// The five refusals are five different facts and none of them is "no". In order, and the order is
+/// the design:
+///
+/// 1. **423, the emergency stop.** First, before the path is so much as looked at. A write refused
+///    for a path reason while the stop is engaged would tell somebody their path was wrong when the
+///    answer is that nothing acts right now. The scoped brake counts too: a project held on its own
+///    is held for this as well.
+///
+///    The cost of this guard is one thing and it is worth naming: the rules file cannot be edited
+///    HERE while the stop is engaged, which is a moment somebody might well want to edit it. It
+///    costs nothing they cannot recover, because layer 2's whole premise is that the editor is one
+///    click away and the file is ordinary text — and what it buys is that the shell is not a door
+///    with privileges an agent lacks, which is the promise §7.5 makes.
+/// 2. **404, no folder.** A project the daemon has no root for has no file to write.
+/// 3. **403, not ours.** Everything the table does not name, which is nearly everything. A path
+///    with `..` in it lands here rather than at the path guard, and deliberately: the app answers
+///    about names it owns, and a traversal is not one — so the filesystem is never touched for a
+///    path nobody claimed.
+/// 4. **400/404, unwritable.** The claimed path that nonetheless does not land inside the project,
+///    which after (3) means one thing: a directory link or junction under `.ai/`.
+/// 5. **422, invalid, WITH the parser's words.** The one refusal carrying a detail, because the raw
+///    hatch is unusable without it — "unprocessable entity" sends somebody to an editor, which is
+///    the surface the hatch exists to replace.
+///
+/// **The file written is the one the registry names, never the string the caller sent.** The two
+/// normalise to the same file by the time (3) passes, and joining the caller's spelling anyway
+/// would make every future change to `normalise` a security question instead of a tidiness one.
+///
+/// This route is in no table in `auth.rs`, so `permits` — which is default-deny — leaves it to
+/// Control and Admin. That is not an omission: `.ai/autopilot.yaml` carries `gate_command`, and a
+/// run able to rewrite it could decide what green means for every gate it will ever face.
+async fn post_project_write(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<WriteRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
+    // about is not a stop anybody may assume is off.
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+        || crate::autopilot::scoped_kill_engaged(&state.pool, "project", &id)
+            .await
+            .unwrap_or(true);
+    if halted {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+
+    let crate::ownership::Owner::Declared(claim) =
+        crate::ownership::owner_of(crate::ownership::CLAIMS, &body.path)
+    else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+
+    let target = inspect::safe_write_target(&root, claim.path)
+        .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
+
+    if let Err(detail) = (claim.validate)(&body.contents) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
+        ));
+    }
+
+    let contents = body.contents;
+    tokio::task::spawn_blocking(move || write_atomically(&target, &contents))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, path = %claim.path, "writing a project file failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // After the write, not before, and loudly on failure. A feed line about a write that then failed
+    // claims something that did not happen; a write whose line was lost is recoverable from the log,
+    // and refusing the request at this point would report a failure for work already done.
+    if let Err(error) = feed::append(
+        &state.pool,
+        Some(&id),
+        "config_written",
+        &format!("{} written from the app", claim.path),
+        None,
+    )
+    .await
+    {
+        tracing::error!(
+            %error,
+            project_id = %id,
+            path = %claim.path,
+            "a project file was written and its feed line was not recorded"
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Write through a temporary file in the same directory, then rename over the target.
+///
+/// A plain truncate-and-write leaves the rules file half-written if anything goes wrong mid-write,
+/// and a half-written `.ai/autopilot.yaml` is not a smaller file — it is an *unreadable* one, which
+/// `gate.rs` reports as `gate errored` on every completed run from then on. Rename is atomic on both
+/// platforms and replaces an existing file on both, so the file is either wholly the old one or
+/// wholly the new one.
+///
+/// The temporary lives beside the target because rename is only atomic within a filesystem. Two
+/// writes racing would collide on it; they would be writing the same class of content to the same
+/// file, and the loser is a request the caller is watching.
+fn write_atomically(target: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = target.with_extension("nucleos-tmp");
+    std::fs::write(&temp, contents)?;
+    std::fs::rename(&temp, target)
 }
 
 async fn get_project_ls(
@@ -9048,6 +9221,274 @@ mod tests {
         assert_eq!(
             set_wip_limit(state, "nowhere", serde_json::json!({ "limit": 1 })).await,
             StatusCode::NOT_FOUND,
+        );
+    }
+
+    /* ------------------------------------------------ the write boundary -- */
+
+    async fn write_file(
+        state: AppState,
+        id: &str,
+        path: &str,
+        contents: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{id}/write"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "path": path, "contents": contents }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    /// The round trip that has to hold: what the app writes is what the daemon then reads.
+    ///
+    /// Asserted through `GET /rules` rather than by reading the file back, and the difference is
+    /// the whole test. Reading the bytes back proves the write landed; asking the daemon proves the
+    /// bytes mean what the app thought they meant — which is the claim a structured editor makes
+    /// and a text editor does not.
+    #[tokio::test]
+    async fn a_rules_file_written_from_the_app_is_the_one_the_daemon_then_reads() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, _) = write_file(
+            state.clone(),
+            "alpha",
+            ".ai/autopilot.yaml",
+            "gate_command: cargo clippy\nschedules:\n  - name: nightly\n    cron: '0 3 * * *'\n    prompt: sweep\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rules_file"], "present");
+        assert_eq!(body["gate_command"], "cargo clippy");
+        assert_eq!(body["schedules"].as_array().unwrap().len(), 1);
+
+        // In the feed, because a write from the app goes the same way an agent's does. A change to
+        // what a project does on its own that left no line would be the one edit nobody could find
+        // afterwards.
+        let (kind, summary): (String, String) = sqlx::query_as(
+            "SELECT kind, summary FROM feed WHERE project_id = 'alpha' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(kind, "config_written");
+        assert!(summary.contains(".ai/autopilot.yaml"), "got: {summary}");
+    }
+
+    /// Everything the registry does not name is refused, and the refusal is named so the page can
+    /// say *why* rather than "no".
+    ///
+    /// The traversal is in this list rather than in a path-guard test on purpose: the app answers
+    /// about names it owns, and `..` is not one — so it is turned away before the filesystem is
+    /// touched at all.
+    #[tokio::test]
+    async fn a_file_the_app_does_not_own_is_refused_before_anything_is_touched() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        for path in [
+            // Layer 2: read, plus a door to an editor. Never written from here.
+            "core/src/http.rs",
+            "README.md",
+            // The `.ai/` workflow harness's own config, which a `.ai/*.yaml` glob would have swept
+            // in and which the núcleo has never opened.
+            ".ai/models.yaml",
+            // This machine's settings, which are not any project's however the URL is spelled.
+            ".ai/github.yaml",
+            "../escape.yaml",
+            ".ai/../../escape.yaml",
+        ] {
+            let (status, body) = write_file(state.clone(), "alpha", path, "x: 1\n").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(body["refusal"], "not_ours", "{path}");
+        }
+
+        // Nothing was created anywhere, including one level up from the project.
+        assert!(!dir.path().join("core").exists());
+        assert!(!dir.path().join("README.md").exists());
+        assert!(!dir.path().join(".ai").join("models.yaml").exists());
+        assert!(!dir.path().parent().unwrap().join("escape.yaml").exists());
+    }
+
+    /// YAML the daemon could not read is refused **and the file that was there survives**.
+    ///
+    /// The surviving file is the assertion that matters. A validator that refused after truncating
+    /// would be worse than no validator at all: the caller would be told their edit was rejected
+    /// while the project quietly lost its rules, and the next run would report `gate errored` for a
+    /// reason nothing on the screen could explain.
+    ///
+    /// The detail comes back with it, because "unprocessable entity" and nothing else sends
+    /// somebody to a text editor — which is the surface the hatch exists to replace.
+    #[tokio::test]
+    async fn yaml_the_daemon_could_not_read_is_refused_and_the_old_file_survives() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let file = dir.path().join(".ai").join("autopilot.yaml");
+
+        for (contents, expected_in_detail) in [
+            ("schedules: [\n", "line"),
+            // `deny_unknown_fields`: a typo an editor would save happily, and after which the gate
+            // is silently absent for ever.
+            ("gate_commmand: cargo test\n", "gate_commmand"),
+        ] {
+            let (status, body) =
+                write_file(state.clone(), "alpha", ".ai/autopilot.yaml", contents).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{contents}");
+            assert_eq!(body["refusal"], "invalid");
+            let detail = body["detail"].as_str().unwrap();
+            assert!(
+                detail.contains(expected_in_detail),
+                "the refusal must say what broke: {detail}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "gate_command: cargo test\n",
+                "the file that was there must survive a refusal"
+            );
+        }
+    }
+
+    /// The emergency stop holds the app's write too, which is the promise that the shell is not a
+    /// door with privileges an agent lacks.
+    ///
+    /// Both brakes, because a project held on its own is held for this as well — and the scoped one
+    /// is the likelier of the two to be forgotten, since it is the only one that names the project
+    /// this route already has in its path.
+    #[tokio::test]
+    async fn the_emergency_stop_holds_a_write_from_the_app() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let file = dir.path().join(".ai").join("autopilot.yaml");
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+        let (status, body) = write_file(
+            state.clone(),
+            "alpha",
+            ".ai/autopilot.yaml",
+            "gate_command: x\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+
+        crate::autopilot::set_kill_switch(&state.pool, false)
+            .await
+            .unwrap();
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "alpha", true)
+            .await
+            .unwrap();
+        let (status, body) = write_file(
+            state.clone(),
+            "alpha",
+            ".ai/autopilot.yaml",
+            "gate_command: x\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "gate_command: cargo test\n",
+            "nothing is written while the stop is engaged"
+        );
+
+        // Released, and the same request goes through — so the refusal was the stop and not the
+        // request.
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "alpha", false)
+            .await
+            .unwrap();
+        let (status, _) =
+            write_file(state, "alpha", ".ai/autopilot.yaml", "gate_command: x\n").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// A project the daemon has no folder for has no file to write, and no fence to draw either.
+    /// Both routes fail in the same place, so the page cannot end up showing an editor that cannot
+    /// save.
+    #[tokio::test]
+    async fn a_project_with_no_folder_has_no_file_and_no_fence() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('rootless', 'off')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = write_file(
+            state.clone(),
+            "rootless",
+            ".ai/autopilot.yaml",
+            "gate_command: x\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "no_project_root");
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/rootless/ownership")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The fence is served, and it names the file, the owner and what editing it changes.
+    ///
+    /// Served rather than hard-coded in the shell: a client carrying its own copy would offer an
+    /// editor for a file the daemon refuses, or hide one for a file it would accept, and neither
+    /// mistake announces itself.
+    #[tokio::test]
+    async fn the_write_boundary_is_served_so_the_page_can_draw_it() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/alpha/ownership")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let claims = claims.as_array().unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0]["path"], ".ai/autopilot.yaml");
+        assert_eq!(claims[0]["owner"], "core");
+        assert!(
+            claims[0]["what"].as_str().unwrap().contains("gate command"),
+            "the fence has to say what crossing it changes"
         );
     }
 

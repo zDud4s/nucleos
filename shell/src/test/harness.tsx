@@ -14,7 +14,9 @@ import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
 import { ApiRefusal } from "../data/client";
 import type { Concurrency, HeldSlot, ProjectConcurrency } from "../data/fleet";
+import type { ClassTally } from "../data/autopilot";
 import type { Changed, Worktree } from "../data/project-code";
+import type { Claim } from "../data/project-config";
 import type { Branches, Commit } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
@@ -107,7 +109,30 @@ export interface DaemonState {
    * — a clean tree, an empty file. A responder that could not distinguish "empty" from "absent"
    * would make the most common answer untestable.
    */
-  text: { diff: string; cat: string };
+  text: { diff: string; cat: string | null };
+  /**
+   * The write boundary this project's daemon declares.
+   *
+   * A list rather than a flag, because the page must not know the fence by heart: an editor that
+   * appeared for a hard-coded path would keep appearing after the daemon stopped granting it. A
+   * test can hand back an empty list, which is a real answer — a project the app authors nothing
+   * in.
+   */
+  ownership: Claim[];
+  /** What the classifier has been judged on, class by class. */
+  scoreboard: ClassTally[];
+  /**
+   * Every write the shell has made, in order, so a test can assert what was SENT rather than what
+   * the component thinks it sent.
+   */
+  writes: { path: string; contents: string }[];
+  /**
+   * What `POST /projects/{id}/write` refuses with, or `null` to accept.
+   *
+   * Refusals are the interesting half of this route — five of them, each a different sentence — and
+   * they are reachable only if the fake can be told to give one.
+   */
+  writeRefusal: { status: number; code: string; detail: string } | null;
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -138,6 +163,16 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
       created_at: "2026-08-23T09:00:00Z",
     },
     text: { diff: "", cat: "" },
+    ownership: [
+      {
+        path: ".ai/autopilot.yaml",
+        owner: "core",
+        what: "what this project does on its own, and the gate command that decides what green means",
+      },
+    ],
+    scoreboard: [],
+    writes: [],
+    writeRefusal: null,
     ...overrides,
   };
 }
@@ -247,6 +282,30 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       if (path === "/autopilot/kill" && typeof init.body === "string") {
         state.kill = JSON.parse(init.body) as { engaged: boolean };
       }
+      if (path.includes("/write") && typeof init.body === "string") {
+        if (state.writeRefusal !== null) {
+          const { status, code, detail } = state.writeRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        const body = JSON.parse(init.body) as { path: string; contents: string };
+        state.writes.push(body);
+        // Applied to the text the read route serves, so the refetch after a save reads back what
+        // was written — the same thing the daemon does, and the only way a test can tell a save
+        // that landed from one that only looked like it did.
+        state.text.cat = body.contents;
+      }
+      if (path.includes("/wip-limit") && typeof init.body === "string") {
+        const { limit } = JSON.parse(init.body) as { limit: number | null };
+        state.projects = state.projects.map((row) =>
+          row.project_id === path.split("/")[2] ? { ...row, wip_limit: limit } : row,
+        );
+      }
+      if (path === "/autopilot/state" && typeof init.body === "string") {
+        const change = JSON.parse(init.body) as { project_id: string; mode: ProjectSummary["mode"] };
+        state.projects = state.projects.map((row) =>
+          row.project_id === change.project_id ? { ...row, mode: change.mode } : row,
+        );
+      }
       return undefined;
     }
 
@@ -254,6 +313,8 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     // `switch` over literals cannot express.
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;
+    if (path.startsWith("/projects/") && path.endsWith("/ownership")) return state.ownership;
+    if (path.startsWith("/scoreboard")) return state.scoreboard;
     if (path.startsWith("/projects/") && path.includes("/changed")) {
       if (state.changed === null) throw new ApiRefusal(422, "unprocessable", "no branch point");
       return state.changed;
@@ -296,7 +357,13 @@ export interface HarnessOptions {
 export function daemonText(state: DaemonState): (path: string) => Promise<string> {
   return async (path) => {
     if (path.includes("/diff")) return state.text.diff;
-    if (path.includes("/cat")) return state.text.cat;
+    if (path.includes("/cat")) {
+      // `null` is a file that is not there — a 404, and a different fact from an empty file. A
+      // project with no rules file yet is the ordinary case, and the editor says a different
+      // sentence for it.
+      if (state.text.cat === null) throw new ApiRefusal(404, "not_found", "no such file");
+      return state.text.cat;
+    }
     return "";
   };
 }

@@ -41,6 +41,7 @@ mod mcp_tools;
 mod mentions;
 mod notes;
 mod notify;
+mod ownership;
 mod pii_shadow;
 mod presets;
 mod priority;

@@ -10,6 +10,8 @@ import {
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { Branches } from "./Branches";
 import { Occupancy } from "./Occupancy";
+import { OwnedFiles } from "./OwnedFiles";
+import { Settings } from "./Settings";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
 
 /**
@@ -93,6 +95,20 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
           what="This project's own commands"
           why="the núcleo has no command registry yet"
         />
+      </Section>
+
+      {/*
+        The two halves of the write boundary, at the bottom and in this order: what the app authors
+        in the database, then what it authors on disk. Last because the sections above answer *how
+        is this now* and these two answer *what can I do to it* — and the top of this page is
+        state-dependent by design, so the settled things belong furthest from it.
+      */}
+      <Section label="Settings">
+        <Settings projectId={projectId} />
+      </Section>
+
+      <Section label="Files the app owns">
+        <OwnedFiles projectId={projectId} />
       </Section>
     </div>
   );

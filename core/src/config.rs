@@ -1056,12 +1056,33 @@ pub struct AutopilotRules {
     pub gate_command: Option<String>,
 }
 
+/// Where a project keeps its rules, relative to its root, in forward slashes.
+///
+/// Named once because two things have to agree about it and they live in different modules: this
+/// loader, and `ownership.rs`, which declares the file writable by the app. A registry that granted
+/// write to a path the loader never reads would be permission to write bytes nobody parses, which
+/// is the one thing that registry exists to prevent — so the claim is asserted against this const
+/// rather than against a second literal.
+pub const AUTOPILOT_RULES_PATH: &str = ".ai/autopilot.yaml";
+
 pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRules> {
-    let path = project_root.join(".ai").join("autopilot.yaml");
+    let path = project_root.join(AUTOPILOT_RULES_PATH);
     if !path.exists() {
         return Ok(AutopilotRules::default());
     }
-    let contents = std::fs::read_to_string(&path)?;
+    parse_schedule_rules(&std::fs::read_to_string(&path)?)
+}
+
+/// The same rules, from text that is not on disk yet.
+///
+/// Split out of [`load_schedule_rules`] so that the app can hold a candidate to exactly the standard
+/// the daemon will hold the file to, BEFORE writing it. Without this the only validator was "read it
+/// back afterwards", which is a check that happens after the damage.
+///
+/// The two must not drift, and the shape here is what stops them: the loader reads bytes and then
+/// calls this, so there is one parser and one range check rather than a second pair kept in step by
+/// hand.
+pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
     // A file with no YAML document in it -- empty, or nothing but comments -- is a fourth state, and
     // it must land with "absent" rather than with "unreadable". serde_yaml returns EndOfStream here,
     // which would otherwise become `GateConfig::Unreadable` and report `gate errored` on every
@@ -1070,7 +1091,7 @@ pub fn load_schedule_rules(project_root: &Path) -> std::io::Result<AutopilotRule
     if contents.trim().is_empty() {
         return Ok(AutopilotRules::default());
     }
-    let rules: AutopilotRules = serde_yaml::from_str(&contents)
+    let rules: AutopilotRules = serde_yaml::from_str(contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     validate_rules(&rules)?;
     Ok(rules)

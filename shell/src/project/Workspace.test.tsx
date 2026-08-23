@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { screen } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import {
   daemonFetch,
   daemonState,
@@ -58,6 +58,14 @@ function reviewState(): DaemonState {
     },
     changed: { paths: ["core/src/http.rs", "shell/src/a.tsx"], tracked: 3_214 },
   });
+}
+
+/** Mount the app over a state a test built for itself. */
+async function openState(state: DaemonState, path = "/projects/nucleos/estado") {
+  daemon.apiFetch.mockImplementation(daemonFetch(state));
+  daemon.apiText.mockImplementation(daemonText(state));
+  daemon.probeHealth.mockResolvedValue(true);
+  return renderApp({ initialPath: path });
 }
 
 /** The page's panels, in order, read the way a screen reader would read them. */
@@ -137,6 +145,8 @@ describe("the project workspace", () => {
       "Branches",
       "Workflow",
       "Commands",
+      "Settings",
+      "Files the app owns",
     ]);
   });
 
@@ -174,7 +184,9 @@ describe("the project workspace", () => {
     // must not be confused with calm.
     await screen.findByText(/Nothing waiting on you/);
 
-    // Four readings, four em dashes, four reasons — and not one zero among them. The harness's
+    // Four readings, four em dashes, four reasons — and not one zero. Exactly four, which is
+    // also what keeps the dash meaning ONE thing on this page: the ceiling below says "off"
+    // rather than borrowing the mark for a reading nobody took. among them. The harness's
     // default project is the ordinary case this has to survive: brand new, nothing behind it.
     expect(screen.getAllByText("—").length).toBe(4);
     expect(screen.getByText("nothing finished in the last 30 days")).toBeTruthy();
@@ -216,6 +228,8 @@ describe("the project workspace", () => {
       "Branches",
       "Workflow",
       "Commands",
+      "Settings",
+      "Files the app owns",
     ]);
   });
 
@@ -370,5 +384,188 @@ describe("the project workspace", () => {
   it("shows the workflows mode as designed and not yet served", async () => {
     await openWorkspace({ mode: "workflows" });
     expect(await screen.findByText(/No workflow is installed in nucleos/)).toBeTruthy();
+  });
+});
+
+/* ------------------------------------------------------- the write boundary -- */
+
+describe("what the app may author", () => {
+  /** A project with a rules file already in it. */
+  function ownedState(overrides: Partial<DaemonState> = {}): DaemonState {
+    return daemonState({
+      projects: [project({ project_id: "nucleos", mode: "shadow", project_root: "C:/p" })],
+      text: { diff: "", cat: "gate_command: cargo test\n" },
+      ...overrides,
+    });
+  }
+
+  /**
+   * The fence is the daemon's, and the page draws what it is told.
+   *
+   * A client carrying its own copy would offer an editor for a file the daemon refuses, or hide
+   * one for a file it would accept — and neither mistake announces itself. So the empty answer has
+   * to produce no editor at all, which is what proves the list is doing the deciding.
+   */
+  it("offers an editor for exactly the files the núcleo says it authors", async () => {
+    const nothing = await openState(ownedState({ ownership: [] }));
+    expect(await screen.findByText(/authors no file in this project/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "edit" })).toBeNull();
+
+    nothing.unmount();
+
+    await openState(ownedState());
+    expect(await screen.findByText(".ai/autopilot.yaml")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "edit" })).toBeTruthy();
+  });
+
+  /**
+   * What is SENT, not what the component believed it sent. The path comes from the claim rather
+   * than from anything typed here, which is the same rule the daemon follows on its side.
+   */
+  it("sends the text that was typed, to the path the núcleo named", async () => {
+    const state = ownedState();
+    await openState(state);
+
+    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
+    const box = await screen.findByLabelText(".ai/autopilot.yaml");
+    fireEvent.change(box, { target: { value: "gate_command: cargo clippy\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+
+    await waitFor(() => expect(state.writes.length).toBe(1));
+    expect(state.writes[0]).toEqual({
+      path: ".ai/autopilot.yaml",
+      contents: "gate_command: cargo clippy\n",
+    });
+  });
+
+  /**
+   * A refused save keeps the text in front of the person who wrote it, and says where the file
+   * broke.
+   *
+   * Both halves matter and they fail differently. Dropping the draft makes a rejected edit an edit
+   * LOST — the worst possible answer to "that YAML is invalid". And showing only the word "invalid"
+   * sends somebody to a text editor to find the broken line, which is the surface this editor
+   * exists to replace; the daemon already located it, so the sentence is free.
+   */
+  it("keeps a refused edit on the screen and says where the file broke", async () => {
+    const state = ownedState({
+      writeRefusal: {
+        status: 422,
+        code: "invalid",
+        detail: "unknown field `gate_commmand` at line 1 column 1",
+      },
+    });
+    await openState(state);
+
+    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
+    const box = await screen.findByLabelText(".ai/autopilot.yaml");
+    fireEvent.change(box, { target: { value: "gate_commmand: cargo test\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+
+    expect(await screen.findByText(/gate_commmand/)).toBeTruthy();
+    expect((box as HTMLTextAreaElement).value).toBe("gate_commmand: cargo test\n");
+  });
+
+  /**
+   * The emergency stop holds this write too, and the sentence says the one thing that keeps that
+   * from being a trap: the file is still ordinary text in an editor one click away.
+   */
+  it("says the stop is why a save was refused, and where the file is still editable", async () => {
+    const state = ownedState({
+      writeRefusal: { status: 423, code: "kill_switch", detail: "kill_switch" },
+    });
+    await openState(state);
+
+    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
+    fireEvent.change(await screen.findByLabelText(".ai/autopilot.yaml"), {
+      target: { value: "gate_command: x\n" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+
+    expect(await screen.findByText(/emergency stop is engaged/)).toBeTruthy();
+    expect(screen.getByText(/still editable in an editor/)).toBeTruthy();
+  });
+
+  /**
+   * A file that is not there yet is a state, not an error. A project nobody has scheduled anything
+   * in has no rules file, which is the ordinary case — and saving is how it gets one.
+   */
+  it("says a rules file is absent rather than showing an empty one", async () => {
+    await openState(ownedState({ text: { diff: "", cat: null } }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
+    expect(await screen.findByText(/no such file yet/)).toBeTruthy();
+    expect((await screen.findByLabelText(".ai/autopilot.yaml") as HTMLTextAreaElement).value).toBe("");
+  });
+});
+
+describe("the settings this app authors", () => {
+  function settingsState(overrides: Partial<ReturnType<typeof project>> = {}): DaemonState {
+    return daemonState({
+      projects: [
+        project({ project_id: "nucleos", mode: "shadow", project_root: "C:/p", ...overrides }),
+      ],
+    });
+  }
+
+  /**
+   * The ceiling says what it is holding, because a ceiling of three reads as slack until you know
+   * two are already taken.
+   *
+   * And clearing it is not setting it to zero: the daemon compares `open >= limit`, so zero means
+   * *never start anything again* — the opposite end of the same axis from "no brake".
+   */
+  it("says what the ceiling is holding, and clears it without setting it to zero", async () => {
+    const state = settingsState({ wip_limit: 3, open_proposals: 2 });
+    await openState(state);
+
+    expect(await screen.findByText("2 of 3 taken")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "no ceiling" }));
+    await waitFor(() =>
+      expect(state.projects[0].wip_limit).toBe(null),
+    );
+    expect(await screen.findByText(/no ceiling — 2 proposals waiting on you/)).toBeTruthy();
+  });
+
+  /**
+   * The third setting is earned, and the page says what is still missing rather than offering a
+   * button that would refuse.
+   *
+   * `promotable` is the núcleo's arithmetic and is never recomputed here — the blocker sentence is
+   * the same one the Autopilot page shows, from `lib/mode.ts`, so the two cannot come to disagree
+   * about what restraint means.
+   */
+  it("does not offer to let a project act until the núcleo says it has earned it", async () => {
+    const locked = await openState(
+      settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
+    );
+    const active = await screen.findByRole("button", { name: "active" });
+    expect(active.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(/3 of 5 action classes are still short of the bar/)).toBeTruthy();
+
+    locked.unmount();
+
+    await openState(
+      settingsState({
+        promotable: true,
+        classes_ready: 5,
+        classes_total: 5,
+        withheld_classes_ready: 1,
+      }),
+    );
+    expect((await screen.findByRole("button", { name: "active" })).hasAttribute("disabled")).toBe(
+      false,
+    );
+  });
+
+  /**
+   * Nothing measured is not zero cleared. A project that has never run in shadow has taken no
+   * measurement, and the difference is the whole of the never-collapse contract.
+   */
+  it("says no class was measured rather than saying none cleared", async () => {
+    await openState(settingsState());
+    expect(await screen.findByText(/Nothing recorded in shadow yet/)).toBeTruthy();
+    expect(screen.getByText(/not the same as a bad one/)).toBeTruthy();
   });
 });

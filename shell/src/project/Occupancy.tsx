@@ -1,6 +1,5 @@
 import { Link } from "@tanstack/react-router";
 import { useConcurrency } from "../data/fleet";
-import { useProjects } from "../data/system";
 
 /**
  * How full this project is, as slots rather than as a number.
@@ -24,11 +23,9 @@ export interface OccupancyProps {
 
 export function Occupancy({ projectId }: OccupancyProps) {
   const concurrency = useConcurrency();
-  const projects = useProjects();
 
   const answered = concurrency.data !== undefined;
   const here = concurrency.data?.projects.find((row) => row.project_id === projectId);
-  const rosterRow = projects.data?.find((row) => row.project_id === projectId);
 
   if (!answered) {
     return <p className="text-sm text-text-faint">Reading capacity…</p>;
@@ -41,7 +38,17 @@ export function Occupancy({ projectId }: OccupancyProps) {
    * rather than a gap in the answer.
    */
   const slots = here?.slots ?? [];
-  const limit = here?.limit ?? rosterRow?.wip_limit ?? null;
+  /**
+   * The slot ceiling, and **only** the slot ceiling.
+   *
+   * `wip_limit` on the roster row is a different brake with a similar name — it bounds proposals
+   * waiting on a person (migration 0017), while this bounds worktrees (0052). Falling back to it
+   * would draw one number's boxes for the other number's ceiling. It cannot happen today, because
+   * the readout unions the roster with everything holding a slot and so always has a row for a
+   * project that exists; it would start happening silently the day that union changed, which is
+   * exactly when nobody would be looking.
+   */
+  const limit = here?.limit ?? null;
 
   /**
    * `null` is the brake OFF, and it is not a ceiling of zero.
