@@ -116,6 +116,36 @@ pub fn build_router(state: AppState) -> Router {
             "/projects/{id}/commands/{command_id}/run",
             post(post_project_command_run),
         )
+        // The workflow library, and what one project uses out of it.
+        //
+        // The library is house-wide and hangs off no project — it is one folder on this machine,
+        // shared by everything — while a pin belongs to a project and is stored in the project's
+        // own files. Two prefixes, because they are two nouns and not two views of one.
+        //
+        // Everything that changes a pin is a POST or a DELETE on the project's side; nothing here
+        // ever writes into the library, and that asymmetry is §6.3's second exit staying honest:
+        // "edit it in the library" means the editor, not a form in this app.
+        .route("/workflows/library", get(get_workflow_library))
+        .route(
+            "/projects/{id}/workflows",
+            get(get_project_workflows).post(post_project_workflow),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}",
+            delete(delete_project_workflow),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}/eject",
+            post(post_project_workflow_eject),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}/update",
+            post(post_project_workflow_update),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}/diff",
+            get(get_project_workflow_diff),
+        )
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
         .route(
@@ -2839,14 +2869,20 @@ async fn get_project_worktree(
 
 /// One row of the write boundary, as the page draws it.
 ///
-/// Every field is `&'static str` because every field comes off `ownership::CLAIMS`, which is a
-/// `static` — there is nothing here computed per project yet, and when a workflow's claims arrive
-/// they will arrive as rows rather than as a different shape.
+/// Owned strings now, because half the table is: an installed workflow's rows are read off its
+/// manifest per project. They arrived as ROWS and not as a second shape, which is what the first
+/// version of this struct said would happen.
+///
+/// `writable` is the field §12 asks for. Three states, not two: a file the app authors, a file
+/// somebody else authors, and everything else — and the middle one needs its own answer because it
+/// gets a different exit. The page must not infer it from `owner`, because `owner` is a name and
+/// tomorrow there is a workflow called `core`.
 #[derive(serde::Serialize)]
 struct ClaimView {
-    path: &'static str,
-    owner: &'static str,
-    what: &'static str,
+    path: String,
+    owner: String,
+    what: String,
+    writable: bool,
 }
 
 /// Which files in this project the app is the legitimate author of.
@@ -2863,17 +2899,40 @@ async fn get_project_ownership(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ClaimView>>, StatusCode> {
-    resolve_project_root(&state, &id).await?;
+    let root = resolve_project_root(&state, &id).await?;
+    let claims = claims_for_project(root, state.workflow_library.clone()).await?;
     Ok(Json(
-        crate::ownership::CLAIMS
-            .iter()
+        claims
+            .into_iter()
             .map(|claim| ClaimView {
-                path: claim.path,
-                owner: claim.owner,
-                what: claim.what,
+                writable: claim.validate.is_some(),
+                path: claim.path.into_owned(),
+                owner: claim.owner.into_owned(),
+                what: claim.what.into_owned(),
             })
             .collect(),
     ))
+}
+
+/// The fence in force in one project, read off the disk on the thread pool.
+///
+/// `spawn_blocking`, because assembling it opens the pins file and walks whatever bundles are
+/// installed. Small work, but filesystem work, and the runtime this daemon shares with every
+/// sidecar and every run is not the place to do it inline.
+///
+/// A machine with no home directory has no library, which is an empty shelf and not a failure: the
+/// núcleo's own rows still stand, so the write boundary never disappears because a path lookup came
+/// back empty.
+async fn claims_for_project(
+    root: PathBuf,
+    library: Option<PathBuf>,
+) -> Result<Vec<crate::ownership::Claim>, StatusCode> {
+    tokio::task::spawn_blocking(move || match library {
+        Some(library) => crate::ownership::claims_for(&root, &library),
+        None => crate::ownership::CLAIMS.to_vec(),
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize)]
@@ -2902,7 +2961,10 @@ struct WriteRequest {
 /// 3. **403, not ours.** Everything the table does not name, which is nearly everything. A path
 ///    with `..` in it lands here rather than at the path guard, and deliberately: the app answers
 ///    about names it owns, and a traversal is not one — so the filesystem is never touched for a
-///    path nobody claimed.
+///    path nobody claimed. **`another_author` is its own refusal beside it**, for a file an
+///    installed workflow declares: the fence names it, and the app still may not write it, because
+///    it has no parser for it. One code for both would tell somebody the file is nobody's when it
+///    has an author standing right there, and the exit for the two is different.
 /// 4. **400/404, unwritable.** The claimed path that nonetheless does not land inside the project,
 ///    which after (3) means one thing: a directory link or junction under `.ai/`.
 /// 5. **422, invalid, WITH the parser's words.** The one refusal carrying a detail, because the raw
@@ -2937,16 +2999,31 @@ async fn post_project_write(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
 
-    let crate::ownership::Owner::Declared(claim) =
-        crate::ownership::owner_of(crate::ownership::CLAIMS, &body.path)
+    let claims = claims_for_project(root.clone(), state.workflow_library.clone())
+        .await
+        .map_err(|status| refusal(status, "internal"))?;
+    let crate::ownership::Owner::Declared(claim) = crate::ownership::owner_of(&claims, &body.path)
     else {
         return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
     };
+    let Some(validate) = claim.validate else {
+        // The middle state of §12, said in its own words: somebody authors this file and it is not
+        // this app. `detail` carries who, because the exit depends on it — a workflow's file is
+        // changed where the workflow lives.
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "refusal": "another_author",
+                "detail": format!("{} authors this file", claim.owner),
+            })),
+        ));
+    };
 
-    let target = inspect::safe_write_target(&root, claim.path)
+    let path = claim.path.clone().into_owned();
+    let target = inspect::safe_write_target(&root, &path)
         .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
 
-    if let Err(detail) = (claim.validate)(&body.contents) {
+    if let Err(detail) = validate(&body.contents) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
@@ -2958,7 +3035,7 @@ async fn post_project_write(
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .map_err(|error| {
-            tracing::warn!(%error, project_id = %id, path = %claim.path, "writing a project file failed");
+            tracing::warn!(%error, project_id = %id, %path, "writing a project file failed");
             refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         })?;
 
@@ -2969,7 +3046,7 @@ async fn post_project_write(
         &state.pool,
         Some(&id),
         "config_written",
-        &format!("{} written from the app", claim.path),
+        &format!("{path} written from the app"),
         None,
     )
     .await
@@ -2977,7 +3054,7 @@ async fn post_project_write(
         tracing::error!(
             %error,
             project_id = %id,
-            path = %claim.path,
+            %path,
             "a project file was written and its feed line was not recorded"
         );
     }
@@ -3245,6 +3322,347 @@ async fn post_project_command_run(
         return Err(refusal(StatusCode::CONFLICT, "already_running"));
     }
     Ok(StatusCode::ACCEPTED)
+}
+
+/* ------------------------------------------------------------- workflows -- */
+
+/// Where the library is on this machine, refused as one answer when there is nowhere for it to be.
+///
+/// A machine with no home directory has no library. `503` rather than `500`: nothing broke, the
+/// answer simply does not exist here, and the page says so instead of showing an empty shelf that
+/// reads as "you have installed nothing".
+fn library_or_refusal(state: &AppState) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .workflow_library
+        .clone()
+        .ok_or_else(|| refusal(StatusCode::SERVICE_UNAVAILABLE, "no_library"))
+}
+
+/// Every bundle on this machine, whatever any project uses.
+///
+/// House-wide, under `/workflows` and not under a project, because that is what it is: one folder
+/// shared by everything. A library route hanging off a project id would answer identically for
+/// every project and teach the shell a relationship that does not exist.
+async fn get_workflow_library(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::workflows::Bundle>>, (StatusCode, Json<serde_json::Value>)> {
+    let root = library_or_refusal(&state)?;
+    tokio::task::spawn_blocking(move || crate::workflows::library(&root))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the workflow library failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })
+}
+
+/// What this project uses, measured against the library as it is right now.
+///
+/// The measurement is the point. A listing that only replayed the pins file would say `referenced`
+/// for a bundle somebody has since edited, rewritten or deleted — which is the exact silence §6.1
+/// asks this page to break.
+async fn get_project_workflows(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::workflows::Installed>>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+    tokio::task::spawn_blocking(move || crate::workflows::installed(&root, &library))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map(Json)
+        // The parser's own words, the same as `POST /write`'s `invalid`: a pins file that will not
+        // load is a file somebody has to fix, and "unprocessable entity" does not say which line.
+        .map_err(|detail| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "refusal": "unreadable_pins", "detail": detail })),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+struct InstallRequest {
+    name: String,
+    version: String,
+}
+
+/// Turn a `workflows::Refused` into the status code that matches what it says.
+fn workflow_status(refused: &crate::workflows::Refused) -> (StatusCode, &'static str) {
+    match refused {
+        crate::workflows::Refused::NoSuchBundle => (StatusCode::NOT_FOUND, "no_such_bundle"),
+        crate::workflows::Refused::NotInstalled => (StatusCode::NOT_FOUND, "not_installed"),
+        crate::workflows::Refused::BadName => (StatusCode::UNPROCESSABLE_ENTITY, "bad_name"),
+        crate::workflows::Refused::AlreadyEjected => (StatusCode::CONFLICT, "already_ejected"),
+        crate::workflows::Refused::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+fn workflow_refusal(refused: crate::workflows::Refused) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, name) = workflow_status(&refused);
+    (
+        status,
+        Json(serde_json::json!({ "refusal": name, "detail": refused.to_string() })),
+    )
+}
+
+/// Find one bundle in the library, or say which half is missing.
+fn bundle_or_refusal(
+    library: &std::path::Path,
+    name: &str,
+    version: Option<&str>,
+) -> Result<crate::workflows::Bundle, crate::workflows::Refused> {
+    if !crate::workflows::valid_name(name) {
+        return Err(crate::workflows::Refused::BadName);
+    }
+    let shelf = crate::workflows::library(library)
+        .map_err(|e| crate::workflows::Refused::Io(e.to_string()))?;
+    let mut candidates: Vec<_> = shelf
+        .into_iter()
+        .filter(|bundle| bundle.name == name)
+        .filter(|bundle| version.is_none_or(|wanted| bundle.version == wanted))
+        .collect();
+    // Newest last, so `None` for the version means "the latest there is" — which is what an update
+    // asks for when the page offered it a version it read from this same listing.
+    candidates.sort_by(|a, b| crate::workflows::compare_versions(&a.version, &b.version));
+    candidates
+        .pop()
+        .ok_or(crate::workflows::Refused::NoSuchBundle)
+}
+
+/// Every route below writes into the project's own folder, so every one of them asks the same two
+/// questions first, in the same order, for the reasons `POST /write` sets out at length.
+///
+/// **The kill switch first.** These write `.ai/workflows.yaml`, and one of them copies a whole
+/// bundle into `.ai/workflows/` — bytes in the project's folder, which §7.5 says must go the way an
+/// agent's write goes. That is the line `POST /commands` sits on the other side of: that one writes
+/// a database row and touches nothing on disk.
+async fn workflow_write_root(
+    state: &AppState,
+    id: &str,
+) -> Result<(PathBuf, PathBuf), (StatusCode, Json<serde_json::Value>)> {
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+        || crate::autopilot::scoped_kill_engaged(&state.pool, "project", id)
+            .await
+            .unwrap_or(true);
+    if halted {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+    let root = resolve_project_root(state, id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    Ok((root, library_or_refusal(state)?))
+}
+
+/// Pin a bundle to this project.
+///
+/// The version is required, unlike the update route below. Installing is choosing, and a request
+/// that said only `harness` would silently mean something different next week — which is the
+/// property a pin exists to remove.
+async fn post_project_workflow(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<InstallRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, library) = workflow_write_root(&state, &id).await?;
+    let project_id = id.clone();
+
+    let installed = tokio::task::spawn_blocking(move || {
+        let bundle = bundle_or_refusal(&library, &body.name, Some(&body.version))?;
+        crate::workflows::install(&root, &bundle)?;
+        Ok::<_, crate::workflows::Refused>(bundle)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(
+        &state,
+        &project_id,
+        &format!(
+            "{}@{} installed from the app",
+            installed.name, installed.version
+        ),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stop using a workflow. Never deletes an ejected copy — see `workflows::uninstall`.
+async fn delete_project_workflow(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, _) = workflow_write_root(&state, &id).await?;
+    let removed = name.clone();
+
+    tokio::task::spawn_blocking(move || crate::workflows::uninstall(&root, &name))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map_err(workflow_refusal)?;
+
+    workflow_feed(&state, &id, &format!("{removed} is no longer used here")).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Take a copy, and stop receiving updates.
+///
+/// The one route here that puts a whole tree in somebody's repository, so it is the one the
+/// disclosure in §6.3 guards. It refuses rather than overwriting when a copy is already there: the
+/// edits in it are the entire reason it exists.
+async fn post_project_workflow_eject(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, library) = workflow_write_root(&state, &id).await?;
+    let now = chrono::Utc::now();
+    let ejected = name.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // The pinned version and not the newest: ejecting is taking a copy of what this project
+        // uses, and quietly taking a copy of something else would be an upgrade nobody asked for
+        // performed at the one moment updates stop arriving.
+        let pinned = crate::workflows::read_pins(&root)
+            .map_err(crate::workflows::Refused::Io)?
+            .workflows
+            .into_iter()
+            .find(|pin| pin.name == name)
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+        let bundle = bundle_or_refusal(&library, &name, Some(&pinned.version))?;
+        crate::workflows::eject(&root, &bundle, now)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(
+        &state,
+        &id,
+        &format!("{ejected} ejected: this project now has its own copy"),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct UpdateRequest {
+    /// Absent means the newest the library has. The page always sends the version it showed, so
+    /// this is the CLI's affordance rather than the shell's.
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// Take the origin's current bytes.
+///
+/// For a referenced workflow this re-stamps the pin. **For an ejected one it replaces the project's
+/// copy**, which is what update means — and why the page puts the diff in front of the button
+/// rather than beside it.
+async fn post_project_workflow_update(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Json(body): Json<UpdateRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, library) = workflow_write_root(&state, &id).await?;
+    let now = chrono::Utc::now();
+    let project_id = id.clone();
+
+    let bundle = tokio::task::spawn_blocking(move || {
+        let bundle = bundle_or_refusal(&library, &name, body.version.as_deref())?;
+        crate::workflows::update(&root, &bundle, now)?;
+        Ok::<_, crate::workflows::Refused>(bundle)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(
+        &state,
+        &project_id,
+        &format!("{}@{} taken from the library", bundle.name, bundle.version),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What this project's copy has that the origin does not.
+#[derive(serde::Serialize)]
+struct WorkflowDiff {
+    /// The bundle both sides were measured against, so the answer names what it compared.
+    origin_version: String,
+    changes: Vec<crate::workflows::FileChange>,
+    /// Files that are identical in both. Counted rather than listed: the interesting half is the
+    /// short one, and a hundred unchanged paths would bury it.
+    unchanged: usize,
+}
+
+/// The diff §6.1 asks for, file by file.
+///
+/// Only for an ejected workflow, and the 409 says so rather than answering with an empty list. A
+/// referenced bundle IS the library's — there is no second copy to compare — so "no differences"
+/// would be true and useless, and would read as *your copy matches* to somebody who has no copy.
+async fn get_project_workflow_diff(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<WorkflowDiff>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+
+    tokio::task::spawn_blocking(move || {
+        let pinned = crate::workflows::read_pins(&root)
+            .map_err(crate::workflows::Refused::Io)?
+            .workflows
+            .into_iter()
+            .find(|pin| pin.name == name)
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+        let mine = crate::workflows::ejected_path(&root, &name)
+            .filter(|path| path.is_dir())
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+        let bundle = bundle_or_refusal(&library, &name, Some(&pinned.version))?;
+
+        let mine = crate::workflows::file_hashes(&mine)
+            .map_err(|e| crate::workflows::Refused::Io(e.to_string()))?;
+        let theirs = crate::workflows::file_hashes(std::path::Path::new(&bundle.path))
+            .map_err(|e| crate::workflows::Refused::Io(e.to_string()))?;
+        let changes = crate::workflows::compare(&mine, &theirs);
+        Ok::<_, crate::workflows::Refused>(WorkflowDiff {
+            origin_version: bundle.version,
+            unchanged: mine.len()
+                - changes
+                    .iter()
+                    .filter(|c| c.change != crate::workflows::Change::Removed)
+                    .count(),
+            changes,
+        })
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map(Json)
+    .map_err(workflow_refusal)
+}
+
+/// One feed line, after the fact and loudly on failure.
+///
+/// The same rule `POST /write` follows: a line about a change that then failed claims something
+/// that did not happen, and a change whose line was lost is recoverable from the log.
+async fn workflow_feed(state: &AppState, project_id: &str, said: &str) {
+    if let Err(error) = feed::append(
+        &state.pool,
+        Some(project_id),
+        "workflow_changed",
+        said,
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, project_id, "a workflow change was made and its feed line was not recorded");
+    }
 }
 
 async fn get_project_ls(
@@ -6956,6 +7374,7 @@ mod tests {
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
                 files_root: None,
+                workflow_library: None,
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -7539,6 +7958,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -8598,6 +9018,7 @@ mod tests {
     fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
         AppState {
             files_root: Some(root),
+            workflow_library: None,
             ..state
         }
     }
@@ -9740,13 +10161,297 @@ mod tests {
             .unwrap();
         let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let claims = claims.as_array().unwrap();
-        assert_eq!(claims.len(), 1);
+        assert_eq!(claims.len(), 2);
         assert_eq!(claims[0]["path"], ".ai/autopilot.yaml");
         assert_eq!(claims[0]["owner"], "core");
+        assert_eq!(claims[0]["writable"], true);
         assert!(
             claims[0]["what"].as_str().unwrap().contains("gate command"),
             "the fence has to say what crossing it changes"
         );
+        // The second row arrived with the module that parses it, which is the membership rule the
+        // registry runs on: a claim and a parser come together or not at all.
+        assert_eq!(claims[1]["path"], ".ai/workflows.yaml");
+        assert_eq!(claims[1]["writable"], true);
+    }
+
+    /* --------------------------------------------------------------- workflows -- */
+
+    /// A library with one bundle in it, and a state pointing at it.
+    ///
+    /// The library goes through `AppState` rather than through the machine's home directory, which
+    /// is what makes any of this testable without touching the person running the suite. See the
+    /// field's own comment in `state.rs`.
+    fn library_with(bundles: &[(&str, &str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, version, manifest) in bundles {
+            let at = dir.path().join(name).join(version);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join(crate::workflows::MANIFEST), manifest).unwrap();
+            std::fs::write(at.join("graph.yaml"), format!("# {name} {version}\n")).unwrap();
+        }
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
+
+    async fn workflow_call(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test-token")
+            .header("content-type", "application/json");
+        let request = match body {
+            Some(json) => request.body(Body::from(json.to_string())).unwrap(),
+            None => request.body(Body::empty()).unwrap(),
+        };
+        let response = build_router(state).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The library is listed, a pin records the hash, and a bundle edited under it reads as drift.
+    ///
+    /// The whole of §6.1's second requirement in one pass. The listing is a *measurement* against
+    /// the library as it is right now, not a replay of the file: replaying it would say
+    /// `referenced` for a bundle somebody has since rewritten, which is the exact silence this page
+    /// exists to break.
+    #[tokio::test]
+    async fn a_pin_records_the_hash_and_a_bundle_edited_under_it_reads_as_drift() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: the .ai harness\n")]);
+        state.workflow_library = Some(library.clone());
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, shelf) = workflow_call(state.clone(), "GET", "/workflows/library", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(shelf.as_array().unwrap().len(), 1);
+        assert_eq!(shelf[0]["origin"], "library:harness@1.0");
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, installed) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(installed[0]["standing"], "referenced");
+        assert_eq!(installed[0]["origin"], "library:harness@1.0");
+        assert_eq!(installed[0]["hash"], shelf[0]["hash"]);
+
+        // Somebody edits the bundle in place, under a pin that claims to know what it says.
+        std::fs::write(library.join("harness/1.0/graph.yaml"), "# changed\n").unwrap();
+        let (_, installed) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(installed[0]["standing"], "drifted");
+        assert_ne!(installed[0]["hash"], installed[0]["origin_hash"]);
+        // Drift is not an update on offer: nobody published a new version.
+        assert!(installed[0]["update_available"].is_null());
+    }
+
+    /// An installed workflow's declared file is in the fence and cannot be written from here.
+    ///
+    /// §12's middle state, end to end: `writable: false` on the row, and `another_author` rather
+    /// than `not_ours` from the write route. The two refusals send somebody to two different
+    /// places — one file has nobody this app writes as, the other has an author standing right
+    /// there — so collapsing them would be the page telling somebody to give up on a file that has
+    /// an owner they can go and edit.
+    #[tokio::test]
+    async fn a_workflows_own_file_is_shown_in_the_fence_and_refused_by_the_write_route() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[(
+            "harness",
+            "1.0",
+            "description: the .ai harness\nowns:\n  - .ai/models.yaml\n",
+        )]);
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (_, claims) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/ownership", None).await;
+        let claims = claims.as_array().unwrap();
+        assert_eq!(claims.len(), 3);
+        let theirs = claims
+            .iter()
+            .find(|claim| claim["path"] == ".ai/models.yaml")
+            .expect("an installed workflow's file must be in the fence");
+        assert_eq!(theirs["owner"], "harness");
+        assert_eq!(theirs["writable"], false);
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/write",
+            Some(serde_json::json!({ "path": ".ai/models.yaml", "contents": "plan: opus\n" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["refusal"], "another_author");
+        assert!(body["detail"].as_str().unwrap().contains("harness"));
+
+        // And the file the app DOES author still saves, so the refusal above is about authorship
+        // rather than about the route having stopped working.
+        let (status, _) = workflow_call(
+            state,
+            "POST",
+            "/projects/alpha/write",
+            Some(
+                serde_json::json!({ "path": ".ai/workflows.yaml", "contents": "workflows: []\n" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// Ejecting is a one-way door, and pressing it twice does not walk back through it.
+    ///
+    /// The edits in an ejected copy are the entire reason it exists. A second eject that
+    /// overwrote them would be the one operation here that destroys work, reachable by a
+    /// double-click.
+    #[tokio::test]
+    async fn ejecting_twice_is_a_conflict_and_leaves_the_first_copy_alone() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library);
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/eject",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let mine = dir.path().join(".ai/workflows/harness/graph.yaml");
+        std::fs::write(&mine, "# mine now\n").unwrap();
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/eject",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "already_ejected");
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "# mine now\n");
+
+        // And the diff is the thing that now has something to say.
+        let (status, diff) =
+            workflow_call(state, "GET", "/projects/alpha/workflows/harness/diff", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(diff["origin_version"], "1.0");
+        assert_eq!(diff["changes"][0]["path"], "graph.yaml");
+        assert_eq!(diff["changes"][0]["change"], "changed");
+    }
+
+    /// A referenced workflow has no second copy, so the diff refuses rather than answering "none".
+    ///
+    /// An empty list would be true and useless: it reads as *your copy matches* to somebody who has
+    /// no copy at all.
+    #[tokio::test]
+    async fn the_diff_refuses_for_a_workflow_this_project_has_no_copy_of() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (status, body) =
+            workflow_call(state, "GET", "/projects/alpha/workflows/harness/diff", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "not_installed");
+    }
+
+    /// The stop stops these too, and that is the line `POST /commands` sits on the other side of.
+    ///
+    /// These put bytes in the project's own folder — one of them copies a whole tree in — which
+    /// §7.5 says must go the way an agent's write goes. Declaring a command writes a database row
+    /// and touches nothing on disk, so it does not ask.
+    #[tokio::test]
+    async fn a_workflow_cannot_be_installed_or_ejected_while_the_stop_is_engaged() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/projects/alpha/workflows",
+                Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+            ),
+            ("POST", "/projects/alpha/workflows/harness/eject", None),
+            (
+                "POST",
+                "/projects/alpha/workflows/harness/update",
+                Some(serde_json::json!({})),
+            ),
+            ("DELETE", "/projects/alpha/workflows/harness", None),
+        ] {
+            let (status, refused) = workflow_call(state.clone(), method, uri, body).await;
+            assert_eq!(status, StatusCode::LOCKED, "{method} {uri}");
+            assert_eq!(refused["refusal"], "kill_switch");
+        }
+
+        // Reading is not writing: the page still says what this project uses while the stop is on,
+        // which is exactly when somebody is trying to work out what would have run.
+        let (status, _) = workflow_call(state, "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A machine with no library says so instead of showing an empty shelf.
+    ///
+    /// `503` and not `200 []`. Nothing broke — the answer does not exist here — and an empty list
+    /// would read as "you have installed nothing", which sends somebody looking for an install
+    /// button that cannot work.
+    #[tokio::test]
+    async fn a_machine_with_no_library_says_so_rather_than_showing_an_empty_shelf() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (status, body) = workflow_call(state, "GET", "/workflows/library", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["refusal"], "no_library");
     }
 
     /* ----------------------------------------------------- project commands -- */
@@ -12629,6 +13334,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

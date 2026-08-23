@@ -19,6 +19,7 @@ import type { Changed, Worktree } from "../data/project-code";
 import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
 import type { Branches, Commit } from "../data/project-git";
+import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
@@ -142,6 +143,30 @@ export interface DaemonState {
   declared: Partial<ProjectCommand>[];
   /** What `POST .../run` refuses with, or `null` to accept. */
   runRefusal: { status: number; code: string; detail: string } | null;
+  /**
+   * The workflow bundles on this fake machine.
+   *
+   * `null` is a machine with no library at all, which is a 503 and a different fact from an empty
+   * shelf: one says there is nowhere to keep bundles, the other says there are none. The page says
+   * a different sentence for each, so both have to be reachable.
+   */
+  library: Bundle[] | null;
+  /** What this project uses, already measured — the daemon does the measuring, not the shell. */
+  workflows: Installed[];
+  /** What the diff route answers, or `null` for a project with no copy to compare. */
+  workflowDiff: WorkflowDiff | null;
+  /** Every pin change the shell asked for, as it asked for it. */
+  workflowChanges: { verb: string; name: string; version?: string }[];
+  /** What every workflow-changing route refuses with, or `null` to accept. */
+  workflowRefusal: { status: number; code: string; detail: string } | null;
+  /**
+   * A `.ai/workflows.yaml` the daemon cannot parse.
+   *
+   * Its own field rather than a variant of `workflows`, because it is a different answer with a
+   * different sentence: an empty list says *this project uses no workflow*, and that is precisely
+   * the claim a daemon staring at a broken pins file cannot make.
+   */
+  pinsError: string | null;
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -186,6 +211,12 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     started: [],
     declared: [],
     runRefusal: null,
+    library: [],
+    workflows: [],
+    workflowDiff: null,
+    workflowChanges: [],
+    workflowRefusal: null,
+    pinsError: null,
     ...overrides,
   };
 }
@@ -245,6 +276,50 @@ export function projectCommand(overrides: Partial<ProjectCommand> = {}): Project
     runnable_by: "person",
     source: "project",
     last: null,
+    ...overrides,
+  };
+}
+
+/**
+ * One bundle in the library.
+ *
+ * `owns` empty by default: a bundle that declares no files is the ordinary one, and a default that
+ * claimed a path would make every unrelated test's ownership fence three rows long.
+ */
+export function bundle(overrides: Partial<Bundle> = {}): Bundle {
+  return {
+    name: "harness",
+    version: "1.0",
+    description: "the .ai harness, as a bundle",
+    origin: "library:harness@1.0",
+    owns: [],
+    hash: "sha256:aaaa",
+    path: "C:/Users/x/.nucleos/workflows/harness/1.0",
+    ...overrides,
+  };
+}
+
+/**
+ * One workflow a project uses.
+ *
+ * `referenced` and matching hashes by default — the state where nothing needs attention — so a test
+ * that wants drift has to say so, rather than every test starting from a page that is shouting.
+ */
+export function installedWorkflow(overrides: Partial<Installed> = {}): Installed {
+  return {
+    name: "harness",
+    version: "1.0",
+    origin: "library:harness@1.0",
+    hash: "sha256:aaaa",
+    standing: "referenced",
+    ejected_at: null,
+    origin_hash: "sha256:aaaa",
+    local_hash: null,
+    update_available: null,
+    description: "the .ai harness, as a bundle",
+    owns: [],
+    overridden_nodes: 0,
+    disabled_nodes: 0,
     ...overrides,
   };
 }
@@ -351,6 +426,24 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         const parts = path.split("/");
         state.started.push(Number(parts[parts.length - 2]));
       }
+      // The four pin changes, recorded as sent. One branch because they differ only in the verb,
+      // and four near-copies is four places for one of them to stop matching the route.
+      if (path.includes("/workflows")) {
+        if (state.workflowRefusal !== null) {
+          const { status, code, detail } = state.workflowRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        const segments = path.split("/");
+        const at = segments.indexOf("workflows");
+        const verb = segments[at + 2] ?? "install";
+        const body = typeof init.body === "string" ? JSON.parse(init.body) : {};
+        state.workflowChanges.push({
+          verb,
+          name: (segments[at + 1] ?? body.name) as string,
+          ...(body.version === undefined ? {} : { version: body.version as string }),
+        });
+        return undefined;
+      }
       if (path.includes("/wip-limit") && typeof init.body === "string") {
         const { limit } = JSON.parse(init.body) as { limit: number | null };
         state.projects = state.projects.map((row) =>
@@ -366,6 +459,17 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return undefined;
     }
 
+    if (init?.method === "DELETE" && path.includes("/workflows/")) {
+      if (state.workflowRefusal !== null) {
+        const { status, code, detail } = state.workflowRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+      const name = path.split("/").pop() ?? "";
+      state.workflowChanges.push({ verb: "forget", name });
+      state.workflows = state.workflows.filter((row) => row.name !== name);
+      return undefined;
+    }
+
     if (init?.method === "DELETE" && path.includes("/commands/")) {
       const id = Number(path.split("/").pop());
       state.commands = state.commands.filter((row) => row.id !== id);
@@ -378,6 +482,29 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;
     if (path.startsWith("/projects/") && path.endsWith("/ownership")) return state.ownership;
     if (path.startsWith("/projects/") && path.endsWith("/commands")) return state.commands;
+    if (path.startsWith("/projects/") && path.endsWith("/workflows")) {
+      // The daemon resolves the library before it can measure anything against it, so a machine
+      // with nowhere to keep bundles refuses here too — the same 503, from the same cause.
+      if (state.library === null) {
+        throw new ApiRefusal(503, "no_library", "this machine has nowhere for a library");
+      }
+      if (state.pinsError !== null) {
+        throw new ApiRefusal(422, "unreadable_pins", state.pinsError);
+      }
+      return state.workflows;
+    }
+    if (path.startsWith("/projects/") && path.endsWith("/diff") && path.includes("/workflows/")) {
+      if (state.workflowDiff === null) {
+        throw new ApiRefusal(404, "not_installed", "this project does not use that workflow");
+      }
+      return state.workflowDiff;
+    }
+    if (path === "/workflows/library") {
+      if (state.library === null) {
+        throw new ApiRefusal(503, "no_library", "this machine has nowhere for a library");
+      }
+      return state.library;
+    }
     if (path.startsWith("/scoreboard")) return state.scoreboard;
     if (path.startsWith("/projects/") && path.includes("/changed")) {
       if (state.changed === null) throw new ApiRefusal(422, "unprocessable", "no branch point");

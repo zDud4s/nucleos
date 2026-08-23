@@ -769,6 +769,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -2142,6 +2143,63 @@ mod tests {
             &Scope::Control,
             &Method::POST,
             "/projects/7/commands/1/run"
+        ));
+    }
+
+    /// A project's workflows are the owner's, to read and to change.
+    ///
+    /// Six routes, all out of every table, and the reads are the half worth arguing for. A
+    /// workflow is the *instructions an agent is given*: which nodes run, on which model, behind
+    /// which gate. A run able to read the graph it is being executed by is a run reading the shape
+    /// of its own supervision, and one able to write it could switch the review node off. The
+    /// library listing goes with them — it names every workflow on the machine, which is a map of
+    /// the house rather than a fact about this project.
+    ///
+    /// Membership rather than a request, like the commands above: `permits` is default-deny, so
+    /// these are safe today by being nowhere. What that does not survive is somebody filing the
+    /// GETs beside the eight `/projects/{id}/…` reads that share their prefix.
+    #[test]
+    fn a_projects_workflows_are_in_no_scope_table() {
+        for (method, pattern) in [
+            (Method::GET, "/workflows/library"),
+            (Method::GET, "/projects/{id}/workflows"),
+            (Method::POST, "/projects/{id}/workflows"),
+            (Method::DELETE, "/projects/{id}/workflows/{name}"),
+            (Method::POST, "/projects/{id}/workflows/{name}/eject"),
+            (Method::POST, "/projects/{id}/workflows/{name}/update"),
+            (Method::GET, "/projects/{id}/workflows/{name}/diff"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, &method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, &method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, pattern),
+                "{method} {pattern} must stay out of every scope table"
+            );
+        }
+
+        // And the one that would matter most, asked as a request: ejecting writes a whole bundle
+        // into the project's folder, which is exactly what §7.5 says may not have a door here that
+        // an agent lacks.
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, "/projects/7/workflows/harness/eject"),
+                "{scope:?} must not be able to eject a project's workflow"
+            );
+            assert!(
+                !permits(&scope, &Method::GET, "/projects/7/workflows"),
+                "{scope:?} must not be able to read which workflows a project uses"
+            );
+        }
+        assert!(permits(
+            &Scope::Control,
+            &Method::POST,
+            "/projects/7/workflows/harness/eject"
         ));
     }
 

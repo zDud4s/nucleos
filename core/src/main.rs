@@ -76,6 +76,7 @@ mod web;
 mod web_client;
 mod webhook;
 mod wip;
+mod workflows;
 mod worktree;
 
 use auth::Token;
@@ -704,6 +705,9 @@ async fn main() {
         local_triage_disabled,
         local_assistant,
         files_root,
+        // `None` when this machine has no home directory to hang a library off. Resolved here and
+        // not per request, like `files_root` above: it is a fact about the machine.
+        workflow_library: workflows::library_root(),
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,

@@ -6,6 +6,7 @@ import {
   daemonText,
   heldSlots,
   project,
+  installedWorkflow,
   projectCommand,
   readings,
   renderApp,
@@ -383,9 +384,15 @@ describe("the project workspace", () => {
     expect(await screen.findByText(/Nothing to review in nucleos/)).toBeTruthy();
   });
 
-  it("shows the workflows mode as designed and not yet served", async () => {
+  /**
+   * The third mode resolves and reads the library, which is what it did not do while it was a
+   * placeholder. The route is the assertion: `normaliseMode` above proves the parameter maps, and
+   * this proves the thing it maps to is mounted and asking the daemon.
+   */
+  it("mounts the workflows mode on the library and the project's pins", async () => {
     await openWorkspace({ mode: "workflows" });
-    expect(await screen.findByText(/No workflow is installed in nucleos/)).toBeTruthy();
+    expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
+    expect(screen.getByText("On this machine")).toBeTruthy();
   });
 });
 
@@ -709,6 +716,36 @@ describe("what this project can be asked to do", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /^gate,/ }));
     expect(await screen.findByText(/emergency stop is engaged/)).toBeTruthy();
+  });
+
+  /**
+   * Drift takes the top of the page, and an ejected copy does not.
+   *
+   * `workflowDrift` was a hard-coded `false` until the library existed to fill it. Both halves are
+   * asserted together because the risk is one of them: a page that led with an ejected copy would
+   * be shouting about a decision somebody made on purpose, which is how a surface teaches people to
+   * stop reading its top.
+   */
+  it("leads with a drifted workflow and says nothing at the top about an ejected one", async () => {
+    await openState(
+      daemonState({
+        projects: [project({ project_id: "nucleos", mode: "shadow" })],
+        workflows: [installedWorkflow({ standing: "drifted" })],
+      }),
+    );
+    expect(await screen.findByText(/differs from the bundle it references/)).toBeTruthy();
+
+    await openState(
+      daemonState({
+        projects: [project({ project_id: "nucleos", mode: "shadow" })],
+        workflows: [
+          installedWorkflow({ standing: "ejected", ejected_at: "2026-02-01T00:00:00Z" }),
+        ],
+      }),
+    );
+    expect(await screen.findAllByText(/Nothing waiting on you/)).toBeTruthy();
+    // Still stated where it is listed — the panel says how long it has been frozen.
+    expect(screen.getAllByText(/frozen/).length).toBeGreaterThan(0);
   });
 
   /**

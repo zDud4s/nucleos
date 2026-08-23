@@ -8,11 +8,13 @@ import {
   type ProjectReadings,
 } from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
+import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
 import { Occupancy } from "./Occupancy";
 import { OwnedFiles } from "./OwnedFiles";
 import { Settings } from "./Settings";
+import { WorkflowSummary } from "./Workflows";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
 
 /**
@@ -39,6 +41,7 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
   const projects = useProjects();
   const killSwitch = useKillSwitch();
   const budget = useBudget();
+  const workflows = useProjectWorkflows(projectId);
 
   const project = projects.data?.find((row) => row.project_id === projectId);
 
@@ -53,6 +56,11 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
    * weeks ago that was rescued the same afternoon would make this page shout for the rest of the
    * month. The concern needs failures nothing has picked up, which is a different question about
    * different rows.
+   *
+   * **Workflow drift is real now, and it is two of the four standings and not three.** `drifted`
+   * and `missing` are both *the thing this project pinned is not the thing it has*. An ejected copy
+   * is neither: it is a decision somebody made deliberately, and a page that led with it would be
+   * shouting about a choice — which is how a surface teaches people to stop reading its top.
    */
   const concerns: ProjectConcerns | null =
     !answered || project === undefined
@@ -63,7 +71,7 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
           openProposals: project.open_proposals,
           failedGatesWithoutRescue: 0,
           interruptedRuns: 0,
-          workflowDrift: false,
+          workflowDrift: driftingWorkflows(workflows.data).length > 0,
         };
 
   const leading = leadingConcern(concerns);
@@ -85,10 +93,7 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
       </Section>
 
       <Section label="Workflow">
-        <NotServedYet
-          what="The installed workflow, as a chain with the running node lit"
-          why="the workflow library is not built yet"
-        />
+        <WorkflowSummary projectId={projectId} />
       </Section>
 
       <Section label="Commands">
@@ -410,22 +415,5 @@ function DeliveredReading({ data }: { data: ProjectReadings | undefined }) {
           : `${humanMinutes(data.delivered.median_minutes)} median, over ${data.delivered.timed} of ${data.delivered.landed}`}
       </p>
     </Card>
-  );
-}
-
-/**
- * A panel that is designed and not yet served.
- *
- * Dimmed and explained, never hidden. The reason names the *núcleo* rather than this machine — the
- * same rule the sidebar's disabled items follow — because "not built" and "not configured here"
- * send somebody to two different places, and only one of them is something they can do anything
- * about.
- */
-function NotServedYet({ what, why }: { what: string; why: string }) {
-  return (
-    <div className="rounded-lg border border-dashed border-border bg-surface-sunken p-4">
-      <p className="text-sm text-text-muted">{what}</p>
-      <p className="mt-1 text-xs text-text-faint">Not here yet — {why}.</p>
-    </div>
   );
 }

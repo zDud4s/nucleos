@@ -128,6 +128,18 @@ export const keys = {
     ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
     /** What this project can be asked to do to itself, and what each of them last said. */
     commands: (projectId: string) => ["projects", projectId, "commands"] as const,
+    /**
+     * Which workflows this project uses, measured against the library right now.
+     *
+     * Under the project prefix and NOT under `keys.workflows` below, because it is a fact about
+     * this project rather than about the machine — and because installing one also changes what
+     * `ownership` answers, which is its neighbour here. The library itself is the machine's and
+     * has its own root.
+     */
+    workflows: (projectId: string) => ["projects", projectId, "workflows"] as const,
+    /** One workflow's divergence from its origin, asked for only when somebody opens it. */
+    workflowDiff: (projectId: string, name: string) =>
+      ["projects", projectId, "workflows", name, "diff"] as const,
     branches: (projectId: string) => ["projects", projectId, "branches"] as const,
     log: (projectId: string, path: string) => ["projects", projectId, "log", path] as const,
     /**
@@ -149,6 +161,17 @@ export const keys = {
 
   proposals: {
     all: ["proposals"] as const,
+  },
+
+  /**
+   * The bundles on this machine — `GET /workflows/library`.
+   *
+   * Its own root, and not a child of `projects`: one folder, shared by everything, and a page that
+   * invalidates one project's pins must not throw away a listing that every project reads.
+   */
+  workflows: {
+    all: ["workflows"] as const,
+    library: ["workflows", "library"] as const,
   },
 
   /**
