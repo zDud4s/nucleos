@@ -146,6 +146,17 @@ pub fn build_router(state: AppState) -> Router {
             "/projects/{id}/workflows/{name}/diff",
             get(get_project_workflow_diff),
         )
+        .route(
+            "/projects/{id}/workflows/{name}/graph",
+            get(get_project_workflow_graph),
+        )
+        // What this project overrides on one node. Under the workflow's name and then the node's,
+        // because that is what it is — and a flat `/overlay` taking both in the body would make the
+        // one thing being changed invisible in the log.
+        .route(
+            "/projects/{id}/workflows/{name}/nodes/{node}",
+            post(post_project_workflow_node),
+        )
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
         .route(
@@ -3397,6 +3408,13 @@ fn workflow_status(refused: &crate::workflows::Refused) -> (StatusCode, &'static
         crate::workflows::Refused::NotInstalled => (StatusCode::NOT_FOUND, "not_installed"),
         crate::workflows::Refused::BadName => (StatusCode::UNPROCESSABLE_ENTITY, "bad_name"),
         crate::workflows::Refused::AlreadyEjected => (StatusCode::CONFLICT, "already_ejected"),
+        // 404 and not 422: the bundle is fine, it simply does not have a graph in it yet. A
+        // "cannot process" would send somebody looking for a syntax error in a file that is not
+        // there.
+        crate::workflows::Refused::NoGraph => (StatusCode::NOT_FOUND, "no_graph"),
+        crate::workflows::Refused::InvalidGraph(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "invalid_graph")
+        }
         crate::workflows::Refused::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
@@ -3645,6 +3663,131 @@ async fn get_project_workflow_diff(
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
     .map(Json)
     .map_err(workflow_refusal)
+}
+
+/// The graph a project's canvas draws, with this project's overlay painted on.
+#[derive(serde::Serialize)]
+struct GraphView {
+    /// Which copy this came out of. `project` for an ejected workflow, `library` otherwise.
+    ///
+    /// Said out loud because it changes what editing the graph would mean: one is this project's
+    /// file and the other is shared by every project that references the bundle, which is the whole
+    /// of §6.3.
+    source: &'static str,
+    version: String,
+    #[serde(flatten)]
+    resolved: crate::workflow_graph::Resolved,
+}
+
+/// What this project's workflow looks like, ready to be drawn.
+///
+/// **The graph comes from the copy the project actually uses.** An ejected workflow is drawn from
+/// the folder in the project, because that is the one that would run; a referenced one from the
+/// library. Reading the library's for an ejected workflow would draw a picture of somebody else's
+/// bundle and label it as theirs.
+///
+/// Four refusals, and `no_graph` is the one worth naming separately. A bundle with skills and
+/// scripts and no sequence yet is an ordinary halfway state, not a broken bundle — and a page that
+/// reported it as a parse failure would send somebody looking for a syntax error in a file that is
+/// not there.
+async fn get_project_workflow_graph(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<GraphView>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+
+    tokio::task::spawn_blocking(move || {
+        let pinned = crate::workflows::read_pins(&root)
+            .map_err(crate::workflows::Refused::Io)?
+            .workflows
+            .into_iter()
+            .find(|pin| pin.name == name)
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+
+        let mine = crate::workflows::ejected_path(&root, &name).filter(|path| path.is_dir());
+        let (source, from) = match mine {
+            Some(path) => ("project", path),
+            None => (
+                "library",
+                std::path::PathBuf::from(
+                    bundle_or_refusal(&library, &name, Some(&pinned.version))?.path,
+                ),
+            ),
+        };
+
+        let text = std::fs::read_to_string(from.join(crate::workflow_graph::GRAPH_FILE)).map_err(
+            |error| match error.kind() {
+                std::io::ErrorKind::NotFound => crate::workflows::Refused::NoGraph,
+                _ => crate::workflows::Refused::Io(error.to_string()),
+            },
+        )?;
+        let graph =
+            crate::workflow_graph::parse(&text).map_err(crate::workflows::Refused::InvalidGraph)?;
+
+        Ok::<_, crate::workflows::Refused>(GraphView {
+            source,
+            version: pinned.version,
+            resolved: crate::workflow_graph::resolve(&graph, &pinned.nodes),
+        })
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map(Json)
+    .map_err(workflow_refusal)
+}
+
+#[derive(Deserialize)]
+struct OverlayRequest {
+    /// Absent means *inherit*, which is a third answer that `false` would have collapsed into
+    /// "explicitly on". The same reasoning as the fields below.
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+}
+
+/// Change what this project overrides on one node — or clear it back to inherited.
+///
+/// **A write, so the stop applies.** It puts bytes in `.ai/workflows.yaml`, which is the project's
+/// own folder, and §7.5 says that goes the way an agent's write goes.
+///
+/// A body in which everything is absent clears the row, because an override that overrides nothing
+/// is not an override. That makes "go back to what the bundle says" the same request with an empty
+/// body rather than a second route with a different verb.
+async fn post_project_workflow_node(
+    State(state): State<AppState>,
+    Path((id, name, node)): Path<(String, String, String)>,
+    Json(body): Json<OverlayRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, _) = workflow_write_root(&state, &id).await?;
+    let said = format!("{name}/{node} overridden in this project");
+
+    let overlay = crate::workflows::NodeOverlay {
+        disabled: body.disabled,
+        // Empty is cleared, not "the empty model". A form that sends "" for a field somebody
+        // emptied has to be able to mean *stop overriding this*, and there is no model, tool or
+        // command whose name is nothing.
+        model: body.model.filter(|value| !value.trim().is_empty()),
+        tool: body.tool.filter(|value| !value.trim().is_empty()),
+        command: body.command.filter(|value| !value.trim().is_empty()),
+    };
+
+    tokio::task::spawn_blocking(move || {
+        crate::workflows::set_overlay(&root, &name, &node, Some(overlay))
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(&state, &id, &said).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// One feed line, after the fact and loudly on failure.
@@ -10194,6 +10337,9 @@ mod tests {
         (dir, path)
     }
 
+    /// A bundle with a real graph in it, for the canvas routes.
+    const TWO_NODE_GRAPH: &str = "nodes:\n  - {id: plan, type: agent, model: opus}\n  - {id: gate, type: command, command: cargo test}\nedges:\n  - {from: plan, to: gate}\n";
+
     async fn workflow_call(
         state: AppState,
         method: &str,
@@ -10452,6 +10598,175 @@ mod tests {
         let (status, body) = workflow_call(state, "GET", "/workflows/library", None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["refusal"], "no_library");
+    }
+
+    /// The canvas reads the copy that would actually run, and says which one that was.
+    ///
+    /// An ejected workflow is drawn from the folder in the project. Reading the library's for one
+    /// would draw a picture of somebody else's bundle and label it as this project's — and it is
+    /// also the difference §6.3 turns on: editing one file affects this project, editing the other
+    /// affects every project that references the bundle.
+    #[tokio::test]
+    async fn the_canvas_reads_the_copy_that_would_actually_run() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        std::fs::write(library.join("harness/1.0/graph.yaml"), TWO_NODE_GRAPH).unwrap();
+        state.workflow_library = Some(library);
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (status, graph) = workflow_call(
+            state.clone(),
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(graph["source"], "library");
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(graph["nodes"][0]["type"], "agent");
+        // The gate is a role read off the edges, and nothing branches on this one yet.
+        assert_eq!(graph["nodes"][1]["role"], "plain");
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/eject",
+            None,
+        )
+        .await;
+        // The project's copy is now the one that would run, so it is the one that is drawn — and a
+        // change to it shows up while the library's is untouched.
+        std::fs::write(
+            dir.path().join(".ai/workflows/harness/graph.yaml"),
+            "nodes:\n  - {id: only, type: agent}\n",
+        )
+        .unwrap();
+
+        let (_, graph) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(graph["source"], "project");
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["nodes"][0]["id"], "only");
+    }
+
+    /// §6.2 through the route: the overlay is painted, and what the origin said travels with it.
+    #[tokio::test]
+    async fn the_overlay_reaches_the_canvas_as_a_seal_and_not_as_a_substitution() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        std::fs::write(library.join("harness/1.0/graph.yaml"), TWO_NODE_GRAPH).unwrap();
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        // Through the route that writes it, rather than by editing the file in the test: the
+        // shape of the pins file is `render_pins`'s business, and a test that hand-indented it
+        // would break the day that changed, for a reason that has nothing to do with overlays.
+        for (node, body) in [
+            ("plan", serde_json::json!({ "model": "haiku" })),
+            ("council", serde_json::json!({ "disabled": true })),
+        ] {
+            let (status, _) = workflow_call(
+                state.clone(),
+                "POST",
+                &format!("/projects/alpha/workflows/harness/nodes/{node}"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+
+        let (status, graph) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let plan = &graph["nodes"][0];
+        assert_eq!(plan["overridden"], true);
+        let model = plan["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"] == "model")
+            .unwrap();
+        assert_eq!(model["value"], "haiku");
+        assert_eq!(model["origin"], "opus");
+
+        // An override for a node this bundle does not have is reported, never dropped: it is the
+        // only moment somebody learns it stopped applying.
+        assert_eq!(graph["orphaned"][0], "council");
+    }
+
+    /// A bundle with no graph is a halfway state, not a broken bundle, and it gets its own answer.
+    ///
+    /// A parse failure would send somebody looking for a syntax error in a file that is not there.
+    #[tokio::test]
+    async fn a_bundle_with_no_graph_says_so_rather_than_reporting_a_parse_failure() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        std::fs::remove_file(library.join("harness/1.0/graph.yaml")).unwrap();
+        state.workflow_library = Some(library.clone());
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "no_graph");
+
+        // And one that IS there and will not parse comes back with the parser's words, because a
+        // refusal that does not say where the file broke sends somebody to an editor anyway.
+        std::fs::write(
+            library.join("harness/1.0/graph.yaml"),
+            "nodes:\n  - {id: plan, type: agent}\nedges:\n  - {from: plan, to: nowhere}\n",
+        )
+        .unwrap();
+        let (status, body) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid_graph");
+        assert!(body["detail"].as_str().unwrap().contains("nowhere"));
     }
 
     /* ----------------------------------------------------- project commands -- */

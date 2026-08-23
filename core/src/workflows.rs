@@ -627,6 +627,11 @@ pub enum Refused {
     BadName,
     /// Already has its own copy; ejecting again would overwrite whatever is in it.
     AlreadyEjected,
+    /// The bundle has no `graph.yaml`. Not a fault — skills and scripts with no sequence yet is an
+    /// ordinary halfway state, and this module is not the one that decides a bundle needs a graph.
+    NoGraph,
+    /// It has one and it does not parse, in [`crate::workflow_graph`]'s own words.
+    InvalidGraph(String),
     /// The pins file, or the ejected copy, could not be read or written.
     Io(String),
 }
@@ -640,6 +645,8 @@ impl std::fmt::Display for Refused {
             Refused::AlreadyEjected => {
                 write!(f, "this project already has its own copy of that workflow")
             }
+            Refused::NoGraph => write!(f, "this bundle has no graph in it yet"),
+            Refused::InvalidGraph(detail) => write!(f, "{detail}"),
             Refused::Io(detail) => write!(f, "{detail}"),
         }
     }
@@ -778,6 +785,49 @@ pub fn update(
     pins.workflows[index].version = bundle.version.clone();
     pins.workflows[index].origin = bundle.origin.clone();
     pins.workflows[index].hash = bundle.hash.clone();
+    save_pins(project_root, &pins)
+}
+
+/// Longest a node id may be in an overlay row.
+///
+/// The overlay is written before the graph is ever read — a project can override a node of a bundle
+/// this machine does not have — so nothing here can check that the id names anything. A bound is
+/// what stops a file from becoming a place to store something else.
+pub const MAX_NODE_ID: usize = 120;
+
+/// Set, change or clear what this project overrides on one node.
+///
+/// **This is the half of §6.2 that means a project does not have to eject.** Which model runs a
+/// node, which tool, which command, and whether it runs here at all are the project's to decide
+/// without taking a copy of anything — that is what an overlay IS. Ejecting is for changing the
+/// bundle's own content, and §6.3's guard belongs there rather than here.
+///
+/// `None` removes the row, which is how a node goes back to inheriting. A row of all-absent fields
+/// would be a third state meaning the same thing, so it is normalised away: an override that
+/// overrides nothing is not an override.
+pub fn set_overlay(
+    project_root: &Path,
+    name: &str,
+    node: &str,
+    overlay: Option<NodeOverlay>,
+) -> Result<(), Refused> {
+    let node = node.trim();
+    if node.is_empty() || node.len() > MAX_NODE_ID {
+        return Err(Refused::BadName);
+    }
+    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+    let Some(pin) = pins.workflows.iter_mut().find(|pin| pin.name == name) else {
+        return Err(Refused::NotInstalled);
+    };
+
+    match overlay.filter(|row| row != &NodeOverlay::default()) {
+        Some(row) => {
+            pin.nodes.insert(node.to_string(), row);
+        }
+        None => {
+            pin.nodes.remove(node);
+        }
+    }
     save_pins(project_root, &pins)
 }
 
@@ -1189,6 +1239,64 @@ mod tests {
         assert_eq!(
             rows[0].ejected_at.as_deref(),
             Some("2026-09-22T10:00:00+00:00")
+        );
+    }
+
+    /// The overlay is how a project changes a node WITHOUT taking a copy of the bundle, which is
+    /// the whole reason it exists. Clearing a row is how the node goes back to inheriting.
+    #[test]
+    fn overriding_a_node_needs_no_copy_of_anything_and_clears_back_to_inherited() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let lib = shelf(
+            &temp.path().join("lib"),
+            "harness",
+            "1.0",
+            &[("g.yaml", "a")],
+        );
+        install(&project, &bundle_at(&lib, "harness", "1.0")).unwrap();
+
+        set_overlay(
+            &project,
+            "harness",
+            "plan",
+            Some(NodeOverlay {
+                model: Some("haiku".into()),
+                ..NodeOverlay::default()
+            }),
+        )
+        .unwrap();
+        let rows = installed(&project, &lib).unwrap();
+        assert_eq!(rows[0].overridden_nodes, 1);
+        // Still referenced: overriding is not ejecting, and a project that had to take a copy to
+        // change a model would take one every time.
+        assert_eq!(rows[0].standing, Standing::Referenced);
+
+        set_overlay(&project, "harness", "plan", None).unwrap();
+        assert_eq!(installed(&project, &lib).unwrap()[0].overridden_nodes, 0);
+    }
+
+    /// An override that overrides nothing is not an override, and does not become a row that would
+    /// stamp the project seal on a node nobody touched.
+    #[test]
+    fn an_override_of_nothing_does_not_become_a_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let lib = shelf(
+            &temp.path().join("lib"),
+            "harness",
+            "1.0",
+            &[("g.yaml", "a")],
+        );
+        install(&project, &bundle_at(&lib, "harness", "1.0")).unwrap();
+
+        set_overlay(&project, "harness", "plan", Some(NodeOverlay::default())).unwrap();
+        assert!(read_pins(&project).unwrap().workflows[0].nodes.is_empty());
+        assert_eq!(
+            set_overlay(&project, "harness", "  ", None),
+            Err(Refused::BadName)
         );
     }
 

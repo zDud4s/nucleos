@@ -140,6 +140,9 @@ export const keys = {
     /** One workflow's divergence from its origin, asked for only when somebody opens it. */
     workflowDiff: (projectId: string, name: string) =>
       ["projects", projectId, "workflows", name, "diff"] as const,
+    /** One workflow's graph, overlay already painted on by the núcleo. */
+    workflowGraph: (projectId: string, name: string) =>
+      ["projects", projectId, "workflows", name, "graph"] as const,
     branches: (projectId: string) => ["projects", projectId, "branches"] as const,
     log: (projectId: string, path: string) => ["projects", projectId, "log", path] as const,
     /**

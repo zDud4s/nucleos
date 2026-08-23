@@ -20,6 +20,7 @@ import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
+import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
@@ -167,6 +168,15 @@ export interface DaemonState {
    * the claim a daemon staring at a broken pins file cannot make.
    */
   pinsError: string | null;
+  /**
+   * One workflow's graph, or `null` for a bundle with no sequence in it.
+   *
+   * `null` is a halfway state and not a fault — skills and scripts with nothing saying in what
+   * order — which the page says differently from a graph that will not parse.
+   */
+  graph: WorkflowGraph | null;
+  /** Every node override the shell sent, as it sent it. */
+  overlays: { name: string; node: string; body: unknown }[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -217,6 +227,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     workflowChanges: [],
     workflowRefusal: null,
     pinsError: null,
+    graph: null,
+    overlays: [],
     ...overrides,
   };
 }
@@ -320,6 +332,26 @@ export function installedWorkflow(overrides: Partial<Installed> = {}): Installed
     owns: [],
     overridden_nodes: 0,
     disabled_nodes: 0,
+    ...overrides,
+  };
+}
+
+/**
+ * One node of a graph, already resolved by the núcleo.
+ *
+ * `overridden: false` and no `origin` on any field, which is the inherited state — a default that
+ * stamped the project seal would make every test start from a graph that claims to have been
+ * changed.
+ */
+export function graphNode(overrides: Partial<GraphNode> = {}): GraphNode {
+  return {
+    id: "plan",
+    type: "agent",
+    role: "plain",
+    label: "Plan",
+    disabled: false,
+    overridden: false,
+    fields: [{ name: "model", value: "opus" }],
     ...overrides,
   };
 }
@@ -428,6 +460,23 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       }
       // The four pin changes, recorded as sent. One branch because they differ only in the verb,
       // and four near-copies is four places for one of them to stop matching the route.
+      // A node override is a workflow change too, but it names a node as well, so it is recorded
+      // with one — asserting on what was SENT is the only way a test tells a save that landed from
+      // one that only looked like it did.
+      if (path.includes("/workflows/") && path.includes("/nodes/")) {
+        if (state.workflowRefusal !== null) {
+          const { status, code, detail } = state.workflowRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        const segments = path.split("/");
+        const at = segments.indexOf("workflows");
+        state.overlays.push({
+          name: segments[at + 1] ?? "",
+          node: decodeURIComponent(segments[at + 3] ?? ""),
+          body: typeof init.body === "string" ? JSON.parse(init.body) : {},
+        });
+        return undefined;
+      }
       if (path.includes("/workflows")) {
         if (state.workflowRefusal !== null) {
           const { status, code, detail } = state.workflowRefusal;
@@ -492,6 +541,12 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         throw new ApiRefusal(422, "unreadable_pins", state.pinsError);
       }
       return state.workflows;
+    }
+    if (path.startsWith("/projects/") && path.endsWith("/graph")) {
+      if (state.graph === null) {
+        throw new ApiRefusal(404, "no_graph", "this bundle has no graph in it yet");
+      }
+      return state.graph;
     }
     if (path.startsWith("/projects/") && path.endsWith("/diff") && path.includes("/workflows/")) {
       if (state.workflowDiff === null) {

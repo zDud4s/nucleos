@@ -16,6 +16,7 @@ import {
   type Installed,
 } from "../data/workflows";
 import { openInVscode } from "../lib/vscode";
+import { WorkflowChain, WorkflowGraph } from "./WorkflowGraph";
 
 /**
  * The library, the pin, and how far the two have drifted apart.
@@ -274,6 +275,24 @@ function InstalledRow({
       ) : null}
 
       {diffOpen ? <Diff projectId={projectId} name={row.name} /> : null}
+
+      {/*
+        The canvas, under the row whose workflow it draws. Not a separate page and not a tab: the
+        picture and the sentence about where the bundle stands are the same subject, and a surface
+        that separated them would make somebody hold the standing in their head while looking at
+        the graph.
+
+        Only for a workflow this machine can actually produce a graph for. A `missing` pin has
+        nothing to draw and the row above already says what it is missing.
+      */}
+      {row.standing === "missing" ? null : (
+        <WorkflowGraph
+          projectId={projectId}
+          name={row.name}
+          originPath={originPath}
+          ejected={row.standing === "ejected"}
+        />
+      )}
     </li>
   );
 }
@@ -576,11 +595,21 @@ export function WorkflowSummary({ projectId }: { projectId: string }) {
               frozen {sinceText(row.ejected_at, Date.now())}
             </span>
           ) : null}
+          {/*
+            §4.5's miniature. The same reading as the canvas in the Workflows mode, at a fraction of
+            the ink — the question here is *how is this now*, and the answer is a glance.
+
+            Nothing lights yet: which node a run is on is execution semantics, which §14 keeps for
+            the second spec. The chain is drawn now because the shape of the workflow is worth
+            knowing on its own, and because a lit node is then one prop rather than a redraw.
+          */}
+          {row.standing === "missing" ? null : (
+            <div className="basis-full">
+              <WorkflowChain projectId={projectId} name={row.name} />
+            </div>
+          )}
         </div>
       ))}
-      <p className="text-xs text-text-faint">
-        The chain, with the node that is running lit, comes with the canvas.
-      </p>
     </div>
   );
 }

@@ -76,6 +76,7 @@ mod web;
 mod web_client;
 mod webhook;
 mod wip;
+mod workflow_graph;
 mod workflows;
 mod worktree;
 

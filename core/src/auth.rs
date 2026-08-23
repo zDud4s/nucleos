@@ -2168,6 +2168,8 @@ mod tests {
             (Method::POST, "/projects/{id}/workflows/{name}/eject"),
             (Method::POST, "/projects/{id}/workflows/{name}/update"),
             (Method::GET, "/projects/{id}/workflows/{name}/diff"),
+            (Method::GET, "/projects/{id}/workflows/{name}/graph"),
+            (Method::POST, "/projects/{id}/workflows/{name}/nodes/{node}"),
         ] {
             assert!(
                 !route_is_listed(READ_ONLY_ROUTES, &method, pattern)
