@@ -124,6 +124,8 @@ export const keys = {
       ["projects", projectId, "grep", q, path] as const,
     diff: (projectId: string, path: string) => ["projects", projectId, "diff", path] as const,
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
+    branches: (projectId: string) => ["projects", projectId, "branches"] as const,
+    log: (projectId: string, path: string) => ["projects", projectId, "log", path] as const,
   },
 
   proposals: {

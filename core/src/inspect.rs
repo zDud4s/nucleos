@@ -366,6 +366,250 @@ fn parse_status_z(output: &[u8]) -> Vec<String> {
     paths
 }
 
+/* -------------------------------------------------------- history and branches -- */
+
+/// The field separator inside one record of a git `--format`.
+///
+/// ASCII unit separator, which cannot appear in a commit subject, an author name or a branch name —
+/// unlike a comma, a tab or a pipe, all of which can and one day will. The record separator is NUL,
+/// through `-z`, for the same reason applied to newlines in a commit message.
+const FIELD: char = '\u{1f}';
+
+/// The most commits one read returns. A history panel is a panel, not an export.
+const LOG_CAP: usize = 200;
+
+/// The most branches one read returns, most recently committed first.
+///
+/// A ceiling because the ahead/behind figures cost one `git rev-list` **each** — the batched
+/// `%(ahead-behind:…)` atom needs a newer git than this project is willing to require — so an
+/// unbounded list would make a repository with three hundred stale branches spawn three hundred
+/// processes for a panel nobody could read anyway.
+const BRANCH_CAP: usize = 40;
+
+/// One commit, as a panel needs it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Commit {
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    /// Author date, strict ISO 8601 with an offset — `%aI`, never `%ad`, whose shape the
+    /// repository's own config can change underneath us.
+    pub at: String,
+    pub subject: String,
+}
+
+/// One local branch, and how far it is from where work lands.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BranchRow {
+    pub name: String,
+    /// Commits this branch has that the integration branch does not.
+    pub ahead: i64,
+    /// Commits the integration branch has that this one does not.
+    pub behind: i64,
+    /// Whether the pair above was measured at all, which is NOT the same as measuring zero.
+    ///
+    /// `0/0` means *identical to where work lands*. A root on a detached HEAD, or a git that
+    /// refused, means *nobody knows* — and a panel that drew the second as the first would report
+    /// every branch as up to date the moment the measurement broke.
+    pub measured: bool,
+    pub last_commit_at: String,
+    pub last_subject: String,
+}
+
+/// The branches of a project, and the one they are measured against.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Branches {
+    /// The branch checked out at the project root.
+    ///
+    /// **That is the daemon's own definition of where work lands**, not a guess and not `master` by
+    /// convention: `land_worktree` computes a merge's target by reading exactly this. Measuring
+    /// against anything else would draw distances to a place nothing merges into.
+    pub integration: Option<String>,
+    pub branches: Vec<BranchRow>,
+    /// Branches past the ceiling, which were not measured. Zero is the ordinary case.
+    pub omitted: usize,
+}
+
+/// A project's recent commits, newest first.
+///
+/// `rel` narrows the history to one path and is validated through `safe_join` even though nothing
+/// here opens it: git takes it as a pathspec, and a pathspec is not a file name — a leading `-` is
+/// an option and a `..` reaches outside the repository. Refusing the same shapes the readers refuse
+/// keeps one answer to "what may a caller name" rather than two.
+pub fn log(root: &Path, rel: &str, limit: usize) -> Result<Vec<Commit>, InspectError> {
+    // Validated for its shape and then discarded: what git is given is the caller's relative string,
+    // because a pathspec is relative to the repository and `safe_join` returns an absolute path.
+    safe_join(root, rel)?;
+    let limit = limit.clamp(1, LOG_CAP).to_string();
+    let format = format!("--format=%H{FIELD}%h{FIELD}%an{FIELD}%aI{FIELD}%s");
+
+    let mut args = vec![
+        "-c",
+        "core.fsmonitor=",
+        "log",
+        "-z",
+        "--no-color",
+        &format,
+        "-n",
+        &limit,
+    ];
+    let rel = rel.trim();
+    if !rel.is_empty() && rel != "." {
+        // After `--`, so a path that looks like an option is a path.
+        args.push("--");
+        args.push(rel);
+    }
+
+    let output = run_git(root, &args)?;
+    Ok(parse_log(&output))
+}
+
+/// PURE: git's `-z` log output as commits.
+///
+/// A record with too few fields is dropped rather than padded. Padding would invent an empty author
+/// or an empty date for a row that is really a parse failure, and a panel would show it as a commit
+/// by nobody.
+pub fn parse_log(output: &[u8]) -> Vec<Commit> {
+    String::from_utf8_lossy(output)
+        .split('\0')
+        .filter(|record| !record.trim().is_empty())
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split(FIELD);
+            Some(Commit {
+                sha: fields.next()?.to_owned(),
+                short_sha: fields.next()?.to_owned(),
+                author: fields.next()?.to_owned(),
+                at: fields.next()?.to_owned(),
+                // Last, and it takes the remainder: a subject cannot hold the separator, but a
+                // parser that depends on that is one surprise away from splitting a record.
+                subject: fields.collect::<Vec<_>>().join(&FIELD.to_string()),
+            })
+        })
+        .collect()
+}
+
+/// Every local branch, with its distance from where work lands.
+pub fn branches(root: &Path) -> Result<Branches, InspectError> {
+    let integration = current_branch(root)?;
+
+    let format = format!(
+        "--format=%(refname:short){FIELD}%(committerdate:iso-strict){FIELD}%(contents:subject)"
+    );
+    let listed = run_git(
+        root,
+        &[
+            "-c",
+            "core.fsmonitor=",
+            "for-each-ref",
+            "--sort=-committerdate",
+            &format,
+            "refs/heads/",
+        ],
+    )?;
+
+    let all = parse_branch_list(&listed);
+    let omitted = all.len().saturating_sub(BRANCH_CAP);
+
+    let mut branches = Vec::new();
+    for (name, at, subject) in all.into_iter().take(BRANCH_CAP) {
+        // Names come from git's own ref listing, never from a caller, so there is nothing here to
+        // validate that git did not already guarantee.
+        let (ahead, behind, measured) = match integration.as_deref() {
+            // The integration branch against itself is a real answer — zero and zero — and that is
+            // a different fact from a branch that could not be measured.
+            Some(target) if target == name => (0, 0, true),
+            Some(target) => distance(root, target, &name)?,
+            // No integration branch means a detached root. There is nothing to measure against, and
+            // saying so beats measuring against a default nobody chose.
+            None => (0, 0, false),
+        };
+        branches.push(BranchRow {
+            name,
+            ahead,
+            behind,
+            measured,
+            last_commit_at: at,
+            last_subject: subject,
+        });
+    }
+
+    Ok(Branches {
+        integration,
+        branches,
+        omitted,
+    })
+}
+
+/// PURE: one line per branch, three fields each. Short records are dropped, never padded.
+pub fn parse_branch_list(output: &[u8]) -> Vec<(String, String, String)> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split(FIELD);
+            let name = fields.next()?.to_owned();
+            let at = fields.next()?.to_owned();
+            // A branch whose tip has an empty subject is possible; a branch with no third field at
+            // all is a parse failure. `unwrap_or_default` would merge the two.
+            let subject = fields.next()?.to_owned();
+            (!name.is_empty()).then_some((name, at, subject))
+        })
+        .collect()
+}
+
+/// The branch checked out at `root`, or `None` on a detached HEAD.
+fn current_branch(root: &Path) -> Result<Option<String>, InspectError> {
+    // `--quiet` so a detached HEAD is exit 1 with no output rather than the word "HEAD", which is
+    // also a legal branch name and would be indistinguishable from one.
+    let output = match run_git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Ok(output) => output,
+        // A detached HEAD is an ordinary state, not a broken repository.
+        Err(InspectError::Io(_)) => return Ok(None),
+        Err(other) => return Err(other),
+    };
+    let name = String::from_utf8_lossy(&output).trim().to_owned();
+    Ok((!name.is_empty()).then_some(name))
+}
+
+/// How far `branch` is from `target`, in commits each way.
+///
+/// `--count` on a symmetric difference.
+///
+/// **An unrelated history is counted, not refused** — checked against git rather than assumed, and
+/// the assumption here was wrong first: `rev-list --left-right --count A...B` on two histories with
+/// no common ancestor exits 0 and reports both sides in full. That is a true answer to the question
+/// asked, and it is the one that reads correctly on the panel as well: a grafted branch shows every
+/// commit on both sides, which is exactly the work a merge of it would involve.
+///
+/// The command that *does* refuse is `merge-base`, and calling it would cost one more process per
+/// branch — forty more per read — to distinguish a case that is honest without it. Not paid.
+fn distance(root: &Path, target: &str, branch: &str) -> Result<(i64, i64, bool), InspectError> {
+    let range = format!("{target}...{branch}");
+    let output = match run_git(root, &["rev-list", "--left-right", "--count", &range]) {
+        Ok(output) => output,
+        Err(InspectError::Io(_)) => return Ok((0, 0, false)),
+        Err(other) => return Err(other),
+    };
+    Ok(parse_distance(&output))
+}
+
+/// PURE: git's `--left-right --count` pair, as (ahead, behind, measured).
+///
+/// Left is what the target has and the branch does not — *behind*. Right is the branch's own —
+/// *ahead*. Getting that round the wrong way is the easiest mistake here and the hardest to catch
+/// on a screen, since both numbers are usually small and both look plausible either way.
+pub fn parse_distance(output: &[u8]) -> (i64, i64, bool) {
+    let text = String::from_utf8_lossy(output);
+    let mut fields = text.split_whitespace();
+    match (
+        fields.next().and_then(|value| value.parse::<i64>().ok()),
+        fields.next().and_then(|value| value.parse::<i64>().ok()),
+    ) {
+        (Some(behind), Some(ahead)) => (ahead, behind, true),
+        _ => (0, 0, false),
+    }
+}
+
 /// A git with a deadline and a ceiling, whose output is returned whole or not returned.
 ///
 /// The shape follows `diff` above, polling included — this code runs on a blocking thread, and a
@@ -470,6 +714,204 @@ pub(crate) mod tests {
         .trim()
         .to_owned();
         (repo, base)
+    }
+
+    /* ------------------------------------------------ history and branches -- */
+
+    /// The branch the root is standing on, read the way the tests need it rather than through the
+    /// private helper under test.
+    fn head_branch(repo: &Path) -> String {
+        String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    }
+
+    fn commit_file(repo: &Path, name: &str, message: &str) {
+        std::fs::write(repo.join(name), "x\n").unwrap();
+        git_in_repo(repo, &["add", "-A"]);
+        git_in_repo(repo, &["commit", "-m", message]);
+    }
+
+    #[test]
+    fn the_log_reads_newest_first_with_every_field_present() {
+        let (repo, _) = seeded_repo();
+        commit_file(repo.path(), "second.txt", "the second commit");
+
+        let commits = log(repo.path(), "", 10).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].subject, "the second commit");
+        assert_eq!(commits[1].subject, "seed");
+        assert_eq!(commits[0].author, "test");
+        assert_eq!(commits[0].sha.len(), 40);
+        assert!(!commits[0].short_sha.is_empty());
+        // `%aI` and never `%ad`: the repository can redefine `%ad` in its own config, and a date
+        // the shell cannot parse reads on screen as a commit from nowhen.
+        assert!(commits[0].at.contains('T'), "not ISO: {}", commits[0].at);
+    }
+
+    #[test]
+    fn a_path_narrows_the_log_to_the_commits_that_touched_it() {
+        let (repo, _) = seeded_repo();
+        commit_file(repo.path(), "only.txt", "touched only.txt");
+
+        let commits = log(repo.path(), "only.txt", 10).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "touched only.txt");
+    }
+
+    /// The same refusal `cat` gives, for the same reason and through the same function.
+    ///
+    /// Nothing in `log` opens the path — git takes it as a pathspec — which is exactly why it is
+    /// easy to forget that a pathspec climbs out of a repository just as happily as an open does.
+    #[test]
+    fn the_log_refuses_a_path_that_climbs_out_of_the_repository() {
+        let (repo, _) = seeded_repo();
+        assert!(matches!(
+            log(repo.path(), "../secret", 10),
+            Err(InspectError::UnsafePath)
+        ));
+        assert!(matches!(
+            log(repo.path(), "sub/../../secret", 10),
+            Err(InspectError::UnsafePath)
+        ));
+        assert!(matches!(
+            log(repo.path(), "C:/Windows", 10),
+            Err(InspectError::UnsafePath)
+        ));
+    }
+
+    #[test]
+    fn the_log_is_bounded_however_much_is_asked_for() {
+        let (repo, _) = seeded_repo();
+        for index in 0..5 {
+            commit_file(
+                repo.path(),
+                &format!("f{index}.txt"),
+                &format!("commit {index}"),
+            );
+        }
+
+        assert_eq!(log(repo.path(), "", 2).unwrap().len(), 2);
+        // Zero is not a request for nothing; it is a request that cannot be honoured, and one
+        // commit is the smallest honest answer to it.
+        assert_eq!(log(repo.path(), "", 0).unwrap().len(), 1);
+        assert_eq!(log(repo.path(), "", 10_000).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn the_branch_list_measures_every_branch_against_the_one_the_root_is_on() {
+        let (repo, _) = seeded_repo();
+        let integration = head_branch(repo.path());
+
+        git_in_repo(repo.path(), &["checkout", "-b", "feature"]);
+        commit_file(repo.path(), "a.txt", "ahead by one");
+        git_in_repo(repo.path(), &["checkout", &integration]);
+
+        let listed = branches(repo.path()).unwrap();
+        assert_eq!(listed.integration.as_deref(), Some(integration.as_str()));
+
+        let feature = listed
+            .branches
+            .iter()
+            .find(|row| row.name == "feature")
+            .expect("the feature branch should be listed");
+        // One commit of its own, none of the target's missing. Reversing these two is the easiest
+        // mistake in this file and the hardest to notice on a screen, since both look plausible.
+        assert_eq!((feature.ahead, feature.behind), (1, 0));
+        assert!(feature.measured);
+
+        // The integration branch is in its own list at zero and zero — a measurement, not an
+        // absence, and the two must not render alike.
+        let itself = listed
+            .branches
+            .iter()
+            .find(|row| row.name == integration)
+            .expect("the integration branch should be listed too");
+        assert_eq!((itself.ahead, itself.behind), (0, 0));
+        assert!(itself.measured);
+    }
+
+    #[test]
+    fn a_branch_behind_the_integration_branch_reads_as_behind_and_not_as_ahead() {
+        let (repo, _) = seeded_repo();
+        git_in_repo(repo.path(), &["branch", "stale"]);
+        commit_file(repo.path(), "b.txt", "moved on");
+
+        let listed = branches(repo.path()).unwrap();
+        let stale = listed
+            .branches
+            .iter()
+            .find(|row| row.name == "stale")
+            .expect("the stale branch should be listed");
+        assert_eq!((stale.ahead, stale.behind), (0, 1));
+    }
+
+    /// **This test exists because the code was written against a guess and the guess was wrong.**
+    ///
+    /// The assumption was that git refuses to count across histories with no common ancestor, so an
+    /// orphan would come back unmeasured. It does not: `rev-list --left-right --count` exits 0 and
+    /// reports both sides in full. `merge-base` is the command that refuses.
+    ///
+    /// The behaviour is kept rather than corrected, because the number it gives is true and reads
+    /// correctly: every commit on both sides is exactly the work merging a grafted branch involves.
+    /// What is corrected is the claim in the comment above it.
+    #[test]
+    fn an_unrelated_history_is_counted_in_full_rather_than_refused() {
+        let (repo, _) = seeded_repo();
+        let integration = head_branch(repo.path());
+        git_in_repo(repo.path(), &["checkout", "--orphan", "grafted"]);
+        git_in_repo(repo.path(), &["rm", "-rf", "."]);
+        commit_file(repo.path(), "c.txt", "from nowhere");
+        git_in_repo(repo.path(), &["checkout", &integration]);
+
+        let listed = branches(repo.path()).unwrap();
+        let grafted = listed
+            .branches
+            .iter()
+            .find(|row| row.name == "grafted")
+            .expect("the orphan branch should still be listed");
+        assert!(grafted.measured);
+        // One commit each, sharing nothing: the whole of both histories.
+        assert_eq!((grafted.ahead, grafted.behind), (1, 1));
+    }
+
+    #[test]
+    fn a_detached_root_names_no_integration_branch_instead_of_guessing_one() {
+        let (repo, sha) = seeded_repo();
+        git_in_repo(repo.path(), &["checkout", "--detach", &sha]);
+
+        let listed = branches(repo.path()).unwrap();
+        assert_eq!(listed.integration, None);
+        // The branches are still listed — they exist — but nothing claims a distance to a target
+        // that is not there.
+        assert!(listed.branches.iter().all(|row| !row.measured));
+    }
+
+    #[test]
+    fn parse_distance_reads_left_as_behind_and_right_as_ahead() {
+        assert_eq!(parse_distance(b"3\t5\n"), (5, 3, true));
+        assert_eq!(parse_distance(b"0\t0\n"), (0, 0, true));
+        // Anything that is not a pair of numbers is not a distance, and must not become zero.
+        assert_eq!(parse_distance(b""), (0, 0, false));
+        assert_eq!(parse_distance(b"fatal: no merge base\n"), (0, 0, false));
+    }
+
+    #[test]
+    fn a_short_record_is_dropped_rather_than_padded_into_a_commit_by_nobody() {
+        let good = format!("aaa{FIELD}aa{FIELD}me{FIELD}2026-08-23T00:00:00Z{FIELD}subject");
+        let short = format!("bbb{FIELD}bb");
+        let parsed = parse_log(format!("{good}\0{short}\0").as_bytes());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].subject, "subject");
     }
 
     /// The case that makes the measurement lie if only one of the two questions is asked: `job.rs`

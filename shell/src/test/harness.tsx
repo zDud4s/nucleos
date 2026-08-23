@@ -13,6 +13,7 @@ import { NAV_PATHS } from "../app/nav";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
 import type { Concurrency } from "../data/fleet";
+import type { Branches, Commit } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
@@ -85,6 +86,10 @@ export interface DaemonState {
    * it is what a new project looks like for its first month.
    */
   readings: ProjectReadings;
+  /** A project's local branches and the one they are measured against. */
+  branches: Branches;
+  /** A project's recent commits. */
+  log: Commit[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -105,6 +110,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     proposals: [],
     concurrency: { house: { limit: 4, held: 0 }, projects: [] },
     readings: readings(),
+    branches: { integration: "master", branches: [], omitted: 0 },
+    log: [],
     ...overrides,
   };
 }
@@ -183,6 +190,9 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     // Parameterised before the exact matches: the readings route carries a project id, which a
     // `switch` over literals cannot express.
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
+    if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;
+    // The log route carries a query string, so it is matched on its segment rather than its end.
+    if (path.startsWith("/projects/") && path.includes("/log")) return state.log;
 
     switch (path) {
       case "/autopilot/kill":

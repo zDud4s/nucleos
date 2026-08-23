@@ -91,6 +91,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/cat", get(get_project_cat))
         .route("/projects/{id}/grep", get(get_project_grep))
         .route("/projects/{id}/diff", get(get_project_diff))
+        .route("/projects/{id}/log", get(get_project_log))
+        .route("/projects/{id}/branches", get(get_project_branches))
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
         .route(
@@ -768,6 +770,13 @@ struct RunsQuery {
 #[derive(Deserialize)]
 struct PathQuery {
     path: Option<String>,
+}
+
+/// How much history, and of what. Both absent is the whole repository's recent commits.
+#[derive(Deserialize)]
+struct LogQuery {
+    path: Option<String>,
+    limit: Option<usize>,
 }
 
 /// How far back a reading looks. Absent is the default window, not zero days.
@@ -2691,6 +2700,39 @@ async fn get_project_grep(
     let q = query.q.unwrap_or_default();
     let rel = query.path.unwrap_or_default();
     tokio::task::spawn_blocking(move || inspect::grep(&root, &q, &rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// A project's recent commits.
+///
+/// `path` narrows the history and travels the same road every other caller-supplied path here
+/// travels: `inspect::log` runs it through `safe_join` before git sees it, because a pathspec that
+/// begins with `-` is an option and one containing `..` reaches outside the repository.
+async fn get_project_log(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<Vec<inspect::Commit>>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    let rel = query.path.unwrap_or_default();
+    let limit = query.limit.unwrap_or(50);
+    tokio::task::spawn_blocking(move || inspect::log(&root, &rel, limit))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// Every local branch, and how far each is from where work lands.
+async fn get_project_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<inspect::Branches>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    tokio::task::spawn_blocking(move || inspect::branches(&root))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)

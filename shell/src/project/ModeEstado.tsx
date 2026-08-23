@@ -8,6 +8,7 @@ import {
   type ProjectReadings,
 } from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
+import { Branches } from "./Branches";
 import { Occupancy } from "./Occupancy";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
 
@@ -77,10 +78,7 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
       </Section>
 
       <Section label="Branches">
-        <NotServedYet
-          what="Live branches and their distance from the integration branch"
-          why="the núcleo has no git log route yet"
-        />
+        <Branches projectId={projectId} />
       </Section>
 
       <Section label="Workflow">

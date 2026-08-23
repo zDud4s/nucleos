@@ -235,6 +235,61 @@ describe("the project workspace", () => {
     expect(screen.getByText(/1.2 h median, over 18 of 22/)).toBeTruthy();
   });
 
+  it("draws the branches against the branch the root is actually on", async () => {
+    const state = daemonState({
+      projects: [project({ project_id: "nucleos", mode: "shadow" })],
+      branches: {
+        // Not `master`. A project whose trunk is called something else is exactly the case a panel
+        // that assumed a name would get wrong, and landing reads this same value.
+        integration: "trunk",
+        branches: [
+          {
+            name: "trunk",
+            ahead: 0,
+            behind: 0,
+            measured: true,
+            last_commit_at: "2026-08-23T09:00:00Z",
+            last_subject: "the trunk moved",
+          },
+          {
+            name: "feat/one",
+            ahead: 3,
+            behind: 1,
+            measured: true,
+            last_commit_at: "2026-08-23T08:00:00Z",
+            last_subject: "work in progress",
+          },
+          {
+            name: "grafted",
+            ahead: 0,
+            behind: 0,
+            measured: false,
+            last_commit_at: "2026-08-20T08:00:00Z",
+            last_subject: "unrelated",
+          },
+        ],
+        omitted: 2,
+      },
+    });
+    daemon.apiFetch.mockImplementation(daemonFetch(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects/nucleos/estado" });
+
+    expect(await screen.findByText("trunk")).toBeTruthy();
+    // Where work lands is named as a place, not reported as being level with itself.
+    expect(screen.getByText("where work lands")).toBeTruthy();
+
+    // Diverged, and both numbers shown — this is the one that reads as "ahead" until somebody
+    // tries to fast-forward it.
+    expect(screen.getByText("diverged +3 −1")).toBeTruthy();
+
+    // Unmeasured shows the word and no digits. A `0/0` here would claim it is identical to trunk.
+    expect(screen.getByText("distance unknown")).toBeTruthy();
+
+    // A ceiling that hid what it dropped would read as "these are all your branches".
+    expect(screen.getByText("2 older branches not measured.")).toBeTruthy();
+  });
+
   it("shows the other two modes as designed and not yet served", async () => {
     const code = await openWorkspace({ mode: "codigo" });
     expect(await screen.findByText(/review surface for nucleos is not built yet/)).toBeTruthy();
