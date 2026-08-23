@@ -16,6 +16,7 @@ import { ApiRefusal } from "../data/client";
 import type { Concurrency, HeldSlot, ProjectConcurrency } from "../data/fleet";
 import type { ClassTally } from "../data/autopilot";
 import type { Changed, Worktree } from "../data/project-code";
+import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
 import type { Branches, Commit } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
@@ -133,6 +134,14 @@ export interface DaemonState {
    * they are reachable only if the fake can be told to give one.
    */
   writeRefusal: { status: number; code: string; detail: string } | null;
+  /** What this project can be asked to do to itself. Empty is a real answer: nothing declared. */
+  commands: ProjectCommand[];
+  /** Command ids the shell asked to start, in order. */
+  started: number[];
+  /** Every declaration the shell sent, as it sent it. */
+  declared: Partial<ProjectCommand>[];
+  /** What `POST .../run` refuses with, or `null` to accept. */
+  runRefusal: { status: number; code: string; detail: string } | null;
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -173,6 +182,10 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     scoreboard: [],
     writes: [],
     writeRefusal: null,
+    commands: [],
+    started: [],
+    declared: [],
+    runRefusal: null,
     ...overrides,
   };
 }
@@ -210,6 +223,28 @@ export function slot(overrides: Partial<HeldSlot> = {}): HeldSlot {
     job_id: null,
     ordinal: null,
     item_status: null,
+    ...overrides,
+  };
+}
+
+/**
+ * One declared command.
+ *
+ * A constructor because `ProjectCommand` carries nine fields and no test cares about more than
+ * three of them at a time — and because `last: null` is the interesting default: a command nobody
+ * has run has no verdict, which is not the same as one that failed.
+ */
+export function projectCommand(overrides: Partial<ProjectCommand> = {}): ProjectCommand {
+  return {
+    id: 1,
+    name: "gate",
+    command: "cargo test",
+    cwd: null,
+    is_gate: true,
+    pass_exit_code: 0,
+    runnable_by: "person",
+    source: "project",
+    last: null,
     ...overrides,
   };
 }
@@ -294,6 +329,28 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         // that landed from one that only looked like it did.
         state.text.cat = body.contents;
       }
+      if (path.endsWith("/commands") && typeof init.body === "string") {
+        const body = JSON.parse(init.body) as Partial<ProjectCommand>;
+        state.declared.push(body);
+        // Applied to the list the read route serves, so the refetch after a declaration reads back
+        // what was written — the same thing the daemon does, and the only way a test can tell a
+        // declaration that landed from one that only looked like it did.
+        const id = state.commands.length + 1;
+        state.commands = [
+          ...state.commands.filter((row) => row.name !== body.name),
+          { ...projectCommand(), id, ...body },
+        ];
+        return { id };
+      }
+      if (path.includes("/commands/") && path.endsWith("/run")) {
+        if (state.runRefusal !== null) {
+          const { status, code, detail } = state.runRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        // `/projects/{id}/commands/{command}/run` — the id is the second from last.
+        const parts = path.split("/");
+        state.started.push(Number(parts[parts.length - 2]));
+      }
       if (path.includes("/wip-limit") && typeof init.body === "string") {
         const { limit } = JSON.parse(init.body) as { limit: number | null };
         state.projects = state.projects.map((row) =>
@@ -309,11 +366,18 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return undefined;
     }
 
+    if (init?.method === "DELETE" && path.includes("/commands/")) {
+      const id = Number(path.split("/").pop());
+      state.commands = state.commands.filter((row) => row.id !== id);
+      return undefined;
+    }
+
     // Parameterised before the exact matches: the readings route carries a project id, which a
     // `switch` over literals cannot express.
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;
     if (path.startsWith("/projects/") && path.endsWith("/ownership")) return state.ownership;
+    if (path.startsWith("/projects/") && path.endsWith("/commands")) return state.commands;
     if (path.startsWith("/scoreboard")) return state.scoreboard;
     if (path.startsWith("/projects/") && path.includes("/changed")) {
       if (state.changed === null) throw new ApiRefusal(422, "unprocessable", "no branch point");

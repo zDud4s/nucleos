@@ -101,6 +101,21 @@ pub fn build_router(state: AppState) -> Router {
         // name, so a client that cannot read the table can only discover the fence by hitting it.
         .route("/projects/{id}/ownership", get(get_project_ownership))
         .route("/projects/{id}/write", post(post_project_write))
+        // What this project can be asked to do to itself. The literal `commands` ahead of nothing
+        // ambiguous; the run route is a third segment under a command's own id, because running one
+        // is an action ON that command and not a second way of listing them.
+        .route(
+            "/projects/{id}/commands",
+            get(get_project_commands).post(post_project_command),
+        )
+        .route(
+            "/projects/{id}/commands/{command_id}",
+            delete(delete_project_command),
+        )
+        .route(
+            "/projects/{id}/commands/{command_id}/run",
+            post(post_project_command_run),
+        )
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
         .route(
@@ -2988,6 +3003,248 @@ fn write_atomically(target: &std::path::Path, contents: &str) -> std::io::Result
     let temp = target.with_extension("nucleos-tmp");
     std::fs::write(&temp, contents)?;
     std::fs::rename(&temp, target)
+}
+
+/* ------------------------------------------------------- project commands -- */
+
+/// Everything this project can be asked to do to itself, overlay applied.
+async fn get_project_commands(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::project_commands::ProjectCommand>>, StatusCode> {
+    crate::project_commands::list(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "listing project commands failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct DeclareRequest {
+    name: String,
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    is_gate: bool,
+    /// Absent means 0, which is what almost every command means by passing.
+    #[serde(default)]
+    pass_exit_code: Option<i64>,
+    /// Absent means `person`. Default-deny: a command declared by somebody who never thought about
+    /// this question must not thereby become something an autonomous run may execute.
+    #[serde(default)]
+    runnable_by: Option<crate::project_commands::RunnableBy>,
+}
+
+/// Declares one of this project's own commands, replacing any of the same name.
+///
+/// **No kill-switch check here, and the asymmetry with `POST /write` is deliberate.** That one puts
+/// bytes in the project's own folder, which §7.5 says must go the way an agent's write goes. This
+/// writes a database row, like `POST /wip-limit` beside it, and neither of those starts anything.
+/// The stop belongs on the route that spawns a process, which is the next one down.
+async fn post_project_command(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeclareRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+
+    if let Err(invalid) =
+        crate::project_commands::validate(&body.name, &body.command, body.cwd.as_deref())
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "refusal": "invalid", "detail": invalid.to_string() })),
+        ));
+    }
+
+    // The half `validate` cannot do: whether the directory is actually there, and is a directory.
+    // Checked when it is declared so a typo is caught while the person who made it is looking at
+    // it — and again when it runs, because a folder that existed on Tuesday can be gone on
+    // Wednesday.
+    if let Some(cwd) = body.cwd.as_deref() {
+        working_directory(&root, cwd)?;
+    }
+
+    let id_for_log = id.clone();
+    let new_id = crate::project_commands::declare(
+        &state.pool,
+        &id,
+        crate::project_commands::Declaration {
+            name: body.name,
+            command: body.command,
+            cwd: body.cwd,
+            is_gate: body.is_gate,
+            pass_exit_code: body.pass_exit_code.unwrap_or(0),
+            runnable_by: body
+                .runnable_by
+                .unwrap_or(crate::project_commands::RunnableBy::Person),
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, project_id = %id_for_log, "declaring a project command failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+
+    Ok(Json(serde_json::json!({ "id": new_id })))
+}
+
+/// Forgets one of this project's commands.
+async fn delete_project_command(
+    State(state): State<AppState>,
+    Path((id, command_id)): Path<(String, i64)>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::project_commands::remove(&state.pool, &id, command_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, project_id = %id, "forgetting a project command failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Where a command runs, resolved and refused as one answer.
+///
+/// `None` is the project root. A relative path is refused unless it resolves inside the project and
+/// is a directory — the same guard the readers use, and it has to be re-asked at run time because
+/// the declaration was checked at some earlier moment.
+fn working_directory(
+    root: &std::path::Path,
+    cwd: &str,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let resolved =
+        inspect::resolved_within(root, cwd).map_err(|error| match inspect_status(error) {
+            StatusCode::NOT_FOUND => refusal(StatusCode::UNPROCESSABLE_ENTITY, "cwd_missing"),
+            status => refusal(status, "cwd_unsafe"),
+        })?;
+    if !resolved.is_dir() {
+        return Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cwd_not_a_folder",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Runs one of this project's commands and answers before it finishes.
+///
+/// **202 and not the output.** A suite takes minutes; an HTTP request that held the connection for
+/// them would be a request that any proxy, any sleep and any closed lid would kill halfway. The
+/// result lands on the command's own row and the page reads it back — which is also what makes the
+/// answer survive a reload, and what makes "is the gate green" a fact the page already has rather
+/// than something it has to ask for.
+///
+/// The refusals, in the order they are asked:
+///
+/// 1. **423, the emergency stop.** First, because it is the one refusal that is about the machine
+///    rather than about this request. A stop that did not stop a button spawning `cargo test` would
+///    be a stop in name only.
+/// 2. **404**, no folder, or no such command in THIS project — the `project_id` in the lookup being
+///    what keeps an integer in a URL from naming another project's row.
+/// 3. **403**, a command marked `person` reached by a key that is nobody's but an agent's.
+/// 4. **422**, a working directory that has gone, or that is not a directory.
+/// 5. **409**, already running. The claim is a conditional UPDATE rather than a read followed by a
+///    write, so two clicks landing together cannot both start the suite in one folder.
+async fn post_project_command_run(
+    State(state): State<AppState>,
+    Extension(scope): Extension<crate::auth::Scope>,
+    Path((id, command_id)): Path<(String, i64)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+        || crate::autopilot::scoped_kill_engaged(&state.pool, "project", &id)
+            .await
+            .unwrap_or(true);
+    if halted {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+
+    let command = crate::project_commands::get(&state.pool, &id, command_id)
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .ok_or_else(|| refusal(StatusCode::NOT_FOUND, "no_such_command"))?;
+
+    if crate::project_commands::caller_is_an_agent(&scope)
+        && command.runnable_by != crate::project_commands::RunnableBy::Agent
+    {
+        return Err(refusal(StatusCode::FORBIDDEN, "person_only"));
+    }
+
+    let cwd = match command.cwd.as_deref() {
+        Some(cwd) => working_directory(&root, cwd)?,
+        None => root.clone(),
+    };
+
+    let pool = state.pool.clone();
+    let project_id = id.clone();
+    let name = command.name.clone();
+    let text = command.command.clone();
+    let pass = command.pass_exit_code;
+
+    // The claim and the spawn together, uncancellable, for the reason `create_run` gives: a client
+    // that disconnects mid-request drops this future, and a drop landing between the two would
+    // leave a row saying `running` with nothing running.
+    let claimed = uncancellable(async move {
+        if !crate::project_commands::mark_running(&pool, &project_id, command_id)
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        tokio::spawn(async move {
+            // **The reference is the same directory the command runs in, on purpose.**
+            // `run_gate`'s tamper check exists because a gate measures a run's own worktree and
+            // that run could have rewritten the script it is measured by. There is no second copy
+            // here — this runs in the project's own checkout, which IS the reference — so passing
+            // the same path makes the check a no-op by construction rather than by luck. Passing
+            // the project root instead would compare a subdirectory's scripts against paths that
+            // do not exist there and report a tamper that never happened.
+            let outcome = crate::gate::run_gate(
+                &cwd,
+                &cwd,
+                &text,
+                crate::project_commands::COMMAND_TIMEOUT,
+            )
+            .await;
+            let finished = crate::project_commands::verdict(pass, outcome);
+            let said = match finished.outcome {
+                crate::project_commands::Outcome::Passed => format!("{name} passed"),
+                crate::project_commands::Outcome::Failed => match finished.exit_code {
+                    Some(code) => format!("{name} failed with exit {code}"),
+                    None => format!("{name} failed"),
+                },
+                // Never "failed". A command that could not be measured says nothing about the
+                // project, and reporting it as a failure would stop the wrong work.
+                _ => format!("{name} could not be measured"),
+            };
+            if let Err(error) =
+                crate::project_commands::finish(&pool, command_id, finished).await
+            {
+                tracing::error!(%error, command_id, "a project command finished and was not recorded");
+            }
+            let _ = crate::feed::append(&pool, Some(&project_id), "command_finished", &said, None)
+                .await;
+        });
+        true
+    })
+    .await
+    .map_err(|status| refusal(status, "internal"))?;
+
+    if !claimed {
+        return Err(refusal(StatusCode::CONFLICT, "already_running"));
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn get_project_ls(
@@ -9489,6 +9746,411 @@ mod tests {
         assert!(
             claims[0]["what"].as_str().unwrap().contains("gate command"),
             "the fence has to say what crossing it changes"
+        );
+    }
+
+    /* ----------------------------------------------------- project commands -- */
+
+    async fn declare_command(
+        state: AppState,
+        id: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{id}/commands"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn list_commands(state: AppState, id: &str) -> serde_json::Value {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/projects/{id}/commands"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    async fn run_command(
+        state: AppState,
+        id: &str,
+        command_id: i64,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{id}/commands/{command_id}/run"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Waits for a command's row to stop saying `running`.
+    ///
+    /// The route answers 202 and the work happens on a spawned task, which is the whole design — so
+    /// a test that asserted immediately would be asserting the claim rather than the result. Bounded
+    /// at ten seconds: the commands below are `git --version` and a program that does not exist.
+    async fn settled(
+        state: &AppState,
+        id: &str,
+        command_id: i64,
+    ) -> crate::project_commands::LastRun {
+        for _ in 0..200 {
+            if let Ok(Some(row)) = crate::project_commands::get(&state.pool, id, command_id).await
+                && let Some(last) = row.last
+                && last.outcome != crate::project_commands::Outcome::Running
+            {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the command never settled");
+    }
+
+    /// Declared, listed, run, and forgotten — with the verdict and the feed line the run leaves
+    /// behind.
+    ///
+    /// `git --version` rather than `echo`, and the choice is not incidental: on Windows the only
+    /// real `echo.exe` is Git's and it is on PATH only if somebody put it there, which is already
+    /// the documented cause of five confusing failures in this suite. `git` is required by every
+    /// test in `inspect.rs`, so a machine that cannot run this one could not run those either.
+    #[tokio::test]
+    async fn a_command_is_declared_run_and_recorded_with_what_it_said() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version", "is_gate": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let command_id = body["id"].as_i64().unwrap();
+
+        // Listed, with no result at all — which is not a result of zero and not a failure.
+        let listed = list_commands(state.clone(), "alpha").await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["name"], "version");
+        assert_eq!(listed[0]["is_gate"], true);
+        assert!(listed[0]["last"].is_null());
+        // Absent from the request, so the safe default: only a person.
+        assert_eq!(listed[0]["runnable_by"], "person");
+
+        let (status, _) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "the answer comes before the work"
+        );
+
+        let last = settled(&state, "alpha", command_id).await;
+        assert_eq!(last.outcome, crate::project_commands::Outcome::Passed);
+        assert_eq!(last.exit_code, Some(0));
+        assert!(last.ended_at.is_some());
+
+        let summary: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE project_id = 'alpha' AND kind = 'command_finished'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(summary, "version passed");
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/projects/alpha/commands/{command_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            list_commands(state, "alpha")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A command that could not start is `errored`, never `failed` — the distinction the whole
+    /// outcome enum exists for. A missing binary says nothing about whether the project works, and
+    /// reporting it as a failure would stop the wrong work.
+    #[tokio::test]
+    async fn a_command_that_could_not_start_is_errored_and_never_failed() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({
+                "name": "ghost",
+                "command": "nucleos-no-such-program --please",
+            }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        assert_eq!(
+            run_command(state.clone(), "alpha", command_id).await.0,
+            StatusCode::ACCEPTED
+        );
+        let last = settled(&state, "alpha", command_id).await;
+        assert_eq!(last.outcome, crate::project_commands::Outcome::Errored);
+        // No exit code at all, because there was no process to exit.
+        assert_eq!(last.exit_code, None);
+        assert!(last.output.unwrap().contains("failed to start"));
+
+        let summary: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE project_id = 'alpha' AND kind = 'command_finished'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(summary, "ghost could not be measured");
+    }
+
+    /// A declaration that could only ever fail is refused while the person who typed it is looking
+    /// at it, and the refusal says which part was wrong.
+    #[tokio::test]
+    async fn a_declaration_that_could_never_run_is_refused_with_the_reason() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        for (body, expected) in [
+            (
+                serde_json::json!({ "name": "", "command": "git --version" }),
+                "needs a name",
+            ),
+            (
+                serde_json::json!({ "name": "x", "command": "  " }),
+                "something to run",
+            ),
+            (
+                serde_json::json!({ "name": "x", "command": "bash -c \"cargo test" }),
+                "quote",
+            ),
+            (
+                serde_json::json!({ "name": "x", "command": "git --version", "cwd": "../elsewhere" }),
+                "inside the project",
+            ),
+        ] {
+            let (status, refused) = declare_command(state.clone(), "alpha", body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(refused["refusal"], "invalid");
+            let detail = refused["detail"].as_str().unwrap();
+            assert!(detail.contains(expected), "got: {detail}");
+        }
+
+        // A folder that is spelled safely and is simply not there is a different refusal, because
+        // it is a different thing to fix.
+        let (status, refused) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "x", "command": "git --version", "cwd": "nowhere" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "cwd_missing");
+
+        assert!(
+            list_commands(state, "alpha")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The emergency stop stops a button spawning a process, which is the least surprising thing an
+    /// emergency stop could do. Both brakes, because a project held on its own is held for this too.
+    #[tokio::test]
+    async fn the_emergency_stop_holds_a_command_the_app_would_run() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+        let (status, refused) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(refused["refusal"], "kill_switch");
+
+        crate::autopilot::set_kill_switch(&state.pool, false)
+            .await
+            .unwrap();
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "alpha", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_command(state.clone(), "alpha", command_id).await.0,
+            StatusCode::LOCKED
+        );
+
+        // Nothing was claimed, so nothing has a result — the refusal is not a run that failed.
+        let row = crate::project_commands::get(&state.pool, "alpha", command_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.last, None);
+    }
+
+    /// Two clicks landing together must not both start the suite in one folder. The claim is a
+    /// conditional UPDATE, so the second one loses and is told why.
+    #[tokio::test]
+    async fn a_command_already_running_is_refused_rather_than_started_twice() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        assert!(
+            crate::project_commands::mark_running(&state.pool, "alpha", command_id)
+                .await
+                .unwrap()
+        );
+        let (status, refused) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["refusal"], "already_running");
+    }
+
+    /// Another project's id does not reach this project's command, and a command that is not there
+    /// is the same answer — an integer in a URL names nothing on its own.
+    #[tokio::test]
+    async fn a_command_belongs_to_its_project_and_to_no_other() {
+        let state = test_state().await;
+        let _alpha = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let _beta = project_with_rules(&state, "beta", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        let (status, refused) = run_command(state.clone(), "beta", command_id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_command");
+        assert!(
+            list_commands(state, "beta")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `runnable_by` is enforced against the caller's key, and the handler is called directly
+    /// because nothing can reach it as an agent through the router.
+    ///
+    /// That is the point rather than a workaround: `auth.rs` gives a run's key exactly one route,
+    /// so this field is belt and braces today. Calling the handler with the scope a run would carry
+    /// is the only way to prove the belt is fastened — and the day a run is given a way in, this is
+    /// already the test that says what happens.
+    #[tokio::test]
+    async fn a_command_marked_for_people_refuses_a_key_that_is_an_agents() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (_, mine) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "mine", "command": "git --version" }),
+        )
+        .await;
+        let (_, theirs) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({
+                "name": "theirs",
+                "command": "git --version",
+                "runnable_by": "agent",
+            }),
+        )
+        .await;
+
+        let refused = post_project_command_run(
+            State(state.clone()),
+            Extension(crate::auth::Scope::Run(7)),
+            Path(("alpha".to_owned(), mine["id"].as_i64().unwrap())),
+        )
+        .await
+        .expect_err("a person-only command must refuse an agent's key");
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert_eq!(refused.1.0["refusal"], "person_only");
+
+        // The one that says agents may, does.
+        let allowed = post_project_command_run(
+            State(state.clone()),
+            Extension(crate::auth::Scope::Run(7)),
+            Path(("alpha".to_owned(), theirs["id"].as_i64().unwrap())),
+        )
+        .await
+        .expect("a command marked for agents accepts one");
+        assert_eq!(allowed, StatusCode::ACCEPTED);
+
+        // And the human's key opens the person-only one, which is what makes the refusal above
+        // about WHO is asking rather than about the command.
+        assert_eq!(
+            run_command(state, "alpha", mine["id"].as_i64().unwrap())
+                .await
+                .0,
+            StatusCode::ACCEPTED
         );
     }
 

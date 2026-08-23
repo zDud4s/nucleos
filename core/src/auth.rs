@@ -2096,6 +2096,55 @@ mod tests {
         ));
     }
 
+    /// A project's commands are the owner's, to read and to run.
+    ///
+    /// The run route spawns a process of the project's own choosing, which is plainly not a read.
+    /// The **listing** is out of the table too, and that is the half worth an assertion: it is the
+    /// same class of information `GET /projects/{id}/rules` holds — what this project runs on its
+    /// own — and that route has always been Admin's. It also names which commands are marked
+    /// runnable by an agent, which is a map of the surface rather than a fact about the code.
+    ///
+    /// Membership rather than a request, like `POST /email/send` and `POST /projects/{id}/write`
+    /// above: `permits` is default-deny, so these are safe today by being nowhere. What that does
+    /// not survive is somebody filing them beside the seven `/projects/{id}/…` reads that share
+    /// their prefix, which would read as consistency.
+    #[test]
+    fn a_projects_commands_are_in_no_scope_table() {
+        for (method, pattern) in [
+            (Method::GET, "/projects/{id}/commands"),
+            (Method::POST, "/projects/{id}/commands"),
+            (Method::DELETE, "/projects/{id}/commands/{command_id}"),
+            (Method::POST, "/projects/{id}/commands/{command_id}/run"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, &method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, &method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, pattern),
+                "{method} {pattern} must stay out of every scope table"
+            );
+        }
+
+        // And the one that matters most, asked as a request: a run's key opens exactly the safety
+        // gate, so `runnable_by` is belt and braces rather than the only thing standing here.
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, "/projects/7/commands/1/run"),
+                "{scope:?} must not be able to run a project's commands"
+            );
+        }
+        assert!(permits(
+            &Scope::Control,
+            &Method::POST,
+            "/projects/7/commands/1/run"
+        ));
+    }
+
     /// A department's key lives for hours and crosses dozens of subprocesses, which makes it the
     /// longest-lived key in the house and the one that most needs the death rule.
     #[tokio::test]

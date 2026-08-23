@@ -46,6 +46,7 @@ mod pii_shadow;
 mod presets;
 mod priority;
 mod process_tree;
+mod project_commands;
 mod project_readings;
 mod proposals;
 mod recurrence;
@@ -307,6 +308,19 @@ async fn main() {
         .await
         .expect("failed to open local database");
     tracing::info!("nucleos-core database ready at {}", db_path.display());
+
+    // Beside the run sweep and for the same reason: a row saying `running` against a process that
+    // has not existed since the last restart would refuse every future click with "already
+    // running". Best-effort — a project command left unsettled is a button that will not press, not
+    // a daemon that must not start.
+    match project_commands::reconcile_orphaned_commands(&pool).await {
+        Ok(0) => {}
+        Ok(settled) => tracing::info!(
+            settled,
+            "settled project commands left running by a restart"
+        ),
+        Err(error) => tracing::warn!(%error, "could not settle project commands left running"),
+    }
 
     let interrupted = runs::reconcile_orphaned_runs(&pool)
         .await

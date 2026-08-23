@@ -126,6 +126,8 @@ export const keys = {
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
     /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
     ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
+    /** What this project can be asked to do to itself, and what each of them last said. */
+    commands: (projectId: string) => ["projects", projectId, "commands"] as const,
     branches: (projectId: string) => ["projects", projectId, "branches"] as const,
     log: (projectId: string, path: string) => ["projects", projectId, "log", path] as const,
     /**

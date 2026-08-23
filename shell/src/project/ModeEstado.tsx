@@ -9,6 +9,7 @@ import {
 } from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { Branches } from "./Branches";
+import { Commands } from "./Commands";
 import { Occupancy } from "./Occupancy";
 import { OwnedFiles } from "./OwnedFiles";
 import { Settings } from "./Settings";
@@ -91,10 +92,7 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
       </Section>
 
       <Section label="Commands">
-        <NotServedYet
-          what="This project's own commands"
-          why="the núcleo has no command registry yet"
-        />
+        <Commands projectId={projectId} />
       </Section>
 
       {/*

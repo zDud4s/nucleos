@@ -6,12 +6,14 @@ import {
   daemonText,
   heldSlots,
   project,
+  projectCommand,
   readings,
   renderApp,
   slot,
   renderWithQuery,
   type DaemonState,
 } from "../test/harness";
+import { ApiRefusal } from "../data/client";
 import type { ProjectReadings } from "../data/project-readings";
 import { ModeEstado } from "./ModeEstado";
 import { normaliseMode } from "./Workspace";
@@ -567,5 +569,235 @@ describe("the settings this app authors", () => {
     await openState(settingsState());
     expect(await screen.findByText(/Nothing recorded in shadow yet/)).toBeTruthy();
     expect(screen.getByText(/not the same as a bad one/)).toBeTruthy();
+  });
+});
+
+/* --------------------------------------------- what this project can be asked -- */
+
+describe("what this project can be asked to do", () => {
+  function withCommands(commands: DaemonState["commands"], rest: Partial<DaemonState> = {}) {
+    return daemonState({
+      projects: [project({ project_id: "nucleos", mode: "shadow", project_root: "C:/p" })],
+      commands,
+      ...rest,
+    });
+  }
+
+  /**
+   * The rule that keeps this from becoming a drawer, asserted rather than described.
+   *
+   * A gate's last verdict is a fact you want without asking, so it earns a place at the foot of the
+   * page. Everything else is a verb you go looking for by name, and it is not on the screen until
+   * somebody asks. If both ended up in the bar this test still passes on count — so it checks that
+   * the two non-gates are ABSENT, which is the half that actually holds the line.
+   */
+  it("puts the gates in the bar and leaves everything else to the palette", async () => {
+    await openState(
+      withCommands([
+        projectCommand({ id: 1, name: "gate", is_gate: true }),
+        projectCommand({ id: 2, name: "fmt", command: "cargo fmt --check", is_gate: false }),
+        projectCommand({ id: 3, name: "docs", command: "cargo doc", is_gate: false }),
+      ]),
+    );
+
+    expect(await screen.findByRole("button", { name: /^gate,/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^fmt,/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^docs,/ })).toBeNull();
+    // And the door to the rest says how many there are, so a short bar is not mistaken for a short
+    // list.
+    expect(screen.getByRole("button", { name: /all 3/ })).toBeTruthy();
+  });
+
+  /**
+   * A project whose commands are all verbs claims nothing about being green — and says so, rather
+   * than drawing an empty bar that reads as "nothing is wrong".
+   */
+  it("says nothing here claims to know whether the project is green", async () => {
+    await openState(
+      withCommands([projectCommand({ id: 2, name: "fmt", is_gate: false })]),
+    );
+    expect(await screen.findByText(/No command here is marked a gate/)).toBeTruthy();
+  });
+
+  /** What was SENT — the id the núcleo will act on, not the button the component thinks it drew. */
+  it("starts the command that was clicked", async () => {
+    const state = withCommands([
+      projectCommand({ id: 7, name: "gate", is_gate: true }),
+      projectCommand({ id: 9, name: "suite", is_gate: true }),
+    ]);
+    await openState(state);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^suite,/ }));
+    await waitFor(() => expect(state.started).toEqual([9]));
+  });
+
+  /**
+   * The never-collapse contract, at the smallest scale it appears anywhere in this app: three
+   * verdicts, three sentences, and the two that are easiest to merge are the two that must not be.
+   *
+   * A command that could not be measured says nothing about whether the project works. Drawn as a
+   * failure it would send somebody to look for broken tests that are not broken — and drawn as a
+   * pass it would be worse still.
+   */
+  it("never lets a measurement that did not happen read as a failure", async () => {
+    await openState(
+      withCommands([
+        projectCommand({
+          id: 1,
+          name: "gate",
+          last: {
+            outcome: "failed",
+            started_at: "2026-08-23T09:00:00Z",
+            ended_at: "2026-08-23T09:04:00Z",
+            exit_code: 101,
+            output: "2 tests failed",
+          },
+        }),
+        projectCommand({
+          id: 2,
+          name: "suite",
+          last: {
+            outcome: "errored",
+            started_at: "2026-08-23T09:00:00Z",
+            ended_at: "2026-08-23T09:00:01Z",
+            exit_code: null,
+            output: "failed to start gate command",
+          },
+        }),
+        projectCommand({ id: 3, name: "fmt", last: null }),
+      ]),
+    );
+
+    expect(await screen.findByRole("button", { name: "gate, failed with exit 101" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "suite, could not be measured" })).toBeTruthy();
+    // And never run is a fourth thing again: not a pass, not a failure, not a measurement.
+    expect(screen.getByRole("button", { name: "fmt, never run here" })).toBeTruthy();
+  });
+
+  /**
+   * A command already going cannot be started again from here, which is the same answer the núcleo
+   * gives a second click — drawn ahead of the round trip so the button does not invite one.
+   */
+  it("will not offer to start a command that is already going", async () => {
+    const state = withCommands([
+      projectCommand({
+        id: 1,
+        name: "gate",
+        last: {
+          outcome: "running",
+          started_at: "2026-08-23T09:00:00Z",
+          ended_at: null,
+          exit_code: null,
+          output: null,
+        },
+      }),
+    ]);
+    await openState(state);
+
+    const button = await screen.findByRole("button", { name: "gate, running now" });
+    expect(button.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(button);
+    expect(state.started).toEqual([]);
+  });
+
+  /** The stop is why, said in words, rather than a click that appears to do nothing. */
+  it("says the emergency stop is why nothing started", async () => {
+    const state = withCommands([projectCommand({ id: 1, name: "gate" })], {
+      runRefusal: { status: 423, code: "kill_switch", detail: "kill_switch" },
+    });
+    await openState(state);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^gate,/ }));
+    expect(await screen.findByText(/emergency stop is engaged/)).toBeTruthy();
+  });
+
+  /**
+   * Nothing declared is not an empty bar. Declaration rather than detection is the design's own
+   * decision, and the sentence is where somebody learns a list will not appear by itself.
+   */
+  it("says a project has declared nothing rather than showing an empty bar", async () => {
+    await openState(withCommands([]));
+    expect(await screen.findByText(/Nothing declared yet/)).toBeTruthy();
+  });
+
+  /**
+   * The declaration goes as the núcleo's own shape, checkboxes and all — asserted on what was SENT,
+   * because the two flags are the ones a form is most likely to get subtly wrong: `is_gate` decides
+   * whether the command earns a place in the bar, and `runnable_by` decides whether an autonomous
+   * run may execute it.
+   *
+   * Absent is not an option for the second: the form always says which, so a command never reaches
+   * the daemon relying on a default nobody chose.
+   */
+  it("declares a command as the núcleo's own shape, both flags said out loud", async () => {
+    const state = withCommands([]);
+    await openState(state);
+
+    fireEvent.click(await screen.findByRole("button", { name: "declare a command" }));
+    fireEvent.change(screen.getByLabelText("Command name"), { target: { value: "  gate  " } });
+    fireEvent.change(screen.getByLabelText("What it runs"), { target: { value: "cargo test" } });
+    fireEvent.click(screen.getByLabelText(/says whether this project is green/));
+    fireEvent.click(screen.getByRole("button", { name: "declare" }));
+
+    await waitFor(() => expect(state.declared.length).toBe(1));
+    expect(state.declared[0]).toEqual({
+      // Trimmed, because a name with a space on the end is a name nobody can type twice.
+      name: "gate",
+      command: "cargo test",
+      // Empty means the project root, and the empty string is not that — it is a folder with no
+      // name, which the núcleo would have to refuse.
+      cwd: null,
+      is_gate: true,
+      runnable_by: "person",
+    });
+  });
+
+  /**
+   * A refused declaration keeps what was typed, and says which part was wrong. Dropping the form's
+   * contents would make a rejected command a command retyped.
+   */
+  it("keeps a refused declaration on the screen and names the part that was wrong", async () => {
+    const state = withCommands([]);
+    state.writeRefusal = null;
+    await openState(state);
+
+    // The fake accepts declarations, so the refusal is arranged by making the route answer one.
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST" && path.endsWith("/commands")) {
+        throw new ApiRefusal(422, "invalid", "unbalanced quote in the command");
+      }
+      return daemonFetch(state)(path, init);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "declare a command" }));
+    fireEvent.change(screen.getByLabelText("Command name"), { target: { value: "gate" } });
+    fireEvent.change(screen.getByLabelText("What it runs"), {
+      target: { value: 'bash -c "cargo test' },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "declare" }));
+
+    expect(await screen.findByText(/unbalanced quote/)).toBeTruthy();
+    expect((screen.getByLabelText("Command name") as HTMLInputElement).value).toBe("gate");
+  });
+
+  /**
+   * A workflow's command has no forget button, and that is the overlay rather than a gap: it
+   * belongs to the bundle, and the way to be rid of it is to override it with one of this project's
+   * own. A button that refused would be a worse answer than none.
+   */
+  it("offers to forget this project's commands and not the workflow's", async () => {
+    const state = withCommands([
+      projectCommand({ id: 1, name: "gate", source: "project" }),
+      projectCommand({ id: 2, name: "fmt", source: "workflow", is_gate: false }),
+    ]);
+    await openState(state);
+
+    fireEvent.click(await screen.findByRole("button", { name: "declare a command" }));
+    const forgets = screen.getAllByRole("button", { name: "forget" });
+    expect(forgets.length).toBe(1);
+    expect(screen.getByText("the workflow's")).toBeTruthy();
+
+    fireEvent.click(forgets[0]);
+    await waitFor(() => expect(state.commands.map((row) => row.id)).toEqual([2]));
   });
 });

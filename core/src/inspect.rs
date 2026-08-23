@@ -84,7 +84,7 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, InspectError> {
 /// its own internal links, and rejecting those would be a different bug. Kept separate from
 /// `safe_join` so that stays a pure path function — this one necessarily touches the filesystem,
 /// and reports `NotFound` for a path that does not exist, which is what the callers want anyway.
-fn resolved_within(root: &Path, rel: &str) -> Result<PathBuf, InspectError> {
+pub fn resolved_within(root: &Path, rel: &str) -> Result<PathBuf, InspectError> {
     let joined = safe_join(root, rel)?;
     let resolved_root = std::fs::canonicalize(root).map_err(io_err)?;
     let resolved = std::fs::canonicalize(&joined).map_err(io_err)?;
