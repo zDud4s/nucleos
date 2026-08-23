@@ -27,7 +27,6 @@ import { Projects } from "./pages/Projects";
 import { Workspace } from "./project/Workspace";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
-import { SmokeCsp } from "./pages/SmokeCsp";
 import { System } from "./pages/System";
 import { TeamRunDetail } from "./pages/TeamRunDetail";
 import { Teams } from "./pages/Teams";
@@ -181,8 +180,6 @@ const DETAIL_ROUTES: {
   { path: "/mail/$emailId", component: MailDetail },
   { path: "/web/pages/$pageId", component: Web },
   { path: "/system/$view", component: System },
-  // TEMPORARY — fatia 0 only, removed with the page itself.
-  { path: "/smoke-csp", component: SmokeCsp },
 ];
 
 export function createAppRouter(initialPath = "/") {
