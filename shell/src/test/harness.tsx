@@ -21,6 +21,7 @@ import type { Claim } from "../data/project-config";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
+import type { Detected } from "../data/detect";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
@@ -177,6 +178,15 @@ export interface DaemonState {
   graph: WorkflowGraph | null;
   /** Every node override the shell sent, as it sent it. */
   overlays: { name: string; node: string; body: unknown }[];
+  /**
+   * What `GET /projects/detect` answers, or `null` for a folder that is not there.
+   *
+   * `null` rather than an empty `Detected`, because "nothing at that path" and "a folder with
+   * nothing in it" are two different answers and the wizard says a different sentence for each.
+   */
+  detected: Detected | null;
+  /** Every workflow adopted from a folder, as it was sent. */
+  adopted: { name: string; path: string }[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -229,6 +239,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     pinsError: null,
     graph: null,
     overlays: [],
+    detected: null,
+    adopted: [],
     ...overrides,
   };
 }
@@ -356,6 +368,27 @@ export function graphNode(overrides: Partial<GraphNode> = {}): GraphNode {
   };
 }
 
+/**
+ * What the núcleo found in a folder.
+ *
+ * Nothing found by default — no harness, no commands, not a repository — which is the shape of a
+ * plain directory and the one a wizard must handle without pretending anything is missing.
+ */
+export function detected(overrides: Partial<Detected> = {}): Detected {
+  return {
+    root: "C:/Projects/thing",
+    is_git: false,
+    remote: null,
+    branch: null,
+    head: null,
+    harnesses: [],
+    commands: [],
+    commands_omitted: 0,
+    taken_by: null,
+    ...overrides,
+  };
+}
+
 /** A project's readings, empty unless a test says otherwise. */
 export function readings(overrides: Partial<ProjectReadings> = {}): ProjectReadings {
   return {
@@ -460,6 +493,14 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       }
       // The four pin changes, recorded as sent. One branch because they differ only in the verb,
       // and four near-copies is four places for one of them to stop matching the route.
+      if (path.endsWith("/workflows/adopt") && typeof init.body === "string") {
+        if (state.workflowRefusal !== null) {
+          const { status, code, detail } = state.workflowRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        state.adopted.push(JSON.parse(init.body) as { name: string; path: string });
+        return undefined;
+      }
       // A node override is a workflow change too, but it names a node as well, so it is recorded
       // with one — asserting on what was SENT is the only way a test tells a save that landed from
       // one that only looked like it did.
@@ -500,10 +541,29 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         );
       }
       if (path === "/autopilot/state" && typeof init.body === "string") {
-        const change = JSON.parse(init.body) as { project_id: string; mode: ProjectSummary["mode"] };
-        state.projects = state.projects.map((row) =>
-          row.project_id === change.project_id ? { ...row, mode: change.mode } : row,
-        );
+        const change = JSON.parse(init.body) as {
+          project_id: string;
+          mode: ProjectSummary["mode"];
+          project_root?: string;
+        };
+        // An upsert, because the route is one: this is how a project is registered in the first
+        // place, and a fake that could only change an existing row could not test adding one.
+        const known = state.projects.some((row) => row.project_id === change.project_id);
+        state.projects = known
+          ? state.projects.map((row) =>
+              row.project_id === change.project_id
+                ? { ...row, mode: change.mode, project_root: change.project_root ?? row.project_root }
+                : row,
+            )
+          : [
+              ...state.projects,
+              {
+                ...project(),
+                project_id: change.project_id,
+                mode: change.mode,
+                project_root: change.project_root ?? null,
+              },
+            ];
       }
       return undefined;
     }
@@ -541,6 +601,12 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         throw new ApiRefusal(422, "unreadable_pins", state.pinsError);
       }
       return state.workflows;
+    }
+    if (path.startsWith("/projects/detect")) {
+      if (state.detected === null) {
+        throw new ApiRefusal(404, "no_such_folder", "there is nothing at that path");
+      }
+      return state.detected;
     }
     if (path.startsWith("/projects/") && path.endsWith("/graph")) {
       if (state.graph === null) {

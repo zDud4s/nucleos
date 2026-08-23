@@ -84,6 +84,11 @@ pub fn build_router(state: AppState) -> Router {
             get(get_fleet_exclusion_requests),
         )
         .route("/fleet/exclusions/{id}", delete(delete_fleet_exclusion))
+        // Ahead of every `/projects/{id}/…` route, and a literal segment where those take a
+        // parameter. A project called `detect` would be shadowed by it — which is why the wizard
+        // sends the folder as a query rather than in the path, and why this answers about a folder
+        // that has no project id yet at all.
+        .route("/projects/detect", get(get_project_detect))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
@@ -156,6 +161,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/projects/{id}/workflows/{name}/nodes/{node}",
             post(post_project_workflow_node),
+        )
+        // Adopting is not installing and gets its own route rather than a flag on that one: it
+        // takes a folder instead of a coordinate, copies nothing, and produces a pin that no
+        // library can ever update. One route with two meanings would hide exactly that.
+        .route(
+            "/projects/{id}/workflows/adopt",
+            post(post_project_workflow_adopt),
         )
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
@@ -3408,6 +3420,9 @@ fn workflow_status(refused: &crate::workflows::Refused) -> (StatusCode, &'static
         crate::workflows::Refused::NotInstalled => (StatusCode::NOT_FOUND, "not_installed"),
         crate::workflows::Refused::BadName => (StatusCode::UNPROCESSABLE_ENTITY, "bad_name"),
         crate::workflows::Refused::AlreadyEjected => (StatusCode::CONFLICT, "already_ejected"),
+        // 409 beside it, and its own name: both are "you already have a copy", and they differ in
+        // where the copy came from — which decides what the page offers next.
+        crate::workflows::Refused::Adopted => (StatusCode::CONFLICT, "adopted"),
         // 404 and not 422: the bundle is fine, it simply does not have a graph in it yet. A
         // "cannot process" would send somebody looking for a syntax error in a file that is not
         // there.
@@ -3639,7 +3654,7 @@ async fn get_project_workflow_diff(
             .into_iter()
             .find(|pin| pin.name == name)
             .ok_or(crate::workflows::Refused::NotInstalled)?;
-        let mine = crate::workflows::ejected_path(&root, &name)
+        let mine = crate::workflows::copy_path(&root, &pinned)
             .filter(|path| path.is_dir())
             .ok_or(crate::workflows::Refused::NotInstalled)?;
         let bundle = bundle_or_refusal(&library, &name, Some(&pinned.version))?;
@@ -3707,7 +3722,10 @@ async fn get_project_workflow_graph(
             .find(|pin| pin.name == name)
             .ok_or(crate::workflows::Refused::NotInstalled)?;
 
-        let mine = crate::workflows::ejected_path(&root, &name).filter(|path| path.is_dir());
+        // `copy_path` and not `ejected_path`: an adopted workflow's copy is the folder the project
+        // already had — `.ai/` here — rather than the one an eject would have created. Reading the
+        // library instead would draw somebody else's bundle and label it as this project's.
+        let mine = crate::workflows::copy_path(&root, &pinned).filter(|path| path.is_dir());
         let (source, from) = match mine {
             Some(path) => ("project", path),
             None => (
@@ -3781,6 +3799,128 @@ async fn post_project_workflow_node(
 
     tokio::task::spawn_blocking(move || {
         crate::workflows::set_overlay(&root, &name, &node, Some(overlay))
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(&state, &id, &said).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct DetectQuery {
+    /// An absolute path to a folder. See `detect.rs` for why this route takes one at all.
+    path: String,
+}
+
+/// What is already in a folder somebody is about to add.
+///
+/// **§9's second step.** A project worth adding has a history, commands its people type, and often a
+/// written-down way of working — this repository's is `.ai/`, and it built NucleOS. This reports all
+/// of it so the wizard can propose rather than interrogate.
+///
+/// The git half runs even when the folder turns out not to be a repository: `is_git` is a finding
+/// and not a refusal, because `set_project_mode` only insists on a repository for `active`, and a
+/// wizard that refused to look at a folder would be deciding a question the last step asks.
+///
+/// In no scope table, like every route under `/projects/{id}/workflows`: it reads a path nobody has
+/// vouched for, so `permits` — default-deny — leaves it to the key of the person at the machine.
+async fn get_project_detect(
+    State(state): State<AppState>,
+    Query(query): Query<DetectQuery>,
+) -> Result<Json<crate::detect::Detected>, (StatusCode, Json<serde_json::Value>)> {
+    let root = std::path::PathBuf::from(query.path.trim());
+    if !root.is_absolute() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "not_absolute"));
+    }
+
+    let root = tokio::fs::canonicalize(&root)
+        .await
+        .map_err(|_| refusal(StatusCode::NOT_FOUND, "no_such_folder"))?;
+    if !root.is_dir() {
+        return Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "not_a_folder"));
+    }
+
+    let looking = root.clone();
+    let mut found = tokio::task::spawn_blocking(move || crate::detect::inspect_folder(&looking))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+
+    if found.is_git {
+        let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+        found.branch = crate::git_exec::current_branch(&root, deadline).await.ok();
+        let (remote, head) = crate::git_exec::origin_and_head(&root, deadline).await;
+        found.remote = remote;
+        found.head = head;
+    }
+
+    // The one thing here that cannot be seen from the folder. Adding a project twice under two
+    // names is the mistake this prevents, and neither name would look wrong on its own.
+    found.taken_by = already_registered(&state, &root).await;
+    Ok(Json(found))
+}
+
+/// How long the three git reads get, together.
+///
+/// Short on purpose. This runs while somebody waits on a wizard, all three commands are local, and a
+/// repository whose `.git` is on a disconnected network share is exactly the case that would
+/// otherwise hold the request open. Missing git facts degrade to `None`, which the page shows as
+/// "not read" rather than as "there is no remote".
+const DETECT_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A project this daemon already keeps at this folder, if any.
+///
+/// Compared after canonicalising both sides, because the stored root is whatever string was handed
+/// in when the project was registered — a trailing slash, a different case on Windows, a path
+/// through a junction — and a plain string comparison would report "no" for the same folder.
+async fn already_registered(state: &AppState, root: &std::path::Path) -> Option<String> {
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT project_id, project_root FROM autopilot_state")
+            .fetch_all(&state.pool)
+            .await
+            .ok()?;
+
+    for (project_id, stored) in rows {
+        let Some(stored) = stored else { continue };
+        let Ok(stored) = tokio::fs::canonicalize(&stored).await else {
+            continue;
+        };
+        if stored == root {
+            return Some(project_id);
+        }
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct AdoptRequest {
+    /// What to call it. The project's own choice: an adopted folder has no published name.
+    name: String,
+    /// The folder, relative to the project root — `.ai`, `.claude`.
+    path: String,
+}
+
+/// Record a folder this project already has as its workflow.
+///
+/// **Copies nothing and writes nothing into the folder.** §9's second step exists because a project
+/// that already works must not be asked to describe itself again before the app will admit it. So
+/// this writes one pin, and the folder stays exactly as it was — no manifest, no rewrite.
+///
+/// It has no library origin, so it is ejected from birth and can never be updated. That is not a
+/// gap: it is what an adopted folder is, and the page says so rather than offering a button that
+/// would have to refuse.
+async fn post_project_workflow_adopt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AdoptRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, _) = workflow_write_root(&state, &id).await?;
+    let now = chrono::Utc::now();
+    let said = format!("{} adopted as this project's workflow", body.path);
+
+    tokio::task::spawn_blocking(move || {
+        crate::workflows::adopt(&root, &body.name, &body.path, now)
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -10767,6 +10907,141 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["refusal"], "invalid_graph");
         assert!(body["detail"].as_str().unwrap().contains("nowhere"));
+    }
+
+    /// §9's second step, end to end: the app looks at a folder and reports what is already in it.
+    ///
+    /// The harness is the half that matters. This repository's `.ai/` built NucleOS, and an app that
+    /// asked for it to be recreated in a graph editor before admitting the project exists would be
+    /// asking for a day's work to describe a thing that is sitting right there.
+    #[tokio::test]
+    async fn a_folder_is_read_for_what_it_already_has_rather_than_interrogated() {
+        let state = test_state().await;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".ai")).unwrap();
+        std::fs::write(temp.path().join(".ai/workflow.md"), "the pipeline").unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts": {"test": "vitest run"}}"#,
+        )
+        .unwrap();
+
+        let (status, found) = workflow_call(
+            state,
+            "GET",
+            &format!(
+                "/projects/detect?path={}",
+                urlencoding(&temp.path().to_string_lossy())
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(found["harnesses"][0]["path"], ".ai");
+        assert_eq!(found["commands"][0]["name"], "test");
+        assert_eq!(found["commands"][0]["command"], "npm run test");
+        // Not a repository is a finding, not a refusal — the last step is what decides whether that
+        // matters, because only `active` insists on one.
+        assert_eq!(found["is_git"], false);
+        assert!(found["taken_by"].is_null());
+    }
+
+    /// Adding one folder twice under two names is the mistake nothing else here can catch: neither
+    /// name looks wrong on its own, and the folder cannot say it has been claimed.
+    #[tokio::test]
+    async fn a_folder_this_daemon_already_watches_says_which_project_has_it() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (_, found) = workflow_call(
+            state,
+            "GET",
+            &format!(
+                "/projects/detect?path={}",
+                urlencoding(&dir.path().to_string_lossy())
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(found["taken_by"], "alpha");
+    }
+
+    /// A path that is not there, and one that is not a folder, are two different answers.
+    #[tokio::test]
+    async fn a_path_that_is_not_a_folder_is_refused_by_name() {
+        let state = test_state().await;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a-file"), "x").unwrap();
+
+        for (path, code) in [
+            (
+                temp.path().join("nowhere").to_string_lossy().into_owned(),
+                "no_such_folder",
+            ),
+            (
+                temp.path().join("a-file").to_string_lossy().into_owned(),
+                "not_a_folder",
+            ),
+        ] {
+            let (_, body) = workflow_call(
+                state.clone(),
+                "GET",
+                &format!("/projects/detect?path={}", urlencoding(&path)),
+                None,
+            )
+            .await;
+            assert_eq!(body["refusal"], code, "{path}");
+        }
+
+        // A relative path is refused before the filesystem is touched at all: there is no root it
+        // could be relative TO, so resolving it would resolve it against the daemon's own cwd.
+        let (_, body) = workflow_call(state, "GET", "/projects/detect?path=.ai", None).await;
+        assert_eq!(body["refusal"], "not_absolute");
+    }
+
+    /// Adopting records a pin and touches nothing in the folder.
+    ///
+    /// The canvas then says the bundle has no graph, which is true and is the honest halfway state:
+    /// the app recognises the way of working that is there without pretending to have parsed it.
+    #[tokio::test]
+    async fn adopting_the_folder_a_project_already_has_writes_one_pin_and_nothing_else() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[]);
+        state.workflow_library = Some(library);
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::write(dir.path().join(".ai/workflow.md"), "the pipeline").unwrap();
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/adopt",
+            Some(serde_json::json!({ "name": "harness", "path": ".ai" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, installed) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(installed[0]["standing"], "ejected");
+        assert_eq!(installed[0]["origin"], "adopted:.ai");
+        assert!(installed[0]["origin_hash"].is_null());
+
+        // Untouched: no manifest written into somebody else's folder.
+        assert!(!dir.path().join(".ai/bundle.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".ai/workflow.md")).unwrap(),
+            "the pipeline"
+        );
+
+        let (status, body) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "no_graph");
     }
 
     /* ----------------------------------------------------- project commands -- */

@@ -24,6 +24,7 @@ import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
+import { NewProject } from "./pages/NewProject";
 import { Workspace } from "./project/Workspace";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
@@ -146,6 +147,14 @@ const DETAIL_ROUTES: {
   validateSearch?: (search: Record<string, unknown>) => unknown;
 }[] = [
   { path: "/runs/$runId", component: RunDetail },
+  /*
+    Adding a project is a page and not a dialog, for the same reason the eject guard is a panel:
+    §3.2 of the frontend spec. It is also three steps long and one of them is a folder path somebody
+    may want to go and look up — a modal that had to be dismissed to do that would lose the other
+    two. It sits under `/projects/` because that is what it is about, and cannot be confused with a
+    project called `new`: that one would be `/projects/new/estado`, three segments rather than two.
+  */
+  { path: "/projects/new", component: NewProject },
   {
     path: "/projects/$projectId/$view",
     component: Workspace,

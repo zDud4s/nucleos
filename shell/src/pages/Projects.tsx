@@ -124,6 +124,15 @@ export function Projects() {
     <>
       <PageHeader title="Projects" headline={headlineFor(rows, projects.data !== undefined)} />
 
+      {/*
+        The door to adding one. Here rather than in the rail, because the rail is the design's fixed
+        list of places and this is an action taken from the list of what exists — and because the
+        first thing anybody does on an empty roster is look at the roster.
+      */}
+      <p className="pj-add">
+        <Link to="/projects/new">Add a project…</Link>
+      </p>
+
       {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
       {projects.isError && projects.data === undefined && <RosterError error={projects.error} />}
 

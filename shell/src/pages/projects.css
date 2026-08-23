@@ -458,3 +458,9 @@
   line-height: var(--leading-normal);
   color: var(--text);
 }
+
+/* The door to the wizard, under the headline: an action taken from the list of what exists. */
+.pj-add {
+  margin: 0 0 var(--space-4, 1rem);
+  font-size: var(--text-sm, 0.875rem);
+}

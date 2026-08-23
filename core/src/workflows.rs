@@ -366,6 +366,15 @@ pub struct Pin {
     /// lets the page say how long the silence has lasted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ejected_at: Option<String>,
+    /// Where this project's own copy is, when it is not where an eject would have put it.
+    ///
+    /// **This is what lets the app recognise a workflow that was already here.** §9's second step
+    /// says the app must not ask somebody to recreate the harness they already have — this
+    /// repository's `.ai/` built NucleOS — so adopting it points the pin at the folder that is
+    /// there and touches nothing inside it. `None` is the ordinary case: an ejected copy lives at
+    /// `.ai/workflows/<name>/` and does not need saying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub nodes: BTreeMap<String, NodeOverlay>,
 }
@@ -489,12 +498,24 @@ pub struct Installed {
     pub disabled_nodes: usize,
 }
 
-/// Where an ejected copy of `name` lives in this project.
+/// Where an ejected copy of `name` lives in this project, by default.
 pub fn ejected_path(project_root: &Path, name: &str) -> Option<PathBuf> {
     if !valid_name(name) {
         return None;
     }
     crate::inspect::safe_join(project_root, &format!("{EJECTED_DIR}/{name}")).ok()
+}
+
+/// Where THIS pin's own copy is: the folder it names, or the default one.
+///
+/// Through `safe_join` either way, so a `path` somebody wrote by hand into the pins file cannot
+/// name anything outside the project. The pins file is one the app declares itself the author of
+/// and a person can still edit it, which makes it caller-supplied input like any other.
+pub fn copy_path(project_root: &Path, pin: &Pin) -> Option<PathBuf> {
+    match pin.path.as_deref() {
+        Some(rel) => crate::inspect::safe_join(project_root, rel).ok(),
+        None => ejected_path(project_root, &pin.name),
+    }
 }
 
 /// Every workflow this project pins, measured against the library as it is right now.
@@ -511,7 +532,7 @@ pub fn installed(project_root: &Path, library_root: &Path) -> Result<Vec<Install
         // Ejected is decided by what is on disk, not only by the field. A pin stamped `ejected_at`
         // whose folder somebody deleted is not still ejected — it is a project with no copy, and
         // saying otherwise would offer a diff against a directory that is not there.
-        let local_dir = ejected_path(project_root, &pin.name).filter(|path| path.is_dir());
+        let local_dir = copy_path(project_root, &pin).filter(|path| path.is_dir());
         let local = local_dir
             .as_ref()
             .and_then(|path| file_hashes(path).ok())
@@ -627,6 +648,9 @@ pub enum Refused {
     BadName,
     /// Already has its own copy; ejecting again would overwrite whatever is in it.
     AlreadyEjected,
+    /// This workflow is a folder the project already had, adopted rather than ejected. Nothing
+    /// here replaces it — see [`adopt`].
+    Adopted,
     /// The bundle has no `graph.yaml`. Not a fault — skills and scripts with no sequence yet is an
     /// ordinary halfway state, and this module is not the one that decides a bundle needs a graph.
     NoGraph,
@@ -645,6 +669,10 @@ impl std::fmt::Display for Refused {
             Refused::AlreadyEjected => {
                 write!(f, "this project already has its own copy of that workflow")
             }
+            Refused::Adopted => write!(
+                f,
+                "this workflow is a folder this project already had; the app will not replace it"
+            ),
             Refused::NoGraph => write!(f, "this bundle has no graph in it yet"),
             Refused::InvalidGraph(detail) => write!(f, "{detail}"),
             Refused::Io(detail) => write!(f, "{detail}"),
@@ -693,6 +721,9 @@ pub fn install(project_root: &Path, bundle: &Bundle) -> Result<(), Refused> {
         // something an install may do quietly — and `installed` reads the disk, so it will keep
         // reporting `ejected` until somebody removes it. That is the truth of the situation.
         ejected_at: None,
+        // Cleared for the same reason and one more: installing from the library is saying this
+        // project follows a published bundle, and an adopted folder is the opposite claim.
+        path: None,
         nodes,
     };
     match existing {
@@ -742,6 +773,12 @@ pub fn eject(
     else {
         return Err(Refused::NotInstalled);
     };
+    // An adopted workflow is already the project's own folder. Ejecting on top of it would copy a
+    // library bundle into `.ai/workflows/` while the pin went on naming somewhere else — two
+    // copies, one of them unreferenced, and a page that could not say which was running.
+    if pins.workflows[index].path.is_some() {
+        return Err(Refused::Adopted);
+    }
 
     copy_tree(Path::new(&bundle.path), &target).map_err(|error| Refused::Io(error.to_string()))?;
 
@@ -749,6 +786,54 @@ pub fn eject(
     pins.workflows[index].version = bundle.version.clone();
     pins.workflows[index].origin = bundle.origin.clone();
     pins.workflows[index].hash = bundle.hash.clone();
+    save_pins(project_root, &pins)
+}
+
+/// Record a folder this project already has as its workflow, copying nothing.
+///
+/// **§9's second step, and the reason it exists.** A project that already develops a certain way has
+/// that way written down somewhere — this repository's `.ai/` is the case in point, and it built
+/// NucleOS. Asking somebody to recreate it in a graph editor before the app will admit it exists is
+/// how a tool becomes hostile to what is already working. So this writes one pin and touches nothing
+/// inside the folder: no manifest, no rewrite, no copy.
+///
+/// It is recorded as **ejected from birth**, which is the honest description: it has no origin in
+/// any library, so it receives nothing and never will until somebody publishes it. The origin
+/// records where it was adopted from rather than a coordinate, because there is no coordinate — and
+/// a field left blank would have been the `.githooks` mistake again, a pin that cannot say what it
+/// is a pin to.
+pub fn adopt(
+    project_root: &Path,
+    name: &str,
+    rel: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Refused> {
+    if !valid_name(name) {
+        return Err(Refused::BadName);
+    }
+    let folder = crate::inspect::safe_join(project_root, rel).map_err(|_| Refused::BadName)?;
+    if !folder.is_dir() {
+        return Err(Refused::NoSuchBundle);
+    }
+    let hash = digest_of(&file_hashes(&folder).map_err(|error| Refused::Io(error.to_string()))?);
+
+    let mut pins = read_pins(project_root).map_err(Refused::Io)?;
+    let pin = Pin {
+        name: name.to_string(),
+        // Versionless is not a version this app invents. `0` says plainly that nothing has ever
+        // published this, which is exactly what an adopted folder is.
+        version: "0".to_string(),
+        origin: format!("adopted:{rel}"),
+        hash,
+        ejected_at: Some(now.to_rfc3339()),
+        path: Some(rel.to_string()),
+        nodes: BTreeMap::new(),
+    };
+    match pins.workflows.iter().position(|row| row.name == name) {
+        Some(index) => pins.workflows[index] = pin,
+        None => pins.workflows.push(pin),
+    }
+    pins.workflows.sort_by(|a, b| a.name.cmp(&b.name));
     save_pins(project_root, &pins)
 }
 
@@ -771,6 +856,14 @@ pub fn update(
     else {
         return Err(Refused::NotInstalled);
     };
+
+    // **Before anything is deleted.** An adopted pin names a folder the project already had — in
+    // this repository, `.ai/` itself — and the branch below removes the copy before replacing it.
+    // There is no bundle to replace it WITH, so the route refuses first anyway; this is the guard
+    // that does not depend on that staying true.
+    if pins.workflows[index].path.is_some() {
+        return Err(Refused::Adopted);
+    }
 
     if pins.workflows[index].ejected_at.is_some() {
         let target = ejected_path(project_root, &bundle.name).ok_or(Refused::BadName)?;
@@ -975,6 +1068,7 @@ mod tests {
                 origin: "library:harness@1.0".into(),
                 hash: "sha256:abc".into(),
                 ejected_at: None,
+                path: None,
                 nodes,
             }],
         };
@@ -1298,6 +1392,95 @@ mod tests {
             set_overlay(&project, "harness", "  ", None),
             Err(Refused::BadName)
         );
+    }
+
+    /// §9's second step: the app recognises the workflow that is already here and copies nothing.
+    ///
+    /// The folder is left byte for byte as it was — no manifest written into it, no rewrite — which
+    /// is what "recognise it, do not ask for it to be recreated" has to mean.
+    #[test]
+    fn adopting_the_harness_a_project_already_has_copies_nothing_into_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".ai/scripts")).unwrap();
+        std::fs::write(project.join(".ai/workflow.md"), "the pipeline").unwrap();
+        std::fs::write(project.join(".ai/scripts/select_tests.py"), "print()").unwrap();
+        let before = std::fs::read_dir(project.join(".ai")).unwrap().count();
+
+        adopt(&project, "harness", ".ai", now()).unwrap();
+
+        let empty = temp.path().join("no-library");
+        std::fs::create_dir_all(&empty).unwrap();
+        let rows = installed(&project, &empty).unwrap();
+        assert_eq!(rows.len(), 1);
+        // Ejected from birth, and honest about having no origin in any library.
+        assert_eq!(rows[0].standing, Standing::Ejected);
+        assert_eq!(rows[0].origin, "adopted:.ai");
+        assert!(rows[0].origin_hash.is_none());
+        assert!(rows[0].local_hash.is_some());
+
+        // Nothing was written into the folder — only `.ai/workflows.yaml`, which is the app's own.
+        assert!(!project.join(".ai/bundle.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(project.join(".ai/workflow.md")).unwrap(),
+            "the pipeline"
+        );
+        // Two entries before, two after: `workflow.md` and `scripts/`. The pins file the app DOES
+        // write is `.ai/workflows.yaml`, which makes it three — so this is asserted against the
+        // count taken before, not against a literal that would have hidden exactly that.
+        assert_eq!(
+            std::fs::read_dir(project.join(".ai")).unwrap().count(),
+            before + 1
+        );
+    }
+
+    /// An adopted folder is not something this app replaces. The branch that would have deleted it
+    /// is the one that removes an ejected copy before re-copying — and here that folder is `.ai/`.
+    #[test]
+    fn nothing_replaces_a_folder_the_project_already_had() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".ai")).unwrap();
+        std::fs::write(project.join(".ai/workflow.md"), "the pipeline").unwrap();
+        adopt(&project, "harness", ".ai", now()).unwrap();
+
+        let lib = shelf(
+            &temp.path().join("lib"),
+            "harness",
+            "1.0",
+            &[("g.yaml", "a")],
+        );
+        let bundle = bundle_at(&lib, "harness", "1.0");
+        assert_eq!(update(&project, &bundle, now()), Err(Refused::Adopted));
+        assert_eq!(eject(&project, &bundle, now()), Err(Refused::Adopted));
+        assert_eq!(
+            std::fs::read_to_string(project.join(".ai/workflow.md")).unwrap(),
+            "the pipeline"
+        );
+    }
+
+    /// A `path` in the pins file is caller-supplied input like any other — a person can edit that
+    /// file — so it goes through the same guard every other path does.
+    #[test]
+    fn an_adopted_path_cannot_name_somewhere_outside_the_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(
+            adopt(&project, "harness", "../elsewhere", now()),
+            Err(Refused::BadName)
+        );
+
+        let pin = Pin {
+            name: "harness".into(),
+            version: "0".into(),
+            origin: "adopted:..".into(),
+            hash: "sha256:x".into(),
+            ejected_at: None,
+            path: Some("../elsewhere".into()),
+            nodes: BTreeMap::new(),
+        };
+        assert!(copy_path(&project, &pin).is_none());
     }
 
     #[test]

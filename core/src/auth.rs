@@ -2170,6 +2170,11 @@ mod tests {
             (Method::GET, "/projects/{id}/workflows/{name}/diff"),
             (Method::GET, "/projects/{id}/workflows/{name}/graph"),
             (Method::POST, "/projects/{id}/workflows/{name}/nodes/{node}"),
+            (Method::POST, "/projects/{id}/workflows/adopt"),
+            // Reads a path nobody has vouched for — see `detect.rs`. Default-deny leaves it to the
+            // key of the person sitting at the machine, which is the only one that should be able
+            // to point this daemon at an arbitrary folder.
+            (Method::GET, "/projects/detect"),
         ] {
             assert!(
                 !route_is_listed(READ_ONLY_ROUTES, &method, pattern)

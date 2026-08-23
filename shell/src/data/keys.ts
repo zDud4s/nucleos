@@ -143,6 +143,15 @@ export const keys = {
     /** One workflow's graph, overlay already painted on by the núcleo. */
     workflowGraph: (projectId: string, name: string) =>
       ["projects", projectId, "workflows", name, "graph"] as const,
+    /**
+     * What is in a folder nobody has registered yet — `GET /projects/detect`.
+     *
+     * Keyed by the path, because two folders are two different answers and a cache that collapsed
+     * them would show the previous folder's findings under the new one's name. Under the roster
+     * prefix even though there is no project: registering one invalidates it, which is right — the
+     * `taken_by` field becomes true the moment somebody finishes the wizard.
+     */
+    detect: (path: string) => ["projects", "detect", path] as const,
     branches: (projectId: string) => ["projects", projectId, "branches"] as const,
     log: (projectId: string, path: string) => ["projects", projectId, "log", path] as const,
     /**

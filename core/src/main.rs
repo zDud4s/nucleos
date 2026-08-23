@@ -20,6 +20,7 @@ mod config;
 mod contacts;
 mod council;
 mod daemon_client;
+mod detect;
 mod email;
 mod errands;
 mod exclusion;
