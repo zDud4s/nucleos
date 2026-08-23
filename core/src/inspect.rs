@@ -218,6 +218,36 @@ pub fn grep(root: &Path, query: &str, rel: &str) -> Result<Vec<Match>, InspectEr
 /// It also gets a deadline and an output ceiling, having had neither: the whole diff was buffered
 /// into memory and into the response, and a hung git held the blocking thread indefinitely.
 pub fn diff(root: &Path) -> Result<String, InspectError> {
+    diff_with(root, &[])
+}
+
+/// Everything one run changed since it branched, committed or not, optionally for a single file.
+///
+/// **`git diff <base>` and not `git diff`, and the difference is the whole review surface.** A plain
+/// working-tree diff comes back empty halfway through a job, because `job.rs` commits a checkpoint
+/// at every green gate — so the reviewer would be shown nothing at exactly the moment there is most
+/// to see. Comparing against the branch point includes the checkpoints and the uncommitted work
+/// together, which is what "what did this run do" means.
+///
+/// `base` is a sha this daemon wrote into `worktrees.base_sha` and is validated as hexadecimal all
+/// the same, for the reason `changed_paths` gives: a revision argument that may begin with `-` is an
+/// option to git, and the value travels through a database other code writes.
+pub fn diff_since(root: &Path, base: &str, rel: &str) -> Result<String, InspectError> {
+    let hexadecimal = base.chars().all(|character| character.is_ascii_hexdigit());
+    if !matches!(base.len(), 40 | 64) || !hexadecimal {
+        return Err(InspectError::UnsafePath);
+    }
+    let rel = rel.trim();
+    if rel.is_empty() || rel == "." {
+        return diff_with(root, &[base]);
+    }
+    // The same lexical refusal every other reader gives. Git takes this as a pathspec, and a
+    // pathspec climbs out of a repository as happily as an open does.
+    safe_join(root, rel)?;
+    diff_with(root, &[base, "--", rel])
+}
+
+fn diff_with(root: &Path, extra: &[&str]) -> Result<String, InspectError> {
     use std::io::Read;
 
     let mut child = std::process::Command::new("git")
@@ -231,6 +261,7 @@ pub fn diff(root: &Path) -> Result<String, InspectError> {
         .arg("diff")
         .arg("--no-ext-diff")
         .arg("--no-textconv")
+        .args(extra)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -486,6 +517,138 @@ pub fn parse_log(output: &[u8]) -> Vec<Commit> {
             })
         })
         .collect()
+}
+
+/// The most lines one blame returns.
+///
+/// A blame is read beside a diff, one screen at a time. Past this the answer is not a panel, and
+/// the cost is real: `--line-porcelain` repeats the whole commit header for every single line, so a
+/// large file is megabytes of output for a question about twenty lines of it.
+const BLAME_CAP: usize = 4_000;
+
+/// One line of a file, and who last touched it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BlameLine {
+    pub line: u64,
+    pub sha: String,
+    pub author: String,
+    /// Epoch seconds, as git reports them. Formatted by whoever draws it.
+    pub at: i64,
+    pub summary: String,
+    pub text: String,
+    /// Whether this line is in the working tree and not in any commit.
+    ///
+    /// Git blames an uncommitted line to the all-zero sha, and the fields around it are placeholders
+    /// — "Not Committed Yet" as the author, the current time as the date. Left as git reports them
+    /// but flagged, because a panel that showed that row like any other would credit a person who
+    /// never wrote it.
+    pub uncommitted: bool,
+}
+
+/// Who last touched each line of a file.
+///
+/// `-w` so that a reindentation does not reassign a hundred lines to whoever ran the formatter —
+/// blame is read to find out *why* a line is the way it is, and whitespace is never the reason.
+pub fn blame(root: &Path, rel: &str) -> Result<Vec<BlameLine>, InspectError> {
+    // The same resolution `cat` uses, which is the stronger of the two checks: it follows links and
+    // refuses a path that lands outside the root. A blame reads a file, so it earns the same guard.
+    resolved_within(root, rel)?;
+    let output = run_git(
+        root,
+        &[
+            "-c",
+            "core.fsmonitor=",
+            "blame",
+            "-w",
+            "--line-porcelain",
+            "--",
+            rel,
+        ],
+    )?;
+    Ok(parse_blame(&output, BLAME_CAP))
+}
+
+/// PURE: `git blame --line-porcelain` as lines.
+///
+/// The format repeats a full header block per line: a `<sha> <orig> <final>` line, then `key value`
+/// lines, then the content prefixed with a tab. A record is only emitted when the tab line arrives,
+/// so a truncated tail cannot produce a half-built row.
+pub fn parse_blame(output: &[u8], cap: usize) -> Vec<BlameLine> {
+    let text = String::from_utf8_lossy(output);
+    let mut lines = Vec::new();
+
+    let mut sha = String::new();
+    let mut line_number: u64 = 0;
+    let mut author = String::new();
+    let mut at: i64 = 0;
+    let mut summary = String::new();
+
+    for record in text.lines() {
+        if let Some(content) = record.strip_prefix('\t') {
+            if lines.len() >= cap {
+                break;
+            }
+            lines.push(BlameLine {
+                line: line_number,
+                // All zeroes is git's way of saying "this line is not in any commit yet".
+                uncommitted: sha.chars().all(|character| character == '0') && !sha.is_empty(),
+                sha: std::mem::take(&mut sha),
+                author: std::mem::take(&mut author),
+                at,
+                summary: std::mem::take(&mut summary),
+                text: content.to_owned(),
+            });
+            continue;
+        }
+
+        if let Some(rest) = record.strip_prefix("author ") {
+            author = rest.to_owned();
+        } else if let Some(rest) = record.strip_prefix("author-time ") {
+            at = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = record.strip_prefix("summary ") {
+            summary = rest.to_owned();
+        } else if let Some((candidate, rest)) = record.split_once(' ') {
+            // A header line: 40 or 64 hexadecimal characters, then the original and final line
+            // numbers. Anything else is one of the many `key value` lines this does not read.
+            let hexadecimal = candidate
+                .chars()
+                .all(|character| character.is_ascii_hexdigit());
+            if matches!(candidate.len(), 40 | 64) && hexadecimal {
+                sha = candidate.to_owned();
+                // The FINAL line number, which is the second field — the first is where the line
+                // was in the commit that introduced it, and using that would number the panel by a
+                // file that no longer exists.
+                line_number = rest
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    lines
+}
+
+/// What a run has changed, and how much of the tree it left alone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Changed {
+    pub paths: Vec<String>,
+    /// Files tracked in this tree. The subtraction is the point: the Code mode opens on what
+    /// changed and says how many files nobody touched, which is what makes it a review surface
+    /// rather than a file browser that happens to be read-only.
+    pub tracked: usize,
+}
+
+/// The changed paths of a worktree, with the size of the tree they sit in.
+pub fn changed(root: &Path, base: &str) -> Result<Changed, InspectError> {
+    let paths = changed_paths(root, base)?;
+    let listed = run_git(root, &["--no-optional-locks", "ls-files", "-z"])?;
+    let tracked = listed
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .count();
+    Ok(Changed { paths, tracked })
 }
 
 /// Every local branch, with its distance from where work lands.
@@ -894,6 +1057,150 @@ pub(crate) mod tests {
         // The branches are still listed — they exist — but nothing claims a distance to a target
         // that is not there.
         assert!(listed.branches.iter().all(|row| !row.measured));
+    }
+
+    /// **The case a plain working-tree diff gets wrong, and it is the common one.**
+    ///
+    /// `job.rs` commits a checkpoint at every green gate, so a run halfway through a job has its
+    /// work in commits and a clean working tree. `git diff` shows nothing for it — the reviewer
+    /// would be told there is nothing to review at exactly the moment there is most.
+    #[test]
+    fn a_checkpointed_change_is_in_the_diff_since_the_branch_point() {
+        let (repo, base) = seeded_repo();
+        std::fs::write(repo.path().join("seed.txt"), "seed\nand more\n").unwrap();
+        git_in_repo(repo.path(), &["add", "-A"]);
+        git_in_repo(repo.path(), &["commit", "-m", "a checkpoint"]);
+
+        // The working tree is clean, so the old question answers "nothing".
+        assert_eq!(diff(repo.path()).unwrap(), "");
+        // The right question answers with the work.
+        let since = diff_since(repo.path(), &base, "").unwrap();
+        assert!(since.contains("and more"), "{since}");
+    }
+
+    #[test]
+    fn the_diff_since_a_branch_point_can_be_narrowed_to_one_file() {
+        let (repo, base) = seeded_repo();
+        commit_file(repo.path(), "one.txt", "first");
+        commit_file(repo.path(), "two.txt", "second");
+
+        let one = diff_since(repo.path(), &base, "one.txt").unwrap();
+        assert!(one.contains("one.txt"));
+        assert!(!one.contains("two.txt"), "{one}");
+    }
+
+    /// The same refusals `changed_paths` gives, for the same reason: a revision that may begin with
+    /// `-` is an option to git, and a pathspec climbs out of a repository as happily as an open.
+    #[test]
+    fn the_diff_since_refuses_a_base_that_is_not_a_sha_and_a_path_that_climbs_out() {
+        let (repo, base) = seeded_repo();
+        assert!(matches!(
+            diff_since(repo.path(), "--output=/tmp/x", ""),
+            Err(InspectError::UnsafePath)
+        ));
+        assert!(matches!(
+            diff_since(repo.path(), &base, "../secret"),
+            Err(InspectError::UnsafePath)
+        ));
+    }
+
+    #[test]
+    fn blame_names_who_last_touched_each_line() {
+        let (repo, _) = seeded_repo();
+        std::fs::write(repo.path().join("f.txt"), "one\ntwo\n").unwrap();
+        git_in_repo(repo.path(), &["add", "-A"]);
+        git_in_repo(repo.path(), &["commit", "-m", "wrote two lines"]);
+
+        let lines = blame(repo.path(), "f.txt").unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, 1);
+        assert_eq!(lines[1].line, 2);
+        assert_eq!(lines[0].text, "one");
+        assert_eq!(lines[1].text, "two");
+        assert_eq!(lines[0].author, "test");
+        assert_eq!(lines[0].summary, "wrote two lines");
+        assert!(lines[0].at > 0, "author-time should be an epoch");
+        assert!(!lines[0].uncommitted);
+    }
+
+    /// Git blames a line nobody has committed to the all-zero sha and fills the rest of the header
+    /// with placeholders — "Not Committed Yet" as the author, right now as the time. Left as git
+    /// reports them and flagged, because a panel that drew that row like any other would credit a
+    /// person who never wrote the line.
+    #[test]
+    fn an_uncommitted_line_is_flagged_rather_than_credited_to_somebody() {
+        let (repo, _) = seeded_repo();
+        std::fs::write(repo.path().join("f.txt"), "committed\n").unwrap();
+        git_in_repo(repo.path(), &["add", "-A"]);
+        git_in_repo(repo.path(), &["commit", "-m", "first"]);
+        std::fs::write(repo.path().join("f.txt"), "committed\nnot yet\n").unwrap();
+
+        let lines = blame(repo.path(), "f.txt").unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(!lines[0].uncommitted);
+        assert!(lines[1].uncommitted, "the new line is in no commit");
+    }
+
+    /// The same refusal every other reader gives. A blame opens a file, so it earns the guard that
+    /// follows links — not merely the lexical one.
+    #[test]
+    fn blame_refuses_a_path_outside_the_repository() {
+        let (repo, _) = seeded_repo();
+        assert!(matches!(
+            blame(repo.path(), "../secret"),
+            Err(InspectError::UnsafePath)
+        ));
+    }
+
+    #[test]
+    fn blame_is_bounded_however_long_the_file_is() {
+        let porcelain = |sha: &str, line: usize| {
+            format!(
+                "{sha} {line} {line} 1\nauthor test\nauthor-time 1000\nsummary s\n\tline {line}\n"
+            )
+        };
+        let sha = "a".repeat(40);
+        let output: String = (1..=10).map(|line| porcelain(&sha, line)).collect();
+
+        assert_eq!(parse_blame(output.as_bytes(), 3).len(), 3);
+        assert_eq!(parse_blame(output.as_bytes(), 100).len(), 10);
+    }
+
+    /// The header carries two line numbers: where the line was in the commit that introduced it,
+    /// and where it is now. Reading the first would number the panel by a file that no longer
+    /// exists, and the two agree often enough that the mistake survives a casual test.
+    #[test]
+    fn parse_blame_numbers_lines_by_where_they_are_now() {
+        let sha = "b".repeat(40);
+        let output = format!("{sha} 7 42 1\nauthor test\nauthor-time 5\nsummary s\n\tthe line\n");
+        let lines = parse_blame(output.as_bytes(), 10);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, 42);
+    }
+
+    /// A header with no content line behind it is a truncated tail, not a line of the file. Emitting
+    /// on the header instead would put a row with no text into the panel.
+    #[test]
+    fn parse_blame_emits_nothing_for_a_header_with_no_content_line() {
+        let sha = "c".repeat(40);
+        let output = format!("{sha} 1 1 1\nauthor test\nauthor-time 5\nsummary s\n");
+        assert!(parse_blame(output.as_bytes(), 10).is_empty());
+    }
+
+    #[test]
+    fn changed_reports_the_size_of_the_tree_it_measured_in() {
+        let (repo, base) = seeded_repo();
+        commit_file(repo.path(), "a.txt", "one more");
+        std::fs::write(repo.path().join("b.txt"), "untracked\n").unwrap();
+
+        let changed = changed(repo.path(), &base).unwrap();
+        // The committed change and the untracked file: `changed_paths` is the union of both
+        // questions, and the Code mode opens on exactly this list.
+        assert!(changed.paths.iter().any(|path| path == "a.txt"));
+        assert!(changed.paths.iter().any(|path| path == "b.txt"));
+        // `seed.txt` and `a.txt` are tracked; `b.txt` is not tracked yet. The count is what makes
+        // "and N files nobody touched" possible.
+        assert_eq!(changed.tracked, 2);
     }
 
     #[test]

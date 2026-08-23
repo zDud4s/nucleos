@@ -126,6 +126,21 @@ export const keys = {
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
     branches: (projectId: string) => ["projects", projectId, "branches"] as const,
     log: (projectId: string, path: string) => ["projects", projectId, "log", path] as const,
+    /**
+     * Reads scoped to one run's worktree.
+     *
+     * The run is in the key and not only in the URL, because the same project and the same path
+     * mean a different file in a different run's checkout — and a cache that collapsed them would
+     * show one run's work while reviewing another's.
+     */
+    changed: (projectId: string, run: number) => ["projects", projectId, "changed", run] as const,
+    runDiff: (projectId: string, run: number, path: string) =>
+      ["projects", projectId, "run-diff", run, path] as const,
+    runFile: (projectId: string, run: number, path: string) =>
+      ["projects", projectId, "run-file", run, path] as const,
+    runBlame: (projectId: string, run: number, path: string) =>
+      ["projects", projectId, "run-blame", run, path] as const,
+    worktree: (projectId: string, run: number) => ["projects", projectId, "worktree", run] as const,
   },
 
   proposals: {

@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 
@@ -58,7 +59,11 @@ export function Occupancy({ projectId }: OccupancyProps) {
         </p>
         <div className="flex flex-wrap gap-2">
           {slots.map((slot) => (
-            <Slot key={`${slot.owner_kind}-${slot.owner_id}`} taken={slot} />
+            <Slot
+              key={`${slot.owner_kind}-${slot.owner_id}`}
+              taken={slot}
+              projectId={projectId}
+            />
           ))}
         </div>
       </div>
@@ -75,7 +80,11 @@ export function Occupancy({ projectId }: OccupancyProps) {
           return taken === undefined ? (
             <Free key={`free-${index}`} />
           ) : (
-            <Slot key={`${taken.owner_kind}-${taken.owner_id}`} taken={taken} />
+            <Slot
+              key={`${taken.owner_kind}-${taken.owner_id}`}
+              taken={taken}
+              projectId={projectId}
+            />
           );
         })}
       </div>
@@ -105,14 +114,50 @@ function Free() {
   );
 }
 
-function Slot({ taken }: { taken: { owner_kind: string; owner_id: number; claimed_at: string } }) {
-  return (
-    <div
-      className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2"
-      aria-label={`${taken.owner_kind} ${taken.owner_id}`}
-    >
+/**
+ * One taken slot, and the one action that belongs to it.
+ *
+ * The command lives *in* the thing it acts on. This is the rule that keeps a page like this from
+ * becoming a drawer: a row of buttons at the bottom with no owner is how every dashboard ends up
+ * with fourteen of them, and reviewing *this* run is not an action about the project — it is an
+ * action about this slot.
+ *
+ * Only a run gets the link. A job or a team's item holds a worktree too, and the Code mode reads a
+ * *run's* checkout — offering the door for an owner it cannot open would be a link that refuses.
+ */
+function Slot({
+  taken,
+  projectId,
+}: {
+  taken: { owner_kind: string; owner_id: number; claimed_at: string };
+  projectId: string;
+}) {
+  const body = (
+    <>
       <span className="text-xs uppercase tracking-wide text-text-faint">{taken.owner_kind}</span>
       <span className="font-mono text-sm text-text">#{taken.owner_id}</span>
-    </div>
+    </>
+  );
+
+  if (taken.owner_kind !== "run") {
+    return (
+      <div
+        className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2"
+        aria-label={`${taken.owner_kind} ${taken.owner_id}`}
+      >
+        {body}
+      </div>
+    );
+  }
+
+  return (
+    <Link
+      to={`/projects/${projectId}/codigo`}
+      search={{ run: taken.owner_id }}
+      className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2 hover:border-border-strong"
+      aria-label={`Review run ${taken.owner_id}`}
+    >
+      {body}
+    </Link>
   );
 }

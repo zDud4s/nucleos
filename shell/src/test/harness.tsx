@@ -12,7 +12,9 @@ import { render, type RenderResult } from "@testing-library/react";
 import { NAV_PATHS } from "../app/nav";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
-import type { Concurrency } from "../data/fleet";
+import { ApiRefusal } from "../data/client";
+import type { Concurrency, HeldSlot, ProjectConcurrency } from "../data/fleet";
+import type { Changed, Worktree } from "../data/project-code";
 import type { Branches, Commit } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
@@ -90,6 +92,22 @@ export interface DaemonState {
   branches: Branches;
   /** A project's recent commits. */
   log: Commit[];
+  /**
+   * What one run changed, and where its checkout is.
+   *
+   * `null` means the route refuses — which is a state with three different meanings on the wire and
+   * has to be reachable from a test, because the panel says a different sentence for each.
+   */
+  changed: Changed | null;
+  worktree: Worktree | null;
+  /**
+   * The text routes, by path prefix.
+   *
+   * `diff` and `cat` return a body that is not JSON, and an **empty** body is a real answer to both
+   * — a clean tree, an empty file. A responder that could not distinguish "empty" from "absent"
+   * would make the most common answer untestable.
+   */
+  text: { diff: string; cat: string };
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -112,6 +130,51 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     readings: readings(),
     branches: { integration: "master", branches: [], omitted: 0 },
     log: [],
+    changed: { paths: [], tracked: 0 },
+    worktree: {
+      path: "C:/Projects/nucleos-run-41",
+      branch: "feat/x",
+      base_sha: "a".repeat(40),
+      created_at: "2026-08-23T09:00:00Z",
+    },
+    text: { diff: "", cat: "" },
+    ...overrides,
+  };
+}
+
+/**
+ * A project holding some slots, as `/concurrency` reports it.
+ *
+ * Constructors rather than object literals in each test, because `HeldSlot` carries five fields no
+ * test cares about — `ordinal`, `item_status`, and the collision pair — and a literal that omits
+ * them typechecks nowhere while a literal that includes them is four lines of noise per slot.
+ *
+ * `not_measured` for both collision sources, which is the honest default: nothing computed an
+ * overlap for a fixture, and `clean` is the one answer that must never be given in vain.
+ */
+export function heldSlots(projectId: string, limit: number, slots: HeldSlot[]): ProjectConcurrency {
+  return {
+    project_id: projectId,
+    limit,
+    slots,
+    collision: {
+      declared: { state: "not_measured", overlaps: [] },
+      observed: { state: "not_measured", overlaps: [] },
+    },
+  };
+}
+
+/** One taken slot. `run` by default, which is the only kind the Code mode can open. */
+export function slot(overrides: Partial<HeldSlot> = {}): HeldSlot {
+  return {
+    project_id: "alpha",
+    slot: 1,
+    owner_kind: "run",
+    owner_id: 1,
+    claimed_at: "2026-08-23T09:00:00Z",
+    job_id: null,
+    ordinal: null,
+    item_status: null,
     ...overrides,
   };
 }
@@ -191,6 +254,14 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     // `switch` over literals cannot express.
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;
+    if (path.startsWith("/projects/") && path.includes("/changed")) {
+      if (state.changed === null) throw new ApiRefusal(422, "unprocessable", "no branch point");
+      return state.changed;
+    }
+    if (path.startsWith("/projects/") && path.includes("/worktree")) {
+      if (state.worktree === null) throw new ApiRefusal(404, "not_found", "gone");
+      return state.worktree;
+    }
     // The log route carries a query string, so it is matched on its segment rather than its end.
     if (path.startsWith("/projects/") && path.includes("/log")) return state.log;
 
@@ -214,6 +285,20 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
 export interface HarnessOptions {
   initialPath?: string;
   queryClient?: QueryClient;
+}
+
+/**
+ * The núcleo's text routes, over the same mutable state.
+ *
+ * A sibling of {@link daemonFetch} rather than part of it, because `apiText` and `apiFetch` are two
+ * different functions on the seam and a test replaces them separately.
+ */
+export function daemonText(state: DaemonState): (path: string) => Promise<string> {
+  return async (path) => {
+    if (path.includes("/diff")) return state.text.diff;
+    if (path.includes("/cat")) return state.text.cat;
+    return "";
+  };
 }
 
 export interface HarnessResult extends RenderResult {

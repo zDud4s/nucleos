@@ -93,6 +93,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/diff", get(get_project_diff))
         .route("/projects/{id}/log", get(get_project_log))
         .route("/projects/{id}/branches", get(get_project_branches))
+        .route("/projects/{id}/blame", get(get_project_blame))
+        .route("/projects/{id}/changed", get(get_project_changed))
+        .route("/projects/{id}/worktree", get(get_project_worktree))
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
         .route(
@@ -767,9 +770,27 @@ struct RunsQuery {
     live: Option<bool>,
 }
 
+/// One run's checkout, as the shell needs it to open a door to the editor.
+#[derive(serde::Serialize)]
+struct WorktreeView {
+    /// Absolute, on this machine. The shell joins repository-relative paths onto it.
+    path: String,
+    branch: String,
+    /// `None` when the daemon never recorded a branch point, which is why nothing here can be
+    /// measured against it. Reported rather than hidden, so the panel can say which absence it is.
+    base_sha: Option<String>,
+    created_at: String,
+}
+
+/// A read of a project, optionally as one run sees it.
+///
+/// `run` is what makes the Code mode a review surface rather than a file browser: with it, every
+/// reader answers from that run's worktree — the file as the agent left it, not as the trunk has
+/// it.
 #[derive(Deserialize)]
-struct PathQuery {
+struct ReadQuery {
     path: Option<String>,
+    run: Option<i64>,
 }
 
 /// How much history, and of what. Both absent is the whole repository's recent commits.
@@ -777,6 +798,7 @@ struct PathQuery {
 struct LogQuery {
     path: Option<String>,
     limit: Option<usize>,
+    run: Option<i64>,
 }
 
 /// How far back a reading looks. Absent is the default window, not zero days.
@@ -789,6 +811,7 @@ struct WindowQuery {
 struct GrepQuery {
     q: Option<String>,
     path: Option<String>,
+    run: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2203,6 +2226,68 @@ fn inspect_status(error: inspect::InspectError) -> StatusCode {
     }
 }
 
+/// Where a read of this project should happen: the project itself, or one run's worktree.
+///
+/// **The subject of a review is the run, not the repository**, so every reader in this family takes
+/// an optional `run` and answers from that run's checkout when it is given. Without it they answer
+/// from the project root exactly as before, which is what every existing caller gets.
+///
+/// **The `project_id` in the lookup is the guard, and it is the whole security argument here.** A
+/// worktree path is otherwise reachable by asking any project for any run id — the daemon holds
+/// worktrees for every project in one table — so the row must match the project being asked, not
+/// merely exist. A run whose worktree has been released has `removed_at` set and is refused too:
+/// the directory is gone, and answering from a stale path would read whatever has since been put
+/// there.
+async fn resolve_read_root(
+    state: &AppState,
+    id: &str,
+    run: Option<i64>,
+) -> Result<PathBuf, StatusCode> {
+    let Some(run) = run else {
+        return resolve_project_root(state, id).await;
+    };
+    let path: Option<String> = sqlx::query_scalar(
+        "SELECT path FROM worktrees \
+          WHERE owner_kind = 'run' AND owner_id = ? AND project_id = ? AND removed_at IS NULL",
+    )
+    .bind(run)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    path.map(PathBuf::from).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// The base commit a run's worktree was cut from, and the path to it.
+///
+/// Both or neither: a worktree with no `base_sha` cannot be measured — the column is nullable, and
+/// a NULL there means the daemon never recorded where the branch started. Answering "nothing
+/// changed" for it would be the worst possible reading of "we do not know".
+async fn resolve_run_worktree(
+    state: &AppState,
+    id: &str,
+    run: i64,
+) -> Result<(PathBuf, String), StatusCode> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT path, base_sha FROM worktrees \
+          WHERE owner_kind = 'run' AND owner_id = ? AND project_id = ? AND removed_at IS NULL",
+    )
+    .bind(run)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match row {
+        Some((path, Some(base))) => Ok((PathBuf::from(path), base)),
+        // A worktree with no recorded base is a different answer from a worktree that is not there,
+        // and both are refusals the caller has to be able to tell apart from an empty change set.
+        Some((_, None)) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 async fn resolve_project_root(state: &AppState, id: &str) -> Result<PathBuf, StatusCode> {
     match inspect::project_root(&state.pool, id).await {
         Ok(Some(root)) => Ok(PathBuf::from(root)),
@@ -2664,12 +2749,80 @@ async fn get_project_readings(
         })
 }
 
+/// Who last touched each line of a file, in the project or in one run's worktree.
+async fn get_project_blame(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
+) -> Result<Json<Vec<inspect::BlameLine>>, StatusCode> {
+    let root = resolve_read_root(&state, &id, query.run).await?;
+    let rel = query.path.unwrap_or_default();
+    tokio::task::spawn_blocking(move || inspect::blame(&root, &rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// What one run has changed, and how big the tree it changed it in is.
+///
+/// `run` is required here, unlike the readers: "what changed" has no meaning against a project root
+/// with no branch point to measure from. The uncommitted diff of the main checkout is a different
+/// question and `/diff` already answers it.
+async fn get_project_changed(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
+) -> Result<Json<inspect::Changed>, StatusCode> {
+    let run = query.run.ok_or(StatusCode::BAD_REQUEST)?;
+    let (root, base) = resolve_run_worktree(&state, &id, run).await?;
+    tokio::task::spawn_blocking(move || inspect::changed(&root, &base))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// Where one run's checkout is, and what it was cut from.
+///
+/// **The absolute path is the point of this route.** Every door to VS Code needs one — the editor's
+/// URL handler takes a full path and nothing else — and the shell has no way to build one: it holds
+/// repository-relative paths, and a run's worktree is not under the project root but beside it. A
+/// link built from a relative path opens nothing, silently, which is the worst way for a seam to
+/// fail.
+///
+/// The same guard as every other run-aware read: the row must belong to the project being asked.
+async fn get_project_worktree(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
+) -> Result<Json<WorktreeView>, StatusCode> {
+    let run = query.run.ok_or(StatusCode::BAD_REQUEST)?;
+    let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT path, branch, base_sha, created_at FROM worktrees \
+          WHERE owner_kind = 'run' AND owner_id = ? AND project_id = ? AND removed_at IS NULL",
+    )
+    .bind(run)
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (path, branch, base_sha, created_at) = row.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(WorktreeView {
+        path,
+        branch,
+        base_sha,
+        created_at,
+    }))
+}
+
 async fn get_project_ls(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<ReadQuery>,
 ) -> Result<Json<Vec<inspect::Entry>>, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
+    let root = resolve_read_root(&state, &id, query.run).await?;
     let rel = query.path.unwrap_or_default();
     tokio::task::spawn_blocking(move || inspect::ls(&root, &rel))
         .await
@@ -2681,9 +2834,9 @@ async fn get_project_ls(
 async fn get_project_cat(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<ReadQuery>,
 ) -> Result<String, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
+    let root = resolve_read_root(&state, &id, query.run).await?;
     let rel = query.path.unwrap_or_default();
     tokio::task::spawn_blocking(move || inspect::cat(&root, &rel))
         .await
@@ -2696,7 +2849,7 @@ async fn get_project_grep(
     Path(id): Path<String>,
     Query(query): Query<GrepQuery>,
 ) -> Result<Json<Vec<inspect::Match>>, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
+    let root = resolve_read_root(&state, &id, query.run).await?;
     let q = query.q.unwrap_or_default();
     let rel = query.path.unwrap_or_default();
     tokio::task::spawn_blocking(move || inspect::grep(&root, &q, &rel))
@@ -2716,7 +2869,7 @@ async fn get_project_log(
     Path(id): Path<String>,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<Vec<inspect::Commit>>, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
+    let root = resolve_read_root(&state, &id, query.run).await?;
     let rel = query.path.unwrap_or_default();
     let limit = query.limit.unwrap_or(50);
     tokio::task::spawn_blocking(move || inspect::log(&root, &rel, limit))
@@ -2739,12 +2892,28 @@ async fn get_project_branches(
         .map_err(inspect_status)
 }
 
+/// The uncommitted diff of the project, or everything one run changed since it branched.
+///
+/// The two are different questions and the `run` parameter chooses between them. Without it this is
+/// what it always was: the main checkout's working tree. With it, the comparison is against the
+/// branch point — because a run's checkpoints are commits, and a working-tree diff of a run
+/// halfway through a job shows nothing at all.
 async fn get_project_diff(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
 ) -> Result<String, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
-    tokio::task::spawn_blocking(move || inspect::diff(&root))
+    let rel = query.path.unwrap_or_default();
+    let Some(run) = query.run else {
+        let root = resolve_project_root(&state, &id).await?;
+        return tokio::task::spawn_blocking(move || inspect::diff(&root))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(inspect_status);
+    };
+
+    let (root, base) = resolve_run_worktree(&state, &id, run).await?;
+    tokio::task::spawn_blocking(move || inspect::diff_since(&root, &base, &rel))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(inspect_status)
@@ -11561,6 +11730,163 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/projects/p/cat?path=..%2f..%2fsecret")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// **The guard the run-aware readers stand on, and the reason they are safe to have.**
+    ///
+    /// The daemon holds every project's worktrees in one table, so a `run` id alone is enough to
+    /// name any checkout on the machine. What makes `?run=` safe is that the lookup matches the
+    /// project being asked as well as the run — ask project `a` for project `b`'s run and there is
+    /// no row, which is a 404 and not a file.
+    #[tokio::test]
+    async fn a_run_belonging_to_another_project_is_not_readable_through_this_one() {
+        let state = test_state().await;
+        let mine = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        std::fs::write(theirs.path().join("secret.txt"), b"theirs").unwrap();
+
+        for (project, root) in [("a", mine.path()), ("b", theirs.path())] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'active', ?)",
+            )
+            .bind(project)
+            .bind(root.to_string_lossy().into_owned())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        // Project `b` owns run 7's worktree.
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at) \
+             VALUES ('run', 7, 'b', ?, ?, 'feat', '2026-08-23T00:00:00Z')",
+        )
+        .bind(theirs.path().to_string_lossy().into_owned())
+        .bind(theirs.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/a/cat?path=secret.txt&run=7")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A released worktree is a directory that has been removed, and its row keeps the path.
+    /// Answering from it would read whatever has since been written there.
+    #[tokio::test]
+    async fn a_released_worktree_is_refused_rather_than_read_from_its_old_path() {
+        let state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("f.txt"), b"still here").unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at, removed_at) \
+             VALUES ('run', 3, 'p', ?, ?, 'feat', '2026-08-23T00:00:00Z', '2026-08-23T01:00:00Z')",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/p/cat?path=f.txt&run=3")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A worktree with no recorded base cannot be measured, and that is a different answer from
+    /// "nothing changed". The column is nullable, and NULL means the daemon never wrote down where
+    /// the branch started.
+    #[tokio::test]
+    async fn a_worktree_with_no_base_is_unmeasurable_rather_than_unchanged() {
+        let state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at) \
+             VALUES ('run', 5, 'p', ?, ?, 'feat', '2026-08-23T00:00:00Z')",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/p/changed?run=5")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// "What changed" has no meaning without a branch point to measure from, so the run is required
+    /// rather than quietly defaulting to the project root — which would answer a different question
+    /// with the same shape.
+    #[tokio::test]
+    async fn changed_without_a_run_is_refused_rather_than_answered_about_the_trunk() {
+        let state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/p/changed")
                     .header("Authorization", "Bearer test-token")
                     .body(Body::empty())
                     .unwrap(),

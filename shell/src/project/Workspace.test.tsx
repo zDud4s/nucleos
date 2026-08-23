@@ -3,10 +3,14 @@ import { screen } from "@testing-library/react";
 import {
   daemonFetch,
   daemonState,
+  daemonText,
+  heldSlots,
   project,
   readings,
   renderApp,
+  slot,
   renderWithQuery,
+  type DaemonState,
 } from "../test/harness";
 import type { ProjectReadings } from "../data/project-readings";
 import { ModeEstado } from "./ModeEstado";
@@ -34,11 +38,26 @@ async function openWorkspace(options: {
     ...(options.readings === undefined ? {} : { readings: options.readings }),
   });
   daemon.apiFetch.mockImplementation(daemonFetch(state));
+  daemon.apiText.mockImplementation(daemonText(state));
   daemon.probeHealth.mockResolvedValue(true);
   // The whole app, through the real router: a route that is missing from the
   // real tree is missing here too, so this proves the mode resolves as well as
   // what it renders.
   return renderApp({ initialPath: `/projects/nucleos/${options.mode ?? "estado"}` });
+}
+
+/** A project with one run holding a slot, and a dozen changed files under it. */
+function reviewState(): DaemonState {
+  return daemonState({
+    projects: [project({ project_id: "nucleos", mode: "shadow", wip_limit: 2 })],
+    concurrency: {
+      house: { limit: 4, held: 1 },
+      projects: [
+        heldSlots("nucleos", 2, [slot({ project_id: "nucleos", owner_id: 41 })]),
+      ],
+    },
+    changed: { paths: ["core/src/http.rs", "shell/src/a.tsx"], tracked: 3_214 },
+  });
 }
 
 /** The page's panels, in order, read the way a screen reader would read them. */
@@ -290,11 +309,65 @@ describe("the project workspace", () => {
     expect(screen.getByText("2 older branches not measured.")).toBeTruthy();
   });
 
-  it("shows the other two modes as designed and not yet served", async () => {
-    const code = await openWorkspace({ mode: "codigo" });
-    expect(await screen.findByText(/review surface for nucleos is not built yet/)).toBeTruthy();
-    code.unmount();
+  it("takes the run to review from the route, so a slot can link straight to it", async () => {
+    const state = reviewState();
+    daemon.apiFetch.mockImplementation(daemonFetch(state));
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects/nucleos/codigo?run=41" });
 
+    expect(await screen.findByText("core/src/http.rs")).toBeTruthy();
+    /*
+      The number that makes this a review surface rather than a list of two things: 3,214 tracked
+      minus the 2 this run touched.
+
+      Asserted without its separators on purpose. The count goes through `toLocaleString`, which is
+      right for a number a person reads and wrong to pin in a test — the grouping depends on the
+      environment's locale, and this runner and the webview need not agree on it.
+    */
+    const untouched = screen.getByText(/files nobody touched/);
+    expect(untouched.textContent?.replace(/\D/g, "")).toBe("3212");
+  });
+
+  /**
+   * The rule that keeps a page like this from becoming a drawer: the command lives *in* the thing
+   * it acts on. Reviewing this run is an action about this slot, not about the project.
+   */
+  it("puts the door to a review inside the slot the run is holding", async () => {
+    const state = reviewState();
+    daemon.apiFetch.mockImplementation(daemonFetch(state));
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects/nucleos/estado" });
+
+    const link = await screen.findByRole("link", { name: "Review run 41" });
+    expect(link.getAttribute("href")).toContain("/projects/nucleos/codigo");
+    expect(link.getAttribute("href")).toContain("run=41");
+  });
+
+  /**
+   * A worktree with no recorded branch point cannot be measured, and that is not the same as a run
+   * that changed nothing. Saying "nothing changed" for it would be the most reassuring possible way
+   * to be wrong.
+   */
+  it("says a worktree cannot be measured rather than saying nothing changed", async () => {
+    const state = reviewState();
+    state.changed = null;
+    daemon.apiFetch.mockImplementation(daemonFetch(state));
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects/nucleos/codigo?run=41" });
+
+    expect(await screen.findByText(/no recorded branch point/)).toBeTruthy();
+    expect(screen.queryByText(/changed nothing/)).toBeNull();
+  });
+
+  it("offers no review when nothing holds a worktree here", async () => {
+    await openWorkspace({ mode: "codigo" });
+    expect(await screen.findByText(/Nothing to review in nucleos/)).toBeTruthy();
+  });
+
+  it("shows the workflows mode as designed and not yet served", async () => {
     await openWorkspace({ mode: "workflows" });
     expect(await screen.findByText(/No workflow is installed in nucleos/)).toBeTruthy();
   });

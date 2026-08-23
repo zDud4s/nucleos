@@ -135,9 +135,33 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * Nothing else in the tree mentions `/team-runs`, so `router.test.tsx` asserts
  * it by name.
  */
-const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
+/**
+ * A detail route may declare a search validator, which the nav-built routes have always been able
+ * to. Added when the workspace needed one: the Code mode reviews a *run*, and which run that is
+ * belongs in the location — a slot on the State mode links straight to it, and a review somebody
+ * is in the middle of survives a reload.
+ */
+const DETAIL_ROUTES: {
+  path: string;
+  component: () => ReactNode;
+  validateSearch?: (search: Record<string, unknown>) => unknown;
+}[] = [
   { path: "/runs/$runId", component: RunDetail },
-  { path: "/projects/$projectId/$view", component: Workspace },
+  {
+    path: "/projects/$projectId/$view",
+    component: Workspace,
+    /*
+      One optional number. Not validated into a range or checked against the daemon — a run id in a
+      URL is a claim, and the page answers a claim it cannot honour with a refusal rather than the
+      router answering it with a dead end. Anything unparseable becomes `undefined`, which is the
+      same as not asking.
+    */
+    validateSearch: (search) => {
+      const raw = search.run;
+      const run = typeof raw === "number" ? raw : Number(raw);
+      return Number.isInteger(run) && run > 0 ? { run } : {};
+    },
+  },
   /**
    * The read-only inspector, on a path of its own until the Code mode replaces it.
    *
@@ -196,6 +220,12 @@ export function createAppRouter(initialPath = "/") {
       getParentRoute: () => rootRoute,
       path: detail.path,
       component: detail.component,
+      // Spread rather than passed as `undefined`, for the reason the nav routes above give: the
+      // router treats the key's presence as the declaration, and a route that declares a validator
+      // and has none strips every search param it is given.
+      ...(detail.validateSearch === undefined
+        ? {}
+        : { validateSearch: detail.validateSearch }),
     }),
   );
 

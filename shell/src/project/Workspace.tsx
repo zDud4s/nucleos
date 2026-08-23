@@ -1,4 +1,4 @@
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useProjects } from "../data/system";
 import { StateBadge } from "../ui";
 import { ModeEstado } from "./ModeEstado";
@@ -49,6 +49,8 @@ export function normaliseMode(candidate: string | undefined): ProjectMode {
 
 export function Workspace() {
   const params = useParams({ strict: false }) as { projectId?: string; view?: string };
+  const search = useSearch({ strict: false }) as { run?: number };
+  const navigate = useNavigate();
   const projectId = params.projectId ?? "";
   const mode = normaliseMode(params.view);
 
@@ -97,7 +99,20 @@ export function Workspace() {
       {mode === "estado" ? (
         <ModeEstado projectId={projectId} answered={projects.data !== undefined} />
       ) : null}
-      {mode === "codigo" ? <ModeCodigo projectId={projectId} /> : null}
+      {mode === "codigo" ? (
+        <ModeCodigo
+          projectId={projectId}
+          run={search.run ?? null}
+          /*
+            Replaces rather than pushes: choosing a different run to review is changing what you are
+            looking at, not going somewhere new, and a back button that walked through every run
+            somebody glanced at would be a worse back button.
+          */
+          onPickRun={(run) =>
+            void navigate({ to: `/projects/${projectId}/codigo`, search: { run }, replace: true })
+          }
+        />
+      ) : null}
       {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
     </div>
   );
