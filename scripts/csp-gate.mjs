@@ -24,6 +24,14 @@
  * WebView2 is. What it is NOT is the Tauri window: Tauri also injects nonces into tags it finds in
  * the HTML, which can only widen what is allowed, so a page that passes here passes there.
  *
+ * That last sentence was an argument until 2026-08-24, and it is now a measurement.
+ * `scripts/csp-in-the-window.mjs` builds the application, attaches to the real window over the
+ * custom protocol, and reports what the document was actually served — `style-src 'self' 'self'
+ * 'nonce-…'`, with the nonce accepted, an unsigned `<style>` refused, and no refusal on boot or
+ * across six routes. It is not a gate and is not in `gates.sh`: it needs a build, in minutes. Run
+ * it when the answer might have changed — a Tauri or wry upgrade, a change to `index.html`, or a
+ * change to the `csp` block.
+ *
  * # Why a positive control
  *
  * "No violations" and "no policy" look identical from inside a page. Every run ends by injecting a
