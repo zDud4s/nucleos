@@ -148,6 +148,8 @@ function chatsFetch(
     files?: Record<string, Mention[]>;
     /** The slash commands each conversation offers, by chat id. */
     commands?: Record<string, Command[]>;
+    /** The slash commands the front door offers, where there is no conversation to key on. */
+    frontCommands?: Command[];
     /** What is waiting to be said to each conversation, by chat id. */
     queued?: Record<string, Array<{ id: number; text: string }>>;
     /** What each conversation is being held on, by chat id. */
@@ -223,6 +225,16 @@ function chatsFetch(
     }
     // Before the transcript match below: that pattern would not hit a path with a further
     // segment, but the order is what makes that true rather than a coincidence.
+    // The front door's own, with no chat in the path: the same shape, from `opts.frontCommands`.
+    const front = /^\/assistant\/commands\?q=(.*)$/.exec(path);
+    if (front !== null) {
+      const query = decodeURIComponent(front[1]).toLowerCase();
+      return {
+        commands: (opts.frontCommands ?? []).filter((hit) =>
+          hit.name.toLowerCase().includes(query),
+        ),
+      };
+    }
     const commands = /^\/assistant\/chats\/([^/?]+)\/commands\?q=(.*)$/.exec(path);
     if (commands !== null) {
       const offered = opts.commands?.[decodeURIComponent(commands[1])] ?? [];
@@ -594,6 +606,55 @@ describe("Chats - choosing a model", () => {
         body: JSON.stringify({ model: "fable" }),
       });
     });
+  });
+});
+
+describe("Chats - the front door's own slash", () => {
+  const brainstorm: Command = {
+    name: "superpowers:brainstorm",
+    description: "Turn an idea into a design",
+    hint: null,
+    source: "plugin",
+  };
+
+  it("offers commands before there is a conversation to offer them for", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/brain", selectionStart: 6 } });
+
+    // A command needs no conversation: the personal ones and the installed plugins' are the same
+    // wherever this ends up. Offering nothing here was the front door pretending the gesture did
+    // not exist, which is the first gesture anybody tries.
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+    expect(within(list).getByText("/superpowers:brainstorm")).toBeTruthy();
+  });
+
+  it("writes the chosen command into the box, with a space for its argument", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "/brain", selectionStart: 6 } });
+    fireEvent.click(await screen.findByText("/superpowers:brainstorm"));
+
+    await waitFor(() => {
+      expect(box.value).toBe("/superpowers:brainstorm ");
+    });
+  });
+
+  it("says why an @ has nothing to offer here, rather than swallowing it", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "@core", selectionStart: 5 },
+    });
+
+    // An `@` names files inside the conversation's folder and there is no folder yet. A list that
+    // silently never appears is indistinguishable from a feature that is broken.
+    expect(await screen.findByText(/has no folder yet/i)).toBeDefined();
   });
 });
 

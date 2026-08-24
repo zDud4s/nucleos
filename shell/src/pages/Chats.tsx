@@ -30,7 +30,13 @@ import {
   CommandItem,
   CommandList,
 } from "../ui/vendor/command";
-import { ArrowUp, ChevronDown, ImagePlus, Plus, SquareCode } from "lucide-react";
+import {
+  ArrowUp,
+  ChevronDown,
+  ImagePlus,
+  Plus,
+  SquareCode,
+} from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import {
   useArchiveChat,
@@ -46,6 +52,7 @@ import {
   useWireIdeSessionTools,
   useAnswerAsk,
   useChatCommands,
+  useCommands,
   useChatDiff,
   useChatFiles,
   useChatProject,
@@ -127,7 +134,8 @@ export function Chats() {
   const rows = chats.data ?? [];
   const stale = chats.isError && chats.data !== undefined;
   const selectedLive = chatId !== null && anyTurnLive(transcript.data?.turns);
-  const summary = chatId === null ? undefined : rows.find((row) => row.chat_id === chatId);
+  const summary =
+    chatId === null ? undefined : rows.find((row) => row.chat_id === chatId);
 
   /**
    * The list is a panel you open, not a column you live with.
@@ -159,7 +167,8 @@ export function Chats() {
    */
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey)) return;
+      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey))
+        return;
       event.preventDefault();
       setPaletteOpen((open) => !open);
     };
@@ -196,7 +205,9 @@ export function Chats() {
               {/* Answers that landed while you were elsewhere. Shown on the button
                   precisely because the list they are in may be closed — a count that
                   only appears once the list is open tells you what you already see. */}
-              {!railOpen && unseen > 0 && <span className="chats-unseen">{unseen}</span>}
+              {!railOpen && unseen > 0 && (
+                <span className="chats-unseen">{unseen}</span>
+              )}
             </Button>
             <Button variant="ghost" onClick={() => setPaletteOpen(true)}>
               Find a conversation
@@ -207,11 +218,21 @@ export function Chats() {
       />
 
       {stale && <StaleNote dataUpdatedAt={chats.dataUpdatedAt} />}
-      {chats.isError && chats.data === undefined && <ListError error={chats.error} />}
+      {chats.isError && chats.data === undefined && (
+        <ListError error={chats.error} />
+      )}
 
-      <ConversationPalette rows={rows} open={paletteOpen} onOpenChange={setPaletteOpen} />
+      <ConversationPalette
+        rows={rows}
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+      />
 
-      <div className={railOpen ? "chats-layout" : "chats-layout chats-layout-alone"}>
+      <div
+        className={
+          railOpen ? "chats-layout" : "chats-layout chats-layout-alone"
+        }
+      >
         {railOpen && (
           /* The ground that tells the list from the thread. See `.chats-rail`: this used to be a
              bordered panel beside another bordered panel, which is a settings screen, not a chat. */
@@ -246,7 +267,12 @@ export function Chats() {
           )}
           {pickingUp === null && chatId === null && <NothingOpen />}
           {pickingUp === null && chatId !== null && (
-            <ChatDetail key={chatId} chatId={chatId} summary={summary} transcript={transcript} />
+            <ChatDetail
+              key={chatId}
+              chatId={chatId}
+              summary={summary}
+              transcript={transcript}
+            />
           )}
         </div>
       </div>
@@ -255,17 +281,27 @@ export function Chats() {
 }
 
 /** One derived sentence about the whole list. */
-function headlineFor(rows: ChatSummary[], answered: boolean): string | undefined {
+function headlineFor(
+  rows: ChatSummary[],
+  answered: boolean,
+): string | undefined {
   if (!answered) return undefined;
-  if (rows.length === 0) return "no conversation has been opened from this window";
+  if (rows.length === 0)
+    return "no conversation has been opened from this window";
   const noun = rows.length === 1 ? "conversation" : "conversations";
   const unread = unreadTotal(rows);
-  return unread === 0 ? `${rows.length} ${noun}, nothing unread` : `${rows.length} ${noun}, ${unread} unread`;
+  return unread === 0
+    ? `${rows.length} ${noun}, nothing unread`
+    : `${rows.length} ${noun}, ${unread} unread`;
 }
 
 function ListError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about your conversations</ErrorNote>;
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about your conversations
+    </ErrorNote>
+  );
 }
 
 /* --------------------------------------------------------------- the list -- */
@@ -318,8 +354,12 @@ function ConversationPalette({
                 }}
               >
                 <span className="chats-palette-title">{name}</span>
-                {row.cwd !== null && <span className="chats-palette-where">{row.cwd}</span>}
-                {row.waiting > 0 && <span className="chats-palette-waiting">{row.waiting}</span>}
+                {row.cwd !== null && (
+                  <span className="chats-palette-where">{row.cwd}</span>
+                )}
+                {row.waiting > 0 && (
+                  <span className="chats-palette-waiting">{row.waiting}</span>
+                )}
               </CommandItem>
             );
           })}
@@ -346,15 +386,28 @@ export type ListRow =
  * those are conversations here now, and drawing them twice would offer to open a second copy of
  * something already open.
  */
-export function mergeRows(chats: ChatSummary[], sessions: IdeSession[]): ListRow[] {
+export function mergeRows(
+  chats: ChatSummary[],
+  sessions: IdeSession[],
+): ListRow[] {
   const pickedUp = new Set(
-    chats.map((chat) => chat.ide_session_id).filter((id): id is string => id !== null),
+    chats
+      .map((chat) => chat.ide_session_id)
+      .filter((id): id is string => id !== null),
   );
   const rows: ListRow[] = [
-    ...chats.map((chat) => ({ kind: "chat" as const, at: chat.last_activity, chat })),
+    ...chats.map((chat) => ({
+      kind: "chat" as const,
+      at: chat.last_activity,
+      chat,
+    })),
     ...sessions
       .filter((session) => !pickedUp.has(session.session_id))
-      .map((session) => ({ kind: "editor" as const, at: session.last_activity, session })),
+      .map((session) => ({
+        kind: "editor" as const,
+        at: session.last_activity,
+        session,
+      })),
   ];
   // ISO-8601 sorts correctly as text, which is why the daemon sends it. A conversation nobody has
   // spoken in has no activity at all and goes last rather than pretending to be old.
@@ -396,17 +449,21 @@ function ChatListPanel({
       </div>
 
       <div className="chats-rail-scroll">
-        {!answered && <p className="chats-loading">reading your conversations…</p>}
+        {!answered && (
+          <p className="chats-loading">reading your conversations…</p>
+        )}
         {answered && listed.length === 0 && (
           <Teach title="No conversations yet">
             <p>
-              Telegram&apos;s own conversations do not show up here — nothing has opened a row for
-              them, because the only door into this list is the button above. Start one to see it
-              appear.
+              Telegram&apos;s own conversations do not show up here — nothing
+              has opened a row for them, because the only door into this list is
+              the button above. Start one to see it appear.
             </p>
           </Teach>
         )}
-        {sessions.isError && <ErrorNote>your editor sessions could not be read</ErrorNote>}
+        {sessions.isError && (
+          <ErrorNote>your editor sessions could not be read</ErrorNote>
+        )}
         {listed.length > 0 && (
           /* One list, both kinds. See `mergeRows`: what tells them apart is the mark on the row. */
           <ul className="chats-list" aria-label="Conversations">
@@ -465,8 +522,14 @@ function EditorRow({
         onClick={onOpen}
       >
         <SquareCode className="chats-row-mark" aria-hidden="true" />
-        <span className="chats-row-title">{session.title ?? session.session_id}</span>
-        {live && <span className="chats-row-live" aria-hidden="true">now</span>}
+        <span className="chats-row-title">
+          {session.title ?? session.session_id}
+        </span>
+        {live && (
+          <span className="chats-row-live" aria-hidden="true">
+            now
+          </span>
+        )}
       </button>
     </li>
   );
@@ -482,13 +545,24 @@ function EditorRow({
  * of a sentence.
  */
 function chatRowLabel(row: ChatSummary, live: boolean): string {
-  const parts = [row.title ?? row.first_message ?? "nothing said yet", row.brain];
+  const parts = [
+    row.title ?? row.first_message ?? "nothing said yet",
+    row.brain,
+  ];
   if (live) parts.push("thinking");
   if (row.waiting > 0) parts.push(`${row.waiting} unread`);
   return parts.join(", ");
 }
 
-function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; live: boolean }) {
+function ChatRow({
+  row,
+  active,
+  live,
+}: {
+  row: ChatSummary;
+  active: boolean;
+  live: boolean;
+}) {
   // A conversation with no name AND nothing said in it has no name to show. Drawing "New
   // conversation" made a dozen of them into a dozen identical rows; saying what is true of them
   // instead makes them one visibly different kind of row you can skim past.
@@ -508,7 +582,11 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
             conversation, and what you recognise it by is what it is called. The directory is on the
             open conversation's own line and searchable in ⌘K; the model is on that line too. What
             stays here is what CHANGES: it is thinking, or it is holding something for you. */}
-        <span className={said ? "chats-row-title" : "chats-row-title chats-row-unsaid"}>
+        <span
+          className={
+            said ? "chats-row-title" : "chats-row-title chats-row-unsaid"
+          }
+        >
           {row.title ?? row.first_message ?? "nothing said yet"}
         </span>
         {live && <span className="chats-row-live">thinking…</span>}
@@ -539,7 +617,11 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
  * continued where it left off, and costs what its context costs. Over it, the daemon refuses to
  * resume and starts fresh with a short replay — cheap, and forgetful, and better known in advance.
  */
-function WhatItCarries({ view }: { view: ReturnType<typeof useIdeConversation> }) {
+function WhatItCarries({
+  view,
+}: {
+  view: ReturnType<typeof useIdeConversation>;
+}) {
   const carries = view.data?.context_estimate ?? null;
   if (carries === null) return null;
   const ceiling = view.data?.context_rotates_at ?? null;
@@ -570,10 +652,16 @@ const SAMPLED = 6;
 
 function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
   if (view.data === undefined && !view.isError) {
-    return <p className="chats-loading">reading what was said in the editor…</p>;
+    return (
+      <p className="chats-loading">reading what was said in the editor…</p>
+    );
   }
   if (view.data === undefined) {
-    return <p className="chats-picked-up-unread">what was said in the editor could not be read</p>;
+    return (
+      <p className="chats-picked-up-unread">
+        what was said in the editor could not be read
+      </p>
+    );
   }
   if (view.data.said.length === 0) {
     return <p className="chats-picked-up-cut">nobody spoke in this one.</p>;
@@ -582,16 +670,24 @@ function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
   return (
     <>
       {(view.data.cut || tail.length < view.data.said.length) && (
-        <p className="chats-picked-up-cut">the last {tail.length} of it — the rest opens with it</p>
+        <p className="chats-picked-up-cut">
+          the last {tail.length} of it — the rest opens with it
+        </p>
       )}
       <ul className="chats-sample" aria-label="What was said, at the end">
         {tail.map((said, index) => (
           <li
             key={`sample-${index}`}
-            className={said.aside ? "chats-sample-line chats-sample-aside" : "chats-sample-line"}
+            className={
+              said.aside
+                ? "chats-sample-line chats-sample-aside"
+                : "chats-sample-line"
+            }
           >
             {!said.aside && (
-              <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+              <span className="chats-said-who">
+                {said.by_owner ? "you" : "núcleo"}
+              </span>
             )}
             {/* Text, never markup, and never `Rich` either: a sample is for recognising a
                 conversation, and a code block in a 20rem column is not that. */}
@@ -640,7 +736,9 @@ function PickUpPreview({
   const create = useCreateChat();
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
-  const chosen = (sessions.data ?? []).find((session) => session.session_id === sessionId);
+  const chosen = (sessions.data ?? []).find(
+    (session) => session.session_id === sessionId,
+  );
 
   if (chosen === undefined) {
     return (
@@ -648,7 +746,9 @@ function PickUpPreview({
         {sessions.data === undefined && !sessions.isError ? (
           <p className="chats-loading">reading your editor sessions…</p>
         ) : (
-          <ErrorNote>that conversation is not on this machine any more</ErrorNote>
+          <ErrorNote>
+            that conversation is not on this machine any more
+          </ErrorNote>
         )}
       </div>
     );
@@ -657,7 +757,9 @@ function PickUpPreview({
   return (
     <div className="chats-editor-chosen">
       <div className="chats-editor-head">
-        <h2 className="chats-editor-name">{chosen.title ?? chosen.session_id}</h2>
+        <h2 className="chats-editor-name">
+          {chosen.title ?? chosen.session_id}
+        </h2>
         <p className="chats-editor-where">{chosen.cwd}</p>
       </div>
 
@@ -685,7 +787,11 @@ function PickUpPreview({
         </Button>
         {/* The same question the front door asks, asked here for the same reason: it is answerable
             before the first turn and expensive to change after it. */}
-        <ModelMenu model={model} disabled={create.isPending} onPick={setModel} />
+        <ModelMenu
+          model={model}
+          disabled={create.isPending}
+          onPick={setModel}
+        />
         <EffortMenu
           model={model}
           effort={effort}
@@ -716,8 +822,9 @@ function NoTools({ session }: { session: IdeSession }) {
   return (
     <div className="chats-new-notools">
       <p className="chats-new-warning" role="status">
-        this session was had in a folder with no núcleo hook — continued here, it can talk about the
-        code but <b>cannot read or change any file</b>, and cannot run anything
+        this session was had in a folder with no núcleo hook — continued here,
+        it can talk about the code but <b>cannot read or change any file</b>,
+        and cannot run anything
       </p>
       <Button
         type="button"
@@ -733,7 +840,11 @@ function NoTools({ session }: { session: IdeSession }) {
 
 function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the folder was left alone</ErrorNote>;
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the folder was left alone
+      </ErrorNote>
+    );
   }
   return (
     <RefusalNote
@@ -747,11 +858,17 @@ function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
 }
 
 function CreateRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — nothing was opened</ErrorNote>;
+  if (!isApiRefusal(error))
+    return (
+      <ErrorNote>the núcleo did not answer — nothing was opened</ErrorNote>
+    );
   return (
     <RefusalNote
       refusal={error}
-      sentences={{ not_found: "that session is not on this machine — pick another, or start fresh" }}
+      sentences={{
+        not_found:
+          "that session is not on this machine — pick another, or start fresh",
+      }}
     />
   );
 }
@@ -859,20 +976,31 @@ function NothingOpen() {
   return (
     <div className="chats-front">
       <div className="chats-front-inner">
-        <h2 className="chats-front-greeting">{greetingFor(new Date().getHours())}</h2>
+        <h2 className="chats-front-greeting">
+          {greetingFor(new Date().getHours())}
+        </h2>
         <StartBox
           pending={start.isPending}
           onSay={(model, effort, text, images) =>
             start.mutate(
-              { model: model ?? undefined, effort: effort ?? undefined, text, images },
-              { onSuccess: (opened) => void navigate({ to: `/chats/${opened.chat_id}` }) },
+              {
+                model: model ?? undefined,
+                effort: effort ?? undefined,
+                text,
+                images,
+              },
+              {
+                onSuccess: (opened) =>
+                  void navigate({ to: `/chats/${opened.chat_id}` }),
+              },
             )
           }
         />
         {start.isError && <CreateRefusal error={start.error} />}
         <p className="chats-front-note">
-          Every turn is a billed run. Nothing here is ever quietly deleted — ending a conversation
-          only archives it, and every turn it ever had stays readable.
+          Every turn is a billed run. Nothing here is ever quietly deleted —
+          ending a conversation only archives it, and every turn it ever had
+          stays readable.
         </p>
       </div>
     </div>
@@ -882,10 +1010,18 @@ function NothingOpen() {
 /**
  * The box on the front door.
  *
- * Deliberately not the `Composer`: that one reaches into an open conversation for files to mention
- * and commands to run, and neither exists yet. What it DOES carry is everything that is answerable
- * before the first word — which model, and what to send with it. Those are held here as state and
- * written when the conversation is opened, because there is nothing yet to write them to.
+ * Not the `Composer`, which reaches into an open conversation — but it carries the same slash. A
+ * command does not need a conversation to exist: the personal ones and the installed plugins' are
+ * the same wherever this ends up, so the front door offers exactly the ones that will still be
+ * there after the first message. It used to offer nothing at all, and typing `/` where you land is
+ * the first thing anybody does.
+ *
+ * An `@` is the other half and genuinely cannot work here: it names files inside the conversation's
+ * folder, and there is no folder until one is opened. It says so in one line rather than swallowing
+ * the gesture, because a list that never appears is indistinguishable from a feature that is broken.
+ *
+ * The model and the effort are held as state and written when the conversation is opened, because
+ * there is nothing yet to write them to.
  */
 function StartBox({
   pending,
@@ -900,10 +1036,47 @@ function StartBox({
   ) => void;
 }) {
   const [text, setText] = useState("");
+  const [caret, setCaret] = useState(0);
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [highlight, setHighlight] = useState(0);
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
   const [attached, setAttached] = useState<Attachment[]>([]);
+  const box = useRef<HTMLTextAreaElement | null>(null);
   const sayable = text.trim() !== "" && !pending;
+
+  const command = commandAt(text, caret);
+  const mention = mentionAt(text, caret);
+  const live = (at: { query: string } | null) =>
+    at !== null && at.query !== dismissed ? at.query : null;
+  const commands = useCommands(live(command));
+
+  const choices: Choice[] =
+    live(command) === null
+      ? []
+      : (commands.data?.commands ?? []).map((hit: Command) => ({
+          key: hit.name,
+          primary: `/${hit.name}${hit.hint === null ? "" : ` ${hit.hint}`}`,
+          secondary: hit.description ?? hit.source,
+          chosen: () => {
+            const written = withCommand(text, command!, hit.name);
+            setText(written.text);
+            setDismissed(null);
+            setHighlight(0);
+            // The caret is the whole state this list reads from, and only the element can move it.
+            // Next frame, because React has not rendered the new value yet at this point.
+            requestAnimationFrame(() => {
+              box.current?.focus();
+              box.current?.setSelectionRange(written.caret, written.caret);
+              setCaret(written.caret);
+            });
+          },
+        }));
+
+  // The one gesture with something to say and nothing to list. A conversation has no folder until
+  // it is opened, so there are no names to complete — said out loud, because a list that silently
+  // never appears reads as a broken feature rather than as an answered question.
+  const noFolderYet = command === null && live(mention) !== null;
 
   const attach = async (files: FileList | File[] | null) => {
     const pictures = Array.from(files ?? []).filter(isPicture);
@@ -918,83 +1091,126 @@ function StartBox({
   };
 
   return (
-    <form
-      className="chats-composer-box chats-front-box"
-      onSubmit={(event) => {
-        event.preventDefault();
-        say();
-      }}
-    >
-      {attached.length > 0 && (
-        <ul className="chats-attached" aria-label="Attached pictures">
-          {attached.map((picture, index) => (
-            <li key={`start-attached-${index}`} className="chats-attached-item">
-              <img
-                className="chats-attached-thumb"
-                alt={`attached picture ${index + 1}`}
-                src={`data:${picture.media_type};base64,${picture.data}`}
-              />
-              <button
-                type="button"
-                className="chats-attached-drop"
-                aria-label={`Remove attached picture ${index + 1}`}
-                onClick={() => setAttached((was) => was.filter((_, at) => at !== index))}
-              >
-                ×
-              </button>
-            </li>
-          ))}
-        </ul>
+    <>
+      {noFolderYet && (
+        <p className="chats-mentions-none">
+          this conversation has no folder yet — open it, point it at a project,
+          and an @ will name its files
+        </p>
       )}
-      <textarea
-        className="chats-composer-text"
-        aria-label="Message"
-        placeholder="Say something…"
-        rows={1}
-        value={text}
-        onPaste={(event) => {
-          const pictures = Array.from(event.clipboardData.files).filter(isPicture);
-          if (pictures.length === 0) return;
-          event.preventDefault();
-          void attach(pictures);
-        }}
-        onChange={(event) => setText(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter" || event.shiftKey) return;
+      {choices.length > 0 && (
+        <Choices
+          label="Commands to run"
+          choices={choices}
+          highlight={highlight}
+          truncated={false}
+        />
+      )}
+      <form
+        className="chats-composer-box chats-front-box"
+        onSubmit={(event) => {
           event.preventDefault();
           say();
         }}
-      />
-      <div className="chats-composer-actions">
-        <label className="chats-attach" title="Attach a picture">
-          <ImagePlus className="chats-tool-icon" aria-hidden="true" />
-          <span className="chats-offscreen">Attach a picture</span>
-          <input
-            type="file"
-            accept="image/*"
-            multiple
-            aria-label="Attach a picture"
-            onChange={(event) => {
-              void attach(event.target.files);
-              event.target.value = "";
-            }}
-          />
-        </label>
-        {/* Held as state, not written anywhere: there is no conversation to write it to until the
+      >
+        {attached.length > 0 && (
+          <ul className="chats-attached" aria-label="Attached pictures">
+            {attached.map((picture, index) => (
+              <li
+                key={`start-attached-${index}`}
+                className="chats-attached-item"
+              >
+                <img
+                  className="chats-attached-thumb"
+                  alt={`attached picture ${index + 1}`}
+                  src={`data:${picture.media_type};base64,${picture.data}`}
+                />
+                <button
+                  type="button"
+                  className="chats-attached-drop"
+                  aria-label={`Remove attached picture ${index + 1}`}
+                  onClick={() =>
+                    setAttached((was) => was.filter((_, at) => at !== index))
+                  }
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <textarea
+          className="chats-composer-text"
+          aria-label="Message"
+          placeholder="Say something…"
+          ref={box}
+          rows={1}
+          value={text}
+          onPaste={(event) => {
+            const pictures = Array.from(event.clipboardData.files).filter(
+              isPicture,
+            );
+            if (pictures.length === 0) return;
+            event.preventDefault();
+            void attach(pictures);
+          }}
+          onChange={(event) => {
+            setText(event.target.value);
+            setCaret(event.target.selectionStart);
+            setDismissed(null);
+            setHighlight(0);
+          }}
+          // The caret moves without the text changing — arrows, a click, Home — and what is being
+          // typed is read from where it IS.
+          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+          onKeyDown={(event) => {
+            if (listTookTheKey(event, choices, highlight, setHighlight)) return;
+            if ((choices.length > 0 || noFolderYet) && event.key === "Escape") {
+              event.preventDefault();
+              setDismissed(live(command) ?? live(mention));
+              return;
+            }
+            if (event.key !== "Enter" || event.shiftKey) return;
+            event.preventDefault();
+            say();
+          }}
+        />
+        <div className="chats-composer-actions">
+          <label className="chats-attach" title="Attach a picture">
+            <ImagePlus className="chats-tool-icon" aria-hidden="true" />
+            <span className="chats-offscreen">Attach a picture</span>
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              aria-label="Attach a picture"
+              onChange={(event) => {
+                void attach(event.target.files);
+                event.target.value = "";
+              }}
+            />
+          </label>
+          {/* Held as state, not written anywhere: there is no conversation to write it to until the
             first message opens one, and it travels with that message. */}
-        <ModelMenu model={model} disabled={pending} onPick={setModel} />
-        <EffortMenu model={model} effort={effort} disabled={pending} onPick={setEffort} />
-        <span className="chats-composer-gap" />
-        <button
-          type="submit"
-          className="chats-send"
-          aria-label={pending ? "Opening the conversation" : "Send"}
-          disabled={!sayable}
-        >
-          <ArrowUp className="chats-send-icon" aria-hidden="true" />
-        </button>
-      </div>
-    </form>
+          <ModelMenu model={model} disabled={pending} onPick={setModel} />
+          <EffortMenu
+            model={model}
+            effort={effort}
+            disabled={pending}
+            onPick={setEffort}
+          />
+          <span className="chats-composer-gap" />
+          <button
+            type="submit"
+            className="chats-send"
+            aria-label={pending ? "Opening the conversation" : "Send"}
+            disabled={!sayable}
+          >
+            <ArrowUp className="chats-send-icon" aria-hidden="true" />
+          </button>
+        </div>
+      </form>
+    </>
   );
 }
 
@@ -1053,11 +1269,16 @@ function ChatMeta({ chatId }: { chatId: string }) {
             summary line is the wrong place to explain something.
             The model and plan-only were here too; both moved into the box, where the words
             they govern are being written. What is left is where this runs. */}
-        {cwd !== null && tools && <span className="chats-meta-where">{cwd}</span>}
+        {cwd !== null && tools && (
+          <span className="chats-meta-where">{cwd}</span>
+        )}
       </p>
 
       <DropdownMenu>
-        <DropdownMenuTrigger className="chats-meta-more" aria-label="Conversation settings">
+        <DropdownMenuTrigger
+          className="chats-meta-more"
+          aria-label="Conversation settings"
+        >
           ⋯
         </DropdownMenuTrigger>
         {/* One thing left in it, and it is the one thing that must not be a menu ITEM: see
@@ -1074,12 +1295,16 @@ function ChatMeta({ chatId }: { chatId: string }) {
               looks like typeahead, which is every keystroke. */}
           <DropdownMenuItem onSelect={() => setHelpers(true)}>
             Helpers
-            <span className="chats-tool-why">{helperCount === 0 ? "none" : `${helperCount}`}</span>
+            <span className="chats-tool-why">
+              {helperCount === 0 ? "none" : `${helperCount}`}
+            </span>
           </DropdownMenuItem>
           {/* Also written rather than picked, and for the same reason a dialog. */}
           <DropdownMenuItem onSelect={() => setInstructions(true)}>
             Standing instructions
-            <span className="chats-tool-why">{instructed ? "set" : "none"}</span>
+            <span className="chats-tool-why">
+              {instructed ? "set" : "none"}
+            </span>
           </DropdownMenuItem>
           <ChatDenials chatId={chatId} />
           <DropdownMenuSeparator />
@@ -1094,7 +1319,11 @@ function ChatMeta({ chatId }: { chatId: string }) {
       </DropdownMenu>
 
       <ChatHelpers chatId={chatId} open={helpers} onOpenChange={setHelpers} />
-      <ChatInstructions chatId={chatId} open={instructions} onOpenChange={setInstructions} />
+      <ChatInstructions
+        chatId={chatId}
+        open={instructions}
+        onOpenChange={setInstructions}
+      />
     </div>
   );
 }
@@ -1114,8 +1343,12 @@ function Project({ chatId }: { chatId: string }) {
           own, because "exceptions dominate, the normal disappears" and a conversation
           that is set up correctly is the normal case. */}
       {cwd === null && <NoProject chatId={chatId} />}
-      {cwd !== null && !tools && <ProjectWithoutTools chatId={chatId} cwd={cwd} />}
-      {cwd !== null && session !== null && <CarryOn cwd={cwd} session={session} />}
+      {cwd !== null && !tools && (
+        <ProjectWithoutTools chatId={chatId} cwd={cwd} />
+      )}
+      {cwd !== null && session !== null && (
+        <CarryOn cwd={cwd} session={session} />
+      )}
     </>
   );
 }
@@ -1205,13 +1438,17 @@ function NoProject({ chatId }: { chatId: string }) {
   const sessions = useIdeSessions(true);
   const [path, setPath] = useState("");
 
-  const folders = Array.from(new Set((sessions.data ?? []).map((session) => session.cwd)));
+  const folders = Array.from(
+    new Set((sessions.data ?? []).map((session) => session.cwd)),
+  );
 
   return (
     <div className="chats-project">
       <p className="chats-new-warning" role="status">
-        this conversation has no project — it can talk about code and remember what was said, but it{" "}
-        <b>cannot open a file, run a command, or change anything</b> on this machine.
+        this conversation has no project — it can talk about code and remember
+        what was said, but it{" "}
+        <b>cannot open a file, run a command, or change anything</b> on this
+        machine.
       </p>
       <form
         className="chats-project-form"
@@ -1235,7 +1472,11 @@ function NoProject({ chatId }: { chatId: string }) {
             <option key={folder} value={folder} />
           ))}
         </datalist>
-        <Button type="submit" intent="go" disabled={point.isPending || path.trim() === ""}>
+        <Button
+          type="submit"
+          intent="go"
+          disabled={point.isPending || path.trim() === ""}
+        >
           Use this project
         </Button>
       </form>
@@ -1257,10 +1498,15 @@ function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
   return (
     <div className="chats-project">
       <p className="chats-new-warning" role="status">
-        this conversation is about {cwd}, which has no núcleo hook — it can talk about the code but{" "}
-        <b>cannot read or change any file</b>, and cannot run anything
+        this conversation is about {cwd}, which has no núcleo hook — it can talk
+        about the code but <b>cannot read or change any file</b>, and cannot run
+        anything
       </p>
-      <Button type="button" disabled={wire.isPending} onClick={() => wire.mutate()}>
+      <Button
+        type="button"
+        disabled={wire.isPending}
+        onClick={() => wire.mutate()}
+      >
         Give it the tools
       </Button>
       {wire.isError && <WireRefusal error={wire.error} cwd={cwd} />}
@@ -1270,14 +1516,20 @@ function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
 
 function ProjectRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the conversation was left as it was</ErrorNote>;
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the conversation was left as it was
+      </ErrorNote>
+    );
   }
   return (
     <RefusalNote
       refusal={error}
       sentences={{
-        bad_request: "that has to be an absolute path to a folder that exists on this machine",
-        conflict: "this conversation is answering — wait for the turn to end, then move it",
+        bad_request:
+          "that has to be an absolute path to a folder that exists on this machine",
+        conflict:
+          "this conversation is answering — wait for the turn to end, then move it",
         not_found: "that conversation is no longer here",
       }}
     />
@@ -1285,8 +1537,18 @@ function ProjectRefusal({ error }: { error: unknown }) {
 }
 
 function TranscriptError({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={{ not_found: "this conversation is gone or archived" }} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about this conversation</ErrorNote>;
+  if (isApiRefusal(error))
+    return (
+      <RefusalNote
+        refusal={error}
+        sentences={{ not_found: "this conversation is gone or archived" }}
+      />
+    );
+  return (
+    <ErrorNote>
+      the núcleo did not answer — nothing is known about this conversation
+    </ErrorNote>
+  );
 }
 
 /* ----------------------------------------------------------------- title -- */
@@ -1302,7 +1564,13 @@ function TranscriptError({ error }: { error: unknown }) {
  * can be renamed from elsewhere — the daemon names one by itself — and a draft that was set once at
  * mount would quietly write a stale name back over it.
  */
-function TitleEditor({ chatId, title }: { chatId: string; title: string | null }) {
+function TitleEditor({
+  chatId,
+  title,
+}: {
+  chatId: string;
+  title: string | null;
+}) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const patch = usePatchChat();
@@ -1355,7 +1623,10 @@ function TitleEditor({ chatId, title }: { chatId: string; title: string | null }
           }
         }}
       />
-      <Button disabled={draft.trim() === "" || patch.isPending} onClick={rename}>
+      <Button
+        disabled={draft.trim() === "" || patch.isPending}
+        onClick={rename}
+      >
         Rename
       </Button>
       <Button
@@ -1375,23 +1646,35 @@ function TitleEditor({ chatId, title }: { chatId: string; title: string | null }
 }
 
 function TitleRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — the name was not changed</ErrorNote>;
+  if (!isApiRefusal(error))
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the name was not changed
+      </ErrorNote>
+    );
   return (
     <RefusalNote
       refusal={error}
-      sentences={{ not_found: "this conversation is gone or archived, so there is nothing left to rename" }}
+      sentences={{
+        not_found:
+          "this conversation is gone or archived, so there is nothing left to rename",
+      }}
     />
   );
 }
 
 function AutoTitleRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — no name was proposed</ErrorNote>;
+  if (!isApiRefusal(error))
+    return (
+      <ErrorNote>the núcleo did not answer — no name was proposed</ErrorNote>
+    );
   return (
     <RefusalNote
       refusal={error}
       sentences={{
         unavailable: "no local model could name this — nothing has changed",
-        conflict: "nothing has been said in this conversation yet, so there is nothing to name it after",
+        conflict:
+          "nothing has been said in this conversation yet, so there is nothing to name it after",
       }}
     />
   );
@@ -1447,7 +1730,9 @@ function ModelMenu({
       <DropdownMenuContent align="start" className="chats-meta-menu">
         <DropdownMenuLabel>Which model answers</DropdownMenuLabel>
         {catalogue.isError && (
-          <DropdownMenuItem disabled>the núcleo did not say which models it has</DropdownMenuItem>
+          <DropdownMenuItem disabled>
+            the núcleo did not say which models it has
+          </DropdownMenuItem>
         )}
         <DropdownMenuRadioGroup
           value={model ?? ""}
@@ -1456,7 +1741,9 @@ function ModelMenu({
           {catalogue.data !== undefined && (
             <DropdownMenuRadioItem value="">
               Whatever is configured
-              <span className="chats-tool-why">{catalogue.data.configured}</span>
+              <span className="chats-tool-why">
+                {catalogue.data.configured}
+              </span>
             </DropdownMenuRadioItem>
           )}
           {choices.map((choice) => (
@@ -1470,7 +1757,9 @@ function ModelMenu({
               {choice.label}
               {choice.brain === "local" && (
                 <span className="chats-tool-why">
-                  {localUnavailable ? "not running on this machine" : "on this machine"}
+                  {localUnavailable
+                    ? "not running on this machine"
+                    : "on this machine"}
                 </span>
               )}
             </DropdownMenuRadioItem>
@@ -1540,7 +1829,9 @@ function EffortMenu({
           value={effort ?? ""}
           onValueChange={(picked) => onPick(picked === "" ? null : picked)}
         >
-          <DropdownMenuRadioItem value="">the CLI's own default</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="">
+            the CLI's own default
+          </DropdownMenuRadioItem>
           {levels.map((level) => (
             <DropdownMenuRadioItem key={level} value={level}>
               {level}
@@ -1593,11 +1884,19 @@ function ChatModelControls({
    and how hard, and the route follows from the answer. */
 
 function ModelRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — the model was not changed</ErrorNote>;
+  if (!isApiRefusal(error))
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the model was not changed
+      </ErrorNote>
+    );
   return (
     <RefusalNote
       refusal={error}
-      sentences={{ conflict: "a turn is in flight right now — the model cannot change until it settles" }}
+      sentences={{
+        conflict:
+          "a turn is in flight right now — the model cannot change until it settles",
+      }}
     />
   );
 }
@@ -1629,11 +1928,16 @@ function ChatReach({ chatId }: { chatId: string }) {
 
   const granted = row?.extra_dirs ?? [];
   const known = Array.from(
-    new Set([...(sessions.data ?? []).map((session) => session.cwd), ...granted]),
+    new Set([
+      ...(sessions.data ?? []).map((session) => session.cwd),
+      ...granted,
+    ]),
   ).filter((folder) => folder !== row?.cwd);
 
   const toggle = (folder: string, on: boolean) => {
-    const next = on ? [...granted, folder] : granted.filter((path) => path !== folder);
+    const next = on
+      ? [...granted, folder]
+      : granted.filter((path) => path !== folder);
     patch.mutate({ chatId, extra_dirs: next });
   };
 
@@ -1698,7 +2002,10 @@ function ChatCeiling({ chatId }: { chatId: string }) {
         <DropdownMenuRadioGroup
           value={ceiling === null ? "" : String(ceiling)}
           onValueChange={(picked) =>
-            patch.mutate({ chatId, turn_budget_usd: picked === "" ? null : Number(picked) })
+            patch.mutate({
+              chatId,
+              turn_budget_usd: picked === "" ? null : Number(picked),
+            })
           }
         >
           <DropdownMenuRadioItem value="">no ceiling</DropdownMenuRadioItem>
@@ -1725,24 +2032,33 @@ function ChatFallback({ chatId }: { chatId: string }) {
   const patch = usePatchChat();
   const catalogue = useAssistantModels();
 
-  const named = (row?.fallback_model ?? "").split(",").filter((name) => name !== "");
+  const named = (row?.fallback_model ?? "")
+    .split(",")
+    .filter((name) => name !== "");
   const choices = (catalogue.data?.choices ?? []).filter(
     (choice) => choice.brain === "cloud" && choice.id !== row?.model,
   );
-  const shown = catalogue.data?.choices.find((choice) => choice.id === named[0]);
+  const shown = catalogue.data?.choices.find(
+    (choice) => choice.id === named[0],
+  );
 
   return (
     <DropdownMenuSub>
       <DropdownMenuSubTrigger disabled={choices.length === 0}>
         Falls back to
-        <span className="chats-tool-why">{shown?.label ?? named[0] ?? "nobody"}</span>
+        <span className="chats-tool-why">
+          {shown?.label ?? named[0] ?? "nobody"}
+        </span>
       </DropdownMenuSubTrigger>
       <DropdownMenuSubContent className="chats-meta-menu">
         <DropdownMenuLabel>When the model is overloaded</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={named[0] ?? ""}
           onValueChange={(picked) =>
-            patch.mutate({ chatId, fallback_model: picked === "" ? [] : [picked] })
+            patch.mutate({
+              chatId,
+              fallback_model: picked === "" ? [] : [picked],
+            })
           }
         >
           <DropdownMenuRadioItem value="">
@@ -1807,8 +2123,9 @@ function ChatInstructions({
         <DialogHeader>
           <DialogTitle>Standing instructions</DialogTitle>
           <DialogDescription>
-            Added to what this conversation's model is already told — on every turn, not just the
-            first. Nothing here replaces the model's own instructions.
+            Added to what this conversation's model is already told — on every
+            turn, not just the first. Nothing here replaces the model's own
+            instructions.
           </DialogDescription>
         </DialogHeader>
 
@@ -1866,7 +2183,9 @@ function ChatDenials({ chatId }: { chatId: string }) {
   const tools = deniable.data?.tools ?? [];
 
   const toggle = (name: string, on: boolean) => {
-    const next = on ? [...denied, name] : denied.filter((tool) => tool !== name);
+    const next = on
+      ? [...denied, name]
+      : denied.filter((tool) => tool !== name);
     patch.mutate({ chatId, denied_tools: next });
   };
 
@@ -1879,7 +2198,9 @@ function ChatDenials({ chatId }: { chatId: string }) {
         </span>
       </DropdownMenuSubTrigger>
       <DropdownMenuSubContent className="chats-meta-menu chats-denials">
-        <DropdownMenuLabel>Tools this conversation may not reach for</DropdownMenuLabel>
+        <DropdownMenuLabel>
+          Tools this conversation may not reach for
+        </DropdownMenuLabel>
         {tools.map((name) => (
           <DropdownMenuCheckboxItem
             key={name}
@@ -1916,10 +2237,7 @@ function ContextControls({ chatId }: { chatId: string }) {
 
   return (
     <div className="chats-context">
-      <Button
-        disabled={fresh.isPending}
-        onClick={() => fresh.mutate(chatId)}
-      >
+      <Button disabled={fresh.isPending} onClick={() => fresh.mutate(chatId)}>
         Fresh context
       </Button>
       <p className="chats-context-why">
@@ -1962,11 +2280,16 @@ function blankHelper(): HelperDraft {
  * a throw with an empty agent list, so a helper it cannot build costs you every helper you wrote,
  * silently. That is what all of this is protecting against.
  */
-function whyHelperIsRefused(helper: HelperDraft, others: HelperDraft[]): string | null {
+function whyHelperIsRefused(
+  helper: HelperDraft,
+  others: HelperDraft[],
+): string | null {
   const name = helper.name.trim();
   if (name === "") return "needs a name — it is what the model calls it by";
-  if (name.startsWith("-")) return "cannot start with a dash: that reads as a flag";
-  if (!/^[A-Za-z0-9_-]+$/.test(name)) return "letters, digits, dashes and underscores only";
+  if (name.startsWith("-"))
+    return "cannot start with a dash: that reads as a flag";
+  if (!/^[A-Za-z0-9_-]+$/.test(name))
+    return "letters, digits, dashes and underscores only";
   if (others.some((other) => other !== helper && other.name.trim() === name))
     return "another helper already has this name, and one would replace the other";
   if (helper.description.trim() === "")
@@ -2030,13 +2353,17 @@ function ChatHelpers({
     );
   }, [open, saved]);
 
-  const choices = (catalogue.data?.choices ?? []).filter((choice) => choice.brain === "cloud");
+  const choices = (catalogue.data?.choices ?? []).filter(
+    (choice) => choice.brain === "cloud",
+  );
   const refusals = draft.map((helper) => whyHelperIsRefused(helper, draft));
   const ready = refusals.every((why) => why === null);
 
   const change = (at: number, patched: Partial<HelperDraft>) =>
     setDraft((current) =>
-      current.map((helper, index) => (index === at ? { ...helper, ...patched } : helper)),
+      current.map((helper, index) =>
+        index === at ? { ...helper, ...patched } : helper,
+      ),
     );
 
   const save = () => {
@@ -2063,14 +2390,15 @@ function ChatHelpers({
         <DialogHeader>
           <DialogTitle>Helpers</DialogTitle>
           <DialogDescription>
-            Work this conversation can hand off. These are added to any the project already defines
-            — they never hide them.
+            Work this conversation can hand off. These are added to any the
+            project already defines — they never hide them.
           </DialogDescription>
         </DialogHeader>
 
         {draft.length === 0 && (
           <p className="chats-helpers-none">
-            None yet. A helper is a name, what it is for, and the instructions it runs under.
+            None yet. A helper is a name, what it is for, and the instructions
+            it runs under.
           </p>
         )}
 
@@ -2083,7 +2411,9 @@ function ChatHelpers({
                 <span>Name</span>
                 <input
                   value={helper.name}
-                  onChange={(event) => change(index, { name: event.target.value })}
+                  onChange={(event) =>
+                    change(index, { name: event.target.value })
+                  }
                   placeholder="reviewer"
                 />
               </label>
@@ -2091,7 +2421,9 @@ function ChatHelpers({
                 <span>When to use it</span>
                 <input
                   value={helper.description}
-                  onChange={(event) => change(index, { description: event.target.value })}
+                  onChange={(event) =>
+                    change(index, { description: event.target.value })
+                  }
                   placeholder="Reviews a diff for correctness"
                 />
               </label>
@@ -2100,7 +2432,9 @@ function ChatHelpers({
                 <textarea
                   rows={3}
                   value={helper.prompt}
-                  onChange={(event) => change(index, { prompt: event.target.value })}
+                  onChange={(event) =>
+                    change(index, { prompt: event.target.value })
+                  }
                   placeholder="You are a code reviewer. Read the diff and…"
                 />
               </label>
@@ -2114,7 +2448,8 @@ function ChatHelpers({
                       // here rather than left to be refused at the door, where the message would be
                       // about a field nobody touched.
                       change(index, {
-                        model: event.target.value === "" ? null : event.target.value,
+                        model:
+                          event.target.value === "" ? null : event.target.value,
                         effort: null,
                       })
                     }
@@ -2133,7 +2468,8 @@ function ChatHelpers({
                     value={helper.effort ?? ""}
                     onChange={(event) =>
                       change(index, {
-                        effort: event.target.value === "" ? null : event.target.value,
+                        effort:
+                          event.target.value === "" ? null : event.target.value,
                       })
                     }
                   >
@@ -2143,7 +2479,8 @@ function ChatHelpers({
                         the door would refuse. */}
                     {(helper.model === null
                       ? (catalogue.data?.efforts ?? [])
-                      : (choices.find((choice) => choice.id === helper.model)?.efforts ?? [])
+                      : (choices.find((choice) => choice.id === helper.model)
+                          ?.efforts ?? [])
                     ).map((level) => (
                       <option key={level} value={level}>
                         {level}
@@ -2153,7 +2490,11 @@ function ChatHelpers({
                 </label>
                 <Button
                   variant="danger"
-                  onClick={() => setDraft((current) => current.filter((_, at) => at !== index))}
+                  onClick={() =>
+                    setDraft((current) =>
+                      current.filter((_, at) => at !== index),
+                    )
+                  }
                 >
                   Remove
                 </Button>
@@ -2168,10 +2509,16 @@ function ChatHelpers({
         </ul>
 
         <DialogFooter>
-          <Button onClick={() => setDraft((current) => [...current, blankHelper()])}>
+          <Button
+            onClick={() => setDraft((current) => [...current, blankHelper()])}
+          >
             Add a helper
           </Button>
-          <Button variant="approve" disabled={!ready || patch.isPending} onClick={save}>
+          <Button
+            variant="approve"
+            disabled={!ready || patch.isPending}
+            onClick={save}
+          >
             Save
           </Button>
         </DialogFooter>
@@ -2185,7 +2532,11 @@ function ChatHelpers({
  *  a refusal has a code and a sentence, and anything else is the daemon not answering at all. */
 function HelperRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
-    return <ErrorNote>the núcleo did not answer — the helpers were not saved</ErrorNote>;
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the helpers were not saved
+      </ErrorNote>
+    );
   return <RefusalNote refusal={error} />;
 }
 
@@ -2200,7 +2551,11 @@ function ArchiveControl({ chatId }: { chatId: string }) {
       <ConfirmButton
         label="Archive"
         confirmLabel="Archive — every turn stays readable"
-        onConfirm={() => archive.mutate(chatId, { onSuccess: () => void navigate({ to: "/chats" }) })}
+        onConfirm={() =>
+          archive.mutate(chatId, {
+            onSuccess: () => void navigate({ to: "/chats" }),
+          })
+        }
       />
       {archive.isError && <ArchiveRefusal error={archive.error} />}
     </div>
@@ -2208,7 +2563,12 @@ function ArchiveControl({ chatId }: { chatId: string }) {
 }
 
 function ArchiveRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — the conversation was not archived</ErrorNote>;
+  if (!isApiRefusal(error))
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the conversation was not archived
+      </ErrorNote>
+    );
   return <RefusalNote refusal={error} />;
 }
 
@@ -2232,19 +2592,23 @@ function PickedUp({
   handed: Exchange[];
 }) {
   if (view.data === undefined && !view.isError) {
-    return <p className="chats-loading">reading what was said in the editor…</p>;
+    return (
+      <p className="chats-loading">reading what was said in the editor…</p>
+    );
   }
   if (view.data === undefined) {
     return (
       <p className="chats-picked-up-unread">
-        what was said in the editor could not be read — only the turns below are shown
+        what was said in the editor could not be read — only the turns below are
+        shown
       </p>
     );
   }
   if (view.data.said.length === 0) {
     return (
       <p className="chats-picked-up-cut">
-        this was picked up from a conversation in the editor that nobody spoke in.
+        this was picked up from a conversation in the editor that nobody spoke
+        in.
       </p>
     );
   }
@@ -2254,7 +2618,8 @@ function PickedUp({
           footnote. A person reads down from the top; the top is exactly where the gap is. */}
       {view.data.cut && (
         <p className="chats-picked-up-cut">
-          older messages are not shown — this conversation was read from its recent end
+          older messages are not shown — this conversation was read from its
+          recent end
         </p>
       )}
       <ul className="chats-said" aria-label="Said in the editor">
@@ -2274,7 +2639,9 @@ function PickedUp({
             {/* No speaker on an aside. It is about the conversation, not a line of it, and a
                 "núcleo" label over it would attribute words the model never said. */}
             {!said.aside && (
-              <span className="chats-said-who">{said.by_owner ? "you" : "núcleo"}</span>
+              <span className="chats-said-who">
+                {said.by_owner ? "you" : "núcleo"}
+              </span>
             )}
             {/* Text, never markup — this is somebody else's file. `Rich` never emits either:
                 it returns data and this page decides what an element is. */}
@@ -2289,8 +2656,9 @@ function PickedUp({
         ))}
       </ul>
       <p className="chats-picked-up-cut">
-        picked up here — everything above was said in the editor and read back out of its
-        own file. None of it was a run, and none of it was billed here.
+        picked up here — everything above was said in the editor and read back
+        out of its own file. None of it was a run, and none of it was billed
+        here.
       </p>
       <HowItContinued
         handed={handed}
@@ -2332,17 +2700,19 @@ function HowItContinued({
     if (carries === null || carries > rotatesAt) return null;
     return (
       <p className="chats-picked-up-cut">
-        this session was resumed, so the model has all of the above in its context.
+        this session was resumed, so the model has all of the above in its
+        context.
       </p>
     );
   }
   return (
     <div className="chats-handed">
       <p className="chats-handed-line">
-        this session was too large to resume, so it was not. The model was handed the last{" "}
-        {handed.length === 1 ? "exchange" : `${handed.length} exchanges`} of it, word for word, in
-        front of an empty context — everything above them is here for you to read, not something it
-        remembers.
+        this session was too large to resume, so it was not. The model was
+        handed the last{" "}
+        {handed.length === 1 ? "exchange" : `${handed.length} exchanges`} of it,
+        word for word, in front of an empty context — everything above them is
+        here for you to read, not something it remembers.
       </p>
       <button
         type="button"
@@ -2353,7 +2723,10 @@ function HowItContinued({
         {open ? "hide what it was handed" : "show what it was handed"}
       </button>
       {open && (
-        <ul className="chats-handed-list" aria-label="What the model was handed">
+        <ul
+          className="chats-handed-list"
+          aria-label="What the model was handed"
+        >
           {handed.map(([asked, answered], index) => (
             // Keyed by position: this is a stored list nothing here reorders or removes from.
             <li key={`handed-${index}`} className="chats-handed-pair">
@@ -2397,9 +2770,7 @@ function Changed({ chatId }: { chatId: string }) {
       >
         {open ? "hide what is different" : "what is different in this project"}
       </button>
-      {open && diff.isError && (
-        <ChangedRefusal error={diff.error} />
-      )}
+      {open && diff.isError && <ChangedRefusal error={diff.error} />}
       {open && diff.data === undefined && !diff.isError && (
         <p className="chats-loading">reading the project…</p>
       )}
@@ -2412,7 +2783,9 @@ function Changed({ chatId }: { chatId: string }) {
 function DiffView({ diff }: { diff: string }) {
   const lines = diffLines(diff);
   if (lines.length === 0) {
-    return <p className="chats-changed-clean">nothing in this project has changed</p>;
+    return (
+      <p className="chats-changed-clean">nothing in this project has changed</p>
+    );
   }
   return (
     <pre className="chats-diff" aria-label="What is different">
@@ -2429,13 +2802,16 @@ function DiffView({ diff }: { diff: string }) {
 
 function ChangedRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — nothing could be read</ErrorNote>;
+    return (
+      <ErrorNote>the núcleo did not answer — nothing could be read</ErrorNote>
+    );
   }
   return (
     <RefusalNote
       refusal={error}
       sentences={{
-        conflict: "this conversation has no project, so there is no working tree to compare",
+        conflict:
+          "this conversation has no project, so there is no working tree to compare",
         not_found: "that conversation is no longer here",
       }}
     />
@@ -2567,7 +2943,8 @@ function Transcript({
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
   if (turns.length === 0 && precededBy) return null;
-  if (turns.length === 0) return <p className="chats-empty">nothing has been said yet.</p>;
+  if (turns.length === 0)
+    return <p className="chats-empty">nothing has been said yet.</p>;
   return (
     <>
       <ul className="chats-turns" aria-label="Transcript">
@@ -2623,7 +3000,9 @@ function TurnBlock({
         </div>
       )}
       {!live && turn.answer === null && (
-        <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
+        <p className="chats-turn-answer chats-turn-answer-empty">
+          no answer recorded
+        </p>
       )}
       <div className="chats-turn-foot">
         {/* Money only. The daemon's turn rows carry no token breakdown — see `CostLineProps`. */}
@@ -2675,7 +3054,11 @@ function RichLineOut({ line }: { line: RichLine }) {
     ),
   );
   if (line.kind === "heading") {
-    return <p className={`chats-rich-heading chats-rich-heading-${line.level}`}>{inner}</p>;
+    return (
+      <p className={`chats-rich-heading chats-rich-heading-${line.level}`}>
+        {inner}
+      </p>
+    );
   }
   if (line.kind === "bullet") {
     return (
@@ -2703,15 +3086,26 @@ function RichLineOut({ line }: { line: RichLine }) {
  * never keeps a copy of it, and a turn that arrives without one draws the count alone rather than
  * a proportion of a number nobody sent.
  */
-function ContextFill({ fill, rotatesAt }: { fill: number | null; rotatesAt: number | null }) {
+function ContextFill({
+  fill,
+  rotatesAt,
+}: {
+  fill: number | null;
+  rotatesAt: number | null;
+}) {
   if (fill === null) return null;
   const k = (n: number) => `${(n / 1000).toFixed(1)}k`;
-  if (rotatesAt === null) return <span className="chats-turn-fill">{k(fill)} of context</span>;
+  if (rotatesAt === null)
+    return <span className="chats-turn-fill">{k(fill)} of context</span>;
   // Near, not past. Past is too late to be a warning: the turn that crosses the line is the last
   // one that remembers, and this is drawn under it while the next one is still being typed.
   const near = fill >= rotatesAt * 0.85;
   return (
-    <span className={near ? "chats-turn-fill chats-turn-fill-near" : "chats-turn-fill"}>
+    <span
+      className={
+        near ? "chats-turn-fill chats-turn-fill-near" : "chats-turn-fill"
+      }
+    >
       {`${k(fill)} of ${k(rotatesAt)}`}
       {near && " — the next turn may begin a fresh context"}
     </span>
@@ -2731,7 +3125,12 @@ function ContextFill({ fill, rotatesAt }: { fill: number | null; rotatesAt: numb
 function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
   const stop = useStopTurn(chatId);
   return (
-    <Button type="button" variant="ghost" disabled={stop.isPending} onClick={() => stop.mutate(turnId)}>
+    <Button
+      type="button"
+      variant="ghost"
+      disabled={stop.isPending}
+      onClick={() => stop.mutate(turnId)}
+    >
       Stop
     </Button>
   );
@@ -2762,12 +3161,21 @@ function LiveAnswer({ turnId }: { turnId: number }) {
 
   return (
     <>
-      <Thought thought={live.data?.thought ?? []} tokens={live.data?.thought_tokens ?? null} />
-      {text !== "" && <p className="chats-turn-answer chats-turn-writing">{text}</p>}
+      <Thought
+        thought={live.data?.thought ?? []}
+        tokens={live.data?.thought_tokens ?? null}
+      />
+      {text !== "" && (
+        <p className="chats-turn-answer chats-turn-writing">{text}</p>
+      )}
       <Plan todos={planOf(live.data?.did ?? [])} />
       <WhatItDid did={live.data?.did ?? []} />
       <p className="chats-turn-live" ref={end}>
-        {doing !== null ? `running ${doing}…` : text === "" ? "thinking…" : "writing…"}
+        {doing !== null
+          ? `running ${doing}…`
+          : text === ""
+            ? "thinking…"
+            : "writing…"}
       </p>
     </>
   );
@@ -2826,8 +3234,14 @@ function TurnPicture({ path }: { path: string }) {
 
   // Said, not left blank: a picture that was sent and can no longer be read is a fact about the
   // record, and an empty space where one was is indistinguishable from a turn that had none.
-  if (gone) return <p className="chats-picture-gone">a picture sent here can no longer be read</p>;
-  if (url === null) return <p className="chats-picture-gone">reading a picture…</p>;
+  if (gone)
+    return (
+      <p className="chats-picture-gone">
+        a picture sent here can no longer be read
+      </p>
+    );
+  if (url === null)
+    return <p className="chats-picture-gone">reading a picture…</p>;
   return (
     <>
       {/* A button and not a bare image: opening one is an action, and an image that grows when
@@ -2838,9 +3252,15 @@ function TurnPicture({ path }: { path: string }) {
         aria-label={`Open picture ${path}`}
         onClick={() => setOpen(true)}
       >
-        <img className="chats-picture" src={url} alt={`sent with this message: ${path}`} />
+        <img
+          className="chats-picture"
+          src={url}
+          alt={`sent with this message: ${path}`}
+        />
       </button>
-      {open && <PictureOverlay url={url} path={path} onClose={() => setOpen(false)} />}
+      {open && (
+        <PictureOverlay url={url} path={path} onClose={() => setOpen(false)} />
+      )}
     </>
   );
 }
@@ -2879,7 +3299,11 @@ function PictureOverlay({
       onClick={onClose}
     >
       <img className="chats-picture-full" src={url} alt={path} />
-      <button type="button" className="chats-picture-close" aria-label="Close picture">
+      <button
+        type="button"
+        className="chats-picture-close"
+        aria-label="Close picture"
+      >
         close
       </button>
     </div>
@@ -2899,10 +3323,21 @@ function PictureOverlay({
  * would promise reasoning this machine will never hold, which is worse than saying less. If the
  * words ever start arriving, `thought` carries them and they unfold under the same line.
  */
-function Thought({ thought, tokens }: { thought: string[]; tokens: number | null }) {
+function Thought({
+  thought,
+  tokens,
+}: {
+  thought: string[];
+  tokens: number | null;
+}) {
   const [open, setOpen] = useState(false);
   if (thought.length === 0 && tokens === null) return null;
-  const size = tokens === null ? null : tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : `${tokens}`;
+  const size =
+    tokens === null
+      ? null
+      : tokens >= 1000
+        ? `${(tokens / 1000).toFixed(1)}k`
+        : `${tokens}`;
   return (
     <div className="chats-thought">
       {thought.length === 0 ? (
@@ -2914,7 +3349,11 @@ function Thought({ thought, tokens }: { thought: string[]; tokens: number | null
           aria-expanded={open}
           onClick={() => setOpen(!open)}
         >
-          {open ? "hide thinking" : size === null ? "thinking" : `thinking · ~${size} tokens`}
+          {open
+            ? "hide thinking"
+            : size === null
+              ? "thinking"
+              : `thinking · ~${size} tokens`}
         </button>
       )}
       {open &&
@@ -2946,9 +3385,16 @@ function Plan({ todos }: { todos: Todo[] }) {
       {todos.map((todo, index) => (
         // Keyed by position: a plan is a list in an order somebody chose, and the same line can
         // legitimately appear twice.
-        <li key={`todo-${index}`} className={`chats-plan-item chats-plan-${todo.status}`}>
+        <li
+          key={`todo-${index}`}
+          className={`chats-plan-item chats-plan-${todo.status}`}
+        >
           <span className="chats-plan-mark" aria-hidden="true">
-            {todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "→" : "·"}
+            {todo.status === "completed"
+              ? "✓"
+              : todo.status === "in_progress"
+                ? "→"
+                : "·"}
           </span>
           <span className="chats-plan-text">{todo.text}</span>
         </li>
@@ -2976,7 +3422,9 @@ function WhatItDid({ did }: { did: ToolCall[] }) {
         // removes an entry. The same tool on the same file twice is two real calls, not a duplicate.
         <li key={`${call.name}-${index}`}>
           <span className="chats-turn-did-name">{call.name}</span>
-          {call.detail !== null && <span className="chats-turn-did-detail">{call.detail}</span>}
+          {call.detail !== null && (
+            <span className="chats-turn-did-detail">{call.detail}</span>
+          )}
         </li>
       ))}
     </ul>
@@ -2998,16 +3446,16 @@ function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "cleared") {
     return (
       <p className="chats-mark chats-mark-restart" role="status">
-        cleared here — everything above stays readable, and the model past this point was told none
-        of it
+        cleared here — everything above stays readable, and the model past this
+        point was told none of it
       </p>
     );
   }
   if (mark.kind === "restart") {
     return (
       <p className="chats-mark chats-mark-restart" role="status">
-        the conversation restarted here — the model past this point was read the last few exchanges
-        back, and remembers nothing older than those
+        the conversation restarted here — the model past this point was read the
+        last few exchanges back, and remembers nothing older than those
       </p>
     );
   }
@@ -3025,10 +3473,14 @@ function MarkNote({ mark }: { mark: Mark }) {
 /* -------------------------------------------------------------- composer -- */
 
 const MESSAGE_SENTENCES: Record<string, string> = {
-  turn_in_progress: "this conversation already has a turn in flight — it clears on its own once that turn answers",
-  kill_switch: "the kill switch is engaged; nothing autonomous starts until it is released, and this cannot be sent either",
-  no_local_model: "no local model is available on this machine, and this conversation is set to answer locally",
-  errand_not_answering: "the errand behind this conversation is not answering right now",
+  turn_in_progress:
+    "this conversation already has a turn in flight — it clears on its own once that turn answers",
+  kill_switch:
+    "the kill switch is engaged; nothing autonomous starts until it is released, and this cannot be sent either",
+  no_local_model:
+    "no local model is available on this machine, and this conversation is set to answer locally",
+  errand_not_answering:
+    "the errand behind this conversation is not answering right now",
 };
 
 /**
@@ -3052,6 +3504,40 @@ interface Choice {
   primary: string;
   secondary: string;
   chosen: () => void;
+}
+
+/**
+ * The keys a list under the caret owns while it is showing.
+ *
+ * Shared by both boxes rather than written twice. The arrows, the Enter and the Tab belong to the
+ * list for as long as it is open — which is what every editor does and what the hand expects — and
+ * two copies of that rule is how one of them comes to disagree the day somebody adds a key.
+ *
+ * Returns `true` when the key was the list's, so the caller knows not to send.
+ */
+function listTookTheKey(
+  event: { key: string; preventDefault: () => void },
+  choices: Choice[],
+  highlight: number,
+  setHighlight: (next: (was: number) => number) => void,
+): boolean {
+  if (choices.length === 0) return false;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setHighlight((was) => (was + 1) % choices.length);
+    return true;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setHighlight((was) => (was - 1 + choices.length) % choices.length);
+    return true;
+  }
+  if (event.key === "Enter" || event.key === "Tab") {
+    event.preventDefault();
+    choices[Math.min(highlight, choices.length - 1)].chosen();
+    return true;
+  }
+  return false;
 }
 
 function Composer({
@@ -3123,7 +3609,8 @@ function Composer({
             key: hit.path,
             primary: `${hit.name}${hit.is_dir ? "/" : ""}`,
             secondary: hit.path,
-            chosen: () => write(withMention(text, mention, hit.path, hit.is_dir)),
+            chosen: () =>
+              write(withMention(text, mention, hit.path, hit.is_dir)),
           }))
         : [];
 
@@ -3131,14 +3618,18 @@ function Composer({
   // nothing to list. A command gesture never has it: personal and plugin commands exist wherever
   // the conversation runs.
   const nowhere =
-    command === null && mention !== null && live(mention) !== null && files.data?.rooted === false;
+    command === null &&
+    mention !== null &&
+    live(mention) !== null &&
+    files.data?.rooted === false;
   const open = choices.length > 0 || nowhere;
 
   // One place, two ways in: the button and the key. Duplicating the guards into the key handler is
   // how one of them ends up sending an empty turn six months from now.
   // A picture on its own is a message: "what is this?" is a reasonable thing to send with nothing
   // typed, and refusing it because the box is empty would be the window deciding what counts.
-  const sayable = (text.trim() !== "" || attached.length > 0) && !send.isPending;
+  const sayable =
+    (text.trim() !== "" || attached.length > 0) && !send.isPending;
   const say = () => {
     if (!sayable) return;
     send.mutate(
@@ -3186,7 +3677,9 @@ function Composer({
                 type="button"
                 className="chats-attached-drop"
                 aria-label={`Remove attached picture ${index + 1}`}
-                onClick={() => setAttached((was) => was.filter((_, at) => at !== index))}
+                onClick={() =>
+                  setAttached((was) => was.filter((_, at) => at !== index))
+                }
               >
                 ×
               </button>
@@ -3205,7 +3698,9 @@ function Composer({
           // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
           // anything that made you save it to a file first would be a step nobody takes.
           onPaste={(event) => {
-            const pictures = Array.from(event.clipboardData.files).filter(isPicture);
+            const pictures = Array.from(event.clipboardData.files).filter(
+              isPicture,
+            );
             if (pictures.length === 0) return;
             // Only when there IS a picture: a plain text paste must stay a text paste.
             event.preventDefault();
@@ -3234,23 +3729,7 @@ function Composer({
           // under the caret owns the arrows and the Enter for as long as it is showing, which is
           // what every editor does and what the hand already expects.
           onKeyDown={(event) => {
-            if (choices.length > 0) {
-              if (event.key === "ArrowDown") {
-                event.preventDefault();
-                setHighlight((was) => (was + 1) % choices.length);
-                return;
-              }
-              if (event.key === "ArrowUp") {
-                event.preventDefault();
-                setHighlight((was) => (was - 1 + choices.length) % choices.length);
-                return;
-              }
-              if (event.key === "Enter" || event.key === "Tab") {
-                event.preventDefault();
-                choices[Math.min(highlight, choices.length - 1)].chosen();
-                return;
-              }
-            }
+            if (listTookTheKey(event, choices, highlight, setHighlight)) return;
             if (open && event.key === "Escape") {
               event.preventDefault();
               setDismissed(live(command) ?? live(mention));
@@ -3286,11 +3765,20 @@ function Composer({
             />
           </label>
           {chat !== undefined && (
-            <ChatModelControls chatId={chatId} model={chat.model} effort={chat.effort} />
+            <ChatModelControls
+              chatId={chatId}
+              model={chat.model}
+              effort={chat.effort}
+            />
           )}
           <Planning chatId={chatId} />
           <span className="chats-composer-gap" />
-          <button type="submit" className="chats-send" aria-label="Send" disabled={!sayable}>
+          <button
+            type="submit"
+            className="chats-send"
+            aria-label="Send"
+            disabled={!sayable}
+          >
             <ArrowUp className="chats-send-icon" aria-hidden="true" />
           </button>
         </div>
@@ -3327,7 +3815,11 @@ function Choices({
         <li key={choice.key}>
           <button
             type="button"
-            className={index === highlight ? "chats-mention chats-mention-on" : "chats-mention"}
+            className={
+              index === highlight
+                ? "chats-mention chats-mention-on"
+                : "chats-mention"
+            }
             aria-current={index === highlight}
             // The mouse must not take focus off the box: the caret is the whole state this list
             // reads from, and a blur would move it before the click ever lands.
@@ -3340,13 +3832,16 @@ function Choices({
         </li>
       ))}
       {truncated && (
-        <li className="chats-mentions-cut">more than these — keep typing to narrow it</li>
+        <li className="chats-mentions-cut">
+          more than these — keep typing to narrow it
+        </li>
       )}
     </ul>
   );
 }
 
 function MessageRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — nothing was sent</ErrorNote>;
+  if (!isApiRefusal(error))
+    return <ErrorNote>the núcleo did not answer — nothing was sent</ErrorNote>;
   return <RefusalNote refusal={error} sentences={MESSAGE_SENTENCES} />;
 }

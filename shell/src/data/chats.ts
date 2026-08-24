@@ -808,6 +808,27 @@ export function useChatFiles(chatId: string, query: string | null) {
 }
 
 /**
+ * The slash commands available before there is a conversation, narrowed by what has been typed.
+ *
+ * The front door's own, because there is no chat id to ask about yet. It answers with the personal
+ * commands and the installed plugins' — the ones that will still be true after the first message —
+ * and never a project's, which belong to a directory this conversation does not have.
+ */
+export function useCommands(query: string | null) {
+  return useQuery({
+    queryKey: keys.chats.frontCommands(query ?? ""),
+    queryFn: () =>
+      apiFetch<{ commands: Command[] }>(
+        `/assistant/commands?q=${encodeURIComponent(query ?? "")}`,
+      ),
+    enabled: query !== null,
+    placeholderData: keepPreviousData,
+    staleTime: 10_000,
+    retry: false,
+  });
+}
+
+/**
  * The slash commands this conversation can run, narrowed by what has been typed.
  *
  * `null` disables it, exactly as the file completion does: no command is being typed, so nothing is

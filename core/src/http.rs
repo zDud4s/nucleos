@@ -218,6 +218,7 @@ pub fn build_router(state: AppState) -> Router {
         // per row in the list.
         .route("/assistant/models", get(get_assistant_models))
         .route("/assistant/tools", get(get_deniable_tools))
+        .route("/assistant/commands", get(get_commands))
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -4808,6 +4809,30 @@ async fn chat_must_exist(state: &AppState, chat_id: &str) -> Result<(), StatusCo
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// The commands a slash offers before there is a conversation to offer them for.
+///
+/// The front door has a box you type into and no chat behind it yet, so the chat-scoped route
+/// cannot answer — and until this, a slash there did nothing at all. Typing `/` where you land is
+/// the first thing anybody does.
+///
+/// The same `available` the chat route calls, with no project: personal commands and installed
+/// plugins' travel wherever the conversation ends up, and a project's belong to a directory this
+/// conversation does not have yet. So the front door offers exactly what will still be true after
+/// the first message, and never a command that stops existing the moment the chat is opened.
+async fn get_commands(Query(query): Query<MentionQuery>) -> Json<serde_json::Value> {
+    let typed: String = query.q.chars().take(MENTION_QUERY_LIMIT).collect();
+    // Off the async runtime like its chat-scoped twin: this reads several directories and every
+    // command file's front matter, which is short and is still disk on a request thread.
+    let commands = tokio::task::spawn_blocking(move || {
+        let available = crate::commands::available(None, crate::commands::home().as_deref());
+        crate::commands::matching(&available, &typed)
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(serde_json::json!({ "commands": commands }))
 }
 
 /// Which built-in tools a conversation can be told not to reach for.
@@ -11603,6 +11628,21 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// The front door has a box and no conversation behind it, so the chat-scoped route cannot
+    /// answer — and until this, a slash where you land did nothing at all.
+    #[tokio::test]
+    async fn the_front_door_offers_commands_before_a_conversation_exists() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/commands?q=", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        // Answered from the same `available` the chat route calls, with no project: what it lists
+        // depends on the machine, so what is asserted is that it ANSWERS with a list rather than a
+        // 404 — which is what it did before, and what made the gesture look broken.
+        assert!(body["commands"].is_array(), "{body}");
     }
 
     /// One list, served rather than copied into the window. A second copy would offer a name the

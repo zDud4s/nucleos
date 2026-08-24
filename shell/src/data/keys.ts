@@ -175,6 +175,8 @@ export const keys = {
      * so one fetch feeds every picker on the page.
      */
     tools: ["chats", "tools"] as const,
+    /** The commands the front door offers, before a conversation exists to scope them. */
+    frontCommands: (query: string) => ["chats", "front-commands", query] as const,
     project: (chatId: string) => ["chats", "project", chatId] as const,
     diff: (chatId: string) => ["chats", "diff", chatId] as const,
     ideSessions: ["chats", "ide-sessions"] as const,
