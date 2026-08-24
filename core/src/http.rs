@@ -5685,10 +5685,10 @@ async fn create_chat(
     };
     // Checked before the row exists, so a bad level leaves no conversation behind to explain. The
     // three below are checked here for the same reason and in the same breath.
-    if let Some(level) = body.effort.as_deref() {
-        if !crate::config::is_effort_level(&models_config(), level) {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+    if let Some(level) = body.effort.as_deref()
+        && !crate::config::is_effort_level(&models_config(), level)
+    {
+        return Err(StatusCode::BAD_REQUEST);
     }
     checked_fallback(&body.fallback_model)?;
     checked_dirs(&body.extra_dirs).await?;
@@ -5742,46 +5742,43 @@ async fn create_chat(
             tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept the default effort");
         }
     }
-    if !body.fallback_model.is_empty() {
-        if let Err(error) =
+    // Each of these reads "the caller sent one, AND writing it failed" — the guard short-circuits,
+    // so a caller who sent nothing still writes nothing, exactly as the nesting these replaced did.
+    if !body.fallback_model.is_empty()
+        && let Err(error) =
             crate::chats::set_fallback(&state.pool, &chat_id, &body.fallback_model).await
-        {
-            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept no fallback");
-        }
+    {
+        tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept no fallback");
     }
-    if !body.extra_dirs.is_empty() {
-        if let Err(error) =
+    if !body.extra_dirs.is_empty()
+        && let Err(error) =
             crate::chats::set_extra_dirs(&state.pool, &chat_id, &body.extra_dirs).await
-        {
-            tracing::warn!(%error, chat_id = %chat_id, "the new conversation reaches only its own directory");
-        }
+    {
+        tracing::warn!(%error, chat_id = %chat_id, "the new conversation reaches only its own directory");
     }
-    if body.turn_budget_usd.is_some() {
-        if let Err(error) =
+    if body.turn_budget_usd.is_some()
+        && let Err(error) =
             crate::chats::set_turn_budget(&state.pool, &chat_id, body.turn_budget_usd).await
-        {
-            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept no ceiling");
-        }
+    {
+        tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept no ceiling");
     }
-    if !body.agents.is_empty() {
-        if let Err(error) = crate::chats::set_agents(&state.pool, &chat_id, &body.agents).await {
-            tracing::warn!(%error, chat_id = %chat_id, "the new conversation defined no helpers");
-        }
+    if !body.agents.is_empty()
+        && let Err(error) = crate::chats::set_agents(&state.pool, &chat_id, &body.agents).await
+    {
+        tracing::warn!(%error, chat_id = %chat_id, "the new conversation defined no helpers");
     }
-    if body.system_prompt.is_some() {
-        if let Err(error) =
+    if body.system_prompt.is_some()
+        && let Err(error) =
             crate::chats::set_system_prompt(&state.pool, &chat_id, body.system_prompt.as_deref())
                 .await
-        {
-            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept the default instructions");
-        }
+    {
+        tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept the default instructions");
     }
-    if !body.denied_tools.is_empty() {
-        if let Err(error) =
+    if !body.denied_tools.is_empty()
+        && let Err(error) =
             crate::chats::set_denied_tools(&state.pool, &chat_id, &body.denied_tools).await
-        {
-            tracing::warn!(%error, chat_id = %chat_id, "the new conversation denied no tools of its own");
-        }
+    {
+        tracing::warn!(%error, chat_id = %chat_id, "the new conversation denied no tools of its own");
     }
 
     // Measured once, here, where the file is read anyway and where the answer can still change
@@ -6526,10 +6523,10 @@ async fn patch_chat(
     // context the session holds is still that model's own, and dropping it would make a dial nobody
     // considers destructive silently restart the conversation.
     if let Some(effort) = &body.effort {
-        if let Some(level) = effort {
-            if !crate::config::is_effort_level(&models_config(), level) {
-                return Err(StatusCode::BAD_REQUEST);
-            }
+        if let Some(level) = effort
+            && !crate::config::is_effort_level(&models_config(), level)
+        {
+            return Err(StatusCode::BAD_REQUEST);
         }
         crate::chats::set_effort(&state.pool, &chat_id, effort.as_deref())
             .await
