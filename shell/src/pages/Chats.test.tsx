@@ -164,6 +164,13 @@ function chatsFetch(
      * distinction and says so.
      */
     projects?: Record<string, ChatProject>;
+    /** What each turn's tools answered, by turn id. The transcript never carries these. */
+    turnTools?: Record<number, ToolCall[]>;
+    /**
+     * How many turns one read comes back with. The daemon's own is a hundred; a test that is
+     * about paging says a smaller number rather than writing a hundred and one fixtures.
+     */
+    transcriptLimit?: number;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -270,13 +277,49 @@ function chatsFetch(
         truncated: false,
       };
     }
-    const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
+    // What one turn's tools answered. Its own route because the transcript deliberately strips
+    // them — see `ToolCall.result`.
+    const turnTools = /^\/assistant\/turns\/(\d+)\/tools$/.exec(path);
+    if (turnTools !== null) {
+      return { did: opts.turnTools?.[Number(turnTools[1])] ?? [] };
+    }
+    // Something that was said, across every conversation. Matched here rather than served from a
+    // fixture list, so a test says what is in the conversations and not what the daemon replies.
+    const said = /^\/assistant\/search\?q=(.*)$/.exec(path);
+    if (said !== null) {
+      const query = decodeURIComponent(said[1]).toLowerCase();
+      return Object.entries(transcripts).flatMap(([chatId, rows]) =>
+        rows
+          .filter(
+            (row) =>
+              row.asked.toLowerCase().includes(query) ||
+              (row.answer ?? "").toLowerCase().includes(query),
+          )
+          .map((row) => ({
+            chat_id: chatId,
+            title: chats.find((chat) => chat.chat_id === chatId)?.title ?? null,
+            turn_id: row.id,
+            side: row.asked.toLowerCase().includes(query) ? "asked" : "answered",
+            excerpt: row.asked.toLowerCase().includes(query) ? row.asked : (row.answer ?? ""),
+            created_at: row.created_at,
+          })),
+      );
+    }
+    // The `?before=` page walks backwards from a turn id. `transcripts` holds a conversation
+    // whole, so the slice is taken here — which is what makes a paging test a test of the page's
+    // own arithmetic rather than of a fixture that agrees with it.
+    const match = /^\/assistant\/chats\/([^/?]+)(?:\?before=(\d+))?$/.exec(path);
     if (match !== null) {
+      const whole = transcripts[match[1]] ?? [];
+      const limit = opts.transcriptLimit ?? whole.length;
+      const above = match[2] === undefined ? whole : whole.filter((row) => row.id < Number(match[2]));
+      const page = above.slice(-limit);
       return {
         handed: opts.handed?.[match[1]] ?? [],
         queued: opts.queued?.[match[1]] ?? [],
         asks: opts.asks?.[match[1]] ?? [],
-        turns: transcripts[match[1]] ?? [],
+        more: page.length < above.length,
+        turns: page,
       };
     }
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
@@ -3134,5 +3177,210 @@ describe("Chats - a turn while it is running", () => {
     // The clock and the spinner go with the wait they were measuring.
     expect(within(transcript).queryByText("thinking…")).toBeNull();
     expect(within(transcript).queryByText(/^\d+:\d\d$/)).toBeNull();
+  });
+});
+
+/* ------------------------------------------- the rest of a long conversation -- */
+
+describe("Chats - a conversation longer than one read", () => {
+  /** Six turns, so a limit of two makes three pages. */
+  function sixTurns(): AssistantTurnRow[] {
+    return [1, 2, 3, 4, 5, 6].map((id) =>
+      turnRow({ id, asked: `question ${id}`, answer: `answer ${id}` }),
+    );
+  }
+
+  it("says the conversation goes further back, and goes and gets it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": sixTurns() }, {
+        transcriptLimit: 2,
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    // The recent end, and nothing above it — which used to be the whole of what a page could show.
+    expect(await screen.findByText("answer 6")).toBeDefined();
+    expect(screen.queryByText("answer 4")).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Earlier turns" }));
+
+    expect(await screen.findByText("answer 4")).toBeDefined();
+    // And the newer half is still there: a page above is prepended, never swapped in.
+    expect(screen.getByText("answer 6")).toBeDefined();
+  });
+
+  it("stops offering earlier turns once the conversation begins", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": sixTurns() }, {
+        transcriptLimit: 3,
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Earlier turns" }));
+    expect(await screen.findByText("answer 1")).toBeDefined();
+
+    // The whole conversation is on the page. A button still offering more would be offering
+    // nothing — and the poll must not put it back, which is the bug `more` was shaped to avoid.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Earlier turns" })).toBeNull(),
+    );
+  });
+});
+
+describe("Chats - what a tool answered", () => {
+  it("opens one call and shows what came back, without asking for the others", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        {
+          "c-1": [
+            turnRow({
+              id: 4,
+              answer: "the three cases pass",
+              // As the transcript serves them: named, with the answers stripped.
+              did: [
+                { name: "Bash", detail: "cargo test dates::", todos: [] },
+                { name: "Read", detail: "core/src/dates.rs", todos: [] },
+              ],
+            }),
+          ],
+        },
+        {
+          turnTools: {
+            4: [
+              {
+                name: "Bash",
+                detail: "cargo test dates::",
+                todos: [],
+                result: "test result: ok. 3 passed; 0 failed",
+                result_chars: 36,
+              },
+              { name: "Read", detail: "core/src/dates.rs", todos: [], result: "fn leap()" },
+            ],
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // Nothing is fetched until something is opened: the answers are why they are not on the poll.
+    expect(await screen.findByText("cargo test dates::")).toBeDefined();
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/turns/4/tools");
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Bash cargo test dates:: — what it answered/ }),
+    );
+
+    expect(await screen.findByText("test result: ok. 3 passed; 0 failed")).toBeDefined();
+    // One open at a time — the other call's answer is not on the page.
+    expect(screen.queryByText("fn leap()")).toBeNull();
+  });
+
+  it("says what it is not showing rather than passing a cut answer off as the whole one", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 4, did: [{ name: "Read", detail: "big.rs", todos: [] }] })] },
+        {
+          turnTools: {
+            4: [
+              {
+                name: "Read",
+                detail: "big.rs",
+                todos: [],
+                result: "the first bit",
+                result_chars: 41203,
+              },
+            ],
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Read big.rs — what it answered/ }));
+
+    // The defect this prevents: somebody concludes the file ends where the excerpt does.
+    // The grouping separator is the machine's, not this test's: `toLocaleString` writes 41,203
+    // on one and a narrow no-break space on another, and both are right. Testing Library
+    // normalises the RENDERED text's whitespace and not the expected string's, so the expected
+    // one is normalised the same way here — otherwise this passes in one locale and not the next.
+    const cut = `the first 13 of ${(41203).toLocaleString()} characters`.replace(/\s+/g, " ");
+    expect(await screen.findByText(cut)).toBeDefined();
+  });
+
+  it("draws a turn whose tools nothing was recorded for", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 4, did: [{ name: "Glob", detail: "**/*.rs", todos: [] }] })] },
+        { turnTools: { 4: [{ name: "Glob", detail: "**/*.rs", todos: [] }] } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Glob/ }));
+
+    // Not an error, and not an empty box either: a turn from before the daemon kept these has
+    // nothing to show, and so does a tool that genuinely answered nothing.
+    expect(await screen.findByText("nothing was recorded for this one")).toBeDefined();
+  });
+});
+
+describe("Chats - finding something that was said", () => {
+  it("searches inside the conversations, not only their titles", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "the date parser" }),
+          chatSummary({ chat_id: "c-2", title: "the mail sidecar" }),
+        ],
+        {
+          "c-1": [turnRow({ id: 1, asked: "why 29 February?", answer: "the year rule" })],
+          "c-2": [
+            turnRow({ id: 2, asked: "does IMAP idle?", answer: "it uses a leap of faith" }),
+          ],
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "leap" } });
+
+    // No conversation is CALLED "leap" — this hit exists only because the word was said in one.
+    expect(await within(palette).findByText(/it uses a leap of faith/)).toBeDefined();
+    expect(within(palette).getByText("the mail sidecar")).toBeDefined();
+  });
+
+  it("takes you to the turn, not merely to the conversation", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", title: "the date parser" })],
+        {
+          "c-1": [
+            turnRow({ id: 1, asked: "why 29 February?", answer: "the year rule has three parts" }),
+            turnRow({ id: 2, asked: "and the tests?", answer: "1900, 2000 and 2024" }),
+          ],
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "three parts" } });
+
+    fireEvent.click(await within(palette).findByText(/the year rule has three parts/));
+
+    // The turn is pointed AT, and not just scrolled somewhere plausible in a wall of exchanges.
+    await waitFor(() => {
+      const found = document.getElementById("turn-1");
+      expect(found?.className).toContain("chats-turn-lit");
+    });
   });
 });

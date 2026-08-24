@@ -37,6 +37,7 @@ import {
   MoreHorizontal,
   PanelLeft,
   PanelLeftClose,
+  ChevronRight,
   LoaderCircle,
   Plus,
   SquareCode,
@@ -76,6 +77,10 @@ import {
   useClearContext,
   useDeniableTools,
   useFreshContext,
+  useOlderTurns,
+  useSaid,
+  useTurnTools,
+  type SaidHit,
   type Command,
   type Exchange,
   type Ask,
@@ -164,6 +169,21 @@ export function Chats() {
    * picks it up. Cleared the moment one is — by then it is a chat with a URL of its own.
    */
   const [pickingUp, setPickingUp] = useState<string | null>(null);
+  /**
+   * A turn picked out of a search, waiting for its conversation to be on screen.
+   *
+   * Stamped like `reuse` is, and for the same reason: finding the SAME turn twice is a real
+   * gesture — you jump to it, scroll away reading, and go looking for it again — and an effect
+   * watching only the id would fire once and then quietly stop working.
+   *
+   * Held here rather than in the palette because the palette closes on the way: the thing that has
+   * to remember is the page, which is still standing when the conversation finishes loading.
+   */
+  const [found, setFound] = useState<{
+    chatId: string;
+    turnId: number;
+    at: number;
+  } | null>(null);
   const navigate = useNavigate();
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
 
@@ -245,6 +265,9 @@ export function Chats() {
         rows={rows}
         open={paletteOpen}
         onOpenChange={setPaletteOpen}
+        onFound={(chatId, turnId) =>
+          setFound({ chatId, turnId, at: Date.now() })
+        }
       />
 
       <div
@@ -291,6 +314,9 @@ export function Chats() {
               chatId={chatId}
               summary={summary}
               transcript={transcript}
+              /* Only when it is THIS conversation's turn. A jump left over from a search in
+                 another chat would otherwise hunt for an id that is not on the page. */
+              find={found !== null && found.chatId === chatId ? found : null}
             />
           )}
         </div>
@@ -340,33 +366,60 @@ function ConversationPalette({
   rows,
   open,
   onOpenChange,
+  onFound,
 }: {
   rows: ChatSummary[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** A turn somebody picked out of a search, to be scrolled to once its conversation opens. */
+  onFound: (chatId: string, turnId: number) => void;
 }) {
   const navigate = useNavigate();
+  const [query, setQuery] = useState("");
+  const said = useSaid(query);
+  const needle = query.trim().toLowerCase();
+
+  // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
+  // The hits underneath were matched by the daemon against the whole text of a conversation, which
+  // is text this list does not have — left to cmdk they would be filtered out again for not
+  // containing the query in their own visible row.
+  const named = rows.filter((row) => {
+    if (needle === "") return true;
+    const name = row.title ?? row.first_message ?? "New conversation";
+    return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
+  });
+  const hits = said.data ?? [];
 
   return (
     <CommandDialog
       open={open}
-      onOpenChange={onOpenChange}
+      onOpenChange={(next) => {
+        onOpenChange(next);
+        // Cleared on the way out, so opening it again is a fresh question rather than the last
+        // one's answers under an empty box.
+        if (!next) setQuery("");
+      }}
       title="Find a conversation"
       description="Type to narrow the list. Enter opens the one highlighted."
       /* Escape closes it, and a palette is a thing you dismiss rather than
          close — the corner X is clutter that also has to be styled. */
       showCloseButton={false}
+      shouldFilter={false}
     >
-      <CommandInput placeholder="Find a conversation…" />
+      <CommandInput
+        placeholder="Find a conversation, or something said in one…"
+        value={query}
+        onValueChange={setQuery}
+      />
       <CommandList>
-        <CommandEmpty>No conversation matches that.</CommandEmpty>
-        <CommandGroup>
-          {rows.map((row) => {
+        <CommandEmpty>Nothing matches that.</CommandEmpty>
+        <CommandGroup heading="Conversations">
+          {named.map((row) => {
             const name = row.title ?? row.first_message ?? "New conversation";
             return (
               <CommandItem
                 key={row.chat_id}
-                value={`${name} ${row.cwd ?? ""}`}
+                value={`chat-${row.chat_id}`}
                 onSelect={() => {
                   onOpenChange(false);
                   void navigate({ to: `/chats/${row.chat_id}` });
@@ -383,8 +436,47 @@ function ConversationPalette({
             );
           })}
         </CommandGroup>
+        {/* The second question, and the one a title cannot answer: a title is a summary a model
+            wrote, and what people come back for is a sentence they remember. Its own group so the
+            two never merge — retracing your own words and hunting an answer you were given are
+            different errands, and a merged list makes the second one wade through the first. */}
+        {hits.length > 0 && (
+          <CommandGroup heading="Said in a conversation">
+            {hits.map((hit) => (
+              <CommandItem
+                key={`said-${hit.turn_id}`}
+                value={`said-${hit.turn_id}`}
+                onSelect={() => {
+                  onOpenChange(false);
+                  void navigate({ to: `/chats/${hit.chat_id}` });
+                  onFound(hit.chat_id, hit.turn_id);
+                }}
+              >
+                <SaidRow hit={hit} />
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
       </CommandList>
     </CommandDialog>
+  );
+}
+
+/** One search hit: whose half it was, what it said, and which conversation it was said in. */
+function SaidRow({ hit }: { hit: SaidHit }) {
+  return (
+    <span className="chats-palette-said">
+      <span className="chats-palette-said-head">
+        <span className="chats-palette-said-who">
+          {hit.side === "asked" ? "you" : "núcleo"}
+        </span>
+        <span className="chats-palette-title">
+          {hit.title ?? "New conversation"}
+        </span>
+        <RelativeTime at={hit.created_at} />
+      </span>
+      <span className="chats-palette-said-text">{hit.excerpt}</span>
+    </span>
   );
 }
 
@@ -935,10 +1027,13 @@ function ChatDetail({
   chatId,
   summary,
   transcript,
+  find,
 }: {
   chatId: string;
   summary: ChatSummary | undefined;
   transcript: ReturnType<typeof useChatTranscript>;
+  /** A turn to scroll to, from a search. See `found` in `Chats`. */
+  find: { turnId: number; at: number } | null;
 }) {
   const seen = usePostChatSeen();
   const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
@@ -1001,6 +1096,8 @@ function ChatDetail({
             turns={transcript.data.turns}
             precededBy={(pickedUp.data?.said ?? []).length > 0}
             chatId={chatId}
+            more={transcript.data.more}
+            find={find}
             onReuse={(text) => setReuse({ text, at: Date.now() })}
           />
         )}
@@ -2996,16 +3093,29 @@ function Transcript({
   turns,
   precededBy,
   chatId,
+  more,
+  find,
   onReuse,
 }: {
   turns: Turn[];
   precededBy: boolean;
   chatId: string;
+  /** Whether there are turns older than the first one here. See `Transcript.more`. */
+  more: boolean;
+  /** A turn to scroll to, from a search. See `found` in `Chats`. */
+  find: { turnId: number; at: number } | null;
   /** Puts a question that was already asked back in the box. See `TurnBlock`. */
   onReuse: (text: string) => void;
 }) {
   const end = useRef<HTMLDivElement | null>(null);
   const last = turns.length === 0 ? null : turns[turns.length - 1];
+  const older = useOlderTurns(chatId);
+  // Which turn is lit, and the stamp of the jump that lit it. The ref, because a jump can be
+  // asked for before the conversation it belongs to has finished loading: the effect gives up
+  // and the next render tries again, and this is what stops it doing the whole thing twice.
+  const [lit, setLit] = useState<number | null>(null);
+  const jumped = useRef<number | null>(null);
+  const jumping = find !== null && jumped.current !== find.at;
   // Where this conversation was told to forget everything before, so the mark lands on the right
   // turn. Read here rather than inside each block: it is one fact about the whole transcript.
   const clearedAfter = useChatRow(chatId)?.cleared_after_run_id ?? null;
@@ -3020,8 +3130,34 @@ function Transcript({
   // `last?.status` alongside the count, because a turn that ENDS grows the page without adding a
   // row to it — the answer lands where "thinking…" was, and the bottom moves.
   useEffect(() => {
+    // Not while somebody is being taken to a turn in the middle of the conversation, and not for
+    // the couple of seconds they are looking at it. Otherwise the end-scroll and the jump fight
+    // over the same scrollbar, and the jump loses on the next poll tick.
+    if (jumping || lit !== null) return;
     end.current?.scrollIntoView({ block: "end" });
-  }, [chatId, turns.length, last?.status]);
+  }, [chatId, turns.length, last?.status, jumping, lit]);
+
+  /**
+   * The turn somebody searched for, brought into view and lit for a moment.
+   *
+   * By `id` on the element rather than through a map of refs: the id is already how the turn is
+   * addressed — one conversation is open, so `turn-7` is unique on the page — and a ref map would
+   * be a second index over the same list, kept in step by hand.
+   *
+   * A turn that is not on the page is not an error. A search can land on something older than the
+   * hundred turns the transcript holds, and what happens then is that the conversation opens at
+   * its recent end, with "earlier turns" above it. Nothing is claimed that is not true.
+   */
+  useEffect(() => {
+    if (find === null || jumped.current === find.at) return;
+    const at = document.getElementById(`turn-${find.turnId}`);
+    if (at === null) return;
+    jumped.current = find.at;
+    at.scrollIntoView({ block: "center" });
+    setLit(find.turnId);
+    const dim = setTimeout(() => setLit(null), 2500);
+    return () => clearTimeout(dim);
+  }, [find, turns.length]);
 
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
@@ -3030,6 +3166,24 @@ function Transcript({
     return <p className="chats-empty">nothing has been said yet.</p>;
   return (
     <>
+      {/* Above the oldest turn on the page, because that is where the rest of the conversation
+          is. It used to simply not be there: a hundred turns came back, the hundred-and-first was
+          dropped in silence, and nothing distinguished a conversation that began where you were
+          looking from one whose first afternoon had been cut off the top. */}
+      {more && (
+        <div className="chats-earlier">
+          <Button
+            variant="ghost"
+            disabled={older.isPending}
+            onClick={() => older.mutate()}
+          >
+            {older.isPending ? "reading…" : "Earlier turns"}
+          </Button>
+          {older.isError && (
+            <ErrorNote>the earlier turns could not be read</ErrorNote>
+          )}
+        </div>
+      )}
       <ul className="chats-turns" aria-label="Transcript">
         {turns.map((turn, index) => (
           <TurnBlock
@@ -3044,6 +3198,7 @@ function Transcript({
                open; marking the last one means it plays once, on the turn that just arrived,
                and the ones above it are already there. */
             arriving={index === turns.length - 1}
+            lit={lit === turn.id}
           />
         ))}
       </ul>
@@ -3059,6 +3214,7 @@ function TurnBlock({
   chatId,
   onReuse,
   arriving,
+  lit,
 }: {
   turn: Turn;
   previous: Turn | null;
@@ -3068,12 +3224,19 @@ function TurnBlock({
   onReuse: (text: string) => void;
   /** Whether this is the turn at the end of the thread. See `Transcript`. */
   arriving: boolean;
+  /** Whether a search just brought somebody here. See `Transcript`. */
+  lit: boolean;
 }) {
   const marks = marksBetween(previous, turn, clearedAfter);
   const live = turnIsLive(turn.status);
+  const classes = ["chats-turn"];
+  if (arriving) classes.push("chats-turn-arriving");
+  if (lit) classes.push("chats-turn-lit");
 
   return (
-    <li className={arriving ? "chats-turn chats-turn-arriving" : "chats-turn"}>
+    /* The id is how a search addresses this turn — see the jump in `Transcript`. One conversation
+       is open at a time, so a turn's own number is unique on the page. */
+    <li id={`turn-${turn.id}`} className={classes.join(" ")}>
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
@@ -3105,7 +3268,7 @@ function TurnBlock({
       <TurnPictures paths={turn.images} />
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
-      {!live && <WhatItDid did={turn.did} />}
+      {!live && <WhatItDid did={turn.did} turnId={turn.id} settled />}
       {!live && turn.answer !== null && (
         <div className="chats-turn-answer">
           <Rich text={turn.answer} />
@@ -3305,7 +3468,10 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
         <p className="chats-turn-answer chats-turn-writing">{text}</p>
       )}
       <Plan todos={planOf(live.data?.did ?? [])} />
-      <WhatItDid did={live.data?.did ?? []} />
+      {/* `settled={false}`: the answers are already on this stream — the live route reads it whole
+          on every poll — and the database column they would be fetched from is not written until
+          the turn ends. */}
+      <WhatItDid did={live.data?.did ?? []} turnId={turnId} settled={false} />
       <p className="chats-turn-live" ref={end}>
         {/* Turning, because the three words below can stand unchanged for two minutes while a
             build runs and a page that never moves is a page that looks stopped. `base.css`
@@ -3585,21 +3751,126 @@ function Plan({ todos }: { todos: Todo[] }) {
  * Absent rather than empty when there is nothing: a heading over no rows reads as a turn whose
  * actions failed to load, which is a different and worse claim than a turn that acted on nothing.
  */
-function WhatItDid({ did }: { did: ToolCall[] }) {
+/**
+ * What the turn ran — and, when you open one, what it answered.
+ *
+ * The list said what the model REACHED FOR and never what it found: `Bash` beside
+ * `cargo test dates::`, with no way to learn from the conversation whether the tests passed. The
+ * paragraph underneath is the model's summary of exactly that, and a summary is the thing somebody
+ * opening a tool call has decided not to take on trust.
+ *
+ * One open at a time. Two answers of thirty lines each, unfolded together in the middle of a
+ * transcript, is a turn nobody can read past — and the gesture is "let me check that one", not
+ * "expand everything".
+ *
+ * The answers are NOT on the transcript: see `ToolCall.result`. So this fetches them for its own
+ * turn, once, the first time anything here is opened. A live turn is the exception and carries them
+ * already — its stream is being read on every poll anyway, and it is one turn rather than a hundred.
+ */
+function WhatItDid({
+  did,
+  turnId,
+  settled,
+}: {
+  did: ToolCall[];
+  turnId: number;
+  /** Whether the turn has ended. A live turn's answers are not in the database yet. */
+  settled: boolean;
+}) {
+  const [open, setOpen] = useState<number | null>(null);
+  const tools = useTurnTools(turnId, settled && open !== null);
+  // The fetched list when there is one, and what the transcript gave otherwise. Same calls in the
+  // same order either way — the daemon reads both from one column.
+  const calls = tools.data?.did ?? did;
+
   if (did.length === 0) return null;
   return (
     <ul className="chats-turn-did" aria-label="What it did">
-      {did.map((call, index) => (
+      {did.map((call, index) => {
         // Keyed by position: this is a record of what happened, in order, and nothing reorders or
         // removes an entry. The same tool on the same file twice is two real calls, not a duplicate.
-        <li key={`${call.name}-${index}`}>
-          <span className="chats-turn-did-name">{call.name}</span>
-          {call.detail !== null && (
-            <span className="chats-turn-did-detail">{call.detail}</span>
-          )}
-        </li>
-      ))}
+        const key = `${call.name}-${index}`;
+        const shown = open === index;
+        return (
+          <li key={key}>
+            <button
+              type="button"
+              className="chats-turn-did-open"
+              aria-expanded={shown}
+              aria-label={`${call.name}${call.detail === null ? "" : ` ${call.detail}`} — what it answered`}
+              onClick={() => setOpen(shown ? null : index)}
+            >
+              <ChevronRight
+                className={
+                  shown
+                    ? "chats-turn-did-caret chats-turn-did-caret-open"
+                    : "chats-turn-did-caret"
+                }
+                aria-hidden="true"
+              />
+              <span className="chats-turn-did-name">{call.name}</span>
+              {call.detail !== null && (
+                <span className="chats-turn-did-detail">{call.detail}</span>
+              )}
+            </button>
+            {shown && (
+              <ToolAnswer
+                call={calls[index] ?? call}
+                loading={settled && tools.data === undefined && !tools.isError}
+              />
+            )}
+          </li>
+        );
+      })}
     </ul>
+  );
+}
+
+/**
+ * What one tool said back.
+ *
+ * Absence is drawn as absence rather than as an empty box, and it is not one fact: a turn recorded
+ * before the daemon kept these has nothing to show, and so does a tool that genuinely answered
+ * nothing. Neither is a failure and the line says the true, narrow thing — nothing was recorded.
+ */
+function ToolAnswer({ call, loading }: { call: ToolCall; loading: boolean }) {
+  if (loading) {
+    return <p className="chats-tool-answer-note">reading what it answered…</p>;
+  }
+  const text = call.result ?? null;
+  if (text === null || text === "") {
+    return (
+      <p className="chats-tool-answer-note">nothing was recorded for this one</p>
+    );
+  }
+  const whole = call.result_chars ?? text.length;
+  const cut = whole > text.length;
+  return (
+    <div className="chats-tool-answer">
+      <pre
+        className={
+          call.result_failed === true
+            ? "chats-tool-answer-text chats-tool-answer-failed"
+            : "chats-tool-answer-text"
+        }
+      >
+        <code>{text}</code>
+      </pre>
+      <div className="chats-tool-answer-foot">
+        {/* What is NOT being shown, said plainly. A truncation presented as the whole answer is
+            how somebody concludes a command printed nothing after the first thirty lines. */}
+        {cut && (
+          <span className="chats-tool-answer-cut">
+            the first {text.length.toLocaleString()} of{" "}
+            {whole.toLocaleString()} characters
+          </span>
+        )}
+        {call.result_failed === true && (
+          <span className="chats-tool-answer-error">it answered with an error</span>
+        )}
+        <CopyButton value={text} label="this tool's answer" />
+      </div>
+    </div>
   );
 }
 

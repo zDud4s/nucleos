@@ -30,6 +30,21 @@ export interface ToolCall {
    * other tool, and empty on any turn recorded before the daemon carried them.
    */
   todos: Todo[];
+  /**
+   * What the tool answered, cut by the daemon, or absent.
+   *
+   * Absent means three different things and the page can act on none of them apart: nothing came
+   * back, the turn predates the column, or — the ordinary case — this call arrived on the
+   * TRANSCRIPT, which deliberately strips them. See `ToolCall::result` in `core/src/runner.rs`:
+   * the transcript is polled once a second while a turn is live, and a hundred turns of tool
+   * output on that poll is a cost paid forever for something almost nobody has open. They are
+   * fetched per turn, by `useTurnTools`, when somebody opens one.
+   */
+  result?: string | null;
+  /** How long the whole answer was, in characters, so the page can say what it is not showing. */
+  result_chars?: number | null;
+  /** Whether the tool answered with an error rather than an answer. */
+  result_failed?: boolean;
 }
 
 /** One line of a plan, as the daemon read it out of a `TodoWrite`. */

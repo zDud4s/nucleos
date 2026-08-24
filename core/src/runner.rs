@@ -824,6 +824,46 @@ pub struct ToolCall {
     /// is exactly what it was.
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// What the tool answered, cut to `RESULT_LIMIT` characters, or `None` when nothing came back.
+    ///
+    /// Until this existed a turn said what it REACHED FOR and never what it found: `Bash` beside
+    /// `cargo test dates::` with no way to learn, from the conversation, whether the tests passed.
+    /// The model's paragraph underneath is a summary of this, and a summary is exactly the thing
+    /// somebody opening a tool call has decided not to take on trust.
+    ///
+    /// Cut, because a `Read` of a three-thousand-line file answers with the file. The full length
+    /// is kept beside it in `result_chars`, so the window can say what it is NOT showing rather
+    /// than present a truncation as the whole answer.
+    ///
+    /// **Not on the transcript.** `ToolCall::without_result` strips this before the turn list is
+    /// serialised, and the answers are fetched per turn on request — the transcript route is
+    /// polled at a live turn's cadence, and a hundred turns of tool output on a one-second poll
+    /// is a cost paid forever for something almost nobody has open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// How long the whole answer was, in characters. `None` when nothing came back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_chars: Option<i64>,
+    /// Whether the tool answered with an error rather than an answer.
+    ///
+    /// Its own field and not inferred from the text: "the command failed" and "the command printed
+    /// something that mentions an error" are different facts, and only the stream knows which this
+    /// was. False on every turn recorded before the field existed, which is the honest default —
+    /// nothing about those rows says a tool failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result_failed: bool,
+}
+
+impl ToolCall {
+    /// The same call with its answer removed, for the transcript. See `result`.
+    pub(crate) fn without_result(self) -> Self {
+        Self {
+            result: None,
+            result_chars: None,
+            result_failed: false,
+            ..self
+        }
+    }
 }
 
 /// One line of a plan.
@@ -871,6 +911,34 @@ fn plan_of(name: &str, input: Option<&serde_json::Value>) -> Vec<Todo> {
 
 /// The longest detail kept. A command line can be a heredoc.
 const DETAIL_LIMIT: usize = 120;
+
+/// The longest tool answer kept.
+///
+/// Two thousand characters is about thirty lines: enough for a test summary, a short diff or the
+/// head of a compiler's complaint, which is what somebody opening a tool call is looking for. A
+/// `Read` answers with a whole file and a `Grep` with every hit, and neither belongs in a row of
+/// a database that is read back in full every time a conversation is opened.
+const RESULT_LIMIT: usize = 2000;
+
+/// What a `tool_result` block actually said, flattened.
+///
+/// The CLI sends `content` two ways — a bare string, or an array of content blocks — and both are
+/// ordinary. Anything else comes back as `None` rather than as a JSON dump: a window showing the
+/// serialisation of a shape this daemon did not recognise is worse than one showing nothing.
+fn result_text(content: Option<&serde_json::Value>) -> Option<String> {
+    match content? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
 
 /// The argument of a tool call worth showing beside its name.
 ///
@@ -933,6 +1001,11 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
     let mut pondering = String::new();
     let mut doing: Option<String> = None;
     let mut did: Vec<ToolCall> = Vec::new();
+    // The `tool_use` id of each call in `did`, by the same index. Parallel rather than a field on
+    // `ToolCall`, because the id is a fact about this stream and not about the call: it is used to
+    // pair an answer with the question that asked it, and then it is finished with. A field would
+    // put it in the database and in the window, where nothing would ever read it.
+    let mut called: Vec<Option<String>> = Vec::new();
 
     for line in stream.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -1009,7 +1082,16 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                         name: name.to_string(),
                         detail: block.get("input").and_then(detail_of),
                         todos: plan_of(name, block.get("input")),
+                        result: None,
+                        result_chars: None,
+                        result_failed: false,
                     });
+                    called.push(
+                        block
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .map(str::to_string),
+                    );
                     doing = Some(name.to_string());
                 }
                 // The message that just completed is the one those deltas were writing — both
@@ -1022,14 +1104,40 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
             // A tool answering is the only thing that ends a tool call. Clearing this anywhere else
             // would show the model as writing while a command is still running.
             Some("user") => {
-                let returned = value
+                let mut returned = false;
+                for block in value
                     .pointer("/message/content")
                     .and_then(|c| c.as_array())
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|block| {
-                            block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        })
-                    });
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| {
+                        block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    })
+                {
+                    returned = true;
+                    // Paired by id and never by position. A turn can have two tool calls in flight
+                    // at once — the CLI runs them concurrently — and answers arrive in whatever
+                    // order the tools finish, so "the most recent call" is wrong exactly when it
+                    // matters. An answer whose id names no call this stream made is dropped: it
+                    // belongs to something that is not in this list.
+                    let Some(index) = block
+                        .get("tool_use_id")
+                        .and_then(|id| id.as_str())
+                        .and_then(|id| called.iter().position(|made| made.as_deref() == Some(id)))
+                    else {
+                        continue;
+                    };
+                    let Some(text) = result_text(block.get("content")) else {
+                        continue;
+                    };
+                    let call = &mut did[index];
+                    call.result_chars = Some(text.chars().count() as i64);
+                    call.result = Some(text.chars().take(RESULT_LIMIT).collect());
+                    call.result_failed = block
+                        .get("is_error")
+                        .and_then(|flag| flag.as_bool())
+                        .unwrap_or(false);
+                }
                 if returned {
                     doing = None;
                 }
@@ -4100,6 +4208,189 @@ mod tests {
 
     fn said(text: &str) -> serde_json::Value {
         serde_json::json!([{"type": "text", "text": text}])
+    }
+
+    /* ------------------------------------------- what a tool answered -- */
+
+    /// One `tool_result`, as the CLI sends one.
+    fn answered(tool_use_id: &str, content: serde_json::Value, is_error: bool) -> String {
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error
+            }]}
+        })
+        .to_string()
+    }
+
+    /// A turn said what it REACHED FOR and never what it found.
+    ///
+    /// `Bash` beside `cargo test dates::`, with no way to learn from the conversation whether the
+    /// tests passed — the paragraph underneath is the model's summary of exactly that, and a
+    /// summary is what somebody opening a tool call has decided not to take on trust.
+    #[test]
+    fn a_tool_call_carries_what_the_tool_answered() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": "cargo test dates::"}
+            }])),
+            answered("toolu_1", serde_json::json!("test result: ok. 3 passed"), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.did.len(), 1);
+        assert_eq!(live.did[0].result.as_deref(), Some("test result: ok. 3 passed"));
+        assert_eq!(live.did[0].result_chars, Some(24));
+        assert!(!live.did[0].result_failed);
+        // And the tool has stopped running, which is the behaviour that was already here.
+        assert_eq!(live.doing, None);
+    }
+
+    /// Paired by id and never by position.
+    ///
+    /// The CLI runs tool calls concurrently, so answers arrive in whatever order the tools finish
+    /// — "the most recent call" is wrong exactly when it matters, and the failure is quiet: two
+    /// real answers, each filed under the other's question.
+    #[test]
+    fn two_tools_in_flight_get_their_own_answers_back() {
+        let stream = [
+            message(serde_json::json!([
+                {"type": "tool_use", "id": "toolu_slow", "name": "Bash",
+                 "input": {"command": "cargo test"}},
+                {"type": "tool_use", "id": "toolu_fast", "name": "Read",
+                 "input": {"file_path": "core/src/dates.rs"}}
+            ])),
+            // The second call answers first, which is the whole point of this test.
+            answered("toolu_fast", serde_json::json!("fn is_leap_year"), false),
+            answered("toolu_slow", serde_json::json!("test result: ok"), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.did[0].name, "Bash");
+        assert_eq!(live.did[0].result.as_deref(), Some("test result: ok"));
+        assert_eq!(live.did[1].name, "Read");
+        assert_eq!(live.did[1].result.as_deref(), Some("fn is_leap_year"));
+    }
+
+    /// A `Read` answers with the whole file, and the whole file does not go in a database row.
+    ///
+    /// The full length travels beside the cut so the window can say what it is NOT showing — a
+    /// truncation presented as the whole answer is how somebody concludes a command printed
+    /// nothing after the first thirty lines.
+    #[test]
+    fn a_long_answer_is_cut_and_says_how_long_it_really_was() {
+        let whole = "x".repeat(RESULT_LIMIT + 500);
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Read",
+                "input": {"file_path": "big.rs"}
+            }])),
+            answered("toolu_1", serde_json::json!(whole), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.did[0].result.as_ref().map(|kept| kept.chars().count()), Some(RESULT_LIMIT));
+        assert_eq!(live.did[0].result_chars, Some((RESULT_LIMIT + 500) as i64));
+    }
+
+    /// "The command failed" and "the command printed something that mentions an error" are
+    /// different facts, and only the stream knows which this was.
+    #[test]
+    fn a_tool_that_failed_is_recorded_as_having_failed() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": "cargo test"}
+            }])),
+            answered("toolu_1", serde_json::json!("error: could not compile"), true),
+        ]
+        .join("\n");
+
+        assert!(live_from_stream(&stream).did[0].result_failed);
+    }
+
+    /// The CLI sends `content` two ways, and both are ordinary.
+    #[test]
+    fn an_answer_sent_as_blocks_reads_back_as_its_text() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Grep", "input": {"pattern": "leap"}
+            }])),
+            answered(
+                "toolu_1",
+                serde_json::json!([{"type": "text", "text": "core/src/dates.rs:12"}]),
+                false,
+            ),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            live_from_stream(&stream).did[0].result.as_deref(),
+            Some("core/src/dates.rs:12")
+        );
+    }
+
+    /// An answer whose id names no call this stream made belongs to something that is not in this
+    /// list, and is dropped rather than attached to whatever happened to be nearest.
+    #[test]
+    fn an_answer_to_a_call_this_stream_never_made_is_dropped() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a.rs"}
+            }])),
+            answered("toolu_somebody_else", serde_json::json!("not ours"), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+        assert_eq!(live.did[0].result, None);
+        // It still ended the wait: a tool answered, whichever one it was.
+        assert_eq!(live.doing, None);
+    }
+
+    /// A turn recorded before any of this existed still reads back.
+    ///
+    /// `tools_used` is stored JSON, and every row already in the database is a call with none of
+    /// these three fields. They default to absent, which is exactly what those turns knew.
+    #[test]
+    fn a_stored_call_from_before_the_answers_existed_still_parses() {
+        let old: ToolCall =
+            serde_json::from_str(r#"{"name":"Read","detail":"core/src/dates.rs"}"#).unwrap();
+
+        assert_eq!(old.name, "Read");
+        assert_eq!(old.result, None);
+        assert_eq!(old.result_chars, None);
+        assert!(!old.result_failed);
+    }
+
+    /// And a call with nothing to say about its answer says nothing on the wire.
+    ///
+    /// `skip_serializing_if` is what keeps the transcript the size it was: three null fields per
+    /// call, over a hundred turns, on a route polled once a second.
+    #[test]
+    fn a_call_without_an_answer_serialises_without_the_fields() {
+        let bare = ToolCall {
+            name: "Read".to_string(),
+            detail: None,
+            todos: Vec::new(),
+            result: None,
+            result_chars: None,
+            result_failed: false,
+        };
+
+        let json = serde_json::to_string(&bare).unwrap();
+
+        assert!(!json.contains("result"), "the empty answer was serialised: {json}");
     }
 
     #[test]
