@@ -2793,13 +2793,55 @@ async fn get_email_config(State(state): State<AppState>) -> Json<EmailConfigView
     })
 }
 
-async fn get_projects(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<ProjectSummary>>, StatusCode> {
-    autopilot::project_roster(&state.pool)
+/// One roster row, plus the one thing about it that is not in the database.
+///
+/// `#[serde(flatten)]` so the wire shape stays the summary with a field added, rather than a
+/// nesting the shell would have to reach through — the same arrangement `GraphView` uses.
+#[derive(serde::Serialize)]
+struct RosterEntry {
+    /// Whether the recorded folder is actually on the disk.
+    ///
+    /// **Three states and not two, because the page that reads this used to collapse two of them.**
+    /// `None` means no folder was ever named — the project exists in the daemon and nobody has
+    /// pointed it anywhere, which is a thing to finish, not a thing that broke. `Some(false)` means
+    /// a folder WAS named and is not there, which is a thing that broke. `Some(true)` is fine.
+    ///
+    /// Answered here rather than by the shell, which used to ask for a directory listing per
+    /// project to find this out: on a roster of twenty-five that was twenty-five requests on every
+    /// load, to learn one bit each. It is also what makes the page's headline and its rows agree —
+    /// the headline counted *recorded roots* and the rows probed the *folder*, both worded
+    /// "folder", so a roster could say "all with a folder" above seven rows saying it was gone.
+    root_exists: Option<bool>,
+    #[serde(flatten)]
+    summary: ProjectSummary,
+}
+
+async fn get_projects(State(state): State<AppState>) -> Result<Json<Vec<RosterEntry>>, StatusCode> {
+    let summaries = autopilot::project_roster(&state.pool)
         .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    /*
+       On the blocking pool, and it is not superstition: this route is polled every three seconds,
+       most of these roots are ordinary local folders answering in microseconds, and one of them on
+       a disconnected network share is a `stat` that blocks for as long as the OS feels like. One
+       such project would stall the executor thread this future is on, for every caller.
+    */
+    tokio::task::spawn_blocking(move || {
+        summaries
+            .into_iter()
+            .map(|summary| RosterEntry {
+                root_exists: summary
+                    .project_root
+                    .as_deref()
+                    .map(|root| std::path::Path::new(root).is_dir()),
+                summary,
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn get_concurrency(
@@ -15703,6 +15745,73 @@ mod tests {
             .unwrap();
         let readout: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(readout["status"], "down");
+    }
+
+    /// **Three states for the folder, and the shell used to have to ask for each one.**
+    ///
+    /// It made a directory-listing request per project to find out — twenty-five requests on a
+    /// twenty-five project roster, to learn one bit each — and its headline counted *recorded roots*
+    /// while its rows probed *folders*, both worded "folder", so the page could say "all with a
+    /// folder" above seven rows saying it was gone.
+    ///
+    /// `null` is not `false`: a project nobody has pointed anywhere is unfinished, and one whose
+    /// folder has moved is broken. They send a person to two different places.
+    #[tokio::test]
+    async fn the_roster_says_whether_each_folder_is_actually_there() {
+        let state = test_state().await;
+        let here = tempfile::tempdir().unwrap();
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, ?)",
+        )
+        .bind("rooted")
+        .bind("shadow")
+        .bind(here.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, ?)",
+        )
+        .bind("moved")
+        .bind("shadow")
+        .bind(here.path().join("gone").to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('unset', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|row| row["project_id"] == id)
+                .unwrap()
+                .clone()
+        };
+
+        assert_eq!(by_id("rooted")["root_exists"], serde_json::json!(true));
+        assert_eq!(by_id("moved")["root_exists"], serde_json::json!(false));
+        assert_eq!(by_id("unset")["root_exists"], serde_json::Value::Null);
+        // Flattened, not nested: the shell reads one object per project, as it always did.
+        assert_eq!(by_id("rooted")["mode"], "shadow");
     }
 
     #[tokio::test]

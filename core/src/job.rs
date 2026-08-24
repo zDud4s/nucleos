@@ -8011,6 +8011,8 @@ mod tests {
             open_proposals: 0,
             wip_limit: None,
             queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
         }
     }
 

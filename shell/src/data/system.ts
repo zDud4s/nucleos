@@ -43,6 +43,26 @@ export interface ProjectSummary {
   open_proposals: number;
   wip_limit: number | null;
   queue_full: boolean;
+  /**
+   * Whether the recorded folder is actually on the disk, answered by the daemon.
+   *
+   * **Three states, and `data/roster.ts` keeps them three.** `null` means no folder was ever named,
+   * which is unfinished; `false` means one was named and is not there, which is broken. The roster
+   * used to work this out by asking for a directory listing per project — twenty-five requests on
+   * every load to learn one bit each — and its headline counted recorded roots while its rows
+   * probed folders, so the two could contradict each other on screen.
+   *
+   * Optional because the shell can be newer than the daemon: absent reads as `null`, which says
+   * "not named" rather than inventing a folder that is there.
+   */
+  root_exists?: boolean | null;
+  /**
+   * What this project's gate last said, and when — `passed`, `failed`, `errored`, or absent.
+   *
+   * Absent is not a fourth failure: a project with no gate command has no definition of green.
+   */
+  last_gate?: string | null;
+  last_gate_at?: string | null;
 }
 
 export interface Proposal {

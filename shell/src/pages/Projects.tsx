@@ -2,11 +2,9 @@ import { useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
-  REACHABILITY_TEXT,
   joinPath,
   pathSegments,
   pathUpTo,
-  readReachability,
   scheduleCapped,
   scheduleNeverFires,
   useProjectCat,
@@ -20,7 +18,7 @@ import {
   type RepoTriggerView,
   type ScheduleView,
 } from "../data/projects";
-import { useProjects, type ProjectSummary } from "../data/system";
+import { useProjects } from "../data/system";
 import {
   Badge,
   Button,
@@ -29,8 +27,6 @@ import {
   Panel,
   RefusalNote,
   RelativeTime,
-  StaleNote,
-  Teach,
 } from "../ui";
 import "./projects.css";
 
@@ -118,137 +114,53 @@ export function Projects() {
   const projectId = params.projectId ?? null;
   const view = normaliseView(params.view);
   const project = rows.find((row) => row.project_id === projectId);
-  const stale = projects.isError && projects.data !== undefined;
+
+  /*
+    This page is the inspector and nothing else. It used to draw the whole roster above itself —
+    twenty-five chips carried down the page every time somebody opened one project's file tree —
+    and that roster is now `Roster` on `/projects`, which is the page whose question it answers.
+    The route always carries an id; the guard is for a URL typed by hand.
+  */
+  if (projectId === null) {
+    return (
+      <>
+        <PageHeader title="Inspect" />
+        <p className="pj-absence" role="status">
+          This page looks inside one project. Choose one on <Link to="/projects">Projects</Link>.
+        </p>
+      </>
+    );
+  }
 
   return (
     <>
-      <PageHeader title="Projects" headline={headlineFor(rows, projects.data !== undefined)} />
+      <PageHeader title={projectId} headline="reading the folder as it is on disk right now" />
 
       {/*
-        The door to adding one. Here rather than in the rail, because the rail is the design's fixed
-        list of places and this is an action taken from the list of what exists — and because the
-        first thing anybody does on an empty roster is look at the roster.
+        Both ways back, because they are different places: the workspace is this project seen
+        through the app's own readings, and the roster is every project. Somebody who arrived here
+        from the Código mode wants the first.
       */}
       <p className="pj-add">
-        <Link to="/projects/new">Add a project…</Link>
+        <Link to="/projects/$projectId/$view" params={{ projectId, view: "codigo" }}>
+          ‹ back to {projectId}
+        </Link>
+        {" · "}
+        <Link to="/projects">all projects</Link>
       </p>
 
-      {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
-      {projects.isError && projects.data === undefined && <RosterError error={projects.error} />}
-
-      <ProjectPicker rows={rows} answered={projects.data !== undefined} selected={projectId} view={view} />
-
-      {projectId === null && (
-        <Teach title="Choose a project">
-          <p>
-            This page is a window onto one project at a time: what it will do without being asked,
-            and what is in its folder right now. Nothing here changes a file — the only thing this
-            page writes is the ceiling on how much unreviewed work a project may be holding.
-          </p>
-        </Teach>
-      )}
-
-      {projectId !== null && (
-        <>
-          <ViewTabs projectId={projectId} view={view} />
-          {/* Keyed on the project so a folder, a query and an open file all reset
-              when the subject changes. Without the key, switching projects would
-              carry one project's path into another's tree and ask for a folder
-              that is not there. */}
-          <ProjectViews
-            key={projectId}
-            projectId={projectId}
-            projectRoot={project?.project_root ?? null}
-            view={view}
-          />
-        </>
-      )}
+      <ViewTabs projectId={projectId} view={view} />
+      {/* Keyed on the project so a folder, a query and an open file all reset
+          when the subject changes. Without the key, switching projects would
+          carry one project's path into another's tree and ask for a folder
+          that is not there. */}
+      <ProjectViews
+        key={projectId}
+        projectId={projectId}
+        projectRoot={project?.project_root ?? null}
+        view={view}
+      />
     </>
-  );
-}
-
-function headlineFor(rows: ProjectSummary[], answered: boolean): string | undefined {
-  if (!answered) return undefined;
-  if (rows.length === 0) return "the núcleo knows of no project";
-  const rooted = rows.filter((row) => row.project_root !== null).length;
-  return rooted === rows.length
-    ? `${rows.length} ${rows.length === 1 ? "project" : "projects"}, all with a folder`
-    : `${rows.length} ${rows.length === 1 ? "project" : "projects"}, ${rows.length - rooted} without a folder`;
-}
-
-function RosterError({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the roster</ErrorNote>;
-}
-
-/* ------------------------------------------------------------- the picker -- */
-
-function ProjectPicker({
-  rows,
-  answered,
-  selected,
-  view,
-}: {
-  rows: ProjectSummary[];
-  answered: boolean;
-  selected: string | null;
-  view: ProjectView;
-}) {
-  if (!answered) return <p className="pj-loading">reading the roster…</p>;
-  if (rows.length === 0) {
-    return <p className="pj-empty">no project has been registered with the núcleo.</p>;
-  }
-  return (
-    <ul className="pj-picker" aria-label="Projects">
-      {rows.map((project) => (
-        <ProjectChip
-          key={project.project_id}
-          project={project}
-          active={project.project_id === selected}
-          view={view}
-        />
-      ))}
-    </ul>
-  );
-}
-
-/**
- * One project, with its mode and whether its folder is actually there.
- *
- * The reachability is a real probe — the project's own listing of its root —
- * and not a guess from the presence of a string. A recorded root is a row in a
- * table; the folder it names is on a disk somebody may have reorganised, and
- * the difference between those two is exactly what a person hunting a broken
- * project needs to be told first.
- *
- * A project with no recorded root is not probed at all. The route would answer
- * 404 for it, and that 404 means *you have not named a folder* rather than *the
- * folder is gone* — the two must not read the same.
- */
-function ProjectChip({
-  project,
-  active,
-  view,
-}: {
-  project: ProjectSummary;
-  active: boolean;
-  view: ProjectView;
-}) {
-  const probe = useProjectLs(project.project_id, "", project.project_root !== null);
-  const reach = readReachability(project.project_root, probe);
-
-  return (
-    <li className={active ? "pj-chip pj-chip-active" : "pj-chip"}>
-      <Link className="pj-chip-link" to={inspectPath(project.project_id, view)}>
-        <span className="pj-chip-name">{project.project_id}</span>
-      </Link>
-      <Badge tone={project.mode === "active" ? "active" : project.mode === "shadow" ? "shadow" : "off"}>
-        {project.mode}
-      </Badge>
-      <Badge tone={reach === "ok" ? "active" : reach === "gone" ? "danger" : reach === "failed" ? "paused" : "off"}>
-        {REACHABILITY_TEXT[reach]}
-      </Badge>
-    </li>
   );
 }
 
