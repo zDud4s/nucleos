@@ -10,6 +10,7 @@ import "./ui.css";
 import "./app.css";
 import { createAppQueryClient } from "./app/queryClient";
 import { createAppRouter } from "./router";
+import { adoptStyleNonce } from "./lib/style-nonce";
 
 /**
  * Import order is the cascade order, and it is fixed here rather than by
@@ -27,6 +28,14 @@ import { createAppRouter } from "./router";
  * handed down. Building either inside a component would throw the app's entire
  * state away on any re-render of the root.
  */
+/*
+  Before anything renders, because the first modal can open before any effect would have run. What
+  it does and why the window has a nonce to give at all is argued in `lib/style-nonce.ts`; the
+  short version is that Radix locks scrolling by injecting a <style>, and `style-src 'self'`
+  refuses one in a packaged build and nowhere else.
+*/
+adoptStyleNonce();
+
 const queryClient = createAppQueryClient();
 const router = createAppRouter();
 

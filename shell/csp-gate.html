@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>NucleOS — CSP gate</title>
+    <!-- The same nonce channel `index.html` carries; see src/lib/style-nonce.ts. -->
+    <style></style>
+  </head>
+
+  <!--
+    A second entry, built by `csp-gate.vite.config.mjs` into `dist-csp-gate/` and never by the app's
+    own build: `dist/` is embedded into the Tauri binary at compile time and must hold the app and
+    nothing else. Nothing in `src/` imports anything under `src/csp-gate/`, so none of this reaches
+    the shipped bundle either.
+  -->
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/csp-gate/main.tsx"></script>
+  </body>
+</html>
