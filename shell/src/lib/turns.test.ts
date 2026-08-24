@@ -161,46 +161,63 @@ describe("anyTurnLive", () => {
 
 describe("marksBetween", () => {
   it("draws nothing before the transcript's first turn", () => {
-    expect(marksBetween(null, turn())).toEqual([]);
+    expect(marksBetween(null, turn(), null)).toEqual([]);
   });
 
   it("emits no brain mark when either answered_by is null", () => {
     const a = turn({ answeredBy: null });
     const b = turn({ answeredBy: "cloud" });
-    expect(marksBetween(a, b)).toEqual([]);
-    expect(marksBetween(b, a)).toEqual([]);
+    expect(marksBetween(a, b, null)).toEqual([]);
+    expect(marksBetween(b, a, null)).toEqual([]);
   });
 
   it("emits an asymmetric brain mark for cloud to local and local to cloud", () => {
     const cloud = turn({ answeredBy: "cloud" });
     const local = turn({ answeredBy: "local" });
 
-    expect(marksBetween(cloud, local)).toEqual([{ kind: "brain", from: "cloud", to: "local" }]);
-    expect(marksBetween(local, cloud)).toEqual([{ kind: "brain", from: "local", to: "cloud" }]);
+    expect(marksBetween(cloud, local, null)).toEqual([{ kind: "brain", from: "cloud", to: "local" }]);
+    expect(marksBetween(local, cloud, null)).toEqual([{ kind: "brain", from: "local", to: "cloud" }]);
   });
 
   it("emits no brain mark when the model did not change", () => {
     const first = turn({ answeredBy: "cloud" });
     const second = turn({ answeredBy: "cloud" });
-    expect(marksBetween(first, second)).toEqual([]);
+    expect(marksBetween(first, second, null)).toEqual([]);
   });
 
   it("emits a restart mark on a changed session_id", () => {
     const first = turn({ sessionId: "s-1" });
     const second = turn({ sessionId: "s-2" });
-    expect(marksBetween(first, second)).toEqual([{ kind: "restart" }]);
+    expect(marksBetween(first, second, null)).toEqual([{ kind: "restart" }]);
   });
 
   it("emits no restart mark when either session_id is null, or when they match", () => {
-    expect(marksBetween(turn({ sessionId: null }), turn({ sessionId: "s-1" }))).toEqual([]);
-    expect(marksBetween(turn({ sessionId: "s-1" }), turn({ sessionId: null }))).toEqual([]);
-    expect(marksBetween(turn({ sessionId: "s-1" }), turn({ sessionId: "s-1" }))).toEqual([]);
+    expect(marksBetween(turn({ sessionId: null }), turn({ sessionId: "s-1" }), null)).toEqual([]);
+    expect(marksBetween(turn({ sessionId: "s-1" }), turn({ sessionId: null }), null)).toEqual([]);
+    expect(marksBetween(turn({ sessionId: "s-1" }), turn({ sessionId: "s-1" }), null)).toEqual([]);
+  });
+
+  it("emits a clear mark on the turn after the cut, and not before it", () => {
+    const before = turn({ id: 1, sessionId: "s-1" });
+    const after = turn({ id: 2, sessionId: "s-2" });
+    expect(marksBetween(before, after, 1)).toEqual([{ kind: "cleared" }]);
+    // The cut is one place in the transcript, not a state the rest of it is in.
+    expect(marksBetween(turn({ id: 2, sessionId: "s-2" }), turn({ id: 3, sessionId: "s-2" }), 1))
+      .toEqual([]);
+  });
+
+  it("says cleared instead of restarted, never both", () => {
+    // A clear restarts the session too, so both rules match one event. The restart note promises
+    // the model "was read the last few exchanges back" — which is exactly what a clear makes
+    // untrue, so it must not be the note that gets drawn.
+    const marks = marksBetween(turn({ id: 1, sessionId: "s-1" }), turn({ id: 2, sessionId: "s-2" }), 1);
+    expect(marks).toEqual([{ kind: "cleared" }]);
   });
 
   it("can emit both marks together, at most two", () => {
     const previous = turn({ answeredBy: "cloud", sessionId: "s-1" });
     const next = turn({ answeredBy: "local", sessionId: "s-2" });
-    expect(marksBetween(previous, next)).toEqual([
+    expect(marksBetween(previous, next, null)).toEqual([
       { kind: "brain", from: "cloud", to: "local" },
       { kind: "restart" },
     ]);

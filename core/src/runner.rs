@@ -189,6 +189,78 @@ pub struct RunRequest {
     pub ambient_mcp: bool,
     /// Per-run override of the runner's configured model. `None` keeps it.
     pub model: Option<String>,
+    /// How hard this run asks the model to think, or `None` for the CLI's own default.
+    ///
+    /// `low | medium | high | xhigh | max`, validated where it is CHOSEN and not here: this struct
+    /// is built by seven callers and a check in each is seven places for the list to drift. What
+    /// reaches this field has already been checked against `config::EFFORT_LEVELS`, and a value
+    /// that somehow was not is refused by the CLI at spawn — loudly, which is the safe direction.
+    ///
+    /// Honoured only by the agent CLI. `OllamaRunner` has no such notion and drops it, which is why
+    /// a local choice carries no effort levels rather than letting the window offer a dial that
+    /// turns nothing.
+    pub effort: Option<String>,
+    /// Who answers when the chosen model is overloaded or unavailable, tried in the order given.
+    ///
+    /// Beside `model` and not inside it: one says who SHOULD answer and the other who may answer
+    /// instead, and one string holding both would make "no fallback" and "no model" the same
+    /// absence. Empty is no fallback, which is what every run in this daemon has always had.
+    pub fallback_model: Vec<String>,
+    /// Directories this run's tools may reach beyond its `cwd`. Empty is the established behaviour.
+    ///
+    /// `cwd` is where the run happens; these are places it may also look. The distinction matters
+    /// because only one of them can be the working directory, and a person working across a
+    /// repository and the notes folder beside it should not have to choose which half is visible.
+    pub add_dirs: Vec<PathBuf>,
+    /// The most one invocation of the CLI may spend, or `None` for no ceiling.
+    ///
+    /// Per RUN, which in this daemon is per turn — the CLI's own flag bounds a single invocation.
+    /// It is emphatically not a conversation total: ten turns at the ceiling cost ten times it. The
+    /// column behind it is named `turn_budget_usd` for the same reason.
+    ///
+    /// A ceiling the CLI enforces, unlike `max_turns` a few fields up, which this daemon counts
+    /// itself because the CLI has no flag for it.
+    pub max_budget_usd: Option<f64>,
+    /// The helpers this run may hand work to, beyond the ones the CLI finds in `.claude/agents/`.
+    ///
+    /// Additive, not a replacement: measured against CLI 2.1.198, `--agents` builds definitions
+    /// tagged `flagSettings` and merges them with the ones discovered on disk. A conversation with
+    /// its own reviewer still has the project's.
+    ///
+    /// Empty is the established behaviour and writes no flag at all — which matters more here than
+    /// elsewhere, because the CLI parses this JSON in a try/catch and answers a throw with an EMPTY
+    /// agent list. Writing `--agents {}` would therefore not be a harmless no-op to reason about.
+    ///
+    /// Honoured only by the agent CLI, like `effort`. `OllamaRunner` has no notion of a subagent.
+    pub agents: Vec<Subagent>,
+    /// Standing instructions for this run, appended to the CLI's own system prompt.
+    ///
+    /// APPENDED and never substituted. `--system-prompt` exists too and is deliberately not
+    /// reachable from here: it replaces the CLI's own, which carries the tool descriptions and the
+    /// safety framing, and a run that lost those reads as a run whose model got worse.
+    ///
+    /// Per invocation, which in this daemon is per turn — so a conversation's instructions travel
+    /// on every one of its turns. Sending them only on the first would make them apply to the
+    /// opening message and quietly stop mattering, which is the hardest kind of wrong to notice
+    /// because the first answer is right.
+    pub append_system_prompt: Option<String>,
+    /// Built-in tools this run may not reach for, on top of whatever `tool_policy` already denies.
+    ///
+    /// Only ever takes something away. The allow-listing flag beside it does not restrict anything
+    /// — it GRANTS permission on top of what is already allowed, which `BUILTIN_TOOLS` measured —
+    /// so there is no widening version of this field to get wrong.
+    ///
+    /// Merged with the policy's own denials into ONE flag by `cli_args`. `--disallowedTools` is
+    /// variadic, so a second occurrence REPLACES the first: two flags would be a per-run preference
+    /// silently undoing a safety property.
+    pub denied_tools: Vec<String>,
+    /// What to call this run's session where the CLI shows sessions, or `None` for nameless.
+    ///
+    /// Cosmetic and nothing else: it reaches the `--resume` picker and the terminal title, and no
+    /// decision anywhere depends on it. Carried because every session this daemon has ever minted
+    /// is nameless there, so a person looking at their own machine sees a wall of timestamps where
+    /// this app's conversations are.
+    pub session_name: Option<String>,
     /// Which of this server's tools this run is offered, when it is offered any at all.
     ///
     /// `None` — every caller but one — keeps the wildcard: `--allowedTools mcp__nucleos__*`, the
@@ -361,7 +433,7 @@ fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option
 /// advertises it and `advertised_tools_violate` kills the run at the `init` event. The tool set can
 /// move underneath a version that never changed, which means the version number is not the signal:
 /// the stderr line naming the offending tools is.
-const BUILTIN_TOOLS: &[&str] = &[
+pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Agent",
     "Artifact",
     "AskUserQuestion",
@@ -409,6 +481,66 @@ const BUILTIN_TOOLS: &[&str] = &[
     "Write",
 ];
 
+/// One helper a conversation may hand work to, as `--agents` takes it.
+///
+/// The field names ARE the CLI's JSON keys, which is why they are not this codebase's usual prose
+/// names: `description` is what the main model reads to decide whether to delegate — the CLI calls
+/// it `whenToUse` internally — and `prompt` is the system prompt that helper runs under. Renaming
+/// either here would mean a translation layer, and a translation layer is where a key goes missing.
+///
+/// `name` is carried IN the struct although the flag wants it as the object's key. The window edits
+/// a list of helpers and a list has an order and an index; an object has neither, and re-deriving
+/// the name from a map key at every layer is how a rename comes to lose a helper.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Subagent {
+    /// What the main model calls this helper by.
+    ///
+    /// `default` because this struct is read back out of the stored object, where the name is the
+    /// KEY and not a field — `subagents_from` puts it back. It is serialised normally, because the
+    /// window is the other reader of this type and a list of anonymous helpers is not a list
+    /// anybody can edit; `agents_json` is the one place that drops it, on its way to the flag.
+    #[serde(default)]
+    pub name: String,
+    /// What this helper is for, in the main model's words. The one field that decides whether it is
+    /// ever used at all: the CLI hands this to the parent as the reason to delegate.
+    pub description: String,
+    /// The system prompt this helper runs under.
+    pub prompt: String,
+    /// Which model answers as this helper, or `None` to inherit the conversation's.
+    ///
+    /// Absent rather than the CLI's literal `"inherit"`: absence already means it, and offering two
+    /// spellings of one state is two states to keep agreeing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard this helper is asked to think, or `None` for whatever its model does by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// The `--agents` value for a set of helpers: an object keyed by name.
+///
+/// Public because the door checks the SIZE of what it is about to store, and the size that matters
+/// is the size of this string — a helper set is one argv element, and Windows caps a whole command
+/// line at 32767 characters. Measuring the struct instead would measure the wrong thing.
+///
+/// Serialisation cannot fail for these types, so a failure answers with the empty object rather
+/// than panicking: no custom helpers is a state the run survives, and it is what a conversation
+/// that never defined any already has.
+pub fn agents_json(agents: &[Subagent]) -> String {
+    let object: serde_json::Map<String, serde_json::Value> = agents
+        .iter()
+        .filter_map(|agent| {
+            let mut body = serde_json::to_value(agent).ok()?;
+            // The name is the key here, not a field of the value. Dropped rather than left for the
+            // CLI's schema to strip: it strips unknown keys today, and a contract that holds only
+            // because the other side is forgiving is one that breaks when it stops being.
+            body.as_object_mut()?.remove("name");
+            Some((agent.name.clone(), body))
+        })
+        .collect();
+    serde_json::to_string(&object).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// The full `claude` argument vector for one run. Pure, so the flags that decide what a run can
 /// reach are asserted in tests instead of inspected on a live process.
 pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
@@ -424,6 +556,55 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
     }
     args.push("--model".to_string());
     args.push(model.to_string());
+    // Beside `--model`, and conditional like the session flags below it rather than up with
+    // `--exclude-dynamic-system-prompt-sections`: that one's comment reserves the position
+    // immediately after `--verbose`, and this must not be what pushes it out of place.
+    if let Some(effort) = &request.effort {
+        args.push("--effort".to_string());
+        args.push(effort.clone());
+    }
+    // Comma-separated, as the CLI takes it. Documented "(only works with --print)", which every run
+    // here is: `-p` is the first thing this function pushes and there is no path that omits it.
+    if !request.fallback_model.is_empty() {
+        args.push("--fallback-model".to_string());
+        args.push(request.fallback_model.join(","));
+    }
+    // `--add-dir` is variadic — it swallows every following argument until the next flag — so it is
+    // written here, among the `--flag value` pairs, and never before the prompt. On the argv path
+    // the prompt is a POSITIONAL pushed second, and a variadic flag placed above it would eat it.
+    if !request.add_dirs.is_empty() {
+        args.push("--add-dir".to_string());
+        for directory in &request.add_dirs {
+            args.push(directory.to_string_lossy().into_owned());
+        }
+    }
+    // Also print-only, and also always satisfied here. A ceiling the CLI enforces itself, which is
+    // the difference from `max_turns`: that one has no flag and is counted from the transcript.
+    if let Some(ceiling) = request.max_budget_usd {
+        args.push("--max-budget-usd".to_string());
+        args.push(format!("{ceiling}"));
+    }
+    // One argv element holding a JSON object, which is how the flag is defined — not a repeatable
+    // `--agents name=…`. Empty writes nothing rather than `{}`: the CLI answers unparseable JSON
+    // with an empty agent list and no error, so the difference between "no flag" and "a flag that
+    // parsed to nothing" is invisible from outside, and only one of them is a state anybody chose.
+    if !request.agents.is_empty() {
+        args.push("--agents".to_string());
+        args.push(agents_json(&request.agents));
+    }
+    // Appended, never substituted — see the field. Written among the flag/value pairs like the
+    // rest, and never above the prompt, for the reason `--add-dir` gives.
+    if let Some(instructions) = &request.append_system_prompt {
+        args.push("--append-system-prompt".to_string());
+        args.push(instructions.clone());
+    }
+    // Beside the session flags below in meaning, and written here in position for the same reason
+    // everything conditional is: `--exclude-dynamic-system-prompt-sections` holds the slot right
+    // after `--verbose` so the prompt cache keeps matching, and nothing may push it out of place.
+    if let Some(name) = &request.session_name {
+        args.push("--name".to_string());
+        args.push(name.clone());
+    }
     if let Some(sid) = &request.resume_session_id {
         args.push("--resume".to_string());
         args.push(sid.clone());
@@ -471,10 +652,10 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         });
     }
     match request.tool_policy {
-        // No tool denial — the classifier governs what an autopilot run may call — but the ambient
-        // MCP servers are nobody's: each one is re-described in full on every turn, and nothing in
-        // the daemon's design calls them. The `--mcp-config` block above still runs, so a run
-        // carrying `request.mcp_config` keeps its nucleos server under the strict flag.
+        // No tool denial of its own — the classifier governs what an autopilot run may call — but
+        // the ambient MCP servers are nobody's: each one is re-described in full on every turn, and
+        // nothing in the daemon's design calls them. The `--mcp-config` block above still runs, so
+        // a run carrying `request.mcp_config` keeps its nucleos server under the strict flag.
         //
         // Only this arm is opt-out-able. `McpOnly` and `None` keep their unconditional strict flag,
         // where it is a safety property rather than an economy.
@@ -483,25 +664,53 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
                 args.push("--strict-mcp-config".to_string());
             }
         }
-        ToolPolicy::McpOnly => {
-            // Drops every MCP server this user happens to have configured — the ambient surface a
-            // spawned run inherits otherwise includes file-writing connectors.
+        // Both of the arms below drop every MCP server this user happens to have configured — the
+        // ambient surface a spawned run inherits otherwise includes file-writing connectors. Under
+        // the wildcard it is redundant and passed anyway, so a future narrowing of one is not a
+        // silent widening of the other.
+        ToolPolicy::McpOnly | ToolPolicy::None => {
             args.push("--strict-mcp-config".to_string());
-            args.push("--disallowedTools".to_string());
-            args.push(BUILTIN_TOOLS.join(","));
-        }
-        // Measured against CLI 2.1.198: this yields an `init` event advertising NO tools at all —
-        // the capability is absent rather than refused, so there is nothing for a prompt injected
-        // into a mail body to talk the model into reaching for. `--strict-mcp-config` is redundant
-        // under the wildcard and passed anyway, so a future narrowing of one is not a silent
-        // widening of the other.
-        ToolPolicy::None => {
-            args.push("--strict-mcp-config".to_string());
-            args.push("--disallowedTools".to_string());
-            args.push("*".to_string());
         }
     }
+    // ONE `--disallowedTools`, holding everything anything wanted denied.
+    //
+    // The policy's denials and the run's own used to be unable to coexist, and the failure would
+    // have been silent: `--disallowedTools` is variadic, so a second occurrence REPLACES the first
+    // rather than adding to it. Written twice, a conversation asking not to run `Bash` would have
+    // taken `ToolPolicy::McpOnly` down with it and come back with the whole built-in tool set.
+    let denied = denied_tools(&request.tool_policy, &request.denied_tools);
+    if !denied.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(denied.join(","));
+    }
     args
+}
+
+/// Everything one run must be denied: what its policy denies, plus what it asked to be denied.
+///
+/// Separate from `cli_args` so the merge itself is assertable — this is the function whose being
+/// wrong would look like a safety property holding, and a test that read an argument vector could
+/// only ever check the flag that survived.
+///
+/// `ToolPolicy::None` answers with the wildcard alone. Measured against CLI 2.1.198 it yields an
+/// `init` event advertising NO tools at all — the capability is absent rather than refused, so
+/// there is nothing for a prompt injected into a mail body to talk the model into reaching for —
+/// and naming individual tools beside `*` would only add stderr lines about rules that match
+/// nothing on top of a denial that already covers them.
+fn denied_tools(policy: &ToolPolicy, asked: &[String]) -> Vec<String> {
+    if *policy == ToolPolicy::None {
+        return vec!["*".to_string()];
+    }
+    let mut denied: Vec<String> = match policy {
+        ToolPolicy::McpOnly => BUILTIN_TOOLS.iter().map(|name| name.to_string()).collect(),
+        _ => Vec::new(),
+    };
+    for name in asked {
+        if !denied.iter().any(|have| have == name) {
+            denied.push(name.clone());
+        }
+    }
+    denied
 }
 
 /// The final text of a `claude -p --output-format stream-json` run.
@@ -2129,6 +2338,42 @@ impl CommandRunner for CodexCliRunner {
                 "codex exec cannot honour classifier_governs_tools: it has no PreToolUse hook, so nothing would replace the barrier this stands down",
             ));
         }
+        // Every per-conversation control this launch surface has no counterpart for, refused in
+        // one place and named individually so the message says which one.
+        //
+        // These arrived with 0110–0113 and each was accepted and dropped here — the outcome the
+        // block above exists to prevent. They are not one kind of thing, and refusing them together
+        // is still right, because they fail the same way: the chat row says a conversation is
+        // pinned to a model, capped at a dollar a turn, barred from `Bash` and carrying standing
+        // instructions, the window draws all four, and none of them reached the process.
+        //
+        // `denied_tools` is the sharpest of them. It passes the `ToolPolicy` guard above — a
+        // conversation can be `Unrestricted` and still have barred a tool for itself — so without
+        // this it would be a restriction somebody set, saw drawn back at them, and never had.
+        for (asked, control) in [
+            (request.effort.is_some(), "effort"),
+            (!request.fallback_model.is_empty(), "fallback_model"),
+            (!request.add_dirs.is_empty(), "add_dirs"),
+            (request.max_budget_usd.is_some(), "max_budget_usd"),
+            (!request.agents.is_empty(), "agents"),
+            (
+                request.append_system_prompt.is_some(),
+                "append_system_prompt",
+            ),
+            (!request.denied_tools.is_empty(), "denied_tools"),
+        ] {
+            if asked {
+                return Err(std::io::Error::other(format!(
+                    "codex exec cannot honour {control}: it has no counterpart for it, and dropping one would leave the chat row claiming a control the run never had"
+                )));
+            }
+        }
+        // KNOWN LIMITATION, left un-refused on purpose, beside `resume_session_id` below:
+        // `session_name` is not honoured here. It reaches the Claude CLI's `--resume` picker and
+        // nothing else — no decision anywhere depends on it, and no record claims it was applied —
+        // so a run that loses it is a run with a nameless session, which is what every run on this
+        // path has always had.
+
         // Not a safety control, and refused all the same. A caller asks for partial messages because
         // something downstream is waiting on them; a stream that silently never emits any is a
         // feature that looks broken rather than absent.
@@ -2360,6 +2605,22 @@ pub struct FakeCommandRunner {
     /// What the CLI was handed in its environment. Recorded because a run with a Bash tool can read
     /// its own environment, so which key lands here is a safety property and not a detail.
     pub last_env: std::sync::Mutex<Option<Vec<(String, String)>>>,
+    /// Which model and effort the launch was handed. Recorded because there is nowhere else to
+    /// observe them: `cli_args` proves the flags are BUILT from a request, and this proves the
+    /// request a conversation produces carries what that conversation chose. Between the two there
+    /// used to be a gap wide enough for `model: None` to sit in unnoticed for the life of the
+    /// feature.
+    pub last_model: std::sync::Mutex<Option<Option<String>>>,
+    pub last_effort: std::sync::Mutex<Option<Option<String>>>,
+    /// Recorded for the reason `last_model` is: `cli_args` proves the flags are built out of a
+    /// request, and this proves the request a conversation produces carries what it was told.
+    pub last_fallback_model: std::sync::Mutex<Option<Vec<String>>>,
+    pub last_add_dirs: std::sync::Mutex<Option<Vec<PathBuf>>>,
+    pub last_max_budget_usd: std::sync::Mutex<Option<Option<f64>>>,
+    pub last_agents: std::sync::Mutex<Option<Vec<Subagent>>>,
+    pub last_append_system_prompt: std::sync::Mutex<Option<Option<String>>>,
+    pub last_denied_tools: std::sync::Mutex<Option<Vec<String>>>,
+    pub last_session_name: std::sync::Mutex<Option<Option<String>>>,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -2498,6 +2759,16 @@ impl CommandRunner for FakeCommandRunner {
         // Before the failure injection below: what a run was handed is worth knowing even when the
         // launch is made to fail.
         *self.last_env.lock().unwrap() = Some(request.env.clone());
+        *self.last_model.lock().unwrap() = Some(request.model.clone());
+        *self.last_effort.lock().unwrap() = Some(request.effort.clone());
+        *self.last_fallback_model.lock().unwrap() = Some(request.fallback_model.clone());
+        *self.last_add_dirs.lock().unwrap() = Some(request.add_dirs.clone());
+        *self.last_max_budget_usd.lock().unwrap() = Some(request.max_budget_usd);
+        *self.last_agents.lock().unwrap() = Some(request.agents.clone());
+        *self.last_append_system_prompt.lock().unwrap() =
+            Some(request.append_system_prompt.clone());
+        *self.last_denied_tools.lock().unwrap() = Some(request.denied_tools.clone());
+        *self.last_session_name.lock().unwrap() = Some(request.session_name.clone());
         *self.last_launch.lock().unwrap() = Some(Launch {
             prompt: request.prompt.clone(),
             resume_session_id: request.resume_session_id.clone(),
@@ -2648,6 +2919,311 @@ mod tests {
         assert!(args.windows(2).any(|pair| {
             pair[0] == "--session-id" && pair[1] == "123e4567-e89b-42d3-a456-426614174000"
         }));
+    }
+
+    #[test]
+    fn cli_args_names_every_fallback_in_the_order_given() {
+        let mut request = baseline_run_request();
+        request.fallback_model = vec!["opus".to_string(), "sonnet".to_string()];
+
+        let args = cli_args(&request, "fable");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--fallback-model" && pair[1] == "opus,sonnet"),
+            "the fallbacks never reached the argument vector: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cli_args_carries_every_extra_directory() {
+        let mut request = baseline_run_request();
+        request.add_dirs = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+
+        let args = cli_args(&request, "sonnet");
+
+        let at = args
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("no --add-dir");
+        assert_eq!(&args[at + 1..at + 3], ["/one", "/two"]);
+    }
+
+    /// `--add-dir` is variadic: it swallows every following argument until the next flag. On the
+    /// argv path the prompt is a POSITIONAL, so a variadic flag written above it would be handed
+    /// the person's message as a directory — the run would ask for tool access to their sentence
+    /// and never say what it was answering.
+    #[test]
+    fn the_variadic_directory_flag_never_swallows_the_prompt() {
+        let mut request = baseline_run_request();
+        request.add_dirs = vec![PathBuf::from("/one")];
+
+        let args = cli_args(&request, "sonnet");
+
+        assert_eq!(args[0], "-p");
+        assert_eq!(args[1], "test prompt", "the prompt moved: {args:?}");
+        let at = args.iter().position(|a| a == "--add-dir").unwrap();
+        assert!(at > 1, "--add-dir was written above the prompt: {args:?}");
+    }
+
+    #[test]
+    fn cli_args_carries_the_ceiling_a_turn_may_spend() {
+        let mut request = baseline_run_request();
+        request.max_budget_usd = Some(0.5);
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--max-budget-usd" && pair[1] == "0.5"),
+            "{args:?}"
+        );
+    }
+
+    /// One helper, for the tests below to vary.
+    fn a_helper(name: &str) -> Subagent {
+        Subagent {
+            name: name.to_string(),
+            description: "Reviews code".to_string(),
+            prompt: "You are a code reviewer".to_string(),
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// The flag takes ONE argv element holding a JSON object keyed by name — not a repeatable
+    /// `--agents name=…`, and not the list this daemon holds internally.
+    #[test]
+    fn the_helper_set_travels_as_one_object_keyed_by_name() {
+        let mut request = baseline_run_request();
+        request.agents = vec![a_helper("reviewer")];
+
+        let args = cli_args(&request, "sonnet");
+
+        let at = args
+            .iter()
+            .position(|arg| arg == "--agents")
+            .expect("no --agents");
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).expect("not JSON");
+        assert_eq!(sent["reviewer"]["description"], "Reviews code");
+        assert_eq!(sent["reviewer"]["prompt"], "You are a code reviewer");
+        // The name is the KEY. Sent inside the object as well it would be an unknown field, which
+        // the CLI's schema strips today — a contract that holds only because the other side is
+        // forgiving, and this asserts we do not rely on that.
+        assert!(
+            sent["reviewer"].get("name").is_none(),
+            "the name was sent twice: {}",
+            args[at + 1]
+        );
+    }
+
+    /// Absent keys, not null ones. `{"model": null}` is not what "inherit the conversation's model"
+    /// looks like to a schema that types `model` as a string.
+    #[test]
+    fn a_helper_that_named_no_model_sends_no_model_key() {
+        let mut request = baseline_run_request();
+        request.agents = vec![a_helper("reviewer")];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert!(sent["reviewer"].get("model").is_none(), "{}", args[at + 1]);
+        assert!(sent["reviewer"].get("effort").is_none(), "{}", args[at + 1]);
+    }
+
+    #[test]
+    fn a_helper_may_answer_on_its_own_model_and_effort() {
+        let mut request = baseline_run_request();
+        let mut helper = a_helper("reviewer");
+        helper.model = Some("opus".to_string());
+        helper.effort = Some("high".to_string());
+        request.agents = vec![helper];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert_eq!(sent["reviewer"]["model"], "opus");
+        assert_eq!(sent["reviewer"]["effort"], "high");
+        // And the conversation's own model is untouched: a helper's model is not the turn's.
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == "sonnet"),
+            "{args:?}"
+        );
+    }
+
+    /// Not `--agents {}`. The CLI answers unparseable JSON with an EMPTY agent list and no error,
+    /// so from outside there is nothing to tell "a flag that parsed to nothing" from "a flag that
+    /// threw" — and only one of those is a state somebody chose. Sending no flag keeps the two
+    /// apart.
+    #[test]
+    fn a_conversation_with_no_helpers_writes_no_flag_at_all() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        assert!(
+            !args.iter().any(|arg| arg == "--agents"),
+            "an empty helper set was sent: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cli_args_appends_standing_instructions_rather_than_replacing_the_system_prompt() {
+        let mut request = baseline_run_request();
+        request.append_system_prompt = Some("Answer in Portuguese.".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--append-system-prompt"
+                    && pair[1] == "Answer in Portuguese."),
+            "{args:?}"
+        );
+        // The REPLACING flag must never appear. It drops the CLI's tool descriptions and safety
+        // framing, and a run that lost those reads as a run whose model got worse.
+        assert!(
+            !args.iter().any(|arg| arg == "--system-prompt"),
+            "the system prompt was replaced instead of appended: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cli_args_names_the_session_so_it_is_findable_outside_this_app() {
+        let mut request = baseline_run_request();
+        request.session_name = Some("o refactor do runner".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--name" && pair[1] == "o refactor do runner"),
+            "{args:?}"
+        );
+    }
+
+    /// The merge that must not be two flags.
+    ///
+    /// `--disallowedTools` is variadic, so a second occurrence REPLACES the first rather than
+    /// adding to it. Written twice, a conversation asking not to run `Bash` would have taken
+    /// `ToolPolicy::McpOnly` down with it and come back holding the whole built-in tool set — a
+    /// safety property undone by a preference, silently, and looking like it still held.
+    #[test]
+    fn a_runs_own_denials_and_its_policys_travel_as_one_flag() {
+        let mut request = baseline_run_request();
+        request.tool_policy = ToolPolicy::McpOnly;
+        request.denied_tools = vec!["mcp__other__write".to_string()];
+
+        let args = cli_args(&request, "sonnet");
+
+        let flags = args
+            .iter()
+            .filter(|arg| arg.as_str() == "--disallowedTools")
+            .count();
+        assert_eq!(flags, 1, "the deny flag was written twice: {args:?}");
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        let denied: Vec<&str> = args[at + 1].split(',').collect();
+        assert!(denied.contains(&"Bash"), "the policy's denials were lost");
+        assert!(
+            denied.contains(&"mcp__other__write"),
+            "the run's own denial was lost"
+        );
+    }
+
+    /// A conversation may narrow itself even where the policy denies nothing.
+    #[test]
+    fn an_unrestricted_run_still_honours_the_tools_it_was_told_not_to_use() {
+        let mut request = baseline_run_request();
+        request.tool_policy = ToolPolicy::Unrestricted;
+        request.denied_tools = vec!["Bash".to_string(), "Edit".to_string()];
+
+        let args = cli_args(&request, "sonnet");
+
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert_eq!(args[at + 1], "Bash,Edit");
+    }
+
+    /// And the wildcard stands alone. Naming individual tools beside `*` would add stderr lines
+    /// about rules matching nothing, on top of a denial that already covers everything.
+    #[test]
+    fn the_deny_everything_policy_is_not_diluted_by_a_conversations_own_list() {
+        assert_eq!(
+            denied_tools(&ToolPolicy::None, &["Bash".to_string()]),
+            vec!["*".to_string()]
+        );
+    }
+
+    #[test]
+    fn cli_args_is_silent_about_instructions_and_denials_when_none_were_chosen() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        for flag in ["--append-system-prompt", "--name", "--disallowedTools"] {
+            assert!(
+                !args.iter().any(|arg| arg == flag),
+                "{flag} was sent: {args:?}"
+            );
+        }
+    }
+
+    /// And says nothing when nobody asked, in all three. A flag always present would replace the
+    /// CLI's own behaviour with this daemon's guess at it for every run that never expressed one.
+    #[test]
+    fn cli_args_is_silent_about_reach_and_ceiling_when_none_were_chosen() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        for flag in ["--fallback-model", "--add-dir", "--max-budget-usd"] {
+            assert!(
+                !args.iter().any(|arg| arg == flag),
+                "{flag} was sent: {args:?}"
+            );
+        }
+    }
+
+    /// The flag exists on the CLI (2.1.198, `low | medium | high | xhigh | max`) and the daemon had
+    /// no way to send it. This is the half that builds it.
+    #[test]
+    fn cli_args_carries_the_effort_when_one_was_chosen() {
+        let mut request = baseline_run_request();
+        request.effort = Some("xhigh".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--effort" && pair[1] == "xhigh"),
+            "the chosen effort never reached the argument vector: {args:?}"
+        );
+    }
+
+    /// And says nothing when nobody chose. An always-present flag would replace the CLI's own
+    /// default with this daemon's guess at it, for every run that never asked.
+    #[test]
+    fn cli_args_is_silent_about_effort_when_none_was_chosen() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        assert!(
+            !args.iter().any(|arg| arg == "--effort"),
+            "an effort was sent for a run that chose none: {args:?}"
+        );
+    }
+
+    /// `--effort` must not displace `--exclude-dynamic-system-prompt-sections`, whose own comment
+    /// reserves the position immediately after `--verbose` for prompt-cache prefix matching. A flag
+    /// added carelessly is exactly how that invariant dies quietly.
+    #[test]
+    fn the_effort_flag_does_not_disturb_the_cache_prefix() {
+        let mut request = baseline_run_request();
+        request.effort = Some("max".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        let verbose = args.iter().position(|a| a == "--verbose").unwrap();
+        assert_eq!(
+            args[verbose + 1],
+            "--exclude-dynamic-system-prompt-sections",
+            "something was inserted between --verbose and the cache flag: {args:?}"
+        );
     }
 
     #[test]
@@ -2916,6 +3492,14 @@ mod tests {
             classifier_governs_tools: false,
             ambient_mcp: false,
             model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -3032,6 +3616,14 @@ mod tests {
             classifier_governs_tools: false,
             ambient_mcp: false,
             model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -4821,11 +5413,37 @@ mod tests {
         narrowed.mcp_config = Some(std::path::PathBuf::from("C:/nucleos/mcp.json"));
         let mut streaming = baseline_run_request();
         streaming.include_partial_messages = true;
+        // The per-conversation controls of 0110–0113. Each of these is drawn back at the person in
+        // the window as a setting their conversation has, so a launch that dropped one would leave
+        // the row claiming something the run never had.
+        let mut thinking = baseline_run_request();
+        thinking.effort = Some("high".to_string());
+        let mut degrading = baseline_run_request();
+        degrading.fallback_model = vec!["opus".to_string()];
+        let mut reaching = baseline_run_request();
+        reaching.add_dirs = vec![PathBuf::from("/beside")];
+        let mut capped = baseline_run_request();
+        capped.max_budget_usd = Some(0.5);
+        let mut helped = baseline_run_request();
+        helped.agents = vec![a_helper("reviewer")];
+        let mut instructed = baseline_run_request();
+        instructed.append_system_prompt = Some("Answer in Portuguese.".to_string());
+        // The sharpest of them: it passes the `ToolPolicy` guard, because a conversation can be
+        // unrestricted and still have barred a tool for itself.
+        let mut barred = baseline_run_request();
+        barred.denied_tools = vec!["Bash".to_string()];
 
         for (field, request) in [
             ("plan_only", restrained),
             ("mcp_config", narrowed),
             ("include_partial_messages", streaming),
+            ("effort", thinking),
+            ("fallback_model", degrading),
+            ("add_dirs", reaching),
+            ("max_budget_usd", capped),
+            ("agents", helped),
+            ("append_system_prompt", instructed),
+            ("denied_tools", barred),
         ] {
             let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -4870,6 +5488,24 @@ mod tests {
         assert!(
             codex_cli_args(&resumed, "gpt-5.6-terra").is_ok(),
             "resume is degraded on this path, not refused — see the comment in `run_prompt`"
+        );
+
+        // And the other one, for the same reason. A display name reaches the Claude CLI's `--resume`
+        // picker and nothing else; no record claims it was applied, so losing it costs a nameless
+        // session, which is what every run on this path has always had.
+        let mut named = baseline_run_request();
+        named.session_name = Some("o refactor do runner".to_string());
+        let (session_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let outcome = runner
+            .run_prompt(named, session_tx, transcript)
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            !outcome.contains("session_name"),
+            "a cosmetic name is dropped on this path, not refused: {outcome}"
         );
     }
 

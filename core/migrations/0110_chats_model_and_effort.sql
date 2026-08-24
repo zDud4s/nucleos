@@ -1,0 +1,32 @@
+-- Which model answers a conversation, and how hard it is asked to think.
+--
+-- `brain` (0061) has two values, and they name a ROUTE rather than a model: `local` goes to the
+-- Ollama assistant, `cloud` goes to the agent CLI. That was the whole of the choice a person had,
+-- so every cloud conversation ran on `models.yaml`'s `claude_model` and nothing in the window could
+-- say otherwise — `assistant.rs` passed `model: None` on every chat turn, while `RunRequest.model`
+-- and the `--model` flag it becomes had existed since the runs pillar was built. The capability was
+-- there; the conversation had no way to reach it.
+--
+-- Two columns and not one, because they fail differently. A model this CLI does not know is
+-- refused at spawn and the turn dies loudly; an effort it does not know is the same. But effort is
+-- meaningless on the local route -- Ollama has no such notion -- while the model is the one thing
+-- that route DOES vary. Folding them into a single `model@effort` string would make the local case
+-- carry a field it can never use, and would make either half unreadable without parsing.
+--
+-- NULL and not a default, in both. NULL is "whatever this daemon is configured to use", which is
+-- exactly what every conversation that already exists was doing -- and it stays true after somebody
+-- edits `models.yaml`, which a copied-in default would not. A row pinning `claude-sonnet-5` at the
+-- moment of creation would silently outrank the config forever, and nobody would know which of the
+-- two they were reading.
+--
+-- `brain` is not replaced and is still the routing fact. The window picks a MODEL and the API sets
+-- both in one PATCH, so the pair cannot come apart: a row saying `local` while naming a cloud model
+-- would route to Ollama and hand it a name it has never heard.
+ALTER TABLE chats ADD COLUMN model TEXT;
+
+-- `low | medium | high | xhigh | max`, as `claude --help` documents them at CLI 2.1.198, or NULL
+-- for the CLI's own default. Unvalidated in the column and validated at the door in `http.rs`, for
+-- the reason the rest of this schema gives: a CHECK constraint here would have to be migrated every
+-- time the CLI adds a level, and a daemon that cannot store a level it was told is worse than one
+-- that stores a level the CLI later refuses.
+ALTER TABLE chats ADD COLUMN effort TEXT;

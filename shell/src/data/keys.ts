@@ -217,6 +217,23 @@ export const keys = {
     all: ["chats"] as const,
     detail: (chatId: string) => ["chats", "detail", chatId] as const,
     localModel: ["chats", "local-model"] as const,
+    /**
+     * The models a conversation may be moved to — `GET /assistant/models`.
+     *
+     * Its own key and not a child of `detail`, because it is the same answer for
+     * every conversation: one fetch feeds every picker on the page, and a
+     * per-chat key would refetch it once per row.
+     */
+    models: ["chats", "models"] as const,
+    /**
+     * The tools a conversation may be told not to reach for — `GET /assistant/tools`.
+     *
+     * Beside `models` and for the same reason: one answer for every conversation,
+     * so one fetch feeds every picker on the page.
+     */
+    tools: ["chats", "tools"] as const,
+    /** The commands the front door offers, before a conversation exists to scope them. */
+    frontCommands: (query: string) => ["chats", "front-commands", query] as const,
     project: (chatId: string) => ["chats", "project", chatId] as const,
     diff: (chatId: string) => ["chats", "diff", chatId] as const,
     ideSessions: ["chats", "ide-sessions"] as const,

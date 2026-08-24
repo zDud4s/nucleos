@@ -40,6 +40,56 @@ pub struct ChatSummary {
     pub chat_id: String,
     pub title: Option<String>,
     pub brain: String,
+    /// Which model answers this conversation, or `None` for whatever `models.yaml` names.
+    ///
+    /// Beside `brain` because it is the same fact at a finer grain: `brain` is the route and this
+    /// is who is at the end of it. Both travel to the list for one reason — the window's picker has
+    /// to show what is currently chosen, and a picker that cannot read its own value is one that
+    /// shows the default until you touch it.
+    ///
+    /// `None` is not "unknown". It is "unpinned", and it is the state that keeps following the
+    /// config after somebody edits it.
+    pub model: Option<String>,
+    /// How hard this conversation asks the model to think, or `None` for the CLI's own default.
+    pub effort: Option<String>,
+    /// Who answers when the chosen model is unavailable, comma-separated, or `None` for nobody.
+    pub fallback_model: Option<String>,
+    /// Directories this conversation's tools may reach beyond its own.
+    ///
+    /// Stored as a JSON array in one TEXT column — SQLite has no array to give back — and sent to
+    /// the window as an actual list. Parsed HERE and not in the window, so there is one place that
+    /// knows the storage shape and one answer to what an unreadable column means: no extra
+    /// directories, never a broken list the client has to guess about.
+    #[serde(serialize_with = "as_directory_list")]
+    pub extra_dirs: Option<String>,
+    /// The most one TURN of this conversation may spend, or `None` for no ceiling.
+    ///
+    /// Per turn and not per conversation — the CLI's flag bounds one invocation, and this daemon
+    /// spawns one per turn. The column is named for that so nobody reads it as a total.
+    pub turn_budget_usd: Option<f64>,
+    /// The helpers this conversation may hand work to.
+    ///
+    /// Stored as the object the CLI's flag takes and sent to the window as a list, for the reason
+    /// `extra_dirs` is: one place knows the storage shape, and an unreadable column has one answer
+    /// — no helpers — rather than becoming a string every client has to guess about.
+    #[serde(serialize_with = "as_subagent_list")]
+    pub agents: Option<String>,
+    /// Standing instructions appended to this conversation's system prompt, or `None`.
+    pub system_prompt: Option<String>,
+    /// Built-in tools this conversation may not reach for.
+    ///
+    /// A list on the way out, like `extra_dirs` and for the same reason: one place knows the
+    /// storage shape, and an unreadable column has one answer rather than becoming a string every
+    /// client has to guess about.
+    #[serde(serialize_with = "as_name_list")]
+    pub denied_tools: Option<String>,
+    /// The run this conversation was told to forget everything before, or `None`.
+    ///
+    /// Travels to the window so it can draw the cut where it happened. The turns above it are still
+    /// there and still readable — clearing decides what the MODEL is shown, not what happened — and
+    /// a transcript that silently stopped mattering at some invisible point would be a worse lie
+    /// than one that says where.
+    pub cleared_after_run_id: Option<i64>,
     pub created_at: String,
     /// Where this conversation's turns run, or `None` for the daemon's own directory.
     ///
@@ -71,6 +121,46 @@ pub struct ChatSummary {
     /// watermark rather than stored, so it is right after a crash without anything having been
     /// written when the turn ended.
     pub waiting: i64,
+}
+
+/// Sends the `extra_dirs` column out as the list it holds, rather than as the JSON that holds it.
+///
+/// A column that cannot be parsed serialises as an empty list, matching `answering`: this
+/// preference only ever GRANTS reach, so falling back to none is the direction that cannot surprise
+/// anybody. A client seeing `[]` is a client seeing the truth about what the next turn will do.
+/// Sends the `agents` column out as the list of helpers it holds, rather than as the object.
+///
+/// Shares `subagents_from` with `answering`, so the window and the turn cannot come to disagree
+/// about what a column says — which is the whole reason the parse is a function and not two
+/// `serde_json::from_str` calls that happen to look alike.
+/// Sends a JSON-array column out as the list it holds. Unreadable reads as empty.
+fn as_name_list<S>(raw: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let names: Vec<String> = raw
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default();
+    serde::Serialize::serialize(&names, serializer)
+}
+
+fn as_subagent_list<S>(raw: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serde::Serialize::serialize(&subagents_from(raw.clone()), serializer)
+}
+
+fn as_directory_list<S>(raw: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let dirs: Vec<String> = raw
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default();
+    serde::Serialize::serialize(&dirs, serializer)
 }
 
 /// Opens a conversation. The id is minted HERE, not accepted from the caller.
@@ -130,6 +220,302 @@ pub async fn set_plan_only(pool: &SqlitePool, chat_id: &str, planning: bool) -> 
     Ok(())
 }
 
+/// Which model answers this conversation, and how hard it is asked to think.
+///
+/// One query for both, and read on the turn path — matching `cwd_of` and `brain_of`, whose comments
+/// give the reason: `get` walks the whole list to answer, and this runs before every single turn.
+/// Together rather than separately because they are read together and never apart: a turn needs
+/// both to build its request, and two queries would be two round trips for one decision.
+///
+/// `(None, None)` is the state every conversation opened before this column existed is in, and it
+/// means the same thing it meant then — the daemon's configured model, at the CLI's own effort.
+/// Everything a conversation says about HOW its next turn should run.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Answering {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub fallback_model: Vec<String>,
+    pub extra_dirs: Vec<String>,
+    pub turn_budget_usd: Option<f64>,
+    /// The helpers this conversation may hand work to, beyond the ones the CLI finds on disk.
+    pub agents: Vec<crate::runner::Subagent>,
+    /// Standing instructions appended to the CLI's own system prompt, or `None`.
+    pub system_prompt: Option<String>,
+    /// Built-in tools this conversation may not reach for, on top of what its policy already denies.
+    pub denied_tools: Vec<String>,
+    /// What to call this conversation's session where the CLI shows sessions, or `None`.
+    ///
+    /// Cosmetic, and worth carrying anyway: every session this daemon has ever minted is nameless
+    /// in `claude --resume`, so somebody looking at their own machine's sessions sees a wall of
+    /// timestamps where this app's conversations are.
+    pub session_name: Option<String>,
+}
+
+pub async fn model_of(
+    pool: &SqlitePool,
+    chat_id: &str,
+) -> sqlx::Result<(Option<String>, Option<String>)> {
+    let found = answering(pool, chat_id).await?;
+    Ok((found.model, found.effort))
+}
+
+/// How this conversation's next turn should be launched.
+///
+/// One query and one struct, because the turn path reads all of it at once and never a piece of it
+/// alone: two round trips for one decision is two chances to read a row somebody changed in
+/// between. It grew out of `model_of`, which is kept as the narrow view its callers want.
+///
+/// A row that is not there answers `Default` rather than failing — every conversation opened before
+/// these columns existed is in exactly that state, and it means what it always meant: the daemon's
+/// configured model, at the CLI's own effort, reaching only its own directory, with no ceiling.
+/// The helpers a stored `agents` column names, as a list ordered by name.
+///
+/// The column holds the object the CLI's flag takes — keyed by name, no order — and everything
+/// above wants a list, because a list is what a window draws and edits. Sorted rather than left to
+/// the map's own order so two reads of one unchanged column cannot disagree about the order, which
+/// would show up as a list that reshuffles itself whenever somebody opens it.
+///
+/// Unreadable JSON reads as no helpers. The alternative is a turn refused because a preference
+/// could not be parsed, and this preference only ever ADDS helpers — falling back to none leaves
+/// the conversation exactly as capable as one that never defined any.
+fn subagents_from(raw: Option<String>) -> Vec<crate::runner::Subagent> {
+    let Some(parsed) = raw.and_then(|text| {
+        serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(&text).ok()
+    }) else {
+        return Vec::new();
+    };
+    parsed
+        .into_iter()
+        .filter_map(|(name, body)| {
+            let mut agent: crate::runner::Subagent = serde_json::from_value(body).ok()?;
+            // The name lives in the key, and `Subagent` skips it on the way out — so what comes
+            // back from the value is whatever `Default` gave it, which is the empty string. Put the
+            // key back or every helper is anonymous.
+            agent.name = name;
+            Some(agent)
+        })
+        .collect()
+}
+
+pub async fn answering(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Answering> {
+    let found: Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT model, effort, fallback_model, extra_dirs, turn_budget_usd, agents,
+                system_prompt, denied_tools, title
+           FROM chats WHERE chat_id = ?",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((model, effort, fallback, dirs, ceiling, agents, instructions, denied, title)) = found
+    else {
+        return Ok(Answering::default());
+    };
+    Ok(Answering {
+        model,
+        effort,
+        // Split here rather than stored split, because the CLI takes it joined and this is the one
+        // place that knows which side of the wire it is on. Blanks dropped: a trailing comma is a
+        // typo, and an empty model name would reach `--fallback-model` as an argument of nothing.
+        fallback_model: fallback
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect(),
+        // Unparseable JSON reads as no extra directories. The alternative is a turn refused because
+        // a preference could not be read, and this preference only ever GRANTS reach — falling back
+        // to none is the direction that cannot surprise anybody.
+        extra_dirs: dirs
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default(),
+        turn_budget_usd: ceiling,
+        agents: subagents_from(agents),
+        // Blank is `None`, not `Some("")`. A column holding whitespace would write
+        // `--append-system-prompt ""` and spend an argv slot saying nothing, and the door already
+        // refuses to store one — this is the second answer, for rows written before it did.
+        system_prompt: instructions.filter(|text| !text.trim().is_empty()),
+        // Unparseable JSON reads as no denials, matching `extra_dirs`. That is the ONE direction
+        // this fallback goes the wrong way — a lost denial is a wider run, not a narrower one — and
+        // it is still right: what a conversation may reach is decided by `tool_policy_for` and, in
+        // a wired project, by the classifier hook. This column narrows what those already allow, so
+        // losing it returns the conversation to the policy it would have had, never past it.
+        denied_tools: denied
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default(),
+        // Trimmed HERE rather than at the door: the title is the conversation's, not the session's,
+        // and it is renameable to anything. A display name is cosmetic, so a long one would spend
+        // an argument-vector budget that the message itself needs — see `INSTRUCTIONS_CEILING`.
+        // By characters and not bytes, because a cut mid-character is not a shorter name.
+        session_name: title.map(|name| name.chars().take(120).collect::<String>()),
+    })
+}
+
+/// Sets who answers when the chosen model is unavailable. Empty clears it.
+pub async fn set_fallback(pool: &SqlitePool, chat_id: &str, names: &[String]) -> sqlx::Result<()> {
+    let joined = names.join(",");
+    sqlx::query("UPDATE chats SET fallback_model = ? WHERE chat_id = ?")
+        .bind((!joined.is_empty()).then_some(joined))
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets which directories this conversation's tools may reach beyond its own. Empty clears them.
+///
+/// The caller has already checked that each is an absolute directory. Here they are strings going
+/// into a column, and a second check would be a second answer to a question the filesystem can
+/// change between them — the same reasoning `set_cwd` gives.
+pub async fn set_extra_dirs(pool: &SqlitePool, chat_id: &str, dirs: &[String]) -> sqlx::Result<()> {
+    let encoded = serde_json::to_string(dirs).unwrap_or_else(|_| "[]".to_string());
+    sqlx::query("UPDATE chats SET extra_dirs = ? WHERE chat_id = ?")
+        .bind((!dirs.is_empty()).then_some(encoded))
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Moves the floor of this conversation's replay to now — the app's `/clear`.
+///
+/// Stores the id of the last run rather than a timestamp, because that is what it is compared
+/// against: `recent_exchanges` filters on `runs.id`, and two turns of one conversation can share a
+/// timestamp to the second (`get_assistant_chat` gives the long version). A floor that could not
+/// tell two turns apart would sometimes keep one it was told to drop.
+///
+/// A conversation with no turns yet stores `0`, which is not the same as NULL: the column being SET
+/// is what hides the pick-up tail, and a conversation cleared before it ever answered is exactly
+/// the one that wants that.
+pub async fn clear_context(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE chats
+            SET cleared_after_run_id =
+                  COALESCE((SELECT MAX(id) FROM runs WHERE chat_id = ?), 0)
+          WHERE chat_id = ?",
+    )
+    .bind(chat_id)
+    .bind(chat_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Sets the standing instructions appended to this conversation's system prompt. Blank clears them.
+///
+/// Blank stored as NULL rather than as an empty string, so "nobody wrote instructions" and
+/// "somebody wrote nothing" are one state instead of two that read identically everywhere above.
+pub async fn set_system_prompt(
+    pool: &SqlitePool,
+    chat_id: &str,
+    instructions: Option<&str>,
+) -> sqlx::Result<()> {
+    let kept = instructions.map(str::trim).filter(|text| !text.is_empty());
+    sqlx::query("UPDATE chats SET system_prompt = ? WHERE chat_id = ?")
+        .bind(kept)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets the built-in tools this conversation may not reach for. Empty clears the denials.
+///
+/// The caller has already checked that each is a name this daemon knows how to deny. Here they are
+/// strings going into a column, for the reason `set_extra_dirs` gives.
+pub async fn set_denied_tools(
+    pool: &SqlitePool,
+    chat_id: &str,
+    names: &[String],
+) -> sqlx::Result<()> {
+    let encoded = serde_json::to_string(names).unwrap_or_else(|_| "[]".to_string());
+    sqlx::query("UPDATE chats SET denied_tools = ? WHERE chat_id = ?")
+        .bind((!names.is_empty()).then_some(encoded))
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets the helpers this conversation may hand work to. Empty clears them.
+///
+/// Written as the object the CLI's flag takes, keyed by name — one shape for the column and the
+/// flag, so there is nothing to translate on the way out and nothing to get wrong. The caller has
+/// already checked each definition and that the names do not repeat, which is what makes keying by
+/// name safe here: two helpers called `reviewer` would collapse into one on the way into the map,
+/// and a person would watch one of them vanish without being told.
+pub async fn set_agents(
+    pool: &SqlitePool,
+    chat_id: &str,
+    agents: &[crate::runner::Subagent],
+) -> sqlx::Result<()> {
+    let encoded = crate::runner::agents_json(agents);
+    sqlx::query("UPDATE chats SET agents = ? WHERE chat_id = ?")
+        .bind((!agents.is_empty()).then_some(encoded))
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets the most one turn of this conversation may spend, or clears the ceiling.
+pub async fn set_turn_budget(
+    pool: &SqlitePool,
+    chat_id: &str,
+    ceiling: Option<f64>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET turn_budget_usd = ? WHERE chat_id = ?")
+        .bind(ceiling)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Pins a conversation to a model, or unpins it.
+///
+/// Does NOT touch `brain`. The two are set together by `patch_chat`, in one request, because a row
+/// naming a cloud model on the local route would be routed to Ollama under a name it has never
+/// heard — but they are set by two calls, because this file's job is to write columns and not to
+/// decide which columns belong together.
+pub async fn set_model(pool: &SqlitePool, chat_id: &str, model: Option<&str>) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET model = ? WHERE chat_id = ?")
+        .bind(model)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets how hard a conversation asks the model to think, or clears it back to the CLI's default.
+///
+/// The level is not checked here. `http.rs` checks it at the door against `config::EFFORT_LEVELS`,
+/// for the reason 0110 gives: a level this daemon cannot STORE is worse than one the CLI refuses,
+/// because the first loses what somebody said and the second says so loudly.
+pub async fn set_effort(
+    pool: &SqlitePool,
+    chat_id: &str,
+    effort: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET effort = ? WHERE chat_id = ?")
+        .bind(effort)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Points a conversation at the project it is about.
 ///
 /// The second writer this column has ever had. The first is the pick-up, at creation, and until now
@@ -163,11 +549,16 @@ pub async fn set_handover(pool: &SqlitePool, chat_id: &str, handover: &str) -> s
 /// as JSON pairs. Its own query rather than a field off `get`, for the reason `cwd_of` is: it is
 /// read on the turn path, and `get` walks the whole list to answer.
 pub async fn handover_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
-    let handover: Option<Option<String>> =
-        sqlx::query_scalar("SELECT handover FROM chats WHERE chat_id = ?")
-            .bind(chat_id)
-            .fetch_optional(pool)
-            .await?;
+    // `AND cleared_after_run_id IS NULL` is what makes a clear complete. This tail is, by
+    // definition, older than every turn this conversation has — it is what was said BEFORE the
+    // pick-up — so a cut anywhere in the conversation is a cut above it. Left in the column rather
+    // than deleted: clearing decides what the model is shown, not what happened.
+    let handover: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT handover FROM chats WHERE chat_id = ? AND cleared_after_run_id IS NULL",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(handover.flatten())
 }
 
@@ -291,7 +682,9 @@ pub async fn opened_in(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<
 /// second, and "the first message" must not depend on which of them SQLite happens to return.
 pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
     sqlx::query_as::<_, ChatSummary>(
-        "SELECT c.chat_id, c.title, c.brain, c.created_at, c.cwd, c.ide_session_id,
+        "SELECT c.chat_id, c.title, c.brain, c.model, c.effort, c.fallback_model,
+                c.extra_dirs, c.turn_budget_usd, c.agents, c.system_prompt, c.denied_tools,
+                c.cleared_after_run_id, c.created_at, c.cwd, c.ide_session_id,
                 (SELECT r.prompt FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                   ORDER BY r.id ASC LIMIT 1) AS first_message,

@@ -33,6 +33,202 @@ pub struct ModelsConfig {
     /// change nothing at all until somebody asks for it by name.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub local_assistant_model: Option<String>,
+    /// The models a conversation may be moved to, in the order the window offers them.
+    ///
+    /// A list here rather than a list in the window, because the window cannot know it. The agent
+    /// CLI has no `--list-models` (2.1.198) and nothing else enumerates them either, so any list is
+    /// somebody's assertion — and an assertion written into the UI goes stale where nobody who can
+    /// fix it will see it. Written here, it is next to the model names this daemon already pins.
+    ///
+    /// The default names ALIASES and not versions. `sonnet` is whatever the CLI currently resolves
+    /// Sonnet to; `claude-sonnet-5` is a specific model that stops existing. A picker built out of
+    /// versions is a picker that has to be edited every time Anthropic ships, which is the exact
+    /// staleness this key exists to avoid — so pinning is available to whoever wants it, and is not
+    /// what an untouched install does.
+    ///
+    /// Cloud only. The local entry is not written here because it is not a choice: it is whatever
+    /// `local_assistant_model` names, and a second place to say it is a second place to disagree.
+    /// `catalogue` joins the two.
+    #[serde(default = "default_assistant_choices")]
+    pub assistant_choices: Vec<AssistantChoice>,
+}
+
+/// One row of the conversation's model picker.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct AssistantChoice {
+    /// What goes to `--model`, verbatim. An alias or a full name; the CLI accepts both.
+    pub id: String,
+    /// What the window shows. Separate from `id` because the useful name and the accepted name are
+    /// not the same string — `sonnet` is what the CLI takes and "Sonnet" is what a person reads.
+    pub label: String,
+    /// Which route answers this choice: `cloud` or `local`.
+    ///
+    /// Carried on the choice rather than inferred from the id, so picking a model sets the route
+    /// too and the two cannot come apart. A `chats` row saying `local` while naming a cloud model
+    /// would go to Ollama and hand it a name it has never heard.
+    pub brain: String,
+    /// The effort levels THIS model takes, weakest first. Empty means it has no dial.
+    ///
+    /// Per model and not one list for all of them, because they genuinely differ: at the time of
+    /// writing `gpt-5.6-terra` takes an `ultra` that `gpt-5.5` does not, and `gpt-5.5` stops at
+    /// `xhigh` where `gpt-5.6-luna` goes to `max`. A single global list would offer every model the
+    /// union, and the ones that do not take the top of it would die at spawn.
+    ///
+    /// It also subsumes the boolean this replaced: empty is exactly "no dial", which is what a
+    /// local model has, and the window reads the list rather than testing `brain == "cloud"`.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// Which agent CLI runs this model: `claude` or `codex`. Absent means `claude`.
+    ///
+    /// A second axis from `brain`, not a finer grain of it. `brain` says whether the turn goes to
+    /// Ollama or to a CLI; this says WHICH CLI — and they are independent, because the local route
+    /// is the same either way. Carried so one config file can hold both lists and the daemon shows
+    /// the one belonging to the runner it was actually started with.
+    #[serde(default)]
+    pub runner: Option<String>,
+}
+
+/// `low | medium | high | xhigh | max`, exactly as `claude --help` documents them at CLI 2.1.198.
+///
+/// Ordered weakest-first, and the window shows them in this order: the list is a dial, and a dial
+/// whose order is not its magnitude is one people read backwards.
+///
+/// The DEFAULT for a Claude choice that names none of its own, and the fallback when the catalogue
+/// is empty. Not the law: a choice's own `efforts` outranks it, because the CLIs disagree about
+/// what levels exist and one hard-coded list cannot be right for both.
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Whether a string is an effort level this daemon will pass on.
+///
+/// Checked at the API door and not in the column, so a level a CLI later adds needs no migration.
+/// A CHECK constraint would make the daemon unable to STORE a level it was told, which is worse
+/// than storing one the CLI refuses: the first loses what somebody said, the second says so loudly.
+///
+/// Against the UNION of the catalogue's levels and not against the chosen model's own. The two
+/// checks answer different questions and belong in different places: this one rejects nonsense at
+/// the door — a typo, a level no model here has — while the picker offers only the levels the model
+/// in front of you actually takes. The door cannot do the second job honestly anyway, because the
+/// effort and the model can be set in separate requests and the model can change afterwards.
+pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
+    config.effort_levels().iter().any(|level| level == value)
+}
+
+fn default_assistant_choices() -> Vec<AssistantChoice> {
+    ["Opus", "Sonnet", "Fable"]
+        .into_iter()
+        .map(|label| AssistantChoice {
+            id: label.to_lowercase(),
+            label: label.to_string(),
+            brain: "cloud".to_string(),
+            efforts: EFFORT_LEVELS
+                .iter()
+                .map(|level| level.to_string())
+                .collect(),
+            // Absent rather than `Some("claude")`: these are what an untouched install offers, and
+            // an untouched install runs the Claude CLI. Writing it out would suggest the field is
+            // required, and a config that named the other runner would then have to edit all three.
+            runner: None,
+        })
+        .collect()
+}
+
+impl ModelsConfig {
+    /// The model a conversation runs on when it has pinned none — what the runner was built with.
+    ///
+    /// Reported beside the catalogue so the window can name the unpinned state instead of leaving
+    /// it blank. It is deliberately NOT forced into the catalogue as an entry: `claude_model`
+    /// defaults to `claude-sonnet-5` while the catalogue offers the alias `sonnet`, and listing
+    /// both would put one model on the menu twice under two names.
+    pub fn configured_model(&self) -> &str {
+        if self.active_runner() == "codex" {
+            &self.codex_model
+        } else {
+            &self.claude_model
+        }
+    }
+
+    /// Every model a conversation may be moved to: the configured cloud list, then the local model
+    /// if one is named.
+    ///
+    /// The local entry is built here rather than configured, for the reason `assistant_choices`
+    /// says: `local_assistant_model` already names it, and a picker offering a local model the
+    /// assistant is not running would produce `NO_LOCAL_MODEL` at the first turn -- a refusal
+    /// earned by nothing the person did wrong. No model named, no entry, and the route is simply
+    /// not on the menu.
+    pub fn catalogue(&self) -> Vec<AssistantChoice> {
+        // Only the models belonging to the CLI this daemon was actually started with. The file may
+        // hold both lists — `scripts/refresh-models.py` writes both when it can reach both — and
+        // offering `sonnet` to a daemon running Codex would produce a turn that dies at spawn.
+        //
+        // Unknown names fall to `claude`, matching `main.rs`: a typo in `primary_runner` there
+        // keeps the proven path rather than switching binaries, and the menu must agree with it or
+        // it would offer models for a CLI that is not running.
+        let active = self.active_runner();
+        let mut choices = self.assistant_choices.clone();
+        // Cloud only. The local route is the same whichever CLI is configured, so filtering it by
+        // the runner would hide a working model for a reason that has nothing to do with it.
+        choices.retain(|choice| {
+            choice.brain != "cloud" || choice.runner.as_deref().unwrap_or("claude") == active
+        });
+        // A file that says nothing about the running CLI would otherwise produce an empty menu.
+        // The configured model always works — it is what the runner was built with.
+        if choices.iter().all(|choice| choice.brain != "cloud") {
+            choices.insert(
+                0,
+                AssistantChoice {
+                    id: self.configured_model().to_string(),
+                    label: self.configured_model().to_string(),
+                    brain: "cloud".to_string(),
+                    efforts: Vec::new(),
+                    runner: Some(active.to_string()),
+                },
+            );
+        }
+        if let Some(local) = &self.local_assistant_model {
+            choices.push(AssistantChoice {
+                id: local.clone(),
+                label: local.clone(),
+                brain: "local".to_string(),
+                // Ollama has no effort dial. An empty list rather than a flag, so the window reads
+                // one thing — what levels are on offer — and never a rule about routes.
+                efforts: Vec::new(),
+                runner: None,
+            });
+        }
+        choices
+    }
+
+    /// Which agent CLI this daemon runs. Unknown names fall to `claude`, exactly as `main.rs` does.
+    pub fn active_runner(&self) -> &str {
+        match self.primary_runner.as_deref() {
+            Some("codex") => "codex",
+            _ => "claude",
+        }
+    }
+
+    /// Every effort level any model on the menu takes, weakest-first, without repeats.
+    ///
+    /// The union, and only for the door's typo check — the picker offers each model its own list.
+    /// Ordered by first appearance rather than sorted, because these are magnitudes and not words:
+    /// the strongest model's list is the longest, so walking them in order puts `low` before `max`
+    /// and never alphabetically between them.
+    pub fn effort_levels(&self) -> Vec<String> {
+        let mut levels: Vec<String> = Vec::new();
+        for choice in self.catalogue() {
+            for level in choice.efforts {
+                if !levels.contains(&level) {
+                    levels.push(level);
+                }
+            }
+        }
+        if levels.is_empty() {
+            levels = EFFORT_LEVELS
+                .iter()
+                .map(|level| level.to_string())
+                .collect();
+        }
+        levels
+    }
 }
 
 impl Default for ModelsConfig {
@@ -46,6 +242,7 @@ impl Default for ModelsConfig {
             plan_model: None,
             review_model: None,
             local_assistant_model: None,
+            assistant_choices: default_assistant_choices(),
         }
     }
 }
@@ -58,6 +255,13 @@ where
         .map(|model| model.trim().to_string())
         .filter(|model| !model.is_empty()))
 }
+
+/// Where the pinned model names live, relative to the daemon's working directory.
+///
+/// A constant because two places need it and they must not drift: startup builds the runner from
+/// this file, and `GET /assistant/models` re-reads it per request so a choice added to it works
+/// without a restart. The second reader is the reason it stopped being a literal in `main.rs`.
+pub const MODELS_CONFIG_PATH: &str = ".ai/nucleos-models.yaml";
 
 pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
     if !path.exists() {
@@ -1152,6 +1356,231 @@ fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The picker must not offer a route the daemon cannot take.
+    ///
+    /// A conversation moved to `local` with no local model configured is refused at the first turn
+    /// with `NO_LOCAL_MODEL` — a refusal earned by nothing the person did, arriving a message later
+    /// than the choice that caused it. No model named, no entry, and the route is simply not there.
+    #[test]
+    fn the_catalogue_offers_no_local_model_when_none_is_configured() {
+        let config = ModelsConfig::default();
+
+        let catalogue = config.catalogue();
+
+        assert!(
+            catalogue.iter().all(|choice| choice.brain == "cloud"),
+            "a local route was offered with no local model behind it: {catalogue:?}"
+        );
+    }
+
+    /// And it names the local model rather than the word "local", which is the whole point of the
+    /// change: a person picks a model, not a routing decision they have to translate.
+    #[test]
+    fn the_catalogue_names_the_local_model_when_one_is_configured() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..ModelsConfig::default()
+        };
+
+        let catalogue = config.catalogue();
+
+        let local = catalogue
+            .iter()
+            .find(|choice| choice.brain == "local")
+            .expect("a configured local model is not on the menu");
+        assert_eq!(local.id, "qwen3.5:4b");
+        assert_eq!(local.label, "qwen3.5:4b");
+        // Ollama has no effort dial, and a control that turns nothing is worse than no control.
+        assert!(local.efforts.is_empty());
+    }
+
+    /// The cloud list belongs to the Claude CLI. Offering `sonnet` to a daemon running Codex would
+    /// produce a turn that dies at spawn, and an effort dial Codex has never been verified to read.
+    /// The shipped choices belong to the Claude CLI. A daemon started on Codex must not be offered
+    /// them: `sonnet` there is a turn that dies at spawn.
+    #[test]
+    fn codex_is_not_offered_the_claude_models() {
+        let config = ModelsConfig {
+            primary_runner: Some("codex".to_string()),
+            ..ModelsConfig::default()
+        };
+
+        let catalogue = config.catalogue();
+
+        assert_eq!(catalogue.len(), 1, "{catalogue:?}");
+        assert_eq!(catalogue[0].id, config.codex_model);
+        assert_eq!(config.configured_model(), config.codex_model);
+        assert_eq!(config.active_runner(), "codex");
+    }
+
+    /// And when the file DOES name Codex models, those are what it gets — the two lists live side
+    /// by side and the runner decides which is on the menu.
+    #[test]
+    fn a_file_holding_both_lists_shows_only_the_running_ones() {
+        let both = vec![
+            AssistantChoice {
+                id: "sonnet".to_string(),
+                label: "Sonnet".to_string(),
+                brain: "cloud".to_string(),
+                efforts: vec!["high".to_string()],
+                runner: Some("claude".to_string()),
+            },
+            AssistantChoice {
+                id: "gpt-5.6-terra".to_string(),
+                label: "GPT-5.6-Terra".to_string(),
+                brain: "cloud".to_string(),
+                efforts: vec!["high".to_string(), "ultra".to_string()],
+                runner: Some("codex".to_string()),
+            },
+        ];
+
+        let on_claude = ModelsConfig {
+            assistant_choices: both.clone(),
+            ..ModelsConfig::default()
+        };
+        let on_codex = ModelsConfig {
+            assistant_choices: both,
+            primary_runner: Some("codex".to_string()),
+            ..ModelsConfig::default()
+        };
+
+        assert_eq!(
+            on_claude
+                .catalogue()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["sonnet"]
+        );
+        assert_eq!(
+            on_codex
+                .catalogue()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-terra"]
+        );
+        // `ultra` exists on one CLI and not the other, which is the whole reason the levels are
+        // carried per model rather than as one list for everything.
+        assert!(on_codex.effort_levels().contains(&"ultra".to_string()));
+        assert!(!on_claude.effort_levels().contains(&"ultra".to_string()));
+    }
+
+    /// The shipped default names aliases, not versions. `claude-sonnet-5` stops existing; `sonnet`
+    /// is whatever the CLI currently resolves Sonnet to — so an untouched install does not need
+    /// editing every time a model ships.
+    #[test]
+    fn the_shipped_choices_are_aliases_rather_than_pinned_versions() {
+        let catalogue = ModelsConfig::default().catalogue();
+
+        let ids: Vec<&str> = catalogue.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["opus", "sonnet", "fable"]);
+        assert!(
+            catalogue
+                .iter()
+                .all(|c| c.efforts == EFFORT_LEVELS.map(str::to_string).to_vec()),
+            "a Claude CLI choice was shipped without the levels its CLI documents"
+        );
+    }
+
+    /// A file written before this key existed must keep working, and must still produce a picker.
+    /// An empty catalogue would be a menu with nothing on it — the feature silently absent.
+    #[test]
+    fn a_config_without_the_new_key_still_offers_a_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-terra
+local_assistant_model: qwen3.5:4b
+",
+        )
+        .unwrap();
+
+        let config = load_models_config(&path).unwrap();
+
+        assert_eq!(config.configured_model(), "claude-sonnet-5");
+        let catalogue = config.catalogue();
+        let ids: Vec<&str> = catalogue.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["opus", "sonnet", "fable", "qwen3.5:4b"]);
+    }
+
+    /// The format `scripts/refresh-models.py` writes, parsed by the code that has to read it.
+    ///
+    /// A fixture copied from that script's actual output rather than a shape invented here. The two
+    /// are a contract with nothing enforcing it — the script writes YAML, this reads YAML, and
+    /// neither imports the other — so the only thing standing between a format change and a picker
+    /// that silently falls back to defaults is a test that holds a real sample.
+    #[test]
+    fn the_refresh_scripts_output_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+        std::fs::write(
+            &path,
+            concat!(
+                "claude_model: claude-sonnet-5
+",
+                "codex_model: gpt-5.6-terra
+",
+                "local_assistant_model: qwen3.5:4b
+",
+                "
+",
+                "# Escrito por `scripts/refresh-models.py`.
+",
+                "assistant_choices:
+",
+                "  - { id: \"opus\", label: \"Opus\", brain: cloud, runner: claude, efforts: [low, medium, high, xhigh, max] }
+",
+                "  - { id: \"sonnet\", label: \"Sonnet\", brain: cloud, runner: claude, efforts: [low, medium, high, xhigh, max] }
+",
+                "  - { id: \"gpt-5.6-terra\", label: \"GPT-5.6-Terra\", brain: cloud, runner: codex, efforts: [low, medium, high, xhigh, max, ultra] }
+",
+                "  - { id: \"gpt-5.5\", label: \"GPT-5.5\", brain: cloud, runner: codex, efforts: [low, medium, high, xhigh] }
+",
+            ),
+        )
+        .unwrap();
+
+        let config = load_models_config(&path).unwrap();
+
+        // On Claude, which is what this file's `primary_runner` (absent) means.
+        let catalogue = config.catalogue();
+        let ids: Vec<&str> = catalogue.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["opus", "sonnet", "qwen3.5:4b"]);
+        assert_eq!(
+            catalogue[0].efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        // The local model came from its own key and is on the menu whichever CLI is running.
+        assert!(catalogue.last().unwrap().efforts.is_empty());
+
+        // The Codex half is in the same file and appears only when Codex is the runner.
+        let on_codex = ModelsConfig {
+            primary_runner: Some("codex".to_string()),
+            ..config
+        };
+        let ids: Vec<String> = on_codex.catalogue().iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids, vec!["gpt-5.6-terra", "gpt-5.5", "qwen3.5:4b"]);
+        // Per-model levels survived the round trip: `ultra` is on one of these and not the other.
+        assert_eq!(on_codex.catalogue()[0].efforts.last().unwrap(), "ultra");
+        assert_eq!(on_codex.catalogue()[1].efforts.last().unwrap(), "xhigh");
+    }
+
+    /// Ordered weakest-first, because the window draws them in this order and a dial whose order is
+    /// not its magnitude is one people read backwards.
+    #[test]
+    fn the_effort_levels_are_the_ones_the_cli_documents() {
+        let config = ModelsConfig::default();
+
+        assert_eq!(EFFORT_LEVELS, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(config.effort_levels(), EFFORT_LEVELS.to_vec());
+        assert!(is_effort_level(&config, "xhigh"));
+        assert!(!is_effort_level(&config, "XHIGH"));
+        assert!(!is_effort_level(&config, "maximum"));
+    }
+
     use super::*;
 
     fn rules_from(yaml: &str) -> std::io::Result<AutopilotRules> {

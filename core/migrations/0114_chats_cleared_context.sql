@@ -1,0 +1,33 @@
+-- Where a conversation was told to forget everything before.
+--
+-- The app's `/clear`. The CLI's version drops a session's context and starts over; this daemon has
+-- no context to drop — a turn is a fresh process every time — so the same gesture here has to mean
+-- something slightly different, and the column is named for what it actually does.
+--
+-- ── the two gestures, and why they are two ──────────────────────────────────────────────────────
+-- A turn resumes the CLI session named in `assistant_sessions`, and when there is none it starts
+-- clean and is handed a replay of this conversation's recent exchanges (`recent_exchanges`, plus
+-- the tail an editor session was picked up with). So:
+--
+--   * forgetting the session alone is the app's `/compact`: the next turn starts on a fresh window
+--     and is told, in a few hundred tokens, what was recently said. That path already existed —
+--     rotation does it automatically past `CONTEXT_ROTATION_TOKENS` — and until now nobody could
+--     ask for it.
+--   * this column is the app's `/clear`: it moves the floor of that replay to NOW, so the next turn
+--     starts clean AND is told nothing. It also hides the pick-up tail, which by definition is
+--     older than every turn here and would otherwise be the one thing a clear did not clear.
+--
+-- Two gestures because they answer two different questions — "this is getting expensive" and "we
+-- are done with that, start again" — and a single button would have to guess which one was meant.
+--
+-- ── why a cut and not a delete ─────────────────────────────────────────────────────────────────
+-- The turns stay. Every one of them is still readable in the window, still in `runs`, still
+-- costing what it cost. Clearing decides what the MODEL is shown, not what happened — the same
+-- position `handoff.rs` takes about rewriting history, and the reason rotation stores its handover
+-- as a row somebody can go and read.
+--
+-- Holds the id of the last run at the moment of clearing, so it composes with the other floor on
+-- that replay — the untrusted-read barrier — by simply being the larger of the two.
+--
+-- NULL is a conversation that has never been cleared, which is every one of them today.
+ALTER TABLE chats ADD COLUMN cleared_after_run_id INTEGER;

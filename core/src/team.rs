@@ -2506,6 +2506,14 @@ async fn spawn_agent(
         messages: None,
         ambient_mcp: false,
         model: agent.model.clone(),
+        effort: None,
+        fallback_model: Vec::new(),
+        add_dirs: Vec::new(),
+        max_budget_usd: None,
+        agents: Vec::new(),
+        append_system_prompt: None,
+        denied_tools: Vec::new(),
+        session_name: None,
         // The economy half of the boundary — see `mcp_tools::TEAM_TOOLS`.
         allowed_mcp_tools: Some(crate::mcp_tools::TEAM_TOOLS),
     };

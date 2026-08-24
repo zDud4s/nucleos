@@ -1310,6 +1310,14 @@ fn spawn_run(
                 ambient_mcp: false,
                 // Cloned rather than moved: the request is built once per attempt.
                 model: model.clone(),
+                effort: None,
+                fallback_model: Vec::new(),
+                add_dirs: Vec::new(),
+                max_budget_usd: None,
+                agents: Vec::new(),
+                append_system_prompt: None,
+                denied_tools: Vec::new(),
+                session_name: None,
                 // Nothing to narrow: `create_run_inner` never sets `mcp_config`, so the branch
                 // that reads this does not run for a run started here.
                 allowed_mcp_tools: None,
