@@ -58,6 +58,14 @@ export function vscodeUrl(absolutePath: string, line: number | null): string {
  * single `*` does cross the slashes of a path — the plugin's own `http://*`
  * relies on the same.)
  *
+ * Checked rather than reasoned about, since the pattern is the whole fence: run
+ * against `glob` 0.3.3, the crate `tauri-plugin-opener` builds the entry with,
+ * `vscode://file/*` admits every URL {@link vscodeUrl} produces — drive letter,
+ * line suffix, percent-encoded space — and refuses both
+ * `vscode://extension/…` and `vscode://vscode.git/clone?url=…`. The scheme is
+ * registered on this machine under `HKCU\SOFTWARE\Classesscode`, pointing at
+ * `Code.exe --open-url`, so the OS has somewhere to take it.
+ *
  * Rejects when the scheme is outside the opener's allowed scope, or when nothing
  * on this machine claims `vscode://`. The caller decides what to say about it —
  * "VS Code is not installed" and "the shell is not allowed to ask" want

@@ -79,10 +79,19 @@ function WorkflowNode({ data }: NodeProps<WorkflowFlowNode>) {
         indistinguishable from one that was always there.
 
         It animates through the Web Animations API rather than by writing a `style=` attribute into
-        markup, which is the distinction §11 asked to confirm against the Tauri CSP. What settles it
-        is already in this repository: every panel on the project page sets `style={{ borderColor }}`
-        through React, which is the same CSSOM path, and those ship and work. If a runtime check
-        ever says otherwise, the fallback is one keyframe in `ui.css` and this import.
+        markup, which is the distinction §11 asked to confirm against the Tauri CSP — and it is
+        confirmed by measurement, not by argument. Under the production policy in `tauri.conf.json`
+        (`style-src 'self'`, no `unsafe-inline`) served as a header over the built bundle, all three
+        of §11's uses ran — a layout transition, a number interpolating, a colour spring — with a
+        WAAPI animation live at the sample point and not one refusal. A `<style>` element and a
+        `style` attribute injected straight afterwards were both refused, so the policy was in force
+        throughout rather than merely absent.
+
+        The trap that made measuring worth it, recorded because it will catch the next person:
+        `tauri dev` applies `devCsp`, and `devCsp` carries `style-src 'unsafe-inline'` because Vite
+        injects CSS through a `<style>` element it builds at runtime. **Development cannot catch a
+        CSP style regression** — only a packaged build can, or a run of the bundle under the real
+        header. If one ever appears, the fallback is one keyframe in `ui.css` and this import.
       */}
       <motion.div
         animate={running ? { scale: [1, 1.03, 1] } : { scale: 1 }}
