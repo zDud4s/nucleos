@@ -213,6 +213,11 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/ide-sessions/{session_id}/tools",
             post(wire_ide_session_tools),
         )
+        // Which models a conversation may be moved to. Its own route and not a field on the chat,
+        // because it is the same answer for every chat and a per-chat copy would be fetched once
+        // per row in the list.
+        .route("/assistant/models", get(get_assistant_models))
+        .route("/assistant/tools", get(get_deniable_tools))
         .route("/assistant/chats", get(list_chats).post(create_chat))
         .route(
             "/assistant/chats/{chat_id}",
@@ -252,6 +257,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
+        // The two context gestures. Separate routes rather than one with a flag, because they are
+        // separate decisions and a caller that got the flag backwards would silently throw away a
+        // conversation's memory.
+        .route(
+            "/assistant/chats/{chat_id}/fresh-context",
+            post(post_fresh_context),
+        )
+        .route("/assistant/chats/{chat_id}/clear", post(post_clear_context))
         .route("/assistant/{turn_id}", get(get_run))
         // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
         // the two cannot shadow each other whatever a turn id looks like.
@@ -4090,6 +4103,34 @@ struct CreateChatRequest {
     /// accepted here — a caller that could name its own working directory could name one where the
     /// classifier hook is wired and collect the tools that come with it.
     continue_session: Option<String>,
+    /// Which model answers it, as a choice id from `GET /assistant/models`.
+    ///
+    /// Here as well as on the PATCH because the front door has no conversation to PATCH yet: a
+    /// person picks a model, types, and sends, and without this the window would have to open a
+    /// chat on the default and correct it a round trip later — visibly, and wrongly if the second
+    /// call failed.
+    ///
+    /// A plain `Option` and not the PATCH's `Option<Option<_>>`: there is no conversation here to
+    /// unpin, so absent and null both mean the same thing and the third state does not exist.
+    model: Option<String>,
+    /// How hard it is asked to think, on the same footing.
+    effort: Option<String>,
+    /// Who answers when the chosen model is unavailable, as choice ids in the order to try them.
+    #[serde(default)]
+    fallback_model: Vec<String>,
+    /// Absolute paths this conversation's tools may also reach.
+    #[serde(default)]
+    extra_dirs: Vec<String>,
+    /// The most one turn may spend, in dollars.
+    turn_budget_usd: Option<f64>,
+    /// The helpers it may hand work to, added to the ones the CLI finds in the project itself.
+    #[serde(default)]
+    agents: Vec<crate::runner::Subagent>,
+    /// Standing instructions appended to its system prompt.
+    system_prompt: Option<String>,
+    /// Built-in tools it may not reach for.
+    #[serde(default)]
+    denied_tools: Vec<String>,
 }
 
 /// One session as it is OFFERED: what it is, plus what continuing it would be able to do.
@@ -4260,7 +4301,30 @@ async fn create_chat(
     State(state): State<AppState>,
     Json(body): Json<CreateChatRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let brain = crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud"));
+    // A named model decides the route, and outranks any `brain` sent beside it — the same
+    // precedence `patch_chat` applies, for the same reason: a row saying `local` while naming a
+    // cloud model would be sent to Ollama under a name it has never heard.
+    let brain = match body.model.as_deref() {
+        Some(id) => chosen_brain(id)?,
+        None => crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud")),
+    };
+    // Checked before the row exists, so a bad level leaves no conversation behind to explain. The
+    // three below are checked here for the same reason and in the same breath.
+    if let Some(level) = body.effort.as_deref() {
+        if !crate::config::is_effort_level(&models_config(), level) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    checked_fallback(&body.fallback_model)?;
+    checked_dirs(&body.extra_dirs).await?;
+    if let Some(amount) = body.turn_budget_usd {
+        checked_budget(amount)?;
+    }
+    checked_agents(&body.agents)?;
+    if let Some(text) = body.system_prompt.as_deref() {
+        checked_instructions(text)?;
+    }
+    checked_denials(&body.denied_tools)?;
 
     // Resolved BEFORE the row is written, so a session the daemon cannot find leaves nothing behind
     // — rather than a conversation that looks continued and starts a fresh context on its first turn.
@@ -4282,6 +4346,68 @@ async fn create_chat(
             tracing::warn!(%error, "opening a chat failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    // After the row exists rather than as arguments to `create`, which takes the facts a
+    // conversation cannot be opened without. These two are preferences: a conversation with neither
+    // is the ordinary case and has been since the table was made, and threading them through the
+    // constructor would make every existing caller name a choice it does not have.
+    //
+    // A failure here is logged and not fatal. The conversation is open and usable on the configured
+    // model; refusing the whole request would throw away a chat that exists, and answering 500
+    // would tell the window nothing was created when something was.
+    if body.model.is_some() || body.effort.is_some() {
+        if let Err(error) =
+            crate::chats::set_model(&state.pool, &chat_id, body.model.as_deref()).await
+        {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept the configured model");
+        }
+        if let Err(error) =
+            crate::chats::set_effort(&state.pool, &chat_id, body.effort.as_deref()).await
+        {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept the default effort");
+        }
+    }
+    if !body.fallback_model.is_empty() {
+        if let Err(error) =
+            crate::chats::set_fallback(&state.pool, &chat_id, &body.fallback_model).await
+        {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept no fallback");
+        }
+    }
+    if !body.extra_dirs.is_empty() {
+        if let Err(error) =
+            crate::chats::set_extra_dirs(&state.pool, &chat_id, &body.extra_dirs).await
+        {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation reaches only its own directory");
+        }
+    }
+    if body.turn_budget_usd.is_some() {
+        if let Err(error) =
+            crate::chats::set_turn_budget(&state.pool, &chat_id, body.turn_budget_usd).await
+        {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept no ceiling");
+        }
+    }
+    if !body.agents.is_empty() {
+        if let Err(error) = crate::chats::set_agents(&state.pool, &chat_id, &body.agents).await {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation defined no helpers");
+        }
+    }
+    if body.system_prompt.is_some() {
+        if let Err(error) =
+            crate::chats::set_system_prompt(&state.pool, &chat_id, body.system_prompt.as_deref())
+                .await
+        {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation kept the default instructions");
+        }
+    }
+    if !body.denied_tools.is_empty() {
+        if let Err(error) =
+            crate::chats::set_denied_tools(&state.pool, &chat_id, &body.denied_tools).await
+        {
+            tracing::warn!(%error, chat_id = %chat_id, "the new conversation denied no tools of its own");
+        }
+    }
 
     // Measured once, here, where the file is read anyway and where the answer can still change
     // what happens. The ceiling `get_session` enforces reads `runs.context_fill` — the daemon's OWN
@@ -4347,6 +4473,375 @@ async fn create_chat(
     Ok(Json(serde_json::json!({ "chat_id": chat_id })))
 }
 
+/// The pinned model names as they are on disk right now.
+///
+/// Re-read per request rather than held on `AppState`, which every caller of this depends on: a
+/// pinned choice travels as `--model` on the turn itself, so a name added to the file is one this
+/// daemon can already run — and a catalogue cached at startup would spend a whole daemon lifetime
+/// refusing it. `scripts/refresh-models.py` rewrites this file, and nothing should have to be
+/// restarted for that to take.
+///
+/// An unreadable or missing file answers with the built-in defaults rather than an error, matching
+/// what startup does: a picker that fails closed leaves somebody unable to change a model because
+/// of a typo in a key that has nothing to do with models.
+fn models_config() -> crate::config::ModelsConfig {
+    crate::config::load_models_config(std::path::Path::new(crate::config::MODELS_CONFIG_PATH))
+        .unwrap_or_default()
+}
+
+/// Every named model is on the menu AND is one the agent CLI could take over, or a refusal.
+///
+/// The same allowlist a pinned model goes through, for the same reason: a fallback naming something
+/// the daemon would not run is a turn that dies at spawn on the day the primary is overloaded —
+/// which is to say, on the worst day, and only then.
+///
+/// Cloud only, which the pinned model deliberately is not. `--fallback-model` is a flag on the
+/// agent CLI; the local route is a different process that has never heard of it, so a local choice
+/// here is a name handed to a CLI that cannot resolve it — the exact failure this check exists to
+/// prevent, arriving from the one direction the id check alone let through.
+fn checked_fallback(names: &[String]) -> Result<(), StatusCode> {
+    let config = models_config();
+    for name in names {
+        cloud_choice(&config, name).ok_or(StatusCode::BAD_REQUEST)?;
+    }
+    Ok(())
+}
+
+/// The catalogue entry a name refers to, if it is one the agent CLI could be handed.
+///
+/// Takes the config rather than reading it, which is what makes the rule testable: `models_config`
+/// reads a fixed path, so a test running from the crate root gets the built-in defaults and those
+/// have no local model in them — the exact case this exists to refuse would be unreachable.
+///
+/// "Cloud" here means the agent CLI, not "not on this machine". Both `--fallback-model` and the
+/// per-helper `model` inside `--agents` are flags on that CLI; the local route is a different
+/// process that has never heard of either, so a local choice in one of those places is a name
+/// handed to something that cannot resolve it. The conversation's OWN model is deliberately not
+/// filtered this way — picking it is how a conversation moves onto the local route at all.
+fn cloud_choice(
+    config: &crate::config::ModelsConfig,
+    id: &str,
+) -> Option<crate::config::AssistantChoice> {
+    config
+        .catalogue()
+        .into_iter()
+        .find(|choice| choice.id == id)
+        .filter(|choice| {
+            crate::chats::Brain::from_wire(&choice.brain) == crate::chats::Brain::Cloud
+        })
+}
+
+/// The largest `--agents` value this daemon will write, in characters.
+///
+/// A helper set travels as ONE argv element, and Windows caps an entire command line at 32767
+/// characters — the prompt, every flag and this. Refused at the door rather than at spawn, because
+/// over the line `CreateProcess` fails with an error about nothing in particular and the turn looks
+/// broken rather than too big. Somebody who needs more has the CLI's own answer: files in the
+/// project's `.claude/agents/`, which this merges with rather than replaces.
+const AGENTS_JSON_CEILING: usize = 8_000;
+
+/// The longest standing instructions this daemon will write, in characters.
+///
+/// The same command-line ceiling `AGENTS_JSON_CEILING` guards, counted separately because they are
+/// separate argv elements and a person hitting one should not be told about the other. Windows caps
+/// a whole command line at 32767: these two together are 16000 of it, and the message itself is
+/// also on that line — which is a limit this daemon has always had and does not introduce here.
+const INSTRUCTIONS_CEILING: usize = 8_000;
+
+/// Standing instructions that will fit on a command line, or a refusal.
+///
+/// Length is the whole of it. There is nothing else to check: the text becomes ONE element of an
+/// argument vector, never a shell word, so no character in it means anything to anything but the
+/// model reading it.
+fn checked_instructions(text: &str) -> Result<(), StatusCode> {
+    if text.len() > INSTRUCTIONS_CEILING {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+/// Every named tool is one this daemon knows how to deny, or a refusal.
+///
+/// Names only, never the CLI's `Bash(git *)` patterns. Not because a pattern is dangerous — it can
+/// only ever deny — but because a pattern is a rule language, and a rule that matches nothing is
+/// reported as one line on stderr that nobody using this app will ever read. A name off the list is
+/// a refusal somebody can act on; a pattern with a typo is a restriction that silently is not one.
+fn checked_denials(names: &[String]) -> Result<(), StatusCode> {
+    for name in names {
+        if !crate::runner::BUILTIN_TOOLS.contains(&name.as_str()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    Ok(())
+}
+
+/// Every helper is one the CLI would actually build, or a refusal.
+///
+/// The door checks this because the CLI does NOT. Measured against 2.1.198, it parses the flag
+/// inside a try/catch and answers a throw with an EMPTY agent list: a single bad definition costs
+/// you every helper you defined, silently, with the run continuing as though you had asked for
+/// none. There is no message and no exit code to notice. So what could not survive is refused here,
+/// where there is somebody to tell.
+fn checked_agents(agents: &[crate::runner::Subagent]) -> Result<(), StatusCode> {
+    let config = models_config();
+    let mut seen: Vec<&str> = Vec::new();
+
+    for agent in agents {
+        // A name the CLI would reject, or one that is not a name. `-` first is its own documented
+        // rule — a leading dash reads as a flag. The rest is this daemon's: the name is what a model
+        // types to delegate, so a space or a quote in it is a helper nothing can call by hand.
+        let name = agent.name.trim();
+        if name.is_empty()
+            || name.len() > 64
+            || name.starts_with('-')
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        // Two helpers of one name collapse into one on the way into the object the flag takes, and
+        // the person watches the other vanish without being told. Refused here so nothing is lost
+        // quietly. Case-sensitive, because that is what actually collapses: the CLI keys on the
+        // exact string, so `Reviewer` and `reviewer` are genuinely two helpers, and refusing them
+        // would be this daemon inventing a rule the CLI does not have.
+        if seen.contains(&name) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        seen.push(name);
+
+        // Both are `min(1)` in the CLI's own schema. The description is load-bearing beyond that:
+        // it is the whole of what the parent model reads to decide whether to delegate, so a helper
+        // without one is defined, listed, and never used.
+        if agent.description.trim().is_empty() || agent.prompt.trim().is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // A helper runs INSIDE the agent CLI, so its model has to be one that CLI can take — the
+        // same reason the fallback is cloud-only, and not the same question as which route the
+        // conversation itself is on.
+        let named = match &agent.model {
+            None => None,
+            Some(id) => Some(cloud_choice(&config, id).ok_or(StatusCode::BAD_REQUEST)?),
+        };
+
+        // Against the levels the helper's OWN model takes when it named one, and against the union
+        // when it did not. This is the one place the narrow check is honest: a helper's model and
+        // its effort arrive in the same object, in one request, so they cannot drift apart between
+        // two calls the way a conversation's can — which is exactly why `is_effort_level` checks the
+        // union and this does not.
+        if let Some(level) = agent.effort.as_deref() {
+            let takes = match &named {
+                Some(choice) => choice.efforts.iter().any(|have| have == level),
+                None => crate::config::is_effort_level(&config, level),
+            };
+            if !takes {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
+    if crate::runner::agents_json(agents).len() > AGENTS_JSON_CEILING {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+/// Every path is absolute and is a directory that is there, or a refusal.
+///
+/// Checked here rather than at the first turn, matching `cwd`: a conversation pointed at a typo
+/// looks exactly like one pointed at a project until somebody asks it to read a file, and the
+/// answer comes back as a model's confusion rather than as a refusal anybody can act on.
+///
+/// Absolute because a relative path resolves against the DAEMON's working directory, which is not a
+/// place the caller knows or meant — and this grants tool access, so a path nobody verified is a
+/// directory nobody chose. Stored as given rather than canonicalised, for the reason `cwd` gives:
+/// on Windows a canonical path carries a `\\?\` prefix that a raw one does not.
+async fn checked_dirs(paths: &[String]) -> Result<(), StatusCode> {
+    for raw in paths {
+        let path = std::path::Path::new(raw);
+        let is_directory = tokio::fs::metadata(path)
+            .await
+            .map(|found| found.is_dir())
+            .unwrap_or(false);
+        if !path.is_absolute() || !is_directory {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    Ok(())
+}
+
+/// A ceiling that is a real amount of money, or a refusal.
+///
+/// `is_finite` and not just a range check: JSON carries infinities and NaN through some encoders,
+/// and `format!("{ceiling}")` would hand the CLI the word `inf` as a dollar amount. Zero is refused
+/// as well — a ceiling of nothing is a conversation that cannot answer, which is what clearing it
+/// is for and says so plainly.
+fn checked_budget(amount: f64) -> Result<(), StatusCode> {
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+/// Which route a choice id names, or a refusal.
+///
+/// One function because two routes ask — opening a conversation and re-pointing one — and a second
+/// copy of this lookup is how the two come to disagree about which names are real. It re-reads the
+/// file for the reason `get_assistant_models` gives: a pinned choice travels as `--model` on the
+/// turn, so a name added to the config is one this daemon can already run.
+fn chosen_brain(id: &str) -> Result<crate::chats::Brain, StatusCode> {
+    models_config()
+        .catalogue()
+        .into_iter()
+        .find(|choice| choice.id == id)
+        .map(|choice| crate::chats::Brain::from_wire(&choice.brain))
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
+/// Which models a conversation may be moved to, and how hard each can be asked to think.
+///
+/// Read from the file on every request rather than from `AppState`. The runner is built once at
+/// startup and pins the DEFAULT model, but a pinned choice travels as `--model` on the turn itself —
+/// so a name added to the file is one the daemon can already run, and a catalogue cached at startup
+/// would spend a whole daemon lifetime refusing it. The cost is a small file read on a route the
+/// window calls when a menu opens.
+///
+/// An unreadable or missing file answers with the built-in defaults rather than an error: the same
+/// posture startup takes, and a picker that fails closed leaves a person unable to change a model
+/// because of a typo in a key that has nothing to do with models.
+async fn get_assistant_models() -> Json<serde_json::Value> {
+    let config = models_config();
+    Json(serde_json::json!({
+        // Each choice carries its OWN effort levels, which is what the picker draws: they differ
+        // per model, and a menu built from the union below would offer levels that die at spawn.
+        "choices": config.catalogue(),
+        // What an unpinned conversation runs on, so the window can NAME that state rather than
+        // showing an empty selection and letting a person guess.
+        "configured": config.configured_model(),
+        // The union, for the one case with no model chosen yet — the front door before anybody
+        // picks. Also what the door validates against.
+        "efforts": config.effort_levels(),
+    }))
+}
+
+/// Starts this conversation's next turn on a fresh window, with a replay of what was recently said.
+///
+/// This app's `/compact`. There is no context here to compact — a turn is a fresh process every
+/// time, and what a turn resumes is a CLI session — so the gesture is to forget the session: the
+/// next turn starts clean and is handed a few hundred tokens of recent exchanges instead of a
+/// window that has grown to a hundred thousand.
+///
+/// The path already existed and nobody could ask for it. Rotation does exactly this on its own past
+/// `CONTEXT_ROTATION_TOKENS`, which meant the only way to get a conversation out of an expensive
+/// context was to let it get expensive first.
+async fn post_fresh_context(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    chat_must_exist(&state, &chat_id).await?;
+    // A live turn writes its session back when it ends (`upsert_session`), so forgetting one now
+    // would be undone in a minute by the turn that is still running — the request would report
+    // success and change nothing. 409 is the same answer `POST /assistant/message` gives.
+    if crate::assistant::is_busy(&chat_id) {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    crate::assistant::forget_session(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "starting a conversation on a fresh context failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Starts the next turn clean and tells it nothing about what came before — this app's `/clear`.
+///
+/// The stronger of the two, and the difference is the whole point: `/fresh-context` moves the
+/// conversation onto a new window and replays what was recently said; this moves the floor of that
+/// replay to now, so there is nothing to replay. It also hides the tail an editor session was
+/// picked up with, which is older than every turn here and would otherwise be the one thing a clear
+/// did not clear.
+///
+/// The turns are not deleted. Every one of them stays readable in the window and stays in `runs`
+/// costing what it cost — clearing decides what the MODEL is shown, not what happened. That is the
+/// same position `handoff.rs` takes about rewriting history.
+async fn post_clear_context(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    chat_must_exist(&state, &chat_id).await?;
+    // For the reason above, and one more: the floor is the id of the LAST run, and a turn in flight
+    // already has a row. Clearing now would put the floor above a turn that has not answered yet,
+    // so its answer would arrive into a conversation that had already forgotten the question.
+    if crate::assistant::is_busy(&chat_id) {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    crate::chats::clear_context(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "clearing what a conversation is shown failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    // Both, and in this order. The cut decides what a fresh turn is TOLD; forgetting the session is
+    // what makes the next turn fresh at all. Without the second, the next turn would resume the old
+    // window and the cut would have changed nothing anybody could see.
+    crate::assistant::forget_session(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "forgetting a cleared conversation's session failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A 404 for a conversation this daemon does not have — never opened here, or archived.
+///
+/// Answered before anything is written, for the reason `patch_chat` gives at length: without it a
+/// route reports success for an UPDATE that matched no row, which is the API saying "done" about
+/// something it did not do.
+async fn chat_must_exist(state: &AppState, chat_id: &str) -> Result<(), StatusCode> {
+    match crate::chats::get(&state.pool, chat_id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// Which built-in tools a conversation can be told not to reach for.
+///
+/// Served rather than hardcoded in the window, because there is exactly one list and it is the one
+/// `cli_args` writes into the flag. A second copy in the UI would offer a name the door refuses, or
+/// — worse — stop offering one the daemon can still deny, so a restriction somebody set becomes
+/// invisible and unremovable.
+///
+/// The list is deliberately WIDER than any single CLI version's tool set: see `BUILTIN_TOOLS`,
+/// where the margin is the point. Denying a name this CLI does not have costs one line on stderr;
+/// missing one it does have costs the restriction.
+async fn get_deniable_tools() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "tools": crate::runner::BUILTIN_TOOLS }))
+}
+
+/// Tells an absent field from one explicitly sent as `null`.
+///
+/// `Option<Option<T>>` alone does NOT do this. Serde maps a JSON `null` onto the OUTER option, so
+/// `{"model": null}` and `{}` both arrive as `None` and the unpin is silently dropped — the field
+/// has three states in the type and two on the wire. Deserializing the inner option and wrapping it
+/// in `Some` is what makes the third reachable: absent never calls this at all and falls to
+/// `Default`, while `null` calls it and comes back `Some(None)`.
+///
+/// Found by a test that pinned a value and then cleared it. The ones that only cleared an already
+/// empty field passed either way, which is the shape of test that agrees with any implementation.
+fn sent_even_if_null<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
 #[derive(serde::Deserialize)]
 struct PatchChatRequest {
     title: Option<String>,
@@ -4362,6 +4857,57 @@ struct PatchChatRequest {
     /// them on a directory plus a wired classifier hook, and without this there was no directory to
     /// give it.
     cwd: Option<String>,
+    /// Which model answers this conversation from here on.
+    ///
+    /// `Option<Option<_>>` and not `Option<_>`, because three states have to be distinguishable and
+    /// two of them look identical to the simpler type: the field ABSENT means "leave it alone", an
+    /// explicit `null` means "unpin, follow the configured model again", and a string pins. With a
+    /// single `Option` the unpin is unsayable — it arrives as absence, which is the one thing it is
+    /// not.
+    ///
+    /// The string is a choice id from `GET /assistant/models` and is checked against that list. Not
+    /// because an unknown one is dangerous — it becomes one element of an argument vector, never a
+    /// shell word — but because it is a turn that dies at spawn, on the person's next message, for a
+    /// reason the window could have given them here.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    model: Option<Option<String>>,
+    /// How hard the model is asked to think: `low | medium | high | xhigh | max`, or `null` for the
+    /// CLI's own default. Same three states as `model`, for the same reason.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    effort: Option<Option<String>>,
+    /// Who answers when the chosen model is unavailable, as choice ids in the order to try them.
+    /// `null` or an empty list clears it. Same three states as `model`, for the same reason.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    fallback_model: Option<Option<Vec<String>>>,
+    /// Absolute paths this conversation's tools may also reach. `null` or empty clears them.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    extra_dirs: Option<Option<Vec<String>>>,
+    /// The most one TURN may spend, in dollars. `null` clears the ceiling.
+    ///
+    /// Per turn, not per conversation: the CLI's flag bounds one invocation and this daemon spawns
+    /// one per turn. The field is named for what it bounds so nobody reads it as a total.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    turn_budget_usd: Option<Option<f64>>,
+    /// The helpers this conversation may hand work to. `null` or an empty list clears them.
+    ///
+    /// The WHOLE set every time, not one helper added or removed. A conversation's helpers are read
+    /// and drawn as a list, and a client that could add one without naming the others would have to
+    /// be told what happens when two requests cross — this way the last writer wins and says so.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    agents: Option<Option<Vec<crate::runner::Subagent>>>,
+    /// Standing instructions appended to this conversation's system prompt. `null` or blank clears
+    /// them.
+    ///
+    /// Appended and never substituted: the flag that REPLACES the CLI's system prompt exists and is
+    /// deliberately not reachable from here, because it would drop the tool descriptions and the
+    /// safety framing with it.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    system_prompt: Option<Option<String>>,
+    /// Built-in tools this conversation may not reach for. `null` or an empty list clears them.
+    ///
+    /// The whole set every time, like `agents`, and for the same reason.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    denied_tools: Option<Option<Vec<String>>>,
 }
 
 /// Renames a conversation, changes which model answers it, or both.
@@ -4395,7 +4941,11 @@ async fn patch_chat(
     // `POST /assistant/message` gives for the same reason.
     //
     // A rename moves neither and is left alone.
-    if (body.brain.is_some() || body.cwd.is_some() || body.plan_only.is_some())
+    if (body.brain.is_some()
+        || body.model.is_some()
+        || body.effort.is_some()
+        || body.cwd.is_some()
+        || body.plan_only.is_some())
         && crate::assistant::is_busy(&chat_id)
     {
         return Err(StatusCode::CONFLICT);
@@ -4452,6 +5002,140 @@ async fn patch_chat(
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "forgetting a chat's session failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // After the brain block above, and that order is the whole point: a choice names its own route,
+    // so when a client sends both and they disagree, the one that cannot be wrong is the one that
+    // lands last. A row saying `local` while naming a cloud model would be sent to Ollama under a
+    // name it has never heard.
+    if let Some(model) = &body.model {
+        let brain = match model {
+            Some(id) => Some(chosen_brain(id)?),
+            // Unpinning says nothing about the route. The conversation goes back to following the
+            // configured model, and `brain` keeps whatever it already had — changing it here would
+            // be this route inventing a decision nobody expressed.
+            None => None,
+        };
+
+        crate::chats::set_model(&state.pool, &chat_id, model.as_deref())
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "pinning a conversation to a model failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if let Some(brain) = brain {
+            crate::chats::set_brain(&state.pool, &chat_id, brain)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "routing a conversation to its model's brain failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
+
+        // For the reason the brain block gives: the model taking over has not seen the turns the
+        // other one answered, and resuming across that gap hands it a context missing them.
+        crate::assistant::forget_session(&state.pool, &chat_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "forgetting a re-modelled chat's session failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // None of the three below joins the 409 guard above, and that is a per-column answer rather than
+    // an oversight. `cwd` and the brain are guarded because a live turn's record would come to
+    // disagree with them — the chat row is the only note of where a turn ran, and `answered_by` is
+    // written when the row is born. Nothing records a run's fallback, its extra directories or its
+    // ceiling, and all three are read at LAUNCH, so a turn already running has its own copy and
+    // cannot be made to lie by changing them. Refusing here would only stop somebody setting up
+    // their next turn while waiting for this one.
+    if let Some(fallback) = &body.fallback_model {
+        let names = fallback.clone().unwrap_or_default();
+        checked_fallback(&names)?;
+        crate::chats::set_fallback(&state.pool, &chat_id, &names)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "naming a conversation's fallback model failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(dirs) = &body.extra_dirs {
+        let paths = dirs.clone().unwrap_or_default();
+        checked_dirs(&paths).await?;
+        crate::chats::set_extra_dirs(&state.pool, &chat_id, &paths)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "widening what a conversation may reach failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(ceiling) = &body.turn_budget_usd {
+        if let Some(amount) = ceiling {
+            checked_budget(*amount)?;
+        }
+        crate::chats::set_turn_budget(&state.pool, &chat_id, *ceiling)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "setting what a turn may spend failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // Read at launch like the three above, so it stays out of the 409 for the reason they do. A
+    // turn already running holds the helper set it was spawned with; nothing here can reach in and
+    // change what it was given.
+    if let Some(agents) = &body.agents {
+        let defined = agents.clone().unwrap_or_default();
+        checked_agents(&defined)?;
+        crate::chats::set_agents(&state.pool, &chat_id, &defined)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "defining a conversation's helpers failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(instructions) = &body.system_prompt {
+        if let Some(text) = instructions {
+            checked_instructions(text)?;
+        }
+        crate::chats::set_system_prompt(&state.pool, &chat_id, instructions.as_deref())
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "writing a conversation's standing instructions failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    if let Some(denied) = &body.denied_tools {
+        let names = denied.clone().unwrap_or_default();
+        checked_denials(&names)?;
+        crate::chats::set_denied_tools(&state.pool, &chat_id, &names)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "narrowing what a conversation may reach for failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // No `forget_session`. Effort changes how hard the same model thinks, not who is thinking — the
+    // context the session holds is still that model's own, and dropping it would make a dial nobody
+    // considers destructive silently restart the conversation.
+    if let Some(effort) = &body.effort {
+        if let Some(level) = effort {
+            if !crate::config::is_effort_level(&models_config(), level) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        crate::chats::set_effort(&state.pool, &chat_id, effort.as_deref())
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing how hard a conversation thinks failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }
@@ -10132,6 +10816,930 @@ mod tests {
             crate::chats::brain_of(&state.pool, &id).await.unwrap(),
             Some(crate::chats::Brain::Cloud)
         );
+    }
+
+    /// The front door has no conversation to PATCH yet: a person picks a model, types, and sends.
+    /// Without this the window would open the chat on the default and correct it a round trip later
+    /// — visibly, and wrongly if the second call failed.
+    #[tokio::test]
+    async fn a_conversation_can_be_opened_on_a_chosen_model() {
+        let state = test_state().await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/assistant/chats",
+            Some(serde_json::json!({"model": "fable", "effort": "high"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let id = body["chat_id"].as_str().unwrap();
+        assert_eq!(
+            crate::chats::model_of(&state.pool, id).await.unwrap(),
+            (Some("fable".to_string()), Some("high".to_string()))
+        );
+    }
+
+    /// And the same allowlist guards it, before the row exists — so a refused name leaves no
+    /// conversation behind to explain.
+    #[tokio::test]
+    async fn opening_a_conversation_on_a_model_nobody_offers_is_refused() {
+        let state = test_state().await;
+
+        // The table is not empty to begin with: 0061 seeds the window's own conversation. So the
+        // assertion is on the COUNT not moving, which is what "left nothing behind" actually means.
+        let before = crate::chats::list(&state.pool).await.unwrap().len();
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/assistant/chats",
+            Some(serde_json::json!({"model": "gpt-4-turbo"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::chats::list(&state.pool).await.unwrap().len(),
+            before,
+            "a refused model left a conversation behind"
+        );
+    }
+
+    /// A named model decides the route and outranks a `brain` sent beside it, so a client that
+    /// sends both cannot produce a row pointing at Ollama under a cloud model's name.
+    #[tokio::test]
+    async fn the_model_outranks_a_brain_sent_beside_it() {
+        let state = test_state().await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/assistant/chats",
+            Some(serde_json::json!({"brain": "local", "model": "sonnet"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let id = body["chat_id"].as_str().unwrap();
+        assert_eq!(
+            crate::chats::brain_of(&state.pool, id).await.unwrap(),
+            Some(crate::chats::Brain::Cloud)
+        );
+    }
+
+    /// What the window builds its picker from. An empty list would be a menu with nothing on it —
+    /// the feature silently absent rather than visibly broken.
+    #[tokio::test]
+    async fn the_catalogue_route_answers_with_choices_and_efforts() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/models", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let choices = body["choices"].as_array().unwrap();
+        assert!(!choices.is_empty(), "the picker was handed an empty menu");
+        assert!(
+            choices
+                .iter()
+                .all(|c| c["id"].is_string() && c["label"].is_string())
+        );
+        assert_eq!(
+            body["efforts"].as_array().unwrap().len(),
+            crate::config::EFFORT_LEVELS.len()
+        );
+        assert!(body["configured"].is_string());
+    }
+
+    /// The catalogue is the allowlist. Not because an unknown name is dangerous — it becomes one
+    /// element of an argument vector and never a shell word — but because it is a turn that dies at
+    /// spawn, on the person's NEXT message, for a reason the window could have given them here.
+    #[tokio::test]
+    async fn a_model_the_catalogue_does_not_offer_is_refused() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"model":"gpt-4-turbo"}"#).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap(),
+            (None, None),
+            "a refused model was written anyway"
+        );
+    }
+
+    /// Picking a model picks its route. The two are one gesture because a row saying `local` while
+    /// naming a cloud model would be sent to Ollama under a name it has never heard — a state no
+    /// client should be able to produce, however it orders its fields.
+    #[tokio::test]
+    async fn choosing_a_model_routes_the_conversation_to_its_brain() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"model":"sonnet"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            Some("sonnet".to_string())
+        );
+        assert_eq!(
+            crate::chats::brain_of(&state.pool, &id).await.unwrap(),
+            Some(crate::chats::Brain::Cloud),
+            "the conversation kept the local route while naming a cloud model"
+        );
+    }
+
+    /// Unpinning says nothing about the route. The conversation goes back to following the
+    /// configured model; inventing a brain change here would be this route deciding something
+    /// nobody expressed.
+    #[tokio::test]
+    async fn unpinning_a_model_leaves_the_route_where_it_was() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+        // Pinned FIRST, so the assertion below can only pass if the `null` did something. Without
+        // this the test cleared a field that was already empty and agreed with an implementation
+        // that dropped the request on the floor — which is exactly what serde did.
+        crate::chats::set_model(&state.pool, &id, Some("sonnet"))
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"model":null}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            None
+        );
+        assert_eq!(
+            crate::chats::brain_of(&state.pool, &id).await.unwrap(),
+            Some(crate::chats::Brain::Local)
+        );
+    }
+
+    /// An absent field means "leave it alone" and must not read as an unpin. This is the whole
+    /// reason the field is `Option<Option<_>>`: with a single `Option` the two are the same value.
+    #[tokio::test]
+    async fn a_patch_that_says_nothing_about_the_model_leaves_it_alone() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        patch_chat_request(state.clone(), &id, r#"{"model":"fable"}"#).await;
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"title":"orçamento"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            Some("fable".to_string()),
+            "a rename unpinned the model"
+        );
+    }
+
+    /// Checked at the door against the CLI's documented levels, so a typo is a refusal here rather
+    /// than a turn that dies at spawn later.
+    #[tokio::test]
+    async fn an_effort_the_cli_does_not_know_is_refused() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"effort":"maximum"}"#).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().1,
+            None
+        );
+    }
+
+    /// Effort changes how hard the same model thinks, not who is thinking. Dropping the session
+    /// would make a dial nobody considers destructive silently restart the conversation.
+    #[tokio::test]
+    async fn changing_the_effort_keeps_the_conversation_resumable() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::upsert_session(
+            &state.pool,
+            &id,
+            "a-session",
+            "2026-08-22T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"effort":"high"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().1,
+            Some("high".to_string())
+        );
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, &id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a-session"),
+            "turning the effort dial cost the conversation its memory"
+        );
+    }
+
+    /// A model change does drop it, for the reason the brain change does: the model taking over has
+    /// not seen the turns the other one answered, and resuming across that gap hands it a context
+    /// missing them.
+    #[tokio::test]
+    async fn choosing_a_model_forgets_the_session_the_other_one_filled() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::upsert_session(
+            &state.pool,
+            &id,
+            "a-session",
+            "2026-08-22T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"model":"opus"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, &id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The same 409 the brain gets, for the same reason: `answered_by` is written when the turn's
+    /// row is born, so swapping who answers under a live turn makes that column lie.
+    #[tokio::test]
+    async fn the_model_cannot_be_changed_under_a_running_turn() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(ParkedRunner);
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &id,
+            "take your time",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"model":"opus"}"#).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap(),
+            (None, None)
+        );
+    }
+
+    /// The same allowlist a pinned model goes through. A fallback naming something the daemon would
+    /// not run is a turn that dies at spawn on the day the primary is overloaded — which is to say,
+    /// on the worst day, and only then.
+    #[tokio::test]
+    async fn a_fallback_naming_a_model_nobody_offers_is_refused() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(
+            state.clone(),
+            &id,
+            r#"{"fallback_model":["sonnet","gpt-4-turbo"]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // And the good half of the list was not written either: one refusal, nothing partial.
+        assert!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .fallback_model
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_names_who_answers_when_its_model_is_overloaded() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(
+            state.clone(),
+            &id,
+            r#"{"fallback_model":["opus","sonnet"]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .fallback_model,
+            vec!["opus".to_string(), "sonnet".to_string()],
+            "the order is the order they are tried in"
+        );
+    }
+
+    /// A relative path resolves against the DAEMON's working directory, which is not a place the
+    /// caller knows or meant — and this grants tool access, so it is refused rather than resolved.
+    #[tokio::test]
+    async fn a_relative_directory_cannot_be_granted_to_a_conversation() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"extra_dirs":["./beside"]}"#).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// And an absolute one that is not there. Checked at the door rather than at the first turn: a
+    /// typo would otherwise arrive as a model's confusion instead of a refusal anybody can act on.
+    #[tokio::test]
+    async fn a_directory_that_is_not_there_cannot_be_granted() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let missing = std::env::temp_dir().join("nucleos-nao-existe-de-todo");
+
+        let body = serde_json::json!({ "extra_dirs": [missing.to_string_lossy()] }).to_string();
+        let status = patch_chat_request(state.clone(), &id, &body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_is_there_is_granted_and_read_back() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let beside = tempfile::tempdir().unwrap();
+
+        let body =
+            serde_json::json!({ "extra_dirs": [beside.path().to_string_lossy()] }).to_string();
+        let status = patch_chat_request(state.clone(), &id, &body).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .extra_dirs
+                .len(),
+            1
+        );
+    }
+
+    /// A ceiling of nothing is a conversation that cannot answer. Clearing it has its own gesture —
+    /// `null` — and says so plainly, so zero is a mistake rather than a shorthand.
+    #[tokio::test]
+    async fn a_ceiling_that_is_not_an_amount_of_money_is_refused() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        for body in [r#"{"turn_budget_usd":0}"#, r#"{"turn_budget_usd":-1.5}"#] {
+            assert_eq!(
+                patch_chat_request(state.clone(), &id, body).await,
+                StatusCode::BAD_REQUEST,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"turn_budget_usd":0.25}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .turn_budget_usd,
+            Some(0.25)
+        );
+        // `null` is the clearing gesture, and it is not the same request as sending nothing.
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"turn_budget_usd":null}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .turn_budget_usd,
+            None
+        );
+    }
+
+    /// These three are deliberately NOT behind the 409 the brain and the model are, and this is
+    /// what says so out loud.
+    ///
+    /// That guard exists because a live turn's record would come to disagree: the chat row is the
+    /// only note of where a turn ran, and `answered_by` is written when the row is born. Nothing
+    /// records a run's fallback, its reach or its ceiling, and all three are read at LAUNCH — so a
+    /// turn already running holds its own copy and cannot be made to lie. Refusing here would only
+    /// stop somebody setting up their next turn while waiting for this one.
+    #[tokio::test]
+    async fn reach_and_ceiling_can_be_set_while_a_turn_is_in_flight() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(ParkedRunner);
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &id,
+            "take your time",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"turn_budget_usd":1.0}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"fallback_model":["opus"]}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            patch_chat_request(
+                state.clone(),
+                &id,
+                r#"{"agents":[{"name":"reviewer","description":"Reviews code","prompt":"You review"}]}"#
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        // While the model, which WOULD make `answered_by` lie, is still refused.
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"model":"opus"}"#).await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_defines_the_helpers_it_may_hand_work_to() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(
+            state.clone(),
+            &id,
+            r#"{"agents":[
+                 {"name":"reviewer","description":"Reviews code","prompt":"You review",
+                  "model":"opus","effort":"high"},
+                 {"name":"scribe","description":"Writes notes","prompt":"You write"}
+               ]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let defined = crate::chats::answering(&state.pool, &id)
+            .await
+            .unwrap()
+            .agents;
+        // Sorted by name, not by the order they were sent: the column is an object and an object
+        // has no order, so this is the one answer two reads of one unchanged column can agree on.
+        assert_eq!(
+            defined
+                .iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviewer", "scribe"]
+        );
+        // And the name survived the trip through a shape that keeps it in the KEY.
+        assert_eq!(defined[0].description, "Reviews code");
+        assert_eq!(defined[0].model.as_deref(), Some("opus"));
+        assert_eq!(defined[0].effort.as_deref(), Some("high"));
+        assert_eq!(defined[1].model, None);
+    }
+
+    /// Each of these is a definition the CLI would drop on the floor.
+    ///
+    /// Measured against 2.1.198: `--agents` is parsed inside a try/catch that answers a throw with
+    /// an EMPTY agent list, so ONE bad entry costs every helper in the set — silently, with the run
+    /// carrying on as though none had been asked for. There is no message and no exit code. So the
+    /// door refuses what could not survive, where there is still somebody to tell.
+    #[tokio::test]
+    async fn a_helper_the_cli_would_silently_drop_is_refused_at_the_door() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        for body in [
+            // A leading dash reads as a flag — the CLI's own documented rule.
+            r#"{"agents":[{"name":"-x","description":"d","prompt":"p"}]}"#,
+            // A name nothing can call by hand: the model types this to delegate.
+            r#"{"agents":[{"name":"code reviewer","description":"d","prompt":"p"}]}"#,
+            r#"{"agents":[{"name":"","description":"d","prompt":"p"}]}"#,
+            // The description is the whole of what the parent reads to decide whether to delegate.
+            // Without one the helper is defined, listed, and never used.
+            r#"{"agents":[{"name":"reviewer","description":"   ","prompt":"p"}]}"#,
+            r#"{"agents":[{"name":"reviewer","description":"d","prompt":""}]}"#,
+            // A model nobody offers, and a level the named model does not take.
+            r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","model":"gpt-4-turbo"}]}"#,
+            r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p","effort":"colossal"}]}"#,
+        ] {
+            assert_eq!(
+                patch_chat_request(state.clone(), &id, body).await,
+                StatusCode::BAD_REQUEST,
+                "{body}"
+            );
+        }
+        assert!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .agents
+                .is_empty(),
+            "a refused set was written anyway"
+        );
+    }
+
+    /// Two helpers of one name collapse into one on the way into the object the flag takes. The
+    /// person watches the second replace the first and is told nothing, which is the failure mode
+    /// this whole slice exists to stop passing on.
+    #[tokio::test]
+    async fn two_helpers_of_one_name_are_refused_rather_than_collapsed() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(
+            state.clone(),
+            &id,
+            r#"{"agents":[
+                 {"name":"reviewer","description":"first","prompt":"p"},
+                 {"name":"reviewer","description":"second","prompt":"p"}
+               ]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A helper set is ONE argv element and Windows caps a whole command line at 32767 characters.
+    /// Over the line `CreateProcess` fails with an error about nothing in particular, so the turn
+    /// reads as broken rather than as too big — which is why the size is answered here instead.
+    #[tokio::test]
+    async fn a_helper_set_too_large_for_a_command_line_is_refused() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let huge = "x".repeat(AGENTS_JSON_CEILING + 1);
+        let body = serde_json::json!({
+            "agents": [{ "name": "reviewer", "description": "d", "prompt": huge }]
+        })
+        .to_string();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, &body).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// Clearing is a `null`, and it is not the same request as sending nothing. Pinned FIRST so the
+    /// assertion can only pass if the `null` did something — see `sent_even_if_null`, which exists
+    /// because a test that cleared an already-empty field agreed with an implementation that
+    /// dropped the request on the floor.
+    #[tokio::test]
+    async fn clearing_a_conversations_helpers_says_null_rather_than_nothing() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_chat_request(
+                state.clone(),
+                &id,
+                r#"{"agents":[{"name":"reviewer","description":"d","prompt":"p"}]}"#
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"agents":null}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .agents
+                .is_empty()
+        );
+    }
+
+    /// The local route is a different process with no `--agents` and no `--fallback-model` in it,
+    /// so naming a local model in either place is a name handed to something that cannot resolve
+    /// it. Asserted on the pure helper and not through the door: `models_config` reads a fixed
+    /// path, tests run where that path is not, and the built-in defaults have no local model in
+    /// them — so through the door this case is unreachable and would silently assert nothing.
+    #[test]
+    fn a_model_only_the_local_route_knows_is_not_offered_to_the_cli() {
+        let config = crate::config::ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            cloud_choice(&config, "qwen3.5:4b").is_none(),
+            "a local model was offered to the agent CLI"
+        );
+        // While the cloud ones it sits beside are still found, so this refuses the right half.
+        assert!(cloud_choice(&config, "opus").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_conversation_carries_standing_instructions_and_clears_them_with_a_blank() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            patch_chat_request(
+                state.clone(),
+                &id,
+                r#"{"system_prompt":"Answer in Portuguese."}"#
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("Answer in Portuguese.")
+        );
+
+        // Blank and `null` are one gesture, not two: "nobody wrote instructions" and "somebody
+        // wrote nothing" read identically everywhere above, so they are stored identically.
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"system_prompt":"   "}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .system_prompt,
+            None
+        );
+    }
+
+    /// The text becomes ONE element of an argument vector, and Windows caps a whole command line at
+    /// 32767 characters — which the message itself also has to fit on. Over the line
+    /// `CreateProcess` fails with an error about nothing in particular.
+    #[tokio::test]
+    async fn instructions_too_long_for_a_command_line_are_refused() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({ "system_prompt": "x".repeat(INSTRUCTIONS_CEILING + 1) })
+            .to_string();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, &body).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_can_be_told_not_to_reach_for_a_tool() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"denied_tools":["Bash","Edit"]}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .denied_tools,
+            vec!["Bash".to_string(), "Edit".to_string()]
+        );
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &id, r#"{"denied_tools":null}"#).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            crate::chats::answering(&state.pool, &id)
+                .await
+                .unwrap()
+                .denied_tools
+                .is_empty()
+        );
+    }
+
+    /// Names only, never the CLI's `Bash(git *)` patterns — and never a name off the list.
+    ///
+    /// Not because a pattern is dangerous; it can only ever deny. Because a pattern is a rule
+    /// language, and a rule that matches nothing is reported as ONE line on stderr that nobody
+    /// using this app will read. A refusal here is something somebody can act on; a typo in a
+    /// pattern is a restriction that silently is not one.
+    #[tokio::test]
+    async fn a_denial_that_would_quietly_match_nothing_is_refused() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        for body in [
+            r#"{"denied_tools":["Bash(git *)"]}"#,
+            r#"{"denied_tools":["Bahs"]}"#,
+            r#"{"denied_tools":["*"]}"#,
+        ] {
+            assert_eq!(
+                patch_chat_request(state.clone(), &id, body).await,
+                StatusCode::BAD_REQUEST,
+                "{body}"
+            );
+        }
+    }
+
+    /// One list, served rather than copied into the window. A second copy would offer a name the
+    /// door refuses, or stop offering one the daemon can still deny — so a restriction somebody set
+    /// becomes invisible and unremovable.
+    #[tokio::test]
+    async fn the_tools_a_conversation_may_be_denied_are_served_not_guessed() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/tools", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let names = body["tools"].as_array().expect("no tools");
+        assert!(names.iter().any(|name| name == "Bash"));
+        assert!(names.iter().any(|name| name == "Edit"));
+    }
+
+    /// The app's `/compact`: the session goes, the record of what was said stays.
+    #[tokio::test]
+    async fn a_fresh_context_forgets_the_session_and_keeps_the_conversation() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::upsert_session(&state.pool, &id, "s-1", "2026-08-24T09:00:00Z")
+            .await
+            .unwrap();
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/assistant/chats/{id}/fresh-context"),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, &id)
+                .await
+                .unwrap(),
+            None
+        );
+        // Not cleared: the next turn still gets a replay of what was recently said, which is the
+        // whole difference between this gesture and the one below.
+        assert_eq!(
+            crate::chats::get(&state.pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cleared_after_run_id,
+            None
+        );
+    }
+
+    /// And the app's `/clear`, which is the stronger one: the replay's floor moves to now.
+    #[tokio::test]
+    async fn clearing_moves_the_floor_of_the_replay_and_drops_the_session() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::upsert_session(&state.pool, &id, "s-1", "2026-08-24T09:00:00Z")
+            .await
+            .unwrap();
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/assistant/chats/{id}/clear"),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, &id)
+                .await
+                .unwrap(),
+            None,
+            "the next turn would have resumed the window that was just cleared"
+        );
+        assert!(
+            crate::chats::get(&state.pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cleared_after_run_id
+                .is_some()
+        );
+    }
+
+    /// Both refuse while a turn is in flight, and for a reason stronger than tidiness: a live turn
+    /// writes its session back when it ends, so forgetting one now would be undone in a minute by
+    /// the turn still running — the request would report success and change nothing.
+    #[tokio::test]
+    async fn the_context_gestures_refuse_while_a_turn_is_still_answering() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(ParkedRunner);
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &id,
+            "take your time",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        for route in ["fresh-context", "clear"] {
+            let (status, _) = call(
+                state.clone(),
+                "POST",
+                &format!("/assistant/chats/{id}/{route}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_context_gestures_are_a_404_for_a_conversation_this_daemon_does_not_have() {
+        let state = test_state().await;
+
+        for route in ["fresh-context", "clear"] {
+            let (status, _) = call(
+                state.clone(),
+                "POST",
+                &format!("/assistant/chats/nao-existe/{route}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+        }
     }
 
     /// A rename is not a model change, and must not drag one along: forgetting the session on every

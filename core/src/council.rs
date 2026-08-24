@@ -1441,6 +1441,14 @@ impl Driver {
             messages: None,
             ambient_mcp: false,
             model: Some(seat.model_ref.clone()),
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
             // The wildcard: a seat's `mcp_config` is written per council and already advertises
             // only `COUNCIL_TOOLS`, so there is nothing here left to narrow.
             allowed_mcp_tools: None,
