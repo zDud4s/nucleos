@@ -32,6 +32,7 @@ describe("Sidebar", () => {
   it("lists the projects it is given, under the group that declares the position", async () => {
     await renderWithRouter(
       <Sidebar projects={[{ id: "nucleos", mode: "active", pending: 0 }, { id: "sidecar", mode: "shadow", pending: 2 }]} />,
+      { initialPath: "/projects" },
     );
 
     expect(screen.getByRole("link", { name: "nucleos" }).getAttribute("href")).toContain(
@@ -53,9 +54,53 @@ describe("Sidebar", () => {
   });
 
   it("says a project's pending count out loud, since the badge is only drawn", async () => {
-    await renderWithRouter(<Sidebar projects={[{ id: "sidecar", mode: "shadow", pending: 2 }]} />);
+    await renderWithRouter(<Sidebar projects={[{ id: "sidecar", mode: "shadow", pending: 2 }]} />, {
+      initialPath: "/projects",
+    });
 
     expect(screen.getByRole("link", { name: "sidecar, 2 waiting" })).toBeTruthy();
+  });
+
+  /**
+   * **The rail is destinations; the roster is content.** Every other row in the
+   * sidebar is one of a fixed list; this group's length belongs to the daemon,
+   * and fifteen projects would push Work and Pillars off the bottom edge to show
+   * names nobody reading the Feed is looking for. So the rows are drawn where
+   * they are the subject and nowhere else.
+   *
+   * The group is NOT conditional — heading and `All projects` stay put on every
+   * page — because a group that came and went would move everything under it.
+   */
+  it("draws the roster only inside the projects area, and keeps the group everywhere", async () => {
+    const roster = [{ id: "nucleos", mode: "active" as const, pending: 0 }];
+
+    const away = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+    expect(screen.queryByRole("link", { name: "nucleos" })).toBeNull();
+    // The way in is still there, in the place it has always been.
+    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+    away.unmount();
+
+    await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
+    expect(screen.getByRole("link", { name: "nucleos" })).toBeTruthy();
+  });
+
+  /**
+   * Inside a workspace as much as on the list, because switching projects without
+   * going back out to the list is the whole of what the rows are for — and the
+   * wizard counts too: a rail that emptied while somebody was adding a project
+   * would read as having lost the ones they had.
+   */
+  it("keeps the roster while you are in a workspace or adding one", async () => {
+    const roster = [{ id: "nucleos", mode: "active" as const, pending: 0 }];
+
+    const inside = await renderWithRouter(<Sidebar projects={roster} />, {
+      initialPath: "/projects/sidecar/codigo",
+    });
+    expect(screen.getByRole("link", { name: "nucleos" })).toBeTruthy();
+    inside.unmount();
+
+    await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects/new" });
+    expect(screen.getByRole("link", { name: "nucleos" })).toBeTruthy();
   });
 
   it("keeps a project lit while you are in any of its three modes", async () => {

@@ -93,6 +93,30 @@ function projectOf(pathname: string): string | undefined {
   return parts[0] === "projects" ? parts[1] : undefined;
 }
 
+/**
+ * Whether the roster belongs on screen at all.
+ *
+ * **The rail is destinations; the roster is content, and content grows.** Every
+ * other entry in the sidebar is one of a fixed list decided at design time — one
+ * more project is one more row, for ever, and a machine watching fifteen of them
+ * pushes Work and Pillars off the bottom edge to show names that are only useful
+ * to somebody already working in one of them. The rail was the wrong home for a
+ * list whose length is not ours to choose.
+ *
+ * So the rows appear where they are the subject: on `/projects`, and inside a
+ * workspace. That keeps the one thing they were promoted for — switching
+ * projects without going back out to the list, which is what a day of work
+ * actually consists of — and gives back the space everywhere else, where a
+ * project name is a destination you reach through `All projects` like any other
+ * page.
+ *
+ * `/projects/new` counts, deliberately: the wizard is in the area, and a rail
+ * that emptied while somebody added a project would read as having lost them.
+ */
+function inProjects(pathname: string): boolean {
+  return pathname.split("/").filter((part) => part !== "")[0] === "projects";
+}
+
 export interface SidebarProps {
   /**
    * Counts for the items that carry one, by badge source.
@@ -272,7 +296,7 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
               {group.items.map((entry) => (
                 <li key={entry.id}>{item(entry)}</li>
               ))}
-              {group.roster === true
+              {group.roster === true && inProjects(pathname)
                 ? projects?.map((project) => (
                     <li key={project.id}>
                       {item(
