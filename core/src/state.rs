@@ -245,6 +245,19 @@ pub struct AppState {
     /// (`http::files_root`). An `Option` rather than the empty path it used to be: "no folder" and
     /// "the folder at the empty path" are different facts, and only one of them can be a bug.
     pub files_root: Option<std::path::PathBuf>,
+    /// Where this machine keeps its workflow bundles, resolved once at startup.
+    ///
+    /// The same shape `files_root` above has, and for the same two reasons. One: it is a path that
+    /// depends on the machine rather than on any request, so resolving it per request would be one
+    /// answer per caller to a question with one answer. Two: `None` is a real state — a machine
+    /// with no home directory has nowhere for a library — and every route beneath it answers 503
+    /// rather than showing an empty shelf, which would read as "you have installed nothing".
+    ///
+    /// A field and not `workflows::library_root()` called inline, because that is what makes the
+    /// library a thing a test can point somewhere else. The alternative was an environment
+    /// variable, which is process-global: two tests setting it would race, and `set_var` is
+    /// `unsafe` in this edition for exactly that reason.
+    pub workflow_library: Option<std::path::PathBuf>,
     /// Read-only after startup, so it is shared rather than copied per clone of the state.
     pub email: Arc<EmailRuntime>,
     /// The voice pillar's settings, its transcriber and its HTTP client, resolved once at startup.

@@ -19,6 +19,10 @@ rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9.34"
+# `workflows.rs` only. A bundle's identity is the hash of its bytes — that is what lets this app
+# install, eject and detect drift without ever parsing the graph inside it. Already in the lock file
+# as something else's dependency, so this declares what is already built rather than adding a tree.
+sha2 = "0.10"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
 subtle = { version = "2.6.1", default-features = false }
 tokio = { version = "1.53.0", features = ["full"] }

@@ -74,6 +74,36 @@ describe("apiFetch refusals", () => {
     expect(refusal.code).toBe("kill_switch");
   });
 
+  it("keeps the name AND the sentence when a route sends both", async () => {
+    const { apiFetch } = await freshClient();
+    // How `POST /projects/{id}/write` refuses YAML the daemon could not read.
+    fetchMock.mockResolvedValue(
+      jsonResponse(422, { refusal: "invalid", detail: "unknown field `gate_commmand` at line 1 column 1" }),
+    );
+
+    const error = (await apiFetch("/projects/alpha/write", { method: "POST", body: "{}" }).catch(
+      (e: unknown) => e,
+    )) as InstanceType<ClientModule["ApiRefusal"]>;
+
+    // The name a page switches on, and the sentence it shows. Collapsing the two
+    // would leave an editor able to say only "invalid" about a file whose exact
+    // broken line the daemon already located.
+    expect(error.code).toBe("invalid");
+    expect(error.detail).toContain("gate_commmand");
+  });
+
+  it("falls back to the name as the sentence when the route sent only a name", async () => {
+    const { apiFetch } = await freshClient();
+    fetchMock.mockResolvedValue(jsonResponse(403, { refusal: "not_ours" }));
+
+    const error = (await apiFetch("/projects/alpha/write", { method: "POST", body: "{}" }).catch(
+      (e: unknown) => e,
+    )) as InstanceType<ClientModule["ApiRefusal"]>;
+
+    expect(error.code).toBe("not_ours");
+    expect(error.detail).toBe("not_ours");
+  });
+
   it("derives a stable code from the status when the route refused in prose", async () => {
     const { apiFetch, ApiRefusal } = await freshClient();
     // How `POST /jobs` refuses a full project: (StatusCode, String), no JSON at all.

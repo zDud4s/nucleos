@@ -1,7 +1,7 @@
 import { Outlet } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
 import { untriagedCount, useMailQueue } from "../data/mail";
-import { useHealth, useProposals } from "../data/system";
+import { useHealth, useProjects, useProposals } from "../data/system";
 import { unreadTotal } from "../lib/turns";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { BudgetLine } from "./BudgetLine";
@@ -55,6 +55,16 @@ function Frame() {
    * nobody has measured, not an honest "nothing waiting".
    */
   const mail = useMailQueue();
+  /**
+   * The roster, for the sidebar's project group.
+   *
+   * Already polled — this is the same query the roster page and the pending
+   * counts read, so the rail costs no extra request. `undefined` until it has
+   * answered once, and the rail draws no rows for that rather than an empty
+   * group: a heading with nothing under it reads as "you have no projects",
+   * which is a claim about the daemon's answer before it gave one.
+   */
+  const projects = useProjects();
 
   return (
     <div className="app-shell">
@@ -65,6 +75,11 @@ function Frame() {
           chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
           mail: mail.data === undefined ? undefined : untriagedCount(mail.data),
         }}
+        projects={projects.data?.map((project) => ({
+          id: project.project_id,
+          mode: project.mode,
+          pending: project.open_proposals,
+        }))}
         systemAlert={health.data === false}
       >
         <ConnectionStatus />

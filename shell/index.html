@@ -5,6 +5,18 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NucleOS</title>
+
+    <!--
+      Empty on purpose, and NOT dead markup: this is where the window's per-load style nonce
+      arrives. Tauri stamps `nonce="…"` on every <style> element at compile time and replaces it
+      with a fresh random value at serve time, adding that value to the `style-src` it sends. A
+      Vite build emits its CSS as a <link>, so without this element the document has no stamped tag
+      and nothing can read the nonce. `src/lib/style-nonce.ts` reads it here and hands it to the
+      dependencies that inject stylesheets — without it they are refused in a packaged build and
+      nowhere else. Deleting this line breaks every modal dialog, dropdown and the ⌘K palette, and
+      only after somebody installs the app.
+    -->
+    <style></style>
   </head>
 
   <body>

@@ -268,6 +268,45 @@ async fn job_rows(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Vec<SpendRow>>
     spend_rows(raw)
 }
 
+/// What one project's runs cost over a window, for the workspace's cost reading.
+///
+/// The third sibling of the two above, and here rather than in `project_readings.rs` for the reason
+/// the note below already gives: what a run contributed to spend is decided in one place. A reading
+/// that computed its own total would drift from the ceiling that governs the same runs, and the two
+/// numbers disagreeing on the same screen is worse than either being slightly wrong.
+///
+/// Not filtered by mode, unlike the global figure. That list exists to say what the *ceiling*
+/// restrains — a chat turn is exempt because a person is waiting on it — but the question here is
+/// what this project cost, and money a person spent interactively is money the project cost.
+///
+/// The window is on `created_at`: a run that started inside it belongs to it, even if it finished
+/// after. The alternative would move a long run between windows depending on when it was asked.
+pub async fn project_spend(
+    pool: &SqlitePool,
+    project_id: &str,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<crate::project_readings::Cost> {
+    let cfg = load_budget_config(pool).await?;
+    let raw: Vec<RawRow> = sqlx::query_as(
+        "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
+                created_at, completed_at
+         FROM runs
+         WHERE project_id = ? AND created_at >= ? AND created_at < ?",
+    )
+    .bind(project_id)
+    .bind(since.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
+
+    let rows = spend_rows(raw)?;
+    Ok(crate::project_readings::Cost {
+        usd: compute_spend(&rows, now, &cfg),
+        runs: rows.len() as i64,
+    })
+}
+
 /// Spelled out twice above rather than assembled, because sqlx refuses SQL built at runtime — a
 /// guard worth keeping. What the two queries share is the parsing, and that lives here so a
 /// timestamp cannot come to mean two different things depending on which limit is asking.

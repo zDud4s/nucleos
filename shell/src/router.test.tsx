@@ -70,6 +70,25 @@ describe("the app router", () => {
     expect(paths).toContain("/team-runs/$runId");
   });
 
+  /**
+   * The two project routes, and the fact that they are two.
+   *
+   * `Projects.test.tsx` builds a router of its own — for good reasons it states —
+   * which means its whole suite passes whether or not the real tree registers
+   * the inspector at all. That is exactly what happened when the workspace took
+   * the shorter path over: every inspector test stayed green while the tabs on
+   * screen led somewhere else. This is the assertion that file cannot make about
+   * itself.
+   */
+  it("registers the workspace and the inspector as two different routes", () => {
+    const router = createAppRouter();
+    const byId = router.routesById as unknown as Record<string, { fullPath?: string }>;
+    const paths = Object.values(byId).map((route) => route.fullPath);
+
+    expect(paths).toContain("/projects/$projectId/$view");
+    expect(paths).toContain("/projects/$projectId/inspect/$view");
+  });
+
   it("opens on Home", async () => {
     await renderApp();
 

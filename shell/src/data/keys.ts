@@ -123,10 +123,67 @@ export const keys = {
     grep: (projectId: string, q: string, path: string) =>
       ["projects", projectId, "grep", q, path] as const,
     diff: (projectId: string, path: string) => ["projects", projectId, "diff", path] as const,
+    readings: (projectId: string) => ["projects", projectId, "readings"] as const,
+    /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
+    ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
+    /** What this project can be asked to do to itself, and what each of them last said. */
+    commands: (projectId: string) => ["projects", projectId, "commands"] as const,
+    /**
+     * Which workflows this project uses, measured against the library right now.
+     *
+     * Under the project prefix and NOT under `keys.workflows` below, because it is a fact about
+     * this project rather than about the machine — and because installing one also changes what
+     * `ownership` answers, which is its neighbour here. The library itself is the machine's and
+     * has its own root.
+     */
+    workflows: (projectId: string) => ["projects", projectId, "workflows"] as const,
+    /** One workflow's divergence from its origin, asked for only when somebody opens it. */
+    workflowDiff: (projectId: string, name: string) =>
+      ["projects", projectId, "workflows", name, "diff"] as const,
+    /** One workflow's graph, overlay already painted on by the núcleo. */
+    workflowGraph: (projectId: string, name: string) =>
+      ["projects", projectId, "workflows", name, "graph"] as const,
+    /**
+     * What is in a folder nobody has registered yet — `GET /projects/detect`.
+     *
+     * Keyed by the path, because two folders are two different answers and a cache that collapsed
+     * them would show the previous folder's findings under the new one's name. Under the roster
+     * prefix even though there is no project: registering one invalidates it, which is right — the
+     * `taken_by` field becomes true the moment somebody finishes the wizard.
+     */
+    detect: (path: string) => ["projects", "detect", path] as const,
+    branches: (projectId: string) => ["projects", projectId, "branches"] as const,
+    log: (projectId: string, path: string) => ["projects", projectId, "log", path] as const,
+    /**
+     * Reads scoped to one run's worktree.
+     *
+     * The run is in the key and not only in the URL, because the same project and the same path
+     * mean a different file in a different run's checkout — and a cache that collapsed them would
+     * show one run's work while reviewing another's.
+     */
+    changed: (projectId: string, run: number) => ["projects", projectId, "changed", run] as const,
+    runDiff: (projectId: string, run: number, path: string) =>
+      ["projects", projectId, "run-diff", run, path] as const,
+    runFile: (projectId: string, run: number, path: string) =>
+      ["projects", projectId, "run-file", run, path] as const,
+    runBlame: (projectId: string, run: number, path: string) =>
+      ["projects", projectId, "run-blame", run, path] as const,
+    worktree: (projectId: string, run: number) => ["projects", projectId, "worktree", run] as const,
   },
 
   proposals: {
     all: ["proposals"] as const,
+  },
+
+  /**
+   * The bundles on this machine — `GET /workflows/library`.
+   *
+   * Its own root, and not a child of `projects`: one folder, shared by everything, and a page that
+   * invalidates one project's pins must not throw away a listing that every project reads.
+   */
+  workflows: {
+    all: ["workflows"] as const,
+    library: ["workflows", "library"] as const,
   },
 
   /**

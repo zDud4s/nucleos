@@ -40,6 +40,12 @@ import {
   StateBadge,
   Teach,
 } from "../ui";
+import {
+  MODE_LABEL,
+  MODE_SENTENCES,
+  MODE_TONE,
+  promotionBlocker,
+} from "../lib/mode";
 import "./autopilot.css";
 
 /**
@@ -223,18 +229,6 @@ function Statusline({
 /* ------------------------------------------------------ project governance -- */
 
 /** What each setting means, said once rather than on every row. */
-const MODE_TONE: Record<AutopilotMode, "active" | "shadow" | "off"> = {
-  active: "active",
-  shadow: "shadow",
-  off: "off",
-};
-
-const MODE_LABEL: Record<AutopilotMode, string> = {
-  active: "acting",
-  shadow: "shadow",
-  off: "off",
-};
-
 function ProjectGovernanceList({
   rows,
   answered,
@@ -436,35 +430,6 @@ function GovernanceRow({
     </li>
   );
 }
-
-/** Why the promote control is locked, in the daemon's own terms. */
-function promotionBlocker(project: ProjectSummary, withheld: number): string {
-  if (project.classes_total === 0) {
-    return "nothing has been recorded in shadow yet — no evidence is not the same as good evidence";
-  }
-  if (project.classes_ready < project.classes_total) {
-    return `${project.classes_total - project.classes_ready} of ${project.classes_total} action classes are still short of the bar`;
-  }
-  if (withheld === 0) {
-    return "every class it has exercised is one the classifier allowed — nothing yet shows it holds back, and restraint is what it needs to prove";
-  }
-  return "the núcleo is not offering this project for promotion";
-}
-
-/**
- * What the mode door says when it says no.
- *
- * The 422 is the one worth writing copy for, and the copy is deliberately a
- * *list* rather than a diagnosis: the route answers a bare status with an empty
- * body for four different prerequisites, so the honest sentence names all four
- * and admits which one is unknown.
- */
-const MODE_SENTENCES: Record<string, string> = {
-  unprocessable:
-    "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, .ai/workflow/workflow.md inside it, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.",
-  bad_request: "that is not one of the three settings",
-  internal: "the núcleo hit an error of its own while changing this",
-};
 
 /* --------------------------------------------------------- shadow review -- */
 

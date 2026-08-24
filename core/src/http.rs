@@ -84,12 +84,91 @@ pub fn build_router(state: AppState) -> Router {
             get(get_fleet_exclusion_requests),
         )
         .route("/fleet/exclusions/{id}", delete(delete_fleet_exclusion))
+        // Ahead of every `/projects/{id}/…` route, and a literal segment where those take a
+        // parameter. A project called `detect` would be shadowed by it — which is why the wizard
+        // sends the folder as a query rather than in the path, and why this answers about a folder
+        // that has no project id yet at all.
+        .route("/projects/detect", get(get_project_detect))
         .route("/projects/{id}/rules", get(get_project_rules))
+        .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
         .route("/projects/{id}/grep", get(get_project_grep))
         .route("/projects/{id}/diff", get(get_project_diff))
+        .route("/projects/{id}/log", get(get_project_log))
+        .route("/projects/{id}/branches", get(get_project_branches))
+        .route("/projects/{id}/blame", get(get_project_blame))
+        .route("/projects/{id}/changed", get(get_project_changed))
+        .route("/projects/{id}/worktree", get(get_project_worktree))
+        // The write boundary, read and exercised. They sit together because the second is
+        // unintelligible without the first: `POST /write` refuses everything the table does not
+        // name, so a client that cannot read the table can only discover the fence by hitting it.
+        .route("/projects/{id}/ownership", get(get_project_ownership))
+        .route("/projects/{id}/write", post(post_project_write))
+        // What this project can be asked to do to itself. The literal `commands` ahead of nothing
+        // ambiguous; the run route is a third segment under a command's own id, because running one
+        // is an action ON that command and not a second way of listing them.
+        .route(
+            "/projects/{id}/commands",
+            get(get_project_commands).post(post_project_command),
+        )
+        .route(
+            "/projects/{id}/commands/{command_id}",
+            delete(delete_project_command),
+        )
+        .route(
+            "/projects/{id}/commands/{command_id}/run",
+            post(post_project_command_run),
+        )
+        // The workflow library, and what one project uses out of it.
+        //
+        // The library is house-wide and hangs off no project — it is one folder on this machine,
+        // shared by everything — while a pin belongs to a project and is stored in the project's
+        // own files. Two prefixes, because they are two nouns and not two views of one.
+        //
+        // Everything that changes a pin is a POST or a DELETE on the project's side; nothing here
+        // ever writes into the library, and that asymmetry is §6.3's second exit staying honest:
+        // "edit it in the library" means the editor, not a form in this app.
+        .route("/workflows/library", get(get_workflow_library))
+        .route(
+            "/projects/{id}/workflows",
+            get(get_project_workflows).post(post_project_workflow),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}",
+            delete(delete_project_workflow),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}/eject",
+            post(post_project_workflow_eject),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}/update",
+            post(post_project_workflow_update),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}/diff",
+            get(get_project_workflow_diff),
+        )
+        .route(
+            "/projects/{id}/workflows/{name}/graph",
+            get(get_project_workflow_graph),
+        )
+        // What this project overrides on one node. Under the workflow's name and then the node's,
+        // because that is what it is — and a flat `/overlay` taking both in the body would make the
+        // one thing being changed invisible in the log.
+        .route(
+            "/projects/{id}/workflows/{name}/nodes/{node}",
+            post(post_project_workflow_node),
+        )
+        // Adopting is not installing and gets its own route rather than a flag on that one: it
+        // takes a folder instead of a coordinate, copies nothing, and produces a pin that no
+        // library can ever update. One route with two meanings would hide exactly that.
+        .route(
+            "/projects/{id}/workflows/adopt",
+            post(post_project_workflow_adopt),
+        )
         .route("/feed", get(get_feed))
         .route("/runs", get(get_runs).post(create_run))
         .route(
@@ -764,15 +843,48 @@ struct RunsQuery {
     live: Option<bool>,
 }
 
+/// One run's checkout, as the shell needs it to open a door to the editor.
+#[derive(serde::Serialize)]
+struct WorktreeView {
+    /// Absolute, on this machine. The shell joins repository-relative paths onto it.
+    path: String,
+    branch: String,
+    /// `None` when the daemon never recorded a branch point, which is why nothing here can be
+    /// measured against it. Reported rather than hidden, so the panel can say which absence it is.
+    base_sha: Option<String>,
+    created_at: String,
+}
+
+/// A read of a project, optionally as one run sees it.
+///
+/// `run` is what makes the Code mode a review surface rather than a file browser: with it, every
+/// reader answers from that run's worktree — the file as the agent left it, not as the trunk has
+/// it.
 #[derive(Deserialize)]
-struct PathQuery {
+struct ReadQuery {
     path: Option<String>,
+    run: Option<i64>,
+}
+
+/// How much history, and of what. Both absent is the whole repository's recent commits.
+#[derive(Deserialize)]
+struct LogQuery {
+    path: Option<String>,
+    limit: Option<usize>,
+    run: Option<i64>,
+}
+
+/// How far back a reading looks. Absent is the default window, not zero days.
+#[derive(Deserialize)]
+struct WindowQuery {
+    days: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct GrepQuery {
     q: Option<String>,
     path: Option<String>,
+    run: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2187,6 +2299,68 @@ fn inspect_status(error: inspect::InspectError) -> StatusCode {
     }
 }
 
+/// Where a read of this project should happen: the project itself, or one run's worktree.
+///
+/// **The subject of a review is the run, not the repository**, so every reader in this family takes
+/// an optional `run` and answers from that run's checkout when it is given. Without it they answer
+/// from the project root exactly as before, which is what every existing caller gets.
+///
+/// **The `project_id` in the lookup is the guard, and it is the whole security argument here.** A
+/// worktree path is otherwise reachable by asking any project for any run id — the daemon holds
+/// worktrees for every project in one table — so the row must match the project being asked, not
+/// merely exist. A run whose worktree has been released has `removed_at` set and is refused too:
+/// the directory is gone, and answering from a stale path would read whatever has since been put
+/// there.
+async fn resolve_read_root(
+    state: &AppState,
+    id: &str,
+    run: Option<i64>,
+) -> Result<PathBuf, StatusCode> {
+    let Some(run) = run else {
+        return resolve_project_root(state, id).await;
+    };
+    let path: Option<String> = sqlx::query_scalar(
+        "SELECT path FROM worktrees \
+          WHERE owner_kind = 'run' AND owner_id = ? AND project_id = ? AND removed_at IS NULL",
+    )
+    .bind(run)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    path.map(PathBuf::from).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// The base commit a run's worktree was cut from, and the path to it.
+///
+/// Both or neither: a worktree with no `base_sha` cannot be measured — the column is nullable, and
+/// a NULL there means the daemon never recorded where the branch started. Answering "nothing
+/// changed" for it would be the worst possible reading of "we do not know".
+async fn resolve_run_worktree(
+    state: &AppState,
+    id: &str,
+    run: i64,
+) -> Result<(PathBuf, String), StatusCode> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT path, base_sha FROM worktrees \
+          WHERE owner_kind = 'run' AND owner_id = ? AND project_id = ? AND removed_at IS NULL",
+    )
+    .bind(run)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match row {
+        Some((path, Some(base))) => Ok((PathBuf::from(path), base)),
+        // A worktree with no recorded base is a different answer from a worktree that is not there,
+        // and both are refusals the caller has to be able to tell apart from an empty change set.
+        Some((_, None)) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 async fn resolve_project_root(state: &AppState, id: &str) -> Result<PathBuf, StatusCode> {
     match inspect::project_root(&state.pool, id).await {
         Ok(Some(root)) => Ok(PathBuf::from(root)),
@@ -2623,12 +2797,1163 @@ async fn get_concurrency(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// The four readings the project workspace leads with, in one answer.
+///
+/// One route and not four because all four are aggregations over the same rows in the same window —
+/// this project's finished runs — and four routes would be four walks of one table for one panel.
+///
+/// No 404 for a project with no root. Unlike `ls` and `cat`, this asks nothing of the disk: a
+/// project whose folder has moved still has a history of runs, and a reading of it is exactly what
+/// somebody looking at a broken project wants. `resolve_project_root` would refuse it.
+async fn get_project_readings(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<WindowQuery>,
+) -> Result<Json<crate::project_readings::Readings>, StatusCode> {
+    let days = query
+        .days
+        .unwrap_or(crate::project_readings::DEFAULT_WINDOW_DAYS);
+    crate::project_readings::readings(&state.pool, &id, days, chrono::Utc::now())
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "project readings failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Who last touched each line of a file, in the project or in one run's worktree.
+async fn get_project_blame(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
+) -> Result<Json<Vec<inspect::BlameLine>>, StatusCode> {
+    let root = resolve_read_root(&state, &id, query.run).await?;
+    let rel = query.path.unwrap_or_default();
+    tokio::task::spawn_blocking(move || inspect::blame(&root, &rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// What one run has changed, and how big the tree it changed it in is.
+///
+/// `run` is required here, unlike the readers: "what changed" has no meaning against a project root
+/// with no branch point to measure from. The uncommitted diff of the main checkout is a different
+/// question and `/diff` already answers it.
+async fn get_project_changed(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
+) -> Result<Json<inspect::Changed>, StatusCode> {
+    let run = query.run.ok_or(StatusCode::BAD_REQUEST)?;
+    let (root, base) = resolve_run_worktree(&state, &id, run).await?;
+    tokio::task::spawn_blocking(move || inspect::changed(&root, &base))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// Where one run's checkout is, and what it was cut from.
+///
+/// **The absolute path is the point of this route.** Every door to VS Code needs one — the editor's
+/// URL handler takes a full path and nothing else — and the shell has no way to build one: it holds
+/// repository-relative paths, and a run's worktree is not under the project root but beside it. A
+/// link built from a relative path opens nothing, silently, which is the worst way for a seam to
+/// fail.
+///
+/// The same guard as every other run-aware read: the row must belong to the project being asked.
+async fn get_project_worktree(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
+) -> Result<Json<WorktreeView>, StatusCode> {
+    let run = query.run.ok_or(StatusCode::BAD_REQUEST)?;
+    let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT path, branch, base_sha, created_at FROM worktrees \
+          WHERE owner_kind = 'run' AND owner_id = ? AND project_id = ? AND removed_at IS NULL",
+    )
+    .bind(run)
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (path, branch, base_sha, created_at) = row.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(WorktreeView {
+        path,
+        branch,
+        base_sha,
+        created_at,
+    }))
+}
+
+/// One row of the write boundary, as the page draws it.
+///
+/// Owned strings now, because half the table is: an installed workflow's rows are read off its
+/// manifest per project. They arrived as ROWS and not as a second shape, which is what the first
+/// version of this struct said would happen.
+///
+/// `writable` is the field §12 asks for. Three states, not two: a file the app authors, a file
+/// somebody else authors, and everything else — and the middle one needs its own answer because it
+/// gets a different exit. The page must not infer it from `owner`, because `owner` is a name and
+/// tomorrow there is a workflow called `core`.
+#[derive(serde::Serialize)]
+struct ClaimView {
+    path: String,
+    owner: String,
+    what: String,
+    writable: bool,
+}
+
+/// Which files in this project the app is the legitimate author of.
+///
+/// **Served rather than hard-coded in the shell, and that is the point of §7.3.** A boundary the
+/// client carries its own copy of is a boundary that goes out of date silently: the page would
+/// offer an editor for a file the daemon refuses, or hide one for a file it would accept. Here the
+/// only thing that decides is `ownership.rs`, and the page draws what it is told.
+///
+/// The root is resolved even though the table does not depend on it. A fence drawn for a project
+/// the daemon has no folder for is a fence around nothing, and the write route answers 404 on the
+/// same call — so this fails in the same place rather than showing an editor that cannot save.
+async fn get_project_ownership(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ClaimView>>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    let claims = claims_for_project(root, state.workflow_library.clone()).await?;
+    Ok(Json(
+        claims
+            .into_iter()
+            .map(|claim| ClaimView {
+                writable: claim.validate.is_some(),
+                path: claim.path.into_owned(),
+                owner: claim.owner.into_owned(),
+                what: claim.what.into_owned(),
+            })
+            .collect(),
+    ))
+}
+
+/// The fence in force in one project, read off the disk on the thread pool.
+///
+/// `spawn_blocking`, because assembling it opens the pins file and walks whatever bundles are
+/// installed. Small work, but filesystem work, and the runtime this daemon shares with every
+/// sidecar and every run is not the place to do it inline.
+///
+/// A machine with no home directory has no library, which is an empty shelf and not a failure: the
+/// núcleo's own rows still stand, so the write boundary never disappears because a path lookup came
+/// back empty.
+async fn claims_for_project(
+    root: PathBuf,
+    library: Option<PathBuf>,
+) -> Result<Vec<crate::ownership::Claim>, StatusCode> {
+    tokio::task::spawn_blocking(move || match library {
+        Some(library) => crate::ownership::claims_for(&root, &library),
+        None => crate::ownership::CLAIMS.to_vec(),
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct WriteRequest {
+    /// Relative to the project root, forward slashes. Only ever compared — never joined; see below.
+    path: String,
+    contents: String,
+}
+
+/// Writes one file the app declares itself the author of.
+///
+/// The five refusals are five different facts and none of them is "no". In order, and the order is
+/// the design:
+///
+/// 1. **423, the emergency stop.** First, before the path is so much as looked at. A write refused
+///    for a path reason while the stop is engaged would tell somebody their path was wrong when the
+///    answer is that nothing acts right now. The scoped brake counts too: a project held on its own
+///    is held for this as well.
+///
+///    The cost of this guard is one thing and it is worth naming: the rules file cannot be edited
+///    HERE while the stop is engaged, which is a moment somebody might well want to edit it. It
+///    costs nothing they cannot recover, because layer 2's whole premise is that the editor is one
+///    click away and the file is ordinary text — and what it buys is that the shell is not a door
+///    with privileges an agent lacks, which is the promise §7.5 makes.
+/// 2. **404, no folder.** A project the daemon has no root for has no file to write.
+/// 3. **403, not ours.** Everything the table does not name, which is nearly everything. A path
+///    with `..` in it lands here rather than at the path guard, and deliberately: the app answers
+///    about names it owns, and a traversal is not one — so the filesystem is never touched for a
+///    path nobody claimed. **`another_author` is its own refusal beside it**, for a file an
+///    installed workflow declares: the fence names it, and the app still may not write it, because
+///    it has no parser for it. One code for both would tell somebody the file is nobody's when it
+///    has an author standing right there, and the exit for the two is different.
+/// 4. **400/404, unwritable.** The claimed path that nonetheless does not land inside the project,
+///    which after (3) means one thing: a directory link or junction under `.ai/`.
+/// 5. **422, invalid, WITH the parser's words.** The one refusal carrying a detail, because the raw
+///    hatch is unusable without it — "unprocessable entity" sends somebody to an editor, which is
+///    the surface the hatch exists to replace.
+///
+/// **The file written is the one the registry names, never the string the caller sent.** The two
+/// normalise to the same file by the time (3) passes, and joining the caller's spelling anyway
+/// would make every future change to `normalise` a security question instead of a tidiness one.
+///
+/// This route is in no table in `auth.rs`, so `permits` — which is default-deny — leaves it to
+/// Control and Admin. That is not an omission: `.ai/autopilot.yaml` carries `gate_command`, and a
+/// run able to rewrite it could decide what green means for every gate it will ever face.
+async fn post_project_write(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<WriteRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
+    // about is not a stop anybody may assume is off.
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+        || crate::autopilot::scoped_kill_engaged(&state.pool, "project", &id)
+            .await
+            .unwrap_or(true);
+    if halted {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+
+    let claims = claims_for_project(root.clone(), state.workflow_library.clone())
+        .await
+        .map_err(|status| refusal(status, "internal"))?;
+    let crate::ownership::Owner::Declared(claim) = crate::ownership::owner_of(&claims, &body.path)
+    else {
+        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
+    };
+    let Some(validate) = claim.validate else {
+        // The middle state of §12, said in its own words: somebody authors this file and it is not
+        // this app. `detail` carries who, because the exit depends on it — a workflow's file is
+        // changed where the workflow lives.
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "refusal": "another_author",
+                "detail": format!("{} authors this file", claim.owner),
+            })),
+        ));
+    };
+
+    let path = claim.path.clone().into_owned();
+    let target = inspect::safe_write_target(&root, &path)
+        .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
+
+    if let Err(detail) = validate(&body.contents) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
+        ));
+    }
+
+    let contents = body.contents;
+    tokio::task::spawn_blocking(move || write_atomically(&target, &contents))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, %path, "writing a project file failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    // After the write, not before, and loudly on failure. A feed line about a write that then failed
+    // claims something that did not happen; a write whose line was lost is recoverable from the log,
+    // and refusing the request at this point would report a failure for work already done.
+    if let Err(error) = feed::append(
+        &state.pool,
+        Some(&id),
+        "config_written",
+        &format!("{path} written from the app"),
+        None,
+    )
+    .await
+    {
+        tracing::error!(
+            %error,
+            project_id = %id,
+            %path,
+            "a project file was written and its feed line was not recorded"
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Write through a temporary file in the same directory, then rename over the target.
+///
+/// A plain truncate-and-write leaves the rules file half-written if anything goes wrong mid-write,
+/// and a half-written `.ai/autopilot.yaml` is not a smaller file — it is an *unreadable* one, which
+/// `gate.rs` reports as `gate errored` on every completed run from then on. Rename is atomic on both
+/// platforms and replaces an existing file on both, so the file is either wholly the old one or
+/// wholly the new one.
+///
+/// The temporary lives beside the target because rename is only atomic within a filesystem. Two
+/// writes racing would collide on it; they would be writing the same class of content to the same
+/// file, and the loser is a request the caller is watching.
+fn write_atomically(target: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = target.with_extension("nucleos-tmp");
+    std::fs::write(&temp, contents)?;
+    std::fs::rename(&temp, target)
+}
+
+/* ------------------------------------------------------- project commands -- */
+
+/// Everything this project can be asked to do to itself, overlay applied.
+async fn get_project_commands(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::project_commands::ProjectCommand>>, StatusCode> {
+    crate::project_commands::list(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "listing project commands failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct DeclareRequest {
+    name: String,
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    is_gate: bool,
+    /// Absent means 0, which is what almost every command means by passing.
+    #[serde(default)]
+    pass_exit_code: Option<i64>,
+    /// Absent means `person`. Default-deny: a command declared by somebody who never thought about
+    /// this question must not thereby become something an autonomous run may execute.
+    #[serde(default)]
+    runnable_by: Option<crate::project_commands::RunnableBy>,
+}
+
+/// Declares one of this project's own commands, replacing any of the same name.
+///
+/// **No kill-switch check here, and the asymmetry with `POST /write` is deliberate.** That one puts
+/// bytes in the project's own folder, which §7.5 says must go the way an agent's write goes. This
+/// writes a database row, like `POST /wip-limit` beside it, and neither of those starts anything.
+/// The stop belongs on the route that spawns a process, which is the next one down.
+async fn post_project_command(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeclareRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+
+    if let Err(invalid) =
+        crate::project_commands::validate(&body.name, &body.command, body.cwd.as_deref())
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "refusal": "invalid", "detail": invalid.to_string() })),
+        ));
+    }
+
+    // The half `validate` cannot do: whether the directory is actually there, and is a directory.
+    // Checked when it is declared so a typo is caught while the person who made it is looking at
+    // it — and again when it runs, because a folder that existed on Tuesday can be gone on
+    // Wednesday.
+    if let Some(cwd) = body.cwd.as_deref() {
+        working_directory(&root, cwd)?;
+    }
+
+    let id_for_log = id.clone();
+    let new_id = crate::project_commands::declare(
+        &state.pool,
+        &id,
+        crate::project_commands::Declaration {
+            name: body.name,
+            command: body.command,
+            cwd: body.cwd,
+            is_gate: body.is_gate,
+            pass_exit_code: body.pass_exit_code.unwrap_or(0),
+            runnable_by: body
+                .runnable_by
+                .unwrap_or(crate::project_commands::RunnableBy::Person),
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, project_id = %id_for_log, "declaring a project command failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+
+    Ok(Json(serde_json::json!({ "id": new_id })))
+}
+
+/// Forgets one of this project's commands.
+async fn delete_project_command(
+    State(state): State<AppState>,
+    Path((id, command_id)): Path<(String, i64)>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::project_commands::remove(&state.pool, &id, command_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, project_id = %id, "forgetting a project command failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Where a command runs, resolved and refused as one answer.
+///
+/// `None` is the project root. A relative path is refused unless it resolves inside the project and
+/// is a directory — the same guard the readers use, and it has to be re-asked at run time because
+/// the declaration was checked at some earlier moment.
+fn working_directory(
+    root: &std::path::Path,
+    cwd: &str,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let resolved =
+        inspect::resolved_within(root, cwd).map_err(|error| match inspect_status(error) {
+            StatusCode::NOT_FOUND => refusal(StatusCode::UNPROCESSABLE_ENTITY, "cwd_missing"),
+            status => refusal(status, "cwd_unsafe"),
+        })?;
+    if !resolved.is_dir() {
+        return Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cwd_not_a_folder",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Runs one of this project's commands and answers before it finishes.
+///
+/// **202 and not the output.** A suite takes minutes; an HTTP request that held the connection for
+/// them would be a request that any proxy, any sleep and any closed lid would kill halfway. The
+/// result lands on the command's own row and the page reads it back — which is also what makes the
+/// answer survive a reload, and what makes "is the gate green" a fact the page already has rather
+/// than something it has to ask for.
+///
+/// The refusals, in the order they are asked:
+///
+/// 1. **423, the emergency stop.** First, because it is the one refusal that is about the machine
+///    rather than about this request. A stop that did not stop a button spawning `cargo test` would
+///    be a stop in name only.
+/// 2. **404**, no folder, or no such command in THIS project — the `project_id` in the lookup being
+///    what keeps an integer in a URL from naming another project's row.
+/// 3. **403**, a command marked `person` reached by a key that is nobody's but an agent's.
+/// 4. **422**, a working directory that has gone, or that is not a directory.
+/// 5. **409**, already running. The claim is a conditional UPDATE rather than a read followed by a
+///    write, so two clicks landing together cannot both start the suite in one folder.
+async fn post_project_command_run(
+    State(state): State<AppState>,
+    Extension(scope): Extension<crate::auth::Scope>,
+    Path((id, command_id)): Path<(String, i64)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+        || crate::autopilot::scoped_kill_engaged(&state.pool, "project", &id)
+            .await
+            .unwrap_or(true);
+    if halted {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+
+    let command = crate::project_commands::get(&state.pool, &id, command_id)
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .ok_or_else(|| refusal(StatusCode::NOT_FOUND, "no_such_command"))?;
+
+    if crate::project_commands::caller_is_an_agent(&scope)
+        && command.runnable_by != crate::project_commands::RunnableBy::Agent
+    {
+        return Err(refusal(StatusCode::FORBIDDEN, "person_only"));
+    }
+
+    let cwd = match command.cwd.as_deref() {
+        Some(cwd) => working_directory(&root, cwd)?,
+        None => root.clone(),
+    };
+
+    let pool = state.pool.clone();
+    let project_id = id.clone();
+    let name = command.name.clone();
+    let text = command.command.clone();
+    let pass = command.pass_exit_code;
+
+    // The claim and the spawn together, uncancellable, for the reason `create_run` gives: a client
+    // that disconnects mid-request drops this future, and a drop landing between the two would
+    // leave a row saying `running` with nothing running.
+    let claimed = uncancellable(async move {
+        if !crate::project_commands::mark_running(&pool, &project_id, command_id)
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        tokio::spawn(async move {
+            // **The reference is the same directory the command runs in, on purpose.**
+            // `run_gate`'s tamper check exists because a gate measures a run's own worktree and
+            // that run could have rewritten the script it is measured by. There is no second copy
+            // here — this runs in the project's own checkout, which IS the reference — so passing
+            // the same path makes the check a no-op by construction rather than by luck. Passing
+            // the project root instead would compare a subdirectory's scripts against paths that
+            // do not exist there and report a tamper that never happened.
+            let outcome = crate::gate::run_gate(
+                &cwd,
+                &cwd,
+                &text,
+                crate::project_commands::COMMAND_TIMEOUT,
+            )
+            .await;
+            let finished = crate::project_commands::verdict(pass, outcome);
+            let said = match finished.outcome {
+                crate::project_commands::Outcome::Passed => format!("{name} passed"),
+                crate::project_commands::Outcome::Failed => match finished.exit_code {
+                    Some(code) => format!("{name} failed with exit {code}"),
+                    None => format!("{name} failed"),
+                },
+                // Never "failed". A command that could not be measured says nothing about the
+                // project, and reporting it as a failure would stop the wrong work.
+                _ => format!("{name} could not be measured"),
+            };
+            if let Err(error) =
+                crate::project_commands::finish(&pool, command_id, finished).await
+            {
+                tracing::error!(%error, command_id, "a project command finished and was not recorded");
+            }
+            let _ = crate::feed::append(&pool, Some(&project_id), "command_finished", &said, None)
+                .await;
+        });
+        true
+    })
+    .await
+    .map_err(|status| refusal(status, "internal"))?;
+
+    if !claimed {
+        return Err(refusal(StatusCode::CONFLICT, "already_running"));
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+/* ------------------------------------------------------------- workflows -- */
+
+/// Where the library is on this machine, refused as one answer when there is nowhere for it to be.
+///
+/// A machine with no home directory has no library. `503` rather than `500`: nothing broke, the
+/// answer simply does not exist here, and the page says so instead of showing an empty shelf that
+/// reads as "you have installed nothing".
+fn library_or_refusal(state: &AppState) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .workflow_library
+        .clone()
+        .ok_or_else(|| refusal(StatusCode::SERVICE_UNAVAILABLE, "no_library"))
+}
+
+/// Every bundle on this machine, whatever any project uses.
+///
+/// House-wide, under `/workflows` and not under a project, because that is what it is: one folder
+/// shared by everything. A library route hanging off a project id would answer identically for
+/// every project and teach the shell a relationship that does not exist.
+async fn get_workflow_library(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::workflows::Bundle>>, (StatusCode, Json<serde_json::Value>)> {
+    let root = library_or_refusal(&state)?;
+    tokio::task::spawn_blocking(move || crate::workflows::library(&root))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the workflow library failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })
+}
+
+/// What this project uses, measured against the library as it is right now.
+///
+/// The measurement is the point. A listing that only replayed the pins file would say `referenced`
+/// for a bundle somebody has since edited, rewritten or deleted — which is the exact silence §6.1
+/// asks this page to break.
+async fn get_project_workflows(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::workflows::Installed>>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+    tokio::task::spawn_blocking(move || crate::workflows::installed(&root, &library))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map(Json)
+        // The parser's own words, the same as `POST /write`'s `invalid`: a pins file that will not
+        // load is a file somebody has to fix, and "unprocessable entity" does not say which line.
+        .map_err(|detail| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "refusal": "unreadable_pins", "detail": detail })),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+struct InstallRequest {
+    name: String,
+    version: String,
+}
+
+/// Turn a `workflows::Refused` into the status code that matches what it says.
+fn workflow_status(refused: &crate::workflows::Refused) -> (StatusCode, &'static str) {
+    match refused {
+        crate::workflows::Refused::NoSuchBundle => (StatusCode::NOT_FOUND, "no_such_bundle"),
+        crate::workflows::Refused::NotInstalled => (StatusCode::NOT_FOUND, "not_installed"),
+        crate::workflows::Refused::BadName => (StatusCode::UNPROCESSABLE_ENTITY, "bad_name"),
+        crate::workflows::Refused::AlreadyEjected => (StatusCode::CONFLICT, "already_ejected"),
+        // 409 beside it, and its own name: both are "you already have a copy", and they differ in
+        // where the copy came from — which decides what the page offers next.
+        crate::workflows::Refused::Adopted => (StatusCode::CONFLICT, "adopted"),
+        // 404 and not 422: the bundle is fine, it simply does not have a graph in it yet. A
+        // "cannot process" would send somebody looking for a syntax error in a file that is not
+        // there.
+        crate::workflows::Refused::NoGraph => (StatusCode::NOT_FOUND, "no_graph"),
+        crate::workflows::Refused::InvalidGraph(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "invalid_graph")
+        }
+        crate::workflows::Refused::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+fn workflow_refusal(refused: crate::workflows::Refused) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, name) = workflow_status(&refused);
+    (
+        status,
+        Json(serde_json::json!({ "refusal": name, "detail": refused.to_string() })),
+    )
+}
+
+/// Find one bundle in the library, or say which half is missing.
+fn bundle_or_refusal(
+    library: &std::path::Path,
+    name: &str,
+    version: Option<&str>,
+) -> Result<crate::workflows::Bundle, crate::workflows::Refused> {
+    if !crate::workflows::valid_name(name) {
+        return Err(crate::workflows::Refused::BadName);
+    }
+    let shelf = crate::workflows::library(library)
+        .map_err(|e| crate::workflows::Refused::Io(e.to_string()))?;
+    let mut candidates: Vec<_> = shelf
+        .into_iter()
+        .filter(|bundle| bundle.name == name)
+        .filter(|bundle| version.is_none_or(|wanted| bundle.version == wanted))
+        .collect();
+    // Newest last, so `None` for the version means "the latest there is" — which is what an update
+    // asks for when the page offered it a version it read from this same listing.
+    candidates.sort_by(|a, b| crate::workflows::compare_versions(&a.version, &b.version));
+    candidates
+        .pop()
+        .ok_or(crate::workflows::Refused::NoSuchBundle)
+}
+
+/// Every route below writes into the project's own folder, so every one of them asks the same two
+/// questions first, in the same order, for the reasons `POST /write` sets out at length.
+///
+/// **The kill switch first.** These write `.ai/workflows.yaml`, and one of them copies a whole
+/// bundle into `.ai/workflows/` — bytes in the project's folder, which §7.5 says must go the way an
+/// agent's write goes. That is the line `POST /commands` sits on the other side of: that one writes
+/// a database row and touches nothing on disk.
+async fn workflow_write_root(
+    state: &AppState,
+    id: &str,
+) -> Result<(PathBuf, PathBuf), (StatusCode, Json<serde_json::Value>)> {
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+        || crate::autopilot::scoped_kill_engaged(&state.pool, "project", id)
+            .await
+            .unwrap_or(true);
+    if halted {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+    let root = resolve_project_root(state, id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    Ok((root, library_or_refusal(state)?))
+}
+
+/// Pin a bundle to this project.
+///
+/// The version is required, unlike the update route below. Installing is choosing, and a request
+/// that said only `harness` would silently mean something different next week — which is the
+/// property a pin exists to remove.
+async fn post_project_workflow(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<InstallRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, library) = workflow_write_root(&state, &id).await?;
+    let project_id = id.clone();
+
+    let installed = tokio::task::spawn_blocking(move || {
+        let bundle = bundle_or_refusal(&library, &body.name, Some(&body.version))?;
+        crate::workflows::install(&root, &bundle)?;
+        Ok::<_, crate::workflows::Refused>(bundle)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(
+        &state,
+        &project_id,
+        &format!(
+            "{}@{} installed from the app",
+            installed.name, installed.version
+        ),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stop using a workflow. Never deletes an ejected copy — see `workflows::uninstall`.
+async fn delete_project_workflow(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, _) = workflow_write_root(&state, &id).await?;
+    let removed = name.clone();
+
+    tokio::task::spawn_blocking(move || crate::workflows::uninstall(&root, &name))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+        .map_err(workflow_refusal)?;
+
+    workflow_feed(&state, &id, &format!("{removed} is no longer used here")).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Take a copy, and stop receiving updates.
+///
+/// The one route here that puts a whole tree in somebody's repository, so it is the one the
+/// disclosure in §6.3 guards. It refuses rather than overwriting when a copy is already there: the
+/// edits in it are the entire reason it exists.
+async fn post_project_workflow_eject(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, library) = workflow_write_root(&state, &id).await?;
+    let now = chrono::Utc::now();
+    let ejected = name.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // The pinned version and not the newest: ejecting is taking a copy of what this project
+        // uses, and quietly taking a copy of something else would be an upgrade nobody asked for
+        // performed at the one moment updates stop arriving.
+        let pinned = crate::workflows::read_pins(&root)
+            .map_err(crate::workflows::Refused::Io)?
+            .workflows
+            .into_iter()
+            .find(|pin| pin.name == name)
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+        let bundle = bundle_or_refusal(&library, &name, Some(&pinned.version))?;
+        crate::workflows::eject(&root, &bundle, now)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(
+        &state,
+        &id,
+        &format!("{ejected} ejected: this project now has its own copy"),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct UpdateRequest {
+    /// Absent means the newest the library has. The page always sends the version it showed, so
+    /// this is the CLI's affordance rather than the shell's.
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// Take the origin's current bytes.
+///
+/// For a referenced workflow this re-stamps the pin. **For an ejected one it replaces the project's
+/// copy**, which is what update means — and why the page puts the diff in front of the button
+/// rather than beside it.
+async fn post_project_workflow_update(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Json(body): Json<UpdateRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, library) = workflow_write_root(&state, &id).await?;
+    let now = chrono::Utc::now();
+    let project_id = id.clone();
+
+    let bundle = tokio::task::spawn_blocking(move || {
+        let bundle = bundle_or_refusal(&library, &name, body.version.as_deref())?;
+        crate::workflows::update(&root, &bundle, now)?;
+        Ok::<_, crate::workflows::Refused>(bundle)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(
+        &state,
+        &project_id,
+        &format!("{}@{} taken from the library", bundle.name, bundle.version),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What this project's copy has that the origin does not.
+#[derive(serde::Serialize)]
+struct WorkflowDiff {
+    /// The bundle both sides were measured against, so the answer names what it compared.
+    origin_version: String,
+    changes: Vec<crate::workflows::FileChange>,
+    /// Files that are identical in both. Counted rather than listed: the interesting half is the
+    /// short one, and a hundred unchanged paths would bury it.
+    unchanged: usize,
+}
+
+/// The diff §6.1 asks for, file by file.
+///
+/// Only for an ejected workflow, and the 409 says so rather than answering with an empty list. A
+/// referenced bundle IS the library's — there is no second copy to compare — so "no differences"
+/// would be true and useless, and would read as *your copy matches* to somebody who has no copy.
+async fn get_project_workflow_diff(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<WorkflowDiff>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+
+    tokio::task::spawn_blocking(move || {
+        let pinned = crate::workflows::read_pins(&root)
+            .map_err(crate::workflows::Refused::Io)?
+            .workflows
+            .into_iter()
+            .find(|pin| pin.name == name)
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+        let mine = crate::workflows::copy_path(&root, &pinned)
+            .filter(|path| path.is_dir())
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+        let bundle = bundle_or_refusal(&library, &name, Some(&pinned.version))?;
+
+        let mine = crate::workflows::file_hashes(&mine)
+            .map_err(|e| crate::workflows::Refused::Io(e.to_string()))?;
+        let theirs = crate::workflows::file_hashes(std::path::Path::new(&bundle.path))
+            .map_err(|e| crate::workflows::Refused::Io(e.to_string()))?;
+        let changes = crate::workflows::compare(&mine, &theirs);
+        Ok::<_, crate::workflows::Refused>(WorkflowDiff {
+            origin_version: bundle.version,
+            unchanged: mine.len()
+                - changes
+                    .iter()
+                    .filter(|c| c.change != crate::workflows::Change::Removed)
+                    .count(),
+            changes,
+        })
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map(Json)
+    .map_err(workflow_refusal)
+}
+
+/// The graph a project's canvas draws, with this project's overlay painted on.
+#[derive(serde::Serialize)]
+struct GraphView {
+    /// Which copy this came out of. `project` for an ejected workflow, `library` otherwise.
+    ///
+    /// Said out loud because it changes what editing the graph would mean: one is this project's
+    /// file and the other is shared by every project that references the bundle, which is the whole
+    /// of §6.3.
+    source: &'static str,
+    version: String,
+    #[serde(flatten)]
+    resolved: crate::workflow_graph::Resolved,
+}
+
+/// What this project's workflow looks like, ready to be drawn.
+///
+/// **The graph comes from the copy the project actually uses.** An ejected workflow is drawn from
+/// the folder in the project, because that is the one that would run; a referenced one from the
+/// library. Reading the library's for an ejected workflow would draw a picture of somebody else's
+/// bundle and label it as theirs.
+///
+/// Four refusals, and `no_graph` is the one worth naming separately. A bundle with skills and
+/// scripts and no sequence yet is an ordinary halfway state, not a broken bundle — and a page that
+/// reported it as a parse failure would send somebody looking for a syntax error in a file that is
+/// not there.
+async fn get_project_workflow_graph(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<GraphView>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+
+    tokio::task::spawn_blocking(move || {
+        let pinned = crate::workflows::read_pins(&root)
+            .map_err(crate::workflows::Refused::Io)?
+            .workflows
+            .into_iter()
+            .find(|pin| pin.name == name)
+            .ok_or(crate::workflows::Refused::NotInstalled)?;
+
+        // `copy_path` and not `ejected_path`: an adopted workflow's copy is the folder the project
+        // already had — `.ai/` here — rather than the one an eject would have created. Reading the
+        // library instead would draw somebody else's bundle and label it as this project's.
+        let mine = crate::workflows::copy_path(&root, &pinned).filter(|path| path.is_dir());
+        let (source, from) = match mine {
+            Some(path) => ("project", path),
+            None => (
+                "library",
+                std::path::PathBuf::from(
+                    bundle_or_refusal(&library, &name, Some(&pinned.version))?.path,
+                ),
+            ),
+        };
+
+        let text = std::fs::read_to_string(from.join(crate::workflow_graph::GRAPH_FILE)).map_err(
+            |error| match error.kind() {
+                std::io::ErrorKind::NotFound => crate::workflows::Refused::NoGraph,
+                _ => crate::workflows::Refused::Io(error.to_string()),
+            },
+        )?;
+        let graph =
+            crate::workflow_graph::parse(&text).map_err(crate::workflows::Refused::InvalidGraph)?;
+
+        Ok::<_, crate::workflows::Refused>(GraphView {
+            source,
+            version: pinned.version,
+            resolved: crate::workflow_graph::resolve(&graph, &pinned.nodes),
+        })
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map(Json)
+    .map_err(workflow_refusal)
+}
+
+#[derive(Deserialize)]
+struct OverlayRequest {
+    /// Absent means *inherit*, which is a third answer that `false` would have collapsed into
+    /// "explicitly on". The same reasoning as the fields below.
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+}
+
+/// Change what this project overrides on one node — or clear it back to inherited.
+///
+/// **A write, so the stop applies.** It puts bytes in `.ai/workflows.yaml`, which is the project's
+/// own folder, and §7.5 says that goes the way an agent's write goes.
+///
+/// A body in which everything is absent clears the row, because an override that overrides nothing
+/// is not an override. That makes "go back to what the bundle says" the same request with an empty
+/// body rather than a second route with a different verb.
+async fn post_project_workflow_node(
+    State(state): State<AppState>,
+    Path((id, name, node)): Path<(String, String, String)>,
+    Json(body): Json<OverlayRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, _) = workflow_write_root(&state, &id).await?;
+    let said = format!("{name}/{node} overridden in this project");
+
+    let overlay = crate::workflows::NodeOverlay {
+        disabled: body.disabled,
+        // Empty is cleared, not "the empty model". A form that sends "" for a field somebody
+        // emptied has to be able to mean *stop overriding this*, and there is no model, tool or
+        // command whose name is nothing.
+        model: body.model.filter(|value| !value.trim().is_empty()),
+        tool: body.tool.filter(|value| !value.trim().is_empty()),
+        command: body.command.filter(|value| !value.trim().is_empty()),
+    };
+
+    tokio::task::spawn_blocking(move || {
+        crate::workflows::set_overlay(&root, &name, &node, Some(overlay))
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(&state, &id, &said).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct DetectQuery {
+    /// An absolute path to a folder. See `detect.rs` for why this route takes one at all.
+    path: String,
+}
+
+/// What is already in a folder somebody is about to add.
+///
+/// **§9's second step.** A project worth adding has a history, commands its people type, and often a
+/// written-down way of working — this repository's is `.ai/`, and it built NucleOS. This reports all
+/// of it so the wizard can propose rather than interrogate.
+///
+/// The git half runs even when the folder turns out not to be a repository: `is_git` is a finding
+/// and not a refusal, because `set_project_mode` only insists on a repository for `active`, and a
+/// wizard that refused to look at a folder would be deciding a question the last step asks.
+///
+/// In no scope table, like every route under `/projects/{id}/workflows`: it reads a path nobody has
+/// vouched for, so `permits` — default-deny — leaves it to the key of the person at the machine.
+async fn get_project_detect(
+    State(state): State<AppState>,
+    Query(query): Query<DetectQuery>,
+) -> Result<Json<crate::detect::Detected>, (StatusCode, Json<serde_json::Value>)> {
+    let root = std::path::PathBuf::from(query.path.trim());
+    if !root.is_absolute() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "not_absolute"));
+    }
+
+    let root = tokio::fs::canonicalize(&root)
+        .await
+        .map_err(|_| refusal(StatusCode::NOT_FOUND, "no_such_folder"))?;
+    if !root.is_dir() {
+        return Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "not_a_folder"));
+    }
+
+    let looking = root.clone();
+    let mut found = tokio::task::spawn_blocking(move || crate::detect::inspect_folder(&looking))
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+
+    if found.is_git {
+        let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+        found.branch = crate::git_exec::current_branch(&root, deadline).await.ok();
+        let (remote, head) = crate::git_exec::origin_and_head(&root, deadline).await;
+        found.remote = remote;
+        found.head = head;
+    }
+
+    // The one thing here that cannot be seen from the folder. Adding a project twice under two
+    // names is the mistake this prevents, and neither name would look wrong on its own.
+    found.taken_by = already_registered(&state, &root).await;
+    Ok(Json(found))
+}
+
+/// How long the three git reads get, together.
+///
+/// Short on purpose. This runs while somebody waits on a wizard, all three commands are local, and a
+/// repository whose `.git` is on a disconnected network share is exactly the case that would
+/// otherwise hold the request open. Missing git facts degrade to `None`, which the page shows as
+/// "not read" rather than as "there is no remote".
+const DETECT_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A project this daemon already keeps at this folder, if any.
+///
+/// Compared after canonicalising both sides, because the stored root is whatever string was handed
+/// in when the project was registered — a trailing slash, a different case on Windows, a path
+/// through a junction — and a plain string comparison would report "no" for the same folder.
+async fn already_registered(state: &AppState, root: &std::path::Path) -> Option<String> {
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT project_id, project_root FROM autopilot_state")
+            .fetch_all(&state.pool)
+            .await
+            .ok()?;
+
+    for (project_id, stored) in rows {
+        let Some(stored) = stored else { continue };
+        let Ok(stored) = tokio::fs::canonicalize(&stored).await else {
+            continue;
+        };
+        if stored == root {
+            return Some(project_id);
+        }
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct AdoptRequest {
+    /// What to call it. The project's own choice: an adopted folder has no published name.
+    name: String,
+    /// The folder, relative to the project root — `.ai`, `.claude`.
+    path: String,
+}
+
+/// Record a folder this project already has as its workflow.
+///
+/// **Copies nothing and writes nothing into the folder.** §9's second step exists because a project
+/// that already works must not be asked to describe itself again before the app will admit it. So
+/// this writes one pin, and the folder stays exactly as it was — no manifest, no rewrite.
+///
+/// It has no library origin, so it is ejected from birth and can never be updated. That is not a
+/// gap: it is what an adopted folder is, and the page says so rather than offering a button that
+/// would have to refuse.
+async fn post_project_workflow_adopt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AdoptRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (root, _) = workflow_write_root(&state, &id).await?;
+    let now = chrono::Utc::now();
+    let said = format!("{} adopted as this project's workflow", body.path);
+
+    tokio::task::spawn_blocking(move || {
+        crate::workflows::adopt(&root, &body.name, &body.path, now)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(&state, &id, &said).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// One feed line, after the fact and loudly on failure.
+///
+/// The same rule `POST /write` follows: a line about a change that then failed claims something
+/// that did not happen, and a change whose line was lost is recoverable from the log.
+async fn workflow_feed(state: &AppState, project_id: &str, said: &str) {
+    if let Err(error) = feed::append(
+        &state.pool,
+        Some(project_id),
+        "workflow_changed",
+        said,
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, project_id, "a workflow change was made and its feed line was not recorded");
+    }
+}
+
 async fn get_project_ls(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<ReadQuery>,
 ) -> Result<Json<Vec<inspect::Entry>>, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
+    let root = resolve_read_root(&state, &id, query.run).await?;
     let rel = query.path.unwrap_or_default();
     tokio::task::spawn_blocking(move || inspect::ls(&root, &rel))
         .await
@@ -2640,9 +3965,9 @@ async fn get_project_ls(
 async fn get_project_cat(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<ReadQuery>,
 ) -> Result<String, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
+    let root = resolve_read_root(&state, &id, query.run).await?;
     let rel = query.path.unwrap_or_default();
     tokio::task::spawn_blocking(move || inspect::cat(&root, &rel))
         .await
@@ -2655,7 +3980,7 @@ async fn get_project_grep(
     Path(id): Path<String>,
     Query(query): Query<GrepQuery>,
 ) -> Result<Json<Vec<inspect::Match>>, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
+    let root = resolve_read_root(&state, &id, query.run).await?;
     let q = query.q.unwrap_or_default();
     let rel = query.path.unwrap_or_default();
     tokio::task::spawn_blocking(move || inspect::grep(&root, &q, &rel))
@@ -2665,12 +3990,61 @@ async fn get_project_grep(
         .map_err(inspect_status)
 }
 
+/// A project's recent commits.
+///
+/// `path` narrows the history and travels the same road every other caller-supplied path here
+/// travels: `inspect::log` runs it through `safe_join` before git sees it, because a pathspec that
+/// begins with `-` is an option and one containing `..` reaches outside the repository.
+async fn get_project_log(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<Vec<inspect::Commit>>, StatusCode> {
+    let root = resolve_read_root(&state, &id, query.run).await?;
+    let rel = query.path.unwrap_or_default();
+    let limit = query.limit.unwrap_or(50);
+    tokio::task::spawn_blocking(move || inspect::log(&root, &rel, limit))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// Every local branch, and how far each is from where work lands.
+async fn get_project_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<inspect::Branches>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    tokio::task::spawn_blocking(move || inspect::branches(&root))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(inspect_status)
+}
+
+/// The uncommitted diff of the project, or everything one run changed since it branched.
+///
+/// The two are different questions and the `run` parameter chooses between them. Without it this is
+/// what it always was: the main checkout's working tree. With it, the comparison is against the
+/// branch point — because a run's checkpoints are commits, and a working-tree diff of a run
+/// halfway through a job shows nothing at all.
 async fn get_project_diff(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
 ) -> Result<String, StatusCode> {
-    let root = resolve_project_root(&state, &id).await?;
-    tokio::task::spawn_blocking(move || inspect::diff(&root))
+    let rel = query.path.unwrap_or_default();
+    let Some(run) = query.run else {
+        let root = resolve_project_root(&state, &id).await?;
+        return tokio::task::spawn_blocking(move || inspect::diff(&root))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(inspect_status);
+    };
+
+    let (root, base) = resolve_run_worktree(&state, &id, run).await?;
+    tokio::task::spawn_blocking(move || inspect::diff_since(&root, &base, &rel))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(inspect_status)
@@ -6283,6 +7657,7 @@ mod tests {
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
                 files_root: None,
+                workflow_library: None,
                 email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
                 voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
                 browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -6866,6 +8241,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -7925,6 +9301,7 @@ mod tests {
     fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
         AppState {
             files_root: Some(root),
+            workflow_library: None,
             ..state
         }
     }
@@ -8805,6 +10182,1270 @@ mod tests {
         assert_eq!(
             set_wip_limit(state, "nowhere", serde_json::json!({ "limit": 1 })).await,
             StatusCode::NOT_FOUND,
+        );
+    }
+
+    /* ------------------------------------------------ the write boundary -- */
+
+    async fn write_file(
+        state: AppState,
+        id: &str,
+        path: &str,
+        contents: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{id}/write"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "path": path, "contents": contents }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    /// The round trip that has to hold: what the app writes is what the daemon then reads.
+    ///
+    /// Asserted through `GET /rules` rather than by reading the file back, and the difference is
+    /// the whole test. Reading the bytes back proves the write landed; asking the daemon proves the
+    /// bytes mean what the app thought they meant — which is the claim a structured editor makes
+    /// and a text editor does not.
+    #[tokio::test]
+    async fn a_rules_file_written_from_the_app_is_the_one_the_daemon_then_reads() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, _) = write_file(
+            state.clone(),
+            "alpha",
+            ".ai/autopilot.yaml",
+            "gate_command: cargo clippy\nschedules:\n  - name: nightly\n    cron: '0 3 * * *'\n    prompt: sweep\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rules_file"], "present");
+        assert_eq!(body["gate_command"], "cargo clippy");
+        assert_eq!(body["schedules"].as_array().unwrap().len(), 1);
+
+        // In the feed, because a write from the app goes the same way an agent's does. A change to
+        // what a project does on its own that left no line would be the one edit nobody could find
+        // afterwards.
+        let (kind, summary): (String, String) = sqlx::query_as(
+            "SELECT kind, summary FROM feed WHERE project_id = 'alpha' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(kind, "config_written");
+        assert!(summary.contains(".ai/autopilot.yaml"), "got: {summary}");
+    }
+
+    /// Everything the registry does not name is refused, and the refusal is named so the page can
+    /// say *why* rather than "no".
+    ///
+    /// The traversal is in this list rather than in a path-guard test on purpose: the app answers
+    /// about names it owns, and `..` is not one — so it is turned away before the filesystem is
+    /// touched at all.
+    #[tokio::test]
+    async fn a_file_the_app_does_not_own_is_refused_before_anything_is_touched() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        for path in [
+            // Layer 2: read, plus a door to an editor. Never written from here.
+            "core/src/http.rs",
+            "README.md",
+            // The `.ai/` workflow harness's own config, which a `.ai/*.yaml` glob would have swept
+            // in and which the núcleo has never opened.
+            ".ai/models.yaml",
+            // This machine's settings, which are not any project's however the URL is spelled.
+            ".ai/github.yaml",
+            "../escape.yaml",
+            ".ai/../../escape.yaml",
+        ] {
+            let (status, body) = write_file(state.clone(), "alpha", path, "x: 1\n").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(body["refusal"], "not_ours", "{path}");
+        }
+
+        // Nothing was created anywhere, including one level up from the project.
+        assert!(!dir.path().join("core").exists());
+        assert!(!dir.path().join("README.md").exists());
+        assert!(!dir.path().join(".ai").join("models.yaml").exists());
+        assert!(!dir.path().parent().unwrap().join("escape.yaml").exists());
+    }
+
+    /// YAML the daemon could not read is refused **and the file that was there survives**.
+    ///
+    /// The surviving file is the assertion that matters. A validator that refused after truncating
+    /// would be worse than no validator at all: the caller would be told their edit was rejected
+    /// while the project quietly lost its rules, and the next run would report `gate errored` for a
+    /// reason nothing on the screen could explain.
+    ///
+    /// The detail comes back with it, because "unprocessable entity" and nothing else sends
+    /// somebody to a text editor — which is the surface the hatch exists to replace.
+    #[tokio::test]
+    async fn yaml_the_daemon_could_not_read_is_refused_and_the_old_file_survives() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let file = dir.path().join(".ai").join("autopilot.yaml");
+
+        for (contents, expected_in_detail) in [
+            ("schedules: [\n", "line"),
+            // `deny_unknown_fields`: a typo an editor would save happily, and after which the gate
+            // is silently absent for ever.
+            ("gate_commmand: cargo test\n", "gate_commmand"),
+        ] {
+            let (status, body) =
+                write_file(state.clone(), "alpha", ".ai/autopilot.yaml", contents).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{contents}");
+            assert_eq!(body["refusal"], "invalid");
+            let detail = body["detail"].as_str().unwrap();
+            assert!(
+                detail.contains(expected_in_detail),
+                "the refusal must say what broke: {detail}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "gate_command: cargo test\n",
+                "the file that was there must survive a refusal"
+            );
+        }
+    }
+
+    /// The emergency stop holds the app's write too, which is the promise that the shell is not a
+    /// door with privileges an agent lacks.
+    ///
+    /// Both brakes, because a project held on its own is held for this as well — and the scoped one
+    /// is the likelier of the two to be forgotten, since it is the only one that names the project
+    /// this route already has in its path.
+    #[tokio::test]
+    async fn the_emergency_stop_holds_a_write_from_the_app() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let file = dir.path().join(".ai").join("autopilot.yaml");
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+        let (status, body) = write_file(
+            state.clone(),
+            "alpha",
+            ".ai/autopilot.yaml",
+            "gate_command: x\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+
+        crate::autopilot::set_kill_switch(&state.pool, false)
+            .await
+            .unwrap();
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "alpha", true)
+            .await
+            .unwrap();
+        let (status, body) = write_file(
+            state.clone(),
+            "alpha",
+            ".ai/autopilot.yaml",
+            "gate_command: x\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["refusal"], "kill_switch");
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "gate_command: cargo test\n",
+            "nothing is written while the stop is engaged"
+        );
+
+        // Released, and the same request goes through — so the refusal was the stop and not the
+        // request.
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "alpha", false)
+            .await
+            .unwrap();
+        let (status, _) =
+            write_file(state, "alpha", ".ai/autopilot.yaml", "gate_command: x\n").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// A project the daemon has no folder for has no file to write, and no fence to draw either.
+    /// Both routes fail in the same place, so the page cannot end up showing an editor that cannot
+    /// save.
+    #[tokio::test]
+    async fn a_project_with_no_folder_has_no_file_and_no_fence() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('rootless', 'off')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = write_file(
+            state.clone(),
+            "rootless",
+            ".ai/autopilot.yaml",
+            "gate_command: x\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "no_project_root");
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/rootless/ownership")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The fence is served, and it names the file, the owner and what editing it changes.
+    ///
+    /// Served rather than hard-coded in the shell: a client carrying its own copy would offer an
+    /// editor for a file the daemon refuses, or hide one for a file it would accept, and neither
+    /// mistake announces itself.
+    #[tokio::test]
+    async fn the_write_boundary_is_served_so_the_page_can_draw_it() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/alpha/ownership")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let claims = claims.as_array().unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0]["path"], ".ai/autopilot.yaml");
+        assert_eq!(claims[0]["owner"], "core");
+        assert_eq!(claims[0]["writable"], true);
+        assert!(
+            claims[0]["what"].as_str().unwrap().contains("gate command"),
+            "the fence has to say what crossing it changes"
+        );
+        // The second row arrived with the module that parses it, which is the membership rule the
+        // registry runs on: a claim and a parser come together or not at all.
+        assert_eq!(claims[1]["path"], ".ai/workflows.yaml");
+        assert_eq!(claims[1]["writable"], true);
+    }
+
+    /* --------------------------------------------------------------- workflows -- */
+
+    /// A library with one bundle in it, and a state pointing at it.
+    ///
+    /// The library goes through `AppState` rather than through the machine's home directory, which
+    /// is what makes any of this testable without touching the person running the suite. See the
+    /// field's own comment in `state.rs`.
+    fn library_with(bundles: &[(&str, &str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, version, manifest) in bundles {
+            let at = dir.path().join(name).join(version);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join(crate::workflows::MANIFEST), manifest).unwrap();
+            std::fs::write(at.join("graph.yaml"), format!("# {name} {version}\n")).unwrap();
+        }
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
+
+    /// A bundle with a real graph in it, for the canvas routes.
+    const TWO_NODE_GRAPH: &str = "nodes:\n  - {id: plan, type: agent, model: opus}\n  - {id: gate, type: command, command: cargo test}\nedges:\n  - {from: plan, to: gate}\n";
+
+    async fn workflow_call(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test-token")
+            .header("content-type", "application/json");
+        let request = match body {
+            Some(json) => request.body(Body::from(json.to_string())).unwrap(),
+            None => request.body(Body::empty()).unwrap(),
+        };
+        let response = build_router(state).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The library is listed, a pin records the hash, and a bundle edited under it reads as drift.
+    ///
+    /// The whole of §6.1's second requirement in one pass. The listing is a *measurement* against
+    /// the library as it is right now, not a replay of the file: replaying it would say
+    /// `referenced` for a bundle somebody has since rewritten, which is the exact silence this page
+    /// exists to break.
+    #[tokio::test]
+    async fn a_pin_records_the_hash_and_a_bundle_edited_under_it_reads_as_drift() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: the .ai harness\n")]);
+        state.workflow_library = Some(library.clone());
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, shelf) = workflow_call(state.clone(), "GET", "/workflows/library", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(shelf.as_array().unwrap().len(), 1);
+        assert_eq!(shelf[0]["origin"], "library:harness@1.0");
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, installed) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(installed[0]["standing"], "referenced");
+        assert_eq!(installed[0]["origin"], "library:harness@1.0");
+        assert_eq!(installed[0]["hash"], shelf[0]["hash"]);
+
+        // Somebody edits the bundle in place, under a pin that claims to know what it says.
+        std::fs::write(library.join("harness/1.0/graph.yaml"), "# changed\n").unwrap();
+        let (_, installed) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(installed[0]["standing"], "drifted");
+        assert_ne!(installed[0]["hash"], installed[0]["origin_hash"]);
+        // Drift is not an update on offer: nobody published a new version.
+        assert!(installed[0]["update_available"].is_null());
+    }
+
+    /// An installed workflow's declared file is in the fence and cannot be written from here.
+    ///
+    /// §12's middle state, end to end: `writable: false` on the row, and `another_author` rather
+    /// than `not_ours` from the write route. The two refusals send somebody to two different
+    /// places — one file has nobody this app writes as, the other has an author standing right
+    /// there — so collapsing them would be the page telling somebody to give up on a file that has
+    /// an owner they can go and edit.
+    #[tokio::test]
+    async fn a_workflows_own_file_is_shown_in_the_fence_and_refused_by_the_write_route() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[(
+            "harness",
+            "1.0",
+            "description: the .ai harness\nowns:\n  - .ai/models.yaml\n",
+        )]);
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (_, claims) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/ownership", None).await;
+        let claims = claims.as_array().unwrap();
+        assert_eq!(claims.len(), 3);
+        let theirs = claims
+            .iter()
+            .find(|claim| claim["path"] == ".ai/models.yaml")
+            .expect("an installed workflow's file must be in the fence");
+        assert_eq!(theirs["owner"], "harness");
+        assert_eq!(theirs["writable"], false);
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/write",
+            Some(serde_json::json!({ "path": ".ai/models.yaml", "contents": "plan: opus\n" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["refusal"], "another_author");
+        assert!(body["detail"].as_str().unwrap().contains("harness"));
+
+        // And the file the app DOES author still saves, so the refusal above is about authorship
+        // rather than about the route having stopped working.
+        let (status, _) = workflow_call(
+            state,
+            "POST",
+            "/projects/alpha/write",
+            Some(
+                serde_json::json!({ "path": ".ai/workflows.yaml", "contents": "workflows: []\n" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// Ejecting is a one-way door, and pressing it twice does not walk back through it.
+    ///
+    /// The edits in an ejected copy are the entire reason it exists. A second eject that
+    /// overwrote them would be the one operation here that destroys work, reachable by a
+    /// double-click.
+    #[tokio::test]
+    async fn ejecting_twice_is_a_conflict_and_leaves_the_first_copy_alone() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library);
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/eject",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let mine = dir.path().join(".ai/workflows/harness/graph.yaml");
+        std::fs::write(&mine, "# mine now\n").unwrap();
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/eject",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "already_ejected");
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "# mine now\n");
+
+        // And the diff is the thing that now has something to say.
+        let (status, diff) =
+            workflow_call(state, "GET", "/projects/alpha/workflows/harness/diff", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(diff["origin_version"], "1.0");
+        assert_eq!(diff["changes"][0]["path"], "graph.yaml");
+        assert_eq!(diff["changes"][0]["change"], "changed");
+    }
+
+    /// A referenced workflow has no second copy, so the diff refuses rather than answering "none".
+    ///
+    /// An empty list would be true and useless: it reads as *your copy matches* to somebody who has
+    /// no copy at all.
+    #[tokio::test]
+    async fn the_diff_refuses_for_a_workflow_this_project_has_no_copy_of() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (status, body) =
+            workflow_call(state, "GET", "/projects/alpha/workflows/harness/diff", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "not_installed");
+    }
+
+    /// The stop stops these too, and that is the line `POST /commands` sits on the other side of.
+    ///
+    /// These put bytes in the project's own folder — one of them copies a whole tree in — which
+    /// §7.5 says must go the way an agent's write goes. Declaring a command writes a database row
+    /// and touches nothing on disk, so it does not ask.
+    #[tokio::test]
+    async fn a_workflow_cannot_be_installed_or_ejected_while_the_stop_is_engaged() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/projects/alpha/workflows",
+                Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+            ),
+            ("POST", "/projects/alpha/workflows/harness/eject", None),
+            (
+                "POST",
+                "/projects/alpha/workflows/harness/update",
+                Some(serde_json::json!({})),
+            ),
+            ("DELETE", "/projects/alpha/workflows/harness", None),
+        ] {
+            let (status, refused) = workflow_call(state.clone(), method, uri, body).await;
+            assert_eq!(status, StatusCode::LOCKED, "{method} {uri}");
+            assert_eq!(refused["refusal"], "kill_switch");
+        }
+
+        // Reading is not writing: the page still says what this project uses while the stop is on,
+        // which is exactly when somebody is trying to work out what would have run.
+        let (status, _) = workflow_call(state, "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A machine with no library says so instead of showing an empty shelf.
+    ///
+    /// `503` and not `200 []`. Nothing broke — the answer does not exist here — and an empty list
+    /// would read as "you have installed nothing", which sends somebody looking for an install
+    /// button that cannot work.
+    #[tokio::test]
+    async fn a_machine_with_no_library_says_so_rather_than_showing_an_empty_shelf() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (status, body) = workflow_call(state, "GET", "/workflows/library", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["refusal"], "no_library");
+    }
+
+    /// The canvas reads the copy that would actually run, and says which one that was.
+    ///
+    /// An ejected workflow is drawn from the folder in the project. Reading the library's for one
+    /// would draw a picture of somebody else's bundle and label it as this project's — and it is
+    /// also the difference §6.3 turns on: editing one file affects this project, editing the other
+    /// affects every project that references the bundle.
+    #[tokio::test]
+    async fn the_canvas_reads_the_copy_that_would_actually_run() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        std::fs::write(library.join("harness/1.0/graph.yaml"), TWO_NODE_GRAPH).unwrap();
+        state.workflow_library = Some(library);
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (status, graph) = workflow_call(
+            state.clone(),
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(graph["source"], "library");
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(graph["nodes"][0]["type"], "agent");
+        // The gate is a role read off the edges, and nothing branches on this one yet.
+        assert_eq!(graph["nodes"][1]["role"], "plain");
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/eject",
+            None,
+        )
+        .await;
+        // The project's copy is now the one that would run, so it is the one that is drawn — and a
+        // change to it shows up while the library's is untouched.
+        std::fs::write(
+            dir.path().join(".ai/workflows/harness/graph.yaml"),
+            "nodes:\n  - {id: only, type: agent}\n",
+        )
+        .unwrap();
+
+        let (_, graph) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(graph["source"], "project");
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["nodes"][0]["id"], "only");
+    }
+
+    /// §6.2 through the route: the overlay is painted, and what the origin said travels with it.
+    #[tokio::test]
+    async fn the_overlay_reaches_the_canvas_as_a_seal_and_not_as_a_substitution() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        std::fs::write(library.join("harness/1.0/graph.yaml"), TWO_NODE_GRAPH).unwrap();
+        state.workflow_library = Some(library);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        // Through the route that writes it, rather than by editing the file in the test: the
+        // shape of the pins file is `render_pins`'s business, and a test that hand-indented it
+        // would break the day that changed, for a reason that has nothing to do with overlays.
+        for (node, body) in [
+            ("plan", serde_json::json!({ "model": "haiku" })),
+            ("council", serde_json::json!({ "disabled": true })),
+        ] {
+            let (status, _) = workflow_call(
+                state.clone(),
+                "POST",
+                &format!("/projects/alpha/workflows/harness/nodes/{node}"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+
+        let (status, graph) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let plan = &graph["nodes"][0];
+        assert_eq!(plan["overridden"], true);
+        let model = plan["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"] == "model")
+            .unwrap();
+        assert_eq!(model["value"], "haiku");
+        assert_eq!(model["origin"], "opus");
+
+        // An override for a node this bundle does not have is reported, never dropped: it is the
+        // only moment somebody learns it stopped applying.
+        assert_eq!(graph["orphaned"][0], "council");
+    }
+
+    /// A bundle with no graph is a halfway state, not a broken bundle, and it gets its own answer.
+    ///
+    /// A parse failure would send somebody looking for a syntax error in a file that is not there.
+    #[tokio::test]
+    async fn a_bundle_with_no_graph_says_so_rather_than_reporting_a_parse_failure() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        std::fs::remove_file(library.join("harness/1.0/graph.yaml")).unwrap();
+        state.workflow_library = Some(library.clone());
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "no_graph");
+
+        // And one that IS there and will not parse comes back with the parser's words, because a
+        // refusal that does not say where the file broke sends somebody to an editor anyway.
+        std::fs::write(
+            library.join("harness/1.0/graph.yaml"),
+            "nodes:\n  - {id: plan, type: agent}\nedges:\n  - {from: plan, to: nowhere}\n",
+        )
+        .unwrap();
+        let (status, body) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "invalid_graph");
+        assert!(body["detail"].as_str().unwrap().contains("nowhere"));
+    }
+
+    /// §9's second step, end to end: the app looks at a folder and reports what is already in it.
+    ///
+    /// The harness is the half that matters. This repository's `.ai/` built NucleOS, and an app that
+    /// asked for it to be recreated in a graph editor before admitting the project exists would be
+    /// asking for a day's work to describe a thing that is sitting right there.
+    #[tokio::test]
+    async fn a_folder_is_read_for_what_it_already_has_rather_than_interrogated() {
+        let state = test_state().await;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".ai")).unwrap();
+        std::fs::write(temp.path().join(".ai/workflow.md"), "the pipeline").unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts": {"test": "vitest run"}}"#,
+        )
+        .unwrap();
+
+        let (status, found) = workflow_call(
+            state,
+            "GET",
+            &format!(
+                "/projects/detect?path={}",
+                urlencoding(&temp.path().to_string_lossy())
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(found["harnesses"][0]["path"], ".ai");
+        assert_eq!(found["commands"][0]["name"], "test");
+        assert_eq!(found["commands"][0]["command"], "npm run test");
+        // Not a repository is a finding, not a refusal — the last step is what decides whether that
+        // matters, because only `active` insists on one.
+        assert_eq!(found["is_git"], false);
+        assert!(found["taken_by"].is_null());
+    }
+
+    /// Adding one folder twice under two names is the mistake nothing else here can catch: neither
+    /// name looks wrong on its own, and the folder cannot say it has been claimed.
+    #[tokio::test]
+    async fn a_folder_this_daemon_already_watches_says_which_project_has_it() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (_, found) = workflow_call(
+            state,
+            "GET",
+            &format!(
+                "/projects/detect?path={}",
+                urlencoding(&dir.path().to_string_lossy())
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(found["taken_by"], "alpha");
+    }
+
+    /// A path that is not there, and one that is not a folder, are two different answers.
+    #[tokio::test]
+    async fn a_path_that_is_not_a_folder_is_refused_by_name() {
+        let state = test_state().await;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a-file"), "x").unwrap();
+
+        for (path, code) in [
+            (
+                temp.path().join("nowhere").to_string_lossy().into_owned(),
+                "no_such_folder",
+            ),
+            (
+                temp.path().join("a-file").to_string_lossy().into_owned(),
+                "not_a_folder",
+            ),
+        ] {
+            let (_, body) = workflow_call(
+                state.clone(),
+                "GET",
+                &format!("/projects/detect?path={}", urlencoding(&path)),
+                None,
+            )
+            .await;
+            assert_eq!(body["refusal"], code, "{path}");
+        }
+
+        // A relative path is refused before the filesystem is touched at all: there is no root it
+        // could be relative TO, so resolving it would resolve it against the daemon's own cwd.
+        let (_, body) = workflow_call(state, "GET", "/projects/detect?path=.ai", None).await;
+        assert_eq!(body["refusal"], "not_absolute");
+    }
+
+    /// Adopting records a pin and touches nothing in the folder.
+    ///
+    /// The canvas then says the bundle has no graph, which is true and is the honest halfway state:
+    /// the app recognises the way of working that is there without pretending to have parsed it.
+    #[tokio::test]
+    async fn adopting_the_folder_a_project_already_has_writes_one_pin_and_nothing_else() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[]);
+        state.workflow_library = Some(library);
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::write(dir.path().join(".ai/workflow.md"), "the pipeline").unwrap();
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/adopt",
+            Some(serde_json::json!({ "name": "harness", "path": ".ai" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, installed) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/workflows", None).await;
+        assert_eq!(installed[0]["standing"], "ejected");
+        assert_eq!(installed[0]["origin"], "adopted:.ai");
+        assert!(installed[0]["origin_hash"].is_null());
+
+        // Untouched: no manifest written into somebody else's folder.
+        assert!(!dir.path().join(".ai/bundle.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".ai/workflow.md")).unwrap(),
+            "the pipeline"
+        );
+
+        let (status, body) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/workflows/harness/graph",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "no_graph");
+    }
+
+    /* ----------------------------------------------------- project commands -- */
+
+    async fn declare_command(
+        state: AppState,
+        id: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{id}/commands"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn list_commands(state: AppState, id: &str) -> serde_json::Value {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/projects/{id}/commands"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    async fn run_command(
+        state: AppState,
+        id: &str,
+        command_id: i64,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{id}/commands/{command_id}/run"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Waits for a command's row to stop saying `running`.
+    ///
+    /// The route answers 202 and the work happens on a spawned task, which is the whole design — so
+    /// a test that asserted immediately would be asserting the claim rather than the result. Bounded
+    /// at ten seconds: the commands below are `git --version` and a program that does not exist.
+    async fn settled(
+        state: &AppState,
+        id: &str,
+        command_id: i64,
+    ) -> crate::project_commands::LastRun {
+        for _ in 0..200 {
+            if let Ok(Some(row)) = crate::project_commands::get(&state.pool, id, command_id).await
+                && let Some(last) = row.last
+                && last.outcome != crate::project_commands::Outcome::Running
+            {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the command never settled");
+    }
+
+    /// Declared, listed, run, and forgotten — with the verdict and the feed line the run leaves
+    /// behind.
+    ///
+    /// `git --version` rather than `echo`, and the choice is not incidental: on Windows the only
+    /// real `echo.exe` is Git's and it is on PATH only if somebody put it there, which is already
+    /// the documented cause of five confusing failures in this suite. `git` is required by every
+    /// test in `inspect.rs`, so a machine that cannot run this one could not run those either.
+    #[tokio::test]
+    async fn a_command_is_declared_run_and_recorded_with_what_it_said() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version", "is_gate": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let command_id = body["id"].as_i64().unwrap();
+
+        // Listed, with no result at all — which is not a result of zero and not a failure.
+        let listed = list_commands(state.clone(), "alpha").await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["name"], "version");
+        assert_eq!(listed[0]["is_gate"], true);
+        assert!(listed[0]["last"].is_null());
+        // Absent from the request, so the safe default: only a person.
+        assert_eq!(listed[0]["runnable_by"], "person");
+
+        let (status, _) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "the answer comes before the work"
+        );
+
+        let last = settled(&state, "alpha", command_id).await;
+        assert_eq!(last.outcome, crate::project_commands::Outcome::Passed);
+        assert_eq!(last.exit_code, Some(0));
+        assert!(last.ended_at.is_some());
+
+        let summary: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE project_id = 'alpha' AND kind = 'command_finished'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(summary, "version passed");
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/projects/alpha/commands/{command_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            list_commands(state, "alpha")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A command that could not start is `errored`, never `failed` — the distinction the whole
+    /// outcome enum exists for. A missing binary says nothing about whether the project works, and
+    /// reporting it as a failure would stop the wrong work.
+    #[tokio::test]
+    async fn a_command_that_could_not_start_is_errored_and_never_failed() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({
+                "name": "ghost",
+                "command": "nucleos-no-such-program --please",
+            }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        assert_eq!(
+            run_command(state.clone(), "alpha", command_id).await.0,
+            StatusCode::ACCEPTED
+        );
+        let last = settled(&state, "alpha", command_id).await;
+        assert_eq!(last.outcome, crate::project_commands::Outcome::Errored);
+        // No exit code at all, because there was no process to exit.
+        assert_eq!(last.exit_code, None);
+        assert!(last.output.unwrap().contains("failed to start"));
+
+        let summary: String = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE project_id = 'alpha' AND kind = 'command_finished'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(summary, "ghost could not be measured");
+    }
+
+    /// A declaration that could only ever fail is refused while the person who typed it is looking
+    /// at it, and the refusal says which part was wrong.
+    #[tokio::test]
+    async fn a_declaration_that_could_never_run_is_refused_with_the_reason() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        for (body, expected) in [
+            (
+                serde_json::json!({ "name": "", "command": "git --version" }),
+                "needs a name",
+            ),
+            (
+                serde_json::json!({ "name": "x", "command": "  " }),
+                "something to run",
+            ),
+            (
+                serde_json::json!({ "name": "x", "command": "bash -c \"cargo test" }),
+                "quote",
+            ),
+            (
+                serde_json::json!({ "name": "x", "command": "git --version", "cwd": "../elsewhere" }),
+                "inside the project",
+            ),
+        ] {
+            let (status, refused) = declare_command(state.clone(), "alpha", body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(refused["refusal"], "invalid");
+            let detail = refused["detail"].as_str().unwrap();
+            assert!(detail.contains(expected), "got: {detail}");
+        }
+
+        // A folder that is spelled safely and is simply not there is a different refusal, because
+        // it is a different thing to fix.
+        let (status, refused) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "x", "command": "git --version", "cwd": "nowhere" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "cwd_missing");
+
+        assert!(
+            list_commands(state, "alpha")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The emergency stop stops a button spawning a process, which is the least surprising thing an
+    /// emergency stop could do. Both brakes, because a project held on its own is held for this too.
+    #[tokio::test]
+    async fn the_emergency_stop_holds_a_command_the_app_would_run() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        crate::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+        let (status, refused) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(refused["refusal"], "kill_switch");
+
+        crate::autopilot::set_kill_switch(&state.pool, false)
+            .await
+            .unwrap();
+        crate::autopilot::set_scoped_kill(&state.pool, "project", "alpha", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_command(state.clone(), "alpha", command_id).await.0,
+            StatusCode::LOCKED
+        );
+
+        // Nothing was claimed, so nothing has a result — the refusal is not a run that failed.
+        let row = crate::project_commands::get(&state.pool, "alpha", command_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.last, None);
+    }
+
+    /// Two clicks landing together must not both start the suite in one folder. The claim is a
+    /// conditional UPDATE, so the second one loses and is told why.
+    #[tokio::test]
+    async fn a_command_already_running_is_refused_rather_than_started_twice() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        assert!(
+            crate::project_commands::mark_running(&state.pool, "alpha", command_id)
+                .await
+                .unwrap()
+        );
+        let (status, refused) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["refusal"], "already_running");
+    }
+
+    /// Another project's id does not reach this project's command, and a command that is not there
+    /// is the same answer — an integer in a URL names nothing on its own.
+    #[tokio::test]
+    async fn a_command_belongs_to_its_project_and_to_no_other() {
+        let state = test_state().await;
+        let _alpha = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let _beta = project_with_rules(&state, "beta", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        let (status, refused) = run_command(state.clone(), "beta", command_id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_command");
+        assert!(
+            list_commands(state, "beta")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `runnable_by` is enforced against the caller's key, and the handler is called directly
+    /// because nothing can reach it as an agent through the router.
+    ///
+    /// That is the point rather than a workaround: `auth.rs` gives a run's key exactly one route,
+    /// so this field is belt and braces today. Calling the handler with the scope a run would carry
+    /// is the only way to prove the belt is fastened — and the day a run is given a way in, this is
+    /// already the test that says what happens.
+    #[tokio::test]
+    async fn a_command_marked_for_people_refuses_a_key_that_is_an_agents() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (_, mine) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "mine", "command": "git --version" }),
+        )
+        .await;
+        let (_, theirs) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({
+                "name": "theirs",
+                "command": "git --version",
+                "runnable_by": "agent",
+            }),
+        )
+        .await;
+
+        let refused = post_project_command_run(
+            State(state.clone()),
+            Extension(crate::auth::Scope::Run(7)),
+            Path(("alpha".to_owned(), mine["id"].as_i64().unwrap())),
+        )
+        .await
+        .expect_err("a person-only command must refuse an agent's key");
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert_eq!(refused.1.0["refusal"], "person_only");
+
+        // The one that says agents may, does.
+        let allowed = post_project_command_run(
+            State(state.clone()),
+            Extension(crate::auth::Scope::Run(7)),
+            Path(("alpha".to_owned(), theirs["id"].as_i64().unwrap())),
+        )
+        .await
+        .expect("a command marked for agents accepts one");
+        assert_eq!(allowed, StatusCode::ACCEPTED);
+
+        // And the human's key opens the person-only one, which is what makes the refusal above
+        // about WHO is asking rather than about the command.
+        assert_eq!(
+            run_command(state, "alpha", mine["id"].as_i64().unwrap())
+                .await
+                .0,
+            StatusCode::ACCEPTED
         );
     }
 
@@ -11283,6 +13924,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -11487,6 +14129,163 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/projects/p/cat?path=..%2f..%2fsecret")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// **The guard the run-aware readers stand on, and the reason they are safe to have.**
+    ///
+    /// The daemon holds every project's worktrees in one table, so a `run` id alone is enough to
+    /// name any checkout on the machine. What makes `?run=` safe is that the lookup matches the
+    /// project being asked as well as the run — ask project `a` for project `b`'s run and there is
+    /// no row, which is a 404 and not a file.
+    #[tokio::test]
+    async fn a_run_belonging_to_another_project_is_not_readable_through_this_one() {
+        let state = test_state().await;
+        let mine = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        std::fs::write(theirs.path().join("secret.txt"), b"theirs").unwrap();
+
+        for (project, root) in [("a", mine.path()), ("b", theirs.path())] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'active', ?)",
+            )
+            .bind(project)
+            .bind(root.to_string_lossy().into_owned())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        // Project `b` owns run 7's worktree.
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at) \
+             VALUES ('run', 7, 'b', ?, ?, 'feat', '2026-08-23T00:00:00Z')",
+        )
+        .bind(theirs.path().to_string_lossy().into_owned())
+        .bind(theirs.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/a/cat?path=secret.txt&run=7")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A released worktree is a directory that has been removed, and its row keeps the path.
+    /// Answering from it would read whatever has since been written there.
+    #[tokio::test]
+    async fn a_released_worktree_is_refused_rather_than_read_from_its_old_path() {
+        let state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("f.txt"), b"still here").unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at, removed_at) \
+             VALUES ('run', 3, 'p', ?, ?, 'feat', '2026-08-23T00:00:00Z', '2026-08-23T01:00:00Z')",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/p/cat?path=f.txt&run=3")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A worktree with no recorded base cannot be measured, and that is a different answer from
+    /// "nothing changed". The column is nullable, and NULL means the daemon never wrote down where
+    /// the branch started.
+    #[tokio::test]
+    async fn a_worktree_with_no_base_is_unmeasurable_rather_than_unchanged() {
+        let state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at) \
+             VALUES ('run', 5, 'p', ?, ?, 'feat', '2026-08-23T00:00:00Z')",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/p/changed?run=5")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// "What changed" has no meaning without a branch point to measure from, so the run is required
+    /// rather than quietly defaulting to the project root — which would answer a different question
+    /// with the same shape.
+    #[tokio::test]
+    async fn changed_without_a_run_is_refused_rather_than_answered_about_the_trunk() {
+        let state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/p/changed")
                     .header("Authorization", "Bearer test-token")
                     .body(Body::empty())
                     .unwrap(),
