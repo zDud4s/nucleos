@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
@@ -20,8 +20,7 @@ vi.mock("../data/client", async (original) => ({
 
 import { Teams } from "./Teams";
 import { createAppQueryClient } from "../app/queryClient";
-import { ApiRefusal } from "../data/client";
-import type { TeamRun, TeamTrigger, TeamView, TriggerNext } from "../data/teams";
+import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView, TriggerNext } from "../data/teams";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 beforeEach(() => {
@@ -37,10 +36,10 @@ beforeEach(() => {
 
 function teamView(overrides: Partial<TeamView> = {}): TeamView {
   return {
-    id: "atendimento",
-    name: "Atendimento",
-    mission: "answer the customers who write in",
-    director_agent_id: "ana",
+    id: "financas",
+    name: "Finanças",
+    mission: "keep the books straight",
+    director_agent_id: "controller",
     max_rounds: 3,
     max_parallel: 2,
     budget_usd: 10,
@@ -54,83 +53,103 @@ function teamView(overrides: Partial<TeamView> = {}): TeamView {
   };
 }
 
+function teamRun(overrides: Partial<TeamRun> = {}): TeamRun {
+  return {
+    id: "run-1",
+    team_id: "financas",
+    request: "reconcile October",
+    workspace: "teams/financas/run-1",
+    state: "working",
+    director_node: "none",
+    director_run_id: null,
+    round: 2,
+    next_ordinal: 3,
+    dry_rounds: 0,
+    plan_retries: 0,
+    replanned: "no",
+    outcome: null,
+    why: null,
+    created_at: "2026-08-24T09:00:00Z",
+    updated_at: "2026-08-24T09:05:00Z",
+    finished_at: null,
+    trigger_id: null,
+    parent_id: null,
+    root_id: "run-1",
+    depth: 0,
+    ...overrides,
+  };
+}
+
 function teamTrigger(overrides: Partial<TeamTrigger> = {}): TeamTrigger {
   return {
     id: 1,
-    team_id: "atendimento",
-    name: "morning digest",
+    team_id: "financas",
+    name: "monthly reconciliation",
     enabled: 0,
     source: "cron",
-    cron: "0 9 * * *",
+    cron: "0 7 1 * *",
     timezone: "Europe/Lisbon",
     from_team: null,
     email_class: null,
-    request: "summarise the queue",
+    request: "reconcile last month",
     created_at: "2026-08-18T09:00:00Z",
     updated_at: "2026-08-18T09:00:00Z",
     ...overrides,
   };
 }
 
+interface Fake {
+  teams?: TeamView[];
+  runs?: TeamRun[];
+  triggers?: TeamTrigger[];
+  actions?: TeamAction[];
+  /** `GET /team-runs/{id}` — only live tasks are ever asked for. */
+  runViews?: Record<string, TeamRunView>;
+  next?: Record<number, TriggerNext>;
+}
+
 /**
- * The team routes, over mutable state — the `Council.test.tsx` `councilFetch`
- * shape: the page polls the run list, so a queue of one-shot answers runs out
- * halfway through the second tick.
+ * The console's routes, over mutable state — the `Council.test.tsx`
+ * `councilFetch` shape: the page polls the run list, so a queue of one-shot
+ * answers runs out halfway through the second tick.
  */
-function teamsFetch(
-  teams: TeamView[],
-  views: Record<string, TeamView>,
-  runs: TeamRun[],
-  triggers: TeamTrigger[],
-  next: Record<number, TriggerNext>,
-  opts: { onStartRun?: () => unknown } = {},
-): (path: string, init?: RequestInit) => Promise<unknown> {
-  return async (path, init) => {
+function teamsFetch(fake: Fake): (path: string, init?: RequestInit) => Promise<unknown> {
+  return async (path) => {
     if (path === "/agents") return [];
-    if (path === "/teams") return teams;
-    if (path === "/team-runs") return runs;
-    if (path === "/team-triggers") return triggers;
+    if (path === "/teams") return fake.teams ?? [];
+    if (path === "/team-runs") return fake.runs ?? [];
+    if (path === "/team-triggers") return fake.triggers ?? [];
+    if (path === "/team-actions") return fake.actions ?? [];
 
     const nextMatch = /^\/team-triggers\/(\d+)\/next$/.exec(path);
-    if (nextMatch !== null) {
-      const id = Number(nextMatch[1]);
-      return next[id] ?? { next: null, error: null };
-    }
+    if (nextMatch !== null) return fake.next?.[Number(nextMatch[1])] ?? { next: null, error: null };
 
-    const runsMatch = /^\/teams\/([^/]+)\/runs$/.exec(path);
-    if (runsMatch !== null && init?.method === "POST") {
-      if (opts.onStartRun !== undefined) return opts.onStartRun();
-      return { id: "new-run-1" };
-    }
-
-    const detailMatch = /^\/teams\/([^/]+)$/.exec(path);
-    if (detailMatch !== null) {
-      const view = views[detailMatch[1]];
-      if (view === undefined) throw new ApiRefusal(404, "not_found", "no such team");
-      return view;
-    }
+    const runMatch = /^\/team-runs\/([^/]+)$/.exec(path);
+    if (runMatch !== null) return fake.runViews?.[runMatch[1]];
 
     return undefined;
   };
 }
 
 /**
- * The page inside a two-route router, exactly like `Council.test.tsx`'s
+ * The console inside a one-route router, exactly like `Council.test.tsx`'s
  * `renderCouncil`: `renderApp` mounts the gate, the rail and its own live
  * queries around every assertion, which this machine cannot pay for more than
- * once. Only the case that proves the real tree registers both routes uses it,
- * at the end of this file.
+ * once. Only the case that proves the real tree registers the route uses it, at
+ * the end of this file.
  */
-async function renderTeams(initialPath: string) {
+async function renderTeams() {
   const queryClient = createAppQueryClient();
   const rootRoute = createRootRoute({ component: () => <Outlet /> });
   const routes = [
     createRoute({ getParentRoute: () => rootRoute, path: "/teams", component: Teams }),
-    createRoute({ getParentRoute: () => rootRoute, path: "/teams/$teamId", component: Teams }),
+    // Registered so the cards' links resolve; the bench itself is `Bench.test.tsx`.
+    createRoute({ getParentRoute: () => rootRoute, path: "/teams/$teamId", component: () => null }),
+    createRoute({ getParentRoute: () => rootRoute, path: "/team-runs/$runId", component: () => null }),
   ];
   const router = createRouter({
     routeTree: rootRoute.addChildren(routes),
-    history: createMemoryHistory({ initialEntries: [initialPath] }),
+    history: createMemoryHistory({ initialEntries: ["/teams"] }),
     defaultPreload: false,
   });
 
@@ -143,171 +162,198 @@ async function renderTeams(initialPath: string) {
   return { ...result, router, queryClient };
 }
 
-/** The `<section>` a panel's own heading belongs to, so an assertion can be scoped to one card. */
-async function panelFor(headingText: string): Promise<HTMLElement> {
-  const heading = await screen.findByRole("heading", { level: 2, name: headingText });
-  const panel = heading.closest("section");
-  if (panel === null) throw new Error(`no panel section found for heading "${headingText}"`);
-  return panel as HTMLElement;
-}
+/* -------------------------------------------------------------- the matrix -- */
 
-/**
- * Real time, past `ConfirmButton`'s 300ms dwell — the `Chats.test.tsx`
- * `afterDwell` idiom. A click landing inside the dwell reads as the tail of a
- * double-click and is swallowed rather than confirming.
- */
-function afterDwell(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 350));
-}
+describe("Teams - who works where", () => {
+  it("draws one cell for every (specialist, department) pair GET /teams returns", async () => {
+    // Three specialists across two departments, one of whom serves both — the
+    // fact the old page could not show at all, because a roster was only
+    // visible once you had opened the department it belonged to.
+    const financas = teamView({
+      id: "financas",
+      name: "Finanças",
+      director_agent_id: "controller",
+      members: ["controller", "auditor"],
+    });
+    const marketing = teamView({
+      id: "marketing",
+      name: "Marketing",
+      director_agent_id: "writer",
+      members: ["writer", "auditor"],
+    });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [financas, marketing] }));
 
-/* -------------------------------------------------------------- the list -- */
+    await renderTeams();
 
-describe("Teams - the list", () => {
-  it("lists every department with its director and its ceilings", async () => {
-    const teamA = teamView({ id: "atendimento", name: "Atendimento", director_agent_id: "ana", budget_usd: null });
-    const teamB = teamView({ id: "vendas", name: "Vendas", director_agent_id: "bruno", budget_usd: 25 });
-    daemon.apiFetch.mockImplementation(teamsFetch([teamA, teamB], {}, [], [], {}));
+    const matrix = await screen.findByRole("table");
+    // Three specialists (controller, auditor, writer) × two departments.
+    const cells = matrix.querySelectorAll(".teams-matrix-cell");
+    expect(cells).toHaveLength(6);
 
-    await renderTeams("/teams");
+    // And each cell says which of the three standings it is, in words.
+    expect(within(matrix).getAllByText("directs")).toHaveLength(2);
+    expect(within(matrix).getAllByText("on staff")).toHaveLength(2);
+    expect(within(matrix).getAllByText("not on staff")).toHaveLength(2);
 
-    expect(await screen.findByText("Atendimento")).toBeDefined();
-    expect(screen.getByText("Vendas")).toBeDefined();
-    expect(screen.getByText(/director: ana/)).toBeDefined();
-    expect(screen.getByText(/director: bruno/)).toBeDefined();
-    // Absent is not zero: a null ceiling never reads as $0.
-    expect(screen.getByText("no ceiling of its own")).toBeDefined();
-    expect(screen.queryByText("$0.00")).toBeNull();
+    // The headcount row counts the director whether or not the roster does.
+    expect(within(matrix).getAllByText("2")).toHaveLength(2);
+  });
+
+  it("keeps a column for a department with nobody in it rather than dropping it", async () => {
+    // The state a department is in between being created and being staffed —
+    // and the state that stops every task it is asked to run. It must not be
+    // the one column that disappears.
+    const staffed = teamView({ id: "financas", name: "Finanças", director_agent_id: "controller", members: ["controller"] });
+    const empty = teamView({
+      id: "vendas",
+      name: "Vendas",
+      director_agent_id: "",
+      members: [],
+      budget_usd: null,
+    });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [staffed, empty] }));
+
+    await renderTeams();
+
+    const matrix = await screen.findByRole("table");
+    expect(within(matrix).getByRole("columnheader", { name: "Vendas" })).toBeDefined();
+    // One specialist × two departments: the empty column is a column of
+    // "not on staff", not a missing column.
+    expect(matrix.querySelectorAll(".teams-matrix-cell")).toHaveLength(2);
+    expect(within(matrix).getByText("not on staff")).toBeDefined();
+    // Its headcount is zero, and zero is drawn.
+    expect(within(matrix).getByText("0")).toBeDefined();
   });
 });
 
-/* ------------------------------------------------------------ the detail -- */
+/* -------------------------------------------------------------- the cards -- */
 
-describe("Teams - the detail", () => {
-  it("shows a team's roster, its grants and its rules when one is opened", async () => {
+describe("Teams - the department card", () => {
+  it("draws occupancy as a bar and a per-task rule as a chip with no bar", async () => {
     const team = teamView({
-      id: "atendimento",
-      name: "Atendimento",
-      members: ["ana", "bruno"],
-      grants: [{ kind: "send_email", mode: "propose" }],
+      id: "financas",
+      name: "Finanças",
+      max_live_runs: 2,
+      max_open_actions: 5,
+      max_rounds: 4,
+      max_parallel: 2,
+      budget_usd: 5,
+      members: ["controller"],
     });
-    const rule = teamTrigger({ id: 1, team_id: "atendimento", name: "morning digest" });
-    daemon.apiFetch.mockImplementation(teamsFetch([team], { atendimento: team }, [], [rule], {}));
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [team] }));
 
-    await renderTeams("/teams/atendimento");
+    await renderTeams();
 
-    // The list row and the detail panel render the same team name at once —
-    // a bare `findByText` would throw "multiple elements".
-    const list = await screen.findByRole("list", { name: "Departments" });
-    expect(within(list).getByText("Atendimento")).toBeDefined();
-    const detail = await panelFor("Atendimento");
-    expect(within(detail).getByText("ana")).toBeDefined();
-    expect(within(detail).getByText("bruno")).toBeDefined();
+    const card = await screen.findByRole("article", { name: "Finanças" });
 
-    // The same grant selector appears in the "New department" form too — scope
-    // to the edit panel, or a bare `findByLabelText` throws "multiple elements".
-    const editPanel = await panelFor("Edit department");
-    const grantSelect = within(editPanel).getByLabelText("send_email grant") as HTMLSelectElement;
-    expect(grantSelect.value).toBe("propose");
+    // Occupancy: something can be in it, so it gets a bar.
+    expect(within(card).getByRole("img", { name: "at work: 0 of 2" })).toBeDefined();
+    expect(within(card).getByRole("img", { name: "waiting on you: 0 of 5" })).toBeDefined();
 
-    expect(await screen.findByText("morning digest")).toBeDefined();
+    // Per task: nothing is consuming these, so no bar exists for them at all.
+    expect(within(card).getByText("rounds")).toBeDefined();
+    expect(within(card).getByText("≤ 4")).toBeDefined();
+    expect(within(card).getByText("≤ $5.00")).toBeDefined();
+    expect(within(card).queryByRole("img", { name: /rounds/ })).toBeNull();
   });
 
-  it("renders a rule that does not fire on a clock as a sentence rather than an error", async () => {
-    const team = teamView({ id: "atendimento", name: "Atendimento" });
-    const rule = teamTrigger({
-      id: 7,
-      team_id: "atendimento",
-      name: "on demand",
-      source: "team_finished",
-      cron: null,
-      timezone: null,
-    });
+  it("never writes an absent budget ceiling as zero", async () => {
+    const team = teamView({ id: "financas", name: "Finanças", budget_usd: null });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [team] }));
+
+    await renderTeams();
+
+    const card = await screen.findByRole("article", { name: "Finanças" });
+    expect(within(card).getByText("no ceiling")).toBeDefined();
+    expect(within(card).queryByText("≤ $0.00")).toBeNull();
+  });
+
+  it("shows a live task with what it has spent against this department's per-task ceiling", async () => {
+    const team = teamView({ id: "financas", name: "Finanças", budget_usd: 5, max_live_runs: 1 });
+    const live = teamRun({ id: "run-1", team_id: "financas", state: "working", request: "reconcile October" });
     daemon.apiFetch.mockImplementation(
-      teamsFetch([team], { atendimento: team }, [], [rule], {
-        7: { next: null, error: "this rule does not fire on a clock" },
+      teamsFetch({
+        teams: [team],
+        runs: [live],
+        runViews: { "run-1": { ...live, items: [], cost_usd: 1.2 } },
       }),
     );
 
-    await renderTeams("/teams/atendimento");
+    await renderTeams();
+
+    const card = await screen.findByRole("article", { name: "Finanças" });
+    // "at work" is both the card's derived state badge and the occupancy
+    // meter's label — the badge is the one under test here.
+    expect(within(card).getByText("at work", { selector: ".ui-badge" })).toBeDefined();
+    expect(within(card).getByText("reconcile October")).toBeDefined();
+    // Money written as money — the one place in this pillar where a spend and
+    // the ceiling it runs against both exist.
+    expect(await within(card).findByRole("img", { name: "spent on this task: $1.20 of $5.00" })).toBeDefined();
+  });
+
+  it("names the armed routine it is reporting on rather than claiming to be the soonest", async () => {
+    const team = teamView({ id: "financas", name: "Finanças" });
+    const armed = teamTrigger({ id: 3, team_id: "financas", name: "monthly reconciliation", enabled: 1 });
+    const alsoArmed = teamTrigger({ id: 4, team_id: "financas", name: "weekly sweep", enabled: 1 });
+    daemon.apiFetch.mockImplementation(
+      teamsFetch({
+        teams: [team],
+        triggers: [armed, alsoArmed],
+        next: { 3: { next: "2026-09-01T07:00:00Z", error: null } },
+      }),
+    );
+
+    await renderTeams();
+
+    const card = await screen.findByRole("article", { name: "Finanças" });
+    expect(within(card).getByText("monthly reconciliation")).toBeDefined();
+    expect(within(card).getByText("+1")).toBeDefined();
+  });
+
+  it("renders a rule that does not fire on a clock as a sentence rather than an error", async () => {
+    const team = teamView({ id: "financas", name: "Finanças" });
+    const rule = teamTrigger({ id: 7, team_id: "financas", name: "on demand", source: "team_finished", enabled: 1, cron: null });
+    daemon.apiFetch.mockImplementation(
+      teamsFetch({
+        teams: [team],
+        triggers: [rule],
+        next: { 7: { next: null, error: "this rule does not fire on a clock" } },
+      }),
+    );
+
+    await renderTeams();
 
     expect(await screen.findByText("this rule does not fire on a clock")).toBeDefined();
-    expect(screen.queryByText(/fail/i)).toBeNull();
     expect(document.querySelector(".ui-badge-danger")).toBeNull();
   });
 });
 
-/* ---------------------------------------------------------- trigger rules -- */
+/* ------------------------------------------------------------ the header -- */
 
-describe("Teams - arming and disarming a rule", () => {
-  it("asks before arming a rule for a team with no ceiling, and never before disarming", async () => {
-    const team = teamView({ id: "atendimento", name: "Atendimento", budget_usd: null });
-    const disarmedRule = teamTrigger({ id: 1, team_id: "atendimento", name: "disarmed rule", enabled: 0 });
-    const armedRule = teamTrigger({ id: 2, team_id: "atendimento", name: "armed rule", enabled: 1 });
-    daemon.apiFetch.mockImplementation(
-      teamsFetch([team], { atendimento: team }, [], [disarmedRule, armedRule], {}),
-    );
+describe("Teams - the headline", () => {
+  it("counts departments and specialists, and never a spend the daemon does not report", async () => {
+    const financas = teamView({ id: "financas", name: "Finanças", director_agent_id: "controller", members: ["controller", "auditor"] });
+    const marketing = teamView({ id: "marketing", name: "Marketing", director_agent_id: "writer", members: ["writer"] });
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [financas, marketing] }));
 
-    await renderTeams("/teams/atendimento");
+    await renderTeams();
 
-    // Arming a no-ceiling team's rule is a ConfirmButton, and the dwell must
-    // pass for real before the confirm click is honoured.
-    const armButton = await screen.findByRole("button", { name: "Arm with no ceiling" });
-    fireEvent.click(armButton);
-    const confirmArm = await screen.findByRole("button", { name: "Arm it anyway" });
-    await afterDwell();
-    fireEvent.click(confirmArm);
-    await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/team-triggers/1/enable", {
-        method: "POST",
-        body: JSON.stringify({ enabled: true }),
-      });
-    });
-
-    // Disarming is always a plain button and fires on one click, with no
-    // interlock at all.
-    const disarmButton = await screen.findByRole("button", { name: "Disarm" });
-    fireEvent.click(disarmButton);
-    await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/team-triggers/2/enable", {
-        method: "POST",
-        body: JSON.stringify({ enabled: false }),
-      });
-    });
-  });
-});
-
-/* -------------------------------------------------------------- start run -- */
-
-describe("Teams - starting a run", () => {
-  it("names the specialist the núcleo says is missing when a run will not start", async () => {
-    const team = teamView({ id: "atendimento", name: "Atendimento" });
-    daemon.apiFetch.mockImplementation(
-      teamsFetch([team], { atendimento: team }, [], [], {}, {
-        onStartRun: () => {
-          throw new ApiRefusal(400, "bad_request", "`pesquisa` is on this team and not in the catalogue");
-        },
-      }),
-    );
-
-    await renderTeams("/teams/atendimento");
-
-    const startPanel = await panelFor("Start a run");
-    fireEvent.change(within(startPanel).getByLabelText("Request"), { target: { value: "find leads" } });
-    fireEvent.click(within(startPanel).getByRole("button", { name: "Start" }));
-
-    // The daemon's own sentence, verbatim — no toast and no modal anywhere.
-    expect(await within(startPanel).findByText(/pesquisa.*not in the catalogue/)).toBeDefined();
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.queryByRole("alertdialog")).toBeNull();
+    const headline = await screen.findByText(/2 departments · 3 specialists · none at work/);
+    // There is no per-department spend anywhere in the núcleo, so the console
+    // aggregates none — the only money on this page is a per-task ceiling on a
+    // card, and even that is a rule rather than a total. See the module header.
+    expect(headline.textContent).not.toMatch(/\$/);
+    expect(screen.queryByText(/spent/i)).toBeNull();
   });
 
-  it("says the run list is the newest hundred and not the whole history", async () => {
-    const team = teamView({ id: "atendimento", name: "Atendimento" });
-    daemon.apiFetch.mockImplementation(teamsFetch([team], { atendimento: team }, [], [], {}));
+  it("keeps the create form closed until it is asked for", async () => {
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [teamView()] }));
 
-    await renderTeams("/teams/atendimento");
+    await renderTeams();
 
-    expect(await screen.findByText(/newest hundred/i)).toBeDefined();
+    // The old page opened an eleven-field editor above a list nobody had read.
+    expect(await screen.findByRole("button", { name: "New department" })).toBeDefined();
+    expect(screen.queryByRole("heading", { level: 2, name: "New department" })).toBeNull();
   });
 });
 
@@ -316,12 +362,14 @@ describe("Teams - starting a run", () => {
 describe("Teams - the real route", () => {
   it("reaches the real /teams route with no placeholder left", async () => {
     const shared = daemonFetch(daemonState());
-    const teams = teamsFetch([], {}, [], [], {});
+    const teams = teamsFetch({});
     daemon.apiFetch.mockImplementation(async (path, init) => {
       if (
         path === "/teams" ||
         path.startsWith("/teams/") ||
         path === "/team-runs" ||
+        path.startsWith("/team-runs/") ||
+        path === "/team-actions" ||
         path === "/team-triggers" ||
         path.startsWith("/team-triggers/") ||
         path === "/agents"
