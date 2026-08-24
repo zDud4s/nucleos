@@ -8,10 +8,18 @@ import { cn } from "@/lib/cn"
 /*
   The registry's Tabs, in the shape `dialog.tsx` and `dropdown-menu.tsx` already
   established here: the primitive wrapped one-for-one, a `data-slot` on each
-  part, Tailwind through `cn` so a caller can override, and no behaviour of our
-  own. The value is Radix's roving focus and its `aria-controls` wiring — a set
-  of buttons and a conditional would look the same and would not be a tab list
-  to anything that is not a mouse.
+  part, `cn` so a caller can override, and no behaviour of our own. The value is
+  Radix's roving focus and its `aria-controls` wiring — a set of buttons and a
+  conditional would look the same and would not be a tab list to anything that
+  is not a mouse.
+
+  **The classes are `ui-tab*` and not Tailwind**, which is where this file
+  departs from its neighbours. `base.css` resets only `font` and `color` on a
+  `button` — never `background` — and this app's `tailwind.css` is trimmed, so a
+  trigger carrying no background of its own renders on the UA's light
+  `ButtonFace` with near-white inherited text: light boxes with unreadable
+  labels, on a dark page. It typechecked, every test passed, and it was visible
+  only in a screenshot. The rules live in `ui.css` and say the same at length.
 
   Covered by the `menu` surface of the CSP gate rather than by one of its own:
   Tabs uses the same roving-focus machinery as the menu and does not position
@@ -22,13 +30,7 @@ function Tabs({
   className,
   ...props
 }: React.ComponentProps<typeof TabsPrimitive.Root>) {
-  return (
-    <TabsPrimitive.Root
-      data-slot="tabs"
-      className={cn("flex flex-col gap-4", className)}
-      {...props}
-    />
-  )
+  return <TabsPrimitive.Root data-slot="tabs" className={cn("ui-tabs", className)} {...props} />
 }
 
 function TabsList({
@@ -36,14 +38,7 @@ function TabsList({
   ...props
 }: React.ComponentProps<typeof TabsPrimitive.List>) {
   return (
-    <TabsPrimitive.List
-      data-slot="tabs-list"
-      className={cn(
-        "inline-flex w-fit items-center gap-1 border-b border-border",
-        className
-      )}
-      {...props}
-    />
+    <TabsPrimitive.List data-slot="tabs-list" className={cn("ui-tab-list", className)} {...props} />
   )
 }
 
@@ -52,14 +47,7 @@ function TabsTrigger({
   ...props
 }: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
   return (
-    <TabsPrimitive.Trigger
-      data-slot="tabs-trigger"
-      className={cn(
-        "inline-flex items-center gap-2 whitespace-nowrap border-b-2 border-transparent px-3 py-2 text-sm text-text-muted transition-colors hover:text-text focus-visible:outline-2 focus-visible:outline-focus-ring disabled:pointer-events-none disabled:opacity-50 data-[state=active]:border-accent data-[state=active]:text-text",
-        className
-      )}
-      {...props}
-    />
+    <TabsPrimitive.Trigger data-slot="tabs-trigger" className={cn("ui-tab", className)} {...props} />
   )
 }
 
@@ -70,7 +58,7 @@ function TabsContent({
   return (
     <TabsPrimitive.Content
       data-slot="tabs-content"
-      className={cn("flex-1 outline-none", className)}
+      className={cn("ui-tab-panel", className)}
       {...props}
     />
   )

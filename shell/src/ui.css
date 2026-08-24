@@ -682,15 +682,15 @@
   overflow: visible;
 }
 
-.ui-spark-area {
-  fill: var(--accent-quiet);
-}
-
-.ui-spark-line {
-  fill: none;
-  stroke: var(--text-faint);
-  stroke-width: 1.25;
-  stroke-linejoin: round;
+/**
+ * One bar per day the window covers for this department.
+ *
+ * Quiet by default and the most recent one in the accent, because the question
+ * a pulse answers is "and now?". The accent is identity — which bar is the
+ * latest — and not a state, which is what tokens.css reserves it for.
+ */
+.ui-spark-bar {
+  fill: var(--border-strong);
 }
 
 .ui-spark-now {
@@ -708,4 +708,75 @@
 .ui-spark-label {
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+
+/* ------------------------------------------------------------------ tabs -- */
+
+/**
+ * Radix Tabs, dressed here rather than in `ui/vendor/tabs.tsx`.
+ *
+ * The registry ships those components styled with Tailwind, and every other
+ * vendored one in this directory gets away with it. Tabs did not, and the
+ * reason is worth writing down: `base.css` resets only `font` and `color` on
+ * `button`, never `background`. A trigger with no background of its own
+ * therefore renders on the UA's light `ButtonFace`, and `color: inherit` puts
+ * near-white text on it — light-grey boxes with invisible labels, on a dark
+ * page. It typechecked, every test passed, and it was only visible in a
+ * screenshot.
+ *
+ * So the tabs are styled the way the rest of the design system is: real classes
+ * on real tokens. `cn` still merges a caller's overrides on top.
+ */
+
+.ui-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.ui-tab-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.ui-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  /* Explicit, both of them. This is the bug above. */
+  background: none;
+  color: var(--text-muted);
+  border: 0;
+  /* The indicator, transparent until selected — so nothing moves on selection. */
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ui-tab:hover {
+  color: var(--text);
+}
+
+/* The accent as identity — which tab you are on — and not as a state. */
+.ui-tab[data-state="active"] {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.ui-tab:disabled {
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+.ui-tab-panel {
+  min-width: 0;
+  outline: none;
 }

@@ -454,6 +454,46 @@
   line-height: var(--leading-snug);
 }
 
+/**
+ * A placeholder is a hint, not content.
+ *
+ * `base.css` sets `color: inherit` on every control, which a placeholder
+ * inherits too — so the composer's hint rendered at full text weight and read
+ * as a request somebody had already typed.
+ */
+.teams-input::placeholder,
+.teams-textarea::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+/**
+ * A `select` with `multiple` is a listbox, and Chromium paints its interior
+ * from the UA sheet unless the appearance is given up. Left alone it is a light
+ * grey panel with light inherited text in the middle of a dark form — the same
+ * failure the tabs had, from the same cause: `base.css` resets `font` and
+ * `color` on controls and never `background`.
+ */
+.teams-select[multiple] {
+  appearance: none;
+  min-height: 7rem;
+  padding: var(--space-1);
+  background: var(--surface-sunken);
+  color: var(--text);
+}
+
+.teams-select[multiple] option {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+}
+
+.teams-select[multiple] option:checked {
+  background: var(--accent-quiet);
+  color: var(--text);
+}
+
 .teams-input:focus-visible,
 .teams-select:focus-visible,
 .teams-textarea:focus-visible {
