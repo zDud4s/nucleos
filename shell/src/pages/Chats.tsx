@@ -3,10 +3,25 @@ import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuRadioGroup,
+  DropdownMenuCheckboxItem,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "../ui/vendor/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../ui/vendor/dialog";
 import {
   CommandDialog,
   CommandEmpty,
@@ -15,9 +30,11 @@ import {
   CommandItem,
   CommandList,
 } from "../ui/vendor/command";
+import { ArrowUp, ChevronDown, ImagePlus, Plus, SquareCode } from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import {
   useArchiveChat,
+  useAssistantModels,
   useChatTranscript,
   useChats,
   useCreateChat,
@@ -39,10 +56,14 @@ import {
   usePostChatSeen,
   usePostChatTitle,
   useSendMessage,
+  useStartConversation,
   useStopTurn,
-  type Brain,
   type Attachment,
   type ChatSummary,
+  type Subagent,
+  useClearContext,
+  useDeniableTools,
+  useFreshContext,
   type Command,
   type Exchange,
   type Ask,
@@ -68,13 +89,11 @@ import { attachmentFrom, isPicture } from "../lib/picture";
 import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
 import {
-  Badge,
   Button,
   ConfirmButton,
   CostLine,
   ErrorNote,
   PageHeader,
-  Panel,
   RefusalNote,
   StaleNote,
   Teach,
@@ -119,6 +138,15 @@ export function Chats() {
    */
   const [railOpen, setRailOpen] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  /**
+   * The editor conversation being considered, if any.
+   *
+   * State and not a route, because there is nothing to route TO: an editor session is a file on
+   * this machine, not a conversation this app has opened, and it has no id here until somebody
+   * picks it up. Cleared the moment one is — by then it is a chat with a URL of its own.
+   */
+  const [pickingUp, setPickingUp] = useState<string | null>(null);
+  const navigate = useNavigate();
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
 
   /**
@@ -140,7 +168,9 @@ export function Chats() {
   }, []);
 
   return (
-    <>
+    /* The class that turns this route from a document into an application: see `.chats-app`, which
+       stops the shell scrolling the whole page and hands the height to the two columns below. */
+    <div className="chats-app">
       <PageHeader
         title="Chats"
         headline={headlineFor(rows, chats.data !== undefined)}
@@ -183,30 +213,44 @@ export function Chats() {
 
       <div className={railOpen ? "chats-layout" : "chats-layout chats-layout-alone"}>
         {railOpen && (
-          <ChatListPanel
-            rows={rows}
-            answered={chats.data !== undefined}
-            selected={chatId}
-            selectedLive={selectedLive}
-          />
+          /* The ground that tells the list from the thread. See `.chats-rail`: this used to be a
+             bordered panel beside another bordered panel, which is a settings screen, not a chat. */
+          <div className="chats-rail">
+            <ChatListPanel
+              rows={rows}
+              answered={chats.data !== undefined}
+              selected={chatId}
+              selectedLive={selectedLive}
+              pickingUp={pickingUp}
+              onPickUp={setPickingUp}
+              onNew={() => {
+                setPickingUp(null);
+                void navigate({ to: "/chats" });
+              }}
+            />
+          </div>
         )}
 
         <div className="chats-detail">
-          {chatId === null && (
-            <Teach title="Choose a conversation">
-              <p>
-                Nothing is open. Pick a conversation from the list, or start a new one — every turn
-                is a billed run, so nothing here is ever quietly deleted; ending a conversation only
-                archives it, and every turn it ever had stays readable.
-              </p>
-            </Teach>
+          {/* An editor conversation being considered wins the column: it is a decision in progress,
+              and putting it anywhere else would mean choosing it and then hunting for what happened. */}
+          {pickingUp !== null && (
+            <PickUpPreview
+              key={pickingUp}
+              sessionId={pickingUp}
+              onOpened={(opened) => {
+                setPickingUp(null);
+                void navigate({ to: `/chats/${opened}` });
+              }}
+            />
           )}
-          {chatId !== null && (
+          {pickingUp === null && chatId === null && <NothingOpen />}
+          {pickingUp === null && chatId !== null && (
             <ChatDetail key={chatId} chatId={chatId} summary={summary} transcript={transcript} />
           )}
         </div>
       </div>
-    </>
+    </div>
   );
 }
 
@@ -285,80 +329,146 @@ function ConversationPalette({
   );
 }
 
+/**
+ * One row of the sidebar, from either source.
+ *
+ * The list used to hold only conversations this app had opened; the ones still living in the editor
+ * were behind a "From the editor" button, in a list of their own. Two lists of the same thing is
+ * two places to look for a conversation you half remember — so they became one, and what tells them
+ * apart is a mark on the row rather than which door you went through.
+ */
+export type ListRow =
+  | { kind: "chat"; at: string | null; chat: ChatSummary }
+  | { kind: "editor"; at: string; session: IdeSession };
+
+/**
+ * Both sources, newest first, with the editor sessions this app has ALREADY picked up left out —
+ * those are conversations here now, and drawing them twice would offer to open a second copy of
+ * something already open.
+ */
+export function mergeRows(chats: ChatSummary[], sessions: IdeSession[]): ListRow[] {
+  const pickedUp = new Set(
+    chats.map((chat) => chat.ide_session_id).filter((id): id is string => id !== null),
+  );
+  const rows: ListRow[] = [
+    ...chats.map((chat) => ({ kind: "chat" as const, at: chat.last_activity, chat })),
+    ...sessions
+      .filter((session) => !pickedUp.has(session.session_id))
+      .map((session) => ({ kind: "editor" as const, at: session.last_activity, session })),
+  ];
+  // ISO-8601 sorts correctly as text, which is why the daemon sends it. A conversation nobody has
+  // spoken in has no activity at all and goes last rather than pretending to be old.
+  return [...rows].sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""));
+}
+
 function ChatListPanel({
   rows,
   answered,
   selected,
   selectedLive,
+  pickingUp,
+  onPickUp,
+  onNew,
 }: {
   rows: ChatSummary[];
   answered: boolean;
   selected: string | null;
   selectedLive: boolean;
+  pickingUp: string | null;
+  onPickUp: (sessionId: string) => void;
+  onNew: () => void;
 }) {
-  const [composerOpen, setComposerOpen] = useState(false);
-  const [editorOpen, setEditorOpen] = useState(false);
-  const navigate = useNavigate();
-
-  const opened = (chatId: string) => {
-    setComposerOpen(false);
-    setEditorOpen(false);
-    void navigate({ to: `/chats/${chatId}` });
-  };
+  // Watched, because one of these may be being typed into in the editor while it is on screen here.
+  const sessions = useIdeSessions(true, true);
+  const listed = mergeRows(rows, sessions.data ?? []);
 
   return (
-    <Panel
-      title="Conversations"
-      aside={
-        <>
-          <Button
-            variant="ghost"
-            aria-pressed={editorOpen}
-            onClick={() => {
-              setEditorOpen((v) => !v);
-              setComposerOpen(false);
-            }}
-          >
-            {editorOpen ? "Close" : "From the editor"}
-          </Button>
-          <Button
-            variant="approve"
-            aria-pressed={composerOpen}
-            onClick={() => {
-              setComposerOpen((v) => !v);
-              setEditorOpen(false);
-            }}
-          >
-            {composerOpen ? "Cancel" : "New conversation"}
-          </Button>
-        </>
-      }
-    >
-      {composerOpen && <NewChatForm onOpened={opened} />}
-      {editorOpen && <FromTheEditor onOpened={opened} />}
+    <>
+      <div className="chats-rail-actions">
+        {/* Opens an empty chat, and asks nothing. It used to unfold a form here — two radio buttons
+            for the model and a Start — which put a question before the only thing anybody came to
+            do. The model is a control in the box now, answerable while you type the first sentence
+            and changeable after it. */}
+        <button type="button" className="chats-rail-new" onClick={onNew}>
+          <Plus className="chats-rail-icon" aria-hidden="true" />
+          New conversation
+        </button>
+      </div>
 
-      {!answered && <p className="chats-loading">reading your conversations…</p>}
-      {answered && rows.length === 0 && (
-        <Teach title="No conversations yet">
-          <p>
-            Telegram&apos;s own conversations do not show up here — nothing has opened a row for them,
-            because the only door into this list is the button above. Start one to see it appear.
-          </p>
-        </Teach>
-      )}
-      {rows.length > 0 && (
-        <ul className="chats-list" aria-label="Conversations">
-          {rows.map((row) => (
-            <ChatRow
-              key={row.chat_id}
-              row={row}
-              active={row.chat_id === selected}
-              live={row.chat_id === selected && selectedLive}
-            />
-          ))}
-        </ul>
-      )}
-    </Panel>
+      <div className="chats-rail-scroll">
+        {!answered && <p className="chats-loading">reading your conversations…</p>}
+        {answered && listed.length === 0 && (
+          <Teach title="No conversations yet">
+            <p>
+              Telegram&apos;s own conversations do not show up here — nothing has opened a row for
+              them, because the only door into this list is the button above. Start one to see it
+              appear.
+            </p>
+          </Teach>
+        )}
+        {sessions.isError && <ErrorNote>your editor sessions could not be read</ErrorNote>}
+        {listed.length > 0 && (
+          /* One list, both kinds. See `mergeRows`: what tells them apart is the mark on the row. */
+          <ul className="chats-list" aria-label="Conversations">
+            {listed.map((entry) =>
+              entry.kind === "chat" ? (
+                <ChatRow
+                  key={entry.chat.chat_id}
+                  row={entry.chat}
+                  active={entry.chat.chat_id === selected}
+                  live={entry.chat.chat_id === selected && selectedLive}
+                />
+              ) : (
+                <EditorRow
+                  key={entry.session.session_id}
+                  session={entry.session}
+                  active={entry.session.session_id === pickingUp}
+                  onOpen={() => onPickUp(entry.session.session_id)}
+                />
+              ),
+            )}
+          </ul>
+        )}
+      </div>
+    </>
+  );
+}
+
+/**
+ * A conversation still living in the editor, in the same list as the rest.
+ *
+ * Told apart by a mark and by what pressing it does, not by being somewhere else. It is not a link:
+ * there is nothing at `/chats/...` to go to yet, and picking it up costs money and carries warnings
+ * — so it opens the preview beside the list rather than doing anything.
+ */
+function EditorRow({
+  session,
+  active,
+  onOpen,
+}: {
+  session: IdeSession;
+  active: boolean;
+  onOpen: () => void;
+}) {
+  const live = stillGoing(session.last_activity, Date.now());
+  return (
+    <li className={active ? "chats-row chats-row-active" : "chats-row"}>
+      <button
+        type="button"
+        className="chats-row-link chats-row-editor"
+        aria-pressed={active}
+        /* Spelled out: without it the mark, the name and "happening now" concatenate into one
+           run-on word, which is the same trap the nav items and the chat rows already document. */
+        aria-label={`In the editor: ${session.title ?? session.session_id}${
+          live ? ", happening now" : ""
+        }`}
+        onClick={onOpen}
+      >
+        <SquareCode className="chats-row-mark" aria-hidden="true" />
+        <span className="chats-row-title">{session.title ?? session.session_id}</span>
+        {live && <span className="chats-row-live" aria-hidden="true">now</span>}
+      </button>
+    </li>
   );
 }
 
@@ -372,13 +482,17 @@ function ChatListPanel({
  * of a sentence.
  */
 function chatRowLabel(row: ChatSummary, live: boolean): string {
-  const parts = [row.title ?? row.first_message ?? "New conversation", row.brain];
+  const parts = [row.title ?? row.first_message ?? "nothing said yet", row.brain];
   if (live) parts.push("thinking");
   if (row.waiting > 0) parts.push(`${row.waiting} unread`);
   return parts.join(", ");
 }
 
 function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; live: boolean }) {
+  // A conversation with no name AND nothing said in it has no name to show. Drawing "New
+  // conversation" made a dozen of them into a dozen identical rows; saying what is true of them
+  // instead makes them one visibly different kind of row you can skim past.
+  const said = row.title !== null || row.first_message !== null;
   return (
     <li className={active ? "chats-row chats-row-active" : "chats-row"}>
       <Link
@@ -387,9 +501,16 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
         aria-label={chatRowLabel(row, live)}
         aria-current={active ? "page" : undefined}
       >
-        <span className="chats-row-title">{row.title ?? row.first_message ?? "New conversation"}</span>
-        <Badge tone={row.brain === "local" ? "active" : "info"}>{row.brain}</Badge>
-        {row.cwd !== null && <span className="chats-row-cwd">{row.cwd}</span>}
+        {/* The name, and only the name.
+            The row used to carry the title, a coloured badge for the model, the working directory
+            and a count — four things per row, eleven rows, and the ones that never vary said
+            "cloud" and "c:\Projects\nucleos" over and over. A sidebar is for recognising a
+            conversation, and what you recognise it by is what it is called. The directory is on the
+            open conversation's own line and searchable in ⌘K; the model is on that line too. What
+            stays here is what CHANGES: it is thinking, or it is holding something for you. */}
+        <span className={said ? "chats-row-title" : "chats-row-title chats-row-unsaid"}>
+          {row.title ?? row.first_message ?? "nothing said yet"}
+        </span>
         {live && <span className="chats-row-live">thinking…</span>}
         {row.waiting > 0 && (
           <span className="chats-row-unread" aria-hidden="true">
@@ -403,52 +524,9 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
 
 /* ------------------------------------------------------ new conversation -- */
 
-function NewChatForm({ onOpened }: { onOpened: (chatId: string) => void }) {
-  const [brain, setBrain] = useState<Brain>("cloud");
-  const localModel = useLocalModel();
-  const create = useCreateChat();
-  const localUnavailable = localModel.data?.available === false;
-
-  return (
-    <form
-      className="chats-new"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (create.isPending) return;
-        create.mutate({ brain }, { onSuccess: (result) => onOpened(result.chat_id) });
-      }}
-    >
-      <fieldset className="chats-new-brain">
-        <legend>Answered by</legend>
-        <label>
-          <input
-            type="radio"
-            name="new-chat-brain"
-            checked={brain === "cloud"}
-            onChange={() => setBrain("cloud")}
-          />
-          Cloud
-        </label>
-        <label title={localUnavailable ? "no local model is available on this machine" : undefined}>
-          <input
-            type="radio"
-            name="new-chat-brain"
-            checked={brain === "local"}
-            disabled={localUnavailable}
-            onChange={() => setBrain("local")}
-          />
-          Local
-        </label>
-      </fieldset>
-
-      <Button type="submit" intent="go" disabled={create.isPending}>
-        Start
-      </Button>
-      {create.isError && <CreateRefusal error={create.error} />}
-    </form>
-  );
-}
-
+/* `NewChatForm` — two radio buttons for the model and a Start — stood here. The sidebar's button
+   opens an empty chat now and the model is chosen in the box, so there is no form to fill in
+   before saying the first thing. */
 /**
  * What continuing this session would carry, and whether that is more than the daemon will resume.
  *
@@ -541,80 +619,81 @@ function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
  * id, which is a thing only the cloud brain can do; a Local option here would be a button that
  * quietly starts a fresh conversation instead of the one you chose.
  */
-function FromTheEditor({ onOpened }: { onOpened: (chatId: string) => void }) {
+/**
+ * One editor conversation, and the decision to bring it here.
+ *
+ * Shown beside the list rather than inside it, because this is not a row's worth of information:
+ * what it carries, what the model would be handed, whether the folder even lets it touch a file,
+ * and what a resume would cost. A real pick-up of a session near the ceiling billed $1.72 for a
+ * one-word answer, and that is the sort of thing this panel exists to say beforehand.
+ */
+function PickUpPreview({
+  sessionId,
+  onOpened,
+}: {
+  sessionId: string;
+  onOpened: (chatId: string) => void;
+}) {
   const sessions = useIdeSessions(true, true);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  // Watched, not merely read: this is the one panel where the conversation on screen may be being
-  // typed into while somebody looks at it.
+  // Watched, not merely read: this may be being typed into while somebody looks at it.
   const said = useIdeConversation(sessionId, true);
   const create = useCreateChat();
+  const [model, setModel] = useState<string | null>(null);
+  const [effort, setEffort] = useState<string | null>(null);
   const chosen = (sessions.data ?? []).find((session) => session.session_id === sessionId);
 
+  if (chosen === undefined) {
+    return (
+      <div className="chats-editor-chosen">
+        {sessions.data === undefined && !sessions.isError ? (
+          <p className="chats-loading">reading your editor sessions…</p>
+        ) : (
+          <ErrorNote>that conversation is not on this machine any more</ErrorNote>
+        )}
+      </div>
+    );
+  }
+
   return (
-    <div className="chats-editor">
-      {sessions.data === undefined && !sessions.isError && (
-        <p className="chats-loading">reading your editor sessions…</p>
-      )}
-      {sessions.isError && <ErrorNote>your editor sessions could not be read</ErrorNote>}
-      {sessions.data?.length === 0 && (
-        <Teach title="No conversations from the editor">
-          <p>
-            Nothing on this machine has a transcript the daemon can read. These are the sessions the
-            CLI writes as you work in a project — have one there and it shows up here.
-          </p>
-        </Teach>
-      )}
+    <div className="chats-editor-chosen">
+      <div className="chats-editor-head">
+        <h2 className="chats-editor-name">{chosen.title ?? chosen.session_id}</h2>
+        <p className="chats-editor-where">{chosen.cwd}</p>
+      </div>
 
-      {(sessions.data ?? []).length > 0 && (
-        <ul className="chats-editor-list" aria-label="Conversations in the editor">
-          {(sessions.data ?? []).map((session: IdeSession) => (
-            <li key={session.session_id}>
-              <button
-                type="button"
-                className={
-                  session.session_id === sessionId
-                    ? "chats-editor-row chats-editor-row-open"
-                    : "chats-editor-row"
-                }
-                aria-pressed={session.session_id === sessionId}
-                onClick={() =>
-                  setSessionId((open) => (open === session.session_id ? null : session.session_id))
-                }
-              >
-                <span className="chats-editor-title">{session.title ?? session.session_id}</span>
-                <span className="chats-editor-where">{session.cwd}</span>
-                {/* Inside the button, so the mark is part of the row's own name and a screen reader
-                    hears "happening now" along with the title rather than after a silence. */}
-                {stillGoing(session.last_activity, Date.now()) && (
-                  <span className="chats-editor-live">happening now</span>
-                )}
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
+      <WhatItCarries view={said} />
+      <Sample view={said} />
+      {!chosen.tools && <NoTools session={chosen} />}
 
-      {chosen !== undefined && (
-        <div className="chats-editor-chosen">
-          <WhatItCarries view={said} />
-          <Sample view={said} />
-          {!chosen.tools && <NoTools session={chosen} />}
-          <Button
-            type="button"
-            intent="go"
-            disabled={create.isPending}
-            onClick={() =>
-              create.mutate(
-                { brain: "cloud", continueSession: chosen.session_id },
-                { onSuccess: (result) => onOpened(result.chat_id) },
-              )
-            }
-          >
-            Pick it up
-          </Button>
-          {create.isError && <CreateRefusal error={create.error} />}
-        </div>
-      )}
+      <div className="chats-editor-take">
+        <Button
+          type="button"
+          intent="go"
+          disabled={create.isPending}
+          onClick={() =>
+            create.mutate(
+              {
+                model: model ?? undefined,
+                effort: effort ?? undefined,
+                continueSession: chosen.session_id,
+              },
+              { onSuccess: (result) => onOpened(result.chat_id) },
+            )
+          }
+        >
+          Pick it up
+        </Button>
+        {/* The same question the front door asks, asked here for the same reason: it is answerable
+            before the first turn and expensive to change after it. */}
+        <ModelMenu model={model} disabled={create.isPending} onPick={setModel} />
+        <EffortMenu
+          model={model}
+          effort={effort}
+          disabled={create.isPending}
+          onPick={setEffort}
+        />
+      </div>
+      {create.isError && <CreateRefusal error={create.error} />}
     </div>
   );
 }
@@ -706,44 +785,216 @@ function ChatDetail({
   const stale = transcript.isError && transcript.data !== undefined;
 
   return (
-    <Panel title="Conversation">
+    /* No frame and no title. The page header already says Chats, and the conversation says its own
+       name two lines below — a panel captioned "Conversation" around a conversation was a third
+       label for a thing nobody was confused about, plus a border down both sides of the reading. */
+    <section className="chats-detail-inner">
       {summary !== undefined && (
         <div className="chats-detail-head">
           <TitleEditor chatId={chatId} title={summary.title} />
-          <ChatMeta chatId={chatId} brain={summary.brain} />
+          <ChatMeta chatId={chatId} />
         </div>
       )}
 
-      <Project chatId={chatId} />
+      {/* Everything that is a RECORD of the conversation scrolls; the head above and the box below
+          do not. One scrollbar used to move all three, so reading the middle of a long transcript
+          took the title, the model and the place you type off the screen together. */}
+      <div className="chats-scroll">
+        <Project chatId={chatId} />
 
-      {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
+        {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
-      {summary !== undefined && summary.ide_session_id !== null && (
-        <PickedUp view={pickedUp} handed={transcript.data?.handed ?? []} />
-      )}
+        {summary !== undefined && summary.ide_session_id !== null && (
+          <PickedUp view={pickedUp} handed={transcript.data?.handed ?? []} />
+        )}
 
-      {transcript.isError && transcript.data === undefined && <TranscriptError error={transcript.error} />}
-      {!transcript.isError && transcript.data === undefined && (
-        <p className="chats-loading">reading the conversation…</p>
-      )}
-      {transcript.data !== undefined && (
-        <Transcript
-          turns={transcript.data.turns}
-          precededBy={(pickedUp.data?.said ?? []).length > 0}
-          chatId={chatId}
+        {transcript.isError && transcript.data === undefined && (
+          <TranscriptError error={transcript.error} />
+        )}
+        {!transcript.isError && transcript.data === undefined && (
+          <p className="chats-loading">reading the conversation…</p>
+        )}
+        {transcript.data !== undefined && (
+          <Transcript
+            turns={transcript.data.turns}
+            precededBy={(pickedUp.data?.said ?? []).length > 0}
+            chatId={chatId}
+          />
+        )}
+        {/* Below the transcript and above the box, which is where these words are in time: said
+            after everything above them, and not yet said at all. */}
+        {/* Above what is waiting to be said, because this is what everything else is waiting ON:
+            a turn is held while a question stands, and the queue behind it cannot move until it is
+            answered. */}
+        <Asking asks={transcript.data?.asks ?? []} chatId={chatId} />
+        <Changed chatId={chatId} />
+        <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
+      </div>
+
+      <Composer chatId={chatId} chat={summary} />
+    </section>
+  );
+}
+
+/** Morning, afternoon or evening, as a pure function so it can be asserted without a clock. */
+export function greetingFor(hour: number): string {
+  if (hour < 5) return "Still up";
+  if (hour < 12) return "Good morning";
+  if (hour < 19) return "Good afternoon";
+  return "Good evening";
+}
+
+/**
+ * The front door: nothing open, so the page IS the box.
+ *
+ * It used to be a paragraph explaining that you should pick something from the list. That is a
+ * sign pointing at a door rather than a door — every chat application opens on the thing you type
+ * into, and choosing a model before you are allowed to type is a question asked in the wrong order.
+ * Cloud answers unless somebody says otherwise, which is what the daemon defaults to anyway.
+ */
+function NothingOpen() {
+  const navigate = useNavigate();
+  const start = useStartConversation();
+
+  return (
+    <div className="chats-front">
+      <div className="chats-front-inner">
+        <h2 className="chats-front-greeting">{greetingFor(new Date().getHours())}</h2>
+        <StartBox
+          pending={start.isPending}
+          onSay={(model, effort, text, images) =>
+            start.mutate(
+              { model: model ?? undefined, effort: effort ?? undefined, text, images },
+              { onSuccess: (opened) => void navigate({ to: `/chats/${opened.chat_id}` }) },
+            )
+          }
         />
-      )}
-      {/* Below the transcript and above the box, which is where these words are in time: said
-          after everything above them, and not yet said at all. */}
-      {/* Above what is waiting to be said, because this is what everything else is waiting ON:
-          a turn is held while a question stands, and the queue behind it cannot move until it is
-          answered. */}
-      <Asking asks={transcript.data?.asks ?? []} chatId={chatId} />
-      <Changed chatId={chatId} />
-      <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
+        {start.isError && <CreateRefusal error={start.error} />}
+        <p className="chats-front-note">
+          Every turn is a billed run. Nothing here is ever quietly deleted — ending a conversation
+          only archives it, and every turn it ever had stays readable.
+        </p>
+      </div>
+    </div>
+  );
+}
 
-      <Composer chatId={chatId} />
-    </Panel>
+/**
+ * The box on the front door.
+ *
+ * Deliberately not the `Composer`: that one reaches into an open conversation for files to mention
+ * and commands to run, and neither exists yet. What it DOES carry is everything that is answerable
+ * before the first word — which model, and what to send with it. Those are held here as state and
+ * written when the conversation is opened, because there is nothing yet to write them to.
+ */
+function StartBox({
+  pending,
+  onSay,
+}: {
+  pending: boolean;
+  onSay: (
+    model: string | null,
+    effort: string | null,
+    text: string,
+    images: Attachment[],
+  ) => void;
+}) {
+  const [text, setText] = useState("");
+  const [model, setModel] = useState<string | null>(null);
+  const [effort, setEffort] = useState<string | null>(null);
+  const [attached, setAttached] = useState<Attachment[]>([]);
+  const sayable = text.trim() !== "" && !pending;
+
+  const attach = async (files: FileList | File[] | null) => {
+    const pictures = Array.from(files ?? []).filter(isPicture);
+    if (pictures.length === 0) return;
+    const read = await Promise.all(pictures.map(attachmentFrom));
+    setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
+  };
+
+  const say = () => {
+    if (!sayable) return;
+    onSay(model, effort, text.trim(), attached);
+  };
+
+  return (
+    <form
+      className="chats-composer-box chats-front-box"
+      onSubmit={(event) => {
+        event.preventDefault();
+        say();
+      }}
+    >
+      {attached.length > 0 && (
+        <ul className="chats-attached" aria-label="Attached pictures">
+          {attached.map((picture, index) => (
+            <li key={`start-attached-${index}`} className="chats-attached-item">
+              <img
+                className="chats-attached-thumb"
+                alt={`attached picture ${index + 1}`}
+                src={`data:${picture.media_type};base64,${picture.data}`}
+              />
+              <button
+                type="button"
+                className="chats-attached-drop"
+                aria-label={`Remove attached picture ${index + 1}`}
+                onClick={() => setAttached((was) => was.filter((_, at) => at !== index))}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <textarea
+        className="chats-composer-text"
+        aria-label="Message"
+        placeholder="Say something…"
+        rows={1}
+        value={text}
+        onPaste={(event) => {
+          const pictures = Array.from(event.clipboardData.files).filter(isPicture);
+          if (pictures.length === 0) return;
+          event.preventDefault();
+          void attach(pictures);
+        }}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" || event.shiftKey) return;
+          event.preventDefault();
+          say();
+        }}
+      />
+      <div className="chats-composer-actions">
+        <label className="chats-attach" title="Attach a picture">
+          <ImagePlus className="chats-tool-icon" aria-hidden="true" />
+          <span className="chats-offscreen">Attach a picture</span>
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            aria-label="Attach a picture"
+            onChange={(event) => {
+              void attach(event.target.files);
+              event.target.value = "";
+            }}
+          />
+        </label>
+        {/* Held as state, not written anywhere: there is no conversation to write it to until the
+            first message opens one, and it travels with that message. */}
+        <ModelMenu model={model} disabled={pending} onPick={setModel} />
+        <EffortMenu model={model} effort={effort} disabled={pending} onPick={setEffort} />
+        <span className="chats-composer-gap" />
+        <button
+          type="submit"
+          className="chats-send"
+          aria-label={pending ? "Opening the conversation" : "Send"}
+          disabled={!sayable}
+        >
+          <ArrowUp className="chats-send-icon" aria-hidden="true" />
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -781,36 +1032,69 @@ function ChatDetail({
  * turning a deliberate two-step into a one-click irreversible action. Rendered as plain
  * content, the menu stays open and both clicks land.
  */
-function ChatMeta({ chatId, brain }: { chatId: string; brain: Brain }) {
+function ChatMeta({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
   const cwd = project.data?.cwd ?? null;
   const tools = project.data?.tools ?? false;
-  const planning = project.data?.planning ?? false;
+  // Held HERE and not inside `ChatHelpers`, because a dialog rendered inside `DropdownMenuContent`
+  // unmounts the moment the menu closes — which the menu does on the very click that opens it. The
+  // item lives in the menu; the dialog is its sibling.
+  const [helpers, setHelpers] = useState(false);
+  const [instructions, setInstructions] = useState(false);
+  const row = useChatRow(chatId);
+  const helperCount = row?.agents.length ?? 0;
+  const instructed = (row?.system_prompt ?? "") !== "";
 
   return (
     <div className="chats-meta">
       <p className="chats-meta-line">
         {/* The directory is named here only when it is settled. While it is unknown, or
             while it is a state that needs teaching, `Project` below says so in full — a
-            summary line is the wrong place to explain something. */}
+            summary line is the wrong place to explain something.
+            The model and plan-only were here too; both moved into the box, where the words
+            they govern are being written. What is left is where this runs. */}
         {cwd !== null && tools && <span className="chats-meta-where">{cwd}</span>}
-        <span className="chats-meta-brain">{brain}</span>
-        {planning && <span className="chats-meta-planning">plan only</span>}
       </p>
 
       <DropdownMenu>
         <DropdownMenuTrigger className="chats-meta-more" aria-label="Conversation settings">
           ⋯
         </DropdownMenuTrigger>
+        {/* One thing left in it, and it is the one thing that must not be a menu ITEM: see
+            `ArchiveControl`, whose two-click interlock a menu item would collapse. */}
         <DropdownMenuContent align="end" className="chats-meta-menu">
-          <DropdownMenuLabel>Which model answers</DropdownMenuLabel>
-          <BrainPicker chatId={chatId} brain={brain} />
+          {/* Settings, not gestures. The model and the effort sit in the box because they are
+              changed while writing the message they govern; these three are decided once and left
+              alone, so they belong behind the ⋯ rather than in a row you look at all day. */}
+          <ChatReach chatId={chatId} />
+          <ChatCeiling chatId={chatId} />
+          <ChatFallback chatId={chatId} />
+          {/* A menu ITEM and not a submenu: helpers are written, not picked. Three text fields and
+              two selects do not fit in a menu — and a Radix menu closes on the first keystroke that
+              looks like typeahead, which is every keystroke. */}
+          <DropdownMenuItem onSelect={() => setHelpers(true)}>
+            Helpers
+            <span className="chats-tool-why">{helperCount === 0 ? "none" : `${helperCount}`}</span>
+          </DropdownMenuItem>
+          {/* Also written rather than picked, and for the same reason a dialog. */}
+          <DropdownMenuItem onSelect={() => setInstructions(true)}>
+            Standing instructions
+            <span className="chats-tool-why">{instructed ? "set" : "none"}</span>
+          </DropdownMenuItem>
+          <ChatDenials chatId={chatId} />
           <DropdownMenuSeparator />
-          <Planning chatId={chatId} />
+          {/* Content and not items, like `ArchiveControl` below: the stronger of the two is a
+              `ConfirmButton`, whose two-click interlock a menu item would collapse into one. */}
+          <ContextControls chatId={chatId} />
           <DropdownMenuSeparator />
+          {/* The one thing that must not be a menu ITEM: see `ArchiveControl`, whose two-click
+              interlock a menu item would collapse. */}
           <ArchiveControl chatId={chatId} />
         </DropdownMenuContent>
       </DropdownMenu>
+
+      <ChatHelpers chatId={chatId} open={helpers} onOpenChange={setHelpers} />
+      <ChatInstructions chatId={chatId} open={instructions} onOpenChange={setInstructions} />
     </div>
   );
 }
@@ -1007,24 +1291,82 @@ function TranscriptError({ error }: { error: unknown }) {
 
 /* ----------------------------------------------------------------- title -- */
 
+/**
+ * The conversation's name, and the way to change it.
+ *
+ * A name at rest; a field once you ask for one. It was a permanent input and two buttons before,
+ * open on every visit whether anybody was renaming anything or not — a form standing on top of the
+ * thing you came to read, costing a row of height every time.
+ *
+ * The draft is seeded when the editor opens rather than held from the first render. A conversation
+ * can be renamed from elsewhere — the daemon names one by itself — and a draft that was set once at
+ * mount would quietly write a stale name back over it.
+ */
 function TitleEditor({ chatId, title }: { chatId: string; title: string | null }) {
-  const [draft, setDraft] = useState(title ?? "");
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
   const patch = usePatchChat();
   const auto = usePostChatTitle();
+
+  const close = () => setEditing(false);
+  const rename = () => {
+    if (draft.trim() === "") return;
+    patch.mutate({ chatId, title: draft.trim() }, { onSuccess: close });
+  };
+
+  if (!editing) {
+    return (
+      <div className="chats-title">
+        <button
+          type="button"
+          className="chats-title-name"
+          /* Spelled out, because the visible text is the NAME and a button whose whole accessible
+             name is the conversation's title announces nothing about what pressing it does. */
+          aria-label={`Rename this conversation — currently ${title ?? "unnamed"}`}
+          onClick={() => {
+            setDraft(title ?? "");
+            setEditing(true);
+          }}
+        >
+          {title ?? "New conversation"}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="chats-title">
       <input
         className="chats-title-input"
         aria-label="Conversation title"
+        autoFocus
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
+        /* Enter commits and Escape abandons, which is what an in-place rename does everywhere.
+           Without them the only way out of the field would be the mouse. */
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            rename();
+          }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            close();
+          }
+        }}
       />
-      <Button disabled={draft.trim() === "" || patch.isPending} onClick={() => patch.mutate({ chatId, title: draft.trim() })}>
+      <Button disabled={draft.trim() === "" || patch.isPending} onClick={rename}>
         Rename
       </Button>
-      <Button variant="ghost" disabled={auto.isPending} onClick={() => auto.mutate(chatId)}>
+      <Button
+        variant="ghost"
+        disabled={auto.isPending}
+        onClick={() => auto.mutate(chatId, { onSuccess: close })}
+      >
         Name it locally
+      </Button>
+      <Button variant="ghost" onClick={close}>
+        Cancel
       </Button>
       {patch.isError && <TitleRefusal error={patch.error} />}
       {auto.isError && <AutoTitleRefusal error={auto.error} />}
@@ -1055,38 +1397,202 @@ function AutoTitleRefusal({ error }: { error: unknown }) {
   );
 }
 
-/* ----------------------------------------------------------------- brain -- */
+/* ----------------------------------------------------------------- model -- */
 
-function BrainPicker({ chatId, brain }: { chatId: string; brain: Brain }) {
-  const patch = usePatchChat();
+/**
+ * Which model answers.
+ *
+ * The list comes from the daemon (`GET /assistant/models`) and is never written here. Neither agent
+ * CLI can enumerate its own models, so any list is somebody's assertion — and an assertion written
+ * into the window is one that goes stale where nobody who can fix it will look.
+ *
+ * `""` is the unpinned state: follow whatever the daemon is configured with. It is a real state and
+ * it is named in the menu rather than left as an empty selection, because a control showing nothing
+ * selected reads as broken.
+ */
+function ModelMenu({
+  model,
+  onPick,
+  disabled = false,
+  children,
+}: {
+  model: string | null;
+  onPick: (model: string | null) => void;
+  disabled?: boolean;
+  children?: React.ReactNode;
+}) {
+  const catalogue = useAssistantModels();
   const localModel = useLocalModel();
   const localUnavailable = localModel.data?.available === false;
 
+  const choices = catalogue.data?.choices ?? [];
+  const chosen = choices.find((choice) => choice.id === model);
+  // Unpinned shows the configured model's name, not a blank. Falling back to `model` covers the one
+  // case the catalogue cannot explain: a conversation pinned to a name since removed from the
+  // config. Showing the stale name is right — it is what the next turn will actually run.
+  const shown = chosen?.label ?? model ?? catalogue.data?.configured ?? "model";
+
   return (
-    <div className="chats-brain">
-      <Button
-        variant={brain === "cloud" ? "approve" : "ghost"}
-        aria-pressed={brain === "cloud"}
-        disabled={patch.isPending}
-        onClick={() => patch.mutate({ chatId, brain: "cloud" })}
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        className="chats-tool"
+        /* Spelled out: the visible text is a model's NAME, and a control whose whole accessible
+           name is "Sonnet 5" announces a fact rather than something you can press. */
+        aria-label={`Answered by ${shown} — change the model`}
+        disabled={disabled}
       >
-        Cloud
-      </Button>
-      <Button
-        variant={brain === "local" ? "approve" : "ghost"}
-        aria-pressed={brain === "local"}
-        disabled={patch.isPending || localUnavailable}
-        title={localUnavailable ? "no local model is available on this machine" : undefined}
-        onClick={() => patch.mutate({ chatId, brain: "local" })}
-      >
-        Local
-      </Button>
-      {patch.isError && <BrainRefusal error={patch.error} />}
-    </div>
+        {shown}
+        <ChevronDown className="chats-tool-caret" aria-hidden="true" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="chats-meta-menu">
+        <DropdownMenuLabel>Which model answers</DropdownMenuLabel>
+        {catalogue.isError && (
+          <DropdownMenuItem disabled>the núcleo did not say which models it has</DropdownMenuItem>
+        )}
+        <DropdownMenuRadioGroup
+          value={model ?? ""}
+          onValueChange={(picked) => onPick(picked === "" ? null : picked)}
+        >
+          {catalogue.data !== undefined && (
+            <DropdownMenuRadioItem value="">
+              Whatever is configured
+              <span className="chats-tool-why">{catalogue.data.configured}</span>
+            </DropdownMenuRadioItem>
+          )}
+          {choices.map((choice) => (
+            <DropdownMenuRadioItem
+              key={choice.id}
+              value={choice.id}
+              /* A local model can be configured and still not be running. The daemon lists it
+                 because it is named; this is the separate question of whether it answers. */
+              disabled={choice.brain === "local" && localUnavailable}
+            >
+              {choice.label}
+              {choice.brain === "local" && (
+                <span className="chats-tool-why">
+                  {localUnavailable ? "not running on this machine" : "on this machine"}
+                </span>
+              )}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+        {children}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
-function BrainRefusal({ error }: { error: unknown }) {
+/**
+ * How hard the model is asked to think.
+ *
+ * Its own control beside the model's rather than a submenu inside it. They are two decisions and a
+ * person changes them separately — most often the effort, on a model they already chose — and a
+ * dial buried one level down is one you have to remember is there.
+ *
+ * The levels are the CHOSEN model's own, which is why this reads the catalogue instead of taking a
+ * list: they genuinely differ. `claude-haiku-4-5` takes no effort at all; Opus 4.6 takes `max` but
+ * not `xhigh`. A shared list would offer levels that come back as an error.
+ *
+ * A model with no dial gets the button disabled rather than removed. Hiding it would make the row
+ * jump as you switch models, and would read as a feature that is missing rather than one that does
+ * not apply here.
+ */
+function EffortMenu({
+  model,
+  effort,
+  onPick,
+  disabled = false,
+}: {
+  model: string | null;
+  effort: string | null;
+  onPick: (effort: string | null) => void;
+  disabled?: boolean;
+}) {
+  const catalogue = useAssistantModels();
+  const chosen = catalogue.data?.choices.find((choice) => choice.id === model);
+  // The union stands in only while nothing is pinned — the front door, where the model question is
+  // still open. Never empty merely because a fetch is slow: a control greyed out by latency reads
+  // as unavailable rather than as loading.
+  const levels = chosen?.efforts ?? catalogue.data?.efforts ?? [];
+  const hasDial = levels.length > 0;
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        className="chats-tool"
+        /* Named for the setting and not for the behaviour. "Thinking at high…" was the first
+           wording and it collided with the transcript's own rule that a turn which did not think
+           offers no `thinking` control — two unrelated things answering to one word is how a
+           person clicks the wrong one. */
+        aria-label={
+          hasDial
+            ? `Effort: ${effort ?? "the model's own default"} — change it`
+            : `${chosen?.label ?? "this model"} has no effort setting`
+        }
+        disabled={disabled || !hasDial}
+      >
+        {hasDial ? (effort ?? "effort") : "no effort"}
+        <ChevronDown className="chats-tool-caret" aria-hidden="true" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="chats-meta-menu">
+        <DropdownMenuLabel>How hard it thinks</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={effort ?? ""}
+          onValueChange={(picked) => onPick(picked === "" ? null : picked)}
+        >
+          <DropdownMenuRadioItem value="">the CLI's own default</DropdownMenuRadioItem>
+          {levels.map((level) => (
+            <DropdownMenuRadioItem key={level} value={level}>
+              {level}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/**
+ * Both controls, wired to a conversation that already exists.
+ *
+ * Split from the menus themselves because the front door asks the same two questions with no chat
+ * to answer them against: there, the answers are state until the first message creates something to
+ * write them to.
+ */
+function ChatModelControls({
+  chatId,
+  model,
+  effort,
+}: {
+  chatId: string;
+  model: string | null;
+  effort: string | null;
+}) {
+  const patch = usePatchChat();
+  return (
+    <>
+      <ModelMenu
+        model={model}
+        disabled={patch.isPending}
+        onPick={(picked) => patch.mutate({ chatId, model: picked })}
+      >
+        {patch.isError && <ModelRefusal error={patch.error} />}
+      </ModelMenu>
+      <EffortMenu
+        model={model}
+        effort={effort}
+        disabled={patch.isPending}
+        onPick={(picked) => patch.mutate({ chatId, effort: picked })}
+      />
+    </>
+  );
+}
+
+/* `BrainPicker` — two buttons named Cloud and Local — stood here, then `BrainMenu`, which offered
+   the same two words as a menu. Both asked which ROUTE answered; the pair above asks which MODEL
+   and how hard, and the route follows from the answer. */
+
+function ModelRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — the model was not changed</ErrorNote>;
   return (
     <RefusalNote
@@ -1094,6 +1600,593 @@ function BrainRefusal({ error }: { error: unknown }) {
       sentences={{ conflict: "a turn is in flight right now — the model cannot change until it settles" }}
     />
   );
+}
+
+/* ------------------------------------------------- reach, ceiling, fallback -- */
+
+/** The conversation this control is about, or undefined while the list is still being read. */
+function useChatRow(chatId: string): ChatSummary | undefined {
+  const chats = useChats();
+  return (chats.data ?? []).find((row) => row.chat_id === chatId);
+}
+
+/**
+ * Which folders this conversation may reach beyond the one it runs in.
+ *
+ * Checkboxes over folders the editor already knows about, rather than a box to type a path into.
+ * Every path here is one a real session ran in, so it is absolute and it exists — the two things
+ * the daemon refuses a PATCH for. A text field would put the person in a position to fail a
+ * validation they cannot see the rule for.
+ *
+ * A folder granted and later gone stays checked and stays listed, because it is what the row says
+ * and hiding it would make the setting unreachable to turn off.
+ */
+function ChatReach({ chatId }: { chatId: string }) {
+  const row = useChatRow(chatId);
+  const patch = usePatchChat();
+  // Not watched: these are wanted as a list of folders, and that does not need re-reading.
+  const sessions = useIdeSessions(true);
+
+  const granted = row?.extra_dirs ?? [];
+  const known = Array.from(
+    new Set([...(sessions.data ?? []).map((session) => session.cwd), ...granted]),
+  ).filter((folder) => folder !== row?.cwd);
+
+  const toggle = (folder: string, on: boolean) => {
+    const next = on ? [...granted, folder] : granted.filter((path) => path !== folder);
+    patch.mutate({ chatId, extra_dirs: next });
+  };
+
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger disabled={known.length === 0}>
+        Also reaches
+        <span className="chats-tool-why">
+          {known.length === 0
+            ? "no other folders known"
+            : granted.length === 0
+              ? "only its own folder"
+              : `${granted.length} more`}
+        </span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="chats-meta-menu">
+        <DropdownMenuLabel>Folders its tools may open</DropdownMenuLabel>
+        {known.map((folder) => (
+          <DropdownMenuCheckboxItem
+            key={folder}
+            checked={granted.includes(folder)}
+            disabled={patch.isPending}
+            /* Radix closes the menu on select; several folders are usually granted together, so
+               the default is fought here rather than making somebody reopen it each time. */
+            onSelect={(event) => event.preventDefault()}
+            onCheckedChange={(on) => toggle(folder, on === true)}
+          >
+            {folder}
+          </DropdownMenuCheckboxItem>
+        ))}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+/** The amounts offered as a ceiling. Presets rather than a number field: this is a guard rail
+ *  somebody sets in a second, and a text input invites a typo that reads as a refused turn. */
+const CEILINGS = [0.25, 0.5, 1, 2, 5, 10];
+
+/**
+ * The most one turn of this conversation may spend.
+ *
+ * The copy says "per turn" everywhere and never "budget", because the CLI's flag bounds one
+ * invocation and the daemon spawns one per turn. Ten turns at the ceiling cost ten times it, and a
+ * control that let somebody believe otherwise would be lying about money.
+ */
+function ChatCeiling({ chatId }: { chatId: string }) {
+  const row = useChatRow(chatId);
+  const patch = usePatchChat();
+  const ceiling = row?.turn_budget_usd ?? null;
+
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        Spends at most
+        <span className="chats-tool-why">
+          {ceiling === null ? "no ceiling" : `$${ceiling.toFixed(2)} a turn`}
+        </span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="chats-meta-menu">
+        <DropdownMenuLabel>Per turn, not per conversation</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={ceiling === null ? "" : String(ceiling)}
+          onValueChange={(picked) =>
+            patch.mutate({ chatId, turn_budget_usd: picked === "" ? null : Number(picked) })
+          }
+        >
+          <DropdownMenuRadioItem value="">no ceiling</DropdownMenuRadioItem>
+          {CEILINGS.map((amount) => (
+            <DropdownMenuRadioItem key={amount} value={String(amount)}>
+              ${amount.toFixed(2)} a turn
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+/**
+ * Who answers when the chosen model is overloaded or unavailable.
+ *
+ * One name, where the daemon accepts a list. A single fallback is the whole of what anybody has
+ * asked for, and an ordered list is a control with drag handles in it — the API keeps the door open
+ * for the day that is worth building.
+ */
+function ChatFallback({ chatId }: { chatId: string }) {
+  const row = useChatRow(chatId);
+  const patch = usePatchChat();
+  const catalogue = useAssistantModels();
+
+  const named = (row?.fallback_model ?? "").split(",").filter((name) => name !== "");
+  const choices = (catalogue.data?.choices ?? []).filter(
+    (choice) => choice.brain === "cloud" && choice.id !== row?.model,
+  );
+  const shown = catalogue.data?.choices.find((choice) => choice.id === named[0]);
+
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger disabled={choices.length === 0}>
+        Falls back to
+        <span className="chats-tool-why">{shown?.label ?? named[0] ?? "nobody"}</span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="chats-meta-menu">
+        <DropdownMenuLabel>When the model is overloaded</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={named[0] ?? ""}
+          onValueChange={(picked) =>
+            patch.mutate({ chatId, fallback_model: picked === "" ? [] : [picked] })
+          }
+        >
+          <DropdownMenuRadioItem value="">
+            nobody
+            <span className="chats-tool-why">the turn fails instead</span>
+          </DropdownMenuRadioItem>
+          {choices.map((choice) => (
+            <DropdownMenuRadioItem key={choice.id} value={choice.id}>
+              {choice.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+/* ------------------------------------------- instructions, denials, context -- */
+
+/**
+ * Standing instructions for one conversation, appended to the model's own system prompt.
+ *
+ * Appended and never substituted, which is the whole reason this is safe to expose. The flag that
+ * REPLACES the system prompt exists and is deliberately unreachable from here: it would drop the
+ * tool descriptions and the safety framing with it, and a conversation that lost those would read
+ * as one whose model had quietly got worse.
+ *
+ * A draft with an explicit Save, like the helpers, and for the same reason: this text goes out on
+ * every turn, and a patch per keystroke would send dozens of half-written sentences as though each
+ * were somebody's finished instruction.
+ */
+function ChatInstructions({
+  chatId,
+  open,
+  onOpenChange,
+}: {
+  chatId: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const row = useChatRow(chatId);
+  const patch = usePatchChat();
+  const [draft, setDraft] = useState("");
+
+  const saved = row?.system_prompt;
+  // Seeded once per opening, guarded by the ref for the reason `ChatHelpers` gives: the list behind
+  // this is polled, so an effect that merely depended on it would take back what was being typed.
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!open) {
+      seeded.current = false;
+      return;
+    }
+    if (seeded.current || saved === undefined) return;
+    seeded.current = true;
+    setDraft(saved ?? "");
+  }, [open, saved]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="chats-helpers">
+        <DialogHeader>
+          <DialogTitle>Standing instructions</DialogTitle>
+          <DialogDescription>
+            Added to what this conversation's model is already told — on every turn, not just the
+            first. Nothing here replaces the model's own instructions.
+          </DialogDescription>
+        </DialogHeader>
+
+        <label className="chats-helper-field">
+          <span>Instructions</span>
+          <textarea
+            rows={8}
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="Answer in European Portuguese. Prefer the smallest correct change."
+          />
+        </label>
+
+        <DialogFooter>
+          <Button
+            variant="approve"
+            disabled={patch.isPending}
+            onClick={() =>
+              patch.mutate(
+                // Blank goes as an explicit `null`. `undefined` would be dropped by
+                // `JSON.stringify` and read as "leave it alone", which is the one thing emptying
+                // the box is not.
+                { chatId, system_prompt: draft.trim() === "" ? null : draft },
+                { onSuccess: () => onOpenChange(false) },
+              )
+            }
+          >
+            Save
+          </Button>
+        </DialogFooter>
+        {patch.isError && <HelperRefusal error={patch.error} />}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * What this conversation may not reach for.
+ *
+ * A DENY list and not an allow list, and the difference is not cosmetic: the CLI's allow-listing
+ * flag does not restrict anything — it grants permission on top of what is already permitted — so a
+ * control built on it would read as a restriction and be none. Everything here can only take
+ * something away.
+ *
+ * Checkboxes over the names the daemon serves, never a box to type in. A typed rule that matches no
+ * tool is reported as one line on the CLI's stderr, which in this app is a restriction somebody set
+ * and nobody applied.
+ */
+function ChatDenials({ chatId }: { chatId: string }) {
+  const row = useChatRow(chatId);
+  const patch = usePatchChat();
+  const deniable = useDeniableTools();
+
+  const denied = row?.denied_tools ?? [];
+  const tools = deniable.data?.tools ?? [];
+
+  const toggle = (name: string, on: boolean) => {
+    const next = on ? [...denied, name] : denied.filter((tool) => tool !== name);
+    patch.mutate({ chatId, denied_tools: next });
+  };
+
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger disabled={tools.length === 0}>
+        Cannot use
+        <span className="chats-tool-why">
+          {denied.length === 0 ? "nothing barred" : `${denied.length} barred`}
+        </span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="chats-meta-menu chats-denials">
+        <DropdownMenuLabel>Tools this conversation may not reach for</DropdownMenuLabel>
+        {tools.map((name) => (
+          <DropdownMenuCheckboxItem
+            key={name}
+            checked={denied.includes(name)}
+            disabled={patch.isPending}
+            /* Several are usually barred together, so the menu is kept open. */
+            onSelect={(event) => event.preventDefault()}
+            onCheckedChange={(on) => toggle(name, on === true)}
+          >
+            {name}
+          </DropdownMenuCheckboxItem>
+        ))}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+/**
+ * The two ways to start this conversation over, which are deliberately two.
+ *
+ * They answer different questions. "This is getting expensive" wants a fresh window with a short
+ * replay of what was recently said — which the daemon already does by itself once a context grows
+ * past its threshold, and which until now nobody could ask for before the bill arrived. "We are
+ * done with that, start again" wants the next turn told nothing at all. One button would have to
+ * guess which was meant.
+ *
+ * Neither deletes anything. Every turn stays in the transcript, still readable and still costing
+ * what it cost, and the transcript draws a mark where a clear happened — the same position the rest
+ * of this app takes about rewriting history.
+ */
+function ContextControls({ chatId }: { chatId: string }) {
+  const fresh = useFreshContext();
+  const clear = useClearContext();
+
+  return (
+    <div className="chats-context">
+      <Button
+        disabled={fresh.isPending}
+        onClick={() => fresh.mutate(chatId)}
+      >
+        Fresh context
+      </Button>
+      <p className="chats-context-why">
+        the next turn starts on a new window and is told what was recently said
+      </p>
+      {/* The interlock, because this one cannot be undone by pressing it again: the floor only ever
+          moves forward. `ConfirmButton` is why this block is menu CONTENT — a menu item would close
+          on the first click and collapse two deliberate steps into one. */}
+      <ConfirmButton
+        label="Clear"
+        confirmLabel="Clear — the turns stay, the model stops seeing them"
+        onConfirm={() => clear.mutate(chatId)}
+      />
+      <p className="chats-context-why">and this one tells it nothing at all</p>
+      {fresh.isError && <HelperRefusal error={fresh.error} />}
+      {clear.isError && <HelperRefusal error={clear.error} />}
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- helpers -- */
+
+/** A helper as it is being written, before anybody has agreed it is one. */
+type HelperDraft = Subagent & { model: string | null; effort: string | null };
+
+/** What a fresh row starts as. Named so "add" and "reset" cannot drift apart. */
+function blankHelper(): HelperDraft {
+  return { name: "", description: "", prompt: "", model: null, effort: null };
+}
+
+/**
+ * Why the daemon would refuse this helper, in the words of what goes wrong — or null.
+ *
+ * A copy of the door's rules, and copies drift. This one is worth keeping anyway: the daemon
+ * answers a bad set with a bare 400 and no body, so without this the whole dialog would say "no"
+ * about a set of five helpers without saying which one or why. The door stays the authority — this
+ * only ever refuses EARLIER, never instead, and anything it misses still comes back as a refusal.
+ *
+ * The rules themselves are not arbitrary: the CLI parses `--agents` inside a try/catch and answers
+ * a throw with an empty agent list, so a helper it cannot build costs you every helper you wrote,
+ * silently. That is what all of this is protecting against.
+ */
+function whyHelperIsRefused(helper: HelperDraft, others: HelperDraft[]): string | null {
+  const name = helper.name.trim();
+  if (name === "") return "needs a name — it is what the model calls it by";
+  if (name.startsWith("-")) return "cannot start with a dash: that reads as a flag";
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) return "letters, digits, dashes and underscores only";
+  if (others.some((other) => other !== helper && other.name.trim() === name))
+    return "another helper already has this name, and one would replace the other";
+  if (helper.description.trim() === "")
+    return "needs a description — it is what the model reads to decide whether to use it";
+  if (helper.prompt.trim() === "") return "needs instructions to run under";
+  return null;
+}
+
+/**
+ * The helpers this conversation may hand work to.
+ *
+ * A dialog and not a menu, because these are WRITTEN. A name, a sentence about when to use it, and
+ * the instructions it runs under — that is three text fields, and a menu that closes on typeahead
+ * cannot hold one of them.
+ *
+ * Edited as a draft and saved in one gesture. The other settings in this menu patch on the click
+ * that changes them, which is right for a radio button and wrong here: a PATCH per keystroke would
+ * send dozens of half-written helpers, and each one is a whole-set write the daemon would take at
+ * face value.
+ *
+ * The set is saved WHOLE, which is also how the daemon takes it. So the answer to "two windows
+ * saved at once" is the plain one — the last save wins — rather than a merge rule nobody can see.
+ */
+function ChatHelpers({
+  chatId,
+  open,
+  onOpenChange,
+}: {
+  chatId: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const row = useChatRow(chatId);
+  const patch = usePatchChat();
+  const catalogue = useAssistantModels();
+  const [draft, setDraft] = useState<HelperDraft[]>([]);
+
+  const saved = row?.agents;
+  // Seeded ONCE per opening, which the ref is what enforces. The list behind `saved` is polled, so
+  // every poll hands back a new array — and an effect that merely depended on it would reseed the
+  // draft mid-sentence and take back whatever had been typed since the last tick. Found by a test
+  // that added a second helper and then waited: the wait was long enough for a poll to land.
+  //
+  // `saved === undefined` holds the seeding off until the list has actually arrived. Without it, a
+  // dialog opened before the first fetch would seed itself empty and then never look again — the
+  // conversation's real helpers invisible, and one Save away from being deleted.
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!open) {
+      seeded.current = false;
+      return;
+    }
+    if (seeded.current || saved === undefined) return;
+    seeded.current = true;
+    setDraft(
+      saved.map((agent) => ({
+        ...agent,
+        model: agent.model ?? null,
+        effort: agent.effort ?? null,
+      })),
+    );
+  }, [open, saved]);
+
+  const choices = (catalogue.data?.choices ?? []).filter((choice) => choice.brain === "cloud");
+  const refusals = draft.map((helper) => whyHelperIsRefused(helper, draft));
+  const ready = refusals.every((why) => why === null);
+
+  const change = (at: number, patched: Partial<HelperDraft>) =>
+    setDraft((current) =>
+      current.map((helper, index) => (index === at ? { ...helper, ...patched } : helper)),
+    );
+
+  const save = () => {
+    patch.mutate(
+      // Trimmed here rather than left to the daemon: what is stored is what the next turn is
+      // handed, and a helper called "reviewer " is one nothing can call by that name.
+      {
+        chatId,
+        agents: draft.map((helper) => ({
+          name: helper.name.trim(),
+          description: helper.description.trim(),
+          prompt: helper.prompt.trim(),
+          model: helper.model,
+          effort: helper.effort,
+        })),
+      },
+      { onSuccess: () => onOpenChange(false) },
+    );
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="chats-helpers">
+        <DialogHeader>
+          <DialogTitle>Helpers</DialogTitle>
+          <DialogDescription>
+            Work this conversation can hand off. These are added to any the project already defines
+            — they never hide them.
+          </DialogDescription>
+        </DialogHeader>
+
+        {draft.length === 0 && (
+          <p className="chats-helpers-none">
+            None yet. A helper is a name, what it is for, and the instructions it runs under.
+          </p>
+        )}
+
+        <ul className="chats-helpers-list">
+          {draft.map((helper, index) => (
+            // Keyed by position, deliberately. A helper's name is what somebody is editing — keying
+            // by it would rebuild the field on every keystroke and take the caret with it.
+            <li key={index} className="chats-helper">
+              <label className="chats-helper-field">
+                <span>Name</span>
+                <input
+                  value={helper.name}
+                  onChange={(event) => change(index, { name: event.target.value })}
+                  placeholder="reviewer"
+                />
+              </label>
+              <label className="chats-helper-field">
+                <span>When to use it</span>
+                <input
+                  value={helper.description}
+                  onChange={(event) => change(index, { description: event.target.value })}
+                  placeholder="Reviews a diff for correctness"
+                />
+              </label>
+              <label className="chats-helper-field">
+                <span>Instructions</span>
+                <textarea
+                  rows={3}
+                  value={helper.prompt}
+                  onChange={(event) => change(index, { prompt: event.target.value })}
+                  placeholder="You are a code reviewer. Read the diff and…"
+                />
+              </label>
+              <div className="chats-helper-row">
+                <label className="chats-helper-field">
+                  <span>Model</span>
+                  <select
+                    value={helper.model ?? ""}
+                    onChange={(event) =>
+                      // Changing the model can strip an effort the new one does not take. Cleared
+                      // here rather than left to be refused at the door, where the message would be
+                      // about a field nobody touched.
+                      change(index, {
+                        model: event.target.value === "" ? null : event.target.value,
+                        effort: null,
+                      })
+                    }
+                  >
+                    <option value="">same as this conversation</option>
+                    {choices.map((choice) => (
+                      <option key={choice.id} value={choice.id}>
+                        {choice.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="chats-helper-field">
+                  <span>Effort</span>
+                  <select
+                    value={helper.effort ?? ""}
+                    onChange={(event) =>
+                      change(index, {
+                        effort: event.target.value === "" ? null : event.target.value,
+                      })
+                    }
+                  >
+                    <option value="">its model's default</option>
+                    {/* The levels the helper's OWN model takes, or the union while it inherits —
+                        the same split the daemon checks against, so the menu cannot offer a level
+                        the door would refuse. */}
+                    {(helper.model === null
+                      ? (catalogue.data?.efforts ?? [])
+                      : (choices.find((choice) => choice.id === helper.model)?.efforts ?? [])
+                    ).map((level) => (
+                      <option key={level} value={level}>
+                        {level}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <Button
+                  variant="danger"
+                  onClick={() => setDraft((current) => current.filter((_, at) => at !== index))}
+                >
+                  Remove
+                </Button>
+              </div>
+              {refusals[index] !== null && (
+                <p className="chats-helper-why" role="alert">
+                  {refusals[index]}
+                </p>
+              )}
+            </li>
+          ))}
+        </ul>
+
+        <DialogFooter>
+          <Button onClick={() => setDraft((current) => [...current, blankHelper()])}>
+            Add a helper
+          </Button>
+          <Button variant="approve" disabled={!ready || patch.isPending} onClick={save}>
+            Save
+          </Button>
+        </DialogFooter>
+        {patch.isError && <HelperRefusal error={patch.error} />}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Why the daemon would not take this set. Its own component for the reason `ArchiveRefusal` is:
+ *  a refusal has a code and a sentence, and anything else is the daemon not answering at all. */
+function HelperRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error))
+    return <ErrorNote>the núcleo did not answer — the helpers were not saved</ErrorNote>;
+  return <RefusalNote refusal={error} />;
 }
 
 /* --------------------------------------------------------------- archive -- */
@@ -1454,6 +2547,9 @@ function Transcript({
 }) {
   const end = useRef<HTMLDivElement | null>(null);
   const last = turns.length === 0 ? null : turns[turns.length - 1];
+  // Where this conversation was told to forget everything before, so the mark lands on the right
+  // turn. Read here rather than inside each block: it is one fact about the whole transcript.
+  const clearedAfter = useChatRow(chatId)?.cleared_after_run_id ?? null;
 
   // A conversation is read at its end.
   //
@@ -1480,6 +2576,7 @@ function Transcript({
             key={turn.id}
             turn={turn}
             previous={index === 0 ? null : turns[index - 1]}
+            clearedAfter={clearedAfter}
             chatId={chatId}
           />
         ))}
@@ -1492,13 +2589,15 @@ function Transcript({
 function TurnBlock({
   turn,
   previous,
+  clearedAfter,
   chatId,
 }: {
   turn: Turn;
   previous: Turn | null;
+  clearedAfter: number | null;
   chatId: string;
 }) {
-  const marks = marksBetween(previous, turn);
+  const marks = marksBetween(previous, turn, clearedAfter);
   const live = turnIsLive(turn.status);
 
   return (
@@ -1885,13 +2984,25 @@ function WhatItDid({ did }: { did: ToolCall[] }) {
 }
 
 /**
- * The brain and restart marks a transcript draws above one turn.
+ * The brain, restart and clear marks a transcript draws above one turn.
  *
  * The brain mark's copy is deliberately asymmetric: moving *to* the cloud is about where what you
  * type now goes, and moving *to* the local model is about where the answer comes from — the two
  * directions are not mirror images of the same fact.
+ *
+ * A clear restarts the session too, so it could carry both marks. It carries only this one, because
+ * the restart note's own words — "was read the last few exchanges back" — are exactly what a clear
+ * makes untrue.
  */
 function MarkNote({ mark }: { mark: Mark }) {
+  if (mark.kind === "cleared") {
+    return (
+      <p className="chats-mark chats-mark-restart" role="status">
+        cleared here — everything above stays readable, and the model past this point was told none
+        of it
+      </p>
+    );
+  }
   if (mark.kind === "restart") {
     return (
       <p className="chats-mark chats-mark-restart" role="status">
@@ -1943,7 +3054,14 @@ interface Choice {
   chosen: () => void;
 }
 
-function Composer({ chatId }: { chatId: string }) {
+function Composer({
+  chatId,
+  chat,
+}: {
+  chatId: string;
+  /** The row, or undefined while the list is still being read. */
+  chat: ChatSummary | undefined;
+}) {
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
   // Escape closes the list without closing what is being typed: the sigil and what follows it stay
@@ -2076,9 +3194,13 @@ function Composer({ chatId }: { chatId: string }) {
           ))}
         </ul>
       )}
-      <label className="chats-field">
-        <span>Message</span>
+      {/* One object you type into, with the actions inside it — see `.chats-composer-box`. The
+          visible "Message" label went with the frame; the textarea has carried its own `aria-label`
+          all along, so the accessible name is exactly what it was. */}
+      <div className="chats-composer-box">
         <textarea
+          className="chats-composer-text"
+          placeholder="Say something…"
           ref={box}
           // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
           // anything that made you save it to a file first would be a step nobody takes.
@@ -2089,7 +3211,9 @@ function Composer({ chatId }: { chatId: string }) {
             event.preventDefault();
             void attach(pictures);
           }}
-          rows={3}
+          /* The floor, not the size. `field-sizing: content` grows the box from here; this is what
+             it falls back to where that is unsupported. */
+          rows={1}
           aria-label="Message"
           value={text}
           onChange={(event) => {
@@ -2137,27 +3261,39 @@ function Composer({ chatId }: { chatId: string }) {
             say();
           }}
         />
-      </label>
-      <div className="chats-composer-actions">
-        {/* The way in for anything not on the clipboard. Hidden behind its own label because a bare
-            file input is the one control on this page nobody can style into the others. */}
-        <label className="chats-attach">
-          <span>Attach a picture</span>
-          <input
-            type="file"
-            accept="image/*"
-            multiple
-            aria-label="Attach a picture"
-            onChange={(event) => {
-              void attach(event.target.files);
-              // Cleared so the same file chosen twice in a row is heard the second time.
-              event.target.value = "";
-            }}
-          />
-        </label>
-        <Button type="submit" intent="go" disabled={!sayable}>
-          Send
-        </Button>
+        {/* The controls belong to the words being typed, so they live in the box with them — which
+            is the one structure every reference for this page shares. They used to be scattered:
+            the model and plan-only behind a `⋯` at the top of the page, the attach button in a
+            strip under the box. Asking "which model, and does it plan or does it do" a screen away
+            from the sentence those answers apply to is asking about the message somewhere the
+            message is not. */}
+        <div className="chats-composer-actions">
+          {/* The way in for anything not on the clipboard. Hidden behind its own label because a
+              bare file input is the one control on this page nobody can style into the others. */}
+          <label className="chats-attach" title="Attach a picture">
+            <ImagePlus className="chats-tool-icon" aria-hidden="true" />
+            <span className="chats-offscreen">Attach a picture</span>
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              aria-label="Attach a picture"
+              onChange={(event) => {
+                void attach(event.target.files);
+                // Cleared so the same file chosen twice in a row is heard the second time.
+                event.target.value = "";
+              }}
+            />
+          </label>
+          {chat !== undefined && (
+            <ChatModelControls chatId={chatId} model={chat.model} effort={chat.effort} />
+          )}
+          <Planning chatId={chatId} />
+          <span className="chats-composer-gap" />
+          <button type="submit" className="chats-send" aria-label="Send" disabled={!sayable}>
+            <ArrowUp className="chats-send-icon" aria-hidden="true" />
+          </button>
+        </div>
       </div>
       {send.isError && <MessageRefusal error={send.error} />}
     </form>
