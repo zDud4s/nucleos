@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# `*.local` above already covers `.env.local`, which is the file the shadcn CLI reads
+# for registry auth (`${TWENTYFIRST_API_KEY}` in components.json). A plain `.env` was
+# matched by nothing — one typo away from committing a token.
+.env
+.env.*
+!.env.example
