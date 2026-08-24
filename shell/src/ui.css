@@ -380,6 +380,51 @@
  * fact worth the same visual weight as one — the moment this panel is
  * dismissed or the window closes, the value is gone for good.
  */
+/**
+ * Copy a piece of the conversation. See `CopyButton`, and note what it is NOT: the
+ * `.ui-copy-once-*` rules below dress a warning around a secret, and this is a verb.
+ *
+ * At rest it is faint and frameless, because there is one of these under every answer
+ * and one in the corner of every code block — a bordered control repeated that often
+ * is a pattern of boxes down the page rather than a set of things to press.
+ */
+.ui-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-faint);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.ui-copy:hover {
+  border-color: var(--border);
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.ui-copy:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* The one state that has to be seen rather than noticed: it is telling somebody the
+   thing they just asked for did not happen. */
+.ui-copy-refused {
+  color: var(--tone-paused-fg);
+}
+
+.ui-copy-icon {
+  width: 0.8125rem;
+  height: 0.8125rem;
+}
+
 .ui-copy-once {
   display: flex;
   flex-direction: column;

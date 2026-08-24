@@ -109,11 +109,15 @@
   justify-content: center;
 }
 
-/* The list, and the only part of the rail that scrolls. */
+/* The list, and the only part of the rail that scrolls. Faded at the cut like every
+   other scrolling column — on a short window the rail ran out mid-destination, and a
+   row sliced through its own letters reads as a broken row rather than as more list. */
 .nav-scroll {
   min-height: 0;
   overflow-y: auto;
   padding: var(--space-3) var(--space-2);
+  mask-image: var(--scroll-fade);
+  -webkit-mask-image: var(--scroll-fade);
 }
 
 .nav-group + .nav-group {

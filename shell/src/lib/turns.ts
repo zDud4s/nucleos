@@ -140,6 +140,15 @@ export interface Turn {
   cost_usd: number | null;
   answeredBy: Brain | null;
   sessionId: string | null;
+  /**
+   * When the turn was asked — `AssistantTurnRow.created_at`, verbatim.
+   *
+   * It arrived on every row from the beginning and was drawn nowhere, which made a
+   * transcript a stack of exchanges with no time in it: an answer from four minutes ago
+   * and one from last Tuesday looked the same, and the only way to date either was to
+   * count backwards from the conversation's own position in the list.
+   */
+  createdAt: string;
   /** What the turn ran. See `AssistantTurnRow.did`. */
   did: ToolCall[];
   /** See `AssistantTurnRow.images`. */
@@ -193,6 +202,7 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     cost_usd: row.cost_usd,
     answeredBy: row.answered_by,
     sessionId: row.session_id,
+    createdAt: row.created_at,
     // Defaulted rather than trusted: a daemon older than the column sends no such key, and a
     // conversation losing one line is a better answer to that than a page that will not draw.
     did: row.did ?? [],

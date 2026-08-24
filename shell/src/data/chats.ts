@@ -654,6 +654,10 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // This window's clock and not the daemon's, because the daemon has not answered yet and
+        // this row is gone the moment it does. What it has to be right about is "just now", and
+        // for the second and a half this bubble exists both clocks agree about that.
+        createdAt: new Date().toISOString(),
         // Not the pictures that were just sent: those are on disk under names only the daemon
         // knows, because it names them after the turn's own id. They arrive with the next read,
         // which is a beat later — and a wrong guess at a path would draw a broken image instead.

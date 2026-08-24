@@ -8,6 +8,7 @@
 export { Badge, type BadgeProps, type BadgeTone } from "./Badge";
 export { Button, type ButtonIntent, type ButtonProps, type ButtonVariant } from "./Button";
 export { ConfirmButton, type ConfirmButtonProps } from "./ConfirmButton";
+export { CopyButton, type CopyButtonProps } from "./CopyButton";
 export { CopyOnce, type CopyOnceProps } from "./CopyOnce";
 export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
@@ -20,6 +21,8 @@ export {
   ContextMeter,
   CostLine,
   RelativeTime,
+  money,
+  relativeText,
   type ContextMeterProps,
   type CostLineProps,
   type RelativeTimeProps,

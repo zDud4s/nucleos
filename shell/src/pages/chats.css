@@ -53,7 +53,17 @@
   min-height: 0;
 }
 
-@media (max-width: 60rem) {
+/**
+ * Where the list gives way.
+ *
+ * It was 60rem, and that was measured wrong: this query is on the WINDOW, but the
+ * layout it governs is the window minus the shell's own rail and the page padding.
+ * At a 1000px window the transcript was 358px and the conversation list beside it
+ * was 304px — the list, which is a column of titles, was very nearly as wide as the
+ * conversation. 72rem puts the fold where the transcript still has about 550px,
+ * which is the narrowest a measure can be and still be one.
+ */
+@media (max-width: 72rem) {
   .chats-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -67,6 +77,8 @@
   overflow-y: auto;
   overscroll-behavior: contain;
   padding-right: var(--space-3);
+  mask-image: var(--scroll-fade);
+  -webkit-mask-image: var(--scroll-fade);
 }
 
 /* The list closed. A transcript is prose, and prose wants the width. */
@@ -100,6 +112,8 @@
   overscroll-behavior: contain;
   margin-right: calc(var(--space-2) * -1);
   padding-right: var(--space-2);
+  mask-image: var(--scroll-fade);
+  -webkit-mask-image: var(--scroll-fade);
 }
 
 /* Answers that landed while you were elsewhere, on the button that opens the
@@ -164,14 +178,23 @@
 }
 
 /**
- * A measure for the conversation.
+ * A measure for the conversation — two of them, and they are for different things.
  *
- * Without one, a maximised window runs the transcript to nearly 2000px and the
- * eye loses the line it was on between one end and the other. The composer sits
- * inside the same limit on purpose, so the box you type in lines up with the
- * text you are answering.
+ * `max-width` is the COLUMN: what the composer, the code blocks and the turn's
+ * footing are allowed to be. Without it a maximised window ran the transcript to
+ * nearly 2000px and the eye lost the line it was on between one end and the other.
+ *
+ * `--measure` is the RUNNING TEXT inside that column, and it had to be separated out
+ * because 56rem is a good column and a terrible paragraph: measured in the app, a
+ * line of an answer was 844px at 13px, which is about 138 characters — roughly twice
+ * what an eye can track back to the start of. Prose gets `--measure`; a block of code
+ * keeps the whole column, because folding it would change what is written.
+ *
+ * In `ch` rather than `rem` so the two move together: it is a count of characters,
+ * and a character is a property of the type, not of the layout.
  */
 .chats-detail {
+  --measure: 72ch;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -351,6 +374,30 @@
   list-style: none;
 }
 
+/* A day's worth of rows, and the cut above them. A list inside a list item, because that is
+   what a grouped list IS — flattening it to a text line between rows would give a screen
+   reader a stray sentence in the middle of a list instead of something to move by. */
+.chats-band {
+  margin: 0;
+}
+
+.chats-band + .chats-band {
+  margin-top: var(--space-4);
+}
+
+/* The label voice — tracked-out uppercase — and it is the right one here: this names a
+   section rather than speaking in the conversation, which is exactly the distinction that
+   took the same treatment OFF `.chats-turn-who`. */
+.chats-band-title {
+  margin: 0 0 var(--space-1);
+  padding: 0 var(--space-3);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
 .chats-row {
   margin: 0;
 }
@@ -452,6 +499,15 @@
 .chats-row-live {
   font-size: var(--text-xs);
   color: var(--tone-info-fg);
+}
+
+/* Never at the cost of the name: `flex: none` so it keeps its own width, and the title
+   beside it is what gives way. A row whose time was truncated would be a row with no time. */
+.chats-row-when {
+  flex: none;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
 }
 
 .chats-row-unread {
@@ -644,6 +700,13 @@
   margin-bottom: var(--space-5);
 }
 
+/* An icon travelling with a word in the page header. Smaller than the composer's
+   (`.chats-tool-icon`, 1rem): those sit alone in a dense row, these sit beside type. */
+.chats-head-icon {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
 /* ------------------------------------------------------------- the meta line -- */
 
 /**
@@ -664,8 +727,14 @@
   gap: var(--space-2);
 }
 
+/* `flex: 1` is what puts the ⋯ against the right edge of the column. Without it the
+   line was only as wide as its text — and the line is EMPTY on a conversation with no
+   directory — so the menu button sat at the far left of the transcript and its
+   `align="end"` content opened leftwards, over the conversation list. */
 .chats-meta-line {
   display: flex;
+  flex: 1;
+  min-width: 0;
   align-items: center;
   gap: var(--space-2);
   margin: 0;
@@ -691,20 +760,42 @@
   text-align: left;
 }
 
+/**
+ * A square to press, not three dots to hit.
+ *
+ * It was a bare `⋯` with two units of side padding and no height of its own — about
+ * 20 by 16 of target, well under the 24px anything on a desktop pointer should be, and
+ * with no shape at rest it read as punctuation left over from the line beside it.
+ */
 .chats-meta-more {
-  padding: 0 var(--space-2);
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
   border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: none;
-  color: var(--text-muted);
-  font-size: var(--text-md);
-  line-height: 1;
+  color: var(--text-faint);
   cursor: pointer;
 }
 
-.chats-meta-more:hover {
+.chats-meta-more:hover,
+.chats-meta-more[data-state="open"] {
   border-color: var(--border);
+  background: var(--surface-raised);
   color: var(--text);
+}
+
+.chats-meta-more:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.chats-meta-more-icon {
+  width: 1rem;
+  height: 1rem;
 }
 
 /* The menu's own surface comes from the vendor component's Tailwind classes;
@@ -825,7 +916,7 @@
 /* The person's half, echoing `.chats-turn-asked` — same shape, quieter ground. */
 .chats-said-owner .chats-said-text {
   width: fit-content;
-  max-width: 44rem;
+  max-width: var(--measure);
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -834,15 +925,16 @@
   color: var(--text);
 }
 
+/* The imported half's version of `.chats-turn-who`, and it says the same two words,
+   so it speaks at the same volume. */
 .chats-said-who {
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
   color: var(--text-faint);
 }
 
 .chats-said-text {
   margin: 0;
+  max-width: var(--measure);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
@@ -897,6 +989,73 @@
 }
 
 /**
+ * The bubble and the one gesture that acts on it.
+ *
+ * `align-items: start`, so the pencil sits beside the FIRST line of a question rather than
+ * floating at the vertical centre of a four-line one.
+ */
+.chats-turn-said {
+  display: flex;
+  align-items: start;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+/**
+ * Quiet until it is wanted.
+ *
+ * A pencil drawn permanently beside every question in a long transcript is fifty pencils, and
+ * the page has one loud thing per turn already — the bubble. It comes up on hover over the
+ * question it belongs to, and on focus, so the keyboard reaches it in tab order and SEES it
+ * when it gets there. Never `display: none`, which would take it out of that order entirely.
+ */
+.chats-turn-again {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  margin-top: var(--space-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-faint);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.chats-turn-said:hover .chats-turn-again,
+.chats-turn-again:focus-visible {
+  opacity: 1;
+}
+
+.chats-turn-again:hover {
+  border-color: var(--border);
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.chats-turn-again:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.chats-turn-again-icon {
+  width: 0.8125rem;
+  height: 0.8125rem;
+}
+
+/* A pointer is the only way to reveal that button, so a machine without one is shown it
+   outright rather than being given a control it can never bring up. */
+@media (hover: none) {
+  .chats-turn-again {
+    opacity: 1;
+  }
+}
+
+/**
  * The question, in a bubble; the answer stays in the thread.
  *
  * Only one half of the exchange gets a ground, and that asymmetry is the whole
@@ -913,7 +1072,7 @@
  */
 .chats-turn-asked {
   width: fit-content;
-  max-width: 44rem;
+  max-width: var(--measure);
   margin: 0;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
@@ -933,10 +1092,15 @@
  * The same type as a finished answer, deliberately: these ARE the words, not a preview of them, and
  * restyling them would make the turn appear to change its mind about what it said when the run
  * lands. The line below it is what says it is not finished.
+ *
+ * The measure is set here as well as on `.chats-prose`, because this half of it is drawn as one
+ * plain paragraph — the parser only runs once the words have stopped arriving — and a paragraph
+ * that reflows to a different width the moment the turn lands would make the answer appear to move.
  */
 .chats-turn-writing {
   border-left: 2px solid var(--border);
   padding-left: var(--space-2);
+  max-width: var(--measure);
 }
 
 /*
@@ -994,15 +1158,21 @@
   font-style: italic;
 }
 
+/* Two groups and not three readings. `space-between` over three items put the cost at
+   one end, the run number at the other and the context fill floating in the middle of
+   an otherwise empty band — three unrelated things, evenly spaced, which is what a
+   footing looks like when nobody decided what belongs with what. The two readings ABOUT
+   the turn sit together on the left; the turn's own number is the label, and labels go
+   at the end of the line. */
 .chats-turn-foot {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
+  gap: var(--space-2) var(--space-4);
 }
 
 .chats-turn-id {
+  margin-left: auto;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-faint);
@@ -1157,7 +1327,11 @@
   border-radius: var(--radius-md);
   background: none;
   color: var(--text-faint);
-  font-family: var(--font-mono);
+  /* Body, not mono. These are three controls — a name to pick, a dial, a checkbox —
+     and mono is this app's voice for a machine's own words: a path, an id, a command.
+     Set in it, `Sonnet 5 ⌄ effort ⌄` read as terminal output that had wandered into
+     the composer rather than as two things you can press. */
+  font-family: var(--font-body);
   font-size: var(--text-xs);
   line-height: 1.6;
   cursor: pointer;
@@ -1179,6 +1353,56 @@
 .chats-planning:focus-within {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
+}
+
+/**
+ * The one control in the family that is a real form element, and the only one the
+ * platform insists on drawing itself.
+ *
+ * Left alone it painted a filled white square on a near-black composer — the single
+ * brightest object on the page, spent on the least important control on it.
+ * `accent-color` alone does not fix that: it tints the box only once it is CHECKED,
+ * and the unchecked state is the one that is on screen all day.
+ *
+ * So it is drawn here, out of the same three tokens as everything else in the row, and
+ * it stays an `<input type="checkbox">` throughout — the keyboard, the label's click
+ * target and the screen reader all keep working because nothing was replaced, only
+ * repainted.
+ */
+.chats-planning input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-grid;
+  place-content: center;
+  width: 0.8125rem;
+  height: 0.8125rem;
+  margin: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.chats-planning input[type="checkbox"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+/* The tick, drawn rather than typed: a `content` glyph would take the font's own
+   idea of a checkmark, which differs per platform and does not centre. */
+.chats-planning input[type="checkbox"]:checked::after {
+  content: "";
+  width: 0.4375rem;
+  height: 0.25rem;
+  border: 1.5px solid var(--accent-ink);
+  border-top: none;
+  border-right: none;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
+.chats-planning input[type="checkbox"]:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 .chats-tool-caret {
@@ -1204,8 +1428,13 @@
 /* The two ways to start over. Menu CONTENT and not menu items, because the
    stronger one is a `ConfirmButton` whose two-click interlock a menu item would
    collapse — the same reason `.chats-archive` is content. */
+/* `justify-items: start`, or the grid stretches its children and `Fresh context`
+   becomes a full-width band while `Clear` under it — the more dangerous of the two —
+   is a small outline. Weight in this menu is supposed to come from the colour and the
+   interlock, not from which of them happened to be in a stretching grid. */
 .chats-context {
   display: grid;
+  justify-items: start;
   gap: var(--space-1);
   padding: 0 var(--space-1);
 }
@@ -1437,17 +1666,31 @@
 
 /* ------------------------------------------ who said it, and how it reads -- */
 
+/**
+ * `you` and `núcleo`, and they whisper.
+ *
+ * They were set in tracked-out uppercase — the app's label voice — and that was the
+ * wrong voice for them twice over. A label names a field you are about to fill in;
+ * this names the person who is already speaking, on every single turn, which makes it
+ * the most repeated string on the page and the one with the least to say. Uppercase
+ * made the two quietest words in a conversation its loudest marks.
+ *
+ * Kept rather than dropped because the bubble only tells you who spoke while both
+ * halves are on screen — scroll into the middle of a long answer and the bubble is
+ * two screens up.
+ */
 .chats-turn-who {
   margin: 0;
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
   color: var(--text-faint);
 }
 
+/* Prose, and only prose. `.chats-code` is a sibling of this inside the same answer and
+   deliberately keeps the whole column — see `--measure` on `.chats-detail`. */
 .chats-prose {
   display: flex;
   flex-direction: column;
+  max-width: var(--measure);
 }
 
 .chats-rich-line,
@@ -1497,10 +1740,39 @@
   overflow-wrap: break-word;
 }
 
+/* The block and its corner. The margin lives here rather than on the `<pre>` so that the
+   absolutely-positioned button measures against the frame it is sitting in. */
+.chats-code-block {
+  position: relative;
+  margin: var(--space-2) 0;
+}
+
+/* Inside the frame, out of the way of the first line's indentation, and OUTSIDE the element
+   that scrolls — see the note in `Rich`: a control in a sideways-scrolling box leaves its own
+   corner exactly when the code is wide enough to want copying. */
+.chats-code-copy {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.chats-code-block:hover .chats-code-copy,
+.chats-code-copy:focus-within {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .chats-code-copy {
+    opacity: 1;
+  }
+}
+
 /* A block of code keeps its own lines: this is the one place on the page where wrapping would
    change what is written, so it scrolls sideways instead of folding. */
 .chats-code {
-  margin: var(--space-2) 0;
+  margin: 0;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

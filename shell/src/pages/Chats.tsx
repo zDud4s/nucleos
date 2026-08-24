@@ -34,8 +34,12 @@ import {
   ArrowUp,
   ChevronDown,
   ImagePlus,
+  MoreHorizontal,
+  PanelLeft,
+  PanelLeftClose,
   Plus,
   SquareCode,
+  SquarePen,
 } from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import {
@@ -98,13 +102,18 @@ import { diffLines } from "../lib/diff";
 import {
   Button,
   ConfirmButton,
+  CopyButton,
   CostLine,
   ErrorNote,
   PageHeader,
   RefusalNote,
+  RelativeTime,
+  relativeText,
   StaleNote,
   Teach,
 } from "../ui";
+import { BAND_TITLE, inBands } from "../lib/when";
+
 import "./chats.css";
 
 /**
@@ -201,6 +210,15 @@ export function Chats() {
               }
               onClick={() => setRailOpen((open) => !open)}
             >
+              {/* The same gesture the shell's own rail offers, so it reads as the same kind of
+                  thing: a panel that folds away, not a page that opens. The glyph is the only
+                  part shared — the label stays words, because this button is in a header where
+                  a lone icon would be the only unlabelled control on the page. */}
+              {railOpen ? (
+                <PanelLeftClose className="chats-head-icon" aria-hidden="true" />
+              ) : (
+                <PanelLeft className="chats-head-icon" aria-hidden="true" />
+              )}
               {railOpen ? "Hide conversations" : "Conversations"}
               {/* Answers that landed while you were elsewhere. Shown on the button
                   precisely because the list they are in may be closed — a count that
@@ -465,25 +483,39 @@ function ChatListPanel({
           <ErrorNote>your editor sessions could not be read</ErrorNote>
         )}
         {listed.length > 0 && (
-          /* One list, both kinds. See `mergeRows`: what tells them apart is the mark on the row. */
+          /* One list, both kinds, cut into days.
+             See `mergeRows`: what tells the two kinds apart is the mark on the row. What the
+             cuts add is the one thing a column of titles could not say — twelve conversations
+             sorted newest first look identical whether the newest was four minutes ago or in
+             March, and the sort order is only readable by somebody who already knows it exists.
+             `inBands` never reorders; it only says where the list changes day. */
           <ul className="chats-list" aria-label="Conversations">
-            {listed.map((entry) =>
-              entry.kind === "chat" ? (
-                <ChatRow
-                  key={entry.chat.chat_id}
-                  row={entry.chat}
-                  active={entry.chat.chat_id === selected}
-                  live={entry.chat.chat_id === selected && selectedLive}
-                />
-              ) : (
-                <EditorRow
-                  key={entry.session.session_id}
-                  session={entry.session}
-                  active={entry.session.session_id === pickingUp}
-                  onOpen={() => onPickUp(entry.session.session_id)}
-                />
-              ),
-            )}
+            {inBands(listed, (entry) => entry.at, Date.now()).map((cut) => (
+              <li key={cut.band} className="chats-band">
+                {/* A heading and a list of its own, so the cut is structure a screen reader can
+                    move by rather than a line of text sitting between two rows of one flat list. */}
+                <p className="chats-band-title">{BAND_TITLE[cut.band]}</p>
+                <ul className="chats-list" aria-label={BAND_TITLE[cut.band]}>
+                  {cut.rows.map((entry) =>
+                    entry.kind === "chat" ? (
+                      <ChatRow
+                        key={entry.chat.chat_id}
+                        row={entry.chat}
+                        active={entry.chat.chat_id === selected}
+                        live={entry.chat.chat_id === selected && selectedLive}
+                      />
+                    ) : (
+                      <EditorRow
+                        key={entry.session.session_id}
+                        session={entry.session}
+                        active={entry.session.session_id === pickingUp}
+                        onOpen={() => onPickUp(entry.session.session_id)}
+                      />
+                    ),
+                  )}
+                </ul>
+              </li>
+            ))}
           </ul>
         )}
       </div>
@@ -530,6 +562,11 @@ function EditorRow({
             now
           </span>
         )}
+        {!live && (
+          <span className="chats-row-when" aria-hidden="true">
+            <RelativeTime at={session.last_activity} />
+          </span>
+        )}
       </button>
     </li>
   );
@@ -550,6 +587,10 @@ function chatRowLabel(row: ChatSummary, live: boolean): string {
     row.brain,
   ];
   if (live) parts.push("thinking");
+  // The same reading the row draws, in the same sentence as the rest of it rather than as a
+  // fourth run of text after it. See the `aria-hidden` on `.chats-row-when`.
+  if (row.last_activity !== null)
+    parts.push(relativeText(Date.parse(row.last_activity), Date.now()));
   if (row.waiting > 0) parts.push(`${row.waiting} unread`);
   return parts.join(", ");
 }
@@ -590,6 +631,16 @@ function ChatRow({
           {row.title ?? row.first_message ?? "nothing said yet"}
         </span>
         {live && <span className="chats-row-live">thinking…</span>}
+        {/* When it last moved. The band above says which day; this says where in it — which is
+            the difference between two rows under "Today" and two rows you can tell apart.
+            `aria-hidden`, because `chatRowLabel` already spells the row out and a screen reader
+            reading the title, then the time, then the count as three separate runs of text is
+            the exact concatenation that label exists to prevent. */}
+        {row.last_activity !== null && (
+          <span className="chats-row-when" aria-hidden="true">
+            <RelativeTime at={row.last_activity} />
+          </span>
+        )}
         {row.waiting > 0 && (
           <span className="chats-row-unread" aria-hidden="true">
             {row.waiting}
@@ -891,6 +942,15 @@ function ChatDetail({
   const seen = usePostChatSeen();
   const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
   const markedSeen = useRef(false);
+  /**
+   * A question from the transcript, on its way into the box.
+   *
+   * Held here because the transcript and the composer are siblings and neither can hand the
+   * other anything. It carries a stamp as well as the words, and the stamp is the point: put
+   * the SAME question back twice and the text does not change, so an effect keyed on the text
+   * alone would fire once and then quietly stop working.
+   */
+  const [reuse, setReuse] = useState<{ text: string; at: number } | null>(null);
 
   // Once per chat opened, after the transcript has loaded — not on every poll
   // tick that follows. `markedSeen` is fresh per mount, and `ChatDetail` is
@@ -940,6 +1000,7 @@ function ChatDetail({
             turns={transcript.data.turns}
             precededBy={(pickedUp.data?.said ?? []).length > 0}
             chatId={chatId}
+            onReuse={(text) => setReuse({ text, at: Date.now() })}
           />
         )}
         {/* Below the transcript and above the box, which is where these words are in time: said
@@ -952,7 +1013,7 @@ function ChatDetail({
         <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
       </div>
 
-      <Composer chatId={chatId} chat={summary} />
+      <Composer chatId={chatId} chat={summary} reuse={reuse} />
     </section>
   );
 }
@@ -1283,7 +1344,10 @@ function ChatMeta({ chatId }: { chatId: string }) {
           className="chats-meta-more"
           aria-label="Conversation settings"
         >
-          ⋯
+          {/* The icon, not a `⋯` typed into the line. A horizontal-ellipsis character is
+              punctuation: it sits on the text baseline, it takes the line's own size, and it
+              cannot be centred in a button without fighting the font. */}
+          <MoreHorizontal className="chats-meta-more-icon" aria-hidden="true" />
         </DropdownMenuTrigger>
         {/* One thing left in it, and it is the one thing that must not be a menu ITEM: see
             `ArchiveControl`, whose two-click interlock a menu item would collapse. */}
@@ -1717,7 +1781,10 @@ function ModelMenu({
   // Unpinned shows the configured model's name, not a blank. Falling back to `model` covers the one
   // case the catalogue cannot explain: a conversation pinned to a name since removed from the
   // config. Showing the stale name is right — it is what the next turn will actually run.
-  const shown = chosen?.label ?? model ?? catalogue.data?.configured ?? "model";
+  // "Model" and not "model": the last fallback is this app's own word for the setting —
+  // the three before it are proper names — and a setting named in lower case beside a
+  // caret read as terminal output rather than as a control.
+  const shown = chosen?.label ?? model ?? catalogue.data?.configured ?? "Model";
 
   return (
     <DropdownMenu>
@@ -1824,7 +1891,15 @@ function EffortMenu({
         }
         disabled={disabled || !hasDial}
       >
-        {hasDial ? (effort ?? "effort") : "no effort"}
+        {/* The setting's name, and then the CLI's own word for the level — never a
+            prettified version of it. `xhigh` is not a word and `Xhigh` is not one either;
+            what makes the button read as a control rather than as terminal output is the
+            label in front of it. */}
+        {hasDial
+          ? effort === null
+            ? "Effort"
+            : `Effort: ${effort}`
+          : "No effort dial"}
         <ChevronDown className="chats-tool-caret" aria-hidden="true" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="chats-meta-menu">
@@ -2920,10 +2995,13 @@ function Transcript({
   turns,
   precededBy,
   chatId,
+  onReuse,
 }: {
   turns: Turn[];
   precededBy: boolean;
   chatId: string;
+  /** Puts a question that was already asked back in the box. See `TurnBlock`. */
+  onReuse: (text: string) => void;
 }) {
   const end = useRef<HTMLDivElement | null>(null);
   const last = turns.length === 0 ? null : turns[turns.length - 1];
@@ -2959,6 +3037,7 @@ function Transcript({
             previous={index === 0 ? null : turns[index - 1]}
             clearedAfter={clearedAfter}
             chatId={chatId}
+            onReuse={onReuse}
           />
         ))}
       </ul>
@@ -2972,11 +3051,14 @@ function TurnBlock({
   previous,
   clearedAfter,
   chatId,
+  onReuse,
 }: {
   turn: Turn;
   previous: Turn | null;
   clearedAfter: number | null;
   chatId: string;
+  /** Puts this question back in the box, unsent. */
+  onReuse: (text: string) => void;
 }) {
   const marks = marksBetween(previous, turn, clearedAfter);
   const live = turnIsLive(turn.status);
@@ -2987,10 +3069,27 @@ function TurnBlock({
         <MarkNote key={index} mark={mark} />
       ))}
       <p className="chats-turn-who">you</p>
-      {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
-          Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
-          message they did not send. */}
-      <p className="chats-turn-asked">{turn.asked}</p>
+      <div className="chats-turn-said">
+        {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
+            Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
+            message they did not send. */}
+        <p className="chats-turn-asked">{turn.asked}</p>
+        {/* Editing, in the only sense this app can honestly offer.
+            A turn is a billed run that already happened, and its answer is in the record; there is
+            nothing to rewrite and no history to fork. What a person actually wants after a question
+            that came back wrong is to ask a better version of it, and what stops them is retyping
+            four lines. So this puts the words back in the box and stops — nothing is sent, nothing
+            is deleted, and the turn above stays exactly as it was. */}
+        <button
+          type="button"
+          className="chats-turn-again"
+          aria-label="Put this question back in the box to change it"
+          title="put it back in the box — nothing is sent until you send it"
+          onClick={() => onReuse(turn.asked)}
+        >
+          <SquarePen className="chats-turn-again-icon" aria-hidden="true" />
+        </button>
+      </div>
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
@@ -3009,9 +3108,17 @@ function TurnBlock({
         </p>
       )}
       <div className="chats-turn-foot">
+        {/* Only once the turn has stopped moving. A copy control under an answer that is still
+            being written would hand over half a sentence and call it the answer. */}
+        {!live && turn.answer !== null && (
+          <CopyButton value={turn.answer} label="this answer" />
+        )}
         {/* Money only. The daemon's turn rows carry no token breakdown — see `CostLineProps`. */}
         <CostLine costUsd={turn.cost_usd} />
         <ContextFill fill={turn.contextFill} window={turn.window} />
+        {/* When it was asked, relative, with the exact time on hover — the same reading the
+            runs list gives, because it is the same question being asked of it. */}
+        <RelativeTime at={turn.createdAt} />
         <span className="chats-turn-id">#{turn.id}</span>
       </div>
     </li>
@@ -3032,9 +3139,18 @@ function Rich({ text }: { text: string }) {
     <>
       {blocks(text).map((block, index) =>
         block.kind === "code" ? (
-          <pre key={index} className="chats-code">
-            <code>{block.text}</code>
-          </pre>
+          /* The block, and the one gesture anybody performs on one. A wrapper rather than a
+             button inside the `<pre>`: the `<pre>` scrolls sideways, and a control placed in a
+             scrolling box slides out of its own corner the moment the code is wider than the
+             column — which is exactly when somebody wants to copy it rather than read it. */
+          <div key={index} className="chats-code-block">
+            <pre className="chats-code">
+              <code>{block.text}</code>
+            </pre>
+            <span className="chats-code-copy">
+              <CopyButton value={block.text} label="this code" spoken={false} />
+            </span>
+          </div>
         ) : (
           <div key={index} className="chats-prose">
             {lines(block.text).map((line, at) => (
@@ -3114,7 +3230,11 @@ function ContextFill({
       }
     >
       {`${k(fill)} of ${k(window)}`}
-      {near && " — the earlier exchanges may be summarised on the next turn"}
+      {/* Short, because of where it is: this hangs off the end of a reading, in the footing
+          under every turn, and the full sentence it used to be ran the line to twice the
+          width of the two numbers it was qualifying. What a person needs from it is the
+          fact, not the explanation — and the explanation is one hover away. */}
+      {near && " — earlier turns summarised soon"}
     </span>
   );
 }
@@ -3559,10 +3679,13 @@ function listTookTheKey(
 function Composer({
   chatId,
   chat,
+  reuse,
 }: {
   chatId: string;
   /** The row, or undefined while the list is still being read. */
   chat: ChatSummary | undefined;
+  /** A question lifted out of the transcript, or null. See `ChatDetail`. */
+  reuse?: { text: string; at: number } | null;
 }) {
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
@@ -3574,6 +3697,34 @@ function Composer({
   const [attached, setAttached] = useState<Attachment[]>([]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
+
+  /**
+   * A question put back in the box, and the caret at the end of it.
+   *
+   * It REPLACES what is in the box rather than appending to it, which is the honest reading of
+   * the gesture: somebody pressed the pencil on a specific question because that is the one
+   * they want to send a better version of. Appending would leave two half-questions in the box
+   * and the send button armed.
+   *
+   * Keyed on the stamp and not the text — see `reuse` in `ChatDetail` for why.
+   */
+  const at = reuse?.at ?? null;
+  const asked = reuse?.text ?? "";
+  useEffect(() => {
+    if (at === null) return;
+    setText(asked);
+    setCaret(asked.length);
+    // Next frame, for the reason `write` gives: React has not re-rendered the new value yet, so
+    // there is nothing to put a caret at the end OF until it has.
+    requestAnimationFrame(() => {
+      box.current?.focus();
+      box.current?.setSelectionRange(asked.length, asked.length);
+    });
+    // `asked` is deliberately not a dependency: the stamp is what says this is a new gesture,
+    // and including the text would re-run this on nothing whenever an identical question is
+    // reused twice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [at]);
 
   // A picture is read here, in the window, and travels as base64 inside the message. Not as a path
   // for the model to go and read: it is part of what was said, and the CLI takes it that way —

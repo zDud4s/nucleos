@@ -42,6 +42,7 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     cost_usd: null,
     answeredBy: null,
     sessionId: null,
+    createdAt: "2026-08-18T09:00:00Z",
     did: [],
     images: [],
     thought: [],

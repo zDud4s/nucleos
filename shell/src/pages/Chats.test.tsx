@@ -520,7 +520,7 @@ describe("Chats - a conversation that grew too long for its window", () => {
     // meter that keeps its own copy of the number is wrong for exactly the conversations nearest
     // their limit.
     expect(await screen.findByText("150.0k of 190.0k")).toBeTruthy();
-    expect(screen.queryByText(/may be summarised on the next turn/i)).toBeNull();
+    expect(screen.queryByText(/earlier turns summarised soon/i)).toBeNull();
   });
 });
 
@@ -1660,7 +1660,12 @@ describe("Chats - the route and the sidebar badge", () => {
     // too is in the real tree rather than only in a test's own two-route
     // stand-in — `router` here is the harness's narrowed read-only view and
     // has no `navigate` of its own.
-    fireEvent.click(await screen.findByRole("link", { name: "hello there, cloud, 2 unread" }));
+    // Matched rather than spelled out: the row's name carries when it last moved, which is a
+    // relative reading against the real clock and therefore not a constant. What this assertion
+    // is about is that the row is one link with one name — see `chatRowLabel`.
+    fireEvent.click(
+      await screen.findByRole("link", { name: /^hello there, cloud, .+, 2 unread$/ }),
+    );
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
     expect(await screen.findByRole("heading", { level: 1, name: "Chats" })).toBeDefined();
   });
@@ -2593,7 +2598,7 @@ describe("what the page is not showing", () => {
     // used to say the next turn "may begin a fresh context" — which was the honest description of
     // what happened then and would be a lie now: nothing begins again, the early exchanges are
     // condensed and the conversation carries on.
-    expect(screen.getAllByText(/may be summarised on the next turn/i)).toHaveLength(1);
+    expect(screen.getAllByText(/earlier turns summarised soon/i)).toHaveLength(1);
   });
 });
 
@@ -2911,5 +2916,159 @@ describe("Chats - finding a conversation by typing", () => {
     const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
     expect(within(palette).getByText("rewrite the gate")).toBeDefined();
     expect(within(palette).getByText("bump dependencies")).toBeDefined();
+  });
+});
+
+/* ------------------------------------- reading a transcript, not just seeing it -- */
+
+describe("Chats - taking a piece of the conversation with you", () => {
+  it("copies an answer, and never claims a write the webview refused", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "why 29 February?", answer: "the year rule has three parts" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const copy = await screen.findByRole("button", { name: /copy this answer/i });
+
+    // jsdom has no clipboard, which is the same shape as a webview that refuses one. The
+    // button must say what happened rather than say "Copied" over a write that never landed.
+    fireEvent.click(copy);
+    expect(await screen.findByText("Select it instead")).toBeDefined();
+    expect(screen.queryByText("Copied")).toBeNull();
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      fireEvent.click(copy);
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith("the year rule has three parts"));
+    } finally {
+      delete (navigator as { clipboard?: unknown }).clipboard;
+    }
+  });
+
+  it("offers no copy on a turn that is still being written", async () => {
+    // Half a sentence handed over as "the answer" is the defect this prevents.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 7, status: "running", answer: null })] },
+        { live: { 7: { text: "the year rule has", doing: null } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/the year rule has/)).toBeDefined();
+    expect(screen.queryByRole("button", { name: /copy this answer/i })).toBeNull();
+  });
+
+  it("copies a code block on its own, without the prose around it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            answer:
+              "Here it is:\n\n```rust\nfn leap(y: i32) -> bool { y % 4 == 0 }\n```\n\nThat is all.",
+          }),
+        ],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      fireEvent.click(await screen.findByRole("button", { name: /copy this code/i }));
+      await waitFor(() =>
+        expect(writeText).toHaveBeenCalledWith("fn leap(y: i32) -> bool { y % 4 == 0 }"),
+      );
+      // The sentences either side of the fence are not part of the code.
+      expect(writeText.mock.calls[0][0]).not.toContain("That is all");
+    } finally {
+      delete (navigator as { clipboard?: unknown }).clipboard;
+    }
+  });
+
+  it("says when each turn was asked", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, created_at: "2026-08-18T09:00:00Z" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    // The exact time stays reachable — a relative reading alone cannot be lined up with a log.
+    const when = await screen.findByTitle(new Date("2026-08-18T09:00:00Z").toLocaleString());
+    expect(when.getAttribute("datetime")).toBe("2026-08-18T09:00:00Z");
+  });
+});
+
+describe("Chats - asking a question again", () => {
+  it("puts the question back in the box and sends nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "why does the parser take 29 February 2100?" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "something else entirely" } });
+
+    fireEvent.click(await screen.findByRole("button", { name: /put this question back in the box/i }));
+
+    // It replaces what was there rather than appending — see the note on `reuse` in `Composer`.
+    await waitFor(() => expect(box.value).toBe("why does the parser take 29 February 2100?"));
+    // And nothing was said. The turn above is a billed run that already happened; this is a draft.
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/message", expect.anything());
+  });
+
+  it("puts the same question back twice", async () => {
+    // The bug a text-keyed effect would have: the second press changes nothing, because the
+    // text it is watching did not change. See the stamp on `reuse`.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "run the tests" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    const again = await screen.findByRole("button", { name: /put this question back in the box/i });
+
+    fireEvent.click(again);
+    await waitFor(() => expect(box.value).toBe("run the tests"));
+
+    fireEvent.change(box, { target: { value: "" } });
+    fireEvent.click(again);
+    await waitFor(() => expect(box.value).toBe("run the tests"));
+  });
+});
+
+describe("Chats - the list, cut into days", () => {
+  it("groups the conversations by when they last moved", async () => {
+    const now = Date.now();
+    const hoursAgo = (hours: number) => new Date(now - hours * 3600_000).toISOString();
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "this morning", last_activity: hoursAgo(2) }),
+          chatSummary({ chat_id: "c-2", title: "a week ago", last_activity: hoursAgo(24 * 7) }),
+        ],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const today = await screen.findByRole("list", { name: "Today" });
+    expect(within(today).getByText("this morning")).toBeDefined();
+
+    const earlier = await screen.findByRole("list", { name: "Earlier" });
+    expect(within(earlier).getByText("a week ago")).toBeDefined();
+
+    // No heading over a day with nothing under it.
+    expect(screen.queryByRole("list", { name: "Yesterday" })).toBeNull();
   });
 });
