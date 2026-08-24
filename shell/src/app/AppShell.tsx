@@ -63,6 +63,11 @@ function Frame() {
    * answered once, and the rail draws no rows for that rather than an empty
    * group: a heading with nothing under it reads as "you have no projects",
    * which is a claim about the daemon's answer before it gave one.
+   *
+   * Handed over on every page even though the rail only draws it inside the
+   * projects area, and that is not waste: the query is shared, so the request
+   * happens either way, and deciding *where* the roster is shown is the rail's
+   * business rather than something this component should have to know.
    */
   const projects = useProjects();
 

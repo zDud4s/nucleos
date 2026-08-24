@@ -72,6 +72,12 @@ export interface NavGroup {
    * asks *what kind of group is this* instead of knowing one id by heart — and
    * so that `items: []` reads as "filled elsewhere" rather than as an oversight.
    *
+   * A roster group's rows are also **conditional**, which no other group's are:
+   * they are drawn only while the reader is in the projects area. The rail is a
+   * fixed list of destinations and a roster is not one — see `inProjects` in
+   * `Sidebar.tsx` for the argument. The group itself is unconditional: its
+   * heading and `All projects` are always there, so the position never moves.
+   *
    * The consequence worth stating: entries in a roster group are deliberately
    * NOT in {@link NAV_PATHS}. That list is the route list, one route built per
    * entry, and it can only contain paths that exist at compile time. A project
@@ -122,7 +128,17 @@ export const NAV: NavGroup[] = [
    * `All projects` is the old item, kept as this group's first entry: the roster
    * answers "how are all of them doing" and holds the WIP ceiling, which is a
    * fleet-wide reading and not a thing any single workspace can say. The roster
-   * rows follow it — one per project, from the daemon.
+   * rows follow it — one per project, from the daemon — **while you are in the
+   * projects area, and not otherwise.**
+   *
+   * That last clause is a correction to §3.1 of the design, made 2026-08-24 with
+   * the group built and in use. The promotion was argued from the cost of
+   * reaching a project — a list to open and then a choice, on every entry — and
+   * that cost is real *while you are working in one*. What the argument missed is
+   * that the rail is otherwise a fixed list of destinations, and this group's
+   * length belongs to the daemon: fifteen projects push Work and Pillars off the
+   * bottom to show names nobody on the Feed page is looking for. Conditional rows
+   * keep the saving where it was earned and give back the space where it was not.
    */
   {
     id: "projects",
