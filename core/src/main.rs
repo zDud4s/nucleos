@@ -20,6 +20,7 @@ mod config;
 mod contacts;
 mod council;
 mod daemon_client;
+mod detect;
 mod email;
 mod errands;
 mod exclusion;
@@ -41,10 +42,13 @@ mod mcp_tools;
 mod mentions;
 mod notes;
 mod notify;
+mod ownership;
 mod pii_shadow;
 mod presets;
 mod priority;
 mod process_tree;
+mod project_commands;
+mod project_readings;
 mod proposals;
 mod recurrence;
 mod redact;
@@ -74,6 +78,8 @@ mod web;
 mod web_client;
 mod webhook;
 mod wip;
+mod workflow_graph;
+mod workflows;
 mod worktree;
 
 use auth::Token;
@@ -307,6 +313,19 @@ async fn main() {
         .expect("failed to open local database");
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
+    // Beside the run sweep and for the same reason: a row saying `running` against a process that
+    // has not existed since the last restart would refuse every future click with "already
+    // running". Best-effort — a project command left unsettled is a button that will not press, not
+    // a daemon that must not start.
+    match project_commands::reconcile_orphaned_commands(&pool).await {
+        Ok(0) => {}
+        Ok(settled) => tracing::info!(
+            settled,
+            "settled project commands left running by a restart"
+        ),
+        Err(error) => tracing::warn!(%error, "could not settle project commands left running"),
+    }
+
     let interrupted = runs::reconcile_orphaned_runs(&pool)
         .await
         .expect("failed to reconcile orphaned runs on startup");
@@ -412,7 +431,7 @@ async fn main() {
         };
     tracing::info!("nucleos-core token loaded from Credential Manager");
 
-    let models_config_path = std::path::PathBuf::from(".ai/nucleos-models.yaml");
+    let models_config_path = std::path::PathBuf::from(config::MODELS_CONFIG_PATH);
     let models_config = config::load_models_config(&models_config_path).unwrap_or_else(|e| {
         tracing::warn!("failed to parse .ai/nucleos-models.yaml ({e}), using defaults");
         config::ModelsConfig::default()
@@ -689,6 +708,9 @@ async fn main() {
         local_triage_disabled,
         local_assistant,
         files_root,
+        // `None` when this machine has no home directory to hang a library off. Resolved here and
+        // not per request, like `files_root` above: it is a fact about the machine.
+        workflow_library: workflows::library_root(),
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,

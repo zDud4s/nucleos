@@ -1550,6 +1550,11 @@ pub(crate) async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String
 ///
 /// Only `completed` turns, and only ones with a reply: a failed turn's row has no answer, and
 /// replaying a question that was never answered invites the model to answer it now, out of order.
+///
+/// Two floors, and the later one wins — `max` of the untrusted-read barrier above and the chat's
+/// own `cleared_after_run_id` (0114). They are separate because they mean different things: one is
+/// a safety property this daemon imposes, the other is somebody asking to start again, and either
+/// alone must still hold when the other is absent.
 pub(crate) async fn recent_exchanges(
     pool: &SqlitePool,
     chat_id: &str,
@@ -1561,11 +1566,15 @@ pub(crate) async fn recent_exchanges(
             AND status = 'completed'
             AND stdout IS NOT NULL
             AND stdout <> ''
-            AND id > (SELECT COALESCE(MAX(id), 0) FROM runs
-                       WHERE chat_id = ? AND read_untrusted = 1)
+            AND id > max(
+                      (SELECT COALESCE(MAX(id), 0) FROM runs
+                        WHERE chat_id = ? AND read_untrusted = 1),
+                      COALESCE((SELECT cleared_after_run_id FROM chats
+                                 WHERE chat_id = ?), 0))
           ORDER BY id DESC
           LIMIT ?",
     )
+    .bind(chat_id)
     .bind(chat_id)
     .bind(chat_id)
     .bind(HISTORY_TURNS)
@@ -1993,6 +2002,19 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             .await
             .unwrap_or(false);
 
+        // Who answers this turn, and how hard they are asked to think. Read HERE, beside `planning`
+        // and for its reason: both are properties of the conversation at the moment it answers, and
+        // somebody who changed the model while reading the last reply meant this turn and not the
+        // next one.
+        //
+        // `unwrap_or_default` — `(None, None)` — rather than a refusal. A conversation that never
+        // expressed a preference is the overwhelming majority of them and is not an error, and a
+        // row that could not be read has a configured model to fall back on. Failing a turn over an
+        // unreadable preference would break the chats that have none.
+        let answering = crate::chats::answering(&pool, &turn.slot.chat_id)
+            .await
+            .unwrap_or_default();
+
         // A turn with no `resume` is a conversation that has rotated onto a fresh context, so a
         // process still holding the old session has to go rather than be spoken to — answering down
         // it would continue exactly the conversation the rotation just ended.
@@ -2056,8 +2078,46 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // `McpOnly` already pushes the strict flag unconditionally, so this changes
             // nothing here — it is the same answer said in the request rather than inferred.
             ambient_mcp: false,
-            // An orchestrator turn is not a job node, so it has no role to route.
-            model: None,
+            // What the conversation was pinned to, or `None` for the runner's configured model.
+            //
+            // This was `None` unconditionally, with a comment saying an orchestrator turn has no
+            // role to route — true of JOB roles, and it read as though the field had no other use.
+            // It had: `cli_args` turns it into `--model`, so the one kind of run a person actually
+            // watches was the one kind that could not choose who answered it.
+            model: answering.model,
+            // `None` for every conversation that never asked, which leaves the CLI's own default in
+            // place — the behaviour every chat had before the column existed.
+            effort: answering.effort,
+            // Who answers when the chosen model is overloaded. Empty for every conversation that
+            // named nobody, which is the CLI's own behaviour: fail rather than quietly substitute.
+            fallback_model: answering.fallback_model,
+            // Beyond `cwd`, which is set just above and is where the turn actually runs. These only
+            // ever GRANT reach, so a conversation that named none is exactly as confined as before.
+            add_dirs: answering
+                .extra_dirs
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            // A ceiling on THIS answer, not on the conversation. The CLI stops the invocation; the
+            // wall clock around this call is still the other guard, and `max_turns` above is
+            // deliberately `None` here for the reason its own comment gives.
+            max_budget_usd: answering.turn_budget_usd,
+            // The helpers this conversation defined, ADDED to whatever the CLI finds in the
+            // project's own `.claude/agents/`. A conversation that defined none sends no flag, and
+            // that is not the same as sending an empty one — see `agents` on `RunRequest`.
+            agents: answering.agents.clone(),
+            // On EVERY turn, because the flag is per invocation and this daemon spawns one per
+            // turn. Instructions sent only on the first would govern the opening message and then
+            // quietly stop mattering — wrong in the way that is hardest to see, since the first
+            // answer is the right one.
+            append_system_prompt: answering.system_prompt.clone(),
+            // What this conversation is called, so the session it mints is findable in the CLI's
+            // own `--resume` picker instead of being one more nameless timestamp there.
+            session_name: answering.session_name.clone(),
+            // Merged with whatever `tool_policy` denies by `cli_args`, into one flag. This can only
+            // ever narrow: the allow-listing flag beside it grants rather than restricts, so there
+            // is no widening version of this to get wrong.
+            denied_tools: answering.denied_tools.clone(),
             // The wildcard, on purpose: an orchestrator turn acts for the person watching
             // the chat and carries the control token, so narrowing what it is offered would
             // only take away tools it is entitled to call.
@@ -2271,6 +2331,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -3195,17 +3256,17 @@ mod tests {
             .await
             .unwrap();
 
-        for _ in 0..500 {
-            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-                .bind(first)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-            if status == "completed" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Through the helper, not the row. `settled_turn` waits for the [`TurnGuard`] to drop as
+        // well as for the status to land; the raw poll that stood here watched `runs` alone, and
+        // its doc says why that is wrong in both directions. It also fell through in SILENCE when
+        // it timed out, so a slow run did not fail here — it failed four lines down, on the second
+        // `send_message`, as "a turn is already in progress for this chat". Observed in a full
+        // suite run, green on its own immediately after.
+        let (status, _) = settled_turn(&state.pool, first).await;
+        assert_eq!(
+            status, "completed",
+            "the mail-reading turn did not complete"
+        );
 
         assert_eq!(
             get_session(&state.pool, chat_id).await.unwrap(),
@@ -3607,6 +3668,7 @@ mod tests {
     fn with_files_root(state: AppState, root: std::path::PathBuf) -> AppState {
         AppState {
             files_root: Some(root),
+            workflow_library: None,
             ..state
         }
     }
@@ -3800,6 +3862,264 @@ mod tests {
         settled_turn(&state.pool, id).await;
 
         assert_eq!(runner.last_cwd.lock().unwrap().clone(), None);
+    }
+
+    /// The whole change, end to end: what a conversation CHOSE reaches the launch.
+    ///
+    /// `cli_args` proves the flags are built out of a request, and the fake runner proves what this
+    /// module puts in one. Between those two there was a gap wide enough for `model: None` to sit in
+    /// for the entire life of the feature — the flag existed, the field existed, and the one kind of
+    /// run a person actually watches was the one kind that could not reach either.
+    #[tokio::test]
+    async fn the_conversations_model_and_effort_reach_the_launch() {
+        let (state, _dir, runner) = errand_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &id, Some("opus"))
+            .await
+            .unwrap();
+        crate::chats::set_effort(&state.pool, &id, Some("xhigh"))
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        assert_eq!(
+            runner.last_model.lock().unwrap().clone(),
+            Some(Some("opus".to_string())),
+            "the conversation's model never reached the launch"
+        );
+        assert_eq!(
+            runner.last_effort.lock().unwrap().clone(),
+            Some(Some("xhigh".to_string())),
+            "the conversation's effort never reached the launch"
+        );
+    }
+
+    /// The other three of 0111, end to end: what a conversation was told reaches the launch.
+    #[tokio::test]
+    async fn a_conversations_reach_and_ceiling_reach_the_launch() {
+        let (state, dir, runner) = errand_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let extra = dir.path().join("beside");
+        std::fs::create_dir_all(&extra).unwrap();
+        crate::chats::set_fallback(
+            &state.pool,
+            &id,
+            &["opus".to_string(), "sonnet".to_string()],
+        )
+        .await
+        .unwrap();
+        crate::chats::set_extra_dirs(&state.pool, &id, &[extra.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        crate::chats::set_turn_budget(&state.pool, &id, Some(0.25))
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        assert_eq!(
+            runner.last_fallback_model.lock().unwrap().clone(),
+            Some(vec!["opus".to_string(), "sonnet".to_string()])
+        );
+        assert_eq!(
+            runner.last_add_dirs.lock().unwrap().clone(),
+            Some(vec![extra])
+        );
+        assert_eq!(
+            runner.last_max_budget_usd.lock().unwrap().clone(),
+            Some(Some(0.25))
+        );
+    }
+
+    /// The helpers a conversation defined reach the launch, with their names intact.
+    ///
+    /// The name is the thing worth asserting here: it is stored as the object's KEY, dropped from
+    /// the value on the way to the flag, and put back on the way out. Three places to lose it, and
+    /// a helper that arrives anonymous is one the model cannot delegate to.
+    #[tokio::test]
+    async fn the_helpers_a_conversation_defined_reach_the_launch() {
+        let (state, _dir, runner) = errand_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_agents(
+            &state.pool,
+            &id,
+            &[crate::runner::Subagent {
+                name: "reviewer".to_string(),
+                description: "Reviews code".to_string(),
+                prompt: "You are a code reviewer".to_string(),
+                model: Some("opus".to_string()),
+                effort: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        let sent = runner.last_agents.lock().unwrap().clone().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].name, "reviewer");
+        assert_eq!(sent[0].description, "Reviews code");
+        assert_eq!(sent[0].model.as_deref(), Some("opus"));
+    }
+
+    /// What a conversation was told about itself reaches the launch: its instructions, what it may
+    /// not reach for, and what to call its session.
+    #[tokio::test]
+    async fn a_conversations_instructions_and_denials_reach_the_launch() {
+        let (state, _dir, runner) = errand_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_system_prompt(&state.pool, &id, Some("Answer in Portuguese."))
+            .await
+            .unwrap();
+        crate::chats::set_denied_tools(&state.pool, &id, &["Bash".to_string()])
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &id, Some("o refactor do runner"))
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        assert_eq!(
+            runner.last_append_system_prompt.lock().unwrap().clone(),
+            Some(Some("Answer in Portuguese.".to_string()))
+        );
+        assert_eq!(
+            runner.last_denied_tools.lock().unwrap().clone(),
+            Some(vec!["Bash".to_string()])
+        );
+        // Cosmetic, and the reason it is carried at all: without it every session this daemon mints
+        // is a nameless timestamp in the CLI's own `--resume` picker.
+        assert_eq!(
+            runner.last_session_name.lock().unwrap().clone(),
+            Some(Some("o refactor do runner".to_string()))
+        );
+    }
+
+    /// The difference between the two context gestures, stated where it actually shows.
+    ///
+    /// Forgetting the session leaves the replay alone — the next turn starts on a fresh window and
+    /// is told what was recently said. Clearing moves the floor of that replay to now, so there is
+    /// nothing left to tell it. Both leave every turn in `runs`, readable, costing what it cost.
+    #[tokio::test]
+    async fn clearing_leaves_a_fresh_turn_with_nothing_to_replay() {
+        let state = test_state().await;
+        let chat_id = "cleared-chat";
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(chat_id)
+            .bind("2026-08-24T09:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        for (asked, answered) in [("primeira", "uma"), ("segunda", "duas")] {
+            sqlx::query(
+                "INSERT INTO runs (chat_id, mode, status, prompt, stdout, created_at)
+                 VALUES (?, 'assistant', 'completed', ?, ?, ?)",
+            )
+            .bind(chat_id)
+            .bind(asked)
+            .bind(answered)
+            .bind("2026-08-24T09:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        // Before: a fresh turn would be handed both exchanges.
+        assert_eq!(
+            recent_exchanges(&state.pool, chat_id).await.unwrap().len(),
+            2
+        );
+
+        crate::chats::clear_context(&state.pool, chat_id)
+            .await
+            .unwrap();
+
+        assert!(
+            recent_exchanges(&state.pool, chat_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a cleared conversation still had something to replay"
+        );
+        // And the turns are still there. Clearing decides what the MODEL is shown, not what
+        // happened — the window draws all of it either way.
+        let still: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE chat_id = ? AND mode = 'assistant'",
+        )
+        .bind(chat_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(still, 2);
+    }
+
+    /// The tail an editor session was picked up with is older than every turn here, so a cut
+    /// anywhere in the conversation is a cut above it. Without this, a clear would leave the one
+    /// piece of history it was most obviously asked to drop.
+    #[tokio::test]
+    async fn clearing_also_drops_the_tail_the_conversation_was_picked_up_with() {
+        let state = test_state().await;
+        let chat_id = "cleared-pickup";
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, ide_session_id, handover)
+             VALUES (?, 'cloud', ?, 'sess-1', ?)",
+        )
+        .bind(chat_id)
+        .bind("2026-08-24T09:00:00Z")
+        .bind(r#"[["o que fizemos?","isto e aquilo"]]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(handed_over(&state.pool, chat_id).await.len(), 1);
+
+        crate::chats::clear_context(&state.pool, chat_id)
+            .await
+            .unwrap();
+
+        assert!(handed_over(&state.pool, chat_id).await.is_empty());
+    }
+
+    /// And a conversation that chose nothing overrides nothing, which leaves the runner's configured
+    /// model and the CLI's own effort exactly where they were. That is what every chat in this
+    /// daemon did before these columns existed, and an upgrade must not change it.
+    #[tokio::test]
+    async fn a_conversation_that_chose_nothing_overrides_nothing() {
+        let (state, _dir, runner) = errand_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        assert_eq!(runner.last_model.lock().unwrap().clone(), Some(None));
+        assert_eq!(runner.last_effort.lock().unwrap().clone(), Some(None));
     }
 
     #[tokio::test]
@@ -5173,6 +5493,14 @@ mod tests {
             messages: None,
             ambient_mcp: false,
             model: Some("sonnet".to_owned()),
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
             allowed_mcp_tools: None,
         }
     }

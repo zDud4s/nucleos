@@ -1822,6 +1822,7 @@ mod tests {
             web: Arc::new(crate::web::WebRuntime::disabled()),
             calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
             council: Arc::new(crate::council::CouncilRuntime::default()),
+            workflow_library: None,
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }

@@ -267,6 +267,30 @@
   background: var(--tone-danger-fg);
 }
 
+/* What a project is doing without being asked, in the width of a dot.
+   The three tones are already named after the three modes, so the mapping is a
+   substitution rather than a table — a fourth mode would fail visibly here
+   (no colour) instead of silently picking a wrong one. Hollow for `off`: the
+   ring says the project is known and the absent fill says nothing is running,
+   which a grey dot would leave ambiguous against a dimmed row. */
+.nav-mode {
+  flex: none;
+  width: 0.4rem;
+  height: 0.4rem;
+  margin-right: 0.1rem;
+  border-radius: var(--radius-pill);
+  background: var(--tone-active-fg);
+}
+
+.nav-mode[data-mode="shadow"] {
+  background: var(--tone-shadow-fg);
+}
+
+.nav-mode[data-mode="off"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--tone-off-fg);
+}
+
 /* ---------------------------------------------------------- nav: footer -- */
 
 .nav-footer {

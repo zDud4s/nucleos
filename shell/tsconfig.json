@@ -14,6 +14,11 @@
     "noEmit": true,
     "jsx": "react-jsx",
 
+    /* What generated registry components import by. The matching alias lives in
+       vite.config.ts; TypeScript resolves this one and Vite resolves that one. */
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] },
+
     /* Linting */
     "strict": true,
     "noUnusedLocals": true,

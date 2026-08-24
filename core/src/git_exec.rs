@@ -67,14 +67,15 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
-/// **`git`, `add_worktree`, `repo_key`, `current_branch` and `toplevel` are the only sanctioned
-/// production entries**, and a new caller belongs behind one of them rather than here: each is a
-/// place where whatever is left of the operation's budget is computed and an already-spent one is
-/// refused *before* a child is spawned, which `output()` would otherwise do eagerly. The last three
-/// are on the list because they pass that same test rather than because they arrived later — each
-/// computes its own remaining budget and returns without spawning when there is none. A caller that
-/// reaches past the five takes its `Duration` from somewhere else and quietly loses that gate. Naming them makes the gate greppable rather than conventional. The tests below call this directly on purpose — they are
-/// testing the transport itself.
+/// **`git`, `add_worktree`, `repo_key`, `current_branch`, `toplevel` and `origin_and_head` are the
+/// only sanctioned production entries**, and a new caller belongs behind one of them rather than
+/// here: each is a place where whatever is left of the operation's budget is computed and an
+/// already-spent one is refused *before* a child is spawned, which `output()` would otherwise do
+/// eagerly. The last four are on the list because they pass that same test rather than because they
+/// arrived later — each computes its own remaining budget and returns without spawning when there
+/// is none. A caller that reaches past the six takes its `Duration` from somewhere else and quietly
+/// loses that gate. Naming them makes the gate greppable rather than conventional. The tests below
+/// call this directly on purpose — they are testing the transport itself.
 ///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
 /// `TailBuffer`. That is not an oversight: a gate runs a test suite, which can print without bound
@@ -522,6 +523,73 @@ pub async fn toplevel(
     Ok(std::path::PathBuf::from(
         canonical(Path::new(toplevel.trim())).await?,
     ))
+}
+
+/// Where a repository points and what it last did, for a folder nobody has registered yet.
+///
+/// A sixth sanctioned entry to `run_git`: it computes what is left of the budget before each spawn
+/// and returns without spawning when there is none, which is the property that list protects.
+///
+/// **Both halves are optional and neither absence is an error.** A repository with no `origin` is
+/// ordinary — a local-only project is a project — and one with no commits is a repository somebody
+/// made this morning. The caller is a wizard showing a person what is in a folder, and "there is no
+/// remote" is information rather than a failure to look.
+pub async fn origin_and_head(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> (Option<String>, Option<String>) {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return (None, None);
+    }
+    let remote = run_git(
+        path,
+        &[
+            OsStr::new("remote"),
+            OsStr::new("get-url"),
+            OsStr::new("origin"),
+        ],
+        budget,
+    )
+    .await
+    .ok()
+    .filter(|result| result.succeeded())
+    .and_then(|result| {
+        result
+            .stdout
+            .lines()
+            .next()
+            .map(|line| line.trim().to_owned())
+    })
+    .filter(|line| !line.is_empty());
+
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return (remote, None);
+    }
+    let head = run_git(
+        path,
+        &[
+            OsStr::new("log"),
+            OsStr::new("-1"),
+            OsStr::new("--date=short"),
+            OsStr::new("--format=%h %ad %s"),
+        ],
+        budget,
+    )
+    .await
+    .ok()
+    .filter(|result| result.succeeded())
+    .and_then(|result| {
+        result
+            .stdout
+            .lines()
+            .next()
+            .map(|line| line.trim().to_owned())
+    })
+    .filter(|line| !line.is_empty());
+
+    (remote, head)
 }
 
 /// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it

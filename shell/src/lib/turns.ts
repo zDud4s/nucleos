@@ -232,9 +232,16 @@ export function merge(history: Turn[], local: Turn[]): Turn[] {
  * `previous === null` — the transcript's first turn — draws neither mark:
  * there is nothing before it to have changed from.
  */
-export type Mark = { kind: "brain"; from: Brain; to: Brain } | { kind: "restart" };
+export type Mark =
+  | { kind: "brain"; from: Brain; to: Brain }
+  | { kind: "restart" }
+  | { kind: "cleared" };
 
-export function marksBetween(previous: Turn | null, turn: Turn): Mark[] {
+export function marksBetween(
+  previous: Turn | null,
+  turn: Turn,
+  clearedAfter: number | null,
+): Mark[] {
   if (previous === null) return [];
   const marks: Mark[] = [];
   if (
@@ -244,7 +251,18 @@ export function marksBetween(previous: Turn | null, turn: Turn): Mark[] {
   ) {
     marks.push({ kind: "brain", from: previous.answeredBy, to: turn.answeredBy });
   }
-  if (previous.sessionId !== null && turn.sessionId !== null && previous.sessionId !== turn.sessionId) {
+  // A clear always restarts the session too, so both rules match and only one thing happened.
+  // `cleared` wins because it is the whole truth: the restart mark's own words promise the model
+  // was read the last few exchanges, and past a clear it was read nothing at all.
+  const cleared =
+    clearedAfter !== null && previous.id <= clearedAfter && turn.id > clearedAfter;
+  if (cleared) {
+    marks.push({ kind: "cleared" });
+  } else if (
+    previous.sessionId !== null &&
+    turn.sessionId !== null &&
+    previous.sessionId !== turn.sessionId
+  ) {
     marks.push({ kind: "restart" });
   }
   return marks;

@@ -45,3 +45,20 @@ afterEach(cleanup);
 // The absence is a fact about jsdom, not about the type.
 const elementProto = Element.prototype as { scrollIntoView?: () => void };
 elementProto.scrollIntoView ??= () => {};
+
+// The same kind of gap, one layer up: jsdom implements no layout, so it ships no
+// `ResizeObserver`. `cmdk` — the list inside the conversation finder — constructs one on
+// mount, and the bare `ReferenceError` that follows unmounts the whole tree into the
+// router's error boundary, so the failure reads as "the palette does not render" rather
+// than "this environment has no layout".
+//
+// A stub that observes nothing is the honest shape of it: there are no sizes to report
+// here, and a fake that invented some would let a test assert behaviour no browser
+// would reproduce.
+class NoLayoutResizeObserver {
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+const withObserver = globalThis as { ResizeObserver?: typeof ResizeObserver };
+withObserver.ResizeObserver ??= NoLayoutResizeObserver as unknown as typeof ResizeObserver;

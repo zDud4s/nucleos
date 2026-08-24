@@ -1,0 +1,228 @@
+/**
+ * Tailwind, wired to this app's tokens rather than to its own defaults.
+ *
+ * Three things are happening here, and each one is load-bearing.
+ *
+ * **Preflight is deliberately absent.** The individual imports below are the
+ * documented way to take Tailwind without its reset. `base.css` already owns the
+ * document — box model, ground, focus, scrollbars — and two resets fighting over
+ * the same elements is how a migration starts by changing pixels nobody asked it
+ * to change. Preflight comes back, if ever, when `base.css` is retired.
+ *
+ * **Every namespace this file touches is cleared before it is filled.** A
+ * component pasted from a registry that reaches for `text-violet-400` or
+ * `shadow-2xl` compiles to *nothing*, and the decoration shows up at build time
+ * instead of in review. That is what makes "colour is information" a property of
+ * the build rather than a discipline somebody has to remember.
+ *
+ * **Colours arrive by reference, not by value.** `@theme inline` emits `var()`
+ * rather than the resolved colour, so `tokens.css` stays the single source and its
+ * `prefers-color-scheme: light` block keeps working without a line of duplication.
+ * The names differ from the token names — `--color-bg` against `--bg` — because a
+ * theme variable that references itself is a cycle.
+ *
+ * The scales below (type, radii, tracking) are NOT theme-dependent: `tokens.css`
+ * says so itself, and does not redefine them under light. They are the one thing
+ * here written as literals, and `tokens.test.ts` fails if they ever drift from
+ * `tokens.css`.
+ *
+ * Spacing is left at Tailwind's default on purpose: its 0.25rem step *is* the 4px
+ * grid this app already uses, so mapping it would be duplication with no gain.
+ */
+
+@layer theme, base, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+/* @import "tailwindcss/preflight.css" layer(base);  — see the note above. */
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* --------------------------------------------------- a colour for borders -- */
+
+/**
+ * What `border` alone means, for the components that ship with it.
+ *
+ * Tailwind v4 defaults an uncoloured border to `currentColor`, and normally
+ * falls back to a grey from its own palette. That palette is cleared below, so a
+ * registry component whose class list says just `border` — which is most of them —
+ * drew a **near-white** outline in the app: the text colour, at full strength,
+ * around a menu. Seen on screen before it was understood.
+ *
+ * Scoped to `[data-slot]` rather than to `*`. Every element these components
+ * render carries that attribute, and every element this app already had has an
+ * explicit border colour of its own, so a global reset would be a wide change to
+ * fix a narrow thing.
+ */
+@layer base {
+  [data-slot] {
+    border-color: var(--border);
+  }
+}
+
+/* ------------------------------------------------------------- cleared -- */
+
+@theme {
+  --color-*: initial;
+  --text-*: initial;
+  --font-*: initial;
+  --font-weight-*: initial;
+  --leading-*: initial;
+  --tracking-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+}
+
+/* ------------------------------------------- by reference, theme-aware -- */
+
+/**
+ * The two achromatic primitives, readmitted on purpose.
+ *
+ * Clearing `--color-*` was aimed at decorative HUES — the violets and the zincs
+ * a registry component brings with it. It also took black and white, and those
+ * are not decoration: a modal scrim is `bg-black/50` in every shadcn overlay,
+ * and with `--color-black` gone that class compiled to nothing and the dialog
+ * opened over an undimmed page. Found by opening the palette and seeing no
+ * scrim, not by reading the stylesheet.
+ */
+@theme {
+  --color-black: #000;
+  --color-white: #fff;
+}
+
+/**
+ * Anything that changes with the light in the room comes through `var()`, so
+ * that the light theme is still decided in one place: `tokens.css`.
+ */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-sunken: var(--surface-sunken);
+
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+
+  --color-text: var(--text);
+  --color-text-muted: var(--text-muted);
+  --color-text-faint: var(--text-faint);
+
+  --color-accent: var(--accent);
+  --color-accent-quiet: var(--accent-quiet);
+  --color-accent-ink: var(--accent-ink);
+  --color-focus-ring: var(--focus-ring);
+
+  --color-solid: var(--solid);
+  --color-solid-ink: var(--solid-ink);
+
+  /* The seven state tones. `state-map.ts` decides which one a thing gets; this
+     only decides what each one looks like. */
+  --color-tone-active-fg: var(--tone-active-fg);
+  --color-tone-active-bg: var(--tone-active-bg);
+  --color-tone-active-border: var(--tone-active-border);
+
+  --color-tone-shadow-fg: var(--tone-shadow-fg);
+  --color-tone-shadow-bg: var(--tone-shadow-bg);
+  --color-tone-shadow-border: var(--tone-shadow-border);
+
+  --color-tone-off-fg: var(--tone-off-fg);
+  --color-tone-off-bg: var(--tone-off-bg);
+  --color-tone-off-border: var(--tone-off-border);
+
+  --color-tone-pending-fg: var(--tone-pending-fg);
+  --color-tone-pending-bg: var(--tone-pending-bg);
+  --color-tone-pending-border: var(--tone-pending-border);
+
+  --color-tone-paused-fg: var(--tone-paused-fg);
+  --color-tone-paused-bg: var(--tone-paused-bg);
+  --color-tone-paused-border: var(--tone-paused-border);
+
+  --color-tone-danger-fg: var(--tone-danger-fg);
+  --color-tone-danger-bg: var(--tone-danger-bg);
+  --color-tone-danger-border: var(--tone-danger-border);
+
+  --color-tone-info-fg: var(--tone-info-fg);
+  --color-tone-info-bg: var(--tone-info-bg);
+  --color-tone-info-border: var(--tone-info-border);
+
+  /**
+   * Shadows are theme-dependent too, and their token names would collide with
+   * Tailwind's `--shadow-*` namespace — a variable defined as `var()` of itself
+   * is a cycle. So they are renamed for what they are used for rather than for
+   * how big they are: `shadow-raise`, `shadow-float`, `shadow-overlay`.
+   */
+  --shadow-raise: var(--shadow-sm);
+  --shadow-float: var(--shadow-md);
+  --shadow-overlay: var(--shadow-lg);
+
+  /**
+   * The names shadcn-shaped components reach for, pointed at this app's tokens.
+   *
+   * Without these, every component copied out of a registry arrives colourless —
+   * `bg-background` and `text-muted-foreground` would resolve to nothing, because
+   * the namespace was cleared. That is the correct behaviour for *decoration* and
+   * the wrong one for structure, so the structural names are given a home and the
+   * decorative ones are not.
+   *
+   * One collision to know about: shadcn uses `accent` for a hover background,
+   * while `--accent` here is the one brand colour and means the wordmark, links
+   * and the focus ring. `--color-accent` stays pointed at the brand, so a pasted
+   * component that hovers with `bg-accent` will flash cyan and has to be changed
+   * to `bg-surface-raised` by hand. Loud on arrival, which is the point.
+   */
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--text);
+  --color-popover: var(--surface-raised);
+  --color-popover-foreground: var(--text);
+  --color-muted: var(--surface);
+  --color-muted-foreground: var(--text-muted);
+  --color-input: var(--border);
+  --color-ring: var(--focus-ring);
+  --color-primary: var(--solid);
+  --color-primary-foreground: var(--solid-ink);
+  --color-secondary: var(--surface-raised);
+  --color-secondary-foreground: var(--text);
+  --color-destructive: var(--tone-danger-fg);
+  --color-destructive-foreground: var(--text);
+}
+
+/* ------------------------------------------------ by value, fixed scales -- */
+
+/**
+ * Facts about the layout, not about the light in the room. Kept in step with
+ * `tokens.css` by `tokens.test.ts`, which reads both files and fails on drift.
+ */
+@theme {
+  /* The same three stacks `tokens.css` declares. Written out rather than
+     referenced because `--font-display: var(--font-display)` is a cycle: the
+     token name and Tailwind's namespace are the same word. */
+  --font-display: "Cabinet Grotesk", "General Sans", system-ui, sans-serif;
+  --font-body: "General Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Spline Sans Mono", ui-monospace, "Cascadia Mono", monospace;
+
+  --text-xs: 0.6875rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --text-3xl: 2.25rem;
+
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  --leading-tight: 1.2;
+  --leading-snug: 1.35;
+  --leading-normal: 1.55;
+
+  --tracking-wide: 0.08em;
+  --tracking-wider: 0.14em;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
+}

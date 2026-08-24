@@ -54,11 +54,28 @@ beforeEach(() => {
 
 /* ------------------------------------------------------------ fixtures -- */
 
+/** One conversation, already pinned, for tests about the controls rather than the list. */
+function chatSummaryFetchWith(overrides: Partial<ChatSummary>) {
+  return chatsFetch([chatSummary(overrides)], { [overrides.chat_id ?? "c-1"]: [] });
+}
+
+/** What `claude --help` documents at CLI 2.1.198, weakest first. */
+const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
 function chatSummary(overrides: Partial<ChatSummary> = {}): ChatSummary {
   return {
     chat_id: "c-1",
     title: null,
     brain: "cloud",
+    model: null,
+    effort: null,
+    fallback_model: null,
+    extra_dirs: [],
+    turn_budget_usd: null,
+    agents: [],
+    system_prompt: null,
+    denied_tools: [],
+    cleared_after_run_id: null,
     created_at: "2026-08-18T09:00:00Z",
     cwd: null,
     ide_session_id: null,
@@ -131,6 +148,8 @@ function chatsFetch(
     files?: Record<string, Mention[]>;
     /** The slash commands each conversation offers, by chat id. */
     commands?: Record<string, Command[]>;
+    /** The slash commands the front door offers, where there is no conversation to key on. */
+    frontCommands?: Command[];
     /** What is waiting to be said to each conversation, by chat id. */
     queued?: Record<string, Array<{ id: number; text: string }>>;
     /** What each conversation is being held on, by chat id. */
@@ -155,6 +174,28 @@ function chatsFetch(
     }
     if (path === "/assistant/chats") return chats;
     if (path === "/assistant/local-model") return { available: opts.localAvailable ?? true };
+    // The daemon's own shipped default, plus the local model this machine's config names. Written
+    // out rather than derived: this fixture is what the picker is asserted against, and a fixture
+    // that computed itself from the same list the assertions use would agree with anything.
+    // Deliberately short. The daemon's real list is wider than any one CLI version's tool set on
+    // purpose; what the window has to get right is that it draws whatever it is served.
+    if (path === "/assistant/tools") {
+      return { tools: ["Bash", "Edit", "Read", "WebFetch"] };
+    }
+    if (path === "/assistant/models") {
+      return {
+        choices: [
+          { id: "opus", label: "Opus", brain: "cloud", efforts: CLAUDE_EFFORTS },
+          { id: "sonnet", label: "Sonnet", brain: "cloud", efforts: CLAUDE_EFFORTS },
+          // Deliberately shorter than the others: the picker must draw THIS model's levels and not
+          // the union, and a fixture where every model agreed could not tell the two apart.
+          { id: "fable", label: "Fable", brain: "cloud", efforts: ["low", "medium", "high"] },
+          { id: "qwen3.5:4b", label: "qwen3.5:4b", brain: "local", efforts: [] },
+        ],
+        configured: "claude-sonnet-5",
+        efforts: CLAUDE_EFFORTS,
+      };
+    }
     const live = /^\/assistant\/(\d+)\/live$/.exec(path);
     // Undefined is the daemon's 204: nothing is writing, which is not the same as writing nothing.
     if (live !== null) return (opts.live ?? {})[Number(live[1])];
@@ -184,6 +225,16 @@ function chatsFetch(
     }
     // Before the transcript match below: that pattern would not hit a path with a further
     // segment, but the order is what makes that true rather than a coincidence.
+    // The front door's own, with no chat in the path: the same shape, from `opts.frontCommands`.
+    const front = /^\/assistant\/commands\?q=(.*)$/.exec(path);
+    if (front !== null) {
+      const query = decodeURIComponent(front[1]).toLowerCase();
+      return {
+        commands: (opts.frontCommands ?? []).filter((hit) =>
+          hit.name.toLowerCase().includes(query),
+        ),
+      };
+    }
     const commands = /^\/assistant\/chats\/([^/?]+)\/commands\?q=(.*)$/.exec(path);
     if (commands !== null) {
       const offered = opts.commands?.[decodeURIComponent(commands[1])] ?? [];
@@ -283,13 +334,14 @@ describe("Chats - a turn already in flight", () => {
     // The message was refused, not sent — the draft is exactly what was typed.
     expect(textarea.value).toBe("are you still there?");
 
-    // The brain picker is a different mutation and was never touched by the
+    // The model picker is a different mutation and was never touched by the
     // composer's failure — it still takes a click and still writes.
-    fireEvent.click(await screen.findByRole("button", { name: "Local" }));
+    await openModelMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Opus/ }));
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
         method: "PATCH",
-        body: JSON.stringify({ brain: "local" }),
+        body: JSON.stringify({ model: "opus" }),
       });
     });
   });
@@ -398,12 +450,646 @@ function afterDwell(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 350));
 }
 
+/**
+ * Open the conversation's `⋯` menu.
+ *
+ * Archive is the only thing behind it. Which model answers and plan-only were here too
+ * and moved into the composer, where the words they govern are being written — so only
+ * archiving still has to open this.
+ * Radix opens on `pointerdown`, not on `click`, which is why firing a click alone
+ * leaves the menu shut and the control absent rather than merely hidden.
+ */
+async function openConversationSettings(): Promise<void> {
+  const more = await screen.findByRole("button", { name: "Conversation settings" });
+  fireEvent.pointerDown(more, { pointerType: "mouse", button: 0 });
+  fireEvent.click(more);
+}
+
+/** The model menu, which lives in the composer. Same Radix `pointerdown` rule as above. */
+async function openModelMenu(): Promise<void> {
+  const trigger = await screen.findByRole("button", { name: /change the model/i });
+  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+  fireEvent.click(trigger);
+}
+
+/** The effort menu, its own control beside the model's rather than a submenu inside it. */
+async function openEffortMenu(): Promise<void> {
+  const trigger = await screen.findByRole("button", { name: /^effort:/i });
+  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+  fireEvent.click(trigger);
+}
+
+describe("Chats - choosing a model", () => {
+  it("offers the daemon's list rather than a list of its own", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    // Every name here came over the wire. The agent CLI cannot enumerate its own models, so a list
+    // written into the window would be an assertion going stale where nobody who can fix it looks.
+    for (const label of ["Opus", "Sonnet", "Fable", "qwen3.5:4b"]) {
+      expect(await screen.findByRole("menuitemradio", { name: new RegExp(`^${label}`) })).toBeDefined();
+    }
+  });
+
+  it("names the unpinned state instead of leaving nothing selected", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const following = await screen.findByRole("menuitemradio", { name: /whatever is configured/i });
+    expect(following.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("unpins by sending an explicit null, which is not the same as sending nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "opus" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /whatever is configured/i }));
+
+    // `undefined` would be dropped by JSON.stringify and read by the daemon as "leave it alone" —
+    // the one thing an unpin is not.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ model: null }),
+      });
+    });
+  });
+
+  it("writes the effort on its own, without touching which model answers", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openEffortMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "xhigh" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ effort: "xhigh" }),
+      });
+    });
+  });
+
+  it("offers each model its own effort levels, not the union of everyone's", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "fable" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openEffortMenu();
+
+    // Fable's list stops at `high` in the fixture. `xhigh` is on the union and on other models, and
+    // offering it here would be a level that dies at spawn.
+    expect(await screen.findByRole("menuitemradio", { name: "high" })).toBeDefined();
+    expect(screen.queryByRole("menuitemradio", { name: "xhigh" })).toBeNull();
+    expect(screen.queryByRole("menuitemradio", { name: "max" })).toBeNull();
+  });
+
+  it("closes the effort dial on a model that has none, rather than offering one that turns nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "qwen3.5:4b", brain: "local" })], {
+        "c-1": [],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Disabled and still there. Removing it would make the row jump as you switch models, and would
+    // read as a feature that is missing rather than one that does not apply to this model.
+    const dial = await screen.findByRole("button", { name: /has no effort setting/i });
+    expect((dial as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("keeps the model and the effort as two controls, not one inside the other", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatSummaryFetchWith({ chat_id: "c-1", model: "sonnet", effort: "high" }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Two triggers, side by side. They are two decisions and a person changes them separately —
+    // most often the effort, on a model they already chose — and a dial buried one level down is
+    // one you have to remember is there.
+    expect(await screen.findByRole("button", { name: /answered by sonnet/i })).toBeDefined();
+    expect(await screen.findByRole("button", { name: /^effort: high/i })).toBeDefined();
+
+    // And opening the model menu offers models only.
+    await openModelMenu();
+    expect(screen.queryByRole("menuitemradio", { name: "xhigh" })).toBeNull();
+  });
+
+  it("carries the choice into the first message from the front door", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+
+    await renderChats("/chats");
+    await openModelMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Fable/ }));
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    // On the opening call and not as a PATCH afterwards: there is no conversation to PATCH until
+    // this returns, and correcting one a round trip later is visible — and wrong if it fails.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats", {
+        method: "POST",
+        body: JSON.stringify({ model: "fable" }),
+      });
+    });
+  });
+});
+
+describe("Chats - the front door's own slash", () => {
+  const brainstorm: Command = {
+    name: "superpowers:brainstorm",
+    description: "Turn an idea into a design",
+    hint: null,
+    source: "plugin",
+  };
+
+  it("offers commands before there is a conversation to offer them for", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/brain", selectionStart: 6 } });
+
+    // A command needs no conversation: the personal ones and the installed plugins' are the same
+    // wherever this ends up. Offering nothing here was the front door pretending the gesture did
+    // not exist, which is the first gesture anybody tries.
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+    expect(within(list).getByText("/superpowers:brainstorm")).toBeTruthy();
+  });
+
+  it("writes the chosen command into the box, with a space for its argument", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "/brain", selectionStart: 6 } });
+    fireEvent.click(await screen.findByText("/superpowers:brainstorm"));
+
+    await waitFor(() => {
+      expect(box.value).toBe("/superpowers:brainstorm ");
+    });
+  });
+
+  it("says why an @ has nothing to offer here, rather than swallowing it", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "@core", selectionStart: 5 },
+    });
+
+    // An `@` names files inside the conversation's folder and there is no folder yet. A list that
+    // silently never appears is indistinguishable from a feature that is broken.
+    expect(await screen.findByText(/has no folder yet/i)).toBeDefined();
+  });
+});
+
+describe("Chats - what a conversation is told, and what it may not touch", () => {
+  async function openMenuItem(name: RegExp): Promise<void> {
+    await openConversationSettings();
+    const item = await screen.findByRole("menuitem", { name });
+    fireEvent.pointerDown(item, { pointerType: "mouse", button: 0 });
+    fireEvent.click(item);
+  }
+
+  it("appends standing instructions and never offers to replace the system prompt", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openMenuItem(/standing instructions/i);
+
+    // The copy has to say "added to", because the flag behind it appends. A dialog that read as a
+    // replacement would have people writing instructions meant to override the model's own.
+    expect(await screen.findByText(/added to what this conversation's model is already told/i))
+      .toBeDefined();
+
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "Answer in European Portuguese." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ system_prompt: "Answer in European Portuguese." }),
+      });
+    });
+  });
+
+  it("emptying the instructions clears them with a null rather than a blank", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", system_prompt: "Answer in Portuguese." })], {
+        "c-1": [],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openMenuItem(/standing instructions/i);
+    fireEvent.change(await screen.findByLabelText("Instructions"), { target: { value: "  " } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ system_prompt: null }),
+      });
+    });
+  });
+
+  it("bars a tool from a list the daemon serves, never from one typed here", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    const trigger = await screen.findByRole("menuitem", { name: /cannot use/i });
+    fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+    fireEvent.click(trigger);
+
+    // Checkboxes over served names. A typed rule that matches no tool is one line on the CLI's
+    // stderr — in this app, a restriction somebody set and nobody applied.
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: "Bash" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ denied_tools: ["Bash"] }),
+      });
+    });
+  });
+
+  it("asks for a fresh context in one click, and for a clear in two", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    fireEvent.click(await screen.findByRole("button", { name: /fresh context/i }));
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/fresh-context", {
+        method: "POST",
+      });
+    });
+
+    // The stronger one is behind the interlock: the floor only ever moves forward, so pressing it
+    // again cannot undo it.
+    fireEvent.click(screen.getByRole("button", { name: /^clear$/i }));
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/chats/c-1/clear", {
+      method: "POST",
+    });
+    const confirm = await screen.findByRole("button", { name: /the turns stay/i });
+    // The 300ms dwell: a click inside it is read as the tail of a double-click and swallowed, so
+    // the two clicks have to be apart in TIME and not only in await points.
+    await afterDwell();
+    fireEvent.click(confirm);
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/clear", { method: "POST" });
+    });
+  });
+
+  it("marks the transcript where the conversation was cleared", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cleared_after_run_id: 1 })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "antes", answer: "uma", session_id: "s-1" }),
+          turnRow({ id: 2, asked: "depois", answer: "duas", session_id: "s-2" }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // And it says the right thing. The restart note this replaces promises the model "was read the
+    // last few exchanges back" — which is precisely what a clear makes untrue.
+    expect(await screen.findByText(/cleared here/i)).toBeDefined();
+    expect(screen.queryByText(/was read the last few exchanges back/i)).toBeNull();
+  });
+});
+
+describe("Chats - the helpers a conversation may hand work to", () => {
+  /** Opens the ⋯ and then the helper editor. The item is a menu ITEM, not a submenu. */
+  async function openHelpers(): Promise<void> {
+    await openConversationSettings();
+    const item = await screen.findByRole("menuitem", { name: /helpers/i });
+    fireEvent.pointerDown(item, { pointerType: "mouse", button: 0 });
+    fireEvent.click(item);
+  }
+
+  it("writes a helper and saves the whole set in one gesture", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "reviewer" } });
+    fireEvent.change(screen.getByLabelText("When to use it"), {
+      target: { value: "Reviews a diff for correctness" },
+    });
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "You are a code reviewer." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    // One PATCH carrying the WHOLE set — which is how the daemon stores it, and what makes "two
+    // windows saved at once" answerable with "the last one wins" instead of a merge rule.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({
+          agents: [
+            {
+              name: "reviewer",
+              description: "Reviews a diff for correctness",
+              prompt: "You are a code reviewer.",
+              model: null,
+              effort: null,
+            },
+          ],
+        }),
+      });
+    });
+  });
+
+  it("says why a helper would be refused, in place, before anything is sent", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "-x" } });
+
+    // The daemon answers a bad set with a bare 400 and no body. Without this, a dialog holding five
+    // helpers would say "no" without saying which one or why.
+    expect(await screen.findByRole("alert")).toBeDefined();
+    expect(screen.getByText(/reads as a flag/i)).toBeDefined();
+    const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+  });
+
+  it("refuses two helpers of one name rather than letting one replace the other", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [{ name: "reviewer", description: "d", prompt: "p" }],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+    // The second row's fields, which are the last of each label on the page.
+    const names = screen.getAllByLabelText("Name");
+    fireEvent.change(names[names.length - 1], { target: { value: "reviewer" } });
+
+    // Two of one name collapse into one on the way into the object the flag takes, and the person
+    // watches the other vanish without being told.
+    //
+    // BOTH rows are flagged, and that is the point: neither of them is "the duplicate". Marking
+    // only the second would say the first is fine and the newcomer is the mistake, when what is
+    // actually true is that these two cannot both exist.
+    await waitFor(() => {
+      expect(screen.getAllByText(/already has this name/i)).toHaveLength(2);
+    });
+  });
+
+  it("offers a helper only the levels its own model takes", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [{ name: "reviewer", description: "d", prompt: "p", model: "fable" }],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+
+    // Fable stops at `high` in the fixture. A menu built from the union would offer `max` and the
+    // door would refuse it — for a field the person could not see was wrong.
+    const effort = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
+    const levels = Array.from(effort.options).map((option) => option.value);
+    expect(levels).toContain("high");
+    expect(levels).not.toContain("max");
+  });
+
+  it("does not offer a local model, which the agent CLI has never heard of", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+
+    // A helper runs INSIDE the agent CLI. A local name there is handed to a process that cannot
+    // resolve it, and the turn dies at spawn.
+    const model = screen.getByLabelText("Model") as HTMLSelectElement;
+    const ids = Array.from(model.options).map((option) => option.value);
+    expect(ids).toContain("opus");
+    expect(ids).not.toContain("qwen3.5:4b");
+  });
+
+  it("removing every helper saves an empty set rather than saying nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [{ name: "reviewer", description: "d", prompt: "p" }],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /remove/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    // `[]` and not an omitted field: absent means "leave them alone", which is the one thing
+    // clearing is not.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ agents: [] }),
+      });
+    });
+  });
+});
+
+describe("Chats - what a conversation may reach and spend", () => {
+  /** Opens one of the submenus behind the ⋯. Same Radix `pointerdown` rule as everywhere else. */
+  async function openSetting(name: RegExp): Promise<void> {
+    await openConversationSettings();
+    const trigger = await screen.findByRole("menuitem", { name });
+    fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+    fireEvent.click(trigger);
+  }
+
+  it("says per turn and never budget, because that is what the flag bounds", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", turn_budget_usd: 0.5 })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/spends at most/i);
+
+    // The CLI's ceiling bounds one invocation and the daemon spawns one per turn. Ten turns at the
+    // ceiling cost ten times it, and a control that let somebody read it as a total would be lying
+    // about money — which is the one thing this app is built not to do.
+    expect(await screen.findByText(/per turn, not per conversation/i)).toBeDefined();
+  });
+
+  it("sets a ceiling, and clears it with an explicit null", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/spends at most/i);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /\$1\.00 a turn/ }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ turn_budget_usd: 1 }),
+      });
+    });
+  });
+
+  it("clears the ceiling with a null rather than by saying nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", turn_budget_usd: 2 })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/spends at most/i);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^no ceiling/ }));
+
+    // `undefined` would be dropped by JSON.stringify and read as "leave it alone" — the one thing
+    // clearing is not.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ turn_budget_usd: null }),
+      });
+    });
+  });
+
+  it("grants a folder the editor already knows, so no path is ever typed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], { "c-1": [] }, {
+        ideSessions: [
+          {
+            session_id: "s-1",
+            title: "beside",
+            cwd: "C:/Projects/outro",
+            last_activity: "2026-08-23T09:00:00Z",
+            tools: true,
+          },
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/also reaches/i);
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: "C:/Projects/outro" }));
+
+    // Every path offered is one a real session ran in, so it is absolute and it exists — the two
+    // things the daemon refuses a PATCH for. A text field would invite failing a rule nobody sees.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ extra_dirs: ["C:/Projects/outro"] }),
+      });
+    });
+  });
+
+  it("does not offer the folder the conversation already runs in", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], { "c-1": [] }, {
+        ideSessions: [
+          {
+            session_id: "s-1",
+            title: "same",
+            cwd: "C:/Projects/nucleos",
+            last_activity: "2026-08-23T09:00:00Z",
+            tools: true,
+          },
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    // Its own directory is not "extra", and offering it would be a checkbox that grants nothing.
+    const trigger = await screen.findByRole("menuitem", { name: /also reaches/i });
+    expect(trigger.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("names one fallback and never the model it would fall back from", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/falls back to/i);
+
+    // Falling back to the model that just failed is not a fallback.
+    expect(screen.queryByRole("menuitemradio", { name: /^Sonnet/ })).toBeNull();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Opus/ }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ fallback_model: ["opus"] }),
+      });
+    });
+  });
+});
+
 describe("Chats - archiving a conversation", () => {
   it("arms and then confirms in two separate waits, with copy that says the turns are kept", async () => {
     const summary = chatSummary({ chat_id: "c-1" });
     daemon.apiFetch.mockImplementation(chatsFetch([summary], { "c-1": [] }));
 
     await renderChats("/chats/c-1");
+    await openConversationSettings();
     fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
 
     // First wait: the interlock has armed and swapped its own label.
@@ -949,22 +1635,21 @@ function ideSession(overrides: Partial<IdeSession> = {}): IdeSession {
 }
 
 /**
- * Opens the editor door with these sessions on offer.
+ * Renders the page with these editor sessions on offer.
  *
- * A door of its own, and not the optional field at the bottom of the new-conversation form: a
- * person looking for the conversation they were having in the editor has no reason to press a
- * button labelled "New conversation" first, and everything behind it was invisible because of it.
+ * There is no door any more. The conversations still living in the editor are rows in the SAME
+ * list as the ones this app has opened — two lists of the same thing was two places to look for a
+ * conversation you half remember — so they are on screen as soon as the page is, and what tells
+ * them apart is the mark on the row.
  */
-async function openTheEditorDoor(sessions: IdeSession[], said: Record<string, ConversationFixture> = {}) {
+async function withEditorSessions(sessions: IdeSession[], said: Record<string, ConversationFixture> = {}) {
   daemon.apiFetch.mockImplementation(chatsFetch([], {}, { ideSessions: sessions, said }));
-  const view = await renderChats("/chats");
-  fireEvent.click(await screen.findByRole("button", { name: /from the editor/i }));
-  return view;
+  return renderChats("/chats");
 }
 
-describe("the editor's sessions, and the door to them", () => {
-  it("lists them behind a door that names what is behind it", async () => {
-    await openTheEditorDoor([ideSession()]);
+describe("the editor's sessions, in the same list as the rest", () => {
+  it("lists them beside the conversations this app opened, not behind a door", async () => {
+    await withEditorSessions([ideSession()]);
 
     expect(await screen.findByRole("button", { name: /arranja o parser de datas/i })).toBeTruthy();
   });
@@ -973,7 +1658,7 @@ describe("the editor's sessions, and the door to them", () => {
   // CLI's store on every request precisely because it changes while somebody types, and a door that
   // asked once turned that live data back into a photograph.
   it("follows the editor's sessions instead of photographing them once", async () => {
-    const { queryClient } = await openTheEditorDoor([ideSession()]);
+    const { queryClient } = await withEditorSessions([ideSession()]);
     await screen.findByRole("button", { name: /arranja o parser de datas/i });
 
     const query = queryClient
@@ -992,7 +1677,7 @@ describe("the editor's sessions, and the door to them", () => {
   // is live?" with a wall of identical rows.
   it("says which of them is happening right now", async () => {
     const now = Date.now();
-    await openTheEditorDoor([
+    await withEditorSessions([
       ideSession({
         session_id: "live-1",
         title: "a mexer nisto agora",
@@ -1005,12 +1690,16 @@ describe("the editor's sessions, and the door to them", () => {
       }),
     ]);
 
-    const live = await screen.findByRole("button", { name: /a mexer nisto agora/i });
-    expect(within(live).getByText(/happening now/i)).toBeTruthy();
+    // Said in the row's own name rather than spelled out beside the title: the list is a 19rem
+    // column and "happening now" next to a conversation's name squeezes the name to nothing. The
+    // eye gets a mark, everyone gets the phrase.
+    const live = await screen.findByRole("button", { name: /a mexer nisto agora, happening now/i });
+    expect(within(live).getByText("now")).toBeTruthy();
 
     // And the one nobody is in says nothing, because a mark on every row is a mark on none.
     const old = await screen.findByRole("button", { name: /isto foi na terca/i });
-    expect(within(old).queryByText(/happening now/i)).toBeNull();
+    expect(old.getAttribute("aria-label")).not.toMatch(/happening now/i);
+    expect(within(old).queryByText("now")).toBeNull();
   });
 
   it("shows a sample and not the whole conversation, which does not fit in a picker", async () => {
@@ -1021,7 +1710,7 @@ describe("the editor's sessions, and the door to them", () => {
       text: `linha ${at}`,
       aside: false,
     }));
-    await openTheEditorDoor([ideSession()], { "aaaa-1111": { cut: false, said: many } });
+    await withEditorSessions([ideSession()], { "aaaa-1111": { cut: false, said: many } });
 
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
@@ -1035,7 +1724,7 @@ describe("the editor's sessions, and the door to them", () => {
   it("shows what was said in one before it is picked up, not after", async () => {
     // The whole reason this door exists. Choosing by a cut title was choosing blind: you found out
     // which conversation it was by picking it up and reading what came back.
-    await openTheEditorDoor([ideSession()], {
+    await withEditorSessions([ideSession()], {
       "aaaa-1111": {
         cut: false,
         said: [
@@ -1054,7 +1743,7 @@ describe("the editor's sessions, and the door to them", () => {
     // The $1.72 case. A session carrying more than the daemon resumes will NOT be resumed — it
     // starts fresh with a short replay — and knowing that before pressing the button is the whole
     // point of measuring it.
-    await openTheEditorDoor([ideSession()], {
+    await withEditorSessions([ideSession()], {
       "aaaa-1111": {
         cut: false,
         said: [{ by_owner: true, text: "olá", aside: false }],
@@ -1070,7 +1759,7 @@ describe("the editor's sessions, and the door to them", () => {
   });
 
   it("says a small session will be continued where it left off", async () => {
-    await openTheEditorDoor([ideSession()], {
+    await withEditorSessions([ideSession()], {
       "aaaa-1111": {
         cut: false,
         said: [{ by_owner: true, text: "olá", aside: false }],
@@ -1085,14 +1774,16 @@ describe("the editor's sessions, and the door to them", () => {
     expect(screen.queryByText(/starts a fresh conversation/i)).toBeNull();
   });
 
+  // One list means one empty state. Nothing here and nothing in the editor is the same sentence
+  // now, and it points at the one door there is.
   it("says nothing was found rather than showing an empty list", async () => {
-    await openTheEditorDoor([]);
+    await withEditorSessions([]);
 
-    expect(await screen.findByText(/no conversations from the editor/i)).toBeTruthy();
+    expect(await screen.findByText(/no conversations yet/i)).toBeTruthy();
   });
 
   it("picks one up, and the conversation it opens continues it", async () => {
-    await openTheEditorDoor([ideSession()]);
+    await withEditorSessions([ideSession()]);
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
     fireEvent.click(await screen.findByRole("button", { name: /pick it up/i }));
@@ -1112,14 +1803,16 @@ describe("the editor's sessions, and the door to them", () => {
 /**
  * Opens the editor door with these sessions on offer, and hands back a `choose` that waits.
  *
- * The wait is load-bearing: the session list arrives from the daemon after the door is drawn, so
- * the row being clicked does not exist yet at the moment the door opens.
+ * The wait is load-bearing: the session list arrives from the daemon after the page is drawn, so
+ * the row being clicked does not exist yet at the moment it renders.
  */
 async function openThePicker(sessions: IdeSession[]) {
-  const view = await openTheEditorDoor(sessions);
+  const view = await withEditorSessions(sessions);
   const choose = async (sessionId: string) => {
     const label = sessions.find((session) => session.session_id === sessionId)?.title ?? sessionId;
-    const list = await screen.findByRole("list", { name: /conversations in the editor/i });
+    // The one list, which holds both kinds. There is no "conversations in the editor" list to look
+    // in any more — that separation is exactly what went away.
+    const list = await screen.findByRole("list", { name: /^conversations$/i });
     const row = within(list)
       .getAllByRole("button")
       .find((button) => button.textContent?.includes(label));
@@ -2065,5 +2758,110 @@ describe("stopping a turn", () => {
 
     await screen.findByRole("list", { name: "Transcript" });
     expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+});
+
+/* ------------------------------------------- the quiet header and the finder -- */
+
+describe("Chats - what the header says without being asked", () => {
+  it("names the directory in its line, and leaves the model and plan-only in the box", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", brain: "cloud", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: true },
+          },
+        },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    // The list shows each conversation's directory too, so it is closed here to
+    // leave exactly one place the path can be coming from: the header line.
+    fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
+
+    // The line above the transcript says where this runs, and stops there.
+    expect(await screen.findByText("C:/Projects/nucleos")).toBeDefined();
+
+    // Which model answers, and whether it plans instead of doing, are controls in the
+    // composer — beside the words they govern rather than behind a menu at the top of the
+    // page. Asserted here, in the test that owns what the header does and does not carry,
+    // so that moving either one back up top fails this rather than passing quietly.
+    // Named, not blank: a conversation that pinned nothing still runs on something, and the
+    // trigger says which. An empty selection here would read as a broken control.
+    expect(
+      await screen.findByRole("button", { name: /answered by claude-sonnet-5/i }),
+    ).toBeDefined();
+    expect(await screen.findByLabelText(/plan only/i)).toBeDefined();
+
+    // Archiving is the one thing still behind the menu, and stays shut until asked for.
+    expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
+  });
+
+  it("says nothing about plan-only while it is off", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false },
+          },
+        },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
+
+    await screen.findByText("C:/Projects/nucleos");
+    expect(screen.queryByText("plan only")).toBeNull();
+  });
+});
+
+describe("Chats - closing the list", () => {
+  it("hides the conversations and moves the unseen count onto the button that brings them back", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", waiting: 3 }), chatSummary({ chat_id: "c-2", waiting: 2 })],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide conversations" }));
+
+    expect(screen.queryByRole("list", { name: "Conversations" })).toBeNull();
+    // Five answers landed across two conversations, and the list they are in is shut.
+    expect(await screen.findByRole("button", { name: "Conversations, 5 unseen" })).toBeDefined();
+  });
+});
+
+describe("Chats - finding a conversation by typing", () => {
+  it("opens on Ctrl+K and lists what there is", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "rewrite the gate" }),
+          chatSummary({ chat_id: "c-2", title: "bump dependencies" }),
+        ],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    expect(screen.queryByRole("dialog", { name: /find a conversation/i })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    expect(within(palette).getByText("rewrite the gate")).toBeDefined();
+    expect(within(palette).getByText("bump dependencies")).toBeDefined();
   });
 });

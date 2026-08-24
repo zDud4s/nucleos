@@ -26,11 +26,83 @@ import { POLL } from "./poll";
 
 export type { Brain, ToolCall, Turn };
 
+/**
+ * One helper a conversation may hand work to, as the daemon stores and the CLI takes it.
+ *
+ * `description` is not documentation — it is the whole of what the answering model reads to decide
+ * whether to delegate at all, so a helper without a real one is defined, listed, and never used.
+ * `prompt` is the instructions that helper runs under.
+ */
+export interface Subagent {
+  /** What the model calls it by. Letters, digits, `-` and `_`; never leading `-`. */
+  name: string;
+  /** What it is for, in the answering model's words. This is what makes it get used. */
+  description: string;
+  /** The system prompt it runs under. */
+  prompt: string;
+  /** Which model answers as this helper, or null/absent to inherit the conversation's. */
+  model?: string | null;
+  /** How hard it is asked to think, or null/absent for its model's own default. */
+  effort?: string | null;
+}
+
 /** One row of the list — `ChatSummary`, archived excluded, most recently active first. */
 export interface ChatSummary {
   chat_id: string;
   title: string | null;
   brain: Brain;
+  /**
+   * Which model answers this conversation, or null when it follows the daemon's
+   * configured one.
+   *
+   * Null is not "unknown" — it is *unpinned*, and it is the state that keeps
+   * following the config after somebody edits it. The picker shows it by name
+   * rather than as an empty selection, because a control that shows nothing
+   * selected reads as broken.
+   */
+  model: string | null;
+  /** How hard it is asked to think, or null for the CLI's own default. */
+  effort: string | null;
+  /** Who answers when the chosen model is unavailable, comma-separated, or null for nobody. */
+  fallback_model: string | null;
+  /**
+   * Directories this conversation's tools may reach beyond its own.
+   *
+   * A list, not the JSON that stores it: the daemon parses the column before sending it, so an
+   * unreadable one arrives as `[]` rather than as a string the window has to guess about.
+   */
+  extra_dirs: string[];
+  /**
+   * The most one TURN may spend, in dollars, or null for no ceiling.
+   *
+   * Per turn and not per conversation — the CLI's flag bounds one invocation and the daemon spawns
+   * one per turn. Ten turns at the ceiling cost ten times it, and the copy must say so.
+   */
+  turn_budget_usd: number | null;
+  /**
+   * The helpers this conversation may hand work to, added to any the CLI finds in the project.
+   *
+   * A list, not the object that stores it — the daemon parses the column before sending it, for the
+   * same reason `extra_dirs` is parsed there. Ordered by name, so opening this twice cannot show
+   * two different orders.
+   */
+  agents: Subagent[];
+  /** Standing instructions appended to this conversation's system prompt, or null. */
+  system_prompt: string | null;
+  /**
+   * Built-in tools this conversation may not reach for.
+   *
+   * A denial list, never an allow list: the CLI's allow-listing flag GRANTS permission rather than
+   * restricting, so everything here can only take something away.
+   */
+  denied_tools: string[];
+  /**
+   * The turn this conversation was told to forget everything before, or null.
+   *
+   * The transcript draws a mark there. The turns above it are still listed and still cost what they
+   * cost — clearing decides what the MODEL is shown, not what happened.
+   */
+  cleared_after_run_id: number | null;
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;
@@ -266,18 +338,82 @@ export interface Command {
   source: CommandSource;
 }
 
-/** What `POST /assistant/chats` accepts. Both fields are optional; absent brain means cloud. */
+/** What `POST /assistant/chats` accepts. Every field is optional. */
 export interface NewChat {
   brain?: Brain;
   /** The id of an IDE session to continue, from `useIdeSessions`. */
   continueSession?: string;
+  /** A choice id from `useAssistantModels`. It decides the brain, so both need not be sent. */
+  model?: string;
+  effort?: string;
 }
 
-/** What `PATCH /assistant/chats/{chat_id}` accepts. Either field, or both. */
+/** What `PATCH /assistant/chats/{chat_id}` accepts. Any field, or several. */
 export interface ChatPatch {
   chatId: string;
   title?: string;
   brain?: Brain;
+  /**
+   * A choice id, or `null` to unpin and follow the configured model again.
+   *
+   * The distinction is load-bearing and survives the wire: `undefined` is
+   * dropped by `JSON.stringify` and the daemon reads its absence as "leave this
+   * alone", while an explicit `null` is sent and read as the unpin. Passing
+   * `null` where you meant "don't touch" silently resets somebody's choice.
+   */
+  model?: string | null;
+  effort?: string | null;
+  /** Choice ids in the order to try them. `null` or `[]` clears it. */
+  fallback_model?: string[] | null;
+  /** Absolute paths. `null` or `[]` clears them. */
+  extra_dirs?: string[] | null;
+  /** Dollars, per turn. `null` clears the ceiling. */
+  turn_budget_usd?: number | null;
+  /**
+   * The WHOLE set of helpers, not one added or removed. `null` or `[]` clears them.
+   *
+   * Sending the whole set is what makes "who wins when two windows save at once" answerable: the
+   * last writer does, and it is obvious. A patch that added one helper without naming the others
+   * would need a rule nobody could see.
+   */
+  agents?: Subagent[] | null;
+  /** Appended to the system prompt, never substituted for it. `null` or blank clears it. */
+  system_prompt?: string | null;
+  /** Built-in tool names. `null` or `[]` clears the denials. */
+  denied_tools?: string[] | null;
+}
+
+/** One row of the model picker, as the daemon offers it. */
+export interface ModelChoice {
+  /** What travels back on a PATCH, and what the daemon passes to `--model`. */
+  id: string;
+  /** What to show. Not the same string as `id`: `sonnet` is what the CLI takes. */
+  label: string;
+  /** Which route answers it. Carried so picking a model cannot leave the two disagreeing. */
+  brain: Brain;
+  /**
+   * The effort levels THIS model takes, weakest first. Empty means it has no dial.
+   *
+   * Per model, because they genuinely differ — `gpt-5.6-terra` takes an `ultra` that `gpt-5.5`
+   * does not. Drawing the menu from one shared list would offer levels that die at spawn.
+   */
+  efforts: string[];
+  /** Which agent CLI runs it. Absent means the Claude CLI. */
+  runner?: string | null;
+}
+
+/** `GET /assistant/models` — the menu, and what an unpinned conversation runs on. */
+export interface AssistantModels {
+  choices: ModelChoice[];
+  /** The model a conversation with none pinned uses, so that state can be named. */
+  configured: string;
+  /**
+   * Every level any model on the menu takes, weakest first.
+   *
+   * The union, and only for the front door before a model has been picked. Once one is chosen its
+   * own `efforts` is what the picker draws.
+   */
+  efforts: string[];
 }
 
 /* ------------------------------------------------------------------ reads -- */
@@ -299,6 +435,23 @@ export function useChats() {
     refetchInterval: POLL.fast,
     refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * The models a conversation may be moved to.
+ *
+ * Not polled. This changes when somebody edits `.ai/nucleos-models.yaml`, which
+ * is not something that happens while a menu is open — and a picker that
+ * reshuffles under the cursor is worse than one a reload fixes. `staleTime` of
+ * an hour rather than `Infinity` so a daemon restart is eventually noticed
+ * without the app being restarted too.
+ */
+export function useAssistantModels() {
+  return useQuery({
+    queryKey: keys.chats.models,
+    queryFn: () => apiFetch<AssistantModels>("/assistant/models"),
+    staleTime: 60 * 60 * 1000,
   });
 }
 
@@ -527,6 +680,61 @@ export function useSendMessage(chatId: string) {
 }
 
 /**
+ * Open a conversation and say the first thing in it, as one gesture.
+ *
+ * The page with nothing open is a box you type into, the way every chat application's front door
+ * works — so "which model, then Start, then find the box, then type" had to collapse into typing.
+ * Two requests, because the daemon has two routes and neither knows about the other: the id has to
+ * exist before anything can be said into it.
+ *
+ * Not a wrapper over the two hooks below. `useSendMessage` closes over a chat id at render time,
+ * and the id this needs does not exist until halfway through its own call.
+ *
+ * A failure between the two leaves an empty conversation open and the words unsent. That is the
+ * honest outcome and it is visible — the list gains a row, the box keeps what was typed — where
+ * silently deleting the conversation would destroy a billed object to tidy up a screen.
+ */
+export function useStartConversation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      model,
+      effort,
+      text,
+      images,
+    }: {
+      model?: string;
+      effort?: string;
+      text: string;
+      images: Attachment[];
+    }) => {
+      // The model travels on the opening call rather than as a PATCH afterwards.
+      // There is no conversation to PATCH until this returns, and correcting one a
+      // round trip later is visible — and wrong if the second call fails. It also
+      // carries the brain, which the daemon derives from the choice.
+      const opened = await apiFetch<{ chat_id: string }>("/assistant/chats", {
+        method: "POST",
+        body: JSON.stringify({ model, effort }),
+      });
+      await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
+        method: "POST",
+        body: JSON.stringify({
+          chat_id: opened.chat_id,
+          text,
+          images,
+          wait_if_busy: true,
+        }),
+      });
+      return opened;
+    },
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
  * Open a conversation. Answers `{ chat_id }` — the id the daemon minted, not
  * one the caller could have chosen.
  */
@@ -536,7 +744,14 @@ export function useCreateChat() {
     mutationFn: (body: NewChat) =>
       apiFetch<{ chat_id: string }>("/assistant/chats", {
         method: "POST",
-        body: JSON.stringify({ brain: body.brain, continue_session: body.continueSession }),
+        // `model` carries the brain with it — the daemon derives the route from the choice — so a
+        // caller that names one need not name the other, and cannot name them inconsistently.
+        body: JSON.stringify({
+          brain: body.brain,
+          continue_session: body.continueSession,
+          model: body.model,
+          effort: body.effort,
+        }),
       }),
     retry: false,
     onSuccess: () => {
@@ -587,6 +802,27 @@ export function useChatFiles(chatId: string, query: string | null) {
     placeholderData: keepPreviousData,
     // A checkout does not change between keystrokes. Re-walking it for a query already asked would
     // be a directory walk to learn nothing.
+    staleTime: 10_000,
+    retry: false,
+  });
+}
+
+/**
+ * The slash commands available before there is a conversation, narrowed by what has been typed.
+ *
+ * The front door's own, because there is no chat id to ask about yet. It answers with the personal
+ * commands and the installed plugins' — the ones that will still be true after the first message —
+ * and never a project's, which belong to a directory this conversation does not have.
+ */
+export function useCommands(query: string | null) {
+  return useQuery({
+    queryKey: keys.chats.frontCommands(query ?? ""),
+    queryFn: () =>
+      apiFetch<{ commands: Command[] }>(
+        `/assistant/commands?q=${encodeURIComponent(query ?? "")}`,
+      ),
+    enabled: query !== null,
+    placeholderData: keepPreviousData,
     staleTime: 10_000,
     retry: false,
   });
@@ -794,10 +1030,36 @@ export function useWireIdeSessionTools() {
 export function usePatchChat() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ chatId, title, brain }: ChatPatch) =>
+    mutationFn: ({
+      chatId,
+      title,
+      brain,
+      model,
+      effort,
+      fallback_model,
+      extra_dirs,
+      turn_budget_usd,
+      agents,
+      system_prompt,
+      denied_tools,
+    }: ChatPatch) =>
       apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
         method: "PATCH",
-        body: JSON.stringify({ title, brain }),
+        // `undefined` fields are dropped here and `null` fields are kept, which is
+        // exactly the difference the daemon reads: absent leaves a value alone,
+        // null clears it. Building this object by hand instead would lose that.
+        body: JSON.stringify({
+          title,
+          brain,
+          model,
+          effort,
+          fallback_model,
+          extra_dirs,
+          turn_budget_usd,
+          agents,
+          system_prompt,
+          denied_tools,
+        }),
       }),
     retry: false,
     onSuccess: (_data, variables) => {
@@ -834,6 +1096,62 @@ export function usePostChatSeen() {
   return useMutation({
     mutationFn: (chatId: string) =>
       apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/seen`, { method: "POST" }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * The built-in tools a conversation can be told not to reach for.
+ *
+ * Asked of the daemon rather than written out here. There is exactly one list and it is the one the
+ * daemon writes into the flag; a second copy in the window would offer a name the door refuses, or
+ * stop offering one the daemon can still deny — so a restriction somebody set becomes invisible and
+ * impossible to lift.
+ */
+export function useDeniableTools() {
+  return useQuery({
+    queryKey: keys.chats.tools,
+    queryFn: () => apiFetch<{ tools: string[] }>("/assistant/tools"),
+    // The list moves when the CLI does, which is not within a session.
+    staleTime: Infinity,
+  });
+}
+
+/**
+ * Start this conversation's next turn on a fresh window — the app's `/compact`.
+ *
+ * What is said stays: the next turn is handed a short replay of the recent exchanges instead of a
+ * context that has grown to a hundred thousand tokens. The daemon already did this on its own past
+ * a threshold; this is asking for it before the bill arrives.
+ */
+export function useFreshContext() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (chatId: string) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/fresh-context`, {
+        method: "POST",
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Start clean and tell the next turn nothing — the app's `/clear`.
+ *
+ * The stronger of the two. Nothing is deleted: every turn stays in the transcript, and the
+ * transcript draws a mark where the cut is. What changes is what the model is shown.
+ */
+export function useClearContext() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (chatId: string) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/clear`, { method: "POST" }),
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });

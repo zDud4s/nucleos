@@ -2506,6 +2506,14 @@ async fn spawn_agent(
         messages: None,
         ambient_mcp: false,
         model: agent.model.clone(),
+        effort: None,
+        fallback_model: Vec::new(),
+        add_dirs: Vec::new(),
+        max_budget_usd: None,
+        agents: Vec::new(),
+        append_system_prompt: None,
+        denied_tools: Vec::new(),
+        session_name: None,
         // The economy half of the boundary — see `mcp_tools::TEAM_TOOLS`.
         allowed_mcp_tools: Some(crate::mcp_tools::TEAM_TOOLS),
     };
@@ -4000,6 +4008,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             files_root: Some(root),
+            workflow_library: None,
             email: Arc::new(crate::state::EmailRuntime::default()),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
             // Off, like `web` beside it: no test in this module drives a browser, and a department
@@ -5207,6 +5216,7 @@ mod tests {
         marketing(&state).await;
         let state = AppState {
             files_root: None,
+            workflow_library: None,
             ..state
         };
 

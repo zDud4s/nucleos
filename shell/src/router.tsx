@@ -24,6 +24,8 @@ import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
+import { NewProject } from "./pages/NewProject";
+import { Workspace } from "./project/Workspace";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
 import { System } from "./pages/System";
@@ -106,17 +108,22 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * TanStack spells a parameter `$runId`; the page reads it back under that name.
  *
  * `/projects/$projectId/$view` is the second, and it carries a parameter that is
- * not an id: the view a project is being looked at through — `browse`, `search`,
- * `diff` or `rules`. It is in the location rather than in component state
- * because a folder somebody is reading should survive a reload and be
- * linkable, and it is **not** a search param because it is not a filter: there
- * is exactly one of it and it always has a value.
+ * not an id: the mode a project is being looked at through — `estado`, `codigo`
+ * or `workflows`. It is in the location rather than in component state because
+ * a project somebody is working in should survive a reload and be linkable, and
+ * it is **not** a search param because it is not a filter: there is exactly one
+ * of it and it always has a value.
  *
  * There is no validator for it. A route parameter is a string, anybody can type
- * one, and `Projects` answers an unrecognised view with `browse` rather than a
+ * one, and `Workspace` answers an unrecognised mode with `estado` rather than a
  * dead end — a typo in a path is not a missing page. Registering a validator
- * here would move that decision away from the page that knows what the views
+ * here would move that decision away from the page that knows what the modes
  * are.
+ *
+ * The mode names are the design's, and they are the one place in this app where
+ * a route segment is not English. They are identifiers in a URL rather than
+ * copy on a screen — the tabs above them read State, Code and Workflows — and
+ * renaming them later would break every link somebody kept.
  *
  * `/system/$view` is the same idiom again: like `/projects/$projectId/$view`, the
  * view is a path parameter and not a search param — there is exactly one of it, it
@@ -128,9 +135,52 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * Nothing else in the tree mentions `/team-runs`, so `router.test.tsx` asserts
  * it by name.
  */
-const DETAIL_ROUTES: { path: string; component: () => ReactNode }[] = [
+/**
+ * A detail route may declare a search validator, which the nav-built routes have always been able
+ * to. Added when the workspace needed one: the Code mode reviews a *run*, and which run that is
+ * belongs in the location — a slot on the State mode links straight to it, and a review somebody
+ * is in the middle of survives a reload.
+ */
+const DETAIL_ROUTES: {
+  path: string;
+  component: () => ReactNode;
+  validateSearch?: (search: Record<string, unknown>) => unknown;
+}[] = [
   { path: "/runs/$runId", component: RunDetail },
-  { path: "/projects/$projectId/$view", component: Projects },
+  /*
+    Adding a project is a page and not a dialog, for the same reason the eject guard is a panel:
+    §3.2 of the frontend spec. It is also three steps long and one of them is a folder path somebody
+    may want to go and look up — a modal that had to be dismissed to do that would lose the other
+    two. It sits under `/projects/` because that is what it is about, and cannot be confused with a
+    project called `new`: that one would be `/projects/new/estado`, three segments rather than two.
+  */
+  { path: "/projects/new", component: NewProject },
+  {
+    path: "/projects/$projectId/$view",
+    component: Workspace,
+    /*
+      One optional number. Not validated into a range or checked against the daemon — a run id in a
+      URL is a claim, and the page answers a claim it cannot honour with a refusal rather than the
+      router answering it with a dead end. Anything unparseable becomes `undefined`, which is the
+      same as not asking.
+    */
+    validateSearch: (search) => {
+      const raw = search.run;
+      const run = typeof raw === "number" ? raw : Number(raw);
+      return Number.isInteger(run) && run > 0 ? { run } : {};
+    },
+  },
+  /**
+   * The read-only inspector, on a path of its own until the Code mode replaces it.
+   *
+   * It used to share `/projects/$projectId/$view` with nothing else, and the
+   * workspace took that path over. Moving it here rather than deleting it is
+   * deliberate: `browse`, `search` and `diff` are superseded by the Code mode
+   * and `rules` is superseded by the config editor, and neither of those exists
+   * yet. Removing a working capability because its replacement is designed is
+   * how a rewrite loses things quietly.
+   */
+  { path: "/projects/$projectId/inspect/$view", component: Projects },
   { path: "/chats/$chatId", component: Chats },
   { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },
@@ -176,6 +226,12 @@ export function createAppRouter(initialPath = "/") {
       getParentRoute: () => rootRoute,
       path: detail.path,
       component: detail.component,
+      // Spread rather than passed as `undefined`, for the reason the nav routes above give: the
+      // router treats the key's presence as the declaration, and a route that declares a validator
+      // and has none strips every search param it is given.
+      ...(detail.validateSearch === undefined
+        ? {}
+        : { validateSearch: detail.validateSearch }),
     }),
   );
 

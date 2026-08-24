@@ -1,6 +1,22 @@
 {
   "compilerOptions": {
     "composite": true,
+
+    /* Compile the config somewhere it cannot be mistaken for the config.
+     *
+     * Left at the default, `tsc -b` wrote `vite.config.js` and `vite.config.d.ts` beside the
+     * source — and Vite resolves `vite.config.js` BEFORE `vite.config.ts`. So the tool read a
+     * stale compiled copy of its own configuration: an alias added to the `.ts` stayed
+     * invisible until some later build happened to overwrite the `.js`, and the failure read
+     * as a broken alias rather than as a shadowed file. Both emitted names are already
+     * gitignored, which treated the symptom and left the shadowing in place.
+     *
+     * `noEmit` is the obvious fix and is not available: TS6310 forbids it on a project that
+     * `tsconfig.json` references. Moving the output achieves the same thing — the config is
+     * still typechecked, and nothing lands where Vite looks. */
+    "outDir": "./node_modules/.tmp/config",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",

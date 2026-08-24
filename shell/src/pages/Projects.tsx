@@ -39,19 +39,52 @@ import "./projects.css";
  *
  * The page exists because two facts about a project were only readable by
  * leaving the app: what it will do on its own (`.ai/autopilot.yaml`, on disk)
- * and what its tree currently looks like. Both are shown here and neither is
- * editable — the rules file is edited in an editor, and a shell that offered to
- * write it would be a second author of a document git already owns.
+ * and what its tree currently looks like. Both are shown here, and this page
+ * edits neither.
+ *
+ * **The rule that used to justify that, and what is left of it.** The sentence
+ * was: a shell that offered to write the rules file would be a second author of
+ * a document git already owns. That is still true of every `.rs`, every
+ * `package.json`, every file in the tree below — which is the whole of what
+ * this page browses, and why nothing here is editable.
+ *
+ * It stopped being true of one file, and the exception is worth writing down so
+ * nobody restores the rule over it in six months. `.ai/autopilot.yaml` is not a
+ * document git owns: it is **gitignored, per-developer configuration** that the
+ * núcleo itself parses, with a schema, a range check and `deny_unknown_fields`.
+ * An editor that holds text to that schema before saving is not a distracted
+ * second author, it is a better-informed one — `vim` saves `gate_commmand:`
+ * happily and leaves the project silently ungated for ever. The boundary is
+ * therefore not *read vs. write* but **who is the file's legitimate author**,
+ * and it lives as data in `core/src/ownership.rs`, served by
+ * `GET /projects/{id}/ownership`. The editor for it is in the project workspace,
+ * which is where a person goes to change how a project behaves; this page is
+ * where they go to look at what is in it.
+ *
+ * The sentence still constrains the *form* even there, which is the part most
+ * easily lost: the workspace edits that file as raw text and not as a form,
+ * because a form would have to re-serialise the YAML and re-serialising deletes
+ * the comment somebody left explaining why a schedule is switched off.
  *
  * **The single write on this page is the WIP ceiling**, because it is the one of
  * these facts that lives in the database rather than in a file, and until now
  * could only be changed with `sqlite3`.
  *
- * The four views are in the route (`/projects/$projectId/$view`) so a folder
- * somebody is looking at survives a reload and can be linked to. An unknown
- * `$view` falls back to `browse` rather than 404ing: a route parameter is a
- * string, anybody can type one, and a typo in a path is not a missing page.
+ * The four views are in the route (`/projects/$projectId/inspect/$view`) so a
+ * folder somebody is looking at survives a reload and can be linked to. An
+ * unknown `$view` falls back to `browse` rather than 404ing: a route parameter
+ * is a string, anybody can type one, and a typo in a path is not a missing page.
  */
+
+/**
+ * Where this inspector lives, now that the workspace owns the shorter path.
+ *
+ * One function rather than three template literals, because the two callers
+ * below drifted apart the moment there was a prefix to forget.
+ */
+function inspectPath(projectId: string, view: ProjectView): string {
+  return `/projects/${projectId}/inspect/${view}`;
+}
 
 /** The four views, in the order the tabs read. */
 const VIEWS = ["browse", "search", "diff", "rules"] as const;
@@ -90,6 +123,15 @@ export function Projects() {
   return (
     <>
       <PageHeader title="Projects" headline={headlineFor(rows, projects.data !== undefined)} />
+
+      {/*
+        The door to adding one. Here rather than in the rail, because the rail is the design's fixed
+        list of places and this is an action taken from the list of what exists — and because the
+        first thing anybody does on an empty roster is look at the roster.
+      */}
+      <p className="pj-add">
+        <Link to="/projects/new">Add a project…</Link>
+      </p>
 
       {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
       {projects.isError && projects.data === undefined && <RosterError error={projects.error} />}
@@ -197,7 +239,7 @@ function ProjectChip({
 
   return (
     <li className={active ? "pj-chip pj-chip-active" : "pj-chip"}>
-      <Link className="pj-chip-link" to={`/projects/${project.project_id}/${view}`}>
+      <Link className="pj-chip-link" to={inspectPath(project.project_id, view)}>
         <span className="pj-chip-name">{project.project_id}</span>
       </Link>
       <Badge tone={project.mode === "active" ? "active" : project.mode === "shadow" ? "shadow" : "off"}>
@@ -217,7 +259,7 @@ function ViewTabs({ projectId, view }: { projectId: string; view: ProjectView })
         <Link
           key={candidate}
           className={candidate === view ? "pj-tab pj-tab-active" : "pj-tab"}
-          to={`/projects/${projectId}/${candidate}`}
+          to={inspectPath(projectId, candidate)}
           aria-current={candidate === view ? "page" : undefined}
         >
           {VIEW_LABEL[candidate]}
