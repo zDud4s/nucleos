@@ -12,9 +12,12 @@
 -- between them. A file has one. The rules file also travels with nobody: it is gitignored,
 -- per-developer configuration, and a workflow's commands must arrive with the workflow.
 --
--- 0110. Free on every branch in this repository today, which is exactly the fact 0109's header says
--- is a fact about a moment — if master moves first, this renumbers, and renumbering an unmerged
--- migration is routine. What is not routine is running one against a database you rely on.
+-- 0115, and it was 0110 when it was written. Master moved first: `0110_chats_model_and_effort`
+-- landed on a branch that had already RUN against the database this machine relies on, so the free
+-- number was gone and the applied one could not be argued with. This is the renumbering its own
+-- header called routine — routine precisely because this file had run nowhere: `_sqlx_migrations`
+-- on this machine goes 109, 110 (chats model and effort), 111, 112, 113, 114, and never had a row
+-- for `project_commands` to disagree with.
 CREATE TABLE project_commands (
   id          INTEGER PRIMARY KEY,
   project_id  TEXT NOT NULL,
