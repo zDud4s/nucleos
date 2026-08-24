@@ -76,6 +76,7 @@ function chatSummary(overrides: Partial<ChatSummary> = {}): ChatSummary {
     system_prompt: null,
     denied_tools: [],
     cleared_after_run_id: null,
+    context_window: 140000,
     created_at: "2026-08-18T09:00:00Z",
     cwd: null,
     ide_session_id: null,
@@ -102,7 +103,8 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     thought: [],
     thought_tokens: null,
     context_fill: null,
-    context_rotates_at: 140000,
+    context_window: 140000,
+    compacted: false,
     ...overrides,
   };
 }
@@ -218,7 +220,7 @@ function chatsFetch(
       const found =
         fixture === undefined
           ? undefined
-          : { context_estimate: null, context_rotates_at: 140000, ...fixture };
+          : { context_estimate: null, largest_window: 187000, ...fixture };
       // A transcript this machine does not have is a 404, exactly as the daemon answers.
       if (found === undefined) throw new ApiRefusal(404, "not_found", "Not Found");
       return found;
@@ -478,6 +480,49 @@ async function openEffortMenu(): Promise<void> {
   fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
   fireEvent.click(trigger);
 }
+
+describe("Chats - a conversation that grew too long for its window", () => {
+  it("says where the conversation was summarised, rather than letting it happen quietly", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "primeiro", answer: "sim", session_id: "s-1" }),
+          // Same session either side of it — which is the whole point. The conversation did not
+          // restart; it filled up and the CLI condensed its early part in place.
+          turnRow({
+            id: 2,
+            asked: "segundo",
+            answer: "claro",
+            session_id: "s-1",
+            compacted: true,
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    expect(await screen.findByText(/summarised here/i)).toBeTruthy();
+    // And NOT the older, harsher note: nothing was forgotten and no session was traded.
+    expect(screen.queryByText(/the conversation restarted here/i)).toBeNull();
+  });
+
+  it("meters a picked-up conversation against its own window, not the default", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, context_fill: 150_000, context_window: 190_000 }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    // 150k of 190k is comfortable; against the 140k default it would read as over the line. A
+    // meter that keeps its own copy of the number is wrong for exactly the conversations nearest
+    // their limit.
+    expect(await screen.findByText("150.0k of 190.0k")).toBeTruthy();
+    expect(screen.queryByText(/may be summarised on the next turn/i)).toBeNull();
+  });
+});
 
 describe("Chats - choosing a model", () => {
   it("offers the daemon's list rather than a list of its own", async () => {
@@ -1474,7 +1519,7 @@ describe("Chats - a conversation picked up from the editor", () => {
   // The window drew somebody's whole editor conversation and a fresh turn under it with no seam,
   // which reads as one continuous thing the model has all of. For a session past the ceiling that
   // is false: it was not resumed, and what it got was the last few exchanges in front of nothing.
-  it("says a session too large to resume was handed a tail rather than remembered", async () => {
+  it("says a session larger than any window was handed a tail rather than remembered", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "e agora", answer: "feito" })] }, {
         said: {
@@ -1490,7 +1535,7 @@ describe("Chats - a conversation picked up from the editor", () => {
 
     await renderChats("/chats/c-1");
 
-    expect(await screen.findByText(/too large to resume/i)).toBeTruthy();
+    expect(await screen.findByText(/larger than any window a model has/i)).toBeTruthy();
     // Shut until asked: the claim is the note, the exchanges are the audit behind it.
     expect(screen.queryByRole("list", { name: "What the model was handed" })).toBeNull();
 
@@ -1747,15 +1792,15 @@ describe("the editor's sessions, in the same list as the rest", () => {
       "aaaa-1111": {
         cut: false,
         said: [{ by_owner: true, text: "olá", aside: false }],
-        context_estimate: 180000,
-        context_rotates_at: 140000,
+        context_estimate: 400000,
+        largest_window: 187000,
       },
     });
 
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
-    expect(await screen.findByText(/180\.0k/)).toBeTruthy();
-    expect(screen.getByText(/starts a fresh conversation/i)).toBeTruthy();
+    expect(await screen.findByText(/400\.0k/)).toBeTruthy();
+    expect(screen.getByText(/larger than any window a model has/i)).toBeTruthy();
   });
 
   it("says a small session will be continued where it left off", async () => {
@@ -1764,7 +1809,7 @@ describe("the editor's sessions, in the same list as the rest", () => {
         cut: false,
         said: [{ by_owner: true, text: "olá", aside: false }],
         context_estimate: 20000,
-        context_rotates_at: 140000,
+        largest_window: 187000,
       },
     });
 
@@ -2531,7 +2576,7 @@ describe("what the page is not showing", () => {
     expect(screen.queryByText(/older messages are not shown/i)).toBeNull();
   });
 
-  it("says how full the context was, and warns before the daemon rotates", async () => {
+  it("says how full the context was, and warns before the CLI summarises it", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], {
         "c-1": [
@@ -2544,8 +2589,11 @@ describe("what the page is not showing", () => {
     await renderChats("/chats/c-1");
 
     expect(await screen.findByText(/132\.0k of 140\.0k/)).toBeTruthy();
-    // Said on the turn that is close to it, and not on the one that is nowhere near.
-    expect(screen.getAllByText(/a fresh context/i)).toHaveLength(1);
+    // Said on the turn that is close to it, and not on the one that is nowhere near. The warning
+    // used to say the next turn "may begin a fresh context" — which was the honest description of
+    // what happened then and would be a lie now: nothing begins again, the early exchanges are
+    // condensed and the conversation carries on.
+    expect(screen.getAllByText(/may be summarised on the next turn/i)).toHaveLength(1);
   });
 });
 

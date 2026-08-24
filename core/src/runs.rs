@@ -1318,6 +1318,7 @@ fn spawn_run(
                 append_system_prompt: None,
                 denied_tools: Vec::new(),
                 session_name: None,
+                context_window: None,
                 // Nothing to narrow: `create_run_inner` never sets `mcp_config`, so the branch
                 // that reads this does not run for a run started here.
                 allowed_mcp_tools: None,
@@ -3661,6 +3662,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             delay: std::sync::Mutex::new(delay),
             last_plan_only: std::sync::Mutex::new(None),
@@ -5652,6 +5654,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             cache_read_tokens: Some(20_000),
             cache_creation_tokens: Some(3_000),
             num_turns: Some(12),
+            compacted: false,
         });
         let pool = state.pool.clone();
         let app = test_router(state);
@@ -5712,6 +5715,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             cache_read_tokens: None,
             cache_creation_tokens: None,
             num_turns: None,
+            compacted: false,
         });
         let pool = state.pool.clone();
         let app = test_router(state);
@@ -7663,6 +7667,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             cache_read_tokens: None,
             cache_creation_tokens: None,
             num_turns: None,
+            compacted: false,
         });
         let pool = state.pool.clone();
         let app = test_router(state);
@@ -7737,6 +7742,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             cache_read_tokens: None,
             cache_creation_tokens: None,
             num_turns: None,
+            compacted: false,
         });
         let pool = state.pool.clone();
         let app = test_router(state);

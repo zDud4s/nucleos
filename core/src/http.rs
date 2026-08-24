@@ -4881,10 +4881,14 @@ struct AssistantTurn {
     /// The CLI session this turn ran in.
     ///
     /// Travels to the window so it can say where the conversation RESTARTED. `get_session` refuses
-    /// to resume past 140k tokens of context and past anything that read third-party text, and the
-    /// next turn then mints a fresh id — so a change here is the moment the model stopped
-    /// remembering what came before it. Without it, that happens and the transcript above and below
-    /// looks like one unbroken conversation, which is the one thing it is not.
+    /// to resume a session that read third-party text, and `POST /fresh-context` drops one on
+    /// request; the next turn then mints a fresh id — so a change here is the moment the model
+    /// stopped remembering what came before it. Without it, that happens and the transcript above
+    /// and below looks like one unbroken conversation, which is the one thing it is not.
+    ///
+    /// It used to change on SIZE as well, which made this the ordinary fate of any long
+    /// conversation. It is now the rare one: a full context is compacted, and `compacted` below is
+    /// what says so.
     session_id: Option<String>,
     created_at: String,
     /// How much context this turn ran with, as an absolute token count. Null on a turn whose stream
@@ -4906,6 +4910,13 @@ struct AssistantTurn {
     /// Roughly how many tokens the turn spent thinking, or null when it did not think and on every
     /// turn from before the column. Serialized as it stands: it is a number, not a private shape.
     thought_tokens: Option<i64>,
+    /// Whether the CLI summarised its own context while producing this turn.
+    ///
+    /// This is what replaced the restart mark for the ordinary case. A conversation no longer
+    /// changes session when it fills up — it is compacted in place — so the fact the window has
+    /// to draw moved from `session_id` to here, and it says a milder and truer thing: the older
+    /// exchanges were summarised at this point, not forgotten at this point.
+    compacted: bool,
 }
 
 /// One turn as the window receives it: the row, plus what the turn did.
@@ -4930,12 +4941,17 @@ struct AssistantTurnOut {
     /// are different facts and the row keeps them apart, but a window cannot act on the difference:
     /// either way there is nothing to draw.
     thought: Vec<String>,
-    /// The token count past which this daemon stops resuming and mints a fresh session.
+    /// The context window this conversation runs in, in tokens.
     ///
-    /// The same number on every row, because it is a property of the daemon and not of the turn.
-    /// It rides here so the window never keeps its own copy of a rule this side owns: a constant
-    /// duplicated across two codebases is one that drifts silently the day one of them changes it.
-    context_rotates_at: i64,
+    /// It used to be `context_rotates_at`: the count past which the daemon stopped resuming and
+    /// minted a fresh session. Nothing rotates now — the CLI compacts inside the session — so the
+    /// number means the window rather than the cliff, and the name had to move with it.
+    ///
+    /// The same on every row of one conversation and NOT the same across conversations, which is
+    /// why it still rides here rather than being a constant the window keeps its own copy of: a
+    /// chat picked up from the editor runs in a wider window than the default, and a meter drawn
+    /// against the default would be wrong for exactly the conversations nearest their limit.
+    context_window: i64,
 }
 
 /// A conversation as it is read back: its turns, and whatever it was handed before the first one.
@@ -5352,7 +5368,7 @@ async fn get_assistant_chat(
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
                 answered_by, session_id, created_at, context_fill, tools_used, thought,
-                thought_tokens, prompt_images
+                thought_tokens, prompt_images, compacted
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
           ORDER BY id DESC
@@ -5372,6 +5388,16 @@ async fn get_assistant_chat(
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
     // every ordinary conversation.
     let handed = crate::assistant::handed_over(&state.pool, &chat_id).await;
+    // Read once for the whole transcript rather than per turn: it is a property of the
+    // conversation, and forty rows asking the same question of the same row is thirty-nine
+    // round trips nobody needs. A failure reads as the default, which is what every conversation
+    // that never touched this column runs in anyway.
+    let context_window = crate::assistant::window_of(
+        crate::chats::answering(&state.pool, &chat_id)
+            .await
+            .map(|answering| answering.context_window)
+            .unwrap_or_default(),
+    );
     // Empty on a failure rather than a 500: the transcript is the point of this request, and a
     // conversation nobody can read because its queue would not load is a worse answer than one
     // drawn without a note about what is waiting.
@@ -5405,7 +5431,7 @@ async fn get_assistant_chat(
                     did,
                     images,
                     thought,
-                    context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+                    context_window,
                 }
             })
             .collect(),
@@ -5634,23 +5660,28 @@ async fn read_ide_session(
         .map(|conversation| {
             Json(IdeConversationOut {
                 conversation,
-                context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+                largest_window: crate::assistant::LARGEST_WINDOW_TOKENS
+                    - crate::assistant::COMPACTION_HEADROOM,
             })
         })
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// A conversation had in the editor, and the line past which this daemon will not resume one.
+/// A conversation had in the editor, and the largest one this daemon can pick up whole.
 ///
-/// The ceiling rides with it for the reason it rides with a turn: it is a property of this daemon
+/// The number rides with it for the reason it rides with a turn: it is a property of this daemon
 /// and not of the session, and the window keeping its own copy of a rule this side owns is a second
 /// source of truth that drifts silently the day the constant changes. Here it also answers the
-/// question the estimate is being asked for — whether picking this up resumes it or starts fresh.
+/// question the estimate is being asked for — whether picking this up continues it or hands it on.
+///
+/// It is the LARGEST window minus the CLI's own compaction headroom, and not the default window,
+/// because a picked-up conversation is given a window wide enough to hold it. What it cannot be
+/// given is a window wider than the model has, and that is the line this names.
 #[derive(serde::Serialize)]
 struct IdeConversationOut {
     #[serde(flatten)]
     conversation: crate::sessions::Conversation,
-    context_rotates_at: i64,
+    largest_window: i64,
 }
 
 /// How many exchanges a conversation too large to resume is handed.
@@ -5784,11 +5815,19 @@ async fn create_chat(
         }
     }
 
-    // Measured once, here, where the file is read anyway and where the answer can still change
-    // what happens. The ceiling `get_session` enforces reads `runs.context_fill` — the daemon's OWN
-    // prior turns — and a session picked up from the editor has none, so until this every pick-up
-    // resumed whatever it found however large. One did: about 180k of context, re-sent uncached as
-    // fresh input, $1.72 for a one-word answer.
+    // Measured once, here, where the file is read anyway and where the answer can still change what
+    // happens: a picked-up session is the one case where a conversation arrives already full, and
+    // the window it is given has to be wide enough to hold what it is carrying.
+    //
+    // This measurement used to decide whether to pick the session up AT ALL — anything over 140k
+    // was refused and handed six exchanges instead — and that ceiling was written after a real
+    // incident: about 180k of context, re-sent uncached as fresh input, $1.72 for a one-word
+    // answer. What it bought was not what it looked like. The expense there is a COLD CACHE on a
+    // large context, which a window ceiling does not prevent and a stump does not either; what a
+    // stump prevented was the conversation. The bound that does hold is the one the CLI applies
+    // for itself: it never sends more than its window, and it compacts to stay under it. So the
+    // number below is now a window to widen rather than a line to refuse at, and the only refusal
+    // left is for a session larger than any window a model has — which is arithmetic, not policy.
     if let Some(session) = &continued {
         let read = {
             let session_id = session.session_id.clone();
@@ -5803,10 +5842,35 @@ async fn create_chat(
             }
         };
         let carries = read.as_ref().and_then(|read| read.context_estimate);
-        let resumable =
-            carries.is_none_or(|carries| carries <= crate::assistant::CONTEXT_ROTATION_TOKENS);
+        // Against the LARGEST window less the CLI's own compaction headroom, because that is the
+        // point at which the CLI would refuse the context outright rather than summarise it. An
+        // unreadable session file answers `None` and is picked up: a file this daemon could not
+        // measure is not evidence that it is too big, and the CLI reads the same file for itself.
+        let ceiling =
+            crate::assistant::LARGEST_WINDOW_TOKENS - crate::assistant::COMPACTION_HEADROOM;
+        let resumable = carries.is_none_or(|carries| carries <= ceiling);
 
         if resumable {
+            // Widened to fit BEFORE the session is attached, so the first turn already runs in a
+            // window that can hold what it inherited. Only upward, and clamped by `window_of` when
+            // it is read back: an ordinary conversation picked up small keeps the default and
+            // compacts at the default, which is the cheaper of the two and the right one for it.
+            if let Some(carries) = carries
+                && carries > crate::assistant::CONTEXT_WINDOW_TOKENS
+                && let Err(error) = crate::chats::widen_window(
+                    &state.pool,
+                    &chat_id,
+                    (carries + crate::assistant::COMPACTION_HEADROOM)
+                        .min(crate::assistant::LARGEST_WINDOW_TOKENS),
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    chat_id = %chat_id,
+                    "the conversation was picked up but kept the default window; it will compact sooner"
+                );
+            }
             // Written after the chat exists, because it is what `get_session` reads to decide the
             // first turn resumes rather than starts clean. A failure here is not a failed request:
             // the conversation is real and usable, it simply begins a context of its own — so it is
@@ -5827,10 +5891,11 @@ async fn create_chat(
                 );
             }
         } else if let Some(read) = &read {
-            // Too large to resume, so it is handed the tail instead — the rotation's own answer,
-            // and never a summary. Stored rather than re-read: the file can be tens of megabytes,
-            // the turn path must not go near it, and a compaction that lives in a row is one
-            // somebody can read afterwards.
+            // Larger than any window a model has, so there is nothing to resume INTO and it is
+            // handed the tail instead. Rare now, and no longer the ordinary fate of a long
+            // conversation. Stored rather than re-read: the file can be tens of megabytes, the
+            // turn path must not go near it, and a handover that lives in a row is one somebody
+            // can read afterwards.
             let tail = crate::sessions::exchanges(&read.said, HANDOVER_EXCHANGES);
             if !tail.is_empty()
                 && let Ok(stored) = serde_json::to_string(&tail)
@@ -6102,14 +6167,15 @@ async fn get_assistant_models() -> Json<serde_json::Value> {
 
 /// Starts this conversation's next turn on a fresh window, with a replay of what was recently said.
 ///
-/// This app's `/compact`. There is no context here to compact — a turn is a fresh process every
-/// time, and what a turn resumes is a CLI session — so the gesture is to forget the session: the
-/// next turn starts clean and is handed a few hundred tokens of recent exchanges instead of a
-/// window that has grown to a hundred thousand.
+/// This app's `/clear` more than its `/compact`, and the distinction sharpened when the CLI took
+/// over compaction: the CLI SUMMARISES a full context and carries on in the same session, which is
+/// what a `/compact` means and what now happens on its own. This drops the session entirely — the
+/// next turn starts clean and is handed a few hundred tokens of recent exchanges — which is what
+/// somebody means when the conversation has gone somewhere they do not want it to follow.
 ///
-/// The path already existed and nobody could ask for it. Rotation does exactly this on its own past
-/// `CONTEXT_ROTATION_TOKENS`, which meant the only way to get a conversation out of an expensive
-/// context was to let it get expensive first.
+/// It stays because that is a real thing to want and nothing else offers it. What it is no longer
+/// is the escape hatch from an expensive context: a conversation that grows now compacts on its
+/// own, so nobody has to throw one away to stop paying for it.
 async fn post_fresh_context(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
@@ -12374,8 +12440,9 @@ mod tests {
 
         assert_eq!(turns["turns"][0]["context_fill"], serde_json::json!(96000));
         assert_eq!(
-            turns["turns"][0]["context_rotates_at"],
-            serde_json::json!(crate::assistant::CONTEXT_ROTATION_TOKENS)
+            turns["turns"][0]["context_window"],
+            serde_json::json!(crate::assistant::CONTEXT_WINDOW_TOKENS),
+            "a conversation that never asked for a window is metered against the default"
         );
     }
 
@@ -17139,6 +17206,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })
         }
     }

@@ -1028,6 +1028,14 @@
   color: var(--tone-info-fg);
 }
 
+/* Quieter than a restart, because it IS quieter: the conversation continues, the
+   session is the same, and what changed is that its early part is now a summary
+   of itself. Left at the base mark colour on purpose — a tone here would make a
+   routine, healthy event look like something to check. */
+.chats-mark-compacted {
+  font-style: italic;
+}
+
 /* ============================================================= composer == */
 
 .chats-composer {

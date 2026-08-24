@@ -613,9 +613,13 @@ function ChatRow({
  * blindly and billed $1.72 for a one-word answer: a resume re-sends the whole window as fresh
  * input, and a session last touched days ago has nothing cached to make that cheap.
  *
- * Two different futures, said plainly rather than as a number to interpret. Under the ceiling it is
- * continued where it left off, and costs what its context costs. Over it, the daemon refuses to
- * resume and starts fresh with a short replay — cheap, and forgetful, and better known in advance.
+ * Two different futures, said plainly rather than as a number to interpret. Nearly every
+ * conversation is continued where it left off, in a window widened to hold what it is carrying, and
+ * costs what its context costs on the first turn. Past the largest window any model has there is
+ * nothing to continue INTO, and it is handed the last few exchanges instead.
+ *
+ * That second case used to start at 140k, which made it the ordinary fate of a long afternoon. It
+ * now starts near 190k, which is arithmetic rather than policy.
  */
 function WhatItCarries({
   view,
@@ -624,15 +628,15 @@ function WhatItCarries({
 }) {
   const carries = view.data?.context_estimate ?? null;
   if (carries === null) return null;
-  const ceiling = view.data?.context_rotates_at ?? null;
+  const ceiling = view.data?.largest_window ?? null;
   const k = (n: number) => `${(n / 1000).toFixed(1)}k`;
   const over = ceiling !== null && carries > ceiling;
   return (
     <p className={over ? "chats-carries chats-carries-over" : "chats-carries"}>
       {`about ${k(carries)} of context`}
       {over
-        ? " — past what this daemon resumes, so picking it up starts a fresh conversation with a short replay"
-        : " — picked up where it left off, and its context is re-sent on the first turn"}
+        ? " — larger than any window a model has, so picking it up hands the model the last few exchanges instead"
+        : " — picked up where it left off, in a window wide enough to hold it"}
     </p>
   );
 }
@@ -2663,7 +2667,7 @@ function PickedUp({
       <HowItContinued
         handed={handed}
         carries={view.data.context_estimate}
-        rotatesAt={view.data.context_rotates_at}
+        largestWindow={view.data.largest_window}
       />
     </>
   );
@@ -2688,16 +2692,16 @@ function PickedUp({
 function HowItContinued({
   handed,
   carries,
-  rotatesAt,
+  largestWindow,
 }: {
   handed: Exchange[];
   carries: number | null;
-  rotatesAt: number;
+  largestWindow: number;
 }) {
   const [open, setOpen] = useState(false);
 
   if (handed.length === 0) {
-    if (carries === null || carries > rotatesAt) return null;
+    if (carries === null || carries > largestWindow) return null;
     return (
       <p className="chats-picked-up-cut">
         this session was resumed, so the model has all of the above in its
@@ -2708,8 +2712,8 @@ function HowItContinued({
   return (
     <div className="chats-handed">
       <p className="chats-handed-line">
-        this session was too large to resume, so it was not. The model was
-        handed the last{" "}
+        this session was larger than any window a model has, so there was
+        nothing to resume it into. The model was handed the last{" "}
         {handed.length === 1 ? "exchange" : `${handed.length} exchanges`} of it,
         word for word, in front of an empty context — everything above them is
         here for you to read, not something it remembers.
@@ -3007,7 +3011,7 @@ function TurnBlock({
       <div className="chats-turn-foot">
         {/* Money only. The daemon's turn rows carry no token breakdown — see `CostLineProps`. */}
         <CostLine costUsd={turn.cost_usd} />
-        <ContextFill fill={turn.contextFill} rotatesAt={turn.rotatesAt} />
+        <ContextFill fill={turn.contextFill} window={turn.window} />
         <span className="chats-turn-id">#{turn.id}</span>
       </div>
     </li>
@@ -3076,38 +3080,41 @@ function RichLineOut({ line }: { line: RichLine }) {
 }
 
 /**
- * How full the context was, and a word before the daemon starts a new one.
+ * How full the context was, and a word before it is summarised.
  *
- * The rotation used to arrive without a sound. A conversation ran, crossed the ceiling, and the
- * next turn began remembering nothing — and the first anybody heard of it was the restart mark
- * drawn after the fact, or a model suddenly asking what they were talking about.
+ * What it warns about changed and the warning stayed, because what a person wants to know is the
+ * same either way: this conversation is near the end of what it can hold. It used to be about to
+ * be REPLACED — the next turn began remembering nothing, and the first anybody heard of it was a
+ * restart mark drawn after the fact. It is now about to be SUMMARISED, in place, by the CLI, which
+ * is mild enough that the sentence had to stop sounding like a threat.
  *
- * The ceiling is the daemon's, never this file's. It arrives on every turn precisely so this side
- * never keeps a copy of it, and a turn that arrives without one draws the count alone rather than
+ * The window is the conversation's, never this file's. It arrives on every turn precisely so this
+ * side keeps no copy of it — and it genuinely varies now, because a conversation picked up from the
+ * editor is given a wider one — so a turn that arrives without it draws the count alone rather than
  * a proportion of a number nobody sent.
  */
 function ContextFill({
   fill,
-  rotatesAt,
+  window,
 }: {
   fill: number | null;
-  rotatesAt: number | null;
+  window: number | null;
 }) {
   if (fill === null) return null;
   const k = (n: number) => `${(n / 1000).toFixed(1)}k`;
-  if (rotatesAt === null)
+  if (window === null)
     return <span className="chats-turn-fill">{k(fill)} of context</span>;
-  // Near, not past. Past is too late to be a warning: the turn that crosses the line is the last
-  // one that remembers, and this is drawn under it while the next one is still being typed.
-  const near = fill >= rotatesAt * 0.85;
+  // Near, not past. Past is too late to be a warning: this is drawn under the last turn before the
+  // summarising, while the next message is still being typed.
+  const near = fill >= window * 0.85;
   return (
     <span
       className={
         near ? "chats-turn-fill chats-turn-fill-near" : "chats-turn-fill"
       }
     >
-      {`${k(fill)} of ${k(rotatesAt)}`}
-      {near && " — the next turn may begin a fresh context"}
+      {`${k(fill)} of ${k(window)}`}
+      {near && " — the earlier exchanges may be summarised on the next turn"}
     </span>
   );
 }
@@ -3456,6 +3463,15 @@ function MarkNote({ mark }: { mark: Mark }) {
       <p className="chats-mark chats-mark-restart" role="status">
         the conversation restarted here — the model past this point was read the
         last few exchanges back, and remembers nothing older than those
+      </p>
+    );
+  }
+  if (mark.kind === "compacted") {
+    return (
+      <p className="chats-mark chats-mark-compacted" role="status">
+        summarised here — the conversation filled its window, so everything
+        above was condensed into a summary the model carries on from. Same
+        conversation, shorter memory of its early part.
       </p>
     );
   }

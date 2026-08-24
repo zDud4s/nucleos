@@ -103,6 +103,13 @@ export interface ChatSummary {
    * cost — clearing decides what the MODEL is shown, not what happened.
    */
   cleared_after_run_id: number | null;
+  /**
+   * The context window this conversation runs in, or null for the daemon's default.
+   *
+   * Not the same across conversations: one picked up from the editor is given a
+   * window wide enough to hold what it inherited.
+   */
+  context_window: number | null;
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;
@@ -224,8 +231,14 @@ export interface Conversation {
    * has to be right about is the order of magnitude.
    */
   context_estimate: number | null;
-  /** The count past which the daemon stops resuming and starts a fresh context. */
-  context_rotates_at: number;
+  /**
+   * The largest context this daemon can pick up whole, in tokens.
+   *
+   * The largest window a model has, less the headroom the CLI keeps below it
+   * before compacting. Past it there is nothing to resume INTO, and the
+   * conversation is handed its last few exchanges instead.
+   */
+  largest_window: number;
 }
 
 /**
@@ -651,7 +664,10 @@ export function useSendMessage(chatId: string) {
         // Nothing has been sent, so nothing has been measured. The daemon's reading arrives with
         // the turn it belongs to; inventing one here would draw a number this side made up.
         contextFill: null,
-        rotatesAt: null,
+        window: null,
+        // Nothing has run, so nothing has been summarised: that is a fact about a turn that ended,
+        // and this one has not started.
+        compacted: false,
         // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],

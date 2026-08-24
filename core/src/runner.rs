@@ -98,6 +98,13 @@ pub struct RunOutcome {
     pub cache_read_tokens: Option<i64>,
     pub cache_creation_tokens: Option<i64>,
     pub num_turns: Option<i64>,
+    /// Whether the CLI summarised its own context at some point during this run.
+    ///
+    /// Beside the numbers rather than derived from them, because it cannot be derived from them: a
+    /// compacted turn's `context_fill` is simply lower than the one before it, which is
+    /// indistinguishable from a short question. The stream says it outright and this carries what
+    /// it said.
+    pub compacted: bool,
 }
 
 /// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds
@@ -261,6 +268,23 @@ pub struct RunRequest {
     /// is nameless there, so a person looking at their own machine sees a wall of timestamps where
     /// this app's conversations are.
     pub session_name: Option<String>,
+    /// The context window this run is given, or `None` for whatever the CLI decides on its own.
+    ///
+    /// An ENV VAR and not a flag, because the CLI has no flag for it —
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which it clamps to 100k–1M and then caps at the model's
+    /// real window. Below that window minus 13k the CLI compacts its own context and carries on in
+    /// the same session, which is how the editor has always behaved and what this daemon used to
+    /// approximate by refusing to resume and starting again.
+    ///
+    /// Verified in headless mode rather than assumed to be a REPL feature: `claude -p --resume`
+    /// with the window forced low emits `{"type":"system","subtype":"status","status":"compacting"}`
+    /// followed by a `compact_result`. Both are read back below, so a compaction is something the
+    /// transcript can show rather than something that silently happened.
+    ///
+    /// `None` on every run that is not a conversation. A one-shot errand has no second turn for a
+    /// compaction to serve, and naming a window for it would only move the point at which a single
+    /// long tool loop starts summarising itself.
+    pub context_window: Option<i64>,
     /// Which of this server's tools this run is offered, when it is offered any at all.
     ///
     /// `None` — every caller but one — keeps the wildcard: `--allowedTools mcp__nucleos__*`, the
@@ -1082,6 +1106,49 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
     current
 }
 
+/// The environment this run's context window is expressed in, or nothing when it names none.
+///
+/// A function rather than two lines at the spawn site for one reason: the variable's NAME is the
+/// part that fails silently. A typo in it leaves the CLI on its own default window, the daemon
+/// still writes the number the window draws, and the only symptom is a conversation that compacts
+/// at a size nobody asked for. Spelled once, here, where a test can read it back.
+pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)> {
+    request
+        .context_window
+        .map(|window| ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string()))
+}
+
+/// Whether this line says the CLI compacted its own context.
+///
+/// The event, read off a real headless stream rather than inferred from the source:
+///
+/// ```text
+/// {"type":"system","subtype":"status","status":"compacting","session_id":...}
+/// {"type":"system","subtype":"status","status":null,"compact_result":"failed",
+///  "compact_error":"too_few_groups","session_id":...}
+/// ```
+///
+/// `status: "compacting"` is what is read, and the later `compact_result` deliberately is not. The
+/// question this answers is "was the context summarised during this turn" — which is a thing the
+/// transcript should say, because the alternative is a conversation that quietly got shorter — and
+/// a compaction that began is the honest answer to it whether or not it finished. A `failed` result
+/// means the context was left as it was; the turn still answered, and a mark that appeared and then
+/// had to be taken back would be worse than one that says "this is where it summarised".
+///
+/// Sticky once true, like `larger` above: a turn can compact and then go on for many more lines,
+/// and a flag recomputed from the last line alone would report only whatever happened to come last.
+pub(crate) fn compacted_from_line(line: &str, current: bool) -> bool {
+    if current {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return current;
+    };
+    value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+        && value.get("subtype").and_then(serde_json::Value::as_str) == Some("status")
+        && value.get("status").and_then(serde_json::Value::as_str) == Some("compacting")
+}
+
 /// Usage reported by the final `result` event of a Claude `stream-json` transcript.
 ///
 /// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
@@ -1107,6 +1174,12 @@ pub struct TurnOutcome {
     /// What THIS turn added, never what the process has spent altogether.
     pub cost_usd: Option<f64>,
     pub usage: RunUsage,
+    /// Whether the CLI summarised its context while producing THIS turn.
+    ///
+    /// Per turn and not per process, like the cost above and for the same reason: a process that
+    /// serves six turns compacts during one of them, and a flag on the process would mark all six
+    /// as the turn where the conversation got shorter.
+    pub compacted: bool,
 }
 
 /// What one line of a live process's stream means to whoever is recording turns.
@@ -1130,11 +1203,21 @@ pub enum TurnEvent {
 /// in the daemon has to know that a `result` is a boundary or that the cost on it is cumulative.
 pub(crate) struct TurnSplitter {
     spent: f64,
+    /// Belongs to the turn IN FLIGHT, and is cleared when that turn ends.
+    ///
+    /// It is accumulated rather than read off the `result` line, because it is not on it: the CLI
+    /// decides to compact before it answers. Cleared at the boundary and not merely overwritten,
+    /// so a process serving six turns does not report the second one's compaction on the four
+    /// that follow it.
+    compacted: bool,
 }
 
 impl TurnSplitter {
     pub(crate) fn new() -> Self {
-        Self { spent: 0.0 }
+        Self {
+            spent: 0.0,
+            compacted: false,
+        }
     }
 
     /// The events this line produces, in the order a consumer must see them.
@@ -1143,9 +1226,11 @@ impl TurnSplitter {
     /// answer, so a consumer told the turn had ended before being given that line would close every
     /// turn one line short of what it said.
     pub(crate) fn line(&mut self, line: String) -> Vec<TurnEvent> {
+        self.compacted = compacted_from_line(&line, self.compacted);
         match turn_from_result(&line, self.spent) {
-            Some((turn, total)) => {
+            Some((mut turn, total)) => {
                 self.spent = total;
+                turn.compacted = std::mem::take(&mut self.compacted);
                 vec![TurnEvent::Line(line), TurnEvent::Ended(turn)]
             }
             None => vec![TurnEvent::Line(line)],
@@ -1192,6 +1277,9 @@ pub(crate) fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOu
             .map(str::to_owned),
         cost_usd: spent.map(|total| total - already_spent),
         usage: extract_usage(line),
+        // The SPLITTER's to fill: the fact is not on the `result` line this function parses, and
+        // inventing it here from nothing would be a quieter way of saying `false`.
+        compacted: false,
     };
     // A result carrying no cost at all must not reset the total: the next turn would then be
     // differenced against zero and billed for the whole conversation.
@@ -1785,6 +1873,7 @@ impl CommandRunner for OllamaRunner {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             });
         }
 
@@ -1799,6 +1888,7 @@ impl CommandRunner for OllamaRunner {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             num_turns: None,
+            compacted: false,
         })
     }
 }
@@ -1866,6 +1956,12 @@ impl CommandRunner for ClaudeCliRunner {
             std::env::var("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let mut cmd = Command::new(&claude_bin);
         cmd.args(cli_args(&request, &self.model));
+        // Before `request.env` and not after, so an explicit entry still wins. That is what a test
+        // needs to force a window the CLI would otherwise clamp away, and it costs nothing here:
+        // no caller sets both.
+        if let Some((name, value)) = window_env(&request) {
+            cmd.env(name, value);
+        }
         for (k, v) in &request.env {
             cmd.env(k, v);
         }
@@ -1989,6 +2085,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut splitter = TurnSplitter::new();
         let mut usage = RunUsage::default();
         let mut running_context_fill: Option<i64> = None;
+        let mut compacted = false;
 
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut policy_violation: Option<String> = None;
@@ -2029,6 +2126,10 @@ impl CommandRunner for ClaudeCliRunner {
             if let Ok(mut shared) = context_fill.lock() {
                 *shared = running_context_fill;
             }
+            // Read on every line and NOT only near the end: the CLI decides to compact before it
+            // answers. A run cut short here — a timeout, a turn ceiling — has still had its context
+            // summarised, and the record should say so.
+            compacted = compacted_from_line(&line, compacted);
             // After the line is accumulated and mirrored, never before: a run stopped here still has
             // to leave the transcript of the turn that stopped it, or the evidence for why it was
             // stopped is the one thing missing from the record.
@@ -2179,6 +2280,7 @@ impl CommandRunner for ClaudeCliRunner {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
+            compacted,
         })
     }
 }
@@ -2368,6 +2470,15 @@ impl CommandRunner for CodexCliRunner {
                 )));
             }
         }
+        // KNOWN LIMITATION, left un-refused on purpose, beside `session_name` below:
+        // `context_window` is not honoured here, and it is the one control on this list that is
+        // safe to lose. It is exported as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which is a Claude
+        // Code environment variable that `codex exec` reads no meaning into; a run that loses it
+        // compacts on whatever schedule Codex has of its own, which is the schedule every run on
+        // this path has always had. Nothing is loosened and no record claims otherwise — the
+        // window a chat row names is drawn from the row, and the row is still true about the
+        // Claude path it was written for.
+
         // KNOWN LIMITATION, left un-refused on purpose, beside `resume_session_id` below:
         // `session_name` is not honoured here. It reaches the Claude CLI's `--resume` picker and
         // nothing else — no decision anywhere depends on it, and no record claims it was applied —
@@ -2554,6 +2665,7 @@ impl CommandRunner for CodexCliRunner {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
+            compacted: false,
         })
     }
 }
@@ -2841,6 +2953,7 @@ impl CommandRunner for FakeCommandRunner {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })
         };
         if outcome.session_id.is_none() {
@@ -3100,6 +3213,72 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair[0] == "--name" && pair[1] == "o refactor do runner"),
             "{args:?}"
+        );
+    }
+
+    /// The compaction event, as a real headless stream emits it.
+    ///
+    /// Both lines below were copied out of `claude -p --resume` run with the window forced low, not
+    /// written from the source: the point of the test is that this daemon reads what the CLI
+    /// actually sends. The `compact_result` line is deliberately NOT what is read — a compaction
+    /// that began is the honest answer to "was the context summarised here" whether or not it
+    /// finished, and a mark that appeared and then had to be taken back would be worse than one that
+    /// says where the summarising happened.
+    #[test]
+    fn a_compaction_is_read_off_the_stream_and_stays_read() {
+        let started =
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#;
+        let finished = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"too_few_groups","session_id":"s"}"#;
+
+        assert!(
+            compacted_from_line(started, false),
+            "the status line says it"
+        );
+        assert!(
+            !compacted_from_line(finished, false),
+            "the result line alone is not the event"
+        );
+        assert!(
+            compacted_from_line(finished, true),
+            "a compaction already seen is not un-seen by the lines after it"
+        );
+        assert!(
+            !compacted_from_line(r#"{"type":"assistant"}"#, false),
+            "an ordinary line says nothing about compaction"
+        );
+        assert!(
+            !compacted_from_line("not json at all", false),
+            "an unparseable line is not evidence of anything"
+        );
+    }
+
+    /// A compaction belongs to the turn it happened in, and to no other turn of the same process.
+    ///
+    /// The splitter is where this has to hold: on the multi-turn path one process answers several
+    /// times, and a flag left standing would mark every later turn as the one where the
+    /// conversation got shorter.
+    #[test]
+    fn a_compaction_marks_one_turn_and_not_the_ones_after_it() {
+        let mut splitter = TurnSplitter::new();
+        let result =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1,"session_id":"s"}"#;
+
+        splitter.line(
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#.into(),
+        );
+        let first = splitter.line(result.into());
+        let TurnEvent::Ended(first) = &first[1] else {
+            panic!("the result line ends a turn: {first:?}");
+        };
+        assert!(first.compacted, "the turn it happened in carries it");
+
+        let second = splitter.line(result.into());
+        let TurnEvent::Ended(second) = &second[1] else {
+            panic!("the result line ends a turn: {second:?}");
+        };
+        assert!(
+            !second.compacted,
+            "the next turn did not compact, and must not inherit that it did"
         );
     }
 
@@ -3414,6 +3593,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             ..Default::default()
         };
@@ -3500,6 +3680,7 @@ mod tests {
             append_system_prompt: None,
             denied_tools: Vec::new(),
             session_name: None,
+            context_window: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -3624,6 +3805,7 @@ mod tests {
             append_system_prompt: None,
             denied_tools: Vec::new(),
             session_name: None,
+            context_window: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -3643,6 +3825,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             last_plan_only: std::sync::Mutex::new(None),
             ..Default::default()
@@ -3679,6 +3862,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             // The fake releases one canned event per interval. The complete run therefore lasts
             // well beyond the progress deadline while every individual quiet gap stays below it.
