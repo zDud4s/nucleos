@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bandOf, inBands } from "./when";
+import { bandOf, elapsedText, inBands } from "./when";
 
 /** A local time, built the way a person means one — never a UTC string with a Z on it. */
 function local(y: number, m: number, d: number, h: number, min = 0): number {
@@ -77,5 +77,26 @@ describe("inBands", () => {
 
   it("says nothing at all about an empty list", () => {
     expect(inBands([], at, now)).toEqual([]);
+  });
+});
+
+describe("elapsedText", () => {
+  const started = 1_000_000;
+
+  it("reads as a stopwatch, seconds included", () => {
+    // The seconds are the point: they are what says the run is still alive.
+    expect(elapsedText(started, started)).toBe("0:00");
+    expect(elapsedText(started, started + 7_000)).toBe("0:07");
+    expect(elapsedText(started, started + 84_000)).toBe("1:24");
+    expect(elapsedText(started, started + 59_000 + 60_000 * 59)).toBe("59:59");
+  });
+
+  it("grows an hours field rather than counting to 180 minutes", () => {
+    expect(elapsedText(started, started + 3600_000)).toBe("1:00:00");
+    expect(elapsedText(started, started + 3600_000 + 125_000)).toBe("1:02:05");
+  });
+
+  it("never runs backwards when the daemon's clock is ahead of this window's", () => {
+    expect(elapsedText(started, started - 5_000)).toBe("0:00");
   });
 });

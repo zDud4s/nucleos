@@ -18,6 +18,24 @@ export const BAND_TITLE: Record<Band, string> = {
   quiet: "Nothing said yet",
 };
 
+/**
+ * How long a turn has been running, as a clock rather than a phrase.
+ *
+ * NOT `relativeText`, which says "2min ago" and is right for something that already happened.
+ * A turn in flight is being waited ON, and what a person watching one wants is the reading a
+ * stopwatch gives: it moves every second, and the seconds are the part that says it is alive.
+ *
+ * Never negative. A daemon whose clock is a second ahead of this window's would otherwise draw
+ * a run that has not started yet, which is a bug report about a clock rather than a wait.
+ */
+export function elapsedText(started: number, now: number): string {
+  const seconds = Math.max(0, Math.floor((now - started) / 1000));
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}:${pad(seconds % 60)}`;
+  return `${Math.floor(minutes / 60)}:${pad(minutes % 60)}:${pad(seconds % 60)}`;
+}
+
 /** Local midnight before `ms`. Local, because a person's "yesterday" is their own. */
 function midnight(ms: number): number {
   const day = new Date(ms);

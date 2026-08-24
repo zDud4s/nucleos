@@ -37,6 +37,7 @@ import {
   MoreHorizontal,
   PanelLeft,
   PanelLeftClose,
+  LoaderCircle,
   Plus,
   SquareCode,
   SquarePen,
@@ -112,7 +113,7 @@ import {
   StaleNote,
   Teach,
 } from "../ui";
-import { BAND_TITLE, inBands } from "../lib/when";
+import { BAND_TITLE, elapsedText, inBands } from "../lib/when";
 
 import "./chats.css";
 
@@ -3038,6 +3039,11 @@ function Transcript({
             clearedAfter={clearedAfter}
             chatId={chatId}
             onReuse={onReuse}
+            /* The last one, and only the last one. A CSS animation plays when its element
+               mounts, so marking every turn would fade a forty-turn transcript in as a wall on
+               open; marking the last one means it plays once, on the turn that just arrived,
+               and the ones above it are already there. */
+            arriving={index === turns.length - 1}
           />
         ))}
       </ul>
@@ -3052,6 +3058,7 @@ function TurnBlock({
   clearedAfter,
   chatId,
   onReuse,
+  arriving,
 }: {
   turn: Turn;
   previous: Turn | null;
@@ -3059,12 +3066,14 @@ function TurnBlock({
   chatId: string;
   /** Puts this question back in the box, unsent. */
   onReuse: (text: string) => void;
+  /** Whether this is the turn at the end of the thread. See `Transcript`. */
+  arriving: boolean;
 }) {
   const marks = marksBetween(previous, turn, clearedAfter);
   const live = turnIsLive(turn.status);
 
   return (
-    <li className="chats-turn">
+    <li className={arriving ? "chats-turn chats-turn-arriving" : "chats-turn"}>
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
@@ -3091,7 +3100,7 @@ function TurnBlock({
         </button>
       </div>
       <p className="chats-turn-who">núcleo</p>
-      {live && <LiveAnswer turnId={turn.id} />}
+      {live && <LiveAnswer turnId={turn.id} since={turn.createdAt} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
       <TurnPictures paths={turn.images} />
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
@@ -3274,7 +3283,7 @@ function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
  * running is named, because "thinking" over a command that is compiling something is the wrong word
  * for the wait. And words already written are shown as they arrive.
  */
-function LiveAnswer({ turnId }: { turnId: number }) {
+function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
   const live = useLiveTurn(turnId, true);
   const text = live.data?.text ?? "";
   const doing = live.data?.doing ?? null;
@@ -3298,13 +3307,49 @@ function LiveAnswer({ turnId }: { turnId: number }) {
       <Plan todos={planOf(live.data?.did ?? [])} />
       <WhatItDid did={live.data?.did ?? []} />
       <p className="chats-turn-live" ref={end}>
-        {doing !== null
-          ? `running ${doing}…`
-          : text === ""
-            ? "thinking…"
-            : "writing…"}
+        {/* Turning, because the three words below can stand unchanged for two minutes while a
+            build runs and a page that never moves is a page that looks stopped. `base.css`
+            already clamps every animation for anybody who asked for less motion. */}
+        <LoaderCircle className="chats-turn-spinner" aria-hidden="true" />
+        <span>
+          {doing !== null
+            ? `running ${doing}…`
+            : text === ""
+              ? "thinking…"
+              : "writing…"}
+        </span>
+        {/* The seconds, which are the part that says it is still alive. Deliberately outside
+            anything a screen reader watches: a live region that re-announced a ticking clock
+            once a second would make the page unusable for the person it was meant to help. */}
+        <Elapsed since={since} />
       </p>
     </>
+  );
+}
+
+/**
+ * How long this turn has been going, ticking.
+ *
+ * Its own component, and that is the whole reason it exists: a second-by-second reading held in
+ * `LiveAnswer` would re-render the words being written, the plan and the tool list once a second
+ * for as long as a run lasts. Here the interval moves this span and nothing else.
+ *
+ * The interval is cleared on unmount, which is the moment the turn lands.
+ */
+function Elapsed({ since }: { since: string }) {
+  const started = Date.parse(since);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tick);
+  }, []);
+
+  // A timestamp this side cannot read is not drawn as `NaN:aN`. The line above it already says
+  // the turn is running, which is the part that matters.
+  if (Number.isNaN(started)) return null;
+  return (
+    <span className="chats-turn-elapsed">{elapsedText(started, now)}</span>
   );
 }
 

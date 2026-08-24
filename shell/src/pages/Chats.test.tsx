@@ -3072,3 +3072,67 @@ describe("Chats - the list, cut into days", () => {
     expect(screen.queryByRole("list", { name: "Yesterday" })).toBeNull();
   });
 });
+
+describe("Chats - a turn while it is running", () => {
+  it("names the tool it is in and keeps a clock on it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        {
+          "c-1": [
+            turnRow({
+              id: 7,
+              status: "running",
+              answer: null,
+              created_at: new Date(Date.now() - 84_000).toISOString(),
+            }),
+          ],
+        },
+        { live: { 7: { text: "", doing: "cargo test dates::" } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // "thinking" is the wrong word for a wait on something that is compiling.
+    expect(await screen.findByText(/running cargo test dates::…/)).toBeDefined();
+    // Started 84 seconds ago, and the reading moves — which is what says it is alive.
+    expect(await screen.findByText("1:24")).toBeDefined();
+  });
+
+  it("stops the clock when the turn lands", async () => {
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      // Started now, so the clock reads in seconds rather than in the eight days the shared
+      // fixture's timestamp is old.
+      "c-1": [
+        turnRow({
+          id: 7,
+          status: "running",
+          answer: null,
+          created_at: new Date().toISOString(),
+        }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], transcripts, {
+        live: { 7: { text: "", doing: null } },
+      }),
+    );
+    const { queryClient } = await renderChats("/chats/c-1");
+
+    // Scoped to the transcript: the open conversation's row in the list says "thinking…" too,
+    // and a bare `findByText` would match both.
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("thinking…")).toBeDefined();
+    expect(within(transcript).getByText(/^0:0\d$/)).toBeDefined();
+
+    transcripts["c-1"] = [turnRow({ id: 7, status: "completed", answer: "done" })];
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.chats.detail("c-1") });
+    });
+
+    expect(await screen.findByText("done")).toBeDefined();
+    // The clock and the spinner go with the wait they were measuring.
+    expect(within(transcript).queryByText("thinking…")).toBeNull();
+    expect(within(transcript).queryByText(/^\d+:\d\d$/)).toBeNull();
+  });
+});
