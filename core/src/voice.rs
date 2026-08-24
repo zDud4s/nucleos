@@ -1110,11 +1110,24 @@ pub async fn get_turn_speech(
 /// engine and no TTS one has a working conversation that answers in writing, and treating that as
 /// "off" would take the feature away from every machine on the day it ships.
 pub fn speaker_for(config: &crate::config::VoiceConfig) -> Option<Arc<dyn crate::speak::Speaker>> {
-    config.speaks().then(|| {
-        Arc::new(crate::speak::CommandSpeaker::new(
+    if !config.speaks() {
+        return None;
+    }
+    let url = config.tts_url.trim();
+    if url.is_empty() {
+        return Some(Arc::new(crate::speak::CommandSpeaker::new(
             config.tts_command.clone(),
-        )) as Arc<dyn crate::speak::Speaker>
-    })
+        )));
+    }
+    // Said out loud rather than resolved in silence. Both keys set is not an error — the URL is
+    // simply the better one — but a config line that is ignored without comment is how somebody
+    // spends an evening editing a `tts_command` that nothing reads.
+    if !config.tts_command.trim().is_empty() {
+        tracing::warn!(
+            "voice: both tts_url and tts_command are set; using tts_url, which is roughly ten times faster per sentence"
+        );
+    }
+    Some(Arc::new(crate::speak::HttpSpeaker::new(url.to_string())))
 }
 
 /// Builds the transcriber a configured command implies, or `None` when voice is off.
@@ -1927,6 +1940,50 @@ mod tests {
         assert!(!config.speaks());
         assert!(transcriber_for(&config).is_some());
         assert!(speaker_for(&config).is_none());
+    }
+
+    /// A resident engine is a voice too — `speaks()` may not be a synonym for `tts_command`.
+    ///
+    /// The regression this guards is the obvious one when a second implementation arrives: the
+    /// capability check keeps naming the first, so a machine configured entirely correctly for the
+    /// FASTER path reports having no voice at all.
+    #[test]
+    fn a_resident_engine_is_a_voice_even_with_no_command() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: "whisper-cli".to_string(),
+            tts_url: "http://127.0.0.1:5017".to_string(),
+            ..Default::default()
+        };
+
+        assert!(config.speaks());
+        assert!(speaker_for(&config).is_some());
+    }
+
+    /// Both set is not an error, and the URL wins — because the difference is ~2.8 s a sentence.
+    ///
+    /// Asserted through `FakeSpeaker`-free means: what is observable here is that a speaker exists
+    /// and that the *command* is never consulted, which is what the `speak.rs` measurement makes
+    /// worth enforcing. A spawning speaker built from this command would try to run `no-such-program`.
+    #[tokio::test]
+    async fn a_resident_engine_wins_over_a_spawning_one() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: "whisper-cli".to_string(),
+            tts_command: "no-such-program-anywhere".to_string(),
+            // Nothing listens here, which is the point: the failure must be a REFUSED CONNECTION and
+            // not a missing program. Those are the two implementations' distinct signatures.
+            tts_url: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        };
+
+        let speaker = speaker_for(&config).expect("both configured means a speaker exists");
+        let error = speaker.speak("olá").await.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "the spawning speaker was built instead of the resident one: {error}"
+        );
     }
 
     /// And a voice configured on a pillar that is off is not a capability either.

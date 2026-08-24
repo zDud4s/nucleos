@@ -15,14 +15,32 @@
 //! - **Length.** The text is a model's answer. Nothing in this process bounds it, and Windows caps a
 //!   command line at about 32k characters — so an argument would work for every test and fail on the
 //!   one long answer somebody actually wanted read aloud.
-//! - **It is what the engine wants.** Piper reads text from stdin and writes a WAV to stdout with
-//!   `--output_file -`. A contract invented against that would be a contract with an adapter script
-//!   in it.
+//! - **It is what the engine wants.** Piper reads text from stdin and writes a WAV to stdout when
+//!   given `-f -`. A contract invented against that would be a contract with an adapter script in it.
 //!
 //! What is copied exactly is every guard: whitespace splitting with quotes honoured (the SAME
 //! `split_command`, not a second one), a deadline that scales with the work, an output ceiling that
 //! ERRORS rather than clips, and `kill_on_drop` so an abandoned request leaves no process holding the
 //! machine.
+//!
+//! **Two implementations, and the second one is the one to use.** Measured on this machine against
+//! `pt_PT-tugao-medium`, spawning per utterance:
+//!
+//! | | short sentence (1.6s of audio) | long text (27s of audio) |
+//! |---|---|---|
+//! | `CommandSpeaker` | 2.90 s | 4.44 s |
+//! | `HttpSpeaker` | 0.21 s | — |
+//!
+//! Solving those two points gives **~2.8 s of fixed cost per spawn** and synthesis at ~16x realtime:
+//! loading a 63 MB voice dominates everything else, exactly as §14 of the voice design found for
+//! whisper. And because `speakable` hands out one SENTENCE at a time, a spawning speaker pays that
+//! 2.8 s again for every sentence — which takes the whole point out of streaming, since the first
+//! sentence is no longer cheaper than the last.
+//!
+//! So `CommandSpeaker` is kept and `HttpSpeaker` is what a conversation should be pointed at. Keeping
+//! both is not indecision: the command shape is the one an engine that is a plain binary will have,
+//! and having written the trait for exactly this substitution, throwing away the first implementation
+//! the moment the second arrives would be discarding the evidence that the trait was worth having.
 
 use async_trait::async_trait;
 use std::process::Stdio;
@@ -268,6 +286,101 @@ impl Speaker for CommandSpeaker {
     }
 }
 
+/// Speaks by asking a resident engine over loopback.
+///
+/// **The second `impl` this trait was designed to receive**, and the reason decision 5 of the voice
+/// design phrased itself as *"escolhe-se a implementação, não a arquitetura"*. Nothing outside this
+/// file changed to add it.
+///
+/// The shape is deliberately `runner.rs`'s `OllamaRunner` and not `sidecar.rs`'s supervised children:
+/// a base URL in configuration, loopback, and **no supervision**. The núcleo does not start Ollama
+/// either, and for the same reason — it is a service the operator runs, whose lifetime is not this
+/// daemon's business. That symmetry is also why `health.rs` does not probe it: it probes programs
+/// this daemon spawns, and a row that probed one loopback service and not the other would be
+/// describing the operator's setup rather than this daemon's.
+///
+/// The contract is Piper's HTTP server: `POST {base}/synthesize` with `{"text": …}`, WAV back. Chosen
+/// over inventing one because an invented one would need an adapter, which is the same argument that
+/// put the text on stdin above.
+pub struct HttpSpeaker {
+    base_url: String,
+    /// Built once and held, so a conversation's sentences reuse connections instead of paying a
+    /// handshake each. At one request per sentence that is most of what there is to save.
+    client: reqwest::Client,
+}
+
+impl HttpSpeaker {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            // Trailing slashes trimmed here rather than trusted: `{base}/synthesize` against a URL
+            // that already ends in one yields `//synthesize`, which some servers route and some
+            // 404 — and a config file is exactly where a trailing slash gets typed.
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Speaker for HttpSpeaker {
+    async fn speak(&self, text: &str) -> std::io::Result<Vec<u8>> {
+        if text.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nothing to speak",
+            ));
+        }
+
+        let response = self
+            .client
+            .post(format!("{}/synthesize", self.base_url))
+            .json(&serde_json::json!({ "text": text }))
+            // The same deadline the spawning path uses, for the same reason: it has to scale with the
+            // work or it is right for short input and wrong for long, every time, deterministically.
+            .timeout(deadline_for_text(text.chars().count()))
+            .send()
+            .await
+            .map_err(|error| {
+                // Reported as `ConnectionRefused` and not `Other`, because this is the failure that
+                // actually happens: the server is simply not running. `voice.rs` turns it into a 502
+                // and the window says the speaker failed — which is true and is what to act on.
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("could not reach the speaker at {}: {error}", self.base_url),
+                )
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(std::io::Error::other(format!(
+                "the speaker answered {status}"
+            )));
+        }
+
+        let audio = response.bytes().await.map_err(|error| {
+            std::io::Error::other(format!("the speaker's answer broke: {error}"))
+        })?;
+
+        // The same two guards the spawning path applies, and they are not decoration here either. A
+        // server that answers 200 with an error page produces bytes that are not audio, and a voice
+        // whose model failed to load answers 200 with nothing at all.
+        if audio.len() > MAX_AUDIO_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("speaker produced more than {MAX_AUDIO_BYTES} bytes"),
+            ));
+        }
+        if audio.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the speaker produced no audio",
+            ));
+        }
+
+        Ok(audio.to_vec())
+    }
+}
+
 /// What a `FakeSpeaker` will do when asked.
 #[cfg(test)]
 pub enum FakeOutcome {
@@ -439,6 +552,65 @@ mod tests {
         let speaker = CommandSpeaker::new("no-such-program-anywhere".to_string());
         let error = speaker.speak("   ").await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A trailing slash in a config file is not a typo anybody notices, and `{base}//synthesize` is
+    /// routed by some servers and 404'd by others — so it is trimmed rather than trusted.
+    #[tokio::test]
+    async fn a_trailing_slash_in_the_url_does_not_become_a_double_one() {
+        for written in [
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1/",
+            "  http://127.0.0.1:1///  ",
+        ] {
+            let speaker = HttpSpeaker::new(written.to_string());
+            let error = speaker.speak("olá").await.unwrap_err();
+            // Nothing listens on port 1, so the request is REFUSED rather than answered — which is
+            // the outcome that proves a URL was built and attempted at all.
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused,
+                "{written:?} produced {error}"
+            );
+            assert!(
+                !error.to_string().contains("1//"),
+                "{written:?} kept a double slash: {error}"
+            );
+        }
+    }
+
+    /// An engine that is simply not running is the failure that actually happens, and it says so.
+    #[tokio::test]
+    async fn a_resident_engine_that_is_not_there_reports_a_refused_connection() {
+        let speaker = HttpSpeaker::new("http://127.0.0.1:1".to_string());
+        let error = speaker.speak("olá").await.unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        // The address is in the message: "the speaker failed" with no port names nothing to check.
+        assert!(error.to_string().contains("127.0.0.1:1"), "{error}");
+    }
+
+    /// Both implementations refuse an empty utterance, and neither goes near the network or a spawn
+    /// to do it. One trait, one meaning — a rule that held for only one `impl` would be a rule the
+    /// caller cannot rely on.
+    #[tokio::test]
+    async fn neither_implementation_will_speak_nothing() {
+        assert_eq!(
+            HttpSpeaker::new("http://127.0.0.1:1".to_string())
+                .speak("   ")
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            CommandSpeaker::new("no-such-program-anywhere".to_string())
+                .speak("   ")
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     /// A command string with no program in it is a configuration error, not a crash.

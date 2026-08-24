@@ -212,6 +212,14 @@ pub struct VoiceConfig {
     /// núcleo has no voice, which is a smaller loss than having no transcriber: conversation still
     /// works, it just answers in writing.
     pub tts_command: String,
+    /// A resident engine on loopback, e.g. `http://127.0.0.1:5017` for Piper's own HTTP server.
+    ///
+    /// **Preferred over `tts_command` when both are set**, because the difference is not marginal:
+    /// measured here, spawning costs ~2.8 s of model loading per sentence against ~0.2 s for the
+    /// resident server. `speak.rs` carries the numbers. Somebody who configured both meant the one
+    /// that works, so this wins rather than erroring — but it says so in the log, because silently
+    /// ignoring a line somebody wrote is how a config file stops being believed.
+    pub tts_url: String,
     pub hotkey: String,
     pub memo_hotkey: String,
     /// Toggles hands-free conversation mode. A third chord and not a mode of the first, because the
@@ -234,6 +242,7 @@ impl Default for VoiceConfig {
             enabled: false,
             stt_command: String::new(),
             tts_command: String::new(),
+            tts_url: String::new(),
             hotkey: "Ctrl+Alt+Space".to_string(),
             memo_hotkey: "Ctrl+Alt+M".to_string(),
             conversation_hotkey: "Ctrl+Alt+C".to_string(),
@@ -264,7 +273,7 @@ impl VoiceConfig {
     /// Gated on `armed` all the same: a voice with nothing to say it in response to is not a
     /// capability, and reporting it as one would put a control in the window for a pillar that is off.
     pub fn speaks(&self) -> bool {
-        self.armed() && !self.tts_command.trim().is_empty()
+        self.armed() && (!self.tts_url.trim().is_empty() || !self.tts_command.trim().is_empty())
     }
 
     fn validated(mut self) -> Self {

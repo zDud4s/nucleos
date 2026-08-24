@@ -2007,6 +2007,14 @@ function HandsFree({ chatId }: { chatId: string }) {
           no voice on this machine — the answer will be written
         </span>
       )}
+      {/* Only when it is the fallback. Saying "silero" every time would be noise about the thing
+          working; saying nothing when it is NOT would leave somebody watching turns open on a fan
+          with no reason to suspect the detector rather than the microphone. */}
+      {on && voice.listeningWith === "energy" && (
+        <span className="chats-handsfree-phase">
+          listening by loudness — noise may open a turn
+        </span>
+      )}
       {voice.trouble !== null && <ErrorNote>{voice.trouble}</ErrorNote>}
     </div>
   );

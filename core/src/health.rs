@@ -144,7 +144,9 @@ async fn collect_readout(state: AppState) -> HealthReadout {
     // `speaker.is_some()` and not `!tts_command.is_empty()`: `speaker_for` is the one place that
     // decides whether a command becomes a capability, and a probe that re-derives that condition is a
     // second opinion about it. The transcriber probe learned this the hard way with `split_command`.
-    let voice_speaks = state.voice.speaker.is_some();
+    // A COMMAND speaker only. A resident one has no program to look for, and the núcleo does not
+    // probe Ollama either — see `speaker_probe`.
+    let voice_speaks = state.voice.speaker.is_some() && !state.voice.tts_command.trim().is_empty();
     let tts_command = state.voice.tts_command.clone();
     let (pool, cli, credentials, disk, echo, telegram, email, web, browser, voice, speaker, github) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
@@ -306,6 +308,13 @@ async fn voice_probe(armed: bool, command: String) -> SubsystemReadout {
 /// people to ignore the readout when it matters.
 ///
 /// Not configured is `Ok`. A núcleo that does not speak is a choice, not a fault.
+///
+/// **A resident speaker (`tts_url`) is `Ok` here too, and is not probed.** There is no program to
+/// resolve, and the alternative — an HTTP probe — would be a new pattern in this module for one
+/// loopback service while Ollama, the other one, has none. A row that graded the operator's Piper
+/// server and said nothing about their Ollama would be describing their setup rather than this
+/// daemon's. The failure still surfaces: `HttpSpeaker` reports a refused connection, `voice.rs` turns
+/// it into a 502, and the window says the speaker failed.
 async fn speaker_probe(configured: bool, command: String) -> SubsystemReadout {
     run_probe("voice_speaker", async move {
         if !configured {

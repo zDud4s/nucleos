@@ -27,6 +27,7 @@ import {
   onFrame,
   PREROLL_FRAMES,
 } from "../lib/vad";
+import { loadSileroSession, SpeechProbe } from "../lib/silero";
 import { fetchSpeechUnit, postConversation } from "./voice";
 
 /** The chord's event, emitted by `shell/src-tauri/src/dictation.rs`. */
@@ -50,6 +51,14 @@ export interface ConversationView {
   trouble: string | null;
   /** Whether this machine can speak an answer at all. `false` means the answer is read, not heard. */
   hasVoice: boolean;
+  /**
+   * What is deciding whether somebody is talking.
+   *
+   * Surfaced rather than kept private because the two behave visibly differently: `"energy"` opens
+   * turns on a fan or a fridge, and somebody watching that happen deserves to know it is the fallback
+   * talking rather than the feature being broken. `null` until the microphone has been opened once.
+   */
+  listeningWith: "silero" | "energy" | null;
   toggle: () => void;
 }
 
@@ -72,6 +81,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   const [heard, setHeard] = useState<string | null>(null);
   const [trouble, setTrouble] = useState<string | null>(null);
   const [hasVoice, setHasVoice] = useState(true);
+  const [listeningWith, setListeningWith] = useState<"silero" | "energy" | null>(null);
 
   const phaseRef = useRef<ConversationPhase>("off");
   const chatRef = useRef<string | null>(chatId);
@@ -83,6 +93,24 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   const playerRef = useRef<HTMLAudioElement | null>(null);
   /** Bumped on every barge-in and every exit, so audio from an abandoned turn cannot start playing. */
   const generationRef = useRef(0);
+  /** `null` until the model has been loaded, and permanently so if it could not be. */
+  const probeRef = useRef<SpeechProbe | null>(null);
+  /**
+   * Inference is async and Silero's state is sequential, so frames are run one at a time in order.
+   * Two in flight would interleave their state updates and the model's memory would describe audio
+   * that never happened.
+   */
+  const chainRef = useRef<Promise<void>>(Promise.resolve());
+  /** How many frames are waiting on the chain, so a slow runtime cannot grow it without bound. */
+  const pendingRef = useRef(0);
+  /**
+   * Mirrors `listeningWith`, so the load is attempted once and not once per toggle.
+   *
+   * A ref beside the state because the check happens inside `openMic`, which is a stable callback:
+   * reading the state there would read whatever it was when the callback was built, which is `null`
+   * forever.
+   */
+  const listeningWithRef = useRef<"silero" | "energy" | null>(null);
 
   chatRef.current = chatId;
 
@@ -92,6 +120,10 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     recordingRef.current = null;
     prerollRef.current = [];
     gateRef.current = IDLE_GATE;
+    // Silero's state is a memory of what it just heard. Carried across a closed microphone, the next
+    // conversation would start mid-thought about a sentence from the last one.
+    probeRef.current?.reset();
+    pendingRef.current = 0;
     if (live === null) return;
     live.processor.disconnect();
     live.source.disconnect();
@@ -228,6 +260,14 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
 
   const openMic = useCallback(async () => {
     try {
+      // Loaded once and kept: the model is 2.3 MB and the runtime's wasm is larger still, so paying
+      // for it on every toggle would put a second of dead air at the front of every session.
+      if (probeRef.current === null && listeningWithRef.current === null) {
+        const session = await loadSileroSession();
+        probeRef.current = session === null ? null : new SpeechProbe(session);
+        listeningWithRef.current = session === null ? "energy" : "silero";
+        setListeningWith(listeningWithRef.current);
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         // The three that make hands-free possible at all. `echoCancellation` is the load-bearing
         // one: the microphone is open WHILE the answer plays, so without it the gate hears the
@@ -274,15 +314,41 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
    * built and would otherwise hold the first render's closure for the life of the microphone.
    */
   const onAudioFrame = useCallback((frame: Float32Array) => {
+    // Synchronous and first, because these two are what the recording IS. Deferring them behind the
+    // probe below would put the audio's order at the mercy of how fast inference happens to be.
     const recording = recordingRef.current;
     if (recording !== null) recording.push(frame);
 
     prerollRef.current.push(frame);
     if (prerollRef.current.length > PREROLL_FRAMES) prerollRef.current.shift();
 
-    const { state, signal } = onFrame(gateRef.current, energyOf(frame));
-    gateRef.current = state;
-    if (signal !== null) dispatchRef.current({ type: signal });
+    const decide = (probability: number) => {
+      const { state, signal } = onFrame(gateRef.current, probability);
+      gateRef.current = state;
+      if (signal !== null) dispatchRef.current({ type: signal });
+    };
+
+    const probe = probeRef.current;
+    if (probe === null) {
+      decide(energyOf(frame));
+      return;
+    }
+
+    // Dropped rather than queued once the chain is behind. A frame decided three frames late is a
+    // barge-in noticed a tenth of a second late, and every one kept makes the next one later still —
+    // the lag would grow for as long as the runtime stayed slow, and never recover.
+    if (pendingRef.current > 3) return;
+
+    pendingRef.current += 1;
+    chainRef.current = chainRef.current
+      .then(() => probe.probability(frame))
+      .then(decide)
+      // One frame that failed is one frame of silence, not a broken mode. A runtime that fails every
+      // frame presents as a gate that never opens, which is what the fallback below is for.
+      .catch(() => undefined)
+      .finally(() => {
+        pendingRef.current -= 1;
+      });
   }, []);
 
   const perform = useCallback(
@@ -352,7 +418,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
 
   const toggle = useCallback(() => dispatchRef.current({ type: "toggled" }), []);
 
-  return { phase, heard, trouble, hasVoice, toggle };
+  return { phase, heard, trouble, hasVoice, listeningWith, toggle };
 }
 
 function concat(frames: Float32Array[]): Float32Array {
