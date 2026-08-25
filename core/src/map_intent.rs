@@ -248,6 +248,101 @@ fn json_object(answer: &str) -> Option<&str> {
     (end > start).then(|| &answer[start..=end])
 }
 
+/// Ask one runner about one spec.
+///
+/// **The runner is the parameter, and that is the whole of the owner's choice.** `OllamaRunner` and
+/// `ClaudeCliRunner` both implement [`crate::runner::CommandRunner`], so a local brain and a cloud
+/// one arrive here as the same type and leave as the same answer. There is no second code path to
+/// keep in step, and no heuristic deciding which one was good enough — the owner decided.
+///
+/// **An empty list and a failure are different answers and never collapse.** Empty means a model
+/// read the document and found nothing to fix; an error means nobody read anything. Telling the
+/// owner the first when the second happened is precisely the false confidence this feature exists
+/// to cure, in the one place it would be easiest to introduce.
+pub async fn extract(
+    runner: &dyn crate::runner::CommandRunner,
+    spec_slug: &str,
+    source: &str,
+) -> std::io::Result<Vec<Extracted>> {
+    // Every field is spelled out because `RunRequest` deliberately has no `Default` — its own doc
+    // comment says why: a flag added later must not silently inherit a value nobody chose. Copied
+    // from `council.rs`'s cloud seat, which is the closest neighbour (one question, no tools, no
+    // resume), and changed only where this call differs.
+    let request = crate::runner::RunRequest {
+        prompt: extraction_prompt(spec_slug, source),
+        // Nothing to reach, so nothing to carry. A run with no tools cannot spend a token, and one
+        // handed a key it has no door for is a key that leaked for no reason.
+        env: Vec::new(),
+        cwd: None,
+        plan_only: false,
+        resume_session_id: None,
+        mcp_config: None,
+        // The argument is `local_agent::verdict`'s: a reader that could edit the repository is not
+        // reading it. It is also the only policy `OllamaRunner` accepts at all — it refuses
+        // anything else outright — so the local half of the owner's choice depends on this value.
+        tool_policy: crate::runner::ToolPolicy::None,
+        progress_timeout: None,
+        // Asks once and reads the answer. There is no tool call for a second turn to follow up on.
+        max_turns: Some(1),
+        session_id: None,
+        fork_session: false,
+        // Nobody is watching this stream; the answer is read once, whole, at the end.
+        include_partial_messages: false,
+        images: Vec::new(),
+        // NOT because anything ever steers this — `messages` is `None` and no second turn is sent —
+        // but because it is the only way to keep the prompt OFF the command line. `cli_args` pushes
+        // the prompt as a positional argument otherwise, and Windows caps a command line at 32 767
+        // characters while [`MAX_SPEC_BYTES`] lets a document reach 60 000. Every spec worth reading
+        // is over that ceiling, so the argv path would fail with `ERROR_FILENAME_EXCED_RANGE` — os
+        // error 206, whose name says filename and whose meaning is argv. `council.rs` records
+        // losing a whole run to exactly this.
+        steerable: true,
+        // Nothing to govern: the policy above leaves no tool for a classifier to judge a call to.
+        classifier_governs_tools: false,
+        messages: None,
+        // The strict default. A spec is a document, and a document being read is not a reason to
+        // open a connector to it.
+        ambient_mcp: false,
+        // `None` keeps whatever the runner was built with, and that is the point of this signature:
+        // the owner chose a brain by choosing which runner arrives here, not by naming a model
+        // string that only one of the two would honour.
+        model: None,
+        effort: None,
+        fallback_model: Vec::new(),
+        add_dirs: Vec::new(),
+        max_budget_usd: None,
+        agents: Vec::new(),
+        append_system_prompt: None,
+        // Empty, and not a belt for the policy's braces: `ToolPolicy::None` already denies every
+        // built-in, and naming some of them here would read as though the rest were allowed.
+        denied_tools: Vec::new(),
+        session_name: None,
+        context_window: None,
+        // Only ever read beside an `mcp_config`, and there is none.
+        allowed_mcp_tools: None,
+    };
+
+    // Throwaways: this reads neither. The receiver is bound rather than dropped on the spot, and
+    // that is deliberate belt-and-braces — both runners send the session id best-effort (`let _ =
+    // session_tx.send(..)`), so a closed channel is already harmless, but a function that relies on
+    // that is relying on a detail of somebody else's error handling.
+    let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
+    let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+    let outcome = runner.run_prompt(request, session_tx, transcript).await?;
+
+    // The two runners do not answer in the same shape, and this is the seam where that shows.
+    // `OllamaRunner` puts the model's words straight into `stdout`; `ClaudeCliRunner` puts the whole
+    // `--output-format stream-json` transcript there, one event per line, with the answer inside the
+    // final `result`. Handed that stream, `parse_extraction` takes the first `{` and the last `}` of
+    // the WHOLE thing and deserialises nothing — so every cloud extraction would come back "this
+    // spec decided nothing" while the model had in fact answered. `extract_reply` is what the rest
+    // of this daemon uses for exactly that, and it returns `None` for an answer that is not a
+    // stream, which is why the local runner's plain text passes through it untouched.
+    let answer = crate::runner::extract_reply(&outcome.stdout).unwrap_or(outcome.stdout);
+    Ok(parse_extraction(&answer))
+}
+
 use std::path::Path;
 
 /// Where a project might keep its design documents, in the order they are looked for.
@@ -516,5 +611,107 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].ordinal, 1, "the ordinal counts what survived, not what was proposed");
+    }
+
+    /// A runner that answers with exactly this stdout and records what it was handed.
+    ///
+    /// The canned outcome is spelled out rather than defaulted, because `FakeCommandRunner` with
+    /// `canned: None` answers a `result` EVENT — `{"type":"result",...,"result":"fake output"}` —
+    /// and a test of what this module makes of an answer must decide what the answer was.
+    fn fake_answering(stdout: &str) -> crate::runner::FakeCommandRunner {
+        crate::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                session_id: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// A runner whose launch fails — nobody read anything, as opposed to reading and finding none.
+    ///
+    /// `fail_times` is a countdown the fake decrements, so `1` fails the first call and would let a
+    /// second through. One call is all this makes, and a larger number would be a retry budget this
+    /// function does not have.
+    fn fake_failing() -> crate::runner::FakeCommandRunner {
+        crate::runner::FakeCommandRunner {
+            fail_times: std::sync::Mutex::new(1),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_decisions_of_a_spec_come_back_from_whichever_brain_was_asked() {
+        let runner = fake_answering(
+            r#"{"decisions":[{"section":"§1","text":"Alfa.","kind":"c"}]}"#,
+        );
+
+        let found = extract(&runner, "slug", "## §1\nbody").await.expect("extract");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "Alfa.");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_says_nothing_useful_is_an_empty_list_and_not_an_error() {
+        // The owner pressed a button. "This spec produced nothing, press again or pick another
+        // brain" is a sentence; a 500 is not.
+        let runner = fake_answering("I am unable to help with that.");
+        assert!(extract(&runner, "slug", "body").await.expect("extract").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_fails_is_reported_rather_than_read_as_an_empty_spec() {
+        // These two must never collapse. An empty list means the model read it and found nothing;
+        // a failure means nobody read anything, and telling the owner the first when the second
+        // happened is exactly the false confidence this whole feature exists to cure.
+        let runner = fake_failing();
+        assert!(extract(&runner, "slug", "body").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_document_reaches_the_model_and_the_model_gets_no_tools() {
+        // Two properties in one assertion because both are about what the runner was HANDED, which
+        // is the only place either can be observed. A reader that could edit the repository is not
+        // reading it.
+        let runner = fake_answering(r#"{"decisions":[]}"#);
+        let _ = extract(&runner, "the-slug", "## 1. Alfa\n").await.expect("extract");
+
+        let prompt = runner.last_prompt.lock().unwrap().clone().expect("a prompt was sent");
+        assert!(prompt.contains("## 1. Alfa"));
+        assert!(prompt.contains("the-slug"));
+        assert_eq!(
+            *runner.last_tool_policy.lock().unwrap(),
+            Some(crate::runner::ToolPolicy::None)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cloud_brain_answers_in_events_and_its_answer_is_still_found() {
+        // Not in the plan, and it is the difference between this working and this appearing to.
+        // `ClaudeCliRunner` — half of the owner's choice — returns the whole `stream-json`
+        // transcript as `stdout`, one event per line. `parse_extraction` reads first-`{`-to-last-`}`
+        // across whatever it is given, so on that stream it deserialises nothing and returns an
+        // empty list: every cloud extraction would say "this spec decided nothing" while the model
+        // had answered in full. That is the exact collapse the test above forbids, arriving by the
+        // other door.
+        let runner = fake_answering(
+            r#"{"type":"system","subtype":"init","session_id":"s"}
+{"type":"result","subtype":"success","result":"{\"decisions\":[{\"section\":\"§1\",\"text\":\"Alfa.\",\"kind\":\"b\"}]}"}"#,
+        );
+
+        let found = extract(&runner, "slug", "body").await.expect("extract");
+
+        assert_eq!(found.len(), 1, "the answer lives inside the final `result` event");
+        assert_eq!(found[0].text, "Alfa.");
     }
 }
