@@ -1811,6 +1811,9 @@ mod tests {
             triage_runner: None,
             local_triage_disabled: None,
             local_assistant: None,
+            // A doctrine is a Telegram channel's standing instruction. A conversation held at this
+            // machine has none by definition, so `None` here is the value under test, not a stub.
+            telegram_doctrine: None,
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
