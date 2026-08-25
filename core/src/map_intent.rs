@@ -149,6 +149,86 @@ pub fn extraction_prompt(spec_slug: &str, source: &str) -> String {
     )
 }
 
+/// One decision, as proposed and not yet approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Extracted {
+    /// The heading it came from, verbatim. Without this it can never be joined to code.
+    pub section: String,
+    /// Its place in the list the owner reads, 1-based. Counts what survived the parse, not what
+    /// the model proposed — a list numbered with gaps invites the question "where is 3?", and the
+    /// answer would be "it was malformed", which is not the owner's business.
+    pub ordinal: i64,
+    pub text: String,
+    pub kind: Kind,
+}
+
+#[derive(Deserialize)]
+struct RawAnswer {
+    decisions: Vec<RawDecision>,
+}
+
+#[derive(Deserialize)]
+struct RawDecision {
+    #[serde(default)]
+    section: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    kind: String,
+}
+
+/// The decisions in a model's answer, or none.
+///
+/// **Never fails, and that is deliberate.** Every failure here — unparseable JSON, prose around it,
+/// a kind nobody can read, a line with no section — means the same thing to the person who pressed
+/// the button: this spec produced nothing, press again or pick another brain. A `Result` would ask
+/// the route to turn four different noises into one sentence anyway, and an error that always
+/// becomes the same sentence is a longer way of writing an empty list.
+///
+/// A line missing its section, missing its text, or carrying a kind that is not `b` or `c` is
+/// dropped rather than repaired. §4.1's type A arrives here as `"a"` and is dropped by exactly the
+/// same rule, which is what the missing `Kind` variant buys.
+pub fn parse_extraction(answer: &str) -> Vec<Extracted> {
+    let Some(raw) = json_object(answer).and_then(|slice| {
+        serde_json::from_str::<RawAnswer>(slice).ok()
+    }) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for row in raw.decisions {
+        let section = row.section.trim();
+        let text = row.text.trim();
+        if section.is_empty() || text.is_empty() {
+            continue;
+        }
+        let Some(kind) = Kind::from_wire(row.kind.trim()) else {
+            continue;
+        };
+        out.push(Extracted {
+            section: section.to_owned(),
+            ordinal: out.len() as i64 + 1,
+            text: text.to_owned(),
+            kind,
+        });
+    }
+    out
+}
+
+/// The outermost `{...}` in a string, or nothing.
+///
+/// Models wrap JSON in prose and in fences, most of them at least sometimes. Refusing those answers
+/// would send the owner back to press the button again for a reason that was never theirs.
+///
+/// Deliberately not a JSON scanner: it takes the first `{` and the last `}`, which is wrong for an
+/// answer containing two separate objects and right for every answer this has actually been handed.
+/// The cost of being wrong is an empty list and a second press.
+fn json_object(answer: &str) -> Option<&str> {
+    let start = answer.find('{')?;
+    let end = answer.rfind('}')?;
+    (end > start).then(|| &answer[start..=end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +311,54 @@ mod tests {
         let prompt = extraction_prompt("slug", &long);
         assert!(prompt.contains("truncated"));
         assert!(prompt.len() < long.len());
+    }
+
+    #[test]
+    fn the_answer_becomes_one_row_per_decision_in_the_order_it_came() {
+        let answer = r###"{"decisions":[
+            {"section":"## 2. Onde vive","text":"Quarto modo no workspace.","kind":"c"},
+            {"section":"## 7. O carimbo","text":"Tres veredictos.","kind":"b"}
+        ]}"###;
+
+        let found = parse_extraction(answer);
+
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].section, "## 2. Onde vive");
+        assert_eq!(found[0].kind, Kind::Character);
+        assert_eq!(found[0].ordinal, 1, "ordinals are 1-based and are the reading order");
+        assert_eq!(found[1].ordinal, 2);
+    }
+
+    #[test]
+    fn a_model_that_wraps_its_json_in_prose_is_still_understood() {
+        // Every model does this at least sometimes, and refusing the answer would send the owner
+        // back to press the button again for a reason that is not theirs.
+        let answer = "Sure! Here is the list:\n```json\n{\"decisions\":[{\"section\":\"§1\",\
+                      \"text\":\"Alfa.\",\"kind\":\"b\"}]}\n```\nHope that helps.";
+        assert_eq!(parse_extraction(answer).len(), 1);
+    }
+
+    #[test]
+    fn a_line_missing_what_anchors_it_is_dropped_rather_than_kept_half_useful() {
+        // A decision with no section can never be joined to code, and one with no text says
+        // nothing. Both would sit in the approval list forever being neither true nor false.
+        let answer = r#"{"decisions":[
+            {"section":"","text":"Alfa.","kind":"b"},
+            {"section":"§1","text":"   ","kind":"b"},
+            {"section":"§2","text":"Beta.","kind":"a"},
+            {"section":"§3","text":"Gama.","kind":"c"}
+        ]}"#;
+
+        let found = parse_extraction(answer);
+
+        assert_eq!(found.len(), 1, "only the last one is whole");
+        assert_eq!(found[0].text, "Gama.");
+        assert_eq!(found[0].ordinal, 1, "the ordinal counts what survived, not what was proposed");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_json_at_all_is_no_decisions_and_never_a_panic() {
+        assert!(parse_extraction("I could not read that document.").is_empty());
+        assert!(parse_extraction("").is_empty());
     }
 }
