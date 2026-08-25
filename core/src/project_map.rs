@@ -15,7 +15,9 @@
 //! cannot read this" is not.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 /// A language this reader knows how to interpret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -205,9 +207,234 @@ pub fn ts_test_sibling(path: &str) -> String {
     format!("{stem}.test")
 }
 
+/// Folders that are never walked.
+///
+/// `target/` alone is 11.7 GB on this machine and nothing inside it was written by anybody.
+/// `.ai/` is out because it is working material, not product.
+const SKIP: &[&str] = &[
+    ".git",
+    ".ai",
+    ".claude",
+    ".agents",
+    "target",
+    "target-test",
+    "node_modules",
+    "dist",
+    "build",
+];
+
+/// A file of the project, and what is known about it without asking any model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Module {
+    /// Path relative to the root, always with forward slashes.
+    pub path: String,
+    pub reader: Reader,
+    /// It cites a spec section. `false` is the *code nobody asked for* pile of §5.1.
+    pub declares: bool,
+    /// Something tests it.
+    pub tested: bool,
+}
+
+/// One module imports another. Both ends exist — a dangling import is dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Import {
+    pub from: String,
+    pub to: String,
+}
+
+/// The whole structure layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Structure {
+    pub modules: Vec<Module>,
+    pub imports: Vec<Import>,
+    /// Files found that no reader here knows how to interpret (§11).
+    pub unread: Vec<String>,
+}
+
+/// Whether a file is proof or a declaration *about* a module rather than a module itself.
+///
+/// `Meter.test.tsx` is how `Meter.tsx` proves it runs, and a `.d.ts` declares types somebody
+/// else implements. Neither is a feature. Drawing them would double the shell's node count with
+/// nodes that permanently declare nothing and are permanently untested — which is precisely the
+/// pile §5.1 counts, so the noise would land inside the one number that matters.
+///
+/// Deliberately separate from [`reader_for`], which also refuses a `.d.ts`. That refusal means
+/// *nobody here reads this*, and `structure` turns it into `unread`. These files are not unread:
+/// nothing failed to read them. Two questions that happen to overlap on one extension are still
+/// two questions, and collapsing them would make the map say "I cannot read this" about a file
+/// it understands perfectly well.
+fn about_a_module(path: &str) -> bool {
+    path.ends_with(".d.ts") || path.ends_with(".test.ts") || path.ends_with(".test.tsx")
+}
+
+/// The first segment of a path, which is as near to *which crate is this* as a tree walk gets.
+fn top_folder(path: &str) -> &str {
+    path.split_once('/').map(|(head, _)| head).unwrap_or(path)
+}
+
+/// Walk the tree and assemble the structure.
+///
+/// Two passes, and it has to be two: an import can only be resolved once the file list is
+/// known. Resolving while walking would make the answer depend on the order the filesystem
+/// happened to hand back its entries, which is a graph that changes shape between reads for
+/// no reason anybody could see.
+pub fn structure(root: &Path) -> std::io::Result<Structure> {
+    let mut files: Vec<String> = Vec::new();
+    collect(root, root, &mut files)?;
+    files.sort();
+
+    let present: BTreeSet<&str> = files.iter().map(String::as_str).collect();
+    let mut modules = Vec::new();
+    let mut unread = Vec::new();
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+
+    for path in &files {
+        if about_a_module(path) {
+            continue;
+        }
+        let Some(reader) = reader_for(path) else {
+            unread.push(path.clone());
+            continue;
+        };
+        let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+        let tested = match reader {
+            Reader::Rust => rust_has_tests(&source),
+            Reader::Typescript => {
+                let sibling = ts_test_sibling(path);
+                present.contains(format!("{sibling}.ts").as_str())
+                    || present.contains(format!("{sibling}.tsx").as_str())
+            }
+        };
+        modules.push(Module {
+            path: path.clone(),
+            reader,
+            declares: cites_section(&source),
+            tested,
+        });
+        sources.insert(path.clone(), source);
+    }
+
+    // A Rust module is named by its file, and that is how `use crate::storage` finds
+    // `core/src/storage.rs` without this module ever having to know where the crate root is.
+    //
+    // Keyed by top-level folder as well as by stem, because `crate::` never crosses a crate.
+    // Today there is one Rust crate here and the extra key changes nothing. The day `sidecars/`
+    // holds Rust, `main.rs` exists twice, and a flat map would quietly hand half the edges to
+    // the wrong file — which is the one failure this module refuses everywhere else, because a
+    // dropped edge is visible and a wrong one is not.
+    let mut by_stem: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    for module in &modules {
+        if module.reader == Reader::Rust
+            && let Some(stem) = module
+                .path
+                .rsplit('/')
+                .next()
+                .and_then(|f| f.strip_suffix(".rs"))
+        {
+            by_stem.insert((top_folder(&module.path), stem), module.path.as_str());
+        }
+    }
+
+    // An edge may only land on a node the map draws. Resolving against every file on disk would
+    // let an import find a test file, and an edge to something never shown is the same ghost the
+    // dangling case refuses to invent — just harder to see, because one end of it is real.
+    let drawn: BTreeSet<&str> = modules.iter().map(|m| m.path.as_str()).collect();
+
+    let mut imports = Vec::new();
+    for module in &modules {
+        let source = sources.get(&module.path).map(String::as_str).unwrap_or("");
+        match module.reader {
+            Reader::Rust => {
+                for name in rust_imports(source) {
+                    if let Some(target) = by_stem.get(&(top_folder(&module.path), name.as_str()))
+                        && *target != module.path
+                    {
+                        imports.push(Import {
+                            from: module.path.clone(),
+                            to: (*target).into(),
+                        });
+                    }
+                }
+            }
+            Reader::Typescript => {
+                for stem in ts_imports(&module.path, source) {
+                    // The extension resolves only here, where the file list exists.
+                    let candidates = [
+                        format!("{stem}.ts"),
+                        format!("{stem}.tsx"),
+                        format!("{stem}/index.ts"),
+                        format!("{stem}/index.tsx"),
+                    ];
+                    if let Some(target) = candidates.iter().find(|c| drawn.contains(c.as_str()))
+                        && *target != module.path
+                    {
+                        imports.push(Import {
+                            from: module.path.clone(),
+                            to: target.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    imports.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+    imports.dedup();
+
+    Ok(Structure {
+        modules,
+        imports,
+        unread,
+    })
+}
+
+/// Every file below `dir`, by path relative to `root`.
+fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if SKIP.contains(&name.as_str()) || name.starts_with('.') {
+                continue;
+            }
+            collect(root, &path, out)?;
+            continue;
+        }
+        // The same rule as for folders, and for the same reason. An `.eslintrc.ts` is
+        // configuration, not a module, and counting it would drop it straight into the pile of
+        // things that declare nothing — which is the one number this map exists to report.
+        if name.starts_with('.') {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// A toy tree, so no test depends on the shape of the real repository.
+    ///
+    /// Keyed by process as well as by name, the way `transcribe.rs` already keys its temp
+    /// paths. This deletes before it creates, so two suites running at once on one machine
+    /// would delete each other's fixtures mid-test and fail for a reason neither contains.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("nucleos-map-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("scratch");
+        root
+    }
+
+    fn write(root: &std::path::Path, rel: &str, body: &str) {
+        let full = root.join(rel);
+        fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+        fs::write(full, body).expect("write");
+    }
 
     #[test]
     fn a_rust_file_and_a_typescript_file_are_read_by_different_readers() {
@@ -358,5 +585,180 @@ import type { GraphNode } from "../data/workflow-graph";
             ts_test_sibling("shell/src/data/keys.ts"),
             "shell/src/data/keys.test"
         );
+    }
+
+    #[test]
+    fn the_structure_joins_a_module_to_the_one_it_imports() {
+        let root = scratch("joins");
+        write(
+            &root,
+            "core/src/a.rs",
+            "//! §1 alfa\nuse crate::b;\n#[cfg(test)]\nmod t {}",
+        );
+        write(&root, "core/src/b.rs", "pub fn b() {}");
+
+        let found = structure(&root).expect("structure");
+
+        let a = found
+            .modules
+            .iter()
+            .find(|m| m.path == "core/src/a.rs")
+            .expect("a");
+        assert!(a.declares, "it cites a section, so it declares something");
+        assert!(a.tested, "it has cfg(test), so something proves it runs");
+
+        let b = found
+            .modules
+            .iter()
+            .find(|m| m.path == "core/src/b.rs")
+            .expect("b");
+        assert!(
+            !b.declares,
+            "it cites nothing — this is the code nobody asked for"
+        );
+        assert!(!b.tested);
+
+        assert!(
+            found
+                .imports
+                .iter()
+                .any(|i| i.from == "core/src/a.rs" && i.to == "core/src/b.rs")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_import_of_something_that_is_not_there_is_dropped_rather_than_invented() {
+        // `use crate::storage` in a project with no `storage.rs` must not become a ghost node:
+        // a node with no file behind it is indistinguishable from a decision with no code, and
+        // those two say exactly the opposite thing about the project.
+        let root = scratch("dangling");
+        write(&root, "core/src/a.rs", "use crate::nowhere;");
+
+        let found = structure(&root).expect("structure");
+        // Both halves, or the test proves nothing: an empty module list also has no imports,
+        // and that is the opposite outcome wearing the same assertion.
+        assert_eq!(found.modules.len(), 1);
+        assert_eq!(found.modules[0].path, "core/src/a.rs");
+        assert!(found.imports.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_language_nobody_reads_is_listed_instead_of_being_dropped() {
+        let root = scratch("unread");
+        write(&root, "sidecars/echo/main.go", "package main");
+
+        let found = structure(&root).expect("structure");
+        assert!(found.modules.is_empty());
+        assert_eq!(found.unread, vec!["sidecars/echo/main.go".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_build_folder_is_never_walked() {
+        // `target/` is 11.7 GB on this machine and none of it was written by anybody.
+        let root = scratch("skips");
+        write(&root, "target/debug/build.rs", "fn main() {}");
+        write(&root, "node_modules/x/index.ts", "export const x = 1;");
+
+        let found = structure(&root).expect("structure");
+        assert!(found.modules.is_empty());
+        assert!(found.unread.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_test_beside_a_module_is_proof_of_it_and_never_a_module_itself() {
+        // `Meter.test.tsx` is how `Meter.tsx` proves it runs. Drawing it as its own node would
+        // double the shell's count with nodes that permanently declare nothing — putting the
+        // noise inside the one number this map exists to report.
+        let root = scratch("proof");
+        write(
+            &root,
+            "shell/src/ui/Meter.tsx",
+            "export const Meter = () => null;",
+        );
+        write(
+            &root,
+            "shell/src/ui/Meter.test.tsx",
+            "import { Meter } from './Meter';",
+        );
+
+        let found = structure(&root).expect("structure");
+
+        assert_eq!(found.modules.len(), 1);
+        assert_eq!(found.modules[0].path, "shell/src/ui/Meter.tsx");
+        assert!(
+            found.modules[0].tested,
+            "the sibling beside it is the proof"
+        );
+        assert!(
+            found.unread.is_empty(),
+            "nothing failed to read it — it is just not a module"
+        );
+        assert!(
+            found.imports.is_empty(),
+            "the only import came from a file that is not a node"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dotfile_is_configuration_and_never_a_module() {
+        // A folder starting with a dot is already skipped. A file starting with one was not,
+        // so an `.eslintrc.ts` walked straight into the pile of things that declare nothing —
+        // the single number this whole map exists to report.
+        let root = scratch("dotfile");
+        write(&root, "shell/.eslintrc.ts", "export default {};");
+
+        let found = structure(&root).expect("structure");
+        assert!(found.modules.is_empty());
+        assert!(found.unread.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_files_with_the_same_name_in_different_trees_never_share_an_edge() {
+        // `main.rs` exists in every crate there has ever been. A flat index of file stems lets
+        // one tree's import land on another tree's file, and an edge pointing at the wrong
+        // module is worse than no edge: nothing about it looks wrong.
+        let root = scratch("stems");
+        write(&root, "core/src/a.rs", "use crate::shared;");
+        write(&root, "core/src/shared.rs", "pub fn s() {}");
+        write(&root, "sidecars/tool/shared.rs", "pub fn s() {}");
+
+        let found = structure(&root).expect("structure");
+
+        assert_eq!(found.imports.len(), 1);
+        assert_eq!(found.imports[0].from, "core/src/a.rs");
+        assert_eq!(found.imports[0].to, "core/src/shared.rs");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_declaration_file_is_neither_a_module_nor_unread() {
+        // `reader_for` already refuses it, but refusing it there would land it in `unread` —
+        // and nothing failed to read it. Saying "I cannot read this" about a file this reader
+        // understands perfectly well is the one thing §11 exists to prevent.
+        let root = scratch("declaration");
+        write(
+            &root,
+            "shell/src/vite-env.d.ts",
+            "declare const injected: number;",
+        );
+
+        let found = structure(&root).expect("structure");
+        assert!(found.modules.is_empty());
+        assert!(found.unread.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
