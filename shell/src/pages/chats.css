@@ -69,6 +69,22 @@
   }
 }
 
+/**
+ * The page's own floor, given back.
+ *
+ * `.app-page` ends in `--space-8` of padding everywhere in this app; this route zeroes it,
+ * because the composer has to reach the bottom of a column that is exactly the window's height
+ * or the transcript above it cannot scroll inside itself. What that traded away was the air —
+ * the box sat flat on the edge of the screen, which is the one place in the app where something
+ * you type into touches the frame.
+ *
+ * Taken back on the composer instead, where it costs the layout nothing: the column still ends
+ * at the window's edge, and the box ends a little above it.
+ */
+.chats-composer {
+  padding-bottom: var(--space-5);
+}
+
 /* The transcript's own scroll. The head above it and the composer below it stay
    where they are, which is the whole point. */
 .chats-scroll {
@@ -920,10 +936,13 @@
   gap: var(--space-1);
 }
 
-/* The person's half, echoing `.chats-turn-asked` — same shape, quieter ground. */
+/* The person's half, echoing `.chats-turn-asked` — same shape, quieter ground, same side. A
+   conversation had in the editor is still a conversation, and the eye must not have to learn a
+   second layout for the half of the page that was imported. */
 .chats-said-owner .chats-said-text {
   width: fit-content;
   max-width: var(--measure);
+  margin-left: auto;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -1061,16 +1080,32 @@
 }
 
 /**
- * The bubble and the one gesture that acts on it.
+ * The person's half of the exchange, on the right.
  *
- * `align-items: start`, so the pencil sits beside the FIRST line of a question rather than
- * floating at the vertical centre of a four-line one.
+ * Both halves used to start at the same left edge, told apart only by the bubble. That works, and
+ * it is not what anybody's eye is trained on: every chat application there is puts your own words
+ * on one side and the other party's on the other, and a transcript that does not is one you have
+ * to READ to navigate rather than skim. The bubble stays — it is what the imported half echoes,
+ * and it is what makes a question findable inside a long answer — and the side is what makes it
+ * findable without looking at all.
+ *
+ * `flex-wrap` so a question wider than the column takes the whole of it rather than shoving the
+ * pencil off the edge, and `align-items: start` so the pencil sits beside the FIRST line of a
+ * four-line question rather than at its vertical centre.
  */
 .chats-turn-said {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: start;
   gap: var(--space-1);
   min-width: 0;
+}
+
+/* The label goes with the words it names. Only this one: `núcleo` stays where its answer is. */
+.chats-turn-who-you,
+.chats-said-who-you {
+  text-align: right;
 }
 
 /**
@@ -1125,6 +1160,13 @@
   .chats-turn-again {
     opacity: 1;
   }
+}
+
+/* Sent with the question, so drawn with it — on the right, and wrapping onto its own row when
+   the bubble beside it has taken the width. */
+.chats-turn-said .chats-pictures {
+  flex-basis: 100%;
+  justify-content: flex-end;
 }
 
 /**
@@ -1841,26 +1883,220 @@
 
 .chats-rich-line,
 .chats-rich-bullet,
+.chats-rich-quote,
 .chats-rich-heading {
   margin: 0;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
 
+/**
+ * The paragraph break, with a height.
+ *
+ * The parser has always emitted these — "they are the paragraph breaks somebody typed, and a
+ * renderer that dropped them would run two thoughts together" — and the renderer dropped them
+ * anyway, because an empty paragraph is zero pixels tall. Every gap in every answer went missing,
+ * and a reply with three sections came out as one block of text.
+ *
+ * Two thirds of a line rather than a whole one: this sits between two paragraphs that already
+ * have their own leading, and a full blank line reads as a section break rather than a pause.
+ */
+.chats-rich-gap {
+  margin: 0;
+  height: 0.66em;
+}
+
+/* Nothing follows a rule but what comes after it, so it takes its air from both sides. */
+.chats-rich-rule {
+  margin: var(--space-3) 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+/**
+ * A real scale, because there was not one.
+ *
+ * Only `-1` had a size; `##` through `####` inherited the body's, so a model's section headings
+ * came out as body text in medium weight and the structure of a long answer was invisible. Four
+ * steps, and the deepest is deliberately the same size as the text under it — by that level the
+ * weight and the colour are the whole distinction, which is what a fourth-level heading IS.
+ */
 .chats-rich-heading {
-  margin-top: var(--space-2);
-  font-weight: var(--weight-medium);
+  margin-top: var(--space-3);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-snug);
   color: var(--text);
 }
 
+/* Its own top margin is wrong at the very top of an answer: there is nothing above it to be
+   spaced from, and the turn already put air there. */
+.chats-rich-heading:first-child {
+  margin-top: 0;
+}
+
 .chats-rich-heading-1 {
+  font-size: var(--text-lg);
+}
+
+.chats-rich-heading-2 {
   font-size: var(--text-md);
 }
 
+.chats-rich-heading-3 {
+  font-size: var(--text-base);
+}
+
+.chats-rich-heading-4 {
+  font-size: var(--text-sm);
+}
+
+/**
+ * A quotation, held by a stripe.
+ *
+ * The same device `.chats-said` uses for the half of a conversation that was had somewhere else,
+ * and for the same reason: a quotation is text this answer is carrying rather than saying, and one
+ * stripe down the side is what that looks like without giving it a box of its own.
+ */
+.chats-rich-quote {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border);
+  color: var(--text-faint);
+}
+
+/**
+ * One item of a list, hung on its marker.
+ *
+ * `align-items: baseline` so a `10.` sits on the same line as the words beside it, and
+ * `flex: none` on the marker so a two-digit number is never squeezed into one.
+ */
 .chats-rich-bullet {
   display: flex;
+  align-items: baseline;
   gap: var(--space-2);
   padding-left: var(--space-2);
+}
+
+/* Right-aligned and given a width, so `9.` and `10.` end at the same column and the text beside
+   them starts at the same one. A list whose items begin at three different places is a list you
+   read as three lists. */
+.chats-rich-marker {
+  flex: none;
+  min-width: 1.15rem;
+  text-align: right;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/**
+ * How deep a list item is nested.
+ *
+ * Classes and not an inline style, and that is not a preference: this window runs under a CSP with
+ * no `unsafe-inline`, so a `style` attribute computed from a depth would be dropped and every level
+ * would come out flat — which is exactly what the page did before any of this, by a different
+ * route. Four levels, and the parser caps at the last one; past four the nesting has stopped being
+ * something anybody reads.
+ */
+.chats-rich-depth-0 {
+  padding-left: var(--space-2);
+}
+
+.chats-rich-depth-1 {
+  padding-left: var(--space-6);
+}
+
+.chats-rich-depth-2 {
+  padding-left: calc(var(--space-6) + var(--space-4));
+}
+
+.chats-rich-depth-3 {
+  padding-left: calc(var(--space-6) + var(--space-6));
+}
+
+/**
+ * A link, which is a button.
+ *
+ * See `RichLink`: no URL out of a transcript is ever an `href` in this document, and the OS opens
+ * it rather than the webview. What is left for CSS is to make a button read as a link, which means
+ * giving back everything a `<button>` reset takes away.
+ */
+.chats-rich-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.chats-rich-link:hover {
+  color: var(--text);
+}
+
+.chats-rich-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/**
+ * A table, scrolling inside its own frame.
+ *
+ * Never widening the column: a six-column comparison is an ordinary thing for an agent to write,
+ * and the alternatives are a transcript that scrolls sideways as a whole, or cells folded until
+ * the table stops being a table.
+ */
+.chats-table-wrap {
+  margin: var(--space-2) 0;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.chats-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.chats-table-cell {
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+}
+
+.chats-table thead .chats-table-cell {
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  background: var(--surface);
+}
+
+/* A rule under the head and between the rows, and none around the outside — the wrapper's border
+   is the outside. Two frames around one table is the "box inside a box" the principles forbid. */
+.chats-table tbody tr {
+  border-top: 1px solid var(--border);
+}
+
+.chats-table tbody .chats-table-cell {
+  color: var(--text-muted);
+}
+
+/* The author's own alignment. Absent is left, which is what it was already. */
+.chats-table-left {
+  text-align: left;
+}
+
+.chats-table-center {
+  text-align: center;
+}
+
+.chats-table-right {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 /* The whole sentence, as ONE item beside the marker. See the note in `RichLineOut`: the

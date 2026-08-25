@@ -13,6 +13,10 @@ import {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
+/* A link in an answer is handed to the OS rather than followed by the webview — see `RichLink`. */
+const opener = vi.hoisted(() => ({ openUrl: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => opener);
+
 const daemon = vi.hoisted(() => ({
   apiFetch: vi.fn(),
   apiText: vi.fn(),
@@ -49,6 +53,8 @@ beforeEach(() => {
   daemon.probeHealth.mockReset();
   daemon.probeHealth.mockResolvedValue(true);
   daemon.apiText.mockResolvedValue("daemon running");
+  opener.openUrl.mockReset();
+  opener.openUrl.mockResolvedValue(undefined);
   localStorage.clear();
 });
 
@@ -3426,5 +3432,117 @@ describe("Chats - finding something that was said", () => {
       const found = document.getElementById("turn-1");
       expect(found?.className).toContain("chats-turn-lit");
     });
+  });
+});
+
+/* --------------------------------------------- an answer, drawn as it was written -- */
+
+describe("Chats - the shapes an answer is written in", () => {
+  /** One settled turn whose answer is `written`. */
+  function answering(written: string) {
+    return chatsFetch([chatSummary({ chat_id: "c-1" })], {
+      "c-1": [turnRow({ id: 1, answer: written })],
+    });
+  }
+
+  it("draws a table as a table, not as rows of pipes", async () => {
+    daemon.apiFetch.mockImplementation(
+      answering(
+        [
+          "| ano  | bissexto |",
+          "| ---- | -------- |",
+          "| 1900 | nao      |",
+          "| 2000 | sim      |",
+        ].join("\n"),
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const head = await screen.findByRole("columnheader", { name: "bissexto" });
+    expect(head).toBeDefined();
+    expect(screen.getAllByRole("row")).toHaveLength(3);
+    // And the characters it was made of are not on the page as characters.
+    expect(screen.queryByText(/\| 1900 \| nao/)).toBeNull();
+  });
+
+  it("keeps the paragraph breaks somebody typed", async () => {
+    // Every gap in every answer used to be dropped: the parser emitted the blank line and an empty
+    // paragraph is zero pixels tall, so three sections came out as one block of text.
+    daemon.apiFetch.mockImplementation(answering("primeira\n\nsegunda"));
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("primeira");
+    expect(container.querySelectorAll(".chats-rich-gap")).toHaveLength(1);
+  });
+
+  it("hangs a numbered item on the author's own number", async () => {
+    daemon.apiFetch.mockImplementation(answering("1. um\n2. dois"));
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("um");
+    const markers = [...container.querySelectorAll(".chats-rich-marker")].map(
+      (node) => node.textContent,
+    );
+    expect(markers).toEqual(["1.", "2."]);
+  });
+
+  it("keeps a nested item nested", async () => {
+    daemon.apiFetch.mockImplementation(answering("- um\n  - dentro"));
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("dentro");
+    const depths = [...container.querySelectorAll(".chats-rich-bullet")].map(
+      (node) => node.className,
+    );
+    expect(depths[0]).toContain("chats-rich-depth-0");
+    expect(depths[1]).toContain("chats-rich-depth-1");
+  });
+
+  it("hands a link to the OS, and never puts one in an href", async () => {
+    daemon.apiFetch.mockImplementation(
+      answering("ver [o calendario](https://exemplo.pt/gregoriano)"),
+    );
+    const { container } = await renderChats("/chats/c-1");
+
+    const link = await screen.findByRole("button", {
+      name: "Open https://exemplo.pt/gregoriano",
+    });
+    // Not an `<a href>`: an external URL from inside a webview is handled differently per platform
+    // and can simply be swallowed. Nothing out of a transcript is ever an address in this document.
+    expect(container.querySelector("a[href^='http']")).toBeNull();
+
+    fireEvent.click(link);
+    await waitFor(() =>
+      expect(opener.openUrl).toHaveBeenCalledWith("https://exemplo.pt/gregoriano"),
+    );
+  });
+
+  it("draws a hostile URL as text, with nothing to press", async () => {
+    // The defect this exists to prevent: a model writes a `javascript:` link and the window offers
+    // it as a control. It never becomes a link span at all — see `linkAt`.
+    daemon.apiFetch.mockImplementation(
+      answering("carrega [aqui](javascript:alert(1))"),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/javascript:alert\(1\)/)).toBeDefined();
+    expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
+    expect(opener.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("puts what you said on your own side of the exchange", async () => {
+    // Including the pictures, which used to be drawn under the `núcleo` label — a person's own
+    // screenshots, filed in the model's half.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "que cor e esta?", answer: "magenta", images: ["chats/1-0.png"] })],
+      }),
+    );
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("magenta");
+    const mine = container.querySelector(".chats-turn-said") as HTMLElement;
+    expect(within(mine).getByText("que cor e esta?")).toBeDefined();
+    expect(within(mine).getByRole("button", { name: /Open picture/ })).toBeDefined();
   });
 });
