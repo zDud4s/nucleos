@@ -69,22 +69,6 @@
   }
 }
 
-/**
- * The page's own floor, given back.
- *
- * `.app-page` ends in `--space-8` of padding everywhere in this app; this route zeroes it,
- * because the composer has to reach the bottom of a column that is exactly the window's height
- * or the transcript above it cannot scroll inside itself. What that traded away was the air —
- * the box sat flat on the edge of the screen, which is the one place in the app where something
- * you type into touches the frame.
- *
- * Taken back on the composer instead, where it costs the layout nothing: the column still ends
- * at the window's edge, and the box ends a little above it.
- */
-.chats-composer {
-  padding-bottom: var(--space-5);
-}
-
 /* The transcript's own scroll. The head above it and the composer below it stay
    where they are, which is the whole point. */
 .chats-scroll {
@@ -272,6 +256,31 @@
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+/**
+ * The page's own floor, given back.
+ *
+ * `.app-page` ends in `--space-8` of padding everywhere in this app; this route zeroes it,
+ * because the bottom of this column has to BE the bottom of the window or the transcript above
+ * it cannot scroll inside itself. What that traded away was the air: whatever ends the column
+ * sat flat on the edge of the screen, which is the one place in the app where something you
+ * type into touches the frame.
+ *
+ * Here and not on the composer, which is where this went first and was wrong. `.chats-composer`
+ * is one of TWO things that can end this column — a conversation ends in it, and a conversation
+ * being carried on from the editor ends in a bare `StartBox`, whose outermost element is the
+ * `.chats-composer-box` itself. Padding the one that happened to be open on screen left the
+ * other still touching the floor. The floor belongs to the column, not to what is standing on
+ * it, and there is exactly one column.
+ *
+ * Costs the layout nothing: the column still reaches the window's edge, and its last child ends
+ * above it. A fraction of `.app-page`'s own `--space-8` and not the whole of it, because every
+ * pixel here is a pixel taken off the transcript for the rest of the conversation's life. Enough
+ * to read as deliberate air, and no more.
+ */
+.chats-detail-inner {
+  padding-bottom: var(--space-5);
 }
 
 .chats-front {
@@ -958,12 +967,16 @@
   color: var(--text-faint);
 }
 
+/* Set exactly like a turn of this app's own, because that is the whole point of it: a
+   conversation picked up from the editor is a conversation. The stripe down the side already
+   says where it was had — that is provenance, and provenance is not a reason to make the words
+   harder to read. */
 .chats-said-text {
   margin: 0;
   max-width: var(--measure);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
+  font-size: var(--text-base);
+  line-height: var(--leading-relaxed);
+  color: var(--text);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -1192,7 +1205,10 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
-  font-size: var(--text-sm);
+  /* The same size as the answer under it. A question set smaller than its reply says the
+     question mattered less, and it is the half you wrote. Still `snug`, because a bubble is
+     short and holds two or three lines, not twenty. */
+  font-size: var(--text-base);
   font-weight: var(--weight-medium);
   line-height: var(--leading-snug);
   color: var(--text);
@@ -1385,11 +1401,28 @@
 
 /* No ground of its own: the asymmetry between the two halves IS the design.
    Give the answer a box as well and the page is back to a stack of boxes. */
+/**
+ * The words, set as the thing they are.
+ *
+ * This was `--text-sm` in `--text-muted`: 13px of secondary grey. That is the app's CAPTION
+ * treatment — correct for a cost, a timestamp, a tool line — and it was carrying the single
+ * most-read text in the whole product. Every answer therefore arrived quieter than the list of
+ * conversation titles beside it, and a twenty-line reply was twenty lines of small print.
+ *
+ * The muted grey also cost the page its hierarchy rather than creating any: when the answer, the
+ * tool lines, the cost and the context reading are ALL muted, nothing is secondary to anything.
+ * Now the words are `--text` and everything around them stays quiet, which is what makes the
+ * quiet parts read as quiet.
+ *
+ * `--leading-relaxed` because this is prose that gets read from end to end and 1.55 is a leading
+ * for a label. The measure is unchanged — `--measure` is in `ch`, so it grew with the type and
+ * the line still holds about 72 characters.
+ */
 .chats-turn-answer {
   margin: 0;
-  color: var(--text-muted);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
+  color: var(--text);
+  font-size: var(--text-base);
+  line-height: var(--leading-relaxed);
   overflow-wrap: anywhere;
 }
 
@@ -1875,9 +1908,20 @@
 
 /* Prose, and only prose. `.chats-code` is a sibling of this inside the same answer and
    deliberately keeps the whole column — see `--measure` on `.chats-detail`. */
+/**
+ * Prose, and only prose. `.chats-code` is a sibling of this inside the same answer and
+ * deliberately keeps the whole column — see `--measure` on `.chats-detail`.
+ *
+ * The `gap` is what was missing. This was a flex column with none, so consecutive lines sat flush
+ * and the ONLY thing separating one list item from the next was the leading inside them — which
+ * is to say nothing. A four-item list and a four-line paragraph looked identical from a foot
+ * away. One step of the grid is enough: it does not space paragraphs (that is `.chats-rich-gap`),
+ * it just stops the lines touching.
+ */
 .chats-prose {
   display: flex;
   flex-direction: column;
+  gap: var(--space-1);
   max-width: var(--measure);
 }
 
@@ -1898,12 +1942,14 @@
  * anyway, because an empty paragraph is zero pixels tall. Every gap in every answer went missing,
  * and a reply with three sections came out as one block of text.
  *
- * Two thirds of a line rather than a whole one: this sits between two paragraphs that already
- * have their own leading, and a full blank line reads as a section break rather than a pause.
+ * Sized against the leading it sits in, not against nothing: with `.chats-prose`'s own step on
+ * each side this comes to about three quarters of a line, which is the distance at which two
+ * paragraphs read as two. It was 0.66em with no gap around it — half a line — and paragraphs ran
+ * together into one block.
  */
 .chats-rich-gap {
   margin: 0;
-  height: 0.66em;
+  height: 0.75em;
 }
 
 /* Nothing follows a rule but what comes after it, so it takes its air from both sides. */
@@ -1920,9 +1966,16 @@
  * came out as body text in medium weight and the structure of a long answer was invisible. Four
  * steps, and the deepest is deliberately the same size as the text under it — by that level the
  * weight and the colour are the whole distinction, which is what a fourth-level heading IS.
+ *
+ * Each step moved up one when the body did. Left alone, `####` would have been 13px against 15px
+ * body: a heading smaller than the paragraph it heads.
  */
+/* Nearer to the text it introduces than to the text it follows — which is the entire job of a
+   heading's spacing, and it had none: `margin-bottom` was 0 and the column had no gap, so every
+   heading sat directly on top of its first line and read as a bold first sentence. */
 .chats-rich-heading {
-  margin-top: var(--space-3);
+  margin-top: var(--space-4);
+  margin-bottom: var(--space-1);
   font-weight: var(--weight-semibold);
   line-height: var(--leading-snug);
   color: var(--text);
@@ -1935,19 +1988,19 @@
 }
 
 .chats-rich-heading-1 {
-  font-size: var(--text-lg);
+  font-size: var(--text-xl);
 }
 
 .chats-rich-heading-2 {
-  font-size: var(--text-md);
+  font-size: var(--text-lg);
 }
 
 .chats-rich-heading-3 {
-  font-size: var(--text-base);
+  font-size: var(--text-md);
 }
 
 .chats-rich-heading-4 {
-  font-size: var(--text-sm);
+  font-size: var(--text-base);
 }
 
 /**

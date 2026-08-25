@@ -44,6 +44,11 @@
   --leading-tight: 1.2;
   --leading-snug: 1.35;
   --leading-normal: 1.55;
+  /* For running prose that is actually READ rather than scanned — a model's answer, and
+     nothing else so far. 1.55 is right for a label, a row, a two-line note; over the twenty
+     lines of a real reply it packs the lines close enough that the eye loses which one it
+     was on coming back from the left margin. */
+  --leading-relaxed: 1.7;
 
   /* Group labels and badges are set in small caps with air between letters;
      at 11px an untracked uppercase run is a smear. */

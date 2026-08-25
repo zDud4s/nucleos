@@ -517,13 +517,17 @@
 
 /* ----------------------------------------------------------- page header -- */
 
+/* The band every page opens with. Trimmed rather than redesigned: the title keeps its size, and
+   what came back is the leading around it and the air under the rule — a heading and a count are
+   two short lines, and they were costing nearly a tenth of the window before anything on the page
+   had said anything. */
 .ui-page-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-5);
-  padding-bottom: var(--space-4);
-  margin-bottom: var(--space-5);
+  padding-bottom: var(--space-3);
+  margin-bottom: var(--space-4);
   border-bottom: 1px solid var(--border);
 }
 
@@ -534,10 +538,13 @@
   min-width: 0;
 }
 
+/* Display type takes tight leading. At the inherited 1.55 a 28px title reserved 43px for a
+   line that is 28px tall, and the difference read as a gap nobody put there. */
 .ui-page-title {
   font-family: var(--font-display);
   font-size: var(--text-2xl);
   font-weight: var(--weight-bold);
+  line-height: var(--leading-tight);
   letter-spacing: -0.015em;
 }
 
