@@ -90,6 +90,78 @@ fn leading_ident(text: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Which files of this project a TypeScript module imports, by path without an extension.
+///
+/// Only **relative** specifiers count. `@tanstack/react-query` is a dependency, not a module
+/// of this project, and drawing it would fill the map with nodes nobody here wrote.
+///
+/// The extension is deliberately left unresolved: `./client` could be `client.ts` or
+/// `client.tsx`, and only something that has already walked the tree knows which. That
+/// decision belongs to [`structure`], where the file list exists.
+///
+/// `path` is the module's path from the project root, joined with `/` on every platform, which
+/// is the form [`structure`] hands over. Given a backslash path this finds no folder at all and
+/// quietly resolves every import as if the file sat at the root — so the normalisation belongs
+/// to the caller that walked the filesystem, and is not repeated here.
+pub fn ts_imports(path: &str, source: &str) -> BTreeSet<String> {
+    let folder = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let mut found = BTreeSet::new();
+
+    for quote in ['"', '\''] {
+        for (index, _) in source.match_indices(quote) {
+            let rest = &source[index + 1..];
+            let close = match rest.find(quote) {
+                Some(at) => at,
+                None => continue,
+            };
+            let target = &rest[..close];
+            if !target.starts_with('.') {
+                continue;
+            }
+            // No specifier of any kind contains a space, which is the whole of what separates
+            // a real one from an apostrophe in prose closing a span it never opened. Cheap
+            // enough not to need a parser, and it closes the class rather than the example.
+            if target.chars().any(char::is_whitespace) {
+                continue;
+            }
+            if let Some(resolved) = join_relative(folder, target) {
+                found.insert(resolved);
+            }
+        }
+    }
+    found
+}
+
+/// A relative specifier joined to the folder of whoever wrote it, or nothing when it names no
+/// file of this project.
+///
+/// Nothing comes back in two ways, and only one of them is a climb. `../../..` from `a/b` runs
+/// out of folder to pop, which is what stops a path outside the project from becoming a node
+/// that could never match a file. But `..` from `a` lands exactly on the root, and a folder is
+/// not a module either — that one ends with nothing left to name rather than with an underflow,
+/// and is just as correctly not a node.
+fn join_relative(folder: &str, target: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if folder.is_empty() {
+        Vec::new()
+    } else {
+        folder.split('/').collect()
+    };
+
+    for piece in target.split('/') {
+        match piece {
+            "." | "" => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +233,50 @@ use crate::{budget, health};
         // into an edge to every module in the crate would bury the graph under a fan that says
         // less than no edge at all does. Recorded here so the silence is a decision, not a gap.
         assert!(rust_imports("use crate::*;\n").is_empty());
+    }
+
+    #[test]
+    fn a_typescript_module_resolves_a_relative_import_against_its_own_folder() {
+        let source = r#"
+import { useQuery } from "@tanstack/react-query";
+import { apiFetch } from "./client";
+import type { GraphNode } from "../data/workflow-graph";
+"#;
+        let found = ts_imports("shell/src/canvas/map-model.ts", source);
+        // A package from node_modules is not a module of this project.
+        assert!(!found.iter().any(|p| p.contains("react-query")));
+        assert!(found.contains("shell/src/canvas/client"));
+        assert!(found.contains("shell/src/data/workflow-graph"));
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn a_parent_hop_cannot_climb_out_of_the_project() {
+        // `../../../../elsewhere` is not a node on the map. Climbing out of the root returns
+        // nothing rather than a path that could never match a module anyway.
+        let found = ts_imports(
+            "shell/src/main.tsx",
+            "import x from \"../../../../elsewhere\";",
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn a_single_quoted_specifier_is_read_like_a_double_quoted_one() {
+        // The shell writes both forms. A map that only saw one would be missing edges for a
+        // reason no one looking at it could ever guess.
+        let found = ts_imports(
+            "shell/src/project/Workspace.tsx",
+            "import x from './ModeMapa';",
+        );
+        assert!(found.contains("shell/src/project/ModeMapa"));
+    }
+
+    #[test]
+    fn an_apostrophe_in_prose_never_becomes_a_path() {
+        // An apostrophe with no partner turns the next one into a closing quote, and the
+        // sentence caught between them starts with a dot by accident.
+        let source = "// the students'./project is done, ask the teachers' opinion";
+        assert!(ts_imports("shell/src/main.tsx", source).is_empty());
     }
 }
