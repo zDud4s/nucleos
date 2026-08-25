@@ -78,6 +78,15 @@ struct IdParams {
     id: i64,
 }
 
+/// Which jobs to list. Both fields optional, and both narrow: absent means "everything".
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct JobsListParams {
+    /// Narrow to one project. Absent lists every project's jobs.
+    project_id: Option<String>,
+    /// Only the jobs still going. Absent or false includes the finished ones.
+    live: Option<bool>,
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct KillParams {
     engaged: bool,
@@ -502,6 +511,50 @@ impl NucleosTools {
             Ok(job_id) => serde_json::json!({"job_id": job_id}).to_string(),
             Err(msg) => error_json(msg),
         }
+    }
+
+    // Looking at a job, and stopping one. `create_job` was on this server from the start and
+    // nothing here could look at what it started: a caller with no screen opened a night's work and
+    // then went blind to it.
+    //
+    // `get_job` is the one that changes an answer rather than adding one. Every brake in `job.rs`
+    // parks rather than fails — budget, WIP, concurrency, the owner's attention — and a parked job
+    // writes WHY on its own row. Read it and "still going", "waiting for you to step away from the
+    // screen" and "out of budget" are three different sentences; without it they are one silence.
+
+    #[tool(
+        description = "Read one NucleOS job: its status, its queue of items, and — if a brake has \
+                       parked it — the reason, which is on the job itself. A job that looks stuck \
+                       is usually waiting on something nameable, so read this before saying \
+                       nothing is happening."
+    )]
+    async fn get_job(&self, Parameters(IdParams { id }): Parameters<IdParams>) -> String {
+        json_result(self.client.get_job(id).await)
+    }
+
+    #[tool(
+        description = "List NucleOS jobs, newest first. `project_id` narrows to one project and \
+                       absent lists every project's; `live` narrows to the ones still going. Use \
+                       it to answer what is running right now."
+    )]
+    async fn list_jobs(
+        &self,
+        Parameters(JobsListParams { project_id, live }): Parameters<JobsListParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .list_jobs(project_id.as_deref(), live.unwrap_or(false))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Stop a NucleOS job. The item already in flight finishes and nothing else \
+                       starts. It cannot be undone — the job does not resume — so say what you are \
+                       about to stop and why before doing it."
+    )]
+    async fn cancel_job(&self, Parameters(IdParams { id }): Parameters<IdParams>) -> String {
+        json_result(self.client.cancel_job(id).await)
     }
 
     #[tool(description = "Get a NucleOS run by ID")]
@@ -1473,8 +1526,10 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "get_budget",
     "get_email",
     "get_email_queue",
+    "get_job",
     "get_kill",
     "get_run",
+    "list_jobs",
     "list_projects",
     "list_proposals",
     "vcs_ticket",
@@ -1714,6 +1769,9 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("browser_look", ToolEffect::ReadsUntrusted),
     ("browser_open", ToolEffect::ReadsUntrusted),
     ("browser_snapshot", ToolEffect::ReadsUntrusted),
+    // Stopping a job, graded like stopping a run and for the same reason: it ends work that is
+    // already in flight, which is an effect on the world and not a reading of it.
+    ("cancel_job", ToolEffect::Acts),
     ("cancel_run", ToolEffect::Acts),
     // A job is a chain of runs, so it is at least as much of an act as one run is.
     ("create_job", ToolEffect::Acts),
@@ -1730,6 +1788,11 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("get_budget", ToolEffect::ReadsOwn),
     ("get_email", ToolEffect::ReadsUntrusted),
     ("get_email_queue", ToolEffect::ReadsUntrusted),
+    // A job row and a job listing: this daemon's own record of work it started itself. `ReadsOwn`
+    // with less doubt than `get_run` carries, and the difference is worth stating — `get_run`
+    // answers with a run's STDOUT, which for a triage run is a model's answer over a stranger's
+    // mail, while these answer with status, ordinals, states and the wait reason `job::park` wrote.
+    ("get_job", ToolEffect::ReadsOwn),
     ("get_kill", ToolEffect::ReadsOwn),
     ("get_run", ToolEffect::ReadsOwn),
     // The GitHub pair, and their being TWO is a security boundary rather than an arrangement.
@@ -1748,6 +1811,7 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("github_act", ToolEffect::Acts),
     ("github_read", ToolEffect::ReadsOwn),
     ("list_files", ToolEffect::ReadsUntrusted),
+    ("list_jobs", ToolEffect::ReadsOwn),
     ("list_projects", ToolEffect::ReadsOwn),
     ("list_proposals", ToolEffect::ReadsOwn),
     // The four project reads, and this is the weakest line on this page, so it is argued rather
@@ -1999,6 +2063,17 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "get_budget" => self.tools.get_budget().await,
             "get_kill" => self.tools.get_kill().await,
             "get_run" => self.tools.get_run(Parameters(parsed!(IdParams))).await,
+            // The fifth list a tool on `LOCAL_TOOLS` has to join, and the one nothing about adding
+            // a tool reminds you of: this box dispatches to the methods DIRECTLY rather than
+            // through the router, so a name offered here and unhandled here is a tool the model is
+            // shown and then told does not exist. `every_offered_tool_can_be_dispatched` is what
+            // caught it, exactly as the `list_files` note above says it was written to.
+            "get_job" => self.tools.get_job(Parameters(parsed!(IdParams))).await,
+            "list_jobs" => {
+                self.tools
+                    .list_jobs(Parameters(parsed!(JobsListParams)))
+                    .await
+            }
             "get_email_queue" => self.tools.get_email_queue().await,
             "get_email" => self.tools.get_email(Parameters(parsed!(IdParams))).await,
             // `list_files` is on `COUNCIL_TOOLS` and had no arm here, so a local seat that called
@@ -2780,6 +2855,7 @@ mod tests {
                 "browser_look",
                 "browser_open",
                 "browser_snapshot",
+                "cancel_job",
                 "cancel_run",
                 "create_job",
                 "create_run",
@@ -2790,6 +2866,7 @@ mod tests {
                 "get_budget",
                 "get_email",
                 "get_email_queue",
+                "get_job",
                 "get_kill",
                 "get_run",
                 // The pair, and their being two rather than one is the security boundary the
@@ -2799,6 +2876,7 @@ mod tests {
                 "github_act",
                 "github_read",
                 "list_files",
+                "list_jobs",
                 "list_projects",
                 "list_proposals",
                 "project_cat",
@@ -4121,5 +4199,100 @@ mod tests {
              lets this server mint the evidence for its own promotion out of shadow. It stays in \
              the app, where the person can see what they are agreeing to. Found: {judging:?}"
         );
+    }
+
+    /// The three job tools must be served when nothing narrows the box, checked by name for the
+    /// reason the project reads are: `sem_caixa_o_servidor_serve_tudo` counts rather than names, so
+    /// a registration slip on just these three would be silent under it.
+    #[tokio::test]
+    async fn as_tres_ferramentas_de_job_sao_servidas_sem_caixa() {
+        let (_running, context) = served_request_context().await;
+        let listed = unboxed_server().list_tools(None, context).await.unwrap();
+        let names = advertised(&listed);
+
+        for name in ["get_job", "list_jobs", "cancel_job"] {
+            assert!(
+                names.iter().any(|tool| tool == name),
+                "{name} was not served with no box narrowing it: {names:?}"
+            );
+        }
+    }
+
+    /// Reading a job and stopping one are not the same act, and the table has to say so. The reads
+    /// would fail closed to `Acts` while unclassified — refused to any turn that had read mail, for
+    /// no reason — and the stop must NOT be anything but `Acts`, because a turn holding a
+    /// stranger's words is exactly the one that should not be able to end a night's work.
+    #[test]
+    fn olhar_para_um_job_nao_age_e_parar_um_job_age() {
+        for name in ["get_job", "list_jobs"] {
+            assert_eq!(
+                tool_effect(name),
+                ToolEffect::ReadsOwn,
+                "{name} reads a job and must be ReadsOwn, not fail closed to Acts"
+            );
+        }
+        assert_eq!(
+            tool_effect("cancel_job"),
+            ToolEffect::Acts,
+            "cancel_job ends work in flight and must be Acts"
+        );
+    }
+
+    /// The asymmetry, pinned because it is a decision and not an oversight.
+    ///
+    /// A chat turn can already OPEN a job (`create_job` is on `LOCAL_TOOLS`), so it can look at the
+    /// one it opened — a caller who can start a night's work and cannot ask how it is going is the
+    /// gap these tools exist to close. It cannot STOP one, for the reason `cancel_run` is off the
+    /// same list and stated there: stopping is what somebody reaches for when things are going
+    /// wrong, and that stays where the person can see what they are ending.
+    #[test]
+    fn um_chat_pode_ver_o_job_que_abriu_mas_nao_o_pode_parar() {
+        assert!(
+            LOCAL_TOOLS.contains(&"create_job"),
+            "the whole argument below rests on a chat turn being able to open a job at all"
+        );
+        for name in ["get_job", "list_jobs"] {
+            assert!(
+                LOCAL_TOOLS.contains(&name),
+                "{name} is how a chat turn asks about the job it opened"
+            );
+        }
+        assert!(
+            !LOCAL_TOOLS.contains(&"cancel_job"),
+            "cancel_job is on LOCAL_TOOLS, where cancel_run deliberately is not"
+        );
+        assert!(
+            !LOCAL_TOOLS.contains(&"cancel_run"),
+            "cancel_run left LOCAL_TOOLS, so the symmetry this test asserts no longer holds and \
+             the decision about cancel_job has to be taken again rather than inherited"
+        );
+    }
+
+    /// Both halves: the three ARE registered, and none of them reaches a council seat, a team agent
+    /// or an errand's box. A council fans one question into up to eight agents and an errand is a
+    /// Telegram topic anyone in the group can post to; neither is a place to hand the controls of
+    /// work already running.
+    #[test]
+    fn nenhuma_ferramenta_de_job_chega_a_um_conselho_a_uma_equipa_ou_a_um_assunto() {
+        let registered = every_tool_name();
+
+        for name in ["get_job", "list_jobs", "cancel_job"] {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is not registered on this server at all — the absences below prove nothing"
+            );
+            assert!(
+                !COUNCIL_TOOLS.contains(&name),
+                "{name} reached COUNCIL_TOOLS, a council seat's box"
+            );
+            assert!(
+                !TEAM_TOOLS.contains(&name),
+                "{name} reached TEAM_TOOLS, a team agent's box"
+            );
+            assert!(
+                !ERRAND_TOOLS.contains(&name),
+                "{name} reached ERRAND_TOOLS, a Telegram topic's box"
+            );
+        }
     }
 }
