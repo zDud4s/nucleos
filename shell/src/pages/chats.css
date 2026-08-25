@@ -75,7 +75,12 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  /* Sideways is refused outright rather than merely kept from reaching the page — see `html` in
+     `base.css`. Asking for `overflow-y` alone computes `overflow-x` to `auto`, so this box IS a
+     horizontal scroll container with nothing to scroll, which is precisely the shape that drags
+     and springs back. Vertically it still only stops the gesture chaining to the page. */
+  overscroll-behavior-x: none;
+  overscroll-behavior-y: contain;
   /* The mask below fades the first and last 16px of the box, which is right while there is more
      past them and wrong at either end, where it was fading out the newest thing said and the line
      the conversation starts on. The padding is the same 16px at both ends, so the content comes to
@@ -118,7 +123,9 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  /* The same as the transcript beside it, and for the same reason. */
+  overscroll-behavior-x: none;
+  overscroll-behavior-y: contain;
   margin-right: calc(var(--space-2) * -1);
   padding-right: var(--space-2);
   mask-image: var(--scroll-fade);
@@ -1543,6 +1550,9 @@
   line-height: var(--leading-normal);
   resize: none;
   field-sizing: content;
+  /* The same accidental horizontal scroll container as the rail and the transcript: a `max-height`
+     with a scroll makes one, and a two-finger scroll over the box dragged it sideways. */
+  overscroll-behavior-x: none;
   min-height: 1.55em;
   max-height: 18rem;
 }
@@ -2168,6 +2178,10 @@
   margin: var(--space-2) 0;
   max-width: 100%;
   overflow-x: auto;
+  /* This one scrolls sideways for real, and still should — `none` refuses only the OVERSCROLL past
+     either end, not the scrolling in between. Without it a table narrow enough to fit is another
+     horizontal box with nothing to scroll, and drags under a two-finger gesture like the rest. */
+  overscroll-behavior-x: none;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
@@ -2277,6 +2291,8 @@
   border-radius: var(--radius-sm);
   background: var(--surface);
   overflow-x: auto;
+  /* As the table above: a long line still scrolls, and a short block no longer drifts. */
+  overscroll-behavior-x: none;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);

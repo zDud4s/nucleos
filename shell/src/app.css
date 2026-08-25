@@ -115,6 +115,10 @@
 .nav-scroll {
   min-height: 0;
   overflow-y: auto;
+  /* Asking for `overflow-y` alone computes `overflow-x` to `auto`, which makes this a horizontal
+     scroll container with nothing in it to scroll — and a touchpad's sideways drift then drags the
+     whole rail and springs it back. See `html` in `base.css`. */
+  overscroll-behavior-x: none;
   padding: var(--space-3) var(--space-2);
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);
