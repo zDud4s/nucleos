@@ -613,7 +613,7 @@ function RulesPanel({ projectId }: { projectId: string }) {
       <RulesFileState rules={rules.data} />
       <SchedulesPanel schedules={rules.data.schedules} />
       <RepoTriggersPanel triggers={rules.data.repo_triggers} />
-      <GatePanel command={rules.data.gate_command} />
+      <GatePanel command={rules.data.gate_command} beforePublish={rules.data.gate_before_publish} />
       <WipPanel projectId={projectId} rules={rules.data} />
     </>
   );
@@ -780,17 +780,31 @@ function RepoTriggersPanel({ triggers }: { triggers: RepoTriggerView[] }) {
   );
 }
 
-function GatePanel({ command }: { command: string | null }) {
+function GatePanel({ command, beforePublish }: { command: string | null; beforePublish: boolean }) {
+  const configured = command !== null && command.trim() !== "";
   return (
     <Panel title="Gate" variant="dim">
-      {command === null || command.trim() === "" ? (
+      {configured ? (
+        <code className="pj-gate">{command}</code>
+      ) : (
         <p className="pj-note">
           No gate is configured, so nothing measures this project&apos;s work. That is why a job item
           can read <em>passed</em> with no gate status: there was nothing to pass.
         </p>
-      ) : (
-        <code className="pj-gate">{command}</code>
       )}
+      {/* The second moment the same command can run, and the one nothing else on this
+          page would reveal. A landing that takes twenty minutes has a reason, and the
+          reason is a key in a gitignored file — so this is where it stops being
+          invisible. The contradictory state is drawn too, because the queue refuses
+          every merge while it holds and a refusal nobody can explain is the worst of
+          the three. */}
+      <p className="pj-note">
+        {!beforePublish
+          ? "Merges do not wait for it: the queue publishes without measuring the tree the two branches make together."
+          : configured
+            ? "Merges wait for it. The queue runs it on the merged result and publishes only if it passes; nothing is reverted, because nothing is published first."
+            : "Merges are set to wait for a gate and none is configured, so the queue refuses them."}
+      </p>
     </Panel>
   );
 }

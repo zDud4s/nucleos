@@ -67,6 +67,12 @@ export interface ProjectRules {
   /** Why the file could not be read. Non-null exactly when `rules_file` is `unreadable`. */
   rules_error: string | null;
   gate_command: string | null;
+  /**
+   * Whether the VCS queue runs that command on a merge before publishing it.
+   * Read here rather than derived: the rule lives in `.ai/autopilot.yaml`, and a
+   * second copy of it in the window is a copy that will eventually disagree.
+   */
+  gate_before_publish: boolean;
   schedules: ScheduleView[];
   repo_triggers: RepoTriggerView[];
   /** The effective ceiling. `null` means the brake is **off**, which is not a ceiling of zero. */
