@@ -296,53 +296,11 @@
   color: var(--text-faint);
 }
 
-/**
- * One editor conversation, weighed before it is brought here.
- *
- * It takes the whole column rather than unfolding inside the list, because this
- * is a decision with a price on it: what it carries, what the model would be
- * handed, whether the folder even lets it touch a file. A real pick-up of a
- * session near the ceiling billed $1.72 for a one-word answer.
- */
-.chats-editor-chosen {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding-top: var(--space-2);
-}
-
-.chats-editor-head {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.chats-editor-name {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
-  letter-spacing: -0.01em;
-}
-
-.chats-editor-where {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  overflow-wrap: anywhere;
-}
-
-/* The press and the one question worth answering before it. */
-.chats-editor-take {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
+/* The `.chats-editor-*` family stood here — the panel an editor conversation opened into: a name,
+   a directory, a sampled tail and a button marked "Pick it up". There is no panel. An editor
+   conversation opens in the same column, in the same shape, as one of this app's own; see
+   `EditorDetail`. Two sets of rules were declared for it, in this file, with different values —
+   which is what a screen nobody could see the second definition of looks like. */
 
 .chats-loading,
 .chats-empty {
@@ -896,6 +854,17 @@
 
 .chats-title-name:hover {
   background: var(--surface);
+}
+
+/* The same type, and none of the affordances. An editor conversation has no row to write a name
+   to until its first message opens one, so its title is text — and text must not offer the hover
+   and the caret that say "press this to rename it". */
+.chats-title-fixed {
+  cursor: default;
+}
+
+.chats-title-fixed:hover {
+  background: none;
 }
 
 .chats-title-input {
@@ -1835,63 +1804,11 @@
   height: 1rem;
 }
 
-/* ----------------------------------------------- picked up from the editor -- */
-
-.chats-editor-where {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  overflow-wrap: anywhere;
-}
-
-
-.chats-editor-chosen {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
-}
-
-/* Bounded, and scrolling inside itself. Nothing in this column may grow with the length of a
-   conversation: the panel is beside the list, not instead of it. */
-.chats-sample {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  max-height: 14rem;
-  overflow-y: auto;
-  list-style: none;
-}
-
-.chats-sample-line {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  min-width: 0;
-}
-
-.chats-sample-text {
-  margin: 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-  /* Three lines of each, and no more: this is for recognising a conversation. */
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.chats-sample-aside .chats-sample-text {
-  color: var(--text-faint);
-  font-style: italic;
-}
+/* `.chats-sample-*` stood here: six lines of a conversation, clamped to three lines each, in a
+   20rem column beside the list. It existed because the panel it lived in could not hold a whole
+   conversation — and the panel is gone. An editor conversation is drawn in full now, by the same
+   `.chats-said-*` rules that draw it after it has been continued, which is what makes the two
+   sides of that moment look like one thing. */
 
 /* ------------------------------------------ who said it, and how it reads -- */
 

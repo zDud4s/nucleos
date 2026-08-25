@@ -49,7 +49,6 @@ import {
   useAssistantModels,
   useChatTranscript,
   useChats,
-  useCreateChat,
   useIdeConversation,
   useIdeSessions,
   useSetChatProject,
@@ -295,10 +294,10 @@ export function Chats() {
         )}
 
         <div className="chats-detail">
-          {/* An editor conversation being considered wins the column: it is a decision in progress,
-              and putting it anywhere else would mean choosing it and then hunting for what happened. */}
+          {/* An editor conversation opens in this column like any other, because to the person
+              looking at the list it IS any other — see `EditorDetail`. */}
           {pickingUp !== null && (
-            <PickUpPreview
+            <EditorDetail
               key={pickingUp}
               sessionId={pickingUp}
               onOpened={(opened) => {
@@ -786,92 +785,28 @@ function WhatItCarries({
 }
 
 /**
- * The tail of a conversation, enough to recognise it by.
+ * An editor conversation, opened here exactly as one of this app's own.
  *
- * NOT `PickedUp`, which draws the whole thing. This is a 20rem column beside the conversation list,
- * and rendering two hundred messages into it made the panel taller than the page and spilled the
- * preview out from under its own border. What a person is doing here is telling two afternoons
- * apart, and the last few lines do that.
+ * It used to be a panel: a name, a directory, six sampled lines, a warning, and a button marked
+ * "Pick it up". Everything on it was true and it was still the wrong shape — clicking a
+ * conversation in the list opened a FORM about a conversation, while clicking the one below it
+ * opened the conversation. Two kinds of row that look identical must not open two kinds of thing.
  *
- * The END of it, because that is where a conversation is picked up from — the top of a long session
- * is the part nobody is coming back for.
+ * So this is `ChatDetail`'s skeleton, filled from a different source: a name, the folder, the whole
+ * of what was said, and a box to type in. What was a decision with a button on it is now the first
+ * thing you say — which is how the front door has always worked, and is the same gesture at both
+ * doors.
+ *
+ * The pick-up has not stopped mattering; it has stopped being a screen. What it carries and whether
+ * the folder gives it tools are said as notes above the conversation, which is exactly where a chat
+ * of this app's own says the equivalent about its project. And nothing is spent until somebody
+ * speaks: opening one of these reads a file and bills nothing.
+ *
+ * After the first message this view is replaced by `ChatDetail` on the new conversation — which
+ * draws the same lines, in the same order, above the turn that was just sent. The seam between the
+ * two is meant to be invisible, because there is nothing there to see.
  */
-const SAMPLED = 6;
-
-function Sample({ view }: { view: ReturnType<typeof useIdeConversation> }) {
-  if (view.data === undefined && !view.isError) {
-    return (
-      <p className="chats-loading">reading what was said in the editor…</p>
-    );
-  }
-  if (view.data === undefined) {
-    return (
-      <p className="chats-picked-up-unread">
-        what was said in the editor could not be read
-      </p>
-    );
-  }
-  if (view.data.said.length === 0) {
-    return <p className="chats-picked-up-cut">nobody spoke in this one.</p>;
-  }
-  const tail = view.data.said.slice(-SAMPLED);
-  return (
-    <>
-      {(view.data.cut || tail.length < view.data.said.length) && (
-        <p className="chats-picked-up-cut">
-          the last {tail.length} of it — the rest opens with it
-        </p>
-      )}
-      <ul className="chats-sample" aria-label="What was said, at the end">
-        {tail.map((said, index) => (
-          <li
-            key={`sample-${index}`}
-            className={
-              said.aside
-                ? "chats-sample-line chats-sample-aside"
-                : "chats-sample-line"
-            }
-          >
-            {!said.aside && (
-              <span className="chats-said-who">
-                {said.by_owner ? "you" : "núcleo"}
-              </span>
-            )}
-            {/* Text, never markup, and never `Rich` either: a sample is for recognising a
-                conversation, and a code block in a 20rem column is not that. */}
-            <p className="chats-sample-text">{said.text}</p>
-          </li>
-        ))}
-      </ul>
-    </>
-  );
-}
-
-/**
- * The conversations you were having in the editor, and the one press that continues one here.
- *
- * A door of its own. Everything this page could already do with an editor session sat inside the
- * new-conversation form, in a field marked optional, below two radio buttons — reachable only by
- * somebody who had pressed a button labelled "New conversation" while looking for an old one. The
- * feature was complete and invisible, which from the outside is indistinguishable from missing.
- *
- * What was said is shown BEFORE the pick-up, not after. A cut title and a directory is not enough
- * to tell two afternoons of work apart, and the only way to find out which one this was used to be
- * to pick it up and read what came back.
- *
- * Cloud, and no choice offered. Continuing one of these means resuming a Claude Code session by its
- * id, which is a thing only the cloud brain can do; a Local option here would be a button that
- * quietly starts a fresh conversation instead of the one you chose.
- */
-/**
- * One editor conversation, and the decision to bring it here.
- *
- * Shown beside the list rather than inside it, because this is not a row's worth of information:
- * what it carries, what the model would be handed, whether the folder even lets it touch a file,
- * and what a resume would cost. A real pick-up of a session near the ceiling billed $1.72 for a
- * one-word answer, and that is the sort of thing this panel exists to say beforehand.
- */
-function PickUpPreview({
+function EditorDetail({
   sessionId,
   onOpened,
 }: {
@@ -879,76 +814,80 @@ function PickUpPreview({
   onOpened: (chatId: string) => void;
 }) {
   const sessions = useIdeSessions(true, true);
-  // Watched, not merely read: this may be being typed into while somebody looks at it.
+  // Watched, not merely read: this may be being typed into in the editor while it is on screen.
   const said = useIdeConversation(sessionId, true);
-  const create = useCreateChat();
-  const [model, setModel] = useState<string | null>(null);
-  const [effort, setEffort] = useState<string | null>(null);
+  const start = useStartConversation();
   const chosen = (sessions.data ?? []).find(
     (session) => session.session_id === sessionId,
   );
 
   if (chosen === undefined) {
     return (
-      <div className="chats-editor-chosen">
-        {sessions.data === undefined && !sessions.isError ? (
-          <p className="chats-loading">reading your editor sessions…</p>
-        ) : (
-          <ErrorNote>
-            that conversation is not on this machine any more
-          </ErrorNote>
-        )}
-      </div>
+      <section className="chats-detail-inner">
+        <div className="chats-scroll">
+          {sessions.data === undefined && !sessions.isError ? (
+            <p className="chats-loading">reading your editor sessions…</p>
+          ) : (
+            <ErrorNote>
+              that conversation is not on this machine any more
+            </ErrorNote>
+          )}
+        </div>
+      </section>
     );
   }
 
   return (
-    <div className="chats-editor-chosen">
-      <div className="chats-editor-head">
-        <h2 className="chats-editor-name">
-          {chosen.title ?? chosen.session_id}
-        </h2>
-        <p className="chats-editor-where">{chosen.cwd}</p>
+    <section className="chats-detail-inner">
+      <div className="chats-detail-head">
+        <div className="chats-title">
+          {/* Not a rename button. There is no row to write a name to until the first message
+              opens one, and a control that silently does nothing is worse than none. */}
+          <p className="chats-title-name chats-title-fixed">
+            {chosen.title ?? chosen.session_id}
+          </p>
+        </div>
+        {/* The same quiet line a conversation has, carrying the one thing that is knowable about
+            this one: where it was had. No `⋯` — everything behind it writes to a chat row, and
+            there is no chat row yet. */}
+        <div className="chats-meta">
+          <p className="chats-meta-line">
+            <span className="chats-meta-where">{chosen.cwd}</span>
+          </p>
+        </div>
       </div>
 
-      <WhatItCarries view={said} />
-      <Sample view={said} />
-      {!chosen.tools && <NoTools session={chosen} />}
-
-      <div className="chats-editor-take">
-        <Button
-          type="button"
-          intent="go"
-          disabled={create.isPending}
-          onClick={() =>
-            create.mutate(
-              {
-                model: model ?? undefined,
-                effort: effort ?? undefined,
-                continueSession: chosen.session_id,
-              },
-              { onSuccess: (result) => onOpened(result.chat_id) },
-            )
-          }
-        >
-          Pick it up
-        </Button>
-        {/* The same question the front door asks, asked here for the same reason: it is answerable
-            before the first turn and expensive to change after it. */}
-        <ModelMenu
-          model={model}
-          disabled={create.isPending}
-          onPick={setModel}
-        />
-        <EffortMenu
-          model={model}
-          effort={effort}
-          disabled={create.isPending}
-          onPick={setEffort}
-        />
+      <div className="chats-scroll">
+        {/* Above the conversation, which is where `ChatDetail` puts the equivalent notes about a
+            chat's own project. Two things are worth saying before anybody speaks, and both are
+            about what the next turn would be, not about what this screen is. */}
+        {!chosen.tools && <NoTools session={chosen} />}
+        <WhatItCarries view={said} />
+        <PickedUp view={said} handed={[]} already={false} />
       </div>
-      {create.isError && <CreateRefusal error={create.error} />}
-    </div>
+
+      <StartBox
+        pending={start.isPending}
+        placeholder="Carry on where you left off…"
+        standing="thread"
+        /* The `@` note, corrected for this one case: there IS a folder — it is the one the session
+           was had in — and what is missing is a conversation here to ask about it. */
+        noFolderNote={`this conversation is not open here yet — say something to carry it on, and an @ will name the files in ${chosen.cwd}`}
+        onSay={(model, effort, text, images) =>
+          start.mutate(
+            {
+              model: model ?? undefined,
+              effort: effort ?? undefined,
+              continueSession: chosen.session_id,
+              text,
+              images,
+            },
+            { onSuccess: (opened) => onOpened(opened.chat_id) },
+          )
+        }
+      />
+      {start.isError && <CreateRefusal error={start.error} />}
+    </section>
   );
 }
 
@@ -1082,7 +1021,11 @@ function ChatDetail({
         {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
         {summary !== undefined && summary.ide_session_id !== null && (
-          <PickedUp view={pickedUp} handed={transcript.data?.handed ?? []} />
+          <PickedUp
+            view={pickedUp}
+            handed={transcript.data?.handed ?? []}
+            already
+          />
         )}
 
         {transcript.isError && transcript.data === undefined && (
@@ -1189,6 +1132,9 @@ function NothingOpen() {
 function StartBox({
   pending,
   onSay,
+  placeholder = "Say something…",
+  standing = "front",
+  noFolderNote = "this conversation has no folder yet — open it, point it at a project, and an @ will name its files",
 }: {
   pending: boolean;
   onSay: (
@@ -1197,6 +1143,19 @@ function StartBox({
     text: string,
     images: Attachment[],
   ) => void;
+  /** What the empty box invites. The front door says one thing; a conversation being carried on
+      from the editor says another, and both are the same gesture. */
+  placeholder?: string;
+  /**
+   * Where the box is standing.
+   *
+   * `front` is the middle of an empty page — raised, because it is the only object on it.
+   * `thread` is the foot of a conversation, wearing the same frame the composer wears there, so
+   * an editor session and a chat have the same thing at the bottom of the column.
+   */
+  standing?: "front" | "thread";
+  /** What to say when an `@` cannot be answered here. See the call in `EditorDetail`. */
+  noFolderNote?: string;
 }) {
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
@@ -1255,12 +1214,7 @@ function StartBox({
 
   return (
     <>
-      {noFolderYet && (
-        <p className="chats-mentions-none">
-          this conversation has no folder yet — open it, point it at a project,
-          and an @ will name its files
-        </p>
-      )}
+      {noFolderYet && <p className="chats-mentions-none">{noFolderNote}</p>}
       {choices.length > 0 && (
         <Choices
           label="Commands to run"
@@ -1270,7 +1224,11 @@ function StartBox({
         />
       )}
       <form
-        className="chats-composer-box chats-front-box"
+        className={
+          standing === "front"
+            ? "chats-composer-box chats-front-box"
+            : "chats-composer-box"
+        }
         onSubmit={(event) => {
           event.preventDefault();
           say();
@@ -1305,7 +1263,7 @@ function StartBox({
         <textarea
           className="chats-composer-text"
           aria-label="Message"
-          placeholder="Say something…"
+          placeholder={placeholder}
           ref={box}
           rows={1}
           value={text}
@@ -2764,9 +2722,18 @@ function ArchiveRefusal({ error }: { error: unknown }) {
 function PickedUp({
   view,
   handed,
+  already,
 }: {
   view: ReturnType<typeof useIdeConversation>;
   handed: Exchange[];
+  /**
+   * Whether this conversation has been brought here yet.
+   *
+   * The lines above are identical either way — that is the point, and it is what makes the
+   * moment of picking one up invisible. What differs is the seam UNDER them: before, it is the
+   * place the conversation carries on from; after, it is a record of where it did.
+   */
+  already: boolean;
 }) {
   if (view.data === undefined && !view.isError) {
     return (
@@ -2784,8 +2751,9 @@ function PickedUp({
   if (view.data.said.length === 0) {
     return (
       <p className="chats-picked-up-cut">
-        this was picked up from a conversation in the editor that nobody spoke
-        in.
+        {already
+          ? "this was picked up from a conversation in the editor that nobody spoke in."
+          : "nobody spoke in this one — saying something here starts it."}
       </p>
     );
   }
@@ -2832,16 +2800,22 @@ function PickedUp({
           </li>
         ))}
       </ul>
+      {/* The seam, and it says the same true thing from either side: everything above happened
+          somewhere else and cost nothing here. Only the tense changes. */}
       <p className="chats-picked-up-cut">
-        picked up here — everything above was said in the editor and read back
-        out of its own file. None of it was a run, and none of it was billed
-        here.
+        {already
+          ? "picked up here — everything above was said in the editor and read back out of its own file. None of it was a run, and none of it was billed here."
+          : "everything above was said in the editor, and reading it here cost nothing. Say something and it carries on from this line."}
       </p>
-      <HowItContinued
-        handed={handed}
-        carries={view.data.context_estimate}
-        largestWindow={view.data.largest_window}
-      />
+      {/* Only once it HAS continued. Before that there is nothing to disclose about how it did,
+          and `WhatItCarries` above has already said what continuing would carry. */}
+      {already && (
+        <HowItContinued
+          handed={handed}
+          carries={view.data.context_estimate}
+          largestWindow={view.data.largest_window}
+        />
+      )}
     </>
   );
 }

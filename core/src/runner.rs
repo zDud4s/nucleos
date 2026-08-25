@@ -4246,7 +4246,7 @@ mod tests {
 
         assert_eq!(live.did.len(), 1);
         assert_eq!(live.did[0].result.as_deref(), Some("test result: ok. 3 passed"));
-        assert_eq!(live.did[0].result_chars, Some(24));
+        assert_eq!(live.did[0].result_chars, Some(25));
         assert!(!live.did[0].result_failed);
         // And the tool has stopped running, which is the behaviour that was already here.
         assert_eq!(live.doing, None);

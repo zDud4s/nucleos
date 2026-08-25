@@ -12886,7 +12886,7 @@ mod tests {
             "detail": "cargo test dates::",
             "todos": [],
             "result": "test result: ok. 3 passed",
-            "result_chars": 24,
+            "result_chars": 25,
             "result_failed": false
         }])
         .to_string();
@@ -12904,7 +12904,7 @@ mod tests {
         // And the route that exists to carry it, does.
         let opened = get_json(&state, &format!("/assistant/turns/{turn_id}/tools")).await;
         assert_eq!(opened["did"][0]["result"], "test result: ok. 3 passed");
-        assert_eq!(opened["did"][0]["result_chars"], 24);
+        assert_eq!(opened["did"][0]["result_chars"], 25);
     }
 
     /// A run that is not an assistant turn is not a door into the transcript.

@@ -1795,9 +1795,10 @@ describe("the editor's sessions, in the same list as the rest", () => {
     expect(within(old).queryByText("now")).toBeNull();
   });
 
-  it("shows a sample and not the whole conversation, which does not fit in a picker", async () => {
-    // The picker is a 20rem column. Drawing two hundred messages into it made the panel taller than
-    // the page and spilled the preview out from under its own border.
+  it("opens in the same shape as a conversation of this app's own", async () => {
+    // The requirement, asserted directly: two rows that look identical in the list must not open
+    // two different kinds of thing. This used to open a panel — a name, a directory, six sampled
+    // lines and a button marked "Pick it up" — while the row under it opened a conversation.
     const many = Array.from({ length: 40 }, (_, at) => ({
       by_owner: at % 2 === 0,
       text: `linha ${at}`,
@@ -1807,11 +1808,17 @@ describe("the editor's sessions, in the same list as the rest", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
-    const preview = await screen.findByLabelText(/what was said/i);
-    expect(within(preview).getAllByRole("listitem").length).toBeLessThanOrEqual(6);
-    // The end of it, which is where a conversation is picked up from.
-    expect(within(preview).getByText("linha 39")).toBeTruthy();
-    expect(within(preview).queryByText("linha 0")).toBeNull();
+    // The whole conversation, not a sample of its tail — and drawn by the same rules that draw it
+    // after it has been carried on.
+    const shown = await screen.findByLabelText(/said in the editor/i);
+    expect(within(shown).getAllByRole("listitem")).toHaveLength(40);
+    expect(within(shown).getByText("linha 0")).toBeTruthy();
+    expect(within(shown).getByText("linha 39")).toBeTruthy();
+
+    // And a box to type in, exactly where a conversation has one. There is no button to press
+    // first: the first thing you say is what brings it here.
+    expect(await screen.findByLabelText("Message")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /pick it up/i })).toBeNull();
   });
 
   it("shows what was said in one before it is picked up, not after", async () => {
@@ -1875,11 +1882,13 @@ describe("the editor's sessions, in the same list as the rest", () => {
     expect(await screen.findByText(/no conversations yet/i)).toBeTruthy();
   });
 
-  it("picks one up, and the conversation it opens continues it", async () => {
+  it("carries one on by saying something, and opens the conversation that continues it", async () => {
     await withEditorSessions([ideSession()]);
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
-    fireEvent.click(await screen.findByRole("button", { name: /pick it up/i }));
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "e agora corre os testes" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     await waitFor(() => {
       const posted = daemon.apiFetch.mock.calls.find(
@@ -1890,6 +1899,33 @@ describe("the editor's sessions, in the same list as the rest", () => {
         continue_session: "aaaa-1111",
       });
     });
+
+    // And the words went to the conversation that was just opened, in one gesture. Two steps —
+    // open it, then say the thing again — is what this replaced.
+    await waitFor(() => {
+      const said = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/message",
+      );
+      expect(JSON.parse(String(said?.[1]?.body))).toMatchObject({
+        chat_id: "new-1",
+        text: "e agora corre os testes",
+      });
+    });
+  });
+
+  it("bills nothing for looking at one", async () => {
+    // Opening one reads a file. That was true when this was a screen you left by pressing a
+    // button, and it has to stay true now that the screen IS the conversation — otherwise
+    // clicking down a list of editor sessions to find the right one would cost money per click.
+    await withEditorSessions([ideSession()]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
+    expect(await screen.findByLabelText("Message")).toBeTruthy();
+
+    const opened = daemon.apiFetch.mock.calls.filter(
+      (call) => String(call[0]) === "/assistant/chats" && call[1]?.method === "POST",
+    );
+    expect(opened).toHaveLength(0);
   });
 });
 
@@ -3092,13 +3128,21 @@ describe("Chats - asking a question again", () => {
 
 describe("Chats - the list, cut into days", () => {
   it("groups the conversations by when they last moved", async () => {
+    // NOW, and not "two hours ago". Two hours before 01:15 is yesterday, so a test written that
+    // way passes all afternoon and fails at night — which is exactly when it failed.
     const now = Date.now();
-    const hoursAgo = (hours: number) => new Date(now - hours * 3600_000).toISOString();
+    const daysAgo = (days: number) => new Date(now - days * 86_400_000).toISOString();
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [
-          chatSummary({ chat_id: "c-1", title: "this morning", last_activity: hoursAgo(2) }),
-          chatSummary({ chat_id: "c-2", title: "a week ago", last_activity: hoursAgo(24 * 7) }),
+          chatSummary({
+            chat_id: "c-1",
+            // Not "just now": that is what `RelativeTime` writes for a fresh row, and a title
+            // that collides with the reading beside it makes this assertion ambiguous.
+            title: "o parser de datas",
+            last_activity: new Date(now).toISOString(),
+          }),
+          chatSummary({ chat_id: "c-2", title: "a week ago", last_activity: daysAgo(7) }),
         ],
         { "c-1": [], "c-2": [] },
       ),
@@ -3106,7 +3150,7 @@ describe("Chats - the list, cut into days", () => {
     await renderChats("/chats/c-1");
 
     const today = await screen.findByRole("list", { name: "Today" });
-    expect(within(today).getByText("this morning")).toBeDefined();
+    expect(within(today).getByText("o parser de datas")).toBeDefined();
 
     const earlier = await screen.findByRole("list", { name: "Earlier" });
     expect(within(earlier).getByText("a week ago")).toBeDefined();

@@ -363,16 +363,6 @@ export interface Command {
   source: CommandSource;
 }
 
-/** What `POST /assistant/chats` accepts. Every field is optional. */
-export interface NewChat {
-  brain?: Brain;
-  /** The id of an IDE session to continue, from `useIdeSessions`. */
-  continueSession?: string;
-  /** A choice id from `useAssistantModels`. It decides the brain, so both need not be sent. */
-  model?: string;
-  effort?: string;
-}
-
 /** What `PATCH /assistant/chats/{chat_id}` accepts. Any field, or several. */
 export interface ChatPatch {
   chatId: string;
@@ -839,11 +829,22 @@ export function useStartConversation() {
       effort,
       text,
       images,
+      continueSession,
     }: {
       model?: string;
       effort?: string;
       text: string;
       images: Attachment[];
+      /**
+       * An editor session this conversation carries on from, or nothing.
+       *
+       * Here rather than in a hook of its own, because continuing one is not a different
+       * gesture: you open a conversation by saying something to it, and this says which
+       * conversation. The window that offers it draws the editor session in the same shape as
+       * a chat and lets the first message be the thing that brings it here — so a second hook
+       * would be a second way to do one thing.
+       */
+      continueSession?: string;
     }) => {
       // The model travels on the opening call rather than as a PATCH afterwards.
       // There is no conversation to PATCH until this returns, and correcting one a
@@ -851,7 +852,7 @@ export function useStartConversation() {
       // carries the brain, which the daemon derives from the choice.
       const opened = await apiFetch<{ chat_id: string }>("/assistant/chats", {
         method: "POST",
-        body: JSON.stringify({ model, effort }),
+        body: JSON.stringify({ model, effort, continue_session: continueSession }),
       });
       await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",
@@ -871,31 +872,11 @@ export function useStartConversation() {
   });
 }
 
-/**
- * Open a conversation. Answers `{ chat_id }` — the id the daemon minted, not
- * one the caller could have chosen.
- */
-export function useCreateChat() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (body: NewChat) =>
-      apiFetch<{ chat_id: string }>("/assistant/chats", {
-        method: "POST",
-        // `model` carries the brain with it — the daemon derives the route from the choice — so a
-        // caller that names one need not name the other, and cannot name them inconsistently.
-        body: JSON.stringify({
-          brain: body.brain,
-          continue_session: body.continueSession,
-          model: body.model,
-          effort: body.effort,
-        }),
-      }),
-    retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
-  });
-}
+/* `useCreateChat` and its `NewChat` stood here: a conversation opened with no first message,
+   which was how an editor session used to be picked up — a button, and then an empty chat. Nothing
+   opens a conversation that way any more. Both doors work the same: you say something, and saying
+   it is what opens one. `useStartConversation` is that, and its `continueSession` is the only part
+   of this that survived. */
 
 /**
  * A turn while it is still being written.
