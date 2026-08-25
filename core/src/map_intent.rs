@@ -68,7 +68,8 @@ impl Kind {
     }
 }
 
-/// How much of a document is sent. Beyond this it is cut at a line boundary and the cut is stated.
+/// How much of a document is sent. Beyond this it is cut — at a line boundary where there is one —
+/// and the cut is stated.
 ///
 /// Not a token count, because this module does not know which model will answer and the two runners
 /// it feeds count differently. Bytes are the honest unit for a limit whose only job is to keep one
@@ -164,17 +165,27 @@ pub struct Extracted {
 
 #[derive(Deserialize)]
 struct RawAnswer {
-    decisions: Vec<RawDecision>,
+    /// Untyped elements on purpose. A `Vec<RawDecision>` fails the WHOLE array when one element is
+    /// not an object — `{"decisions":[{...good...}, 42]}` returned nothing at all — and an empty
+    /// list is this module's word for "this document decided nothing". A malformed line must cost
+    /// its own row and no others.
+    decisions: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct RawDecision {
+    /// `Option<String>` and not `String`, because `#[serde(default)]` fills in for an ABSENT key
+    /// and does nothing at all for a key present as `null`. The prompt tells the model to "leave it
+    /// out" when it cannot name a heading, and a model constrained to emit JSON answers that with
+    /// `"section": null` at least as readily as by omitting the key. Typed as `String`, that single
+    /// null failed the whole batch: nine good decisions thrown away because a tenth had one odd
+    /// field, and the owner told the document decided nothing.
     #[serde(default)]
-    section: String,
+    section: Option<String>,
     #[serde(default)]
-    text: String,
+    text: Option<String>,
     #[serde(default)]
-    kind: String,
+    kind: Option<String>,
 }
 
 /// The decisions in a model's answer, or none.
@@ -196,13 +207,21 @@ pub fn parse_extraction(answer: &str) -> Vec<Extracted> {
     };
 
     let mut out = Vec::new();
-    for row in raw.decisions {
-        let section = row.section.trim();
-        let text = row.text.trim();
+    for value in raw.decisions {
+        // Converted one element at a time, so a line that is not an object costs its own row and
+        // not the batch.
+        let Ok(row) = serde_json::from_value::<RawDecision>(value) else {
+            continue;
+        };
+        let section = row.section.unwrap_or_default();
+        let text = row.text.unwrap_or_default();
+        let kind_wire = row.kind.unwrap_or_default();
+        let section = section.trim();
+        let text = text.trim();
         if section.is_empty() || text.is_empty() {
             continue;
         }
-        let Some(kind) = Kind::from_wire(row.kind.trim()) else {
+        let Some(kind) = Kind::from_wire(kind_wire.trim()) else {
             continue;
         };
         out.push(Extracted {
@@ -468,5 +487,34 @@ mod tests {
         assert_eq!(spec_slug("docs/specs/beta.md"), "beta");
         assert_eq!(spec_slug(".ai/specs/2026-08-22-alfa-design.md"), "2026-08-22-alfa-design");
         assert_eq!(spec_slug("beta.md"), "beta");
+    }
+
+    #[test]
+    fn a_null_field_costs_its_own_line_and_never_the_whole_batch() {
+        // `#[serde(default)]` fills in for an ABSENT key and does nothing for one present as
+        // `null`. The prompt says "leave it out" when the model cannot name a heading, and a model
+        // constrained to emit JSON answers that with `null` at least as readily as by omitting the
+        // key. Typed as `String` this cost the whole batch, and an empty list is this module's word
+        // for "the document decided nothing" — the two must never be the same answer.
+        let answer = r###"{"decisions":[
+            {"section":"## 1. Alfa","text":"Alfa.","kind":"b"},
+            {"section":null,"text":"Beta.","kind":"c"},
+            {"section":"## 3. Gama","text":"Gama.","kind":null}
+        ]}"###;
+
+        let found = parse_extraction(answer);
+
+        assert_eq!(found.len(), 1, "the whole line survives; the two half-formed ones do not");
+        assert_eq!(found[0].text, "Alfa.");
+    }
+
+    #[test]
+    fn a_line_that_is_not_even_an_object_costs_its_own_line_too() {
+        let answer = r###"{"decisions":[42,{"section":"## 1. Alfa","text":"Alfa.","kind":"b"},"nonsense"]}"###;
+
+        let found = parse_extraction(answer);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].ordinal, 1, "the ordinal counts what survived, not what was proposed");
     }
 }
