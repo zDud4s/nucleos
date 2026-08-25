@@ -74,6 +74,13 @@ pub enum Kind {
     Dictation,
     /// Long, kept as a document until deleted.
     Memo,
+    /// A turn of conversation: sent to the agent instead of pasted, and answered out loud.
+    ///
+    /// The third `Kind` and NOT a flag on the first, because it changes what the recording IS. A
+    /// dictation is text the person is writing and the núcleo is only holding the pen; a
+    /// conversation turn is a question addressed to the agent. Every difference below follows from
+    /// that one — no cleanup, no row of its own, and an answer.
+    Conversation,
 }
 
 impl Kind {
@@ -81,6 +88,7 @@ impl Kind {
         match self {
             Kind::Dictation => "dictation",
             Kind::Memo => "memo",
+            Kind::Conversation => "conversation",
         }
     }
 }
@@ -146,6 +154,15 @@ pub struct VoiceRuntime {
     pub ollama_base_url: String,
     /// Absent means there is nothing to transcribe with, which is the same thing as voice being off.
     pub transcriber: Option<Arc<dyn crate::transcribe::Transcriber>>,
+    /// Retained beside the speaker for the reason `stt_command` is retained beside the transcriber:
+    /// `health.rs` has to be able to say that the program named here does not exist. A conversation
+    /// that hears the question and then answers in silence is the failure this makes reportable.
+    pub tts_command: String,
+    /// The chord that toggles hands-free conversation, carried for the shell like the other two.
+    pub conversation_hotkey: String,
+    /// Absent means the núcleo has no voice. NOT the same as voice being off — the conversation
+    /// still happens, it is just read rather than heard (`VoiceConfig::speaks`).
+    pub speaker: Option<Arc<dyn crate::speak::Speaker>>,
     /// Retained so cleanup reuses connections across dictations instead of building a client per
     /// keystroke-sized request.
     pub client: reqwest::Client,
@@ -165,6 +182,9 @@ impl Default for VoiceRuntime {
             cleanup_model: None,
             ollama_base_url: crate::runner::OLLAMA_BASE_URL.to_string(),
             transcriber: None,
+            tts_command: String::new(),
+            conversation_hotkey: String::new(),
+            speaker: None,
             client: reqwest::Client::new(),
         }
     }
@@ -182,6 +202,9 @@ impl VoiceRuntime {
             memo_hotkey: config.memo_hotkey.clone(),
             cleanup_model,
             transcriber: transcriber_for(config),
+            tts_command: config.tts_command.clone(),
+            conversation_hotkey: config.conversation_hotkey.clone(),
+            speaker: speaker_for(config),
             ..Self::default()
         }
     }
@@ -305,7 +328,9 @@ pub fn chunk_transcript(text: &str, budget: usize) -> Vec<String> {
 ///
 /// Every index comes from `char_indices`, so a cut can never land inside a multibyte character. A
 /// byte-arithmetic version of this would panic on the first accented word.
-fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
+/// `pub(crate)` so `speak.rs` cuts an over-long answer with the SAME logic that cuts an over-long
+/// transcript. Two implementations of one cut is how the two come to disagree about where a word ends.
+pub(crate) fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
     if sentence.chars().count() <= budget {
         return vec![sentence];
     }
@@ -579,6 +604,14 @@ pub enum CaptureError {
     Transcription(String),
     /// The transcriber succeeded and heard nothing — a muted microphone or the wrong input device.
     NothingHeard,
+    /// A conversation turn arrived without naming a chat to hold it.
+    ///
+    /// Refused rather than defaulted to some "current" chat, because there is no such thing here: the
+    /// núcleo has no window and no idea which conversation is open. A default would send a spoken
+    /// question into whichever chat happened to sort first.
+    NoChat,
+    /// The chat refused the turn, and this is what it said.
+    Refused(String),
 }
 
 /// The whole pipeline for one recording: transcribe, apply hints, clean up.
@@ -598,12 +631,22 @@ pub struct Captured {
     pub cleaned: Cleaned,
 }
 
-pub async fn capture(
+/// What the microphone actually said, with hints applied and nothing else done to it.
+///
+/// Split out of `capture` because the two consumers diverge here and only here. A dictation goes on
+/// to cleanup; a conversation turn goes to the agent. Everything BEFORE this point — the transcriber,
+/// the length ceiling, the empty-transcript refusal, the hints — is identical for both, and one
+/// pipeline with several consumers is the promise decision 1 of the voice design made.
+///
+/// Hints run here, on the raw transcript, for both. It is tempting to think a conversation does not
+/// need them because no human reads the text — but the agent does, and a question about the `núcleo`
+/// transcribed as "nucleo" is a question about something else.
+async fn heard(
     voice: &VoiceRuntime,
     audio: &[u8],
     extension: &str,
     duration: Duration,
-) -> Result<Captured, CaptureError> {
+) -> Result<String, CaptureError> {
     let Some(transcriber) = voice.transcriber.as_ref() else {
         return Err(CaptureError::NotConfigured);
     };
@@ -623,12 +666,86 @@ pub async fn capture(
 
     // Hints run on the RAW transcript, before cleanup, so the model reads correct terminology rather
     // than being asked to guess from something mangled.
-    let hinted = apply_hints(&raw, &voice.hints);
+    Ok(apply_hints(&raw, &voice.hints))
+}
+
+pub async fn capture(
+    voice: &VoiceRuntime,
+    audio: &[u8],
+    extension: &str,
+    duration: Duration,
+) -> Result<Captured, CaptureError> {
+    let hinted = heard(voice, audio, extension, duration).await?;
     let cleaned = clean_up(voice, &hinted).await;
     Ok(Captured {
         raw: hinted,
         cleaned,
     })
+}
+
+/// What a conversation turn produced: what was heard, and where the answer will appear.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Conversed {
+    /// The transcript, so the window can show what it thinks was said WITHOUT waiting for the answer.
+    /// A hands-free mode that shows nothing until the agent replies is a mode in which a
+    /// misheard question is invisible until it has already been answered.
+    pub text: String,
+    /// `None` when the message was queued behind a turn already in flight.
+    pub turn_id: Option<i64>,
+    pub queued: bool,
+}
+
+/// One turn of conversation: transcribe, hand to the chat, and say where the answer will be.
+///
+/// Three things this deliberately does NOT do, each of which was a live option:
+///
+/// - **No cleanup.** The cleanup model exists to make text presentable where it will be READ — pasted
+///   into a document, kept as a memo. Nobody reads a conversation turn; the agent does. §14.4 measured
+///   that with a resident server cleanup becomes "the big half" of the latency, so skipping it is the
+///   largest saving available and it costs nothing anybody would notice.
+/// - **No row in `voice_captures`.** The turn is already stored as a chat message and a `runs` row.
+///   Writing it a third time would create a second place to look for the same sentence — and the
+///   table's own CHECK constraint (`kind IN ('dictation','memo')`) enforces this, so a future wiring
+///   mistake fails loudly instead of quietly duplicating.
+/// - **No opinion about who answers.** `send_or_queue` routes by the chat's `answered_by`, exactly as
+///   a typed message does. Voice is an input channel, not a second brain.
+pub async fn converse(
+    state: &AppState,
+    chat_id: &str,
+    audio: &[u8],
+    extension: &str,
+    duration: Duration,
+) -> Result<Conversed, CaptureError> {
+    if chat_id.trim().is_empty() {
+        return Err(CaptureError::NoChat);
+    }
+    let text = heard(&state.voice, audio, extension, duration).await?;
+
+    // `send_or_queue` rather than `send_message`, and the choice is the opposite of the Telegram
+    // sidecar's. Hands-free means the next thing said arrives while the last answer is still being
+    // spoken, and refusing it would make the mode drop every second utterance. The person is here,
+    // watching; waiting is what they expect.
+    match crate::assistant::send_or_queue(
+        state,
+        chat_id,
+        &text,
+        &[],
+        crate::assistant::Origin::Voice,
+    )
+    .await
+    {
+        Ok(crate::assistant::Sent::Turn(turn_id)) => Ok(Conversed {
+            text,
+            turn_id: Some(turn_id),
+            queued: false,
+        }),
+        Ok(crate::assistant::Sent::Queued) => Ok(Conversed {
+            text,
+            turn_id: None,
+            queued: true,
+        }),
+        Err(refusal) => Err(CaptureError::Refused(refusal)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -640,6 +757,9 @@ pub struct CaptureQuery {
     /// Resolved through `transcribe::extension_for`, which answers from an allowlist rather than
     /// echoing this string — the value names a file this process creates.
     pub format: Option<String>,
+    /// Which conversation a `kind=conversation` recording belongs to. Ignored by the other two kinds,
+    /// and required by that one — see `CaptureError::NoChat` for why it has no default.
+    pub chat_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -668,6 +788,27 @@ pub async fn post_capture(
         )
             .into_response();
     };
+    // Branched before the recording path, because a conversation turn shares the transcriber and
+    // nothing after it: no cleanup, no row, and an answer instead of a paste.
+    //
+    // Cancellable, like a dictation and unlike a memo (decision 14). The window this leaves open is
+    // only the transcription: once `send_or_queue` has returned, the turn is a registered task that
+    // finishes whoever is listening. And nobody wants an answer to a question they walked away from.
+    if query.kind == Kind::Conversation {
+        return match converse(
+            &state,
+            query.chat_id.as_deref().unwrap_or_default(),
+            &wav,
+            extension,
+            duration,
+        )
+        .await
+        {
+            Ok(conversed) => axum::Json(conversed).into_response(),
+            Err(error) => capture_error(error).into_response(),
+        };
+    }
+
     let work = capture_and_record(
         state.pool.clone(),
         state.voice.clone(),
@@ -692,30 +833,52 @@ pub async fn post_capture(
             Ok(outcome) => outcome,
             Err(status) => return status.into_response(),
         },
-        Kind::Dictation => work.await,
+        // A dictation dies with its request. A conversation turn would too — but none reaches here:
+        // `Kind::Conversation` returned above, before `work` was built. The arm is written out rather
+        // than folded into a `_` so that a fourth kind is a compile error here instead of silently
+        // inheriting a cancellation policy nobody chose for it.
+        Kind::Dictation | Kind::Conversation => work.await,
     };
 
     match outcome {
         Ok(response) => axum::Json(response).into_response(),
+        Err(error) => capture_error(error).into_response(),
+    }
+}
+
+/// One capture failure as a status code, so both paths through `post_capture` answer identically.
+///
+/// Factored out when conversation arrived rather than copied: two `match`es over the same enum are
+/// two places for a new variant to be forgotten, and the one that forgets it answers 500.
+fn capture_error(error: CaptureError) -> axum::response::Response {
+    match error {
         // Not an error condition — the capability genuinely does not exist on this machine, and saying
         // so beats a hotkey that silently does nothing.
-        Err(CaptureError::NotConfigured) => (
+        CaptureError::NotConfigured => (
             StatusCode::SERVICE_UNAVAILABLE,
             "no transcriber is configured; voice is off",
         )
             .into_response(),
-        Err(CaptureError::TooLong) => (
+        CaptureError::TooLong => (
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("a capture may not exceed {MAX_CAPTURE_SECONDS}s"),
         )
             .into_response(),
-        Err(CaptureError::Transcription(error)) => {
+        CaptureError::Transcription(error) => {
             tracing::warn!(%error, "voice: transcription failed");
             (StatusCode::BAD_GATEWAY, "the transcriber failed").into_response()
         }
-        Err(CaptureError::NothingHeard) => {
-            (StatusCode::NO_CONTENT, "nothing was heard").into_response()
-        }
+        CaptureError::NothingHeard => (StatusCode::NO_CONTENT, "nothing was heard").into_response(),
+        CaptureError::NoChat => (
+            StatusCode::BAD_REQUEST,
+            "a conversation turn must name a chat_id",
+        )
+            .into_response(),
+        // The chat said no for a reason it knows and this does not — a kill switch, a chat set to a
+        // local model this machine does not have. Passed through verbatim: `assistant.rs` writes
+        // these sentences to be read by a person, and paraphrasing them here would lose the only
+        // explanation there is.
+        CaptureError::Refused(refusal) => (StatusCode::CONFLICT, refusal).into_response(),
     }
 }
 
@@ -811,6 +974,14 @@ pub struct VoiceConfigView {
     /// and nothing anywhere read either one.
     pub hotkey: String,
     pub memo_hotkey: String,
+    pub conversation_hotkey: String,
+    /// Whether an answer can be SPOKEN, as opposed to merely arrived at.
+    ///
+    /// Separate from `armed` because the two failures are different sizes and the window must be able
+    /// to tell them apart: unarmed means no conversation at all, while `speaks: false` means the
+    /// conversation happens and is read instead of heard. A single flag would hide a working feature
+    /// behind a missing one.
+    pub speaks: bool,
     /// The shell reads this rather than defining its own, so the two cannot disagree.
     pub max_capture_seconds: u64,
     pub max_body_bytes: usize,
@@ -826,6 +997,8 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         retain_dictations_days: state.voice.retain_dictations_days,
         hotkey: state.voice.hotkey.clone(),
         memo_hotkey: state.voice.memo_hotkey.clone(),
+        conversation_hotkey: state.voice.conversation_hotkey.clone(),
+        speaks: state.voice.speaker.is_some(),
         max_capture_seconds: MAX_CAPTURE_SECONDS,
         max_body_bytes: max_body_bytes(),
     })
@@ -834,6 +1007,127 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
 fn db_error(error: sqlx::Error) -> axum::response::Response {
     tracing::warn!(%error, "voice: database read failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+}
+
+/// The answer `turn_id` has produced so far, and whether more can still arrive.
+///
+/// Two sources, and which one applies is decided by the tail's own lifetime rather than by asking the
+/// database first. `runs::read_tail` returns `Some` exactly while the run is registered in THIS
+/// daemon; when the run ends, its `Registration` drops and the tail disappears, so the absence is the
+/// signal that the durable copy is now the truth.
+///
+/// The two answer paths store their result differently, and getting this wrong would make voice work
+/// for one brain and not the other:
+///
+/// - **A local turn writes `stdout` as the plain answer** (`spawn_local_turn`) and streams nothing at
+///   all, so its tail stays empty for the whole turn and everything arrives at once at the end. That
+///   is not a defect to work around: it is why `speakable` had to be a pure function of whatever text
+///   exists, rather than a subscriber to a stream that only one of the two paths has.
+/// - **A CLI turn streams JSONL** into the tail and stores the same stream in `stdout`, so the
+///   finished text comes back through `extract_reply`.
+async fn answer_so_far(state: &AppState, turn_id: i64) -> Option<(String, bool)> {
+    if let Some(stream) = crate::runs::read_tail(&state.run_tails, turn_id, 0) {
+        return Some((crate::runner::live_from_stream(&stream).text, false));
+    }
+
+    let row: Option<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT status, stdout, answered_by FROM runs WHERE id = ?")
+            .bind(turn_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()?;
+    let (status, stdout, answered_by) = row?;
+    let stdout = stdout.unwrap_or_default();
+    let text = if answered_by.as_deref() == Some("local") {
+        stdout
+    } else {
+        crate::runner::extract_reply(&stdout).unwrap_or_default()
+    };
+    // Anything not `running` is over, however it ended. A turn that failed or was cancelled has no
+    // more text coming, and saying so is what stops the window polling a dead turn forever.
+    Some((text, status != "running"))
+}
+
+/// `GET /voice/turns/{turn_id}/speech/{index}` — one unit of the answer, as WAV.
+///
+/// Pull-driven and stateless, which was a choice against the obvious alternative: a background task
+/// that synthesises the whole answer as it arrives and holds the audio in a map. That map would need
+/// eviction, would keep speech for turns nobody is listening to, and — the deciding argument — would
+/// synthesise everything that gets INTERRUPTED. Hands-free conversation exists so a person can cut in;
+/// barge-in is the ordinary path, not the exception. Here, cutting in simply stops the next request
+/// being made, and nothing was spent.
+///
+/// The three answers are distinct on purpose, because the window does three different things with
+/// them: **200** plays it and asks for the next, **204** waits and asks again, **404** stops asking.
+/// Collapsing "not yet" and "no more" into one status is how a client comes to poll forever.
+///
+/// Not restricted to conversation turns. Reading any answer aloud is a legitimate thing to want, the
+/// endpoint is local and authenticated, and each request synthesises at most `MAX_SPEAK_CHARS` — so
+/// there is no bound to enforce that `speakable` is not already enforcing.
+pub async fn get_turn_speech(
+    State(state): State<AppState>,
+    Path((turn_id, index)): Path<(i64, usize)>,
+) -> impl IntoResponse {
+    let Some(speaker) = state.voice.speaker.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no speaker is configured; the answer will have to be read",
+        )
+            .into_response();
+    };
+    let Some((text, finished)) = answer_so_far(&state, turn_id).await else {
+        return (StatusCode::NOT_FOUND, "no such turn").into_response();
+    };
+
+    let units = crate::speak::speakable(&text, finished);
+    let Some(unit) = units.get(index) else {
+        return if finished {
+            (StatusCode::NOT_FOUND, "no further speech").into_response()
+        } else {
+            // Deliberately not an error. This is what every poll of a turn that is still thinking
+            // looks like, and it is the common path.
+            StatusCode::NO_CONTENT.into_response()
+        };
+    };
+
+    match speaker.speak(unit).await {
+        Ok(audio) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+            audio,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, turn_id, index, "voice: synthesis failed");
+            (StatusCode::BAD_GATEWAY, "the speaker failed").into_response()
+        }
+    }
+}
+
+/// Builds the speaker a configured command implies, or `None` when nothing can be said out loud.
+///
+/// The twin of `transcriber_for`, gated on `speaks()` rather than `armed()` — a machine with an STT
+/// engine and no TTS one has a working conversation that answers in writing, and treating that as
+/// "off" would take the feature away from every machine on the day it ships.
+pub fn speaker_for(config: &crate::config::VoiceConfig) -> Option<Arc<dyn crate::speak::Speaker>> {
+    if !config.speaks() {
+        return None;
+    }
+    let url = config.tts_url.trim();
+    if url.is_empty() {
+        return Some(Arc::new(crate::speak::CommandSpeaker::new(
+            config.tts_command.clone(),
+        )));
+    }
+    // Said out loud rather than resolved in silence. Both keys set is not an error — the URL is
+    // simply the better one — but a config line that is ignored without comment is how somebody
+    // spends an evening editing a `tts_command` that nothing reads.
+    if !config.tts_command.trim().is_empty() {
+        tracing::warn!(
+            "voice: both tts_url and tts_command are set; using tts_url, which is roughly ten times faster per sentence"
+        );
+    }
+    Some(Arc::new(crate::speak::HttpSpeaker::new(url.to_string())))
 }
 
 /// Builds the transcriber a configured command implies, or `None` when voice is off.
@@ -1502,5 +1796,441 @@ mod tests {
         let hints = vec!["   ".to_string(), String::new()];
 
         assert_eq!(apply_hints("texto intacto", &hints), "texto intacto");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Conversation: the second consumer of this same pipeline.
+    // ---------------------------------------------------------------------------------------------
+
+    /// An `AppState` whose voice runtime is whatever the test needs and whose runner never runs.
+    async fn conversing_state(voice: VoiceRuntime) -> AppState {
+        AppState {
+            token: crate::auth::Token("t".into()),
+            pool: pool().await,
+            runner: Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            local_assistant: None,
+            // A doctrine is a Telegram channel's standing instruction. A conversation held at this
+            // machine has none by definition, so `None` here is the value under test, not a stub.
+            telegram_doctrine: None,
+            run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
+            files_root: None,
+            email: Arc::new(crate::state::EmailRuntime::default()),
+            voice: Arc::new(voice),
+            browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: Arc::new(crate::github::GithubRuntime::default()),
+            web: Arc::new(crate::web::WebRuntime::disabled()),
+            calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: Arc::new(crate::council::CouncilRuntime::default()),
+            workflow_library: None,
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// A voice runtime that hears `heard`, with hints armed and a cleanup model named.
+    ///
+    /// The cleanup model is named ON PURPOSE in the conversation tests: it is what makes
+    /// "cleanup was skipped" an assertable fact rather than a property of an unconfigured runtime.
+    fn hearing(heard: &str) -> VoiceRuntime {
+        VoiceRuntime {
+            armed: true,
+            hints: hints(),
+            cleanup_model: Some("qwen3.5:4b".to_string()),
+            // Nothing listens here. A cleanup that ran would have to reach it, and a cleanup that is
+            // skipped never notices.
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+            transcriber: Some(Arc::new(crate::transcribe::FakeTranscriber::returning(
+                heard,
+            ))),
+            ..VoiceRuntime::default()
+        }
+    }
+
+    /// The turn goes to the chat, and NOTHING is written to `voice_captures`.
+    ///
+    /// The absence is the assertion. A conversation turn is already stored twice — as a chat message
+    /// and as a `runs` row — and a third copy would be a third place to look for one sentence. The
+    /// table's CHECK constraint would refuse the insert anyway; this proves nobody tries.
+    #[tokio::test]
+    async fn a_conversation_is_sent_to_the_chat_and_recorded_nowhere_else() {
+        let state = conversing_state(hearing("o que esta a correr?")).await;
+
+        let conversed = converse(&state, "a-conversa", b"RIFF", "wav", Duration::from_secs(3))
+            .await
+            .expect("the turn was accepted");
+
+        assert_eq!(conversed.text, "o que esta a correr?");
+        assert!(conversed.turn_id.is_some());
+        assert!(!conversed.queued);
+
+        assert!(list(&state.pool, Kind::Dictation).await.unwrap().is_empty());
+        assert!(list(&state.pool, Kind::Memo).await.unwrap().is_empty());
+    }
+
+    /// What the agent is asked is what was heard, with hints applied and nothing else done to it.
+    ///
+    /// Both halves matter. Hints must run — a question about the `núcleo` heard as "nucleo" is a
+    /// question about something else. Cleanup must not: the `ollama_base_url` above points at a
+    /// closed port, so a cleanup that ran would have to fail and fall back, which is indistinguishable
+    /// from success here — but it would also cost a round trip per chunk on the one path whose whole
+    /// requirement is latency.
+    #[tokio::test]
+    async fn the_agent_is_asked_exactly_what_was_heard() {
+        let state = conversing_state(hearing("o nucleo esta a correr?")).await;
+
+        let conversed = converse(&state, "hints", b"RIFF", "wav", Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(conversed.text, "o núcleo esta a correr?");
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(conversed.turn_id.unwrap())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(prompt, "o núcleo esta a correr?");
+    }
+
+    /// The turn is recorded as having arrived by voice, and survives the round trip.
+    ///
+    /// `Origin` is written to the row so a queued message is sent as the thing it was. A voice turn
+    /// that came back as `shell` would answer in writing.
+    #[test]
+    fn a_spoken_turn_is_recorded_as_spoken() {
+        assert_eq!(crate::assistant::Origin::Voice.as_wire(), "voice");
+        assert_eq!(
+            crate::assistant::Origin::from_wire(Some("voice")),
+            crate::assistant::Origin::Voice
+        );
+    }
+
+    /// There is no "current chat" in a daemon with no window, so a turn that names none is refused.
+    #[tokio::test]
+    async fn a_conversation_that_names_no_chat_is_refused_rather_than_guessed() {
+        let state = conversing_state(hearing("olá")).await;
+
+        assert_eq!(
+            converse(&state, "   ", b"RIFF", "wav", Duration::from_secs(1)).await,
+            Err(CaptureError::NoChat)
+        );
+        // Refused BEFORE the transcriber ran: there was nowhere to send the answer, so recording the
+        // question would have been work done for nothing — and a recording made for nothing is still
+        // a recording of somebody's voice.
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    /// A machine with an STT engine and no TTS one still converses — it just answers in writing.
+    ///
+    /// The regression this guards is collapsing `speaks` into `armed`, which would take conversation
+    /// away from every machine that has not installed a voice yet. Which is all of them, today.
+    #[test]
+    fn hearing_without_speaking_is_a_working_pillar() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: "whisper-cli -m model.bin".to_string(),
+            tts_command: String::new(),
+            ..Default::default()
+        };
+
+        assert!(config.armed());
+        assert!(!config.speaks());
+        assert!(transcriber_for(&config).is_some());
+        assert!(speaker_for(&config).is_none());
+    }
+
+    /// A resident engine is a voice too — `speaks()` may not be a synonym for `tts_command`.
+    ///
+    /// The regression this guards is the obvious one when a second implementation arrives: the
+    /// capability check keeps naming the first, so a machine configured entirely correctly for the
+    /// FASTER path reports having no voice at all.
+    #[test]
+    fn a_resident_engine_is_a_voice_even_with_no_command() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: "whisper-cli".to_string(),
+            tts_url: "http://127.0.0.1:5017".to_string(),
+            ..Default::default()
+        };
+
+        assert!(config.speaks());
+        assert!(speaker_for(&config).is_some());
+    }
+
+    /// Both set is not an error, and the URL wins — because the difference is ~2.8 s a sentence.
+    ///
+    /// Asserted through `FakeSpeaker`-free means: what is observable here is that a speaker exists
+    /// and that the *command* is never consulted, which is what the `speak.rs` measurement makes
+    /// worth enforcing. A spawning speaker built from this command would try to run `no-such-program`.
+    #[tokio::test]
+    async fn a_resident_engine_wins_over_a_spawning_one() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: "whisper-cli".to_string(),
+            tts_command: "no-such-program-anywhere".to_string(),
+            // Nothing listens here, which is the point: the failure must be a REFUSED CONNECTION and
+            // not a missing program. Those are the two implementations' distinct signatures.
+            tts_url: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        };
+
+        let speaker = speaker_for(&config).expect("both configured means a speaker exists");
+        let error = speaker.speak("olá").await.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "the spawning speaker was built instead of the resident one: {error}"
+        );
+    }
+
+    /// And a voice configured on a pillar that is off is not a capability either.
+    #[test]
+    fn a_speaker_without_a_transcriber_is_not_a_capability() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: String::new(),
+            tts_command: "piper -m voz.onnx -f -".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!config.armed());
+        assert!(!config.speaks());
+        assert!(speaker_for(&config).is_none());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Speech: one unit of an answer at a time.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A finished local turn whose answer is `answer`, as `spawn_local_turn` would have left it.
+    async fn finished_local_turn(pool: &sqlx::SqlitePool, answer: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, stdout, created_at) \
+             VALUES ('perguntei', 'completed', 'assistant', 's', 'c', 'local', ?, ?)",
+        )
+        .bind(answer)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A running turn, as it looks for every poll before the answer exists.
+    async fn running_turn(pool: &sqlx::SqlitePool, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, created_at) \
+             VALUES ('perguntei', ?, 'assistant', 's', 'c', 'local', ?)",
+        )
+        .bind(status)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    fn speaking(audio: &[u8]) -> VoiceRuntime {
+        VoiceRuntime {
+            armed: true,
+            speaker: Some(Arc::new(crate::speak::FakeSpeaker::returning(audio))),
+            ..VoiceRuntime::default()
+        }
+    }
+
+    async fn body_of(response: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The three answers are distinct, and the window does three different things with them.
+    ///
+    /// Sentence by sentence until they run out, then `404` — which is what tells a hands-free client
+    /// to stop asking. A `204` in that position would poll a finished turn forever.
+    #[tokio::test]
+    async fn a_finished_answer_is_spoken_one_sentence_at_a_time_and_then_ends() {
+        let state = conversing_state(speaking(b"RIFFfake")).await;
+        let turn = finished_local_turn(&state.pool, "Esta a correr. Acabou agora.").await;
+
+        let first = get_turn_speech(State(state.clone()), Path((turn, 0)))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "audio/wav"
+        );
+        assert_eq!(body_of(first).await, b"RIFFfake");
+
+        let second = get_turn_speech(State(state.clone()), Path((turn, 1)))
+            .await
+            .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let past_the_end = get_turn_speech(State(state.clone()), Path((turn, 2)))
+            .await
+            .into_response();
+        assert_eq!(past_the_end.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// What was spoken is the sentence, not the whole answer.
+    ///
+    /// The bug this catches is an off-by-one that synthesises unit 0 for every index — audible as the
+    /// same sentence read twice, which is easy to mistake for a stutter in the player.
+    #[tokio::test]
+    async fn each_index_speaks_its_own_sentence() {
+        let fake = Arc::new(crate::speak::FakeSpeaker::returning(b"RIFF"));
+        let state = conversing_state(VoiceRuntime {
+            armed: true,
+            speaker: Some(fake.clone()),
+            ..VoiceRuntime::default()
+        })
+        .await;
+        let turn = finished_local_turn(&state.pool, "Primeira. Segunda.").await;
+
+        for index in 0..2 {
+            let _ = get_turn_speech(State(state.clone()), Path((turn, index)))
+                .await
+                .into_response();
+        }
+        assert_eq!(fake.said(), vec!["Primeira.", "Segunda."]);
+    }
+
+    /// A turn still thinking answers `204`, which means "ask again" and not "there is nothing".
+    ///
+    /// This is the whole of the local path's behaviour, and it is why `speakable` is a pure function
+    /// of whatever text exists: `spawn_local_turn` streams NOTHING, so a local turn's tail stays
+    /// empty for its entire life and every poll before the end looks exactly like this one.
+    #[tokio::test]
+    async fn a_turn_that_is_still_thinking_says_ask_again() {
+        let state = conversing_state(speaking(b"RIFF")).await;
+        let turn = running_turn(&state.pool, "running").await;
+
+        let response = get_turn_speech(State(state), Path((turn, 0)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// A turn that failed has no more text coming, so it ends rather than being polled forever.
+    #[tokio::test]
+    async fn a_turn_that_failed_ends_instead_of_waiting() {
+        let state = conversing_state(speaking(b"RIFF")).await;
+        let turn = running_turn(&state.pool, "failed").await;
+
+        let response = get_turn_speech(State(state), Path((turn, 0)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// No speaker is not an error condition, and it is not a 500 either.
+    ///
+    /// `503` says the capability is absent, which is the one thing a window can act on: it stops
+    /// asking for audio and reads the answer instead.
+    #[tokio::test]
+    async fn a_machine_with_no_voice_says_so() {
+        let state = conversing_state(VoiceRuntime {
+            armed: true,
+            ..VoiceRuntime::default()
+        })
+        .await;
+        let turn = finished_local_turn(&state.pool, "Qualquer coisa.").await;
+
+        let response = get_turn_speech(State(state), Path((turn, 0)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A turn nobody ever created is a 404 and not a silence.
+    #[tokio::test]
+    async fn speech_for_a_turn_that_does_not_exist_is_not_found() {
+        let state = conversing_state(speaking(b"RIFF")).await;
+
+        let response = get_turn_speech(State(state), Path((4321, 0)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An engine that breaks is reported as a gateway failure, not as an empty answer.
+    #[tokio::test]
+    async fn a_broken_speaker_is_reported_rather_than_silent() {
+        let state = conversing_state(VoiceRuntime {
+            armed: true,
+            speaker: Some(Arc::new(crate::speak::FakeSpeaker::failing(
+                std::io::ErrorKind::NotFound,
+                "piper is not installed",
+            ))),
+            ..VoiceRuntime::default()
+        })
+        .await;
+        let turn = finished_local_turn(&state.pool, "Isto devia soar.").await;
+
+        let response = get_turn_speech(State(state), Path((turn, 0)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The window is told the third chord and whether anything can say a word, from the one file that
+    /// owns both. The shell may not read `.ai/voice.yaml`, so anything it is not told, it cannot know.
+    #[test]
+    fn the_runtime_carries_the_third_chord_and_whether_there_is_a_voice() {
+        let config = crate::config::VoiceConfig {
+            enabled: true,
+            stt_command: "whisper-cli".to_string(),
+            tts_command: "piper -m voz.onnx -f -".to_string(),
+            conversation_hotkey: "Ctrl+Alt+C".to_string(),
+            ..Default::default()
+        };
+        let runtime = VoiceRuntime::from_config(&config, None);
+
+        assert_eq!(runtime.conversation_hotkey, "Ctrl+Alt+C");
+        assert_eq!(runtime.tts_command, "piper -m voz.onnx -f -");
+        assert!(runtime.speaker.is_some());
+    }
+
+    /// Nothing is synthesised until it is asked for, and THAT is what makes barge-in free.
+    ///
+    /// The design this pins down is the one that was chosen against a background task synthesising
+    /// the whole answer as it arrives. Hands-free conversation exists so a person can cut in, so
+    /// interruption is the ordinary path — and under the rejected design every interruption would
+    /// leave a queue of audio nobody will ever hear, already paid for. Here, cutting in is simply
+    /// the next request not being made.
+    #[tokio::test]
+    async fn a_unit_nobody_asks_for_is_never_synthesised() {
+        let fake = Arc::new(crate::speak::FakeSpeaker::returning(b"RIFF"));
+        let state = conversing_state(VoiceRuntime {
+            armed: true,
+            speaker: Some(fake.clone()),
+            ..VoiceRuntime::default()
+        })
+        .await;
+        let turn = finished_local_turn(&state.pool, "Uma. Duas. Tres. Quatro.").await;
+
+        // One sentence asked for, as a client interrupted after the first would have done.
+        let _ = get_turn_speech(State(state), Path((turn, 0)))
+            .await
+            .into_response();
+
+        assert_eq!(
+            fake.calls(),
+            1,
+            "three unheard sentences were synthesised anyway"
+        );
     }
 }

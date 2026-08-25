@@ -1350,6 +1350,7 @@ mod tests {
         AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,

@@ -195,6 +195,11 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // `ownership` is the write boundary, read. Knowing which files the app would write is not
     // permission to write one — `POST /projects/{id}/write` is in no table at all — and a fence
     // only a privileged caller can see is a fence nobody can argue with.
+    //
+    // `map` lists every source path in the project and the import graph between them, and
+    // nothing else. A reader who already reaches `cat`, `grep` and `blame` can already read the
+    // contents of those same files, so a list of their names grants nothing it did not already
+    // have.
     (Method::GET, "/projects/{id}/readings"),
     (Method::GET, "/projects/{id}/log"),
     (Method::GET, "/projects/{id}/branches"),
@@ -202,6 +207,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/changed"),
     (Method::GET, "/projects/{id}/worktree"),
     (Method::GET, "/projects/{id}/ownership"),
+    (Method::GET, "/projects/{id}/map"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),
@@ -761,6 +767,7 @@ mod tests {
         AppState {
             token: Token(token.to_string()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,

@@ -292,7 +292,7 @@ async fn serve_turn(
         let known = live.session_id.lock().unwrap().clone();
         // Everything a process fixed when it was spawned and cannot be told to change: where it is
         // standing, and which conversation it is having. Both are resolved per turn — an errand's
-        // folder wins over the chat's, and a rotation abandons the session — so a process that no
+        // folder wins over the chat's, and a fresh context abandons the session — so a process that no
         // longer matches this turn is not a process this turn may be answered by. It falls through
         // and is dropped, which stops it, and a new one is started to the turn's own shape.
         let same_ground = live.cwd == request.cwd && live.planning == request.plan_only;
@@ -513,6 +513,7 @@ fn gathered(
         cache_read_tokens: outcome.usage.cache_read_tokens,
         cache_creation_tokens: outcome.usage.cache_creation_tokens,
         num_turns: outcome.usage.num_turns,
+        compacted: outcome.compacted,
     }
 }
 
@@ -551,13 +552,50 @@ impl Drop for TurnGuard {
     }
 }
 
-/// How much context a chat's session may have occupied before resuming it stops paying for itself.
+/// The context window a conversation is given, unless its own row asks for a different one.
 ///
-/// `runs.context_fill` is an ABSOLUTE token count, not a fraction: runner.rs writes
-/// `input_tokens + cache_read_input_tokens` from the live assistant events, so this compares against
-/// tokens directly. 140k is ≈0.7 of the 200k window the runner assumes as its conservative floor —
-/// past there a resume mostly re-buys prior turns whose useful part was the last exchange.
-pub(crate) const CONTEXT_ROTATION_TOKENS: i64 = 140_000;
+/// An ABSOLUTE token count, not a fraction, because everything it is compared against is one:
+/// `runs.context_fill` is `input_tokens + cache_read_input_tokens` off the live assistant events,
+/// and `sessions::Conversation::context_estimate` is a character count divided by four. 140k is
+/// ≈0.7 of the 200k window the runner assumes as its conservative floor — deliberately below it, so
+/// an ordinary conversation is summarised while it is still cheap to summarise.
+///
+/// This number USED to mean "the point past which this daemon refuses to resume". It no longer
+/// refuses anything: it is handed to the CLI as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, and the CLI
+/// compacts its own context inside the same session rather than the daemon minting a new one. See
+/// `0116_chats_context_window.sql` for why that swap is both gentler and cheaper.
+pub(crate) const CONTEXT_WINDOW_TOKENS: i64 = 140_000;
+
+/// The largest window there is any point asking for.
+///
+/// The CLI takes `CLAUDE_CODE_AUTO_COMPACT_WINDOW` up to a million and then caps it at the model's
+/// real window anyway, so a bigger number here would buy a promise the model cannot keep. 200k is
+/// the window the runner already assumes as its conservative floor, and assuming the same number in
+/// two places is how the two come to disagree — so this is the one that names it.
+///
+/// Only the pick-up path ever reaches for it: a conversation continued from the editor may arrive
+/// carrying more than the default window can hold, and raising its window to fit is what lets it be
+/// resumed instead of stumped.
+pub(crate) const LARGEST_WINDOW_TOKENS: i64 = 200_000;
+
+/// The headroom the CLI keeps below the window before it compacts.
+///
+/// Read out of the CLI's own binary — its threshold is `window - 13000` — rather than guessed, and
+/// named here because the pick-up path has to answer "will this session fit" and the honest answer
+/// is "does it fit under the line the CLI will actually draw", not "under the window".
+pub(crate) const COMPACTION_HEADROOM: i64 = 13_000;
+
+/// The window this conversation runs in: its own if it asked for one, the default otherwise.
+///
+/// Clamped on the way out rather than on the way in, because a row written by an older daemon — or
+/// by a pick-up whose ceiling has since changed — is not something a turn should refuse over. The
+/// CLI clamps this again at its own end; agreeing with it here means the number the window SHOWS is
+/// the number the CLI will actually use.
+pub(crate) fn window_of(asked: Option<i64>) -> i64 {
+    asked
+        .unwrap_or(CONTEXT_WINDOW_TOKENS)
+        .clamp(CONTEXT_WINDOW_TOKENS, LARGEST_WINDOW_TOKENS)
+}
 
 /// The session a chat's next turn resumes, or `None` when it must start clean.
 ///
@@ -573,23 +611,23 @@ pub(crate) const CONTEXT_ROTATION_TOKENS: i64 = 140_000;
 /// session that is unresumable because of what the database says about it is unresumable on every
 /// one of them, including across a restart.
 ///
-/// The second `NOT EXISTS` is context rotation, and it is on the READ for that same reason. It needs
-/// no counterpart anywhere else: `send_message` mints a fresh session id whenever this returns
-/// `None`, and `upsert_session` replaces the chat's row rather than adding one, so refusing to
-/// resume IS the whole rotation.
+/// There is deliberately no second condition about SIZE, and there used to be one.
+///
+/// A conversation whose context had grown past 140k was refused here, which minted a fresh session
+/// and left the model with six replayed exchanges and no memory of the rest. Size is now the CLI's
+/// business: it is given the window as `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and compacts inside this
+/// same session, so a long conversation stays ONE conversation. What remains here is the untrusted
+/// barrier, which is a safety property and not a cost one — the two were never the same rule and
+/// only ever shared a `WHERE`.
 pub async fn get_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
     let session_id: Option<Option<String>> = sqlx::query_scalar(
         "SELECT s.session_id FROM assistant_sessions s
           WHERE s.chat_id = ?
             AND NOT EXISTS (SELECT 1 FROM runs r
                              WHERE r.session_id = s.session_id
-                               AND r.read_untrusted = 1)
-            AND NOT EXISTS (SELECT 1 FROM runs r
-                             WHERE r.session_id = s.session_id
-                               AND r.context_fill > ?)",
+                               AND r.read_untrusted = 1)",
     )
     .bind(chat_id)
-    .bind(CONTEXT_ROTATION_TOKENS)
     .fetch_optional(pool)
     .await?;
 
@@ -696,6 +734,12 @@ pub fn build_mcp_config(exe_path: &str, errand: Option<i64>) -> serde_json::Valu
 pub enum Origin {
     Shell,
     Telegram,
+    /// Spoken into the microphone of the machine this daemon runs on.
+    ///
+    /// A variant and not a flag on `Shell`, because the two differ in what happens to the ANSWER:
+    /// a shell turn is read, a voice turn is spoken. Recorded on the row for the same reason the
+    /// other two are — a queued message must be sent as the thing it was.
+    Voice,
 }
 
 impl Origin {
@@ -704,6 +748,7 @@ impl Origin {
     pub fn from_wire(value: Option<&str>) -> Self {
         match value {
             Some("telegram") => Self::Telegram,
+            Some("voice") => Self::Voice,
             _ => Self::Shell,
         }
     }
@@ -716,6 +761,7 @@ impl Origin {
     pub fn as_wire(self) -> &'static str {
         match self {
             Self::Telegram => "telegram",
+            Self::Voice => "voice",
             Self::Shell => "shell",
         }
     }
@@ -1263,6 +1309,22 @@ pub async fn send_message_with(
             crate::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
         }),
     );
+    // The configured Telegram doctrine, resolved HERE and not inside the spawned task below,
+    // because `origin` is what decides it and `origin` does not survive to that task: the task
+    // reads `chats::answering` instead, which knows the chat's own instructions and nothing about
+    // which door the message came in by. `None` for every other origin, so a shell turn — sitting
+    // at this machine, with a person watching — never has a channel-wide doctrine pushed onto it.
+    //
+    // Voice sits with the shell here, and by decision rather than by omission: a spoken turn is
+    // somebody at this machine talking into its microphone, which is the same presence the
+    // exemption is about — the argument `tool_policy_for` makes at length. Written out rather than
+    // swept up by a wildcard, so that the next origin — which will arrive over a network, as every
+    // origin after the first has — is a compile error here instead of silently inheriting the
+    // doctrine a Telegram channel was given.
+    let doctrine = match origin {
+        Origin::Telegram => state.telegram_doctrine.clone(),
+        Origin::Shell | Origin::Voice => None,
+    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe, errand.as_ref().map(|turn| turn.errand.id));
@@ -1324,14 +1386,13 @@ pub async fn send_message_with(
     // The conversation so far, for a turn that has no session to hold it.
     //
     // `resume` is `None` on a first turn — where there is nothing to replay and this adds nothing —
-    // and on a ROTATED one, which is the case this exists for. The daemon refuses to resume past
-    // `CONTEXT_ROTATION_TOKENS`, and past anything that read third-party text, and then mints a
-    // fresh session; without this the model on the far side of that line begins remembering
-    // nothing while the transcript above it reads as one unbroken conversation.
+    // and on the three cases where a session was deliberately let go of: a turn that read
+    // third-party text, somebody asking for a fresh context, and a picked-up conversation too large
+    // for any window a model has. Size on its own is no longer one of them; the CLI compacts inside
+    // the session instead, so an ordinary long conversation never reaches this branch at all.
     //
-    // It bites hardest on a conversation picked up from the editor: one arrives carrying a context
-    // somebody else's session already filled, often past the ceiling on the first turn here — so
-    // continuing one could mean exactly one continued turn and then a stranger.
+    // What is left is genuinely a new context, and this is what stops it beginning as a stranger
+    // while the transcript above it reads as one unbroken conversation.
     //
     // The same answer the LOCAL path has always given, for the same reason and through the same
     // function: no session to resume, so the exchanges are read back instead. A failure to read
@@ -1389,6 +1450,7 @@ pub async fn send_message_with(
             cwd,
             tool_policy,
             notebook: errand.map(|turn| turn.errand),
+            doctrine,
         },
     );
     Ok(id)
@@ -1475,9 +1537,17 @@ const HISTORY_CHARS: usize = 6_000;
 /// `you:` and `núcleo:` rather than `user`/`assistant`: the CLI has its own idea of those roles and
 /// this text is a user message, not a transcript it should adopt. Naming them after the roles would
 /// invite the model to continue the transcript rather than answer the question.
+///
+/// The opening line used to be "This conversation has just begun a new context, so you do not
+/// remember what is below", and changing it is not cosmetic. A model told it has forgotten answers
+/// like someone who has forgotten — it hedges, it re-asks what was settled, it treats the replay as
+/// hearsay. The person on the other side reads that as a different assistant, which is the whole of
+/// the complaint this change answers. What is true is narrower and worth saying instead: this is the
+/// conversation, here is the part of it that fits, carry on.
 fn replayed(history: &[(String, String)], prompt: &str) -> String {
     let mut out = String::from(
-        "This conversation has just begun a new context, so you do not remember what is below.          These are its recent exchanges, oldest first, replayed for you:
+        "Here is the conversation so far, oldest first. Continue it as your own — it is yours, and \
+         what is below is the part of it being carried forward:
 
 ",
     );
@@ -1780,6 +1850,18 @@ async fn spawn_local_turn(
 /// `McpOnly` because the policy — not the MCP allowlist, which only grants — is the one thing that
 /// keeps a message arriving over the network away from this machine's filesystem and shell.
 ///
+/// `Origin::Voice` joins `Shell` here EXPLICITLY, and the explicitness is the point: letting it fall
+/// through to `_` would be the same question answered with a weaker policy for having been spoken,
+/// with nothing anywhere saying so. It belongs on this arm because the fact the arm turns on is
+/// physical presence, and a microphone is a stricter proof of it than a keyboard — a spoken turn
+/// requires being in the room, while a typed one only requires reaching the machine.
+///
+/// The argument against, which is real and loses: a transcript is a GUESS at what was said, and
+/// whisper mishears. But the guess is shown to the person as the turn is sent, the answer is spoken
+/// back to them, and the `PreToolUse` classifier this arm defers to is still the thing deciding. What
+/// would not survive scrutiny is the alternative — trusting a message that crossed the network more
+/// than one spoken into the machine's own microphone.
+///
 /// **A wired hook.** `Unrestricted` is not "ungoverned": it hands the decision to the `PreToolUse`
 /// classifier. But that hook is COOPERATIVE — it runs only if the `.claude/settings.json` resolved
 /// from the run's working directory registers it — so in a directory that never onboarded,
@@ -1796,7 +1878,7 @@ pub(crate) fn tool_policy_for(
     hook_is_wired: bool,
 ) -> crate::runner::ToolPolicy {
     match (cwd, origin, hook_is_wired) {
-        (Some(_), Origin::Shell, true) => crate::runner::ToolPolicy::Unrestricted,
+        (Some(_), Origin::Shell | Origin::Voice, true) => crate::runner::ToolPolicy::Unrestricted,
         _ => crate::runner::ToolPolicy::McpOnly,
     }
 }
@@ -1829,6 +1911,14 @@ struct TurnLaunch {
     /// notebook has already been spent on the prompt, so what is still needed when the answer comes
     /// back is only the errand to write it against.
     notebook: Option<crate::errands::Errand>,
+    /// The configured Telegram doctrine, already resolved against `origin` in `send_message` —
+    /// `Some` only for an `Origin::Telegram` turn whose operator configured one, `None` otherwise.
+    ///
+    /// Carried on the struct rather than re-derived where it is used, because `origin` is gone by
+    /// then: this is read inside the task `spawn_assistant_turn` spawns, where `chats::answering`
+    /// is read and the doctrine fills its `system_prompt` only when that is empty — a person's own
+    /// instructions must never be replaced, only completed.
+    doctrine: Option<String>,
 }
 
 fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
@@ -1843,6 +1933,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         cwd,
         tool_policy,
         notebook,
+        doctrine,
     } = launch;
     let pool = state.pool.clone();
     let runner = state.runner.clone();
@@ -1995,9 +2086,10 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             .await
             .unwrap_or_default();
 
-        // A turn with no `resume` is a conversation that has rotated onto a fresh context, so a
-        // process still holding the old session has to go rather than be spoken to — answering down
-        // it would continue exactly the conversation the rotation just ended.
+        // A turn with no `resume` is a conversation that was deliberately let go of — it read
+        // third-party text, or somebody asked for a fresh context — so a process still holding the
+        // old session has to go rather than be spoken to: answering down it would continue exactly
+        // the conversation that was just ended.
         //
         // Pictures used to be here too, because `messages` carried a bare `String` and a later turn
         // was written with no attachments. `runner::LaterTurn` carries its own, so a screenshot
@@ -2090,10 +2182,16 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // turn. Instructions sent only on the first would govern the opening message and then
             // quietly stop mattering — wrong in the way that is hardest to see, since the first
             // answer is the right one.
-            append_system_prompt: answering.system_prompt.clone(),
+            //
+            // `.or(doctrine)`, not `.or_else`: the chat's own `system_prompt` — read moments ago
+            // from `chats::answering`, where `origin` no longer exists — always wins when it is
+            // there, and the configured Telegram doctrine only fills the slot when it is empty. A
+            // person's own instructions are never replaced, only completed.
+            append_system_prompt: answering.system_prompt.clone().or(doctrine),
             // What this conversation is called, so the session it mints is findable in the CLI's
             // own `--resume` picker instead of being one more nameless timestamp there.
             session_name: answering.session_name.clone(),
+            context_window: Some(crate::assistant::window_of(answering.context_window)),
             // Merged with whatever `tool_policy` denies by `cli_args`, into one flag. This can only
             // ever narrow: the allow-listing flag beside it grants rather than restricts, so there
             // is no widening version of this to get wrong.
@@ -2164,7 +2262,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // Read out of the same stream, and stored here because this is where an
                     // assistant turn ends. `runs.rs` does the equivalent at its own terminal write,
                     // and a chat turn never passes through it — so the column stayed null on every
-                    // conversation, and the rotation it governs could not be seen coming.
+                    // conversation, and the window meter under each turn had nothing to draw.
                     //
                     // Cache-read tokens count as context because they occupy the window exactly as
                     // fresh input does. A resumed conversation is nearly all cache: reading only
@@ -2172,8 +2270,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     let context_fill = o.stdout.lines().fold(None, |fill, line| {
                         crate::runner::context_fill_from_line(line, fill)
                     });
+                    // Taken off the outcome and not re-derived from the transcript beside it: on the
+                    // multi-turn path the transcript belongs to a PROCESS that may have served several
+                    // answers, and this is a fact about ONE of them. `RunOutcome` is where the
+                    // splitter already put the right turn's copy.
+                    let compacted = o.compacted;
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
@@ -2184,6 +2287,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(&thought)
                     .bind(thought_tokens)
                     .bind(context_fill)
+                    .bind(compacted)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -2303,6 +2407,7 @@ mod tests {
         AppState {
             token: Token("t".into()),
             pool: test_pool().await,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -2961,28 +3066,28 @@ mod tests {
         );
     }
 
-    /// A chat is a conversation that never ends, and `--resume` hands every turn the whole of it.
-    /// Past the point where the window is mostly prior turns, the resume stops buying continuity and
-    /// starts buying the same tokens again on every message — the CLI re-reads a context whose useful
-    /// part is the last exchange, and the chat pays for the rest.
+    /// A long conversation stays ONE conversation, and this is the test that used to say the
+    /// opposite.
     ///
-    /// So the resume has a ceiling. `runs.context_fill` is an absolute token count, not a fraction,
-    /// and once any turn on a session recorded more than `CONTEXT_ROTATION_TOKENS` of it, that
-    /// session stops being resumable and the next message starts clean.
+    /// It asserted that a session whose `context_fill` had passed 140k stopped being resumable, so
+    /// the next message started clean. That was the fork the person on the other side could feel:
+    /// the model lost the conversation while the transcript above it read as unbroken. Size is the
+    /// CLI's business now — it is handed the window and compacts inside this same session — so a
+    /// full context is a reason to summarise and never a reason to start again.
     ///
     /// Written as rows rather than driven through a turn, for the same reason the mail-read test
-    /// above is: the condition lives on the READ, so it must hold for a session whose turn died
-    /// without running any cleanup.
+    /// above is: the condition lives on the READ, so whatever it says must hold for a session whose
+    /// turn died without running any cleanup.
     #[tokio::test]
-    async fn a_chat_whose_session_filled_the_context_starts_clean() {
+    async fn a_chat_whose_session_filled_the_context_is_still_resumed() {
         let pool = test_pool().await;
-        let chat_id = "assistant-rotated-session-chat";
+        let chat_id = "assistant-full-session-chat";
 
         sqlx::query(
             "INSERT INTO runs (prompt, status, mode, session_id, context_fill, created_at)
              VALUES ('x', 'completed', 'assistant', 'sess-full', ?, '2026-08-08T00:00:00Z')",
         )
-        .bind(CONTEXT_ROTATION_TOKENS + 1)
+        .bind(LARGEST_WINDOW_TOKENS * 4)
         .execute(&pool)
         .await
         .unwrap();
@@ -2992,46 +3097,78 @@ mod tests {
 
         assert_eq!(
             get_session(&pool, chat_id).await.unwrap(),
-            None,
-            "a session that filled the context must not be resumed into again"
+            Some("sess-full".to_string()),
+            "a full context is compacted inside the session, never traded for a new one"
         );
     }
 
-    /// The contrast that stops the rotation from simply ending every conversation: a session still
-    /// inside the ceiling keeps being resumed, and a turn that never reported a fill at all is not
-    /// treated as though it had overflowed.
+    /// The one rule that DOES still refuse a resume, kept apart from the one that no longer does.
+    ///
+    /// Cost and safety shared a `WHERE` and were never the same rule. Removing the size half must
+    /// not quietly remove the other: a session that read third-party text stays unresumable however
+    /// much room is left in it, because what it is carrying is somebody else's instructions.
     #[tokio::test]
-    async fn a_chat_below_the_rotation_threshold_still_resumes() {
+    async fn a_full_session_that_read_untrusted_text_is_still_refused() {
         let pool = test_pool().await;
-        let chat_id = "assistant-roomy-session-chat";
+        let chat_id = "assistant-full-and-tainted-chat";
 
         sqlx::query(
-            "INSERT INTO runs (prompt, status, mode, session_id, context_fill, created_at)
-             VALUES ('x', 'completed', 'assistant', 'sess-roomy', ?, '2026-08-08T00:00:00Z'),
-                    ('y', 'completed', 'assistant', 'sess-roomy', NULL, '2026-08-08T00:01:00Z')",
+            "INSERT INTO runs (prompt, status, mode, session_id, context_fill, read_untrusted,
+                               created_at)
+             VALUES ('x', 'completed', 'assistant', 'sess-tainted', ?, 1, '2026-08-08T00:00:00Z')",
         )
-        .bind(CONTEXT_ROTATION_TOKENS - 1)
+        .bind(LARGEST_WINDOW_TOKENS * 4)
         .execute(&pool)
         .await
         .unwrap();
-        upsert_session(&pool, chat_id, "sess-roomy", "2026-08-08T00:01:00Z")
+        upsert_session(&pool, chat_id, "sess-tainted", "2026-08-08T00:00:00Z")
             .await
             .unwrap();
 
         assert_eq!(
             get_session(&pool, chat_id).await.unwrap(),
-            Some("sess-roomy".to_string()),
-            "a chat with room left is still one conversation, and an unreported fill is not an \
-             overflow"
+            None,
+            "the untrusted barrier is a safety property and does not lapse with the cost ceiling"
+        );
+    }
+
+    /// The window a conversation runs in, and the two ways a row can ask for a silly one.
+    ///
+    /// Clamped rather than trusted, because this number is written by the pick-up path against a
+    /// ceiling that can change between releases — and because the CLI clamps it again at its own
+    /// end, so a number the window SHOWS that the CLI would not honour is a lie in the interface.
+    #[test]
+    fn a_conversation_runs_in_its_own_window_within_reason() {
+        assert_eq!(
+            window_of(None),
+            CONTEXT_WINDOW_TOKENS,
+            "the default is the default"
+        );
+        assert_eq!(
+            window_of(Some(180_000)),
+            180_000,
+            "a picked-up session gets the room it needs"
+        );
+        assert_eq!(
+            window_of(Some(20_000)),
+            CONTEXT_WINDOW_TOKENS,
+            "below the default is not an economy, it is a conversation that compacts every turn"
+        );
+        assert_eq!(
+            window_of(Some(900_000)),
+            LARGEST_WINDOW_TOKENS,
+            "a window larger than the model's is a promise the model cannot keep"
         );
     }
 
     /// A conversation too large to resume is still continued, from what it was handed.
     ///
-    /// The rotation's answer to a lost context has always been a verbatim tail. Its source was the
-    /// turns of the chat itself — and a chat picked up from the editor has none, so a session too
-    /// large to resume began knowing nothing at all. That is the original complaint with a new hat:
-    /// the sessions appear, you continue one, and it has never heard of you.
+    /// The answer to a context that genuinely cannot be resumed has always been a verbatim tail.
+    /// Its source was the turns of the chat itself — and a chat picked up from the editor has none,
+    /// so a session too large to resume began knowing nothing at all. That is the original
+    /// complaint with a new hat: the sessions appear, you continue one, and it has never heard of
+    /// you. Rare now that only a session past every model's window reaches this, and no less wrong
+    /// when it happens.
     ///
     /// The tail is read from the transcript once, when the session is picked up, and stored on the
     /// chat. This asserts the far end of that: what the model is actually handed.
@@ -3071,7 +3208,7 @@ mod tests {
             prompt.contains("e agora os testes"),
             "the new message was lost: {prompt}"
         );
-        // Framed as a replay, not as the conversation itself — the same frame the rotation uses.
+        // Framed as a replay, not as the conversation itself — the same frame every replay uses.
         assert!(prompt.contains("replay"), "{prompt}");
     }
 
@@ -3082,8 +3219,8 @@ mod tests {
     /// column this path never wrote. `runs.rs` observes the stream and stores it at its terminal
     /// write; an assistant turn has a terminal write of its own, and did not.
     ///
-    /// It is what decides the rotation, so a turn that does not record it is a turn that cannot be
-    /// seen coming: the ceiling is read off these rows.
+    /// It is what the meter under every turn reads, so a turn that does not record it is a
+    /// conversation whose fullness cannot be seen coming.
     #[tokio::test]
     async fn a_finished_turn_records_how_full_its_context_was() {
         let mut state = test_state().await;
@@ -3104,6 +3241,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             ..Default::default()
         });
@@ -3155,6 +3293,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             ..Default::default()
         });
@@ -3410,6 +3549,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             ..Default::default()
         });
@@ -3998,6 +4138,105 @@ mod tests {
         );
     }
 
+    /// A state carrying the configured Telegram doctrine, with the fake runner still typed — the
+    /// same shape `errand_state` returns, minus the file root neither new test below needs.
+    async fn state_with_doctrine(doctrine: Option<&str>) -> (AppState, Arc<FakeCommandRunner>) {
+        let runner = Arc::new(FakeCommandRunner::default());
+        let state = AppState {
+            runner: runner.clone(),
+            telegram_doctrine: doctrine.map(str::to_string),
+            ..test_state().await
+        };
+        (state, runner)
+    }
+
+    /// A Telegram turn with no instructions of its own is not a turn with no instructions at all —
+    /// it is answered under whatever doctrine the operator configured for the whole channel, the
+    /// same way `a_conversations_instructions_and_denials_reach_the_launch` shows a chat's OWN
+    /// `system_prompt` reaching the launch untouched. `Brain::Cloud` is set explicitly on the chat
+    /// so `wants_local` cannot route this into the local-assistant path instead of the runner this
+    /// test inspects.
+    #[tokio::test]
+    async fn um_turno_de_telegram_sem_instrucoes_leva_a_doutrina() {
+        const DOCTRINE: &str = "Falas sempre em português europeu, e nunca reveles segredos.";
+        let (state, runner) = state_with_doctrine(Some(DOCTRINE)).await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        assert_eq!(
+            runner.last_append_system_prompt.lock().unwrap().clone(),
+            Some(Some(DOCTRINE.to_string())),
+            "a Telegram turn with no instructions of its own must reach the runner carrying the \
+             configured doctrine"
+        );
+    }
+
+    /// The doctrine is a fallback for a channel that said nothing, never a replacement for
+    /// something a person actually wrote. Two independent reasons the same configured doctrine must
+    /// NOT reach the launch: (a) the origin is not Telegram at all, and (b) the chat has its own
+    /// `system_prompt`, which — like `a_conversations_instructions_and_denials_reach_the_launch`
+    /// already pins for the shell — must survive untouched.
+    #[tokio::test]
+    async fn a_doutrina_nunca_substitui_instrucoes_de_uma_pessoa() {
+        const DOCTRINE: &str = "Falas sempre em português europeu, e nunca reveles segredos.";
+
+        // (a) Shell, doctrine configured, no instructions of the chat's own: still no doctrine.
+        let (shell_state, shell_runner) = state_with_doctrine(Some(DOCTRINE)).await;
+        let shell_id = crate::chats::create(&shell_state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let shell_turn = send_message(&shell_state, &shell_id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&shell_state.pool, shell_turn).await;
+
+        assert_eq!(
+            shell_runner
+                .last_append_system_prompt
+                .lock()
+                .unwrap()
+                .clone(),
+            Some(None),
+            "a shell turn must never receive the Telegram doctrine"
+        );
+
+        // (b) Telegram, doctrine configured, AND the chat has its own instructions: its own text
+        // wins, whole, over the doctrine that would otherwise have filled the same slot.
+        let (person_state, person_runner) = state_with_doctrine(Some(DOCTRINE)).await;
+        let person_id = crate::chats::create(&person_state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_system_prompt(
+            &person_state.pool,
+            &person_id,
+            Some("Answer in Portuguese."),
+        )
+        .await
+        .unwrap();
+
+        let person_turn = send_message(&person_state, &person_id, "olá", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&person_state.pool, person_turn).await;
+
+        assert_eq!(
+            person_runner
+                .last_append_system_prompt
+                .lock()
+                .unwrap()
+                .clone(),
+            Some(Some("Answer in Portuguese.".to_string())),
+            "a chat's own instructions must survive even on Telegram with a doctrine configured"
+        );
+    }
+
     /// The difference between the two context gestures, stated where it actually shows.
     ///
     /// Forgetting the session leaves the replay alone — the next turn starts on a fresh window and
@@ -4467,7 +4706,7 @@ mod tests {
     /// whatever else changes here, none of them may pick up the filesystem by accident.
     #[test]
     fn a_conversation_with_no_directory_keeps_exactly_the_policy_it_always_had() {
-        for origin in [Origin::Shell, Origin::Telegram] {
+        for origin in [Origin::Shell, Origin::Telegram, Origin::Voice] {
             for wired in [true, false] {
                 assert_eq!(
                     tool_policy_for(None, origin, wired),
@@ -4475,6 +4714,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A question does not get a weaker policy for having been spoken.**
+    ///
+    /// The security decision of the voice-conversation design, written as the test that fails if
+    /// somebody reverts it. `Origin::Voice` is on the `Unrestricted` arm because the fact that arm
+    /// turns on is physical presence, and a microphone is a stricter proof of it than a keyboard: a
+    /// spoken turn requires being in the room, a typed one only requires reaching the machine.
+    ///
+    /// The failure this prevents is silent and would be very hard to recognise. Drop `Origin::Voice`
+    /// from the arm and nothing errors — voice turns simply fall to `McpOnly`, so the SAME question
+    /// that works when typed answers "I cannot do that" when spoken, in a directory that is onboarded
+    /// and with the hook wired. Nothing on screen would connect that to the microphone.
+    #[test]
+    fn a_spoken_turn_is_trusted_exactly_as_much_as_a_typed_one() {
+        for wired in [true, false] {
+            assert_eq!(
+                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, wired),
+                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Shell, wired),
+                "a spoken turn diverged from a typed one at wired={wired}"
+            );
+        }
+        // And the direction is the permissive one, so this cannot pass by both being McpOnly.
+        assert_eq!(
+            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, true),
+            crate::runner::ToolPolicy::Unrestricted
+        );
+    }
+
+    /// Voice does not lift Telegram along with it.
+    ///
+    /// The arm names two origins now, and a third could be added to it by a careless edit — so the
+    /// thing that must stay true is stated separately: what keeps a message that crossed the network
+    /// away from this machine's shell is the policy, not the MCP allowlist.
+    #[test]
+    fn a_message_over_the_network_is_still_kept_off_the_machine() {
+        assert_eq!(
+            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Telegram, true),
+            crate::runner::ToolPolicy::McpOnly
+        );
     }
 
     /// A session the daemon never started has no rows in `runs`, so both of `get_session`'s
@@ -4655,6 +4934,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             ..Default::default()
         })
@@ -5197,7 +5477,7 @@ mod tests {
         }
     }
 
-    /// A conversation that has rotated onto a fresh context must not be answered by the process
+    /// A conversation given a fresh context must not be answered by the process
     /// holding the old one.
     ///
     /// Rotation is the daemon deciding this conversation starts again: the window is full, or
@@ -5206,25 +5486,25 @@ mod tests {
     /// continue the conversation that was supposed to have ended — with every one of those reasons
     /// still true, and nothing in the transcript to show it happened.
     #[tokio::test]
-    async fn a_conversation_that_rotated_is_not_answered_by_the_process_holding_the_old_session() {
+    async fn a_conversation_let_go_of_is_not_answered_by_the_process_holding_the_old_session() {
         let fake = std::sync::Arc::new(FakeCommandRunner::default());
         let mut state = test_state().await;
         state.runner = fake.clone();
-        let _root = rooted_chat(&state, "rotating-chat").await;
+        let _root = rooted_chat(&state, "restarted-chat").await;
 
-        let first = send_message(&state, "rotating-chat", "primeiro", Origin::Shell)
+        let first = send_message(&state, "restarted-chat", "primeiro", Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, first).await;
 
-        // What rotation leaves behind: no session to resume. The reasons differ — a full window, a
-        // mail body read — and they all arrive here as the same absence.
-        sqlx::query("DELETE FROM assistant_sessions WHERE chat_id = 'rotating-chat'")
+        // What letting go of a session leaves behind: nothing to resume. The reasons differ — a
+        // mail body read, somebody asking to start over — and both arrive here as the same absence.
+        sqlx::query("DELETE FROM assistant_sessions WHERE chat_id = 'restarted-chat'")
             .execute(&state.pool)
             .await
             .unwrap();
 
-        let second = send_message(&state, "rotating-chat", "segundo", Origin::Shell)
+        let second = send_message(&state, "restarted-chat", "segundo", Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, second).await;
@@ -5232,7 +5512,7 @@ mod tests {
         assert_eq!(
             *fake.calls.lock().unwrap(),
             2,
-            "the rotated turn was answered by the process holding the session it left"
+            "the restarted turn was answered by the process holding the session it left"
         );
     }
 
@@ -5441,6 +5721,7 @@ mod tests {
             append_system_prompt: None,
             denied_tools: Vec::new(),
             session_name: None,
+            context_window: None,
             allowed_mcp_tools: None,
         }
     }
@@ -5909,17 +6190,17 @@ mod tests {
 
     /// A conversation that cannot resume is READ BACK to the model instead of starting blank.
     ///
-    /// This is the ceiling in `CONTEXT_ROTATION_TOKENS` biting, and it bites hardest on a
-    /// conversation picked up from the editor: one arrives with somebody else's context already
-    /// filling the window, so the very first turn here can push it past the ceiling and the second
-    /// one would begin remembering nothing. The local path has always replayed its history for want
-    /// of a session protocol; this is the same answer to the same problem.
+    /// The cases that still reach it are narrow now — a turn that read third-party text, somebody
+    /// asking for a fresh context, and a picked-up session larger than any model window — but each
+    /// of them genuinely ends one context and begins another, and a model that begins the next one
+    /// blank is a stranger answering in the same thread. The local path has always replayed its
+    /// history for want of a session protocol; this is the same answer to the same problem.
     #[tokio::test]
     async fn a_turn_that_cannot_resume_is_replayed_the_conversation_so_far() {
         let mut state = test_state().await;
         let runner = Arc::new(FakeCommandRunner::default());
         state.runner = runner.clone();
-        let chat_id = "assistant-rotated-chat";
+        let chat_id = "assistant-restarted-chat";
         past_exchange(&state.pool, chat_id, "arranja o parser", "está arranjado").await;
 
         let id = send_message(&state, chat_id, "e os testes?", Origin::Shell)

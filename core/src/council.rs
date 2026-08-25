@@ -1449,6 +1449,7 @@ impl Driver {
             append_system_prompt: None,
             denied_tools: Vec::new(),
             session_name: None,
+            context_window: None,
             // The wildcard: a seat's `mcp_config` is written per council and already advertises
             // only `COUNCIL_TOOLS`, so there is nothing here left to narrow.
             allowed_mcp_tools: None,
@@ -2826,6 +2827,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             };
             match scripted {
                 Scripted::Answers(text) => Ok(crate::runner::RunOutcome {
@@ -2864,6 +2866,7 @@ mod tests {
         crate::state::AppState {
             token: crate::auth::Token("control-token".into()),
             pool: test_pool().await,
+            telegram_doctrine: None,
             runner,
             triage_runner: None,
             local_triage_disabled: None,

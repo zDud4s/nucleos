@@ -48,6 +48,7 @@ mod presets;
 mod priority;
 mod process_tree;
 mod project_commands;
+mod project_map;
 mod project_readings;
 mod proposals;
 mod recurrence;
@@ -64,6 +65,7 @@ mod seed;
 mod sessions;
 mod shadow;
 mod sidecar;
+mod speak;
 mod state;
 mod storage;
 mod team;
@@ -538,6 +540,7 @@ async fn main() {
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
     let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
+    let telegram_config = config::load_telegram_config(std::path::Path::new(".ai/telegram.yaml"));
     // The path is named once and reused, because two facts come off it: what the file SAYS
     // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
     // `GithubRuntime::configured` — and deriving it from a second literal is how the two would come
@@ -744,6 +747,7 @@ async fn main() {
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),
+        telegram_doctrine: telegram_config.doctrine,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,

@@ -89,8 +89,9 @@ function panelsOf2(container: HTMLElement): string[] {
 }
 
 describe("normaliseMode", () => {
-  it("takes the three modes as themselves", () => {
+  it("takes the four modes as themselves", () => {
     expect(normaliseMode("estado")).toBe("estado");
+    expect(normaliseMode("mapa")).toBe("mapa");
     expect(normaliseMode("codigo")).toBe("codigo");
     expect(normaliseMode("workflows")).toBe("workflows");
   });
@@ -107,11 +108,12 @@ describe("normaliseMode", () => {
 });
 
 describe("the project workspace", () => {
-  it("opens on State and offers the other two modes", async () => {
+  it("opens on State and offers the other three modes", async () => {
     await openWorkspace();
 
     expect(await screen.findByRole("link", { name: "State" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "State" }).getAttribute("aria-current")).toBe("page");
+    expect(screen.getByRole("link", { name: "Map" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "Code" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "Workflows" })).toBeTruthy();
   });
@@ -393,6 +395,33 @@ describe("the project workspace", () => {
     await openWorkspace({ mode: "workflows" });
     expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
     expect(screen.getByText("On this machine")).toBeTruthy();
+  });
+
+  /**
+   * The tab test above proves the "Map" link exists. It would not notice a typo in the render
+   * condition — `mode === "maps"` would leave that same link sitting there, clickable, over an
+   * empty page. This proves the thing the link points to is actually mounted and asking the
+   * daemon for the project's structure.
+   */
+  it("mounts the map mode and reads the project's structure", async () => {
+    const state = daemonState({
+      projects: [project({ project_id: "nucleos", mode: "shadow" })],
+    });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.endsWith("/map")) {
+        return {
+          modules: [{ path: "core/src/a.rs", reader: "rust", declares: false, tested: false }],
+          imports: [],
+          unread: [],
+        };
+      }
+      return daemonFetch(state)(path, init);
+    });
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects/nucleos/mapa" });
+
+    expect(await screen.findByText(/declaring nothing they implement/)).toBeTruthy();
   });
 });
 

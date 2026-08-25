@@ -188,7 +188,8 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                  FROM shadow_decisions
                  JOIN runs ON shadow_decisions.run_id = runs.id
                  WHERE runs.project_id = state.project_id
-                   AND shadow_decisions.human_verdict IS NULL)
+                   AND shadow_decisions.human_verdict IS NULL
+                   AND runs.mode = 'shadow')
                 +
                 (SELECT COUNT(*)
                  FROM runs
@@ -197,7 +198,12 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                 -- Same arithmetic as `wip::open_proposals`, deliberately: the flag the shell renders
                 -- and the gate the daemon enforces must not be able to disagree. Shadow decisions
                 -- count because a shadow run mints no proposal, so counting proposals alone left
-                -- the brake invisible in the mode that generates the most review work.
+                -- the brake invisible in the mode that generates the most review work. Scoped to
+                -- `runs.mode = 'shadow'`: a `worktree`-mode decision was already enforced (no
+                -- verdict left to give it) or already became a proposal the first term counts, so
+                -- an unfiltered count would either double-count or count enforced work as backlog.
+                -- Both copies of this subquery must carry the same filter, or this display number
+                -- and the number the daemon enforces (`wip::open_proposals`) would disagree.
                 (SELECT COUNT(*)
                  FROM proposals
                  WHERE proposals.project_id = state.project_id
@@ -207,7 +213,8 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                  FROM shadow_decisions
                  JOIN runs ON shadow_decisions.run_id = runs.id
                  WHERE runs.project_id = state.project_id
-                   AND shadow_decisions.human_verdict IS NULL) AS open_proposals,
+                   AND shadow_decisions.human_verdict IS NULL
+                   AND runs.mode = 'shadow') AS open_proposals,
                 state.wip_limit AS wip_limit
          FROM autopilot_state AS state
          ORDER BY state.project_id",
@@ -841,6 +848,85 @@ mod tests {
                 roster[1].queue_full
             ),
             (1, Some(3), false)
+        );
+    }
+
+    /// The roster's `open_proposals` and `wip::open_proposals` are two hand-written copies of the
+    /// same query — nothing else stops them drifting apart. Compares the two NUMBERS, not two
+    /// hardcoded literals, so a change to one copy that is not mirrored in the other fails this
+    /// test rather than silently making the shell disagree with the daemon.
+    #[tokio::test]
+    async fn o_roster_e_o_portao_contam_o_mesmo() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-a', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
+             VALUES ('action-approval', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A shadow-mode unreviewed decision: must count in both readers.
+        let shadow_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'shadow work', 'completed', 'shadow', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO shadow_decisions
+             (run_id, tool_name, decision, action_class, classifier_version, created_at)
+             VALUES (?, 'Bash', 'allow', 'read-local', 2, '2026-08-24T00:01:00Z')",
+        )
+        .bind(shadow_run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Five worktree-mode unreviewed decisions: already enforced, must count in NEITHER reader.
+        let worktree_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'worktree work', 'completed', 'worktree', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        for index in 0..5 {
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, decision, action_class, classifier_version, created_at)
+                 VALUES (?, 'Bash', 'allow', 'read-local', 2, ?)",
+            )
+            .bind(worktree_run_id)
+            .bind(format!("2026-08-24T00:0{index}:00Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let roster = project_roster(&pool).await.unwrap();
+        let gate = crate::wip::open_proposals(&pool, "project-a")
+            .await
+            .unwrap();
+
+        assert_eq!(roster.len(), 1);
+        assert_eq!(
+            roster[0].open_proposals, gate,
+            "the roster's open_proposals must never disagree with the daemon's wip gate"
+        );
+        assert_eq!(
+            gate, 2,
+            "1 pending proposal + 1 shadow decision; the 5 worktree decisions must not count"
         );
     }
 

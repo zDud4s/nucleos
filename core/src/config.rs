@@ -411,8 +411,26 @@ pub struct VoiceConfig {
     /// contains spaces, which anything installed under `C:\Program Files` needs. Empty means there is
     /// no transcriber, which is indistinguishable from the pillar being off and is treated as such.
     pub stt_command: String,
+    /// Split into program + args exactly as `stt_command` is, but the text goes on STDIN and a WAV
+    /// comes back on STDOUT — `speak.rs` explains why the two contracts differ. Empty means the
+    /// núcleo has no voice, which is a smaller loss than having no transcriber: conversation still
+    /// works, it just answers in writing.
+    pub tts_command: String,
+    /// A resident engine on loopback, e.g. `http://127.0.0.1:5017` for Piper's own HTTP server.
+    ///
+    /// **Preferred over `tts_command` when both are set**, because the difference is not marginal:
+    /// measured here, spawning costs ~2.8 s of model loading per sentence against ~0.2 s for the
+    /// resident server. `speak.rs` carries the numbers. Somebody who configured both meant the one
+    /// that works, so this wins rather than erroring — but it says so in the log, because silently
+    /// ignoring a line somebody wrote is how a config file stops being believed.
+    pub tts_url: String,
     pub hotkey: String,
     pub memo_hotkey: String,
+    /// Toggles hands-free conversation mode. A third chord and not a mode of the first, because the
+    /// two do opposite things with the same recording: dictation pastes it into whatever had focus,
+    /// conversation sends it to the agent. A single key that guessed between them would guess wrong
+    /// in the direction that types a question into a terminal.
+    pub conversation_hotkey: String,
     /// Dictations are a searchable record of everything said, in a pillar whose first requirement is
     /// privacy, so they expire. Memos do not: those are documents somebody asked for.
     pub retain_dictations_days: u8,
@@ -427,8 +445,11 @@ impl Default for VoiceConfig {
         Self {
             enabled: false,
             stt_command: String::new(),
+            tts_command: String::new(),
+            tts_url: String::new(),
             hotkey: "Ctrl+Alt+Space".to_string(),
             memo_hotkey: "Ctrl+Alt+M".to_string(),
+            conversation_hotkey: "Ctrl+Alt+C".to_string(),
             retain_dictations_days: 7,
             hints: Vec::new(),
             cleanup_prompt: DEFAULT_CLEANUP_PROMPT.to_string(),
@@ -443,6 +464,20 @@ impl VoiceConfig {
     /// have nowhere to send the audio, which presents as the feature being broken rather than absent.
     pub fn armed(&self) -> bool {
         self.enabled && !self.stt_command.trim().is_empty()
+    }
+
+    /// Whether this machine can say anything out loud.
+    ///
+    /// Deliberately NOT folded into `armed`, and the asymmetry is the design. A pillar with no
+    /// transcriber is off, because every entry point starts with a recording. A pillar with no
+    /// speaker still works: the question is heard, the agent answers, and the answer is read rather
+    /// than spoken. Collapsing the two would take a conversation away from someone who has an STT
+    /// engine and no TTS one — which is every machine on the day this ships.
+    ///
+    /// Gated on `armed` all the same: a voice with nothing to say it in response to is not a
+    /// capability, and reporting it as one would put a control in the window for a pillar that is off.
+    pub fn speaks(&self) -> bool {
+        self.armed() && (!self.tts_url.trim().is_empty() || !self.tts_command.trim().is_empty())
     }
 
     fn validated(mut self) -> Self {
@@ -667,6 +702,53 @@ pub fn load_browser_config(path: &Path) -> BrowserConfig {
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "browser config: could not be read; the pillar stays off");
             BrowserConfig::default()
+        }
+    }
+}
+
+/// `.ai/telegram.yaml`. Per-developer, gitignored, and read for exactly one thing: the standing
+/// doctrine a Telegram turn falls back on when the chat itself gave no instructions.
+///
+/// Ships with no field this widens into a capability, unlike `GithubConfig` below — the whole
+/// content is a paragraph of text that becomes `append_system_prompt` when nothing else would have.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    /// The standing instructions a Telegram turn is launched with when the chat has none of its
+    /// own. `None` — absent, blank, or whitespace-only — means every turn is launched exactly as it
+    /// was before this file existed: see `chats.rs`'s identical treatment of a blank `instructions`
+    /// column.
+    #[serde(default, deserialize_with = "deserialize_blank_as_none")]
+    pub doctrine: Option<String>,
+}
+
+/// A blank or whitespace-only string reads as `None`, mirroring `chats.rs`'s
+/// `instructions.filter(|text| !text.trim().is_empty())` for the same reason: a doctrine of empty
+/// spaces would spend an argv slot saying nothing.
+fn deserialize_blank_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|text| !text.trim().is_empty()))
+}
+
+/// Reads `.ai/telegram.yaml`. Absent, unreadable or malformed → default (`doctrine: None`), with a
+/// warning — the same asymmetry `load_web_config` and `load_browser_config` both take: a typo in a
+/// per-developer file must cost fidelity (no doctrine prepended) and never stop the daemon, and
+/// never invent a doctrine nobody wrote.
+pub fn load_telegram_config(path: &Path) -> TelegramConfig {
+    if !path.exists() {
+        return TelegramConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<TelegramConfig>(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "telegram config: could not be parsed; every turn is launched exactly as before");
+            TelegramConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "telegram config: could not be read; every turn is launched exactly as before");
+            TelegramConfig::default()
         }
     }
 }
@@ -2436,5 +2518,22 @@ local_assistant_model: qwen3.5:4b
         assert_eq!(rules.repo_triggers[0].name, "review-main");
         assert_eq!(rules.repo_triggers[0].branch, "main");
         assert_eq!(rules.repo_triggers[0].prompt, "review new commits on main");
+    }
+
+    /// Absent, unreadable or malformed → defaults, the same asymmetry `load_web_config` and
+    /// `load_browser_config` both take: a typo in a per-developer YAML must cost fidelity (no
+    /// doctrine to prepend) and never stop the daemon, and never invent a doctrine nobody wrote.
+    #[test]
+    fn um_telegram_yaml_malformado_cai_no_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telegram.yaml");
+        std::fs::write(&path, "doctrine: [this is not a string\n").unwrap();
+
+        let config = load_telegram_config(&path);
+
+        assert_eq!(
+            config.doctrine, None,
+            "a malformed telegram.yaml must fall back to the default, not invent a doctrine"
+        );
     }
 }

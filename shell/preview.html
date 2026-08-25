@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>NucleOS — preview</title>
+    <!-- The same nonce channel `index.html` carries; see src/lib/style-nonce.ts. -->
+    <style></style>
+  </head>
+
+  <!--
+    A third entry, built by `preview.vite.config.mjs` into `dist-preview/` and never by the app's
+    own build: `dist/` is embedded into the Tauri binary at compile time and must hold the app and
+    nothing else. Nothing in `src/` imports anything under `src/preview/`, so none of this reaches
+    the shipped bundle either.
+
+    This is scaffolding for looking at pages, not a deliverable. It is uncommitted on purpose.
+  -->
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/preview/main.tsx"></script>
+  </body>
+</html>

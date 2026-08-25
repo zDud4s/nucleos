@@ -1,13 +1,15 @@
 /**
  * The Teams slice: `/teams`, `/teams/$teamId` and `/team-runs/$runId`,
  * `teams-` throughout — as `runs-` is shared by `Runs.tsx` and `RunDetail.tsx`,
- * this prefix is shared by `Teams.tsx` and `TeamRunDetail.tsx`.
+ * this prefix is shared by the console (`pages/Teams.tsx`), the bench
+ * (`team/*.tsx`) and `pages/TeamRunDetail.tsx`.
  *
  * The rule this file lives under: **no class appears in a `.tsx` that this
  * file does not define.** `tsc` and vitest both pass happily on a class no
  * stylesheet has ever heard of, and the defect shows up only as something
  * looking wrong on a screen nobody is testing. Grep every `teams-*` class in
- * both pages against this file before calling the slice done.
+ * `pages/Teams.tsx`, `pages/TeamRunDetail.tsx` and everything under `team/`
+ * against this file before calling the slice done.
  */
 
 /* ================================================================ shared == */
@@ -26,100 +28,404 @@
   color: var(--text-faint);
 }
 
-/* ================================================================== list == */
+/* =============================================================== console == */
 
-.teams-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.teams-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+/**
+ * In flight — everything running now, above the table.
+ *
+ * This block used to sit inside a department's card, and only when that
+ * department had something running. Every card below it then started at a
+ * different height, which is why six cards read as six documents rather than
+ * one list. Lifted out, the table below can align because every row has the
+ * same rows in it.
+ */
+.teams-flight {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-4);
+  border: 1px solid var(--tone-active-border);
+  border-radius: var(--radius-lg);
   background: var(--surface);
 }
 
-.teams-row-open {
-  border-color: var(--accent);
+.teams-flight-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
-.teams-name {
-  font-family: var(--font-display);
+.teams-flight-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--tone-active-fg);
+}
+
+.teams-flight-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/**
+ * The departments, one per row.
+ *
+ * Its own scroller, like the matrix below it: seven columns slide inside this
+ * box rather than making the whole document — and the rail with it — move
+ * sideways.
+ */
+.teams-table-scroller {
+  margin: var(--space-4) 0 0;
+  overflow-x: auto;
+}
+
+.teams-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.teams-table thead th {
+  padding: 0 var(--space-3) var(--space-2);
+  border-bottom: 1px solid var(--border-strong);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--text-faint);
+}
+
+.teams-table tbody th,
+.teams-table tbody td {
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.teams-table tbody tr:hover {
+  background: var(--surface);
+}
+
+/*
+  The row header: the department, and what it is for. Both lines always, so the
+  next row starts at the same height on every row — see the note on the strip.
+*/
+.teams-row-name {
+  min-width: 14rem;
+  max-width: 24rem;
+  font-weight: 400;
+}
+
+.teams-row-name a {
   font-size: var(--text-base);
-  font-weight: var(--weight-semibold);
+  font-weight: 600;
+}
+
+/*
+  One line, whatever the remit's length. A department with a paragraph in it
+  would otherwise set the height of every column beside it — which is the defect
+  the cards had, in miniature.
+*/
+.teams-row-remit {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  overflow: hidden;
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.teams-row-unwritten {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Figures line up under each other, which is the whole reason this is a table. */
+.teams-col-num {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.teams-figure {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
   color: var(--text);
 }
 
-.teams-mission {
+.teams-figure-of {
+  color: var(--text-faint);
+}
+
+/* At the ceiling. `1 / 1` and `0 / 1` are one glyph apart and are not the same news. */
+.teams-figure-full {
+  color: var(--tone-pending-fg);
+}
+
+/* Nobody on the roster — not a low number, a department that cannot start a task. */
+.teams-figure-none {
+  color: var(--tone-danger-fg);
+}
+
+/*
+  What it does without you: three powers and, when there is one, an armed
+  routine. Marks rather than boxes — the bordered pills these replaced were the
+  same shape as a specialist, a ceiling and a state, so no pill could be told
+  from another without reading it.
+*/
+.teams-alone {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
   margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.teams-alone-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+}
+
+/* Does it on its own. The only one at full strength — that is the news. */
+.teams-alone-allow {
+  color: var(--text);
+}
+
+/* Drafts it and waits for you. */
+.teams-alone-propose {
   color: var(--text-muted);
+}
+
+/* Cannot act: it asks. Absence of a grant row IS the denial — see the module header. */
+.teams-alone-none {
+  color: var(--text-faint);
+}
+
+/* A mode this shell does not know. Marked, never quietly folded into "asks you". */
+.teams-alone-unmapped {
+  color: var(--tone-info-fg);
+}
+
+/* A clock, not a power — hence a diamond and not a disc. */
+.teams-alone-rule {
+  color: var(--text-faint);
+}
+
+.teams-alone-armed {
+  color: var(--tone-active-fg);
+}
+
+/*
+  Wide enough for the chart it holds, padding included.
+  
+  Two mistakes were made here in a row and both cost bars. `width: 1%` squeezes
+  the cell to the narrowest thing in it and an svg contributes no minimum, so
+  the column collapsed to 38px and a department with three days drew nothing.
+  Then `width: 96px` under `box-sizing: border-box` left a 72px content box for
+  a 96px svg, and the newest bar — the one in the accent, the one the chart is
+  answering "and now?" with — spilled past the cell and was clipped by the
+  scroller. The chart is 96 and the padding is `--space-3` twice: 120.
+*/
+.teams-row-pulse {
+  width: 120px;
+  min-width: 120px;
+}
+
+/*
+  A mark's meaning in words, for anything that does not render. `.ui-who-said`
+  and `.ui-spark-label-said` are the same treatment; there is no shared class
+  in this app, and each stylesheet carries its own.
+*/
+.teams-said,
+.teams-matrix-said {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ========================================================= charter bits == */
+
+/*
+  Three rules the console used to share, kept because the Charter still lays out
+  a roster, a section label and a row of ceilings. Renamed off `teams-card-*`
+  when the cards went: a class naming a component that no longer exists is how
+  the next person goes looking for one.
+*/
+.teams-charter-label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.teams-charter-people {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* The per-task ceilings. Text now, not chips — the run reads as a sentence. */
+.teams-charter-limits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+
+/* ============================================================== live task == */
+
+.teams-task {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-active-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.teams-task-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
   overflow-wrap: anywhere;
 }
 
-.teams-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
+/*
+  Which department is running this. In the strip every task needs it — the
+  card it used to live in said so by containing it, and nothing contains it
+  now.
+*/
+.teams-task-dept {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/*
+  A run whose department is not in `GET /teams` — deleted while it ran. Drawn,
+  not dropped: a running task nobody can attribute is worth seeing more, not
+  less.
+*/
+.teams-task-orphan {
+  color: var(--tone-danger-fg);
+  font-style: italic;
+}
+
+.teams-task-what {
+  flex: 1 1 18rem;
+}
+
+.teams-task-when {
+  margin: 0;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
-.teams-ceilings {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+/* ================================================================ matrix == */
+
+/**
+ * Who works where. Its own scroller: a wide table scrolls inside its box, and
+ * the page body never slides sideways and takes the rail with it.
+ */
+.teams-matrix-scroll {
+  overflow-x: auto;
+  margin: 0 calc(var(--space-1) * -1);
+  padding: 0 var(--space-1);
 }
 
-.teams-ceiling {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  font-family: var(--font-mono);
+.teams-matrix {
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+.teams-matrix-caption {
+  margin-bottom: var(--space-3);
+  text-align: left;
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
-/* ================================================================ detail == */
-
-.teams-detail {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
+.teams-matrix-corner {
+  text-align: left;
 }
 
-.teams-roster {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+.teams-matrix-col {
+  padding: 0 var(--space-2) var(--space-2);
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  color: var(--text-muted);
 }
 
-.teams-member {
+.teams-matrix-row {
+  padding: var(--space-1) var(--space-3) var(--space-1) 0;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-weight: var(--weight-regular);
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.teams-matrix-cell,
+.teams-matrix-count {
   padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  background: var(--surface-sunken);
+  text-align: center;
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The director. Accent is identity here, exactly as it is on `.ui-who-leads`. */
+.teams-matrix-leads {
+  color: var(--accent);
+}
+
+.teams-matrix-staff {
   color: var(--text);
+}
+
+/* Not on staff. Quiet enough that the filled cells are the shape you see. */
+.teams-matrix-none {
+  color: var(--border-strong);
+}
+
+.teams-matrix-count {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
 }
 
 /* ================================================================ grants == */
@@ -251,6 +557,46 @@
   line-height: var(--leading-snug);
 }
 
+/**
+ * A placeholder is a hint, not content.
+ *
+ * `base.css` sets `color: inherit` on every control, which a placeholder
+ * inherits too — so the composer's hint rendered at full text weight and read
+ * as a request somebody had already typed.
+ */
+.teams-input::placeholder,
+.teams-textarea::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+/**
+ * A `select` with `multiple` is a listbox, and Chromium paints its interior
+ * from the UA sheet unless the appearance is given up. Left alone it is a light
+ * grey panel with light inherited text in the middle of a dark form — the same
+ * failure the tabs had, from the same cause: `base.css` resets `font` and
+ * `color` on controls and never `background`.
+ */
+.teams-select[multiple] {
+  appearance: none;
+  min-height: 7rem;
+  padding: var(--space-1);
+  background: var(--surface-sunken);
+  color: var(--text);
+}
+
+.teams-select[multiple] option {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+}
+
+.teams-select[multiple] option:checked {
+  background: var(--accent-quiet);
+  color: var(--text);
+}
+
 .teams-input:focus-visible,
 .teams-select:focus-visible,
 .teams-textarea:focus-visible {
@@ -293,14 +639,6 @@
   gap: var(--space-2);
 }
 
-.teams-run-request {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
 .teams-run-why {
   margin: 0;
   font-size: var(--text-xs);
@@ -312,6 +650,409 @@
   margin: var(--space-3) 0 0;
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+
+/* ================================================================= bench == */
+
+/**
+ * `/teams/$teamId` — one department, with the page to itself.
+ *
+ * No `PageHeader` here: the bench's own head carries a name, a derived state
+ * and the one destructive control, and the shared header has no slot for the
+ * middle one. The breadcrumb above it is what makes this a place you came
+ * *into* rather than a page that replaced the console.
+ */
+.teams-crumb {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.teams-bench-head {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-2) var(--space-4);
+  padding-bottom: var(--space-4);
+  margin-bottom: var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.teams-bench-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.teams-bench-name {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.015em;
+  overflow-wrap: anywhere;
+}
+
+.teams-bench-remit {
+  grid-column: 1;
+  margin: 0;
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.teams-bench-aside {
+  grid-row: 1 / 3;
+  grid-column: 2;
+  align-self: start;
+}
+
+/* The tabs themselves are Radix through `ui/vendor/tabs.tsx` and carry their
+   own utility classes; this only gives the group room to breathe. */
+.teams-bench-tabs {
+  margin-top: var(--space-4);
+}
+
+/* ================================================================== work == */
+
+.teams-work,
+.teams-routines {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/**
+ * One line that grows when you mean it — it replaced a three-row textarea that
+ * stood permanently open on a page you had come to read.
+ */
+.teams-composer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.teams-composer-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.teams-composer-grown {
+  border-color: var(--border-strong);
+}
+
+/* =============================================================== rounds == */
+
+/**
+ * The bench's half of the handoff contract: which round, and who is on it.
+ * Everything below this — the graph, the files, the actions one by one — is the
+ * task page's.
+ */
+.teams-rounds {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.teams-round-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.teams-round-no {
+  flex: none;
+  width: 5rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.teams-round-who {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.teams-round-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.teams-round-mark {
+  color: var(--text-faint);
+}
+
+.teams-round-done {
+  border-color: var(--tone-active-border);
+  color: var(--tone-active-fg);
+}
+
+.teams-round-working {
+  border-color: var(--tone-active-border);
+  background: var(--tone-active-bg);
+  color: var(--tone-active-fg);
+}
+
+.teams-round-failed {
+  border-color: var(--tone-danger-border);
+  color: var(--tone-danger-fg);
+}
+
+.teams-round-skipped {
+  border-style: dashed;
+  color: var(--text-faint);
+}
+
+/* A planned item has no tone of its own: not started is the resting state. */
+.teams-round-planned {
+  border-style: dashed;
+}
+
+/* ============================================================== routines == */
+
+.teams-rule-source,
+.teams-rule-zone {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.teams-rule-cron {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.teams-rule-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+/* ============================================================ decisions == */
+
+.teams-decisions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.teams-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+/* The director's own sentence — a quotation, because it is what a person
+   actually reads before answering, not a field of the payload. */
+.teams-act-why {
+  margin: 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border-strong);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.teams-act-field-name {
+  flex: none;
+  width: 5rem;
+  color: var(--text-faint);
+}
+
+.teams-act-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+.teams-act-outcome {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--tone-active-fg);
+}
+
+/* The six editable fields of a recruitment — the one proposal in the house
+   that can be corrected at the moment of deciding. */
+.teams-hire {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+/* =============================================================== charter == */
+
+.teams-charter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  /* Room under the last section for the sticky bar to sit over. */
+  padding-bottom: var(--space-8);
+}
+
+/**
+ * A section is its explanation and its fields side by side, because the
+ * explanation is what makes the field answerable — "max open actions" means
+ * nothing until you know the ceiling is your attention.
+ */
+.teams-section {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(0, 2fr);
+  gap: var(--space-4);
+}
+
+@media (max-width: 60rem) {
+  .teams-section {
+    grid-template-columns: 1fr;
+  }
+}
+
+.teams-section-note {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.teams-section-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.teams-charter-limits {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--space-3);
+  align-items: end;
+}
+
+/**
+ * The save bar, visible only when there is something to save.
+ *
+ * A bar that is always there stops being a signal that anything changed, which
+ * is the whole reason it is conditional rather than merely disabled.
+ */
+.teams-savebar {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+}
+
+.teams-savebar-said {
+  margin: 0;
+  margin-right: auto;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* ================================================================ drift == */
+
+/**
+ * Somebody else changed this while the form was open.
+ *
+ * Warm rather than red: nothing is broken and nothing failed — a decision is
+ * being asked for, and `paused` is the tone this app uses for "held by a rule".
+ * Not a modal: deciding needs to see what is in the form behind it.
+ */
+.teams-drift {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-lg);
+  background: var(--tone-paused-bg);
+}
+
+.teams-drift-said {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+}
+
+.teams-drift-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.teams-drift-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+}
+
+.teams-drift-field {
+  flex: none;
+  width: 8rem;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.teams-drift-was,
+.teams-drift-now {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.teams-drift-was {
+  color: var(--text-muted);
+}
+
+.teams-drift-now {
+  color: var(--tone-paused-fg);
 }
 
 /* ============================================================= run detail == */

@@ -27,7 +27,8 @@ function row(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     thought: [],
     thought_tokens: null,
     context_fill: null,
-    context_rotates_at: 140000,
+    context_window: 140000,
+    compacted: false,
     ...overrides,
   };
 }
@@ -41,12 +42,14 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     cost_usd: null,
     answeredBy: null,
     sessionId: null,
+    createdAt: "2026-08-18T09:00:00Z",
     did: [],
     images: [],
     thought: [],
     thoughtTokens: null,
     contextFill: null,
-    rotatesAt: 140000,
+    window: 140000,
+    compacted: false,
     ...overrides,
   };
 }
@@ -221,6 +224,23 @@ describe("marksBetween", () => {
       { kind: "brain", from: "cloud", to: "local" },
       { kind: "restart" },
     ]);
+  });
+
+  it("marks the turn the context was summarised in", () => {
+    // Against the turn itself and not the pair: the CLI decides to summarise before it answers, so
+    // this IS the turn it happened in, and the session either side of it is the same one.
+    const previous = turn({ id: 1, sessionId: "s-1" });
+    const next = turn({ id: 2, sessionId: "s-1", compacted: true });
+    expect(marksBetween(previous, next, null)).toEqual([{ kind: "compacted" }]);
+  });
+
+  it("says restarted rather than summarised when the session changed too", () => {
+    // Both describe what happened to the model's memory here, and only one thing happened. A
+    // restart is the larger claim — nothing older survives — so it is the one drawn; a summary
+    // note under a turn that actually began blank would understate it.
+    const previous = turn({ id: 1, sessionId: "s-1" });
+    const next = turn({ id: 2, sessionId: "s-2", compacted: true });
+    expect(marksBetween(previous, next, null)).toEqual([{ kind: "restart" }]);
   });
 });
 

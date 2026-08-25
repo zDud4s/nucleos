@@ -91,6 +91,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/detect", get(get_project_detect))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
+        .route("/projects/{id}/map", get(get_project_map))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -345,6 +346,14 @@ pub fn build_router(state: AppState) -> Router {
             post(post_fresh_context),
         )
         .route("/assistant/chats/{chat_id}/clear", post(post_clear_context))
+        // What one turn's tools actually answered. Its own route, and a segment deeper than the
+        // turn, because the answers are large and the transcript is polled: see `ToolCall::result`
+        // for why they are stripped from the turn list and fetched only when somebody opens one.
+        .route("/assistant/turns/{turn_id}/tools", get(get_turn_tools))
+        // Finding a sentence rather than a conversation. The window's own palette matches titles,
+        // which is the right first answer and a useless second one: what people come back for is
+        // something that was SAID, and a title is a summary written by a model.
+        .route("/assistant/search", get(search_assistant))
         .route("/assistant/{turn_id}", get(get_run))
         // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
         // the two cannot shadow each other whatever a turn id looks like.
@@ -519,6 +528,13 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::browser::get_writes),
         )
         .route("/voice/config", get(crate::voice::get_config))
+        // One unit of a turn's answer, as audio. Indexed rather than streamed, because the repo's
+        // live-turn transport is a poll over a tail buffer and a second transport for the same job
+        // would be a second thing to keep correct. Sentences arrive seconds apart; poll is enough.
+        .route(
+            "/voice/turns/{turn_id}/speech/{index}",
+            get(crate::voice::get_turn_speech),
+        )
         .route("/voice/memos", get(crate::voice::list_memos))
         // Read by hand for prompt tuning, not by the shell — see voice.rs's `list_dictations`.
         .route("/voice/dictations", get(crate::voice::list_dictations))
@@ -2836,6 +2852,34 @@ async fn get_project_readings(
         })
 }
 
+/// The project's structure layer: what modules there are, and what they import.
+///
+/// Derived on every request and never stored — decision 1 of the spec. It goes to disk, so it
+/// runs on `spawn_blocking` the way `blame` and `grep` already do: walking a thousand-file
+/// tree on the async executor blocks the whole daemon for a good few milliseconds, and this
+/// daemon is also answering a three-second poll.
+async fn get_project_map(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::project_map::Structure>, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+    tokio::task::spawn_blocking(move || crate::project_map::structure(&root))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(|error| {
+            // A folder that has been renamed or deleted is something its owner did, not a
+            // fault of this daemon — and `ls`, `cat`, `grep` and `blame` already answer 404
+            // for the very same `read_dir`. Answering 500 would put a warning in the log for
+            // an ordinary Tuesday.
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return StatusCode::NOT_FOUND;
+            }
+            tracing::warn!(%error, project_id = %id, "project map failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 /// Who last touched each line of a file, in the project or in one run's worktree.
 async fn get_project_blame(
     State(state): State<AppState>,
@@ -4881,10 +4925,14 @@ struct AssistantTurn {
     /// The CLI session this turn ran in.
     ///
     /// Travels to the window so it can say where the conversation RESTARTED. `get_session` refuses
-    /// to resume past 140k tokens of context and past anything that read third-party text, and the
-    /// next turn then mints a fresh id — so a change here is the moment the model stopped
-    /// remembering what came before it. Without it, that happens and the transcript above and below
-    /// looks like one unbroken conversation, which is the one thing it is not.
+    /// to resume a session that read third-party text, and `POST /fresh-context` drops one on
+    /// request; the next turn then mints a fresh id — so a change here is the moment the model
+    /// stopped remembering what came before it. Without it, that happens and the transcript above
+    /// and below looks like one unbroken conversation, which is the one thing it is not.
+    ///
+    /// It used to change on SIZE as well, which made this the ordinary fate of any long
+    /// conversation. It is now the rare one: a full context is compacted, and `compacted` below is
+    /// what says so.
     session_id: Option<String>,
     created_at: String,
     /// How much context this turn ran with, as an absolute token count. Null on a turn whose stream
@@ -4906,6 +4954,13 @@ struct AssistantTurn {
     /// Roughly how many tokens the turn spent thinking, or null when it did not think and on every
     /// turn from before the column. Serialized as it stands: it is a number, not a private shape.
     thought_tokens: Option<i64>,
+    /// Whether the CLI summarised its own context while producing this turn.
+    ///
+    /// This is what replaced the restart mark for the ordinary case. A conversation no longer
+    /// changes session when it fills up — it is compacted in place — so the fact the window has
+    /// to draw moved from `session_id` to here, and it says a milder and truer thing: the older
+    /// exchanges were summarised at this point, not forgotten at this point.
+    compacted: bool,
 }
 
 /// One turn as the window receives it: the row, plus what the turn did.
@@ -4930,12 +4985,17 @@ struct AssistantTurnOut {
     /// are different facts and the row keeps them apart, but a window cannot act on the difference:
     /// either way there is nothing to draw.
     thought: Vec<String>,
-    /// The token count past which this daemon stops resuming and mints a fresh session.
+    /// The context window this conversation runs in, in tokens.
     ///
-    /// The same number on every row, because it is a property of the daemon and not of the turn.
-    /// It rides here so the window never keeps its own copy of a rule this side owns: a constant
-    /// duplicated across two codebases is one that drifts silently the day one of them changes it.
-    context_rotates_at: i64,
+    /// It used to be `context_rotates_at`: the count past which the daemon stopped resuming and
+    /// minted a fresh session. Nothing rotates now — the CLI compacts inside the session — so the
+    /// number means the window rather than the cliff, and the name had to move with it.
+    ///
+    /// The same on every row of one conversation and NOT the same across conversations, which is
+    /// why it still rides here rather than being a constant the window keeps its own copy of: a
+    /// chat picked up from the editor runs in a wider window than the default, and a meter drawn
+    /// against the default would be wrong for exactly the conversations nearest their limit.
+    context_window: i64,
 }
 
 /// A conversation as it is read back: its turns, and whatever it was handed before the first one.
@@ -4966,6 +5026,26 @@ struct TranscriptOut {
     /// turn is live, which is exactly when a question can appear — a route of its own would need a
     /// second poll at the same speed to say "nothing" almost every time.
     asks: Vec<crate::hooks::Ask>,
+    /// Whether there are turns older than the oldest one in `turns`.
+    ///
+    /// A conversation is read from its recent end and cut at `ASSISTANT_TRANSCRIPT_LIMIT`, and
+    /// until this existed the cut was silent: the hundred-and-first turn simply was not there, and
+    /// nothing on the page distinguished a conversation that started where you were looking from
+    /// one whose first afternoon had been dropped off the top. This is what lets the window offer
+    /// to go and get the rest.
+    more: bool,
+}
+
+/// Which slice of a conversation to read back.
+#[derive(serde::Deserialize)]
+struct TranscriptQuery {
+    /// Read the turns immediately BEFORE this one, rather than the most recent.
+    ///
+    /// Absent is the ordinary case and means the recent end. A page walks backwards by handing
+    /// back the id of the oldest turn it has, which is stable in a way an offset is not: turns are
+    /// only ever appended, so an offset from the end shifts under a conversation that answers
+    /// while somebody is reading it and a page boundary would repeat or skip a turn.
+    before: Option<i64>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -5348,30 +5428,51 @@ async fn get_chat_files(
 async fn get_assistant_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
 ) -> Result<Json<TranscriptOut>, StatusCode> {
+    // `?` on a missing bound reads as no bound: `i64::MAX` is above every id this table will ever
+    // hold, so one query serves both the recent end and a page above it. Two queries differing by
+    // a single clause is how the two come to disagree about ordering.
+    let before = query.before.unwrap_or(i64::MAX);
+    // One more than asked for, and it is never returned. Whether there is anything above this page
+    // is a question about the row after the last one, and asking for it here answers it for the
+    // price of a row rather than with a second COUNT over the same index.
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
                 answered_by, session_id, created_at, context_fill, tools_used, thought,
-                thought_tokens, prompt_images
+                thought_tokens, prompt_images, compacted
            FROM runs
-          WHERE chat_id = ? AND mode = 'assistant'
+          WHERE chat_id = ? AND mode = 'assistant' AND id < ?
           ORDER BY id DESC
           LIMIT ?",
     )
     .bind(&chat_id)
-    .bind(ASSISTANT_TRANSCRIPT_LIMIT)
+    .bind(before)
+    .bind(ASSISTANT_TRANSCRIPT_LIMIT + 1)
     .fetch_all(&state.pool)
     .await
     .map_err(|error| {
         tracing::warn!(%error, "reading an assistant chat failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    let more = turns.len() as i64 > ASSISTANT_TRANSCRIPT_LIMIT;
+    turns.truncate(ASSISTANT_TRANSCRIPT_LIMIT as usize);
     turns.reverse();
     // Read through `assistant::handed_over` rather than parsed here: that function is already the
     // one reader of the column's shape, and a second one is a second thing to change the day the
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
     // every ordinary conversation.
     let handed = crate::assistant::handed_over(&state.pool, &chat_id).await;
+    // Read once for the whole transcript rather than per turn: it is a property of the
+    // conversation, and forty rows asking the same question of the same row is thirty-nine
+    // round trips nobody needs. A failure reads as the default, which is what every conversation
+    // that never touched this column runs in anyway.
+    let context_window = crate::assistant::window_of(
+        crate::chats::answering(&state.pool, &chat_id)
+            .await
+            .map(|answering| answering.context_window)
+            .unwrap_or_default(),
+    );
     // Empty on a failure rather than a 500: the transcript is the point of this request, and a
     // conversation nobody can read because its queue would not load is a worse answer than one
     // drawn without a note about what is waiting.
@@ -5382,14 +5483,23 @@ async fn get_assistant_chat(
         handed,
         queued,
         asks: crate::hooks::asks_for(&chat_id),
+        more,
         turns: turns
             .into_iter()
             .map(|turn| {
-                let did = turn
+                // Without their answers. See `ToolCall::result`: this list rides a route that is
+                // polled once a second while a turn is live, and the answers are fetched per turn
+                // by `get_turn_tools` when somebody actually opens one.
+                let did: Vec<crate::runner::ToolCall> = turn
                     .tools_used
                     .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok())
-                    .unwrap_or_default();
+                    .and_then(|json| {
+                        serde_json::from_str::<Vec<crate::runner::ToolCall>>(json).ok()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(crate::runner::ToolCall::without_result)
+                    .collect();
                 let thought = turn
                     .thought
                     .as_deref()
@@ -5405,11 +5515,238 @@ async fn get_assistant_chat(
                     did,
                     images,
                     thought,
-                    context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+                    context_window,
                 }
             })
             .collect(),
     }))
+}
+
+/// What one turn's tools answered.
+///
+/// A route of its own rather than a wider transcript, and the reason is arithmetic. The
+/// transcript is polled at a live turn's cadence — about once a second while something is
+/// running — and a tool answer is capped at two thousand characters. Twenty calls in a turn and a
+/// hundred turns in a conversation is four megabytes on the wire every second, paid forever, for
+/// something almost nobody has open. So `get_assistant_chat` strips the answers and this hands
+/// them over for one turn, when somebody asks.
+///
+/// `404` for a turn that is not an assistant turn of this daemon's: a job's run id must not open a
+/// door into the chat transcript by guessing a number.
+async fn get_turn_tools(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<Json<TurnToolsOut>, StatusCode> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT tools_used FROM runs WHERE id = ? AND mode = 'assistant'")
+            .bind(turn_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, turn_id, "reading a turn's tools failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    let Some(tools_used) = stored else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    // A column that will not parse reads as an empty list, exactly as the transcript treats it: a
+    // turn recorded before the column existed acted on nothing as far as anything here can tell,
+    // and that is a true statement about what is known rather than an error.
+    Ok(Json(TurnToolsOut {
+        did: tools_used
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default(),
+    }))
+}
+
+#[derive(serde::Serialize)]
+struct TurnToolsOut {
+    /// Every tool the turn ran, oldest first, WITH what each one answered. See `ToolCall::result`.
+    did: Vec<crate::runner::ToolCall>,
+}
+
+/// How many hits a search comes back with.
+///
+/// Small on purpose. This answers "where did we talk about that", and a person scanning for the
+/// conversation they half remember reads the first few and refines the words if none of them is
+/// it. Two hundred hits is not a better answer to that question; it is the same answer with the
+/// useful part further down.
+const SEARCH_HITS: i64 = 40;
+
+/// The longest search acted on. Longer than this is a paste, not a search.
+const SEARCH_QUERY_MAX: usize = 200;
+
+/// How much of the line around a hit comes back, in characters either side of it.
+const EXCERPT_BEFORE: usize = 60;
+const EXCERPT_AFTER: usize = 140;
+
+#[derive(serde::Deserialize)]
+struct AssistantSearchQuery {
+    q: String,
+}
+
+/// One thing that was said, and where.
+#[derive(serde::Serialize)]
+struct SearchHit {
+    chat_id: String,
+    /// What the conversation is called, or null when nothing has named it.
+    title: Option<String>,
+    /// The turn it was said in, so the window can scroll to it rather than merely open the chat.
+    turn_id: i64,
+    /// `asked` or `answered`: which half of the exchange matched.
+    ///
+    /// Worth saying, because the two are found for different reasons. Somebody looking for
+    /// something they asked is retracing their own steps; somebody looking for something the model
+    /// said is looking for an answer they were given. A list that merged the two would make the
+    /// second kind hunt through the first.
+    side: &'static str,
+    /// The words around the hit, with an ellipsis on whichever side was cut.
+    excerpt: String,
+    created_at: String,
+}
+
+/// One matched row, before it is read into a hit.
+#[derive(sqlx::FromRow)]
+struct SearchRow {
+    chat_id: String,
+    title: Option<String>,
+    turn_id: i64,
+    asked: String,
+    answered: Option<String>,
+    created_at: String,
+}
+
+/// Something that was SAID, across every conversation this app is holding.
+///
+/// The window's palette matches titles, which is the right first answer and a useless second one:
+/// a title is a summary a model wrote, and what somebody comes back for is a sentence — the name
+/// of a function, the error they pasted, the decision they want to quote.
+///
+/// Archived conversations are left out, for the same reason `chats::list` leaves them out: this
+/// answers "which of my conversations", and archiving one is saying it is not among them.
+///
+/// Case is folded the way SQLite folds it, which is ASCII only — `Parser` finds `parser`, and `Ç`
+/// does not find `ç`. Deliberately not worked around here: the excerpt below matches the same way
+/// the query does, so what is highlighted is always what was actually found. A search that folded
+/// more than the query did would point at a word the query never matched.
+async fn search_assistant(
+    State(state): State<AppState>,
+    Query(query): Query<AssistantSearchQuery>,
+) -> Json<Vec<SearchHit>> {
+    let needle = query.q.trim();
+    // Nothing, rather than every turn in the database. An empty search is a box somebody has not
+    // finished typing in, and `%%` matches all of it.
+    if needle.is_empty() || needle.chars().count() > SEARCH_QUERY_MAX {
+        return Json(Vec::new());
+    }
+    let pattern = like_pattern(needle);
+    let rows = sqlx::query_as::<_, SearchRow>(
+        "SELECT r.chat_id AS chat_id, c.title AS title, r.id AS turn_id,
+                r.prompt AS asked, r.stdout AS answered, r.created_at AS created_at
+           FROM runs r
+           JOIN chats c ON c.chat_id = r.chat_id
+          WHERE r.mode = 'assistant'
+            AND c.archived_at IS NULL
+            AND (r.prompt LIKE ?1 ESCAPE '\\' OR r.stdout LIKE ?1 ESCAPE '\\')
+          ORDER BY r.id DESC
+          LIMIT ?2",
+    )
+    .bind(&pattern)
+    .bind(SEARCH_HITS)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_else(|error| {
+        // Nothing found rather than a 500. A search that cannot run is a search with no results
+        // from where the person is standing, and a page that refuses to draw because a LIKE went
+        // wrong loses them the conversation they still have open.
+        tracing::warn!(%error, "searching the conversations failed");
+        Vec::new()
+    });
+
+    Json(
+        rows.into_iter()
+            .map(|row| {
+                // The question first when it matched, because that is the half a person owns. Only
+                // one hit per turn either way: a turn where both halves mention the word is one
+                // exchange, and two rows for it would push a different conversation off the list.
+                let (side, text) = if find_ascii_ci(&chars(&row.asked), &chars(needle)).is_some() {
+                    ("asked", row.asked.as_str())
+                } else {
+                    ("answered", row.answered.as_deref().unwrap_or(""))
+                };
+                SearchHit {
+                    chat_id: row.chat_id,
+                    title: row.title,
+                    turn_id: row.turn_id,
+                    side,
+                    excerpt: excerpt_of(text, needle),
+                    created_at: row.created_at,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// A `LIKE` pattern that matches this text and nothing cleverer.
+///
+/// `%` and `_` are wildcards in `LIKE`, so a search for `budget_usd` would otherwise match
+/// `budgetXusd` — and, worse, a search for `%` would match every turn ever recorded. Escaped, with
+/// the escape character escaped first.
+fn like_pattern(text: &str) -> String {
+    let mut out = String::from("%");
+    for ch in text.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
+}
+
+fn chars(text: &str) -> Vec<char> {
+    text.chars().collect()
+}
+
+/// Where `pin` first occurs in `hay`, folding case the way SQLite's `LIKE` does — ASCII only.
+///
+/// Deliberately the same folding as the query, so the excerpt always contains the thing that was
+/// matched. See `search_assistant`.
+fn find_ascii_ci(hay: &[char], pin: &[char]) -> Option<usize> {
+    if pin.is_empty() || pin.len() > hay.len() {
+        return None;
+    }
+    hay.windows(pin.len()).position(|window| {
+        window
+            .iter()
+            .zip(pin)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// The words around a hit, with an ellipsis on whichever side was cut.
+///
+/// Around it and not from the top: a match nine hundred characters into an answer is not visible
+/// in the first line of that answer, and a list of first lines is a list that does not show what
+/// it found. Falls back to the head of the text when the hit cannot be located — which is only
+/// reachable if the query and this disagree about folding, and the head of the text is at least
+/// true.
+fn excerpt_of(text: &str, needle: &str) -> String {
+    let hay = chars(text);
+    let pin = chars(needle);
+    let at = find_ascii_ci(&hay, &pin).unwrap_or(0);
+    let start = at.saturating_sub(EXCERPT_BEFORE);
+    let end = (at + pin.len() + EXCERPT_AFTER).min(hay.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(hay[start..end].iter());
+    if end < hay.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// A turn while it is still being written: what has been said, and what is being done.
@@ -5634,23 +5971,28 @@ async fn read_ide_session(
         .map(|conversation| {
             Json(IdeConversationOut {
                 conversation,
-                context_rotates_at: crate::assistant::CONTEXT_ROTATION_TOKENS,
+                largest_window: crate::assistant::LARGEST_WINDOW_TOKENS
+                    - crate::assistant::COMPACTION_HEADROOM,
             })
         })
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// A conversation had in the editor, and the line past which this daemon will not resume one.
+/// A conversation had in the editor, and the largest one this daemon can pick up whole.
 ///
-/// The ceiling rides with it for the reason it rides with a turn: it is a property of this daemon
+/// The number rides with it for the reason it rides with a turn: it is a property of this daemon
 /// and not of the session, and the window keeping its own copy of a rule this side owns is a second
 /// source of truth that drifts silently the day the constant changes. Here it also answers the
-/// question the estimate is being asked for — whether picking this up resumes it or starts fresh.
+/// question the estimate is being asked for — whether picking this up continues it or hands it on.
+///
+/// It is the LARGEST window minus the CLI's own compaction headroom, and not the default window,
+/// because a picked-up conversation is given a window wide enough to hold it. What it cannot be
+/// given is a window wider than the model has, and that is the line this names.
 #[derive(serde::Serialize)]
 struct IdeConversationOut {
     #[serde(flatten)]
     conversation: crate::sessions::Conversation,
-    context_rotates_at: i64,
+    largest_window: i64,
 }
 
 /// How many exchanges a conversation too large to resume is handed.
@@ -5781,11 +6123,19 @@ async fn create_chat(
         tracing::warn!(%error, chat_id = %chat_id, "the new conversation denied no tools of its own");
     }
 
-    // Measured once, here, where the file is read anyway and where the answer can still change
-    // what happens. The ceiling `get_session` enforces reads `runs.context_fill` — the daemon's OWN
-    // prior turns — and a session picked up from the editor has none, so until this every pick-up
-    // resumed whatever it found however large. One did: about 180k of context, re-sent uncached as
-    // fresh input, $1.72 for a one-word answer.
+    // Measured once, here, where the file is read anyway and where the answer can still change what
+    // happens: a picked-up session is the one case where a conversation arrives already full, and
+    // the window it is given has to be wide enough to hold what it is carrying.
+    //
+    // This measurement used to decide whether to pick the session up AT ALL — anything over 140k
+    // was refused and handed six exchanges instead — and that ceiling was written after a real
+    // incident: about 180k of context, re-sent uncached as fresh input, $1.72 for a one-word
+    // answer. What it bought was not what it looked like. The expense there is a COLD CACHE on a
+    // large context, which a window ceiling does not prevent and a stump does not either; what a
+    // stump prevented was the conversation. The bound that does hold is the one the CLI applies
+    // for itself: it never sends more than its window, and it compacts to stay under it. So the
+    // number below is now a window to widen rather than a line to refuse at, and the only refusal
+    // left is for a session larger than any window a model has — which is arithmetic, not policy.
     if let Some(session) = &continued {
         let read = {
             let session_id = session.session_id.clone();
@@ -5800,10 +6150,35 @@ async fn create_chat(
             }
         };
         let carries = read.as_ref().and_then(|read| read.context_estimate);
-        let resumable =
-            carries.is_none_or(|carries| carries <= crate::assistant::CONTEXT_ROTATION_TOKENS);
+        // Against the LARGEST window less the CLI's own compaction headroom, because that is the
+        // point at which the CLI would refuse the context outright rather than summarise it. An
+        // unreadable session file answers `None` and is picked up: a file this daemon could not
+        // measure is not evidence that it is too big, and the CLI reads the same file for itself.
+        let ceiling =
+            crate::assistant::LARGEST_WINDOW_TOKENS - crate::assistant::COMPACTION_HEADROOM;
+        let resumable = carries.is_none_or(|carries| carries <= ceiling);
 
         if resumable {
+            // Widened to fit BEFORE the session is attached, so the first turn already runs in a
+            // window that can hold what it inherited. Only upward, and clamped by `window_of` when
+            // it is read back: an ordinary conversation picked up small keeps the default and
+            // compacts at the default, which is the cheaper of the two and the right one for it.
+            if let Some(carries) = carries
+                && carries > crate::assistant::CONTEXT_WINDOW_TOKENS
+                && let Err(error) = crate::chats::widen_window(
+                    &state.pool,
+                    &chat_id,
+                    (carries + crate::assistant::COMPACTION_HEADROOM)
+                        .min(crate::assistant::LARGEST_WINDOW_TOKENS),
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    chat_id = %chat_id,
+                    "the conversation was picked up but kept the default window; it will compact sooner"
+                );
+            }
             // Written after the chat exists, because it is what `get_session` reads to decide the
             // first turn resumes rather than starts clean. A failure here is not a failed request:
             // the conversation is real and usable, it simply begins a context of its own — so it is
@@ -5824,10 +6199,11 @@ async fn create_chat(
                 );
             }
         } else if let Some(read) = &read {
-            // Too large to resume, so it is handed the tail instead — the rotation's own answer,
-            // and never a summary. Stored rather than re-read: the file can be tens of megabytes,
-            // the turn path must not go near it, and a compaction that lives in a row is one
-            // somebody can read afterwards.
+            // Larger than any window a model has, so there is nothing to resume INTO and it is
+            // handed the tail instead. Rare now, and no longer the ordinary fate of a long
+            // conversation. Stored rather than re-read: the file can be tens of megabytes, the
+            // turn path must not go near it, and a handover that lives in a row is one somebody
+            // can read afterwards.
             let tail = crate::sessions::exchanges(&read.said, HANDOVER_EXCHANGES);
             if !tail.is_empty()
                 && let Ok(stored) = serde_json::to_string(&tail)
@@ -6099,14 +6475,15 @@ async fn get_assistant_models() -> Json<serde_json::Value> {
 
 /// Starts this conversation's next turn on a fresh window, with a replay of what was recently said.
 ///
-/// This app's `/compact`. There is no context here to compact — a turn is a fresh process every
-/// time, and what a turn resumes is a CLI session — so the gesture is to forget the session: the
-/// next turn starts clean and is handed a few hundred tokens of recent exchanges instead of a
-/// window that has grown to a hundred thousand.
+/// This app's `/clear` more than its `/compact`, and the distinction sharpened when the CLI took
+/// over compaction: the CLI SUMMARISES a full context and carries on in the same session, which is
+/// what a `/compact` means and what now happens on its own. This drops the session entirely — the
+/// next turn starts clean and is handed a few hundred tokens of recent exchanges — which is what
+/// somebody means when the conversation has gone somewhere they do not want it to follow.
 ///
-/// The path already existed and nobody could ask for it. Rotation does exactly this on its own past
-/// `CONTEXT_ROTATION_TOKENS`, which meant the only way to get a conversation out of an expensive
-/// context was to let it get expensive first.
+/// It stays because that is a real thing to want and nothing else offers it. What it is no longer
+/// is the escape hatch from an expensive context: a conversation that grows now compacts on its
+/// own, so nobody has to throw one away to stop paying for it.
 async fn post_fresh_context(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
@@ -8355,6 +8732,7 @@ mod tests {
             AppState {
                 token: Token("test-token".into()),
                 pool,
+                telegram_doctrine: None,
                 runner: Arc::new(FakeCommandRunner::default()),
                 triage_runner: None,
                 local_triage_disabled: None,
@@ -8939,6 +9317,7 @@ mod tests {
         AppState {
             token: Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -11164,6 +11543,98 @@ mod tests {
         assert_eq!(claims[1]["writable"], true);
     }
 
+    /// The map of a project, derived from the tree on the spot.
+    #[tokio::test]
+    async fn the_map_of_a_project_names_its_modules_and_what_they_import() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\nuse crate::b;\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("core/src/notes.go"), "package main\n").unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/alpha/map")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let map: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let modules = map["modules"].as_array().unwrap();
+        assert!(
+            modules
+                .iter()
+                .any(|m| m["path"] == "core/src/a.rs" && m["declares"] == true)
+        );
+        assert!(
+            modules
+                .iter()
+                .any(|m| m["path"] == "core/src/b.rs" && m["declares"] == false)
+        );
+
+        let imports = map["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0]["from"], "core/src/a.rs");
+        assert_eq!(imports[0]["to"], "core/src/b.rs");
+
+        // The only test of the wire shape. `unread` is what keeps the Go sidecars from silently
+        // vanishing off the map, and a serde rename would take it away without a sound.
+        let unread = map["unread"].as_array().unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0], "core/src/notes.go");
+    }
+
+    #[tokio::test]
+    async fn the_map_of_a_project_that_is_not_registered_is_not_found() {
+        let state = test_state().await;
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/nowhere/map")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_map_of_a_project_whose_folder_is_gone_is_not_found_rather_than_broken() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let root = dir.path().to_path_buf();
+        drop(dir);
+        assert!(
+            !root.exists(),
+            "the folder is gone, but the project is still registered"
+        );
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/alpha/map")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     /* --------------------------------------------------------------- workflows -- */
 
     /// A library with one bundle in it, and a state pointing at it.
@@ -12371,8 +12842,9 @@ mod tests {
 
         assert_eq!(turns["turns"][0]["context_fill"], serde_json::json!(96000));
         assert_eq!(
-            turns["turns"][0]["context_rotates_at"],
-            serde_json::json!(crate::assistant::CONTEXT_ROTATION_TOKENS)
+            turns["turns"][0]["context_window"],
+            serde_json::json!(crate::assistant::CONTEXT_WINDOW_TOKENS),
+            "a conversation that never asked for a window is metered against the default"
         );
     }
 
@@ -12415,6 +12887,335 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A GET as the window makes one, answered.
+    async fn get_json(state: &AppState, uri: &str) -> serde_json::Value {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        json_body(response).await
+    }
+
+    /// One settled assistant turn, with whatever it asked, answered and ran.
+    async fn seed_turn(
+        state: &AppState,
+        chat_id: &str,
+        asked: &str,
+        answered: &str,
+        tools_used: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, stdout, status, mode, session_id, chat_id, tools_used,
+                               created_at)
+             VALUES (?, ?, 'completed', 'assistant', 's', ?, ?, '2026-08-20T10:00:00+00:00')",
+        )
+        .bind(asked)
+        .bind(answered)
+        .bind(chat_id)
+        .bind(tools_used)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A conversation this daemon is holding, so the search's own join finds it.
+    async fn seed_chat(state: &AppState, title: &str) -> String {
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &chat_id, Some(title))
+            .await
+            .unwrap();
+        chat_id
+    }
+
+    /* ------------------------------------------- reading further back -- */
+
+    /// The cut at the end of a long conversation stops being silent.
+    ///
+    /// It always existed — a hundred turns come back and the hundred-and-first does not — and
+    /// nothing said so, which made a conversation whose first afternoon had been dropped off the
+    /// top indistinguishable from one that began where you were looking.
+    #[tokio::test]
+    async fn a_transcript_says_when_the_conversation_goes_further_back() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the date parser").await;
+        for turn in 0..(ASSISTANT_TRANSCRIPT_LIMIT + 5) {
+            seed_turn(
+                &state,
+                &chat_id,
+                &format!("q{turn}"),
+                &format!("a{turn}"),
+                None,
+            )
+            .await;
+        }
+
+        let body = get_json(&state, &format!("/assistant/chats/{chat_id}")).await;
+        let turns = body["turns"].as_array().unwrap();
+        assert_eq!(turns.len() as i64, ASSISTANT_TRANSCRIPT_LIMIT);
+        assert_eq!(
+            body["more"], true,
+            "five turns were cut off the top in silence"
+        );
+        // The RECENT end, and in order. A page that came back newest-first would read backwards.
+        assert_eq!(turns[turns.len() - 1]["asked"], "q104");
+        assert_eq!(turns[0]["asked"], "q5");
+    }
+
+    /// And the page above it, addressed by the oldest turn already held.
+    ///
+    /// By id rather than by offset, and this is the case that shows why: turns are only ever
+    /// appended, so an offset from the end shifts under a conversation that answers while somebody
+    /// is reading it, and a boundary would repeat or skip a turn.
+    #[tokio::test]
+    async fn the_page_above_is_asked_for_by_the_oldest_turn_held() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the date parser").await;
+        let mut ids = Vec::new();
+        for turn in 0..(ASSISTANT_TRANSCRIPT_LIMIT + 5) {
+            ids.push(seed_turn(&state, &chat_id, &format!("q{turn}"), "a", None).await);
+        }
+
+        let oldest_held = ids[5];
+        let page = get_json(
+            &state,
+            &format!("/assistant/chats/{chat_id}?before={oldest_held}"),
+        )
+        .await;
+        let turns = page["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 5, "five turns stood above the first page");
+        assert_eq!(turns[0]["asked"], "q0");
+        assert_eq!(turns[4]["asked"], "q4");
+        assert_eq!(
+            page["more"], false,
+            "the conversation begins here, and nothing may offer to go further"
+        );
+        // The turn the page was asked to stop BEFORE is not in it — or reading back would show
+        // every boundary turn twice.
+        assert!(
+            turns.iter().all(|turn| turn["id"] != oldest_held),
+            "the boundary turn came back in both pages"
+        );
+    }
+
+    /* --------------------------------------- what a tool answered -- */
+
+    /// The transcript names the tools and never carries what they said.
+    ///
+    /// This is the arithmetic in `ToolCall::result`, asserted rather than trusted: the route is
+    /// polled about once a second while a turn is live, and a regression that put two thousand
+    /// characters per call back on it would be invisible until somebody's window got slow.
+    #[tokio::test]
+    async fn the_transcript_names_the_tools_and_leaves_their_answers_behind() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the date parser").await;
+        let tools = serde_json::json!([{
+            "name": "Bash",
+            "detail": "cargo test dates::",
+            "todos": [],
+            "result": "test result: ok. 3 passed",
+            "result_chars": 25,
+            "result_failed": false
+        }])
+        .to_string();
+        let turn_id = seed_turn(&state, &chat_id, "run them", "they pass", Some(&tools)).await;
+
+        let body = get_json(&state, &format!("/assistant/chats/{chat_id}")).await;
+        let call = &body["turns"][0]["did"][0];
+        assert_eq!(call["name"], "Bash");
+        assert_eq!(call["detail"], "cargo test dates::");
+        assert!(
+            call.get("result").is_none(),
+            "the transcript carried a tool's answer: {call}"
+        );
+
+        // And the route that exists to carry it, does.
+        let opened = get_json(&state, &format!("/assistant/turns/{turn_id}/tools")).await;
+        assert_eq!(opened["did"][0]["result"], "test result: ok. 3 passed");
+        assert_eq!(opened["did"][0]["result_chars"], 25);
+    }
+
+    /// A run that is not an assistant turn is not a door into the transcript.
+    #[tokio::test]
+    async fn a_job_run_id_does_not_open_a_turn_s_tools() {
+        let state = test_state().await;
+        let job_run = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, created_at)
+             VALUES ('build it', 'completed', 'worktree', 's', '2026-08-20T10:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/turns/{job_run}/tools"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /* ------------------------------------------- something that was said -- */
+
+    /// Found by what was SAID, which is the question a title cannot answer.
+    #[tokio::test]
+    async fn a_search_finds_a_sentence_no_title_contains() {
+        let state = test_state().await;
+        let dates = seed_chat(&state, "the date parser").await;
+        let mail = seed_chat(&state, "the mail sidecar").await;
+        seed_turn(
+            &state,
+            &dates,
+            "why 29 February?",
+            "the year rule has three parts",
+            None,
+        )
+        .await;
+        let hit = seed_turn(
+            &state,
+            &mail,
+            "does IMAP idle?",
+            "it takes a leap of faith",
+            None,
+        )
+        .await;
+
+        let found = get_json(&state, "/assistant/search?q=leap").await;
+        let hits = found.as_array().unwrap();
+        assert_eq!(hits.len(), 1, "one turn said it: {found}");
+        assert_eq!(hits[0]["chat_id"], mail);
+        assert_eq!(hits[0]["turn_id"], hit);
+        assert_eq!(hits[0]["side"], "answered");
+        assert!(
+            hits[0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("leap of faith"),
+            "the excerpt did not carry the hit: {}",
+            hits[0]["excerpt"]
+        );
+    }
+
+    /// The half that matched is named, because the two are different errands.
+    #[tokio::test]
+    async fn a_search_says_which_half_of_the_exchange_matched() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the date parser").await;
+        seed_turn(
+            &state,
+            &chat_id,
+            "why does the parser take 2100?",
+            "the year rule",
+            None,
+        )
+        .await;
+
+        let found = get_json(&state, "/assistant/search?q=parser").await;
+        assert_eq!(found[0]["side"], "asked");
+    }
+
+    /// A wildcard is a character somebody typed, not a query language.
+    ///
+    /// Without the escape, `%` matches every turn ever recorded and `budget_usd` matches
+    /// `budgetXusd` — the first is a search that answers with the whole database and the second is
+    /// one that answers with the wrong row.
+    #[tokio::test]
+    async fn a_search_treats_a_wildcard_as_a_character() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the budget").await;
+        seed_turn(&state, &chat_id, "what is budgetXusd?", "not a field", None).await;
+        seed_turn(&state, &chat_id, "and budget_usd?", "a real one", None).await;
+
+        let found = get_json(&state, "/assistant/search?q=budget_usd").await;
+        let hits = found.as_array().unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the underscore matched as a wildcard: {found}"
+        );
+        assert!(hits[0]["excerpt"].as_str().unwrap().contains("budget_usd"));
+
+        let everything = get_json(&state, "/assistant/search?q=%25").await;
+        assert!(
+            everything.as_array().unwrap().is_empty(),
+            "a bare percent sign came back with the whole database"
+        );
+    }
+
+    /// An empty box is not a question, and an archived conversation is not among yours.
+    #[tokio::test]
+    async fn a_search_answers_nothing_for_an_empty_box_and_skips_what_was_archived() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the date parser").await;
+        seed_turn(&state, &chat_id, "why 29 February?", "the year rule", None).await;
+
+        assert!(
+            get_json(&state, "/assistant/search?q=%20")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "an empty search answered with every turn in the database"
+        );
+
+        assert!(
+            !get_json(&state, "/assistant/search?q=February")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        crate::chats::archive(&state.pool, &chat_id).await.unwrap();
+        assert!(
+            get_json(&state, "/assistant/search?q=February")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "an archived conversation still answered a search"
+        );
+    }
+
+    /// The words AROUND the hit, not the first line of the answer.
+    ///
+    /// A match nine hundred characters into a reply is not visible in that reply's opening, and a
+    /// list of openings is a list that does not show what it found.
+    #[tokio::test]
+    async fn an_excerpt_is_cut_around_the_hit_and_says_it_was_cut() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "the long one").await;
+        let long = format!("{}NEEDLE{}", "a".repeat(400), "b".repeat(400));
+        seed_turn(&state, &chat_id, "tell me", &long, None).await;
+
+        let found = get_json(&state, "/assistant/search?q=needle").await;
+        let excerpt = found[0]["excerpt"].as_str().unwrap();
+        assert!(
+            excerpt.contains("NEEDLE"),
+            "the excerpt missed the hit: {excerpt}"
+        );
+        assert!(excerpt.starts_with('…') && excerpt.ends_with('…'));
+        assert!(
+            excerpt.chars().count() < 250,
+            "the excerpt was the whole answer: {} characters",
+            excerpt.chars().count()
+        );
     }
 
     #[tokio::test]
@@ -15561,6 +16362,7 @@ mod tests {
         let state = AppState {
             token: Token("test-token".into()),
             pool: pool.clone(),
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -16459,8 +17261,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             stage.as_deref(),
-            Some("plan"),
-            "the tick has to pick this job up and start its plan node, exactly as for a scheduled one"
+            Some("spec"),
+            "the tick has to pick this job up and start its FIRST node, exactly as for a scheduled \
+             one. That node is the spec rather than the plan since `job::next_step` grew a spec \
+             step; what this test is about is the tick reaching the job at all."
         );
     }
 
@@ -17136,6 +17940,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })
         }
     }
