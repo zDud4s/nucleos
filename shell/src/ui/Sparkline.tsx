@@ -31,6 +31,15 @@ export interface SparklineProps {
   values: number[];
   /** The window these values are, in words. Rendered, and used as the accessible name. */
   label: string;
+  /**
+   * Keep the label as the accessible name, but stop drawing it.
+   *
+   * For a table cell, where the column header already says what the series is
+   * and repeating it under every row is the noise a table exists to remove. The
+   * label stays mandatory and stays in the accessible tree — this hides it from
+   * the eye, never from a reader.
+   */
+  labelHidden?: boolean;
   width?: number;
   height?: number;
 }
@@ -49,8 +58,25 @@ const GAP = 2;
  * which is what they are.
  */
 const MAX_BAR = 9;
+/**
+ * The widest one bar's share of the box gets.
+ *
+ * Without this the slot is simply `width / count`, so three days in a 96px cell
+ * get 32px each and the bars sit 23px apart — three loose blocks rather than a
+ * series. Capping the slot keeps them adjacent at any count, and what is left
+ * over goes to the right edge below.
+ */
+const MAX_SLOT = MAX_BAR + GAP;
 
-export function Sparkline({ values, label, width = WIDTH, height = HEIGHT }: SparklineProps) {
+export function Sparkline({
+  values,
+  label,
+  labelHidden = false,
+  width = WIDTH,
+  height = HEIGHT,
+}: SparklineProps) {
+  const labelClass = labelHidden ? "ui-spark-label ui-spark-label-said" : "ui-spark-label";
+
   /*
     One bar is not a pulse and zero bars are not anything. Both draw the same
     dashed rail the `Meter` uses for an absent ceiling, so "nothing to plot"
@@ -60,7 +86,7 @@ export function Sparkline({ values, label, width = WIDTH, height = HEIGHT }: Spa
     return (
       <p className="ui-spark ui-spark-empty">
         <span className="ui-spark-rail" role="img" aria-label={`${label} — not enough to plot`} />
-        <span className="ui-spark-label">{label}</span>
+        <span className={labelClass}>{label}</span>
       </p>
     );
   }
@@ -73,10 +99,16 @@ export function Sparkline({ values, label, width = WIDTH, height = HEIGHT }: Spa
     one — it draws as a row of floors, which is true.
   */
   const y = scaleLinear<number>({ domain: [0, top === 0 ? 1 : top], range: [0, height - 1] });
-  const slot = width / values.length;
-  const bar = Math.min(Math.max(slot - GAP, 1), MAX_BAR);
+  const slot = Math.min(width / values.length, MAX_SLOT);
+  const bar = Math.max(slot - GAP, 1);
   /* Centred in its slot, so the spacing stays even at any count. */
   const inset = (slot - bar) / 2;
+  /*
+    Flushed right, so the newest bar sits at the same x on every row of a
+    column. Down a table that is what makes the series comparable at a glance:
+    a department with three days and one with twelve both end at "now".
+  */
+  const left = width - slot * values.length;
   const last = values.length - 1;
 
   return (
@@ -91,7 +123,7 @@ export function Sparkline({ values, label, width = WIDTH, height = HEIGHT }: Spa
               <Bar
                 key={index}
                 className={index === last ? "ui-spark-bar ui-spark-now" : "ui-spark-bar"}
-                x={index * slot + inset}
+                x={left + index * slot + inset}
                 y={height - drawn}
                 width={bar}
                 height={drawn}
@@ -101,7 +133,7 @@ export function Sparkline({ values, label, width = WIDTH, height = HEIGHT }: Spa
           })}
         </Group>
       </svg>
-      <span className="ui-spark-label">{label}</span>
+      <span className={labelClass}>{label}</span>
     </p>
   );
 }

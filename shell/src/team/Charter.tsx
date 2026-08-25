@@ -363,7 +363,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
           </select>
         </Field>
         {form.members.length > 0 && (
-          <div className="teams-card-people">
+          <div className="teams-charter-people">
             {form.members.map((id) => {
               const elsewhere = shared.filter(
                 (other) => other.members.includes(id) || other.director_agent_id === id,
@@ -393,7 +393,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
         title="Limits"
         note="Two different kinds. One has something in it right now; the other applies to each task, from zero, every time."
       >
-        <p className="teams-card-label">Occupancy</p>
+        <p className="teams-charter-label">Occupancy</p>
         <div className="teams-charter-limits">
           <Field label="Max live runs (1-4)">
             <input
@@ -422,7 +422,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
           </Field>
         </div>
 
-        <p className="teams-card-label">Per task</p>
+        <p className="teams-charter-label">Per task</p>
         <div className="teams-charter-limits">
           <Field label="Max rounds (1-6)">
             <input
@@ -455,7 +455,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
             />
           </Field>
         </div>
-        <div className="teams-card-chips">
+        <div className="teams-charter-limits">
           <LimitChip name="rounds" ceiling={parseCeiling(form.maxRounds)} />
           <LimitChip name="parallel" ceiling={parseCeiling(form.maxParallel)} />
           <LimitChip name="spend" ceiling={parseCeiling(form.budgetUsd)} format={usd} />

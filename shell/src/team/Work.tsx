@@ -233,7 +233,7 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
                   <span className="teams-round-mark" aria-hidden="true">
                     {MARK[item.state] ?? "·"}
                   </span>
-                  <span className="teams-power-said">{item.state}</span>
+                  <span className="teams-said">{item.state}</span>
                 </span>
               ))}
           </span>
