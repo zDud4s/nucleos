@@ -393,6 +393,34 @@ impl DaemonClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
+    /// Hands a message to a different conversation than the one this run is answering in.
+    ///
+    /// `chat_id` names the DESTINATION and travels in the URL, matching every other
+    /// `/assistant/chats/{id}/...` route on this server; `sending_run_id` — which conversation is
+    /// doing the relaying — is never a parameter here or on the wire, because this run already
+    /// states it, on every request, the same way it does for `read_team_file`: as `RUN_ID_HEADER`,
+    /// added by `request()` above from an id this process cannot alter, since nothing on the local
+    /// path can read its own environment. Naming a destination the daemon later refuses is not a
+    /// broken call — see `json_or_refusal`, below.
+    ///
+    /// Through `json_or_refusal` rather than the hand-written status check `propose_action` and
+    /// `propose_teammate` use above: those predate it, and what this route refuses with is already
+    /// a short, specific slug the daemon wrote for exactly this failure
+    /// (`http::relay_refusal_response`), not a sentence that needs composing — the generic
+    /// "the daemon refused …: <status>: <body>" wrapper says everything a bespoke one would here.
+    pub async fn send_to_chat(&self, chat_id: &str, text: &str) -> Result<Value, String> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/assistant/chats/{chat_id}/relay"),
+            )
+            .json(&serde_json::json!({ "text": text }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "relaying a message to another conversation").await
+    }
+
     /// The accessibility view of a page: what is there and what it is called.
     pub async fn browser_snapshot(
         &self,

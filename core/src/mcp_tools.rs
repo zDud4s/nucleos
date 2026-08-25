@@ -293,6 +293,17 @@ struct VcsTicketParams {
     wait: Option<bool>,
 }
 
+/// What the model chooses, and nothing more — see `send_to_chat`'s own doc for what it does not.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SendToChatParams {
+    /// The OTHER conversation to hand this message to. Never this one — asking for the
+    /// conversation you are already in is refused, not a way to talk to yourself.
+    chat_id: String,
+    /// What to say. Arrives at that conversation as its next turn, exactly as written here — it is
+    /// not shown to the person on this end first.
+    text: String,
+}
+
 #[tool_router]
 impl NucleosTools {
     #[tool(description = "List projects known to the NucleOS daemon")]
@@ -485,6 +496,23 @@ impl NucleosTools {
                 }))
                 .await,
         )
+    }
+
+    #[tool(
+        description = "Hand a message to a DIFFERENT NucleOS conversation — not the one you are \
+                       answering in now. It will read the message as its own next turn, once it \
+                       has a turn free, exactly as you wrote it. Use this to bring another \
+                       conversation into something you are doing; do not use it to answer the \
+                       person you are already talking to, which is your ordinary reply. Refused \
+                       if the conversation named does not exist (or is archived), if handing it on \
+                       would create or close a loop between conversations, or if nobody is at the \
+                       machine right now to see it arrive."
+    )]
+    async fn send_to_chat(
+        &self,
+        Parameters(SendToChatParams { chat_id, text }): Parameters<SendToChatParams>,
+    ) -> String {
+        json_result(self.client.send_to_chat(&chat_id, &text).await)
     }
 
     #[tool(
@@ -1606,6 +1634,18 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // a file the core wrote out the other, and authority to act on the day that authority exists.
     ("read_team_file", ToolEffect::ReadsUntrusted),
     ("reject_proposal", ToolEffect::Acts),
+    // `Acts`, and this one is the barrier itself rather than a label on it. Every other tool on
+    // this table is classified so that `permitted_after_untrusted` can decide whether to let it
+    // run; this is the tool `relay.rs`'s header calls "a conversation acting on another's behalf"
+    // — a stranger's words could otherwise be relayed into a DIFFERENT conversation, past every
+    // taint check that conversation's own turn will ever see, because to it the relayed message
+    // simply arrives as its next turn with no mark saying where it came from. `ReadsOwn` would
+    // reduce that to a filing detail; `Acts` is what makes `permitted_after_untrusted` refuse it
+    // for the rest of any turn that has read mail, a web page, or a teammate's answer — closing
+    // the laundering path on both the CLI and the local dispatcher, since both consult this same
+    // table. `send_to_chat` never reaching `LOCAL_TOOLS` or `TEAM_TOOLS` narrows WHO can call it;
+    // this line is what makes calling it safe for the callers who can.
+    ("send_to_chat", ToolEffect::Acts),
     ("set_kill", ToolEffect::Acts),
     ("triage_email", ToolEffect::Acts),
     ("vcs_request", ToolEffect::Acts),
@@ -2620,6 +2660,7 @@ mod tests {
                 "propose_teammate",
                 "read_team_file",
                 "reject_proposal",
+                "send_to_chat",
                 "set_kill",
                 "triage_email",
                 "vcs_request",
@@ -3013,6 +3054,44 @@ mod tests {
             registered, classified,
             "every tool this server exposes must be classified, and nothing else"
         );
+    }
+
+    /// `send_to_chat` is `Acts` — pinned on its own, not folded into
+    /// `the_mail_tools_are_what_brings_third_party_text_into_a_turn`'s table, because this one
+    /// assertion would still pass today even if the classification below it were deleted:
+    /// `tool_effect` answers `Acts` for a name it does not recognise, which is the fail-safe
+    /// default and not evidence the table was written correctly. Written anyway, because a guard's
+    /// job is to catch tomorrow's edit, not today's — a later reclassification to `ReadsOwn` for
+    /// some plausible reason ("it only files a message") is exactly the drift this exists to catch
+    /// before `permitted_after_untrusted` stops shutting it after a stranger's page.
+    #[test]
+    fn send_to_chat_is_acts() {
+        assert_eq!(tool_effect("send_to_chat"), ToolEffect::Acts);
+    }
+
+    /// `send_to_chat` reaches none of the four narrowed boxes, and each absence is a different
+    /// refusal to guess a caller's identity rather than one omission repeated four times.
+    ///
+    /// `LOCAL_TOOLS` and `TEAM_TOOLS`: neither the in-process local loop nor a department's node
+    /// can name which conversation it is speaking FOR — see this tool's own registration for why
+    /// that is a startup-singleton problem, not a policy one. `COUNCIL_TOOLS`: nothing on a
+    /// council's list acts at all (`every_council_tool_only_reads`), and a seat is not a
+    /// conversation of its own to relay from. `ERRAND_TOOLS`: an errand is a Telegram topic
+    /// anybody in the group can post to, and hands its answer to a person, never to another
+    /// conversation.
+    #[test]
+    fn send_to_chat_reaches_no_narrowed_box() {
+        for (list, name) in [
+            (LOCAL_TOOLS, "LOCAL_TOOLS"),
+            (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+            (TEAM_TOOLS, "TEAM_TOOLS"),
+            (ERRAND_TOOLS, "ERRAND_TOOLS"),
+        ] {
+            assert!(
+                !list.contains(&"send_to_chat"),
+                "send_to_chat must stay off {name}"
+            );
+        }
     }
 
     /// Nothing a council seat may call can act.

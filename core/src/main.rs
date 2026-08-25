@@ -49,6 +49,7 @@ mod proposals;
 mod recurrence;
 mod redact;
 mod refine;
+mod relay;
 mod repo_trigger;
 mod resolver;
 mod runner;
