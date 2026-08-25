@@ -91,6 +91,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/detect", get(get_project_detect))
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
+        .route("/projects/{id}/map", get(get_project_map))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -2832,6 +2833,34 @@ async fn get_project_readings(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "project readings failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The project's structure layer: what modules there are, and what they import.
+///
+/// Derived on every request and never stored — decision 1 of the spec. It goes to disk, so it
+/// runs on `spawn_blocking` the way `blame` and `grep` already do: walking a thousand-file
+/// tree on the async executor blocks the whole daemon for a good few milliseconds, and this
+/// daemon is also answering a three-second poll.
+async fn get_project_map(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::project_map::Structure>, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+    tokio::task::spawn_blocking(move || crate::project_map::structure(&root))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(|error| {
+            // A folder that has been renamed or deleted is something its owner did, not a
+            // fault of this daemon — and `ls`, `cat`, `grep` and `blame` already answer 404
+            // for the very same `read_dir`. Answering 500 would put a warning in the log for
+            // an ordinary Tuesday.
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return StatusCode::NOT_FOUND;
+            }
+            tracing::warn!(%error, project_id = %id, "project map failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -11162,6 +11191,98 @@ mod tests {
         // registry runs on: a claim and a parser come together or not at all.
         assert_eq!(claims[1]["path"], ".ai/workflows.yaml");
         assert_eq!(claims[1]["writable"], true);
+    }
+
+    /// The map of a project, derived from the tree on the spot.
+    #[tokio::test]
+    async fn the_map_of_a_project_names_its_modules_and_what_they_import() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\nuse crate::b;\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("core/src/notes.go"), "package main\n").unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/alpha/map")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let map: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let modules = map["modules"].as_array().unwrap();
+        assert!(
+            modules
+                .iter()
+                .any(|m| m["path"] == "core/src/a.rs" && m["declares"] == true)
+        );
+        assert!(
+            modules
+                .iter()
+                .any(|m| m["path"] == "core/src/b.rs" && m["declares"] == false)
+        );
+
+        let imports = map["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0]["from"], "core/src/a.rs");
+        assert_eq!(imports[0]["to"], "core/src/b.rs");
+
+        // The only test of the wire shape. `unread` is what keeps the Go sidecars from silently
+        // vanishing off the map, and a serde rename would take it away without a sound.
+        let unread = map["unread"].as_array().unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0], "core/src/notes.go");
+    }
+
+    #[tokio::test]
+    async fn the_map_of_a_project_that_is_not_registered_is_not_found() {
+        let state = test_state().await;
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/nowhere/map")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_map_of_a_project_whose_folder_is_gone_is_not_found_rather_than_broken() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let root = dir.path().to_path_buf();
+        drop(dir);
+        assert!(
+            !root.exists(),
+            "the folder is gone, but the project is still registered"
+        );
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/alpha/map")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /* --------------------------------------------------------------- workflows -- */
