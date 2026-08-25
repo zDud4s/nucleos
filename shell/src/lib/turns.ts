@@ -30,6 +30,21 @@ export interface ToolCall {
    * other tool, and empty on any turn recorded before the daemon carried them.
    */
   todos: Todo[];
+  /**
+   * What the tool answered, cut by the daemon, or absent.
+   *
+   * Absent means three different things and the page can act on none of them apart: nothing came
+   * back, the turn predates the column, or — the ordinary case — this call arrived on the
+   * TRANSCRIPT, which deliberately strips them. See `ToolCall::result` in `core/src/runner.rs`:
+   * the transcript is polled once a second while a turn is live, and a hundred turns of tool
+   * output on that poll is a cost paid forever for something almost nobody has open. They are
+   * fetched per turn, by `useTurnTools`, when somebody opens one.
+   */
+  result?: string | null;
+  /** How long the whole answer was, in characters, so the page can say what it is not showing. */
+  result_chars?: number | null;
+  /** Whether the tool answered with an error rather than an answer. */
+  result_failed?: boolean;
 }
 
 /** One line of a plan, as the daemon read it out of a `TodoWrite`. */
@@ -70,8 +85,24 @@ export interface AssistantTurnRow {
    * whose stream never reported one, and on every turn from before the column.
    */
   context_fill: number | null;
-  /** The count past which the daemon stops resuming. The same on every row. */
-  context_rotates_at: number;
+  /**
+   * The context window this conversation runs in, in tokens.
+   *
+   * The same on every row of one conversation, and NOT the same across
+   * conversations: a chat picked up from the editor is given a window wide
+   * enough to hold what it inherited. It used to be `context_rotates_at`, the
+   * point past which the daemon stopped resuming; nothing rotates now, so the
+   * number means the window rather than the cliff.
+   */
+  context_window: number;
+  /**
+   * Whether the CLI summarised its own context while producing this turn.
+   *
+   * What the transcript draws from it is a line saying the older exchanges were
+   * summarised here — which is the thing that used to happen silently, and is
+   * the whole complaint this answers.
+   */
+  compacted: boolean;
   /**
    * What the turn ran, oldest first. Empty on a turn that acted on nothing AND
    * on a turn from before the daemon recorded this — the daemon collapses the
@@ -124,6 +155,15 @@ export interface Turn {
   cost_usd: number | null;
   answeredBy: Brain | null;
   sessionId: string | null;
+  /**
+   * When the turn was asked — `AssistantTurnRow.created_at`, verbatim.
+   *
+   * It arrived on every row from the beginning and was drawn nowhere, which made a
+   * transcript a stack of exchanges with no time in it: an answer from four minutes ago
+   * and one from last Tuesday looked the same, and the only way to date either was to
+   * count backwards from the conversation's own position in the list.
+   */
+  createdAt: string;
   /** What the turn ran. See `AssistantTurnRow.did`. */
   did: ToolCall[];
   /** See `AssistantTurnRow.images`. */
@@ -134,8 +174,10 @@ export interface Turn {
   thoughtTokens: number | null;
   /** See `AssistantTurnRow.context_fill`. */
   contextFill: number | null;
-  /** See `AssistantTurnRow.context_rotates_at`. */
-  rotatesAt: number | null;
+  /** See `AssistantTurnRow.context_window`. */
+  window: number | null;
+  /** See `AssistantTurnRow.compacted`. */
+  compacted: boolean;
 }
 
 /** Whether a turn's status means the daemon is still working it. */
@@ -175,6 +217,7 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     cost_usd: row.cost_usd,
     answeredBy: row.answered_by,
     sessionId: row.session_id,
+    createdAt: row.created_at,
     // Defaulted rather than trusted: a daemon older than the column sends no such key, and a
     // conversation losing one line is a better answer to that than a page that will not draw.
     did: row.did ?? [],
@@ -184,9 +227,13 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     thought: row.thought ?? [],
     thoughtTokens: row.thought_tokens ?? null,
     contextFill: row.context_fill ?? null,
-    // Null, not a number this side made up. A daemon that does not send the ceiling is one whose
-    // ceiling this window does not know, and guessing it would draw a proportion out of nothing.
-    rotatesAt: row.context_rotates_at ?? null,
+    // Null, not a number this side made up. A daemon that does not send the window is one whose
+    // window this side does not know, and guessing it would draw a proportion out of nothing.
+    window: row.context_window ?? null,
+    // False rather than null: a daemon too old to send this is one whose turns never compacted,
+    // because compaction is what this release added. So the absent value and the false one say the
+    // same thing here, which is the only case where collapsing them is honest.
+    compacted: row.compacted ?? false,
   };
 }
 
@@ -235,7 +282,8 @@ export function merge(history: Turn[], local: Turn[]): Turn[] {
 export type Mark =
   | { kind: "brain"; from: Brain; to: Brain }
   | { kind: "restart" }
-  | { kind: "cleared" };
+  | { kind: "cleared" }
+  | { kind: "compacted" };
 
 export function marksBetween(
   previous: Turn | null,
@@ -264,6 +312,14 @@ export function marksBetween(
     previous.sessionId !== turn.sessionId
   ) {
     marks.push({ kind: "restart" });
+  } else if (turn.compacted) {
+    // Last of the three and never beside them, because all three answer the same question — what
+    // happened to the conversation's memory here — and only one thing happened. Compaction is the
+    // mildest and by far the commonest: the session is the same, the model still remembers, and
+    // what changed is that the older exchanges are now a summary of themselves. Drawn against the
+    // turn that compacted rather than between two turns, which is why it reads `turn` and not the
+    // pair: the CLI decides to summarise before it answers, so this IS the turn it happened in.
+    marks.push({ kind: "compacted" });
   }
   return marks;
 }

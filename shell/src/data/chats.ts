@@ -103,6 +103,13 @@ export interface ChatSummary {
    * cost — clearing decides what the MODEL is shown, not what happened.
    */
   cleared_after_run_id: number | null;
+  /**
+   * The context window this conversation runs in, or null for the daemon's default.
+   *
+   * Not the same across conversations: one picked up from the editor is given a
+   * window wide enough to hold what it inherited.
+   */
+  context_window: number | null;
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;
@@ -224,8 +231,14 @@ export interface Conversation {
    * has to be right about is the order of magnitude.
    */
   context_estimate: number | null;
-  /** The count past which the daemon stops resuming and starts a fresh context. */
-  context_rotates_at: number;
+  /**
+   * The largest context this daemon can pick up whole, in tokens.
+   *
+   * The largest window a model has, less the headroom the CLI keeps below it
+   * before compacting. Past it there is nothing to resume INTO, and the
+   * conversation is handed its last few exchanges instead.
+   */
+  largest_window: number;
 }
 
 /**
@@ -248,6 +261,18 @@ export type Exchange = [string, string];
 export interface Transcript {
   handed: Exchange[];
   turns: Turn[];
+  /**
+   * Whether there are turns older than the oldest one in `turns`.
+   *
+   * A conversation is read from its recent end and cut at a hundred turns, and until this existed
+   * the cut was silent: the page simply did not have the first afternoon, and nothing said so.
+   * `useOlderTurns` is what acts on it.
+   *
+   * It is about what the PAGE is holding, not about what the last read returned — see the note in
+   * `useChatTranscript`, where a poll that reaches less far back than the cache does must not
+   * un-answer a question an earlier page load already answered.
+   */
+  more: boolean;
   /**
    * What was said to this conversation while it was busy and has not been sent
    * yet, oldest first, each with the name it can be taken back by.
@@ -336,16 +361,6 @@ export interface Command {
   /** What the command expects after its name, when its file says. */
   hint: string | null;
   source: CommandSource;
-}
-
-/** What `POST /assistant/chats` accepts. Every field is optional. */
-export interface NewChat {
-  brain?: Brain;
-  /** The id of an IDE session to continue, from `useIdeSessions`. */
-  continueSession?: string;
-  /** A choice id from `useAssistantModels`. It decides the brain, so both need not be sent. */
-  model?: string;
-  effort?: string;
 }
 
 /** What `PATCH /assistant/chats/{chat_id}` accepts. Any field, or several. */
@@ -480,11 +495,21 @@ export function useChatTranscript(chatId: string | null) {
         turns: AssistantTurnRow[];
         queued: Waiting[];
         asks: Ask[];
+        more?: boolean;
       }>(
         `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
       );
       const fresh = read.turns.map(turnFromRow);
-      const local = client.getQueryData<Transcript>(queryKey)?.turns ?? [];
+      const held = client.getQueryData<Transcript>(queryKey);
+      const local = held?.turns ?? [];
+      const turns = merge(fresh, local);
+      // `more` is about the oldest turn the PAGE holds, and this read only ever asks about the
+      // recent hundred. Once somebody has fetched a page above that, every subsequent poll would
+      // otherwise answer "yes, there is more" about a boundary that has already been walked past —
+      // and the button to walk past it would never go away. Where the cache reaches further back
+      // than this read did, the last page load's answer is the current one.
+      const reachesFurther =
+        turns.length > 0 && fresh.length > 0 && turns[0].id < fresh[0].id;
       // Defaulted rather than trusted, exactly as the turn fields are: a daemon older than the
       // column answers with turns and no `handed`, and a conversation that will not draw over a
       // missing field is a worse answer than one that draws without the note.
@@ -492,11 +517,102 @@ export function useChatTranscript(chatId: string | null) {
         handed: read.handed ?? [],
         queued: read.queued ?? [],
         asks: read.asks ?? [],
-        turns: merge(fresh, local),
+        more: reachesFurther ? (held?.more ?? false) : (read.more ?? false),
+        turns,
       };
     },
     enabled: chatId !== null,
     refetchInterval: (query) => (anyTurnLive(query.state.data?.turns) ? POLL.turn : POLL.fast),
+  });
+}
+
+/**
+ * The page of turns above the one the transcript is holding.
+ *
+ * A mutation and not a query, because it is a gesture: somebody presses "earlier turns" and the
+ * conversation grows upwards. There is no key it could be cached under that would not also have to
+ * encode how many times it had been pressed.
+ *
+ * It writes into the transcript's own cache rather than holding a list beside it, and that works
+ * because of `merge`: the poll keeps anything the cache has that the daemon's read did not return,
+ * which is exactly what an older page is. So the pressed-open history survives every tick without
+ * a second store to keep in step.
+ */
+export function useOlderTurns(chatId: string) {
+  const queryClient = useQueryClient();
+  const queryKey = keys.chats.detail(chatId);
+  return useMutation({
+    mutationFn: async () => {
+      const held = queryClient.getQueryData<Transcript>(queryKey);
+      const oldest = held?.turns[0]?.id;
+      // Nothing held means nothing to be above. The button is not drawn in that state either;
+      // this is the guard that makes that a fact rather than a convention.
+      if (oldest === undefined) return { turns: [] as Turn[], more: false };
+      const read = await apiFetch<{ turns: AssistantTurnRow[]; more?: boolean }>(
+        `/assistant/chats/${encodeURIComponent(chatId)}?before=${oldest}`,
+      );
+      return { turns: read.turns.map(turnFromRow), more: read.more ?? false };
+    },
+    retry: false,
+    onSuccess: (page) => {
+      queryClient.setQueryData<Transcript>(queryKey, (held) =>
+        held === undefined
+          ? held
+          : { ...held, more: page.more, turns: merge(page.turns, held.turns) },
+      );
+    },
+  });
+}
+
+/**
+ * What one turn's tools answered.
+ *
+ * `enabled` and not an eager read: the transcript deliberately arrives without these — see the
+ * daemon's `ToolCall::result` — and fetching them for forty turns nobody has opened would undo the
+ * whole reason they were split off.
+ *
+ * Never polled and never stale. A settled turn's tool answers are a record of something that has
+ * already happened; there is no version of them that arrives later.
+ */
+export function useTurnTools(turnId: number, enabled: boolean) {
+  return useQuery({
+    queryKey: keys.chats.turnTools(turnId),
+    queryFn: () => apiFetch<{ did: ToolCall[] }>(`/assistant/turns/${turnId}/tools`),
+    enabled,
+    staleTime: Infinity,
+  });
+}
+
+/** One thing that was said, and the conversation it was said in. */
+export interface SaidHit {
+  chat_id: string;
+  title: string | null;
+  turn_id: number;
+  /** `asked` or `answered` — which half of the exchange matched. */
+  side: string;
+  /** The words around the hit, with an ellipsis on whichever side was cut. */
+  excerpt: string;
+  created_at: string;
+}
+
+/**
+ * Something that was SAID, across every conversation.
+ *
+ * The palette's own matching is over titles, which is the right first answer and a useless second
+ * one: a title is a summary a model wrote, and what people come back for is a sentence.
+ *
+ * Two characters before it asks anything. One is every conversation in the database, and the
+ * daemon would do the work of finding them so that a list could throw all but forty away.
+ */
+export function useSaid(query: string) {
+  const trimmed = query.trim();
+  return useQuery({
+    queryKey: keys.chats.said(trimmed),
+    queryFn: () => apiFetch<SaidHit[]>(`/assistant/search?q=${encodeURIComponent(trimmed)}`),
+    enabled: trimmed.length >= 2,
+    // Long enough that walking back through a word does not re-ask for every prefix, short enough
+    // that a search run after a conversation has moved on says something current.
+    staleTime: 30_000,
   });
 }
 
@@ -641,6 +757,10 @@ export function useSendMessage(chatId: string) {
         cost_usd: null,
         answeredBy: null,
         sessionId: null,
+        // This window's clock and not the daemon's, because the daemon has not answered yet and
+        // this row is gone the moment it does. What it has to be right about is "just now", and
+        // for the second and a half this bubble exists both clocks agree about that.
+        createdAt: new Date().toISOString(),
         // Not the pictures that were just sent: those are on disk under names only the daemon
         // knows, because it names them after the turn's own id. They arrive with the next read,
         // which is a beat later — and a wrong guess at a path would draw a broken image instead.
@@ -651,7 +771,10 @@ export function useSendMessage(chatId: string) {
         // Nothing has been sent, so nothing has been measured. The daemon's reading arrives with
         // the turn it belongs to; inventing one here would draw a number this side made up.
         contextFill: null,
-        rotatesAt: null,
+        window: null,
+        // Nothing has run, so nothing has been summarised: that is a fact about a turn that ended,
+        // and this one has not started.
+        compacted: false,
         // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],
@@ -668,6 +791,10 @@ export function useSendMessage(chatId: string) {
         // conversation is being HELD on, blanked by an optimistic write, would take the answer
         // buttons off the screen while the turn behind them went on waiting.
         asks: current?.asks ?? [],
+        // And carried through for the same reason again: a conversation somebody has pressed
+        // "earlier turns" on has already answered the question of what is above it, and a send
+        // resetting that to `false` would take the button away in the middle of reading back.
+        more: current?.more ?? false,
         turns: merge(current?.turns ?? [], [optimistic]),
       }));
       // The list's "thinking…" reading and its `waiting` count both depend on
@@ -702,11 +829,22 @@ export function useStartConversation() {
       effort,
       text,
       images,
+      continueSession,
     }: {
       model?: string;
       effort?: string;
       text: string;
       images: Attachment[];
+      /**
+       * An editor session this conversation carries on from, or nothing.
+       *
+       * Here rather than in a hook of its own, because continuing one is not a different
+       * gesture: you open a conversation by saying something to it, and this says which
+       * conversation. The window that offers it draws the editor session in the same shape as
+       * a chat and lets the first message be the thing that brings it here — so a second hook
+       * would be a second way to do one thing.
+       */
+      continueSession?: string;
     }) => {
       // The model travels on the opening call rather than as a PATCH afterwards.
       // There is no conversation to PATCH until this returns, and correcting one a
@@ -714,7 +852,7 @@ export function useStartConversation() {
       // carries the brain, which the daemon derives from the choice.
       const opened = await apiFetch<{ chat_id: string }>("/assistant/chats", {
         method: "POST",
-        body: JSON.stringify({ model, effort }),
+        body: JSON.stringify({ model, effort, continue_session: continueSession }),
       });
       await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",
@@ -734,31 +872,11 @@ export function useStartConversation() {
   });
 }
 
-/**
- * Open a conversation. Answers `{ chat_id }` — the id the daemon minted, not
- * one the caller could have chosen.
- */
-export function useCreateChat() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (body: NewChat) =>
-      apiFetch<{ chat_id: string }>("/assistant/chats", {
-        method: "POST",
-        // `model` carries the brain with it — the daemon derives the route from the choice — so a
-        // caller that names one need not name the other, and cannot name them inconsistently.
-        body: JSON.stringify({
-          brain: body.brain,
-          continue_session: body.continueSession,
-          model: body.model,
-          effort: body.effort,
-        }),
-      }),
-    retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
-  });
-}
+/* `useCreateChat` and its `NewChat` stood here: a conversation opened with no first message,
+   which was how an editor session used to be picked up — a button, and then an empty chat. Nothing
+   opens a conversation that way any more. Both doors work the same: you say something, and saying
+   it is what opens one. `useStartConversation` is that, and its `continueSession` is the only part
+   of this that survived. */
 
 /**
  * A turn while it is still being written.

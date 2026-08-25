@@ -9,6 +9,7 @@ import "./base.css";
 import "./ui.css";
 import "./app.css";
 import { createAppQueryClient } from "./app/queryClient";
+import { lastPlace, rememberPlace } from "./app/last-place";
 import { createAppRouter } from "./router";
 import { adoptStyleNonce } from "./lib/style-nonce";
 
@@ -37,7 +38,18 @@ import { adoptStyleNonce } from "./lib/style-nonce";
 adoptStyleNonce();
 
 const queryClient = createAppQueryClient();
-const router = createAppRouter();
+/**
+ * Opened where it was left, and remembered as it moves.
+ *
+ * `onResolved` and not `onBeforeLoad`: what is worth remembering is where the window ENDED UP, and
+ * a navigation that is redirected away resolves somewhere else than it started. Subscribed once,
+ * out here beside the router it belongs to, because the router lives for the life of the window and
+ * an effect inside a component would attach and detach with a re-render.
+ */
+const router = createAppRouter(lastPlace());
+router.subscribe("onResolved", ({ toLocation }) => {
+  rememberPlace(toLocation.pathname);
+});
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
