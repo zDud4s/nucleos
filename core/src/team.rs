@@ -94,7 +94,12 @@ const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 *
 /// director's behalf.
 const DELIVERY_FILE: &str = "entrega.md";
 
-const DAEMON_URL: &str = "http://127.0.0.1:8791";
+/// Where this daemon is reached. A function and not a `const`, because the port is no longer a
+/// compile-time fact: a second instance binds its own (`daemon_client::PORT_VAR`), and a const
+/// would send its runs to whichever daemon happens to hold the default.
+fn daemon_url() -> String {
+    crate::daemon_client::daemon_url()
+}
 
 /// PURE: whether a run in this state is still one the daemon is advancing.
 pub fn is_live(state: &str) -> bool {
@@ -2405,12 +2410,8 @@ async fn spawn_agent(
             crate::runner::OllamaChat::new(crate::runner::OLLAMA_BASE_URL.to_string(), model);
         // The TEAM's box, never `LocalToolBox::new`: `LOCAL_TOOLS` carries `create_run` and
         // `create_job`, and the local path never passes through `hooks.rs` at all.
-        let tools = crate::mcp_tools::LocalToolBox::for_team(
-            DAEMON_URL.to_string(),
-            token,
-            pool.clone(),
-            run_id,
-        );
+        let tools =
+            crate::mcp_tools::LocalToolBox::for_team(daemon_url(), token, pool.clone(), run_id);
         let timeout = state.run_timeout;
         crate::runs::spawn_registered(state, run_id, async move {
             let taint = std::sync::atomic::AtomicBool::new(false);

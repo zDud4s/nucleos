@@ -154,7 +154,7 @@ async fn main() {
             .unwrap_or_default();
         let body = serde_json::json!({ "cwd": cwd }).to_string();
         let response = reqwest::Client::new()
-            .post("http://127.0.0.1:8791/vcs/land")
+            .post(format!("{}/vcs/land", daemon_client::daemon_url()))
             .bearer_auth(token)
             .header("content-type", "application/json")
             .body(body)
@@ -276,21 +276,51 @@ async fn main() {
     let dirs = directories::ProjectDirs::from("dev", "nucleos", "NucleOS")
         .expect("could not resolve local app data directory");
 
-    let log_dir = dirs.data_local_dir().join("logs");
+    // Whether this process is the machine's daemon or a second one somebody is testing with, and
+    // where its database and logs go. Resolved HERE, before the first thing that acts on either,
+    // because everything below reads the answer and nothing below may reach for the environment
+    // again — two readers of one variable is how a daemon ends up binding one port and telling its
+    // own tools to call back on another.
+    //
+    // The reason this exists at all: the port and the data directory were literals, so exercising
+    // a change end to end meant running the new build against the live database, on the live port,
+    // after stopping whatever was already serving. That is the one experiment nobody can undo.
+    let port_override = std::env::var(daemon_client::PORT_VAR).ok();
+    let data_dir_override = std::env::var(daemon_client::DATA_DIR_VAR).ok();
+    let is_primary =
+        daemon_client::is_primary(port_override.as_deref(), data_dir_override.as_deref());
+    let data_dir = match data_dir_override.as_deref().filter(|dir| !dir.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => dirs.data_local_dir().to_path_buf(),
+    };
+    if !is_primary {
+        eprintln!(
+            "nucleos-core: secondary instance — data in {}, no autostart, no sidecars",
+            data_dir.display()
+        );
+    }
+
+    let log_dir = data_dir.join("logs");
     let _log_guard = logging::init(&log_dir);
 
-    match std::env::current_exe() {
-        Ok(exe_path) => {
-            if let Err(e) = autostart::ensure_registered(&exe_path) {
-                tracing::warn!("failed to self-register Windows autostart task: {e}");
+    // Only the machine's daemon claims the logon task. `ensure_registered` writes it with
+    // `schtasks /F`, so a secondary doing this would point the machine's autostart at whatever
+    // build is under test — typically one inside a worktree that is about to be deleted, leaving a
+    // task that runs nothing.
+    if is_primary {
+        match std::env::current_exe() {
+            Ok(exe_path) => {
+                if let Err(e) = autostart::ensure_registered(&exe_path) {
+                    tracing::warn!("failed to self-register Windows autostart task: {e}");
+                }
             }
-        }
-        Err(e) => {
-            tracing::warn!("failed to resolve current exe path for autostart registration: {e}")
+            Err(e) => {
+                tracing::warn!("failed to resolve current exe path for autostart registration: {e}")
+            }
         }
     }
 
-    let db_path = dirs.data_local_dir().join("nucleos.db");
+    let db_path = data_dir.join("nucleos.db");
     match backup::apply_pending_restore(&db_path).await {
         Ok(Some(applied)) => tracing::warn!(
             "applied pending database restore from {}; safety backup at {}",
@@ -644,7 +674,7 @@ async fn main() {
                         // handlers, so a local turn and a cloud turn cannot disagree about what a
                         // tool does — only about which ones they are offered.
                         Box::new(mcp_tools::LocalToolBox::new(
-                            "http://127.0.0.1:8791".to_string(),
+                            daemon_client::daemon_url(),
                             token_value.clone(),
                             pool.clone(),
                         )),
@@ -733,23 +763,32 @@ async fn main() {
     };
 
     let app = http::build_router(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8791")
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", daemon_client::port()))
         .await
         .unwrap();
     tracing::info!(
         "nucleos-core listening on {}",
         listener.local_addr().unwrap()
     );
+    // Every sidecar below is gated on this, and the reason is not tidiness. Secrets live in
+    // Windows Credential Manager, which is NOT under the data directory — so a secondary instance
+    // with its own empty database still loads the real Telegram bot token and the real mail
+    // password. Two supervised telegram sidecars poll one account and answer every message twice;
+    // two browser or web sidecars fight over the same fixed ports. A second daemon is for
+    // exercising this process's own HTTP and MCP surface, and it does that without any of them.
+    let sidecars_wanted = is_primary;
     let sidecar_path = std::env::current_exe()
         .unwrap()
         .parent()
         .unwrap()
         .join("echo-sidecar.exe");
-    tokio::spawn(sidecar::supervise(
-        sidecar::ECHO.to_string(),
-        sidecar_path,
-        vec![],
-    ));
+    if sidecars_wanted {
+        tokio::spawn(sidecar::supervise(
+            sidecar::ECHO.to_string(),
+            sidecar_path,
+            vec![],
+        ));
+    }
 
     // The browser sidecar. Started only when the pillar is on, like the web one beside it.
     //
@@ -772,11 +811,13 @@ async fn main() {
             .unwrap()
             .join("browser-sidecar.exe");
         let env = sidecar::browser_env(
-            "http://127.0.0.1:8791",
+            &daemon_client::daemon_url(),
             &browser_sidecar_token,
             &browser_config,
         );
-        tokio::spawn(sidecar::supervise(sidecar::BROWSER.to_string(), path, env));
+        if sidecars_wanted {
+            tokio::spawn(sidecar::supervise(sidecar::BROWSER.to_string(), path, env));
+        }
         tracing::info!(
             max_sessions = browser_config.max_sessions,
             "browser sidecar supervised"
@@ -805,12 +846,14 @@ async fn main() {
             .unwrap()
             .join("web-sidecar.exe");
         let env = sidecar::web_env(
-            "http://127.0.0.1:8791",
+            &daemon_client::daemon_url(),
             &web_sidecar_token,
             &web_config,
             &search_key,
         );
-        tokio::spawn(sidecar::supervise(sidecar::WEB.to_string(), path, env));
+        if sidecars_wanted {
+            tokio::spawn(sidecar::supervise(sidecar::WEB.to_string(), path, env));
+        }
         tracing::info!(provider = %web_config.provider, "web sidecar supervised");
 
         // Retention. Hourly rather than on a timer tied to reads: a cache that is never read again
@@ -844,12 +887,14 @@ async fn main() {
                 .unwrap()
                 .join("telegram-sidecar.exe");
             let telegram_env =
-                sidecar::telegram_env("http://127.0.0.1:8791", &state.token.0, &bot_token);
-            tokio::spawn(sidecar::supervise(
-                sidecar::TELEGRAM.to_string(),
-                telegram_path,
-                telegram_env,
-            ));
+                sidecar::telegram_env(&daemon_client::daemon_url(), &state.token.0, &bot_token);
+            if sidecars_wanted {
+                tokio::spawn(sidecar::supervise(
+                    sidecar::TELEGRAM.to_string(),
+                    telegram_path,
+                    telegram_env,
+                ));
+            }
             tracing::info!("telegram sidecar supervised");
         }
         Ok(None) => {
@@ -946,7 +991,7 @@ async fn main() {
             match triage::verify_hook_barrier(
                 &state.pool,
                 &state.email.sandbox,
-                "http://127.0.0.1:8791",
+                &daemon_client::daemon_url(),
                 &state.token.0,
             )
             .await
@@ -986,12 +1031,18 @@ async fn main() {
                                 .unwrap()
                                 .join("email-sidecar.exe");
                             let env = sidecar::email_env(
-                                "http://127.0.0.1:8791",
+                                &daemon_client::daemon_url(),
                                 token,
                                 &email_config,
                                 &password,
                             );
-                            tokio::spawn(sidecar::supervise(sidecar::EMAIL.to_string(), path, env));
+                            if sidecars_wanted {
+                                tokio::spawn(sidecar::supervise(
+                                    sidecar::EMAIL.to_string(),
+                                    path,
+                                    env,
+                                ));
+                            }
                             tracing::info!("email sidecar supervised");
                         }
                         None => tracing::error!(

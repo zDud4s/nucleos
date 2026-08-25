@@ -21,6 +21,66 @@ use crate::autopilot::{Mode, ProjectSummary};
 /// authenticated, so a stale or foreign value resolves to nobody rather than to somebody else.
 pub const RUN_ID_HEADER: &str = "x-nucleos-run-id";
 
+/// The port a NucleOS daemon binds when nothing says otherwise.
+///
+/// It lived as a literal in nine places, which was honest while a machine ran exactly one daemon.
+pub const DEFAULT_PORT: u16 = 8791;
+
+/// The environment variable that moves a daemon off `DEFAULT_PORT`.
+pub const PORT_VAR: &str = "NUCLEOS_PORT";
+
+/// The environment variable that moves a daemon's database and logs somewhere of their own.
+pub const DATA_DIR_VAR: &str = "NUCLEOS_DATA_DIR";
+
+/// PURE: the port to bind, given what the environment said.
+///
+/// Anything that is not a usable port falls back to the default rather than refusing to start —
+/// see this function's test for why a daemon that will not come up is the worse failure. Zero is
+/// refused along with the nonsense: to the OS it means "any free port", and a daemon whose address
+/// cannot be predicted is unreachable by every client that was told the default.
+pub fn port_from(configured: Option<&str>) -> u16 {
+    configured
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_PORT)
+}
+
+/// PURE: the URL a daemon on `port` is reached at.
+///
+/// Derived and never written beside the port. Two literals for one fact is what lets a daemon bind
+/// one port and tell everything it launches to call back on another, which presents as every tool
+/// being broken at once.
+pub fn url_for(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+/// PURE: whether this process is the machine's daemon, or a second one run beside it.
+///
+/// A secondary must not register the logon task — that would point the machine's autostart at
+/// whatever build is under test — and must not start the sidecars, which would put a second copy
+/// of every integration on the same accounts.
+///
+/// An empty value is not an override: it is what a shell leaves behind when a variable is exported
+/// and never given one, and reading it as "secondary" would quietly take autostart and sidecars
+/// away from a real daemon.
+pub fn is_primary(port: Option<&str>, data_dir: Option<&str>) -> bool {
+    let stated = |value: Option<&str>| value.is_some_and(|value| !value.is_empty());
+    !stated(port) && !stated(data_dir)
+}
+
+/// The port this process binds, read from the environment.
+pub fn port() -> u16 {
+    port_from(std::env::var(PORT_VAR).ok().as_deref())
+}
+
+/// The URL this daemon hands to everything it launches.
+///
+/// One reader for the whole process, so a secondary instance cannot bind one port and advertise
+/// another.
+pub fn daemon_url() -> String {
+    url_for(port())
+}
+
 pub struct DaemonClient {
     base_url: String,
     token: String,
@@ -49,8 +109,11 @@ impl DaemonClient {
     }
 
     pub fn from_env() -> Result<Self, String> {
-        let base_url =
-            std::env::var("NUCLEOS_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:8791".into());
+        // `NUCLEOS_DAEMON_URL` still wins: the daemon writes it into everything it launches, and
+        // it is the only value that survives a client running somewhere the daemon's own
+        // environment does not reach. The fallback is derived rather than written out again, so a
+        // secondary instance's tools reach the secondary rather than the machine's real daemon.
+        let base_url = std::env::var("NUCLEOS_DAEMON_URL").unwrap_or_else(|_| daemon_url());
         let token = std::env::var("NUCLEOS_DAEMON_TOKEN")
             .map_err(|_| "NUCLEOS_DAEMON_TOKEN not set".to_owned())?;
         if token.is_empty() {
@@ -943,6 +1006,66 @@ async fn json_or_null(response: reqwest::Response) -> Result<Value, String> {
         Ok(Value::Null)
     } else {
         serde_json::from_slice(&body).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    /// The port a second daemon binds, and what happens to a value that is not a port.
+    ///
+    /// A machine runs ONE NucleOS, so the port was a literal in nine places and that was honest
+    /// while it was true. It stopped being true the moment somebody needed to exercise a change
+    /// end to end without stopping the daemon that is already serving — the alternative being to
+    /// run the new build against the live database, which is the one experiment nobody can undo.
+    ///
+    /// Unparseable falls back to the default rather than refusing to start. This value arrives
+    /// from a shell, it is only ever set on purpose, and a daemon that will not come up because
+    /// somebody typed `NUCLEOS_PORT=879l` is a worse answer than one that comes up where it always
+    /// does. Zero is rejected with them: it means "any free port" to the OS, and a daemon whose
+    /// address nothing can predict is unreachable by every client that was told the default.
+    #[test]
+    fn a_port_is_read_from_what_the_environment_said_or_falls_back() {
+        assert_eq!(port_from(None), DEFAULT_PORT);
+        assert_eq!(port_from(Some("8792")), 8792);
+        assert_eq!(port_from(Some("")), DEFAULT_PORT);
+        assert_eq!(port_from(Some("879l")), DEFAULT_PORT);
+        assert_eq!(port_from(Some("0")), DEFAULT_PORT);
+        assert_eq!(port_from(Some("99999")), DEFAULT_PORT);
+    }
+
+    /// The URL is derived from the port and never written beside it.
+    ///
+    /// Two literals for one fact is the shape that lets a daemon bind one port and tell everything
+    /// it launches to call back on another — a failure that looks like every tool being broken.
+    #[test]
+    fn the_url_a_daemon_hands_out_names_the_port_it_binds() {
+        assert_eq!(url_for(port_from(None)), "http://127.0.0.1:8791");
+        assert_eq!(url_for(port_from(Some("8792"))), "http://127.0.0.1:8792");
+    }
+
+    /// Whether this process is the machine's daemon or a second one run beside it.
+    ///
+    /// Asked because two things must not happen on a secondary: registering the logon task, which
+    /// would point the machine's autostart at whatever build happened to be under test, and
+    /// starting the sidecars, which would have a second copy of every integration talking to the
+    /// same accounts.
+    ///
+    /// Either override makes it secondary, and that is deliberate rather than lazy. A second
+    /// daemon on the default port cannot bind at all, and one on the real data directory is
+    /// writing the live database — which is the case this whole mechanism exists to avoid. Neither
+    /// is a primary; both are somebody testing.
+    #[test]
+    fn a_daemon_told_a_port_or_a_directory_of_its_own_is_not_the_machines_daemon() {
+        assert!(is_primary(None, None));
+        assert!(!is_primary(Some("8792"), None));
+        assert!(!is_primary(None, Some("C:/tmp/nucleos-test")));
+        assert!(!is_primary(Some("8792"), Some("C:/tmp/nucleos-test")));
+        // An empty value is not an override. It is what a shell leaves behind when a variable is
+        // exported and never given a value, and reading it as "secondary" would silently take a
+        // real daemon's autostart and sidecars away from it.
+        assert!(is_primary(Some(""), Some("")));
     }
 }
 
