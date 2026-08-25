@@ -58,6 +58,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 const params = new URLSearchParams(window.location.search);
 const path = params.get("path") ?? "/teams";
 const tab = params.get("tab");
+const press = params.get("press");
 
 interface PreviewWindow {
   /** Set once the page has settled, so the driver shoots a finished frame and not a spinner. */
@@ -102,9 +103,30 @@ function openTab(name: string): boolean {
   return true;
 }
 
+/**
+ * Press a named button before declaring the page ready.
+ *
+ * Not every surface worth photographing is on screen when the page loads: a
+ * create form that opens from the header, an editor that opens from a row. A
+ * harness that could only ever shoot the closed state would leave exactly the
+ * halves nobody has looked at where they already were.
+ *
+ * Matched on the trimmed label and clicked, rather than by selector: the label
+ * is what a person reads, so a shot that names one is describing what somebody
+ * would do rather than what the DOM currently happens to look like.
+ */
+function pressButton(name: string): boolean {
+  const buttons = [...document.querySelectorAll("button")];
+  const wanted = buttons.find((one) => (one.textContent ?? "").trim() === name);
+  if (wanted === undefined) return false;
+  wanted.click();
+  return true;
+}
+
 /* Long enough for the queries to answer and the fonts to land. */
 window.setTimeout(() => {
   if (tab !== null) openTab(tab);
+  if (press !== null) pressButton(press);
   window.setTimeout(() => {
     window.__preview.ready = true;
   }, 400);
