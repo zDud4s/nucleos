@@ -39,6 +39,7 @@ mod local_agent;
 mod logging;
 mod mailsend;
 mod map_intent;
+mod map_store;
 mod mcp_tools;
 mod mentions;
 mod notes;
