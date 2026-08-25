@@ -232,30 +232,48 @@
 }
 
 /**
- * A measure for the conversation — two of them, and they are for different things.
+ * Two measures for the conversation, and they are for different things.
  *
- * `max-width` is the COLUMN: what the composer, the code blocks and the turn's
- * footing are allowed to be. Without it a maximised window ran the transcript to
- * nearly 2000px and the eye lost the line it was on between one end and the other.
+ * The COLUMN has no ceiling of its own any more. It used to stop at 56rem, on the reasoning that a
+ * maximised window would otherwise run the transcript to nearly 2000px and the eye would lose the
+ * line it was on — which was true when that number was also the width of the running text, and
+ * stopped being true the moment `--measure` took that job. What the ceiling did after that was
+ * make the record end short of the rule the page header draws above it, so a conversation sat
+ * inside a page whose own width it did not use. `.app-page` already stops at 78rem; a second
+ * ceiling under it was bounding something that was already bounded.
  *
- * `--measure` is the RUNNING TEXT inside that column, and it had to be separated out
- * because 56rem is a good column and a terrible paragraph: measured in the app, a
- * line of an answer was 844px at 13px, which is about 138 characters — roughly twice
- * what an eye can track back to the start of. Prose gets `--measure`; a block of code
- * keeps the whole column, because folding it would change what is written.
+ * `--measure` is the RUNNING TEXT inside the column. It exists because 138 characters — what a
+ * line of an answer measured before there was one — is roughly twice what an eye can track back to
+ * the start of. Prose gets `--measure`; a block of code and a table keep the whole column, because
+ * folding either would change what is written.
  *
- * In `ch` rather than `rem` so the two move together: it is a count of characters,
- * and a character is a property of the type, not of the layout.
+ * **100ch is wider than the range that reasoning points at, and it is deliberate.** 72ch sat at
+ * the top of the classic 45-75 and left the answers using about half the column, which is not what
+ * this window is for: the column got wide so the record could use it. Raised on request, and it is
+ * one number — turn it back down and everything that hangs off it follows.
+ *
+ * In `ch` rather than `rem`, so it is a count of characters — a property of the type, not of the
+ * layout — and it grew with the type when the type grew.
  */
 .chats-detail {
-  --measure: 72ch;
+  --measure: 100ch;
+  /**
+   * What you type into, which is no longer the width of the record above it.
+   *
+   * Two terms, and the second is the one that matters. A ceiling alone only separates them when
+   * there is room to spare — with the conversation list open the column is under 56rem, so both
+   * simply filled it and the two were the same width again, which was the complaint. The inset
+   * holds in every state: the box is always narrower than what it is answering.
+   *
+   * `--space-8` in total, so a token and not a percentage: the gap either side stays the same
+   * whatever the window does, rather than growing with it.
+   */
+  --composer: min(56rem, calc(100% - var(--space-8)));
   display: flex;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  max-width: 56rem;
   width: 100%;
-  margin-inline: auto;
 }
 
 /**
@@ -1497,10 +1515,16 @@
 
 /* ============================================================= composer == */
 
+/* Narrower than the conversation above it, and centred under it. Both were `.chats-detail`'s one
+   `max-width` and grew together, so widening the record would have widened the box with it — and
+   a text field the width of a page is a form, not a place to say something. */
 .chats-composer {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+  max-width: var(--composer);
+  width: 100%;
+  margin-inline: auto;
   padding-top: var(--space-4);
 }
 
@@ -1527,6 +1551,21 @@
 
 .chats-composer-box:focus-within {
   border-color: var(--border-strong);
+}
+
+/**
+ * The same width at the other door.
+ *
+ * A conversation carried on from the editor has no `.chats-composer` around its box — `StartBox`'s
+ * outermost element IS the box — so the rule above it does not reach. Written as a child selector
+ * rather than put on `.chats-composer-box` itself, because that class is also the box INSIDE the
+ * wrapper: saying it in both places applied the inset twice on this door and once on the other,
+ * and the two came out 64px apart, which is the mismatch this exists to prevent.
+ */
+.chats-detail-inner > .chats-composer-box {
+  max-width: var(--composer);
+  width: 100%;
+  margin-inline: auto;
 }
 
 /**

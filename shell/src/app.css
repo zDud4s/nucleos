@@ -37,8 +37,22 @@
   background: var(--bg);
 }
 
+/**
+ * The page, centred in whatever room the rail leaves it.
+ *
+ * `max-width` without `margin-inline` is a width that is never used: the page stopped growing at
+ * 78rem and then sat against the left edge, so on any window wider than that the whole app leaned
+ * left with the slack piled up on the right. With both the rail and the conversation list shut it
+ * was at its worst, because that is when there is most slack to pile.
+ *
+ * `auto` and not a calculation involving the rail. Nothing here knows how wide the rail is and
+ * nothing should: it is `auto` in `.app-shell`'s own columns, it is one width open and another
+ * shut, and it will be a third when somebody changes it. Centring inside the column the grid
+ * hands over is correct for every one of those without being told any of them.
+ */
 .app-page {
   max-width: 78rem;
+  margin-inline: auto;
   padding: var(--space-6) var(--space-6) var(--space-8);
 }
 
