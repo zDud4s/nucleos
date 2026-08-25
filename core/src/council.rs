@@ -2864,6 +2864,7 @@ mod tests {
         crate::state::AppState {
             token: crate::auth::Token("control-token".into()),
             pool: test_pool().await,
+            telegram_doctrine: None,
             runner,
             triage_runner: None,
             local_triage_disabled: None,

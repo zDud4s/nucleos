@@ -671,6 +671,53 @@ pub fn load_browser_config(path: &Path) -> BrowserConfig {
     }
 }
 
+/// `.ai/telegram.yaml`. Per-developer, gitignored, and read for exactly one thing: the standing
+/// doctrine a Telegram turn falls back on when the chat itself gave no instructions.
+///
+/// Ships with no field this widens into a capability, unlike `GithubConfig` below — the whole
+/// content is a paragraph of text that becomes `append_system_prompt` when nothing else would have.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    /// The standing instructions a Telegram turn is launched with when the chat has none of its
+    /// own. `None` — absent, blank, or whitespace-only — means every turn is launched exactly as it
+    /// was before this file existed: see `chats.rs`'s identical treatment of a blank `instructions`
+    /// column.
+    #[serde(default, deserialize_with = "deserialize_blank_as_none")]
+    pub doctrine: Option<String>,
+}
+
+/// A blank or whitespace-only string reads as `None`, mirroring `chats.rs`'s
+/// `instructions.filter(|text| !text.trim().is_empty())` for the same reason: a doctrine of empty
+/// spaces would spend an argv slot saying nothing.
+fn deserialize_blank_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|text| !text.trim().is_empty()))
+}
+
+/// Reads `.ai/telegram.yaml`. Absent, unreadable or malformed → default (`doctrine: None`), with a
+/// warning — the same asymmetry `load_web_config` and `load_browser_config` both take: a typo in a
+/// per-developer file must cost fidelity (no doctrine prepended) and never stop the daemon, and
+/// never invent a doctrine nobody wrote.
+pub fn load_telegram_config(path: &Path) -> TelegramConfig {
+    if !path.exists() {
+        return TelegramConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| serde_yaml::from_str::<TelegramConfig>(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "telegram config: could not be parsed; every turn is launched exactly as before");
+            TelegramConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "telegram config: could not be read; every turn is launched exactly as before");
+            TelegramConfig::default()
+        }
+    }
+}
+
 /// `.ai/github.yaml`. The GitHub pillar's switch and the two lists that decide what runs without
 /// anybody watching.
 ///
@@ -2436,5 +2483,22 @@ local_assistant_model: qwen3.5:4b
         assert_eq!(rules.repo_triggers[0].name, "review-main");
         assert_eq!(rules.repo_triggers[0].branch, "main");
         assert_eq!(rules.repo_triggers[0].prompt, "review new commits on main");
+    }
+
+    /// Absent, unreadable or malformed → defaults, the same asymmetry `load_web_config` and
+    /// `load_browser_config` both take: a typo in a per-developer YAML must cost fidelity (no
+    /// doctrine to prepend) and never stop the daemon, and never invent a doctrine nobody wrote.
+    #[test]
+    fn um_telegram_yaml_malformado_cai_no_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telegram.yaml");
+        std::fs::write(&path, "doctrine: [this is not a string\n").unwrap();
+
+        let config = load_telegram_config(&path);
+
+        assert_eq!(
+            config.doctrine, None,
+            "a malformed telegram.yaml must fall back to the default, not invent a doctrine"
+        );
     }
 }

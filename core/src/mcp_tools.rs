@@ -293,11 +293,172 @@ struct VcsTicketParams {
     wait: Option<bool>,
 }
 
+/// Shared shape of three of the four project reads: a listing, a file's contents, and a diff all
+/// take just the project and a path inside it. `project_grep` is not this — it also needs a query
+/// — and has its own struct below rather than this one with an extra optional field bolted on.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ProjectPathParams {
+    /// Which project's repository. Call list_projects if you do not know it.
+    project_id: String,
+    /// Relative to the project's own root. Absent or empty means the root itself.
+    path: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ProjectGrepParams {
+    /// Which project's repository. Call list_projects if you do not know it.
+    project_id: String,
+    /// Text to search for.
+    query: String,
+    /// Narrow the search to this path. Absent or empty means the whole project.
+    path: Option<String>,
+}
+
+/// Just the project, for the two shadow reads. Neither takes a path or a query: a scoreboard and a
+/// review queue are per-project totals, and narrowing either one would only hide the class that is
+/// short of the bar.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ProjectIdParams {
+    /// Which project. Call list_projects if you do not know it.
+    project_id: String,
+}
+
 #[tool_router]
 impl NucleosTools {
-    #[tool(description = "List projects known to the NucleOS daemon")]
+    #[tool(
+        description = "List projects known to the NucleOS daemon. Each entry carries its autopilot \
+                       mode, how far it is from leaving shadow (`classes_ready` of \
+                       `classes_total`, `withheld_classes_ready`, and `promotable`) and whether \
+                       its WIP brake is currently holding new work back (`open_proposals`, \
+                       `wip_limit`, `queue_full`). Start here: a project in `shadow` mode can plan \
+                       but cannot act, so work dispatched to one produces a plan and nothing else."
+    )]
     async fn list_projects(&self) -> String {
         json_result(self.client.list_projects().await)
+    }
+
+    // The four project reads (orchestrator eyes). Each reaches the project's OWN checkout — never
+    // a run's worktree — so there is no `run` parameter to any of them; that is a different
+    // question, answered by `get_run`. Use these BEFORE proposing work, to see what is actually
+    // there rather than dispatching a vague request as it arrived: `list_projects` to find the
+    // project, then these to look inside it.
+
+    #[tool(
+        description = "List a directory inside a project's own checkout — files and subfolders, \
+                       one level. `path` is relative to the project's root; absent or empty means \
+                       the root itself. Use this to see what is actually in a project before \
+                       proposing work on it."
+    )]
+    async fn project_ls(
+        &self,
+        Parameters(ProjectPathParams { project_id, path }): Parameters<ProjectPathParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .project_ls(&project_id, &path.unwrap_or_default())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read one file's contents out of a project's own checkout, as plain text. \
+                       `path` is relative to the project's root."
+    )]
+    async fn project_cat(
+        &self,
+        Parameters(ProjectPathParams { project_id, path }): Parameters<ProjectPathParams>,
+    ) -> String {
+        match self
+            .client
+            .project_cat(&project_id, &path.unwrap_or_default())
+            .await
+        {
+            Ok(text) => text,
+            Err(msg) => error_json(msg),
+        }
+    }
+
+    #[tool(
+        description = "Search for text inside a project's own checkout. `path` narrows the search \
+                       to a file or folder; absent or empty searches the whole project."
+    )]
+    async fn project_grep(
+        &self,
+        Parameters(ProjectGrepParams {
+            project_id,
+            query,
+            path,
+        }): Parameters<ProjectGrepParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .project_grep(&project_id, &query, &path.unwrap_or_default())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "The uncommitted diff of a project's own checkout, as plain text. `path` \
+                       narrows it to a file or folder; absent or empty means the whole project."
+    )]
+    async fn project_diff(
+        &self,
+        Parameters(ProjectPathParams { project_id, path }): Parameters<ProjectPathParams>,
+    ) -> String {
+        match self
+            .client
+            .project_diff(&project_id, &path.unwrap_or_default())
+            .await
+        {
+            Ok(text) => text,
+            Err(msg) => error_json(msg),
+        }
+    }
+
+    // The two shadow reads (the promotion door), and the tool that is deliberately not here.
+    //
+    // `list_projects` already answers WHETHER a project may leave shadow. These answer WHY NOT:
+    // `shadow_scoreboard` names the action class that is short of the bar, `shadow_queue` names the
+    // decisions waiting on a person.
+    //
+    // **There is no verdict tool, and the absence is the design.** A human verdict on a shadow
+    // decision is the evidence that unlocks `active` — the mode in which a project acts on its own.
+    // A tool for it would let the model mint the evidence for its own promotion, which is the one
+    // control that must not be self-served: every other brake (`budget`, the WIP ceiling, the kill
+    // switch) is a limit ON an active project, and this is the gate INTO being one. The reasoning
+    // is `LOCAL_TOOLS`'s, applied where it matters most — approvals "stay where the person can see
+    // what they are agreeing to". `o_veredicto_do_shadow_nao_e_uma_ferramenta` is what pins it.
+
+    #[tool(
+        description = "The shadow scoreboard for one project: for each action class, what the \
+                       classifier would have decided, how many of those decisions a person has \
+                       reviewed, and how often they agreed. This is what says WHY a project cannot \
+                       leave shadow yet. A class clears the bar at 10 reviewed decisions with 95% \
+                       agreement, EVERY class the project has exercised must clear it, and at \
+                       least one cleared class must be one the classifier withheld entirely. Rows \
+                       are grouped by run mode and only `shadow` rows count toward promotion — a \
+                       rich `worktree` tally beside an empty `shadow` one means the project has \
+                       gathered no promotion evidence at all."
+    )]
+    async fn shadow_scoreboard(
+        &self,
+        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+    ) -> String {
+        json_result(self.client.shadow_scoreboard(&project_id).await)
+    }
+
+    #[tool(
+        description = "The decisions of one project still waiting on a person's verdict. Read it \
+                       to tell the owner what is queued for them and what reviewing it would \
+                       unlock. You cannot record a verdict — that is done in the app, where the \
+                       person can see what they are agreeing to — so never say a decision has been \
+                       reviewed, only that it is waiting."
+    )]
+    async fn shadow_queue(
+        &self,
+        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+    ) -> String {
+        json_result(self.client.shadow_queue(&project_id).await)
     }
 
     #[tool(description = "Create a NucleOS run for a project")]
@@ -1589,6 +1750,21 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("list_files", ToolEffect::ReadsUntrusted),
     ("list_projects", ToolEffect::ReadsOwn),
     ("list_proposals", ToolEffect::ReadsOwn),
+    // The four project reads, and this is the weakest line on this page, so it is argued rather
+    // than asserted. `ReadsUntrusted` would kill the feature at birth: the turn would read the
+    // repository and from that moment every `Acts` tool is refused — including `create_run` and
+    // `create_job`, which is the whole reason it was reading. That is the same trap that forced
+    // `WritesOwn` into existence. For it: the root is the owner's own checkout, resolved by the
+    // daemon from `autopilot_state` and never named by the model, and `safe_join` refuses anything
+    // outside it — unlike `list_files`, where a sender chooses the filename, nothing third-party
+    // chose what is in it. Against it, said plainly: a repository CAN hold third-party text (a
+    // vendored dependency, a saved page, an issue body committed to a file). The marginal exposure
+    // is the orchestrator reading text it was already about to hand to an agent with full tools.
+    // Whoever attacks this design should attack here.
+    ("project_cat", ToolEffect::ReadsOwn),
+    ("project_diff", ToolEffect::ReadsOwn),
+    ("project_grep", ToolEffect::ReadsOwn),
+    ("project_ls", ToolEffect::ReadsOwn),
     // `Acts` even though it acts on nothing at the moment it is called. The classification answers
     // "what does this do to the turn that called it", and what this does is put an email, a file or
     // a calendar entry on a path to happening. Grading it `ReadsOwn` because the immediate effect is
@@ -1607,6 +1783,15 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("read_team_file", ToolEffect::ReadsUntrusted),
     ("reject_proposal", ToolEffect::Acts),
     ("set_kill", ToolEffect::Acts),
+    // The two shadow reads. `ReadsOwn`, on the argument the project reads above set out, and the
+    // honest half of that argument applies here too. A scoreboard row is the daemon's own tally of
+    // its own classifier and carries nobody's words. A queued decision carries `tool_input` — the
+    // argument a local agent of this machine proposed — which CAN quote text that agent read
+    // somewhere else, exactly the exposure `get_run` is graded `ReadsOwn` "only lexically" for.
+    // What keeps that acceptable is that neither of them is a step toward acting: the verdict is
+    // not on this server, so a turn that reads them has nothing to reach for next.
+    ("shadow_queue", ToolEffect::ReadsOwn),
+    ("shadow_scoreboard", ToolEffect::ReadsOwn),
     ("triage_email", ToolEffect::Acts),
     ("vcs_request", ToolEffect::Acts),
     ("vcs_ticket", ToolEffect::ReadsOwn),
@@ -2616,11 +2801,17 @@ mod tests {
                 "list_files",
                 "list_projects",
                 "list_proposals",
+                "project_cat",
+                "project_diff",
+                "project_grep",
+                "project_ls",
                 "propose_action",
                 "propose_teammate",
                 "read_team_file",
                 "reject_proposal",
                 "set_kill",
+                "shadow_queue",
+                "shadow_scoreboard",
                 "triage_email",
                 "vcs_request",
                 "vcs_ticket",
@@ -3731,6 +3922,204 @@ mod tests {
         assert_eq!(
             checked, 4,
             "the four errand tools are what this is about; a loop over none of them proves nothing"
+        );
+    }
+
+    /// The four project reads must be served when nothing narrows the box — the same property
+    /// `sem_caixa_o_servidor_serve_tudo` pins for the server as a whole, checked here by name
+    /// because a registration slip on just these four would be silent under that test alone.
+    #[tokio::test]
+    async fn as_quatro_leituras_de_projeto_sao_servidas_sem_caixa() {
+        let (_running, context) = served_request_context().await;
+        let listed = unboxed_server().list_tools(None, context).await.unwrap();
+        let names = advertised(&listed);
+
+        for name in ["project_ls", "project_cat", "project_grep", "project_diff"] {
+            assert!(
+                names.iter().any(|tool| tool == name),
+                "{name} is a project read and was not served with no box narrowing it: {names:?}"
+            );
+        }
+    }
+
+    /// A project read only reads, and fails open into `Acts` is not acceptable for it: an unknown
+    /// name resolves to `Acts` in `tool_effect`, so until these four are classified they read as
+    /// acting tools rather than as the harmless reads they are.
+    #[test]
+    fn uma_leitura_de_projeto_nao_age() {
+        for name in ["project_ls", "project_cat", "project_grep", "project_diff"] {
+            assert_eq!(
+                tool_effect(name),
+                ToolEffect::ReadsOwn,
+                "{name} is a project read and must be classified ReadsOwn, not fail closed to Acts"
+            );
+        }
+    }
+
+    /// Naively asserting only "an errand's box does not serve the four" would pass today for the
+    /// worthless reason that they do not exist at all — so this pins BOTH halves: the four ARE
+    /// registered on the unboxed server (which fails today, since they are not registered yet), and
+    /// none of them is served once the box narrows to one errand.
+    #[test]
+    fn nenhuma_leitura_de_projeto_chega_a_um_assunto() {
+        let registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        for name in ["project_ls", "project_cat", "project_grep", "project_diff"] {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is not registered on this server at all — the absence below would prove \
+                 nothing"
+            );
+        }
+
+        let errand = errand_server(1);
+        for name in ["project_ls", "project_cat", "project_grep", "project_diff"] {
+            assert!(
+                !errand.serves(name),
+                "{name} is a project read and reached an errand's box, which is a Telegram topic \
+                 anyone in the group can post to"
+            );
+        }
+    }
+
+    /// Same trap as above, same fix: the four must be registered on the router (which fails today),
+    /// AND absent from every narrow list a chat turn, a council seat or a team agent is given —
+    /// a project read is a different surface from all three and must not leak into any of them.
+    #[test]
+    fn nenhuma_leitura_de_projeto_esta_nas_listas_estreitas() {
+        let registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        for name in ["project_ls", "project_cat", "project_grep", "project_diff"] {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is not registered on this server at all — the absence below would prove \
+                 nothing"
+            );
+        }
+
+        for name in ["project_ls", "project_cat", "project_grep", "project_diff"] {
+            assert!(
+                !LOCAL_TOOLS.contains(&name),
+                "{name} is a project read and is on LOCAL_TOOLS, a chat turn's box"
+            );
+            assert!(
+                !COUNCIL_TOOLS.contains(&name),
+                "{name} is a project read and is on COUNCIL_TOOLS, a council seat's box"
+            );
+            assert!(
+                !TEAM_TOOLS.contains(&name),
+                "{name} is a project read and is on TEAM_TOOLS, a team agent's box"
+            );
+        }
+    }
+
+    /// The two shadow reads must be served when nothing narrows the box, for the same reason the
+    /// four project reads are checked by name above: a registration slip on just these two would be
+    /// silent under `sem_caixa_o_servidor_serve_tudo`, which counts rather than names.
+    #[tokio::test]
+    async fn as_duas_leituras_do_shadow_sao_servidas_sem_caixa() {
+        let (_running, context) = served_request_context().await;
+        let listed = unboxed_server().list_tools(None, context).await.unwrap();
+        let names = advertised(&listed);
+
+        for name in ["shadow_scoreboard", "shadow_queue"] {
+            assert!(
+                names.iter().any(|tool| tool == name),
+                "{name} is a shadow read and was not served with no box narrowing it: {names:?}"
+            );
+        }
+    }
+
+    /// `tool_effect` resolves an unknown name to `Acts`, so until these two are in `TOOL_EFFECTS`
+    /// they read as acting tools — which would refuse them to any turn that had read mail, for no
+    /// reason at all.
+    #[test]
+    fn uma_leitura_do_shadow_nao_age() {
+        for name in ["shadow_scoreboard", "shadow_queue"] {
+            assert_eq!(
+                tool_effect(name),
+                ToolEffect::ReadsOwn,
+                "{name} is a shadow read and must be classified ReadsOwn, not fail closed to Acts"
+            );
+        }
+    }
+
+    /// Both halves, same trap as the project reads: the two ARE registered, and neither reaches a
+    /// chat turn's box, a council seat's or a team agent's. A scoreboard is a governance reading of
+    /// the machine itself, not something a fanned-out seat or a topic anyone can post to should be
+    /// handed.
+    #[test]
+    fn nenhuma_leitura_do_shadow_esta_nas_listas_estreitas() {
+        let registered = every_tool_name();
+
+        for name in ["shadow_scoreboard", "shadow_queue"] {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is not registered on this server at all — the absences below would prove \
+                 nothing"
+            );
+            assert!(
+                !LOCAL_TOOLS.contains(&name),
+                "{name} is a shadow read and is on LOCAL_TOOLS, a chat turn's box"
+            );
+            assert!(
+                !COUNCIL_TOOLS.contains(&name),
+                "{name} is a shadow read and is on COUNCIL_TOOLS, a council seat's box"
+            );
+            assert!(
+                !TEAM_TOOLS.contains(&name),
+                "{name} is a shadow read and is on TEAM_TOOLS, a team agent's box"
+            );
+            assert!(
+                !ERRAND_TOOLS.contains(&name),
+                "{name} is a shadow read and is on ERRAND_TOOLS, a Telegram topic's box"
+            );
+        }
+    }
+
+    /// The deliberate absence, pinned so that adding it has to be a decision rather than a reflex.
+    ///
+    /// A human verdict on a shadow decision is what earns a project its promotion to `active` —
+    /// the mode in which it acts without asking. Every other brake on this server limits a project
+    /// that is ALREADY active; this is the gate into being one, so a tool that records a verdict
+    /// would let the model produce the evidence for its own promotion. `POST
+    /// /shadow-decisions/{id}/verdict` therefore has no client method and no tool, and the app is
+    /// the only place it is reachable from.
+    ///
+    /// What this can pin is names, and it is worth being plain about the limit: it catches the tool
+    /// somebody adds called `shadow_verdict` or `review_shadow_decision`, and it does not catch a
+    /// verdict smuggled through a differently-named tool. The guard that does not depend on naming
+    /// is one file over — `DaemonClient` has no method that POSTs to that route, so no tool on this
+    /// server has anything to call.
+    #[test]
+    fn o_veredicto_do_shadow_nao_e_uma_ferramenta() {
+        let registered = every_tool_name();
+
+        assert!(
+            registered.iter().any(|tool| tool == "shadow_queue"),
+            "the shadow reads are not on this server at all — the absence below proves nothing"
+        );
+
+        let judging: Vec<&String> = registered
+            .iter()
+            .filter(|name| {
+                name.contains("verdict") || name.contains("review") || name.contains("promote")
+            })
+            .collect();
+
+        assert!(
+            judging.is_empty(),
+            "a tool that records a verdict on a shadow decision — or promotes a project — is what \
+             lets this server mint the evidence for its own promotion out of shadow. It stays in \
+             the app, where the person can see what they are agreeing to. Found: {judging:?}"
         );
     }
 }

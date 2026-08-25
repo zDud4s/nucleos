@@ -1317,6 +1317,7 @@ mod tests {
         AppState {
             token: Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner {
                 delay: Mutex::new(delay),
                 ..Default::default()

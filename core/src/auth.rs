@@ -767,6 +767,7 @@ mod tests {
         AppState {
             token: Token(token.to_string()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
