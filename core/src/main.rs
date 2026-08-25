@@ -60,6 +60,7 @@ mod runs;
 mod scheduler;
 mod search;
 mod secrets;
+mod seed;
 mod sessions;
 mod shadow;
 mod sidecar;
@@ -117,6 +118,39 @@ fn read_secret_from_stdin(prompt: &str) -> Option<String> {
         .trim_end_matches('\r')
         .to_owned();
     if value.is_empty() { None } else { Some(value) }
+}
+
+/// The workflow library, with the built-in autopilot in it.
+///
+/// **Seeding failing does not stop the daemon**, and that is the whole of the error handling here.
+/// A library that could not be written is a canvas with one fewer workflow on it; refusing to start
+/// over it would take away email, chats, runs and the autopilot itself because a picture could not
+/// be drawn. It is said out loud and then let go — the same shape [`crate::backup`] uses for a
+/// restore that could not be applied.
+fn seeded_library() -> Option<std::path::PathBuf> {
+    let root = workflows::library_root()?;
+    match seed::seed(&root) {
+        // The ordinary case, on every start after the first, and it says nothing.
+        Ok(seed::Seeded::Unchanged) => {}
+        Ok(seed::Seeded::Written) => {
+            tracing::info!(
+                name = seed::NAME,
+                version = seed::VERSION,
+                "seeded the built-in workflow"
+            )
+        }
+        // The one case a person needs told: their disk changed under a name that means one thing.
+        Ok(seed::Seeded::Restored) => tracing::warn!(
+            name = seed::NAME,
+            version = seed::VERSION,
+            "the built-in workflow had been changed on disk and was restored; publish a new version \
+             to keep your own"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not seed the built-in workflow; the library is short one")
+        }
+    }
+    Some(root)
 }
 
 #[tokio::main]
@@ -709,7 +743,7 @@ async fn main() {
         files_root,
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.
-        workflow_library: workflows::library_root(),
+        workflow_library: seeded_library(),
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,
