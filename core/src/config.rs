@@ -1340,6 +1340,28 @@ pub struct AutopilotRules {
     pub repo_triggers: Vec<RepoTrigger>,
     #[serde(default)]
     pub gate_command: Option<String>,
+    /// Whether the VCS queue measures a merge before it publishes it.
+    ///
+    /// **Off by default, and the default is the whole of the compatibility story**: a repository
+    /// that says nothing lands exactly as it landed before this key existed. `deny_unknown_fields`
+    /// above is what makes the opposite true too — a project that MEANT to switch this on and
+    /// misspelled it gets a startup error rather than a queue that quietly went on publishing
+    /// unmeasured.
+    ///
+    /// On, the queue runs `gate_command` against the COMPUTED merge — the commit `compute_merge`
+    /// left in the integration worktree, which is what the target branch is about to become — and
+    /// publishes only if it agrees. Nothing is ever reverted, because nothing is published until
+    /// the measurement agrees.
+    ///
+    /// It costs the gate's own wall clock per merge, and it costs it while holding that
+    /// repository's queue. What that lengthens is the time until a branch appears on the target,
+    /// and not anybody's prompt: `--land` prints a ticket and returns without waiting, and always
+    /// did.
+    ///
+    /// Setting this without a `gate_command` is refused rather than ignored — see
+    /// `git_exec::gate_the_merge`, which is the only reader.
+    #[serde(default)]
+    pub gate_before_publish: bool,
 }
 
 /// Where a project keeps its rules, relative to its root, in forward slashes.
@@ -2481,6 +2503,10 @@ local_assistant_model: qwen3.5:4b
             let rules = load_schedule_rules(dir.path())
                 .unwrap_or_else(|e| panic!("{contents:?} must not be an error, got {e}"));
             assert_eq!(rules.gate_command, None);
+            assert!(
+                !rules.gate_before_publish,
+                "a file with nothing in it must not switch a brake on"
+            );
             assert!(rules.schedules.is_empty());
             assert!(rules.repo_triggers.is_empty());
         }

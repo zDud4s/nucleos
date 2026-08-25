@@ -2460,6 +2460,11 @@ struct ProjectRules {
     /// `schedules:` stopped all autonomy for the project and looked like nothing had happened.
     rules_error: Option<String>,
     gate_command: Option<String>,
+    /// Whether the VCS queue measures a merge into this project's target branch before publishing
+    /// it. Served beside `gate_command` because it decides whether that command runs at a second
+    /// moment entirely — and a brake nobody can see through this route is one nobody thinks to
+    /// check when a landing takes twenty minutes.
+    gate_before_publish: bool,
     schedules: Vec<ScheduleView>,
     repo_triggers: Vec<RepoTriggerView>,
     /// The effective open-proposal ceiling: the project's own, else the global default. `null` means
@@ -2593,6 +2598,7 @@ async fn get_project_rules(
         rules_file,
         rules_error,
         gate_command: loaded.gate_command.clone(),
+        gate_before_publish: loaded.gate_before_publish,
         schedules,
         repo_triggers,
         wip_limit,
