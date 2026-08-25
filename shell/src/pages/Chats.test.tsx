@@ -39,6 +39,7 @@ import type {
   Conversation,
   IdeSession,
   Mention,
+  Transcript,
 } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
@@ -2732,22 +2733,18 @@ describe("reading a transcript back", () => {
     expect(await screen.findByText("porque **isto**")).toBeTruthy();
   });
 
-  it("scrolls to the newest turn instead of opening at the oldest", async () => {
-    // A conversation is read at its end. Opening one at the top means scrolling past an afternoon
-    // of work to reach the sentence you came back for.
-    const scrolled = vi.fn();
-    Element.prototype.scrollIntoView = scrolled;
-    daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1" })], {
-        "c-1": [turnRow({ id: 1, asked: "primeiro", answer: "um" }), turnRow({ id: 2, asked: "ultimo", answer: "dois" })],
-      }),
-    );
-
-    await renderChats("/chats/c-1");
-    await screen.findByText("ultimo");
-
-    await waitFor(() => expect(scrolled).toHaveBeenCalled());
-  });
+  /*
+   * "scrolls to the newest turn instead of opening at the oldest" was here, and it asserted that
+   * SOMETHING on the page had called `scrollIntoView`. It passed for the whole life of the defect
+   * it was written to prevent: the call was being made, at a sentinel that was not the end of the
+   * box, so a conversation opened short of its last line and one opened from the editor did not
+   * scroll at all. A test on the mechanism cannot see that; a test on the position can.
+   *
+   * Replaced by "Chats - a conversation opens at its end" at the foot of this file, which asserts
+   * where the box ends up, at both doors, and that a reader who scrolled away is left alone.
+   *
+   * (It also replaced `Element.prototype.scrollIntoView` with a mock and never put it back.)
+   */
 });
 
 /* ------------------------------------------------- a turn as it happens -- */
@@ -3544,5 +3541,172 @@ describe("Chats - the shapes an answer is written in", () => {
     const mine = container.querySelector(".chats-turn-said") as HTMLElement;
     expect(within(mine).getByText("que cor e esta?")).toBeDefined();
     expect(within(mine).getByRole("button", { name: /Open picture/ })).toBeDefined();
+  });
+});
+
+/* ------------------------------------------- a conversation opens at its end -- */
+
+/**
+ * jsdom has no layout: `scrollHeight` and `clientHeight` are 0 on every element and `scrollTop`
+ * will not hold a value that is assigned to it. Without all three there is no such thing as "the
+ * end of the box" for a test to be about, so they are lent for the length of one.
+ *
+ * On `Element.prototype` because the box under test is found by class, not by identity, and the
+ * undo is returned rather than left to `afterEach` so a test that fails still gives them back.
+ */
+function withLayout(scrollHeight: number, clientHeight: number) {
+  const names = ["scrollHeight", "clientHeight", "scrollTop"] as const;
+  const kept = names.map((name) => [
+    name,
+    Object.getOwnPropertyDescriptor(Element.prototype, name),
+  ] as const);
+  const tops = new WeakMap<Element, number>();
+
+  Object.defineProperty(Element.prototype, "scrollHeight", {
+    configurable: true,
+    get: () => scrollHeight,
+  });
+  Object.defineProperty(Element.prototype, "clientHeight", {
+    configurable: true,
+    get: () => clientHeight,
+  });
+  Object.defineProperty(Element.prototype, "scrollTop", {
+    configurable: true,
+    get(this: Element) {
+      return tops.get(this) ?? 0;
+    },
+    set(this: Element, to: number) {
+      tops.set(this, to);
+    },
+  });
+
+  return () => {
+    for (const [name, was] of kept) {
+      if (was === undefined) Reflect.deleteProperty(Element.prototype, name);
+      else Object.defineProperty(Element.prototype, name, was);
+    }
+  };
+}
+
+/** The one scrolling box on the page: the record of the conversation. */
+function theBox(container: HTMLElement) {
+  const box = container.querySelector(".chats-scroll");
+  expect(box).not.toBeNull();
+  return box as HTMLElement;
+}
+
+describe("Chats - a conversation opens at its end", () => {
+  it("opens one of this app's own at the last thing said in it", async () => {
+    const undo = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [
+            turnRow({ id: 1 }),
+            turnRow({ id: 2, asked: "e depois?", answer: "isto foi o fim" }),
+          ],
+        }),
+      );
+      const { container } = await renderChats("/chats/c-1");
+      await screen.findByText("isto foi o fim");
+
+      // The BOX, not an element inside it. What this used to aim at was the end of the transcript,
+      // and the transcript is not the last thing in the box: a question the run is waiting on, the
+      // files it changed and anything queued behind it are all drawn under it, so it landed short
+      // by however tall those happened to be.
+      await waitFor(() => expect(theBox(container).scrollTop).toBe(2000));
+    } finally {
+      undo();
+    }
+  });
+
+  it("opens one carried on from the editor at its end too", async () => {
+    // This door had no end-scroll at all. It is also the one where it matters most: an editor
+    // session opens on somebody else's whole day, and the line you came back for is the last one.
+    const undo = withLayout(2000, 500);
+    try {
+      const { container, choose } = await openThePicker([ideSession()]);
+      await choose("aaaa-1111");
+      await screen.findByPlaceholderText(/carry on where you left off/i);
+
+      await waitFor(() => expect(theBox(container).scrollTop).toBe(2000));
+    } finally {
+      undo();
+    }
+  });
+
+  it("leaves a reader who has scrolled up where they are", async () => {
+    const undo = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [turnRow({ id: 1, answer: "isto foi o fim" })],
+        }),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("isto foi o fim");
+      const box = theBox(container);
+      await waitFor(() => expect(box.scrollTop).toBe(2000));
+
+      // Reading something further up, while the transcript keeps polling underneath.
+      box.scrollTop = 0;
+      fireEvent.scroll(box);
+      await act(async () => {
+        // A real poll, and it has to be: react-query shares structure, so handing it data that is
+        // deeply equal to what it holds gives back the SAME object and nothing re-renders at all.
+        // A spread of the old transcript would have made this test pass while proving nothing.
+        queryClient.setQueryData<Transcript>(keys.chats.detail("c-1"), (old) =>
+          old === undefined
+            ? old
+            : {
+                ...old,
+                turns: [...old.turns, { ...old.turns[0], id: 99, answer: "e mais isto" }],
+              },
+        );
+      });
+      await screen.findByText("e mais isto");
+
+      expect(box.scrollTop).toBe(0);
+    } finally {
+      undo();
+    }
+  });
+
+  it("follows the end again once the reader comes back to it", async () => {
+    const undo = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [turnRow({ id: 1, answer: "isto foi o fim" })],
+        }),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("isto foi o fim");
+      const box = theBox(container);
+
+      box.scrollTop = 0;
+      fireEvent.scroll(box);
+      // Back down to the end. `scrollHeight - clientHeight` is where the end is.
+      box.scrollTop = 1500;
+      fireEvent.scroll(box);
+      await act(async () => {
+        // A real poll, and it has to be: react-query shares structure, so handing it data that is
+        // deeply equal to what it holds gives back the SAME object and nothing re-renders at all.
+        // A spread of the old transcript would have made this test pass while proving nothing.
+        queryClient.setQueryData<Transcript>(keys.chats.detail("c-1"), (old) =>
+          old === undefined
+            ? old
+            : {
+                ...old,
+                turns: [...old.turns, { ...old.turns[0], id: 99, answer: "e mais isto" }],
+              },
+        );
+      });
+      await screen.findByText("e mais isto");
+
+      expect(box.scrollTop).toBe(2000);
+    } finally {
+      undo();
+    }
   });
 });

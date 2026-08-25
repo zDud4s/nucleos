@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import {
   DropdownMenu,
@@ -825,9 +825,18 @@ function EditorDetail({
   // Watched, not merely read: this may be being typed into in the editor while it is on screen.
   const said = useIdeConversation(sessionId, true);
   const start = useStartConversation();
+  const { box, noteScroll, keepUp } = useFollowsItsEnd();
   const chosen = (sessions.data ?? []).find(
     (session) => session.session_id === sessionId,
   );
+
+  // Above the early return, because the rules of hooks do not bend for a session that is not on
+  // this machine any more. This door had no end-scroll AT ALL: a conversation opened from the
+  // editor is exactly the one whose history is long and whose last line is the only one you have
+  // not read, and it opened at somebody else's first sentence of the day.
+  useEffect(() => {
+    keepUp();
+  }, [keepUp, sessionId, said.data]);
 
   if (chosen === undefined) {
     return (
@@ -865,7 +874,7 @@ function EditorDetail({
         </div>
       </div>
 
-      <div className="chats-scroll">
+      <div className="chats-scroll" ref={box} onScroll={noteScroll}>
         {/* Above the conversation, which is where `ChatDetail` puts the equivalent notes about a
             chat's own project. Two things are worth saying before anybody speaks, and both are
             about what the next turn would be, not about what this screen is. */}
@@ -970,6 +979,50 @@ function CreateRefusal({ error }: { error: unknown }) {
 
 /* -------------------------------------------------------------- the detail -- */
 
+/** Nearer the end than this and the reader is reading the end, not passing through it. */
+const FOLLOWS_WITHIN_PX = 48;
+
+/**
+ * A box that opens at its end and keeps up with it until the reader goes elsewhere in it.
+ *
+ * A conversation is read at its end. Opening one at the top means scrolling past an afternoon of
+ * work to reach the sentence you came back for, and on a conversation picked up from the editor
+ * that is somebody else's whole day above the two turns you just had.
+ *
+ * **The box, not a sentinel element inside it.** That was the previous mechanism and it landed
+ * short every single time, measurably: what it aimed at was the end of the TRANSCRIPT, and the
+ * transcript is not the last thing in the box. A question the run is waiting on, the files it
+ * changed and anything queued behind it are all drawn under it — and each of those is something
+ * you would want to see more than the answer above it. `scrollHeight` is the end of the box
+ * whatever happens to be in it, so nothing has to be remembered when something new is added.
+ *
+ * The other half is `follows`, which is what stops it fighting the reader: it is set from where
+ * the reader actually left the box, so scrolling up to read something is enough to stop it, and
+ * scrolling back down is enough to start it again. A ref rather than state on purpose — nothing
+ * draws differently because of it, and state here would re-render the whole transcript on every
+ * scroll event.
+ */
+function useFollowsItsEnd() {
+  const box = useRef<HTMLDivElement | null>(null);
+  const follows = useRef(true);
+
+  /** Belongs on the box's own `onScroll`. Where the reader is is what decides this. */
+  const noteScroll = useCallback(() => {
+    const b = box.current;
+    if (b === null) return;
+    follows.current =
+      b.scrollHeight - b.clientHeight - b.scrollTop <= FOLLOWS_WITHIN_PX;
+  }, []);
+
+  const keepUp = useCallback(() => {
+    const b = box.current;
+    if (b === null || !follows.current) return;
+    b.scrollTop = b.scrollHeight;
+  }, []);
+
+  return { box, follows, noteScroll, keepUp };
+}
+
 function ChatDetail({
   chatId,
   summary,
@@ -985,6 +1038,7 @@ function ChatDetail({
   const seen = usePostChatSeen();
   const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
   const markedSeen = useRef(false);
+  const { box, follows, noteScroll, keepUp } = useFollowsItsEnd();
   /**
    * A question from the transcript, on its way into the box.
    *
@@ -1006,6 +1060,14 @@ function ChatDetail({
     }
   }, [transcript.data, chatId, seen]);
 
+  // On the whole of `transcript.data` rather than on a count of turns: an answer landing where
+  // "thinking…" was grows the page without adding a row to it, and so does a question the run
+  // starts waiting on. Running every poll costs nothing — at the end it is an assignment that
+  // changes no pixel, and away from the end `keepUp` declines to do anything at all.
+  useEffect(() => {
+    keepUp();
+  }, [keepUp, chatId, transcript.data]);
+
   const stale = transcript.isError && transcript.data !== undefined;
 
   return (
@@ -1023,7 +1085,7 @@ function ChatDetail({
       {/* Everything that is a RECORD of the conversation scrolls; the head above and the box below
           do not. One scrollbar used to move all three, so reading the middle of a long transcript
           took the title, the model and the place you type off the screen together. */}
-      <div className="chats-scroll">
+      <div className="chats-scroll" ref={box} onScroll={noteScroll}>
         <Project chatId={chatId} />
 
         {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
@@ -1049,6 +1111,7 @@ function ChatDetail({
             chatId={chatId}
             more={transcript.data.more}
             find={find}
+            follows={follows}
             onReuse={(text) => setReuse({ text, at: Date.now() })}
           />
         )}
@@ -3083,6 +3146,7 @@ function Transcript({
   chatId,
   more,
   find,
+  follows,
   onReuse,
 }: {
   turns: Turn[];
@@ -3092,38 +3156,20 @@ function Transcript({
   more: boolean;
   /** A turn to scroll to, from a search. See `found` in `Chats`. */
   find: { turnId: number; at: number } | null;
+  /** Whether the box this is drawn in still follows its end. See `useFollowsItsEnd`. */
+  follows: { current: boolean };
   /** Puts a question that was already asked back in the box. See `TurnBlock`. */
   onReuse: (text: string) => void;
 }) {
-  const end = useRef<HTMLDivElement | null>(null);
-  const last = turns.length === 0 ? null : turns[turns.length - 1];
   const older = useOlderTurns(chatId);
   // Which turn is lit, and the stamp of the jump that lit it. The ref, because a jump can be
   // asked for before the conversation it belongs to has finished loading: the effect gives up
   // and the next render tries again, and this is what stops it doing the whole thing twice.
   const [lit, setLit] = useState<number | null>(null);
   const jumped = useRef<number | null>(null);
-  const jumping = find !== null && jumped.current !== find.at;
   // Where this conversation was told to forget everything before, so the mark lands on the right
   // turn. Read here rather than inside each block: it is one fact about the whole transcript.
   const clearedAfter = useChatRow(chatId)?.cleared_after_run_id ?? null;
-
-  // A conversation is read at its end.
-  //
-  // Opening one at the top means scrolling past an afternoon of work to reach the sentence you came
-  // back for, and on a conversation picked up from the editor that is somebody else's whole day
-  // above the two turns you just had. Before the hooks below it, and above the early returns: the
-  // rules of hooks do not bend for a component that sometimes has nothing to draw.
-  //
-  // `last?.status` alongside the count, because a turn that ENDS grows the page without adding a
-  // row to it — the answer lands where "thinking…" was, and the bottom moves.
-  useEffect(() => {
-    // Not while somebody is being taken to a turn in the middle of the conversation, and not for
-    // the couple of seconds they are looking at it. Otherwise the end-scroll and the jump fight
-    // over the same scrollbar, and the jump loses on the next poll tick.
-    if (jumping || lit !== null) return;
-    end.current?.scrollIntoView({ block: "end" });
-  }, [chatId, turns.length, last?.status, jumping, lit]);
 
   /**
    * The turn somebody searched for, brought into view and lit for a moment.
@@ -3141,11 +3187,19 @@ function Transcript({
     const at = document.getElementById(`turn-${find.turnId}`);
     if (at === null) return;
     jumped.current = find.at;
+    // Said here rather than left to the scroll event this is about to cause, because the effect
+    // that keeps the box at its end belongs to the PARENT and parent effects run after a child's.
+    // Waiting for the event would mean the end-scroll ran first and threw the jump away.
+    //
+    // It also settles something the old guard only postponed: the end-scroll used to resume when
+    // the highlight faded, so searching for a turn took you to it, gave you two and a half
+    // seconds with it, and then dropped you at the bottom of the conversation.
+    follows.current = false;
     at.scrollIntoView({ block: "center" });
     setLit(find.turnId);
     const dim = setTimeout(() => setLit(null), 2500);
     return () => clearTimeout(dim);
-  }, [find, turns.length]);
+  }, [find, turns.length, follows]);
 
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
@@ -3190,7 +3244,6 @@ function Transcript({
           />
         ))}
       </ul>
-      <div ref={end} className="chats-turns-end" />
     </>
   );
 }
