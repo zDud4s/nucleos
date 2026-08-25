@@ -15,6 +15,7 @@
 //! cannot read this" is not.
 
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 /// A language this reader knows how to interpret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,6 +42,52 @@ pub fn reader_for(path: &str) -> Option<Reader> {
         return Some(Reader::Typescript);
     }
     None
+}
+
+/// Which modules of this crate a Rust file names.
+///
+/// Catches `use crate::x` and also a bare `crate::x::y(...)` in the middle of an expression,
+/// because `http.rs` calls dozens of modules by full path without ever writing `use` for them
+/// — and without this every route would be drawn with no edge to the module it serves, which
+/// is half the graph missing.
+///
+/// **Deliberately not a parser.** A `crate::` inside a string literal or a comment counts as
+/// an edge. The error that produces is one extra edge between two modules that already mention
+/// each other by name — cheap, visible, and correctable by looking. The error a real parser
+/// would avoid does not justify pulling `syn` into this slice.
+pub fn rust_imports(source: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for (index, _) in source.match_indices("crate::") {
+        let rest = &source[index + "crate::".len()..];
+
+        // `use crate::{a, b};` — a group, and every name inside it counts.
+        if let Some(inner) = rest.strip_prefix('{') {
+            let close = match inner.find('}') {
+                Some(at) => at,
+                None => continue,
+            };
+            for part in inner[..close].split(',') {
+                if let Some(name) = leading_ident(part.trim()) {
+                    found.insert(name);
+                }
+            }
+            continue;
+        }
+
+        if let Some(name) = leading_ident(rest) {
+            found.insert(name);
+        }
+    }
+    found
+}
+
+/// The identifier a piece of text starts with, or nothing.
+fn leading_ident(text: &str) -> Option<String> {
+    let name: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 #[cfg(test)]
@@ -73,5 +120,46 @@ mod tests {
         // `vite-env.d.ts` is nobody's code; counting it would put a permanently orphaned node
         // on the map, which is noise that never resolves.
         assert_eq!(reader_for("shell/src/vite-env.d.ts"), None);
+    }
+
+    #[test]
+    fn a_rust_module_imports_what_it_names_after_use_crate() {
+        let source = r#"
+use std::collections::BTreeMap;
+use crate::storage;
+use crate::token_efficiency::Baseline;
+use crate::{budget, health};
+"#;
+        let found = rust_imports(source);
+        assert!(found.contains("storage"));
+        assert!(found.contains("token_efficiency"));
+        assert!(found.contains("budget"));
+        assert!(found.contains("health"));
+        // `std` is not a module of this project and is not a node on the map.
+        assert!(!found.contains("collections"));
+        assert_eq!(found.len(), 4);
+    }
+
+    #[test]
+    fn a_crate_reference_inside_a_line_of_code_counts_too() {
+        // `http.rs` calls `crate::project_readings::readings(...)` without ever writing `use`.
+        // Ignoring that would leave every route without an edge to the module it serves.
+        let source = "crate::project_readings::readings(&state.pool, &id).await";
+        let found = rust_imports(source);
+        assert!(found.contains("project_readings"));
+    }
+
+    #[test]
+    fn a_module_named_more_than_once_still_appears_once() {
+        let source = "use crate::storage;\nuse crate::storage::Thing;";
+        assert_eq!(rust_imports(source).len(), 1);
+    }
+
+    #[test]
+    fn a_glob_import_names_no_single_module_and_so_draws_no_edge() {
+        // `use crate::*;` names everything and therefore nothing in particular. Expanding it
+        // into an edge to every module in the crate would bury the graph under a fan that says
+        // less than no edge at all does. Recorded here so the silence is a decision, not a gap.
+        assert!(rust_imports("use crate::*;\n").is_empty());
     }
 }
