@@ -5493,7 +5493,9 @@ async fn get_assistant_chat(
                 let did: Vec<crate::runner::ToolCall> = turn
                     .tools_used
                     .as_deref()
-                    .and_then(|json| serde_json::from_str::<Vec<crate::runner::ToolCall>>(json).ok())
+                    .and_then(|json| {
+                        serde_json::from_str::<Vec<crate::runner::ToolCall>>(json).ok()
+                    })
                     .unwrap_or_default()
                     .into_iter()
                     .map(crate::runner::ToolCall::without_result)
@@ -5719,7 +5721,7 @@ fn find_ascii_ci(hay: &[char], pin: &[char]) -> Option<usize> {
         window
             .iter()
             .zip(pin)
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
 }
 
@@ -12949,13 +12951,23 @@ mod tests {
         let state = test_state().await;
         let chat_id = seed_chat(&state, "the date parser").await;
         for turn in 0..(ASSISTANT_TRANSCRIPT_LIMIT + 5) {
-            seed_turn(&state, &chat_id, &format!("q{turn}"), &format!("a{turn}"), None).await;
+            seed_turn(
+                &state,
+                &chat_id,
+                &format!("q{turn}"),
+                &format!("a{turn}"),
+                None,
+            )
+            .await;
         }
 
         let body = get_json(&state, &format!("/assistant/chats/{chat_id}")).await;
         let turns = body["turns"].as_array().unwrap();
         assert_eq!(turns.len() as i64, ASSISTANT_TRANSCRIPT_LIMIT);
-        assert_eq!(body["more"], true, "five turns were cut off the top in silence");
+        assert_eq!(
+            body["more"], true,
+            "five turns were cut off the top in silence"
+        );
         // The RECENT end, and in order. A page that came back newest-first would read backwards.
         assert_eq!(turns[turns.len() - 1]["asked"], "q104");
         assert_eq!(turns[0]["asked"], "q5");
@@ -13068,8 +13080,22 @@ mod tests {
         let state = test_state().await;
         let dates = seed_chat(&state, "the date parser").await;
         let mail = seed_chat(&state, "the mail sidecar").await;
-        seed_turn(&state, &dates, "why 29 February?", "the year rule has three parts", None).await;
-        let hit = seed_turn(&state, &mail, "does IMAP idle?", "it takes a leap of faith", None).await;
+        seed_turn(
+            &state,
+            &dates,
+            "why 29 February?",
+            "the year rule has three parts",
+            None,
+        )
+        .await;
+        let hit = seed_turn(
+            &state,
+            &mail,
+            "does IMAP idle?",
+            "it takes a leap of faith",
+            None,
+        )
+        .await;
 
         let found = get_json(&state, "/assistant/search?q=leap").await;
         let hits = found.as_array().unwrap();
@@ -13078,7 +13104,10 @@ mod tests {
         assert_eq!(hits[0]["turn_id"], hit);
         assert_eq!(hits[0]["side"], "answered");
         assert!(
-            hits[0]["excerpt"].as_str().unwrap().contains("leap of faith"),
+            hits[0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("leap of faith"),
             "the excerpt did not carry the hit: {}",
             hits[0]["excerpt"]
         );
@@ -13089,7 +13118,14 @@ mod tests {
     async fn a_search_says_which_half_of_the_exchange_matched() {
         let state = test_state().await;
         let chat_id = seed_chat(&state, "the date parser").await;
-        seed_turn(&state, &chat_id, "why does the parser take 2100?", "the year rule", None).await;
+        seed_turn(
+            &state,
+            &chat_id,
+            "why does the parser take 2100?",
+            "the year rule",
+            None,
+        )
+        .await;
 
         let found = get_json(&state, "/assistant/search?q=parser").await;
         assert_eq!(found[0]["side"], "asked");
@@ -13109,7 +13145,11 @@ mod tests {
 
         let found = get_json(&state, "/assistant/search?q=budget_usd").await;
         let hits = found.as_array().unwrap();
-        assert_eq!(hits.len(), 1, "the underscore matched as a wildcard: {found}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the underscore matched as a wildcard: {found}"
+        );
         assert!(hits[0]["excerpt"].as_str().unwrap().contains("budget_usd"));
 
         let everything = get_json(&state, "/assistant/search?q=%25").await;
@@ -13166,7 +13206,10 @@ mod tests {
 
         let found = get_json(&state, "/assistant/search?q=needle").await;
         let excerpt = found[0]["excerpt"].as_str().unwrap();
-        assert!(excerpt.contains("NEEDLE"), "the excerpt missed the hit: {excerpt}");
+        assert!(
+            excerpt.contains("NEEDLE"),
+            "the excerpt missed the hit: {excerpt}"
+        );
         assert!(excerpt.starts_with('…') && excerpt.ends_with('…'));
         assert!(
             excerpt.chars().count() < 250,

@@ -168,6 +168,64 @@ impl DaemonClient {
         json_or_null(response).await
     }
 
+    // Looking at a job, and stopping one. `create_job` has been on this client since jobs existed
+    // and nothing here could ever look at what it started — so a caller with no screen could open a
+    // night's work and then had no way to ask how it went, or to end it.
+    //
+    // The middle one matters more than it reads. A job that a brake has parked writes its reason on
+    // its own row (`jobs.wait_reason`, set by `job::park`) and says it once in the feed. Without a
+    // read of that row, "waiting" and "doing nothing" are the same silence to anyone not at the app.
+
+    /// One job: its status, its wait reason if a brake parked it, and its queue.
+    pub async fn get_job(&self, id: i64) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::GET, &format!("/jobs/{id}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, &format!("reading job {id}")).await
+    }
+
+    /// The project's jobs, newest first. `live` narrows it to the ones still going.
+    ///
+    /// The project is optional because the route's is: `GET /jobs` with no `project_id` lists every
+    /// project's, which is the right answer to "what is running anywhere" — the question somebody
+    /// away from the machine actually asks.
+    pub async fn list_jobs(&self, project_id: Option<&str>, live: bool) -> Result<Value, String> {
+        // Assembled from a list rather than pushed onto a string, so that "no narrowing at all"
+        // comes out as `/jobs` and not as `/jobs?` with a dangling separator. An empty pair is a
+        // parse the route should never be asked to make: `JobsQuery::live` is an `Option<bool>`,
+        // and `live=` with nothing after it is not a bool.
+        let mut params: Vec<String> = Vec::new();
+        if live {
+            params.push("live=true".to_owned());
+        }
+        if let Some(project_id) = project_id {
+            params.push(format!("project_id={}", urlencoding_encode(project_id)));
+        }
+        let route = if params.is_empty() {
+            "/jobs".to_owned()
+        } else {
+            format!("/jobs?{}", params.join("&"))
+        };
+        let response = self
+            .request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "listing jobs").await
+    }
+
+    /// Stops a job. The item in flight finishes; nothing else starts.
+    pub async fn cancel_job(&self, id: i64) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, &format!("/jobs/{id}/cancel"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_null(response).await
+    }
+
     // The four project reads (spec: orchestrator eyes). Each reaches the calling person's OWN
     // checkout — never a run's worktree, so none of them takes a `run` parameter, unlike the
     // sibling routes in `http.rs` that answer both questions. Every interpolated segment and every
@@ -1494,6 +1552,54 @@ mod tests {
                 "{label}: the project id split into more than one query parameter: {uri}"
             );
         }
+    }
+
+    /// The job listing builds its own query, so the two ways it can be built wrong are checked
+    /// here: a project id that rewrites the request around itself, and a separator left dangling
+    /// when nothing narrows the list.
+    ///
+    /// `&` is the sharp case for the first. For the second, `/jobs?` with an empty pair after it is
+    /// a `live=` the route has to parse as an `Option<bool>`, which it is not — so "list
+    /// everything" has to come out as a bare path.
+    #[tokio::test]
+    async fn a_lista_de_jobs_monta_a_sua_query_sem_separador_a_solta() {
+        let (url, seen) = recording_daemon().await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        client
+            .list_jobs(Some("nucleos&live=true"), false)
+            .await
+            .expect("the recording daemon answers 200 to everything");
+        let uri = seen.lock().unwrap().clone().expect("no request was sent");
+        let query = uri
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_else(|| panic!("no query string was sent at all: {uri}"));
+        assert_eq!(
+            query.split('&').count(),
+            1,
+            "an unescaped & in the project id started a second query parameter: {uri}"
+        );
+
+        client
+            .list_jobs(None, false)
+            .await
+            .expect("the recording daemon answers 200 to everything");
+        let uri = seen.lock().unwrap().clone().expect("no request was sent");
+        assert!(
+            !uri.contains('?'),
+            "listing every job narrowed by nothing must not send a query string at all: {uri}"
+        );
+
+        client
+            .list_jobs(None, true)
+            .await
+            .expect("the recording daemon answers 200 to everything");
+        let uri = seen.lock().unwrap().clone().expect("no request was sent");
+        assert!(
+            uri.ends_with("live=true"),
+            "the live flag alone must be the whole query, with nothing after it: {uri}"
+        );
     }
 
     #[test]
