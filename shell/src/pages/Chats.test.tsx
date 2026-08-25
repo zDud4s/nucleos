@@ -3802,3 +3802,106 @@ describe("Chats - a conversation opens at its end", () => {
     }
   });
 });
+
+/* ------------------------------------------ the conversation, at the size you want it -- */
+
+describe("Chats - how large the conversation is drawn", () => {
+  /** One settled turn is enough: what is under test is the class on the box, not the turns. */
+  async function openOne() {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, answer: "uma resposta" })],
+      }),
+    );
+    const view = await renderChats("/chats/c-1");
+    await screen.findByText("uma resposta");
+    return { ...view, box: () => theBox(view.container) };
+  }
+
+  const press = (key: string) =>
+    fireEvent.keyDown(window, { key, ctrlKey: true });
+
+  it("opens at the page's own size when nothing has been asked for", async () => {
+    // The defect this exists to catch: `Number(null)` is 0, which is a perfectly valid index into
+    // the ladder, so a window that had never been zoomed opened every conversation at the SMALLEST
+    // step and the default was unreachable until you pressed the keys.
+    const { box } = await openOne();
+
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("goes down a step on ctrl and minus, and back up on ctrl and plus", async () => {
+    const { box } = await openOne();
+
+    act(() => press("-"));
+    expect(box().className).toContain("chats-zoom-90");
+    act(() => press("-"));
+    expect(box().className).toContain("chats-zoom-80");
+    act(() => press("="));
+    expect(box().className).toContain("chats-zoom-90");
+  });
+
+  it("takes the unshifted keys, which are the ones a keyboard sends", async () => {
+    const { box } = await openOne();
+
+    act(() => press("_"));
+    expect(box().className).toContain("chats-zoom-90");
+    act(() => press("+"));
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("puts it back on ctrl and zero", async () => {
+    const { box } = await openOne();
+
+    act(() => press("-"));
+    act(() => press("-"));
+    act(() => press("0"));
+
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("stops at the ends of the ladder rather than running off them", async () => {
+    const { box } = await openOne();
+
+    for (let i = 0; i < 12; i += 1) act(() => press("-"));
+    expect(box().className).toContain("chats-zoom-67");
+    for (let i = 0; i < 20; i += 1) act(() => press("="));
+    expect(box().className).toContain("chats-zoom-200");
+  });
+
+  it("leaves the key alone unless ctrl is held", async () => {
+    // Somebody typing a dash into the box is not asking for a smaller conversation.
+    const { box } = await openOne();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "-" });
+      fireEvent.keyDown(window, { key: "-", ctrlKey: true, altKey: true });
+    });
+
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("remembers the size the next time the conversation is opened", async () => {
+    const first = await openOne();
+    act(() => press("-"));
+    expect(first.box().className).toContain("chats-zoom-90");
+    first.unmount();
+
+    const again = await openOne();
+    expect(again.box().className).toContain("chats-zoom-90");
+  });
+
+  it("changes nothing outside the record of the conversation", async () => {
+    // The whole reason this is not the webview's own zoom: that one takes the rail, the page
+    // header and the box you type into with it, and a smaller conversation is what was asked for.
+    const { container, box } = await openOne();
+    act(() => press("-"));
+
+    expect(box().className).toContain("chats-zoom-90");
+    for (const sel of [".chats-detail-head", ".chats-composer-box", ".ui-page-header"]) {
+      const other = container.querySelector(sel);
+      if (other === null) continue;
+      expect(other.className).not.toContain("chats-zoom");
+    }
+  });
+});

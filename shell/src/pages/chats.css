@@ -2763,3 +2763,56 @@
   font-size: var(--text-xs);
   cursor: pointer;
 }
+
+/**
+ * How large the record of the conversation is drawn.
+ *
+ * `zoom` and not `transform: scale()`: a transform paints the same layout smaller, so the lines
+ * keep their old width and the page keeps its old height — nothing more fits, which is the whole
+ * point of asking. `zoom` re-lays it out at the new size, so a smaller setting genuinely holds
+ * more conversation, and `--measure` follows because it is a count of characters.
+ *
+ * On the scrolling box and nothing above it, so the head, the composer and everything outside this
+ * page stay exactly the size they were. One class per step, from `useChatZoom` — see the note
+ * there about why this cannot be a computed style.
+ */
+.chats-zoom-67 {
+  zoom: 0.67;
+}
+
+.chats-zoom-75 {
+  zoom: 0.75;
+}
+
+.chats-zoom-80 {
+  zoom: 0.8;
+}
+
+.chats-zoom-90 {
+  zoom: 0.9;
+}
+
+/* The page's own size, said explicitly so the ladder has no gap in the middle. */
+.chats-zoom-100 {
+  zoom: 1;
+}
+
+.chats-zoom-110 {
+  zoom: 1.1;
+}
+
+.chats-zoom-125 {
+  zoom: 1.25;
+}
+
+.chats-zoom-150 {
+  zoom: 1.5;
+}
+
+.chats-zoom-175 {
+  zoom: 1.75;
+}
+
+.chats-zoom-200 {
+  zoom: 2;
+}

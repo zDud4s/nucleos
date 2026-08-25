@@ -837,6 +837,7 @@ function EditorDetail({
   const said = useIdeConversation(sessionId, true);
   const start = useStartConversation();
   const { box, noteScroll, keepUp } = useFollowsItsEnd();
+  const zoom = useChatZoom();
   const chosen = (sessions.data ?? []).find(
     (session) => session.session_id === sessionId,
   );
@@ -885,7 +886,11 @@ function EditorDetail({
         </div>
       </div>
 
-      <div className="chats-scroll" ref={box} onScroll={noteScroll}>
+      <div
+        className={`chats-scroll ${zoom}`}
+        ref={box}
+        onScroll={noteScroll}
+      >
         {/* Above the conversation, which is where `ChatDetail` puts the equivalent notes about a
             chat's own project. Two things are worth saying before anybody speaks, and both are
             about what the next turn would be, not about what this screen is. */}
@@ -990,6 +995,77 @@ function CreateRefusal({ error }: { error: unknown }) {
 
 /* -------------------------------------------------------------- the detail -- */
 
+/**
+ * The sizes the conversation is read at, as percentages of the page's own.
+ *
+ * A ladder and not a multiplier, because the class is the only way to say this: the window runs
+ * under a CSP with no `unsafe-inline`, so a `style` attribute computed from a number would be
+ * dropped and every step would come out at 100. Same reason `.chats-rich-depth-*` is a ladder.
+ *
+ * Weighted downwards — five steps below the page's size and four above. Zooming a conversation is
+ * nearly always an attempt to get MORE of it on the screen; the ones above exist for reading
+ * something dense, not for the common case.
+ */
+const ZOOMS = [67, 75, 80, 90, 100, 110, 125, 150, 175, 200] as const;
+const ZOOM_REST = 4;
+const ZOOM_KEY = "chats.zoom";
+
+/**
+ * `Ctrl` and `+`/`-`, but only for the record of the conversation.
+ *
+ * Not the webview's own zoom, which was tried first and is wrong for this: it takes the whole
+ * window with it — the rail, the page header, the list, the box you type into — and what somebody
+ * asking for a smaller conversation wants is a smaller CONVERSATION. The chrome around it is
+ * already the size it should be.
+ *
+ * On `window` rather than on the scrolling box, because the box is not focusable and a zoom that
+ * only answered when you had clicked inside the transcript first would look broken. Mounted with
+ * the conversation, so it listens only while there is one open.
+ */
+function useChatZoom() {
+  const [step, setStep] = useState(() => {
+    // `null` handled before `Number` sees it. `Number(null)` is 0, which is a perfectly valid
+    // index into the ladder — so a window that had never been zoomed opened every conversation at
+    // the smallest setting there is, and the default was unreachable until you pressed the keys.
+    const kept = localStorage.getItem(ZOOM_KEY);
+    const asStep = kept === null ? Number.NaN : Number(kept);
+    return Number.isInteger(asStep) && asStep >= 0 && asStep < ZOOMS.length
+      ? asStep
+      : ZOOM_REST;
+  });
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      // `altKey` excluded so this never eats a combination somebody meant for the OS.
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      // `=` as well as `+`, because the unshifted key is what most keyboards actually send, and
+      // `_` as well as `-` for the same reason on the other side.
+      const move =
+        event.key === "+" || event.key === "="
+          ? 1
+          : event.key === "-" || event.key === "_"
+            ? -1
+            : event.key === "0"
+              ? 0
+              : null;
+      if (move === null) return;
+      event.preventDefault();
+      setStep((was) => {
+        const next =
+          move === 0
+            ? ZOOM_REST
+            : Math.min(ZOOMS.length - 1, Math.max(0, was + move));
+        localStorage.setItem(ZOOM_KEY, String(next));
+        return next;
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  return `chats-zoom-${ZOOMS[step]}`;
+}
+
 /** Nearer the end than this and the reader is reading the end, not passing through it. */
 const FOLLOWS_WITHIN_PX = 48;
 
@@ -1063,6 +1139,7 @@ function ChatDetail({
   const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
   const markedSeen = useRef(false);
   const { box, follows, noteScroll, keepUp } = useFollowsItsEnd();
+  const zoom = useChatZoom();
   /**
    * A question from the transcript, on its way into the box.
    *
@@ -1109,7 +1186,11 @@ function ChatDetail({
       {/* Everything that is a RECORD of the conversation scrolls; the head above and the box below
           do not. One scrollbar used to move all three, so reading the middle of a long transcript
           took the title, the model and the place you type off the screen together. */}
-      <div className="chats-scroll" ref={box} onScroll={noteScroll}>
+      <div
+        className={`chats-scroll ${zoom}`}
+        ref={box}
+        onScroll={noteScroll}
+      >
         <Project chatId={chatId} />
 
         {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
