@@ -747,12 +747,15 @@
 /* No rule under it. The title, the context line and the first turn are one
    thing being read down, and a border across them cut the page in half again
    right after the page header had already done it once. */
+/* The band above the reading, and it was 96px tall to carry a name and a path. The gap holds a
+   title to the line that describes it, so one step is enough; the margin was doing separation the
+   scrolling box already does with its own 16px of padding, and doing it twice. */
 .chats-detail-head {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: var(--space-2);
-  margin-bottom: var(--space-5);
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
 }
 
 /* An icon travelling with a word in the page header. Smaller than the composer's
@@ -901,6 +904,10 @@
   background: none;
   color: var(--text);
   font-family: var(--font-display);
+  /* Display type takes tight leading. At the inherited 1.55 this reserved 28px for a line 18px
+     tall, and the difference was air nobody put there — the padding above and below is the
+     button's own hit target and stays. */
+  line-height: var(--leading-tight);
   font-size: var(--text-lg);
   font-weight: var(--weight-semibold);
   letter-spacing: -0.01em;

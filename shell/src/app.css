@@ -53,7 +53,9 @@
 .app-page {
   max-width: 78rem;
   margin-inline: auto;
-  padding: var(--space-6) var(--space-6) var(--space-8);
+  /* Less above than to the sides: the sides carry the measure, and the top is only the distance
+     from the window's edge to the first word — which needs less than the 32px it had. */
+  padding: var(--space-5) var(--space-6) var(--space-8);
 }
 
 /* ------------------------------------------------------------------- nav -- */
