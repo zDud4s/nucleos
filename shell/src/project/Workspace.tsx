@@ -2,6 +2,7 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { useProjects } from "../data/system";
 import { StateBadge } from "../ui";
 import { ModeEstado } from "./ModeEstado";
+import { ModeMapa } from "./ModeMapa";
 import { ModeCodigo } from "./ModeCodigo";
 import { ModeWorkflows } from "./ModeWorkflows";
 
@@ -16,24 +17,29 @@ import { ModeWorkflows } from "./ModeWorkflows";
  * here it is *this worktree has been busy for 41 minutes*, which is a fact that
  * either blocks you or frees you.
  *
- * Three modes and not seven tabs, because the three have genuinely different
- * shapes — a dense grid of panels, three columns with a tree that persists, a
- * graph canvas. Seven tabs would have been seven variations on one grid, which
- * is a second sidebar wearing a disguise.
+ * Four modes and not seven tabs, because the four have genuinely different
+ * shapes — a dense grid of panels, a graph of the repository, three columns
+ * with a tree that persists, a graph of one workflow. Seven tabs would have
+ * been seven variations on one grid, which is a second sidebar wearing a
+ * disguise. The rule was never the count: a mode earns its place by having a
+ * shape and a subject of its own, which is why Map and Workflows can both be
+ * graphs without being the same mode — one draws the project, the other draws
+ * one pipeline installed in it.
  */
 
-/** The three modes, in the order the tabs read. */
-const MODES = ["estado", "codigo", "workflows"] as const;
+/** The four modes, in the order the tabs read. */
+const MODES = ["estado", "mapa", "codigo", "workflows"] as const;
 export type ProjectMode = (typeof MODES)[number];
 
 const MODE_LABEL: Record<ProjectMode, string> = {
   estado: "State",
+  mapa: "Map",
   codigo: "Code",
   workflows: "Workflows",
 };
 
 /**
- * A `$view` parameter as one of the three.
+ * A `$view` parameter as one of the four.
  *
  * Falls back to `estado` rather than 404ing, which is the rule the inspector
  * this replaces already followed: a route parameter is a string, anybody can
@@ -99,6 +105,7 @@ export function Workspace() {
       {mode === "estado" ? (
         <ModeEstado projectId={projectId} answered={projects.data !== undefined} />
       ) : null}
+      {mode === "mapa" ? <ModeMapa projectId={projectId} /> : null}
       {mode === "codigo" ? (
         <ModeCodigo
           projectId={projectId}

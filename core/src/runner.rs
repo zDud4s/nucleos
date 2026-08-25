@@ -98,6 +98,13 @@ pub struct RunOutcome {
     pub cache_read_tokens: Option<i64>,
     pub cache_creation_tokens: Option<i64>,
     pub num_turns: Option<i64>,
+    /// Whether the CLI summarised its own context at some point during this run.
+    ///
+    /// Beside the numbers rather than derived from them, because it cannot be derived from them: a
+    /// compacted turn's `context_fill` is simply lower than the one before it, which is
+    /// indistinguishable from a short question. The stream says it outright and this carries what
+    /// it said.
+    pub compacted: bool,
 }
 
 /// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds
@@ -261,6 +268,23 @@ pub struct RunRequest {
     /// is nameless there, so a person looking at their own machine sees a wall of timestamps where
     /// this app's conversations are.
     pub session_name: Option<String>,
+    /// The context window this run is given, or `None` for whatever the CLI decides on its own.
+    ///
+    /// An ENV VAR and not a flag, because the CLI has no flag for it —
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which it clamps to 100k–1M and then caps at the model's
+    /// real window. Below that window minus 13k the CLI compacts its own context and carries on in
+    /// the same session, which is how the editor has always behaved and what this daemon used to
+    /// approximate by refusing to resume and starting again.
+    ///
+    /// Verified in headless mode rather than assumed to be a REPL feature: `claude -p --resume`
+    /// with the window forced low emits `{"type":"system","subtype":"status","status":"compacting"}`
+    /// followed by a `compact_result`. Both are read back below, so a compaction is something the
+    /// transcript can show rather than something that silently happened.
+    ///
+    /// `None` on every run that is not a conversation. A one-shot errand has no second turn for a
+    /// compaction to serve, and naming a window for it would only move the point at which a single
+    /// long tool loop starts summarising itself.
+    pub context_window: Option<i64>,
     /// Which of this server's tools this run is offered, when it is offered any at all.
     ///
     /// `None` — every caller but one — keeps the wildcard: `--allowedTools mcp__nucleos__*`, the
@@ -800,6 +824,46 @@ pub struct ToolCall {
     /// is exactly what it was.
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// What the tool answered, cut to `RESULT_LIMIT` characters, or `None` when nothing came back.
+    ///
+    /// Until this existed a turn said what it REACHED FOR and never what it found: `Bash` beside
+    /// `cargo test dates::` with no way to learn, from the conversation, whether the tests passed.
+    /// The model's paragraph underneath is a summary of this, and a summary is exactly the thing
+    /// somebody opening a tool call has decided not to take on trust.
+    ///
+    /// Cut, because a `Read` of a three-thousand-line file answers with the file. The full length
+    /// is kept beside it in `result_chars`, so the window can say what it is NOT showing rather
+    /// than present a truncation as the whole answer.
+    ///
+    /// **Not on the transcript.** `ToolCall::without_result` strips this before the turn list is
+    /// serialised, and the answers are fetched per turn on request — the transcript route is
+    /// polled at a live turn's cadence, and a hundred turns of tool output on a one-second poll
+    /// is a cost paid forever for something almost nobody has open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// How long the whole answer was, in characters. `None` when nothing came back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_chars: Option<i64>,
+    /// Whether the tool answered with an error rather than an answer.
+    ///
+    /// Its own field and not inferred from the text: "the command failed" and "the command printed
+    /// something that mentions an error" are different facts, and only the stream knows which this
+    /// was. False on every turn recorded before the field existed, which is the honest default —
+    /// nothing about those rows says a tool failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result_failed: bool,
+}
+
+impl ToolCall {
+    /// The same call with its answer removed, for the transcript. See `result`.
+    pub(crate) fn without_result(self) -> Self {
+        Self {
+            result: None,
+            result_chars: None,
+            result_failed: false,
+            ..self
+        }
+    }
 }
 
 /// One line of a plan.
@@ -847,6 +911,34 @@ fn plan_of(name: &str, input: Option<&serde_json::Value>) -> Vec<Todo> {
 
 /// The longest detail kept. A command line can be a heredoc.
 const DETAIL_LIMIT: usize = 120;
+
+/// The longest tool answer kept.
+///
+/// Two thousand characters is about thirty lines: enough for a test summary, a short diff or the
+/// head of a compiler's complaint, which is what somebody opening a tool call is looking for. A
+/// `Read` answers with a whole file and a `Grep` with every hit, and neither belongs in a row of
+/// a database that is read back in full every time a conversation is opened.
+const RESULT_LIMIT: usize = 2000;
+
+/// What a `tool_result` block actually said, flattened.
+///
+/// The CLI sends `content` two ways — a bare string, or an array of content blocks — and both are
+/// ordinary. Anything else comes back as `None` rather than as a JSON dump: a window showing the
+/// serialisation of a shape this daemon did not recognise is worse than one showing nothing.
+fn result_text(content: Option<&serde_json::Value>) -> Option<String> {
+    match content? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
 
 /// The argument of a tool call worth showing beside its name.
 ///
@@ -909,6 +1001,11 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
     let mut pondering = String::new();
     let mut doing: Option<String> = None;
     let mut did: Vec<ToolCall> = Vec::new();
+    // The `tool_use` id of each call in `did`, by the same index. Parallel rather than a field on
+    // `ToolCall`, because the id is a fact about this stream and not about the call: it is used to
+    // pair an answer with the question that asked it, and then it is finished with. A field would
+    // put it in the database and in the window, where nothing would ever read it.
+    let mut called: Vec<Option<String>> = Vec::new();
 
     for line in stream.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -985,7 +1082,16 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                         name: name.to_string(),
                         detail: block.get("input").and_then(detail_of),
                         todos: plan_of(name, block.get("input")),
+                        result: None,
+                        result_chars: None,
+                        result_failed: false,
                     });
+                    called.push(
+                        block
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .map(str::to_string),
+                    );
                     doing = Some(name.to_string());
                 }
                 // The message that just completed is the one those deltas were writing — both
@@ -998,14 +1104,40 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
             // A tool answering is the only thing that ends a tool call. Clearing this anywhere else
             // would show the model as writing while a command is still running.
             Some("user") => {
-                let returned = value
+                let mut returned = false;
+                for block in value
                     .pointer("/message/content")
                     .and_then(|c| c.as_array())
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|block| {
-                            block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        })
-                    });
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| {
+                        block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    })
+                {
+                    returned = true;
+                    // Paired by id and never by position. A turn can have two tool calls in flight
+                    // at once — the CLI runs them concurrently — and answers arrive in whatever
+                    // order the tools finish, so "the most recent call" is wrong exactly when it
+                    // matters. An answer whose id names no call this stream made is dropped: it
+                    // belongs to something that is not in this list.
+                    let Some(index) = block
+                        .get("tool_use_id")
+                        .and_then(|id| id.as_str())
+                        .and_then(|id| called.iter().position(|made| made.as_deref() == Some(id)))
+                    else {
+                        continue;
+                    };
+                    let Some(text) = result_text(block.get("content")) else {
+                        continue;
+                    };
+                    let call = &mut did[index];
+                    call.result_chars = Some(text.chars().count() as i64);
+                    call.result = Some(text.chars().take(RESULT_LIMIT).collect());
+                    call.result_failed = block
+                        .get("is_error")
+                        .and_then(|flag| flag.as_bool())
+                        .unwrap_or(false);
+                }
                 if returned {
                     doing = None;
                 }
@@ -1082,6 +1214,49 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
     current
 }
 
+/// The environment this run's context window is expressed in, or nothing when it names none.
+///
+/// A function rather than two lines at the spawn site for one reason: the variable's NAME is the
+/// part that fails silently. A typo in it leaves the CLI on its own default window, the daemon
+/// still writes the number the window draws, and the only symptom is a conversation that compacts
+/// at a size nobody asked for. Spelled once, here, where a test can read it back.
+pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)> {
+    request
+        .context_window
+        .map(|window| ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string()))
+}
+
+/// Whether this line says the CLI compacted its own context.
+///
+/// The event, read off a real headless stream rather than inferred from the source:
+///
+/// ```text
+/// {"type":"system","subtype":"status","status":"compacting","session_id":...}
+/// {"type":"system","subtype":"status","status":null,"compact_result":"failed",
+///  "compact_error":"too_few_groups","session_id":...}
+/// ```
+///
+/// `status: "compacting"` is what is read, and the later `compact_result` deliberately is not. The
+/// question this answers is "was the context summarised during this turn" — which is a thing the
+/// transcript should say, because the alternative is a conversation that quietly got shorter — and
+/// a compaction that began is the honest answer to it whether or not it finished. A `failed` result
+/// means the context was left as it was; the turn still answered, and a mark that appeared and then
+/// had to be taken back would be worse than one that says "this is where it summarised".
+///
+/// Sticky once true, like `larger` above: a turn can compact and then go on for many more lines,
+/// and a flag recomputed from the last line alone would report only whatever happened to come last.
+pub(crate) fn compacted_from_line(line: &str, current: bool) -> bool {
+    if current {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return current;
+    };
+    value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+        && value.get("subtype").and_then(serde_json::Value::as_str) == Some("status")
+        && value.get("status").and_then(serde_json::Value::as_str) == Some("compacting")
+}
+
 /// Usage reported by the final `result` event of a Claude `stream-json` transcript.
 ///
 /// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
@@ -1107,6 +1282,12 @@ pub struct TurnOutcome {
     /// What THIS turn added, never what the process has spent altogether.
     pub cost_usd: Option<f64>,
     pub usage: RunUsage,
+    /// Whether the CLI summarised its context while producing THIS turn.
+    ///
+    /// Per turn and not per process, like the cost above and for the same reason: a process that
+    /// serves six turns compacts during one of them, and a flag on the process would mark all six
+    /// as the turn where the conversation got shorter.
+    pub compacted: bool,
 }
 
 /// What one line of a live process's stream means to whoever is recording turns.
@@ -1130,11 +1311,21 @@ pub enum TurnEvent {
 /// in the daemon has to know that a `result` is a boundary or that the cost on it is cumulative.
 pub(crate) struct TurnSplitter {
     spent: f64,
+    /// Belongs to the turn IN FLIGHT, and is cleared when that turn ends.
+    ///
+    /// It is accumulated rather than read off the `result` line, because it is not on it: the CLI
+    /// decides to compact before it answers. Cleared at the boundary and not merely overwritten,
+    /// so a process serving six turns does not report the second one's compaction on the four
+    /// that follow it.
+    compacted: bool,
 }
 
 impl TurnSplitter {
     pub(crate) fn new() -> Self {
-        Self { spent: 0.0 }
+        Self {
+            spent: 0.0,
+            compacted: false,
+        }
     }
 
     /// The events this line produces, in the order a consumer must see them.
@@ -1143,9 +1334,11 @@ impl TurnSplitter {
     /// answer, so a consumer told the turn had ended before being given that line would close every
     /// turn one line short of what it said.
     pub(crate) fn line(&mut self, line: String) -> Vec<TurnEvent> {
+        self.compacted = compacted_from_line(&line, self.compacted);
         match turn_from_result(&line, self.spent) {
-            Some((turn, total)) => {
+            Some((mut turn, total)) => {
                 self.spent = total;
+                turn.compacted = std::mem::take(&mut self.compacted);
                 vec![TurnEvent::Line(line), TurnEvent::Ended(turn)]
             }
             None => vec![TurnEvent::Line(line)],
@@ -1192,6 +1385,9 @@ pub(crate) fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOu
             .map(str::to_owned),
         cost_usd: spent.map(|total| total - already_spent),
         usage: extract_usage(line),
+        // The SPLITTER's to fill: the fact is not on the `result` line this function parses, and
+        // inventing it here from nothing would be a quieter way of saying `false`.
+        compacted: false,
     };
     // A result carrying no cost at all must not reset the total: the next turn would then be
     // differenced against zero and billed for the whole conversation.
@@ -1785,6 +1981,7 @@ impl CommandRunner for OllamaRunner {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             });
         }
 
@@ -1799,6 +1996,7 @@ impl CommandRunner for OllamaRunner {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             num_turns: None,
+            compacted: false,
         })
     }
 }
@@ -1866,6 +2064,12 @@ impl CommandRunner for ClaudeCliRunner {
             std::env::var("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let mut cmd = Command::new(&claude_bin);
         cmd.args(cli_args(&request, &self.model));
+        // Before `request.env` and not after, so an explicit entry still wins. That is what a test
+        // needs to force a window the CLI would otherwise clamp away, and it costs nothing here:
+        // no caller sets both.
+        if let Some((name, value)) = window_env(&request) {
+            cmd.env(name, value);
+        }
         for (k, v) in &request.env {
             cmd.env(k, v);
         }
@@ -1989,6 +2193,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut splitter = TurnSplitter::new();
         let mut usage = RunUsage::default();
         let mut running_context_fill: Option<i64> = None;
+        let mut compacted = false;
 
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut policy_violation: Option<String> = None;
@@ -2029,6 +2234,10 @@ impl CommandRunner for ClaudeCliRunner {
             if let Ok(mut shared) = context_fill.lock() {
                 *shared = running_context_fill;
             }
+            // Read on every line and NOT only near the end: the CLI decides to compact before it
+            // answers. A run cut short here — a timeout, a turn ceiling — has still had its context
+            // summarised, and the record should say so.
+            compacted = compacted_from_line(&line, compacted);
             // After the line is accumulated and mirrored, never before: a run stopped here still has
             // to leave the transcript of the turn that stopped it, or the evidence for why it was
             // stopped is the one thing missing from the record.
@@ -2179,6 +2388,7 @@ impl CommandRunner for ClaudeCliRunner {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
+            compacted,
         })
     }
 }
@@ -2368,6 +2578,15 @@ impl CommandRunner for CodexCliRunner {
                 )));
             }
         }
+        // KNOWN LIMITATION, left un-refused on purpose, beside `session_name` below:
+        // `context_window` is not honoured here, and it is the one control on this list that is
+        // safe to lose. It is exported as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which is a Claude
+        // Code environment variable that `codex exec` reads no meaning into; a run that loses it
+        // compacts on whatever schedule Codex has of its own, which is the schedule every run on
+        // this path has always had. Nothing is loosened and no record claims otherwise — the
+        // window a chat row names is drawn from the row, and the row is still true about the
+        // Claude path it was written for.
+
         // KNOWN LIMITATION, left un-refused on purpose, beside `resume_session_id` below:
         // `session_name` is not honoured here. It reaches the Claude CLI's `--resume` picker and
         // nothing else — no decision anywhere depends on it, and no record claims it was applied —
@@ -2554,6 +2773,7 @@ impl CommandRunner for CodexCliRunner {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
+            compacted: false,
         })
     }
 }
@@ -2841,6 +3061,7 @@ impl CommandRunner for FakeCommandRunner {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })
         };
         if outcome.session_id.is_none() {
@@ -3100,6 +3321,72 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair[0] == "--name" && pair[1] == "o refactor do runner"),
             "{args:?}"
+        );
+    }
+
+    /// The compaction event, as a real headless stream emits it.
+    ///
+    /// Both lines below were copied out of `claude -p --resume` run with the window forced low, not
+    /// written from the source: the point of the test is that this daemon reads what the CLI
+    /// actually sends. The `compact_result` line is deliberately NOT what is read — a compaction
+    /// that began is the honest answer to "was the context summarised here" whether or not it
+    /// finished, and a mark that appeared and then had to be taken back would be worse than one that
+    /// says where the summarising happened.
+    #[test]
+    fn a_compaction_is_read_off_the_stream_and_stays_read() {
+        let started =
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#;
+        let finished = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"too_few_groups","session_id":"s"}"#;
+
+        assert!(
+            compacted_from_line(started, false),
+            "the status line says it"
+        );
+        assert!(
+            !compacted_from_line(finished, false),
+            "the result line alone is not the event"
+        );
+        assert!(
+            compacted_from_line(finished, true),
+            "a compaction already seen is not un-seen by the lines after it"
+        );
+        assert!(
+            !compacted_from_line(r#"{"type":"assistant"}"#, false),
+            "an ordinary line says nothing about compaction"
+        );
+        assert!(
+            !compacted_from_line("not json at all", false),
+            "an unparseable line is not evidence of anything"
+        );
+    }
+
+    /// A compaction belongs to the turn it happened in, and to no other turn of the same process.
+    ///
+    /// The splitter is where this has to hold: on the multi-turn path one process answers several
+    /// times, and a flag left standing would mark every later turn as the one where the
+    /// conversation got shorter.
+    #[test]
+    fn a_compaction_marks_one_turn_and_not_the_ones_after_it() {
+        let mut splitter = TurnSplitter::new();
+        let result =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1,"session_id":"s"}"#;
+
+        splitter.line(
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#.into(),
+        );
+        let first = splitter.line(result.into());
+        let TurnEvent::Ended(first) = &first[1] else {
+            panic!("the result line ends a turn: {first:?}");
+        };
+        assert!(first.compacted, "the turn it happened in carries it");
+
+        let second = splitter.line(result.into());
+        let TurnEvent::Ended(second) = &second[1] else {
+            panic!("the result line ends a turn: {second:?}");
+        };
+        assert!(
+            !second.compacted,
+            "the next turn did not compact, and must not inherit that it did"
         );
     }
 
@@ -3414,6 +3701,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             ..Default::default()
         };
@@ -3500,6 +3788,7 @@ mod tests {
             append_system_prompt: None,
             denied_tools: Vec::new(),
             session_name: None,
+            context_window: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -3624,6 +3913,7 @@ mod tests {
             append_system_prompt: None,
             denied_tools: Vec::new(),
             session_name: None,
+            context_window: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -3643,6 +3933,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             last_plan_only: std::sync::Mutex::new(None),
             ..Default::default()
@@ -3679,6 +3970,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             // The fake releases one canned event per interval. The complete run therefore lasts
             // well beyond the progress deadline while every individual quiet gap stays below it.
@@ -3916,6 +4208,206 @@ mod tests {
 
     fn said(text: &str) -> serde_json::Value {
         serde_json::json!([{"type": "text", "text": text}])
+    }
+
+    /* ------------------------------------------- what a tool answered -- */
+
+    /// One `tool_result`, as the CLI sends one.
+    fn answered(tool_use_id: &str, content: serde_json::Value, is_error: bool) -> String {
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error
+            }]}
+        })
+        .to_string()
+    }
+
+    /// A turn said what it REACHED FOR and never what it found.
+    ///
+    /// `Bash` beside `cargo test dates::`, with no way to learn from the conversation whether the
+    /// tests passed — the paragraph underneath is the model's summary of exactly that, and a
+    /// summary is what somebody opening a tool call has decided not to take on trust.
+    #[test]
+    fn a_tool_call_carries_what_the_tool_answered() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": "cargo test dates::"}
+            }])),
+            answered(
+                "toolu_1",
+                serde_json::json!("test result: ok. 3 passed"),
+                false,
+            ),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.did.len(), 1);
+        assert_eq!(
+            live.did[0].result.as_deref(),
+            Some("test result: ok. 3 passed")
+        );
+        assert_eq!(live.did[0].result_chars, Some(25));
+        assert!(!live.did[0].result_failed);
+        // And the tool has stopped running, which is the behaviour that was already here.
+        assert_eq!(live.doing, None);
+    }
+
+    /// Paired by id and never by position.
+    ///
+    /// The CLI runs tool calls concurrently, so answers arrive in whatever order the tools finish
+    /// — "the most recent call" is wrong exactly when it matters, and the failure is quiet: two
+    /// real answers, each filed under the other's question.
+    #[test]
+    fn two_tools_in_flight_get_their_own_answers_back() {
+        let stream = [
+            message(serde_json::json!([
+                {"type": "tool_use", "id": "toolu_slow", "name": "Bash",
+                 "input": {"command": "cargo test"}},
+                {"type": "tool_use", "id": "toolu_fast", "name": "Read",
+                 "input": {"file_path": "core/src/dates.rs"}}
+            ])),
+            // The second call answers first, which is the whole point of this test.
+            answered("toolu_fast", serde_json::json!("fn is_leap_year"), false),
+            answered("toolu_slow", serde_json::json!("test result: ok"), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.did[0].name, "Bash");
+        assert_eq!(live.did[0].result.as_deref(), Some("test result: ok"));
+        assert_eq!(live.did[1].name, "Read");
+        assert_eq!(live.did[1].result.as_deref(), Some("fn is_leap_year"));
+    }
+
+    /// A `Read` answers with the whole file, and the whole file does not go in a database row.
+    ///
+    /// The full length travels beside the cut so the window can say what it is NOT showing — a
+    /// truncation presented as the whole answer is how somebody concludes a command printed
+    /// nothing after the first thirty lines.
+    #[test]
+    fn a_long_answer_is_cut_and_says_how_long_it_really_was() {
+        let whole = "x".repeat(RESULT_LIMIT + 500);
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Read",
+                "input": {"file_path": "big.rs"}
+            }])),
+            answered("toolu_1", serde_json::json!(whole), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(
+            live.did[0].result.as_ref().map(|kept| kept.chars().count()),
+            Some(RESULT_LIMIT)
+        );
+        assert_eq!(live.did[0].result_chars, Some((RESULT_LIMIT + 500) as i64));
+    }
+
+    /// "The command failed" and "the command printed something that mentions an error" are
+    /// different facts, and only the stream knows which this was.
+    #[test]
+    fn a_tool_that_failed_is_recorded_as_having_failed() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": "cargo test"}
+            }])),
+            answered(
+                "toolu_1",
+                serde_json::json!("error: could not compile"),
+                true,
+            ),
+        ]
+        .join("\n");
+
+        assert!(live_from_stream(&stream).did[0].result_failed);
+    }
+
+    /// The CLI sends `content` two ways, and both are ordinary.
+    #[test]
+    fn an_answer_sent_as_blocks_reads_back_as_its_text() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Grep", "input": {"pattern": "leap"}
+            }])),
+            answered(
+                "toolu_1",
+                serde_json::json!([{"type": "text", "text": "core/src/dates.rs:12"}]),
+                false,
+            ),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            live_from_stream(&stream).did[0].result.as_deref(),
+            Some("core/src/dates.rs:12")
+        );
+    }
+
+    /// An answer whose id names no call this stream made belongs to something that is not in this
+    /// list, and is dropped rather than attached to whatever happened to be nearest.
+    #[test]
+    fn an_answer_to_a_call_this_stream_never_made_is_dropped() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a.rs"}
+            }])),
+            answered("toolu_somebody_else", serde_json::json!("not ours"), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+        assert_eq!(live.did[0].result, None);
+        // It still ended the wait: a tool answered, whichever one it was.
+        assert_eq!(live.doing, None);
+    }
+
+    /// A turn recorded before any of this existed still reads back.
+    ///
+    /// `tools_used` is stored JSON, and every row already in the database is a call with none of
+    /// these three fields. They default to absent, which is exactly what those turns knew.
+    #[test]
+    fn a_stored_call_from_before_the_answers_existed_still_parses() {
+        let old: ToolCall =
+            serde_json::from_str(r#"{"name":"Read","detail":"core/src/dates.rs"}"#).unwrap();
+
+        assert_eq!(old.name, "Read");
+        assert_eq!(old.result, None);
+        assert_eq!(old.result_chars, None);
+        assert!(!old.result_failed);
+    }
+
+    /// And a call with nothing to say about its answer says nothing on the wire.
+    ///
+    /// `skip_serializing_if` is what keeps the transcript the size it was: three null fields per
+    /// call, over a hundred turns, on a route polled once a second.
+    #[test]
+    fn a_call_without_an_answer_serialises_without_the_fields() {
+        let bare = ToolCall {
+            name: "Read".to_string(),
+            detail: None,
+            todos: Vec::new(),
+            result: None,
+            result_chars: None,
+            result_failed: false,
+        };
+
+        let json = serde_json::to_string(&bare).unwrap();
+
+        assert!(
+            !json.contains("result"),
+            "the empty answer was serialised: {json}"
+        );
     }
 
     #[test]

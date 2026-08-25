@@ -2514,6 +2514,7 @@ async fn spawn_agent(
         append_system_prompt: None,
         denied_tools: Vec::new(),
         session_name: None,
+        context_window: None,
         // The economy half of the boundary — see `mcp_tools::TEAM_TOOLS`.
         allowed_mcp_tools: Some(crate::mcp_tools::TEAM_TOOLS),
     };
@@ -4000,6 +4001,7 @@ mod tests {
         AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,

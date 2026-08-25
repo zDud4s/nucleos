@@ -22,8 +22,8 @@
 //! restarts and a streak that resets on restart would let a permanent regression stay permanently
 //! below the threshold.
 //!
-//! **What it deliberately does NOT report.** Anything the daemon already answers. Chats rotate at
-//! `CONTEXT_ROTATION_TOKENS`; every other mode hands off at four fifths of
+//! **What it deliberately does NOT report.** Anything the daemon already answers. Chats are
+//! compacted in place by the CLI at their own window; every other mode hands off at four fifths of
 //! `HANDOFF_CONTEXT_LIMIT_FLOOR` and records a successor as it goes. So the context signal reports
 //! the handoff FAILING to happen, not the swelling — a detector that names a threshold enforced
 //! elsewhere is announcing somebody else's solved problem to somebody who cannot act on it. The same
@@ -339,16 +339,16 @@ fn cache_verdict(measures: &Measures, thresholds: &Thresholds) -> Verdict {
     Verdict::from(read == 0 && created == 0)
 }
 
-/// Context that grew past the ceiling WITHOUT anything having rotated it away.
+/// Context that grew past the ceiling WITHOUT anything having carried it over.
 ///
-/// Not the swelling itself, which the daemon already answers twice over: `assistant.rs` rotates a
-/// conversation at `CONTEXT_ROTATION_TOKENS`, and every other mode hands off at four fifths of
+/// Not the swelling itself, which the daemon already answers twice over: a conversation is compacted
+/// in place by the CLI at its own window, and every other mode hands off at four fifths of
 /// `HANDOFF_CONTEXT_LIMIT_FLOOR` — 160_000 — recording a successor run as it goes. Reporting the
 /// swelling would name a threshold the daemon enforces itself, about a run whose successor is
 /// sitting in the same feed. What nothing else notices is the mechanism failing to fire.
 fn context_verdict(measures: &Measures, thresholds: &Thresholds) -> Verdict {
-    // Chats rotate in place and never record a successor, so the handoff evidence this signal reads
-    // does not exist for them. The question is not answerable here rather than answered `no`.
+    // Chats are compacted in place and never record a successor, so the handoff evidence this
+    // signal reads does not exist for them. Not answerable here, rather than answered `no`.
     if measures.mode == "assistant" {
         return Verdict::Undecidable;
     }

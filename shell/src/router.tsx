@@ -32,6 +32,7 @@ import { Runs, validateRunSearch } from "./pages/Runs";
 import { System } from "./pages/System";
 import { TeamRunDetail } from "./pages/TeamRunDetail";
 import { Teams } from "./pages/Teams";
+import { Bench } from "./team/Bench";
 import { Voice } from "./pages/Voice";
 import { Waiting } from "./pages/Waiting";
 import { Web } from "./pages/Web";
@@ -135,6 +136,13 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * is reached from inside a department rather than from its own list page.
  * Nothing else in the tree mentions `/team-runs`, so `router.test.tsx` asserts
  * it by name.
+ *
+ * `/teams/$teamId` is a `Bench` and NOT a second mounting of `Teams`, which it
+ * used to be. That page served both routes at once in the Council pattern —
+ * list on screen, detail added below — and the two altitudes turned out to want
+ * different things: `/teams` is a console over every department, and a
+ * department is a workbench that wants the page to itself. Two components is
+ * what makes that possible, and this line is where it is decided.
  */
 /**
  * A detail route may declare a search validator, which the nav-built routes have always been able
@@ -192,7 +200,7 @@ const DETAIL_ROUTES: {
   { path: "/chats/$chatId", component: Chats },
   { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },
-  { path: "/teams/$teamId", component: Teams },
+  { path: "/teams/$teamId", component: Bench },
   { path: "/team-runs/$runId", component: TeamRunDetail },
   { path: "/mail/$emailId", component: MailDetail },
   { path: "/web/pages/$pageId", component: Web },

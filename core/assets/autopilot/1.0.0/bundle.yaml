@@ -1,0 +1,6 @@
+description: >
+  The sequence every autonomous job in NucleOS has always run: plan the work, do it item by item
+  with a gate between each one, then review what landed. Seeded by the daemon from its own assets,
+  and read back like any other bundle.
+origin: built in — `core/assets/autopilot/`, seeded on first start
+owns: []

@@ -117,6 +117,16 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// One file's hash, as [`file_hashes`] records it.
+///
+/// Public so that something holding a bundle's bytes without a directory to walk — the seeded
+/// autopilot, which lives inside the binary — can build the same map and be compared through
+/// [`digest_of`] against a real one. Two spellings of this would be two answers to *has this bundle
+/// changed*, and the whole of drift rests on there being one.
+pub fn hash_of(contents: &[u8]) -> String {
+    hex(&Sha256::digest(contents))
+}
+
 /// Every file under `dir`, by relative forward-slash path, each mapped to the hash of its contents.
 ///
 /// Sorted by construction — a `BTreeMap` — because the bundle hash below folds this in order and a
@@ -171,7 +181,7 @@ fn walk(
             return Ok(());
         }
         *budget -= size;
-        found.insert(rel, hex(&Sha256::digest(&contents)));
+        found.insert(rel, hash_of(&contents));
     }
     Ok(())
 }

@@ -17,6 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/ui/vendor/dialog";
+import { Sparkline } from "@/ui/Sparkline";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -32,7 +33,7 @@ import {
  * **This is a list of LIBRARIES, not a list of screens**, and the distinction is what keeps it
  * short enough to stay true. A Content-Security-Policy refusal is a property of how a dependency
  * writes style — a `<style>` element it builds at runtime, or a `style=` attribute it puts into
- * markup — so covering one screen that uses xyflow covers every screen that uses xyflow. Four
+ * markup — so covering one screen that uses xyflow covers every screen that uses xyflow. Five
  * libraries in this app can write style that way, and every one of them has a surface below.
  *
  * The list is meant to be annoying in the same way `app/nav.test.ts` is: **adding a dependency
@@ -46,9 +47,14 @@ import {
  * - **`FleetCanvas`** is not here. It is xyflow, and xyflow is already covered by the workflow
  *   canvas; a second surface of the same library buys a second chance to be slow and no new
  *   information.
- * - **`@visx/*`** is not here because nothing in `src/` imports it yet. It was installed in slice
- *   0 for charts that have not landed. When the first one does, it wants a row — a chart library
- *   that emits a `<style>` for its tooltips is exactly this gate's case.
+ * - **Radix Tabs** is not here, and it is the same argument in a different library: Tabs rides the
+ *   roving-focus machinery the dropdown already exercises and does not position with Popper, so it
+ *   can emit nothing the `menu` surface has not already proved.
+ *
+ * This header used to say `@visx/*` was absent because nothing in `src/` imported it, and that
+ * it would want a row when something did. Something does: `ui/Sparkline.tsx`. The row is `charts`,
+ * below, and this paragraph is rewritten rather than left standing as a comment that has quietly
+ * become false — which is the failure mode a list like this dies of.
  */
 
 /** One thing under test: mounted alone, on its own page load, so a refusal has one suspect. */
@@ -224,6 +230,29 @@ function PaletteSurface({ done }: { done: () => void }) {
   );
 }
 
+/**
+ * `@visx/*`, through the one chart this app draws.
+ *
+ * A chart library is this gate's canonical case: it computes geometry at render time and the
+ * question is always whether it writes the result into the CSSOM or into a `style` attribute in
+ * markup. visx composes d3's scales into React elements rather than mutating the DOM, so it should
+ * be clean — "should be" is precisely what a gate is for.
+ *
+ * Two sparklines rather than one, because the component has two branches and only one of them
+ * emits an `<svg>`: a series with points, and the dashed rail it draws for a series too short to
+ * plot. A surface that exercised only the happy branch would go green on half the component.
+ */
+function ChartSurface({ done }: { done: () => void }) {
+  useDoneAfter(done);
+
+  return (
+    <div className="p-6">
+      <Sparkline values={[0, 2, 1, 4, 3, 6, 2, 5]} label="the 8 runs in the window" />
+      <Sparkline values={[]} label="no run in the window" />
+    </div>
+  );
+}
+
 export const SURFACES: Surface[] = [
   {
     name: "workflow",
@@ -244,5 +273,10 @@ export const SURFACES: Surface[] = [
     name: "palette",
     why: "cmdk, the ⌘K palette, filtering and rendering inside a dialog",
     Component: PaletteSurface,
+  },
+  {
+    name: "charts",
+    why: "@visx/{group,scale,shape}, which compute geometry per render — both branches of Sparkline",
+    Component: ChartSurface,
   },
 ];

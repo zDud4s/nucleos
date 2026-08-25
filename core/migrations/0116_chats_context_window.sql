@@ -1,0 +1,47 @@
+-- The context window a conversation is given, and the end of rotating conversations by size.
+--
+-- What this replaces. Until now the daemon refused to `--resume` a session once any of its runs had
+-- recorded more than 140k of `context_fill`: it minted a fresh session and replayed six exchanges in
+-- front of the next message, under a sentence that began "This conversation has just begun a new
+-- context, so you do not remember what is below." That is a FORK, and it is the one the user could
+-- feel — the model on the far side of it had genuinely lost the conversation while the transcript
+-- above it read as unbroken.
+--
+-- It was also reactive, which is worth saying plainly because it undercuts the only argument for
+-- keeping it: `runs.context_fill` is written BY A RUN THAT ALREADY HAPPENED. The expensive turn was
+-- always bought first and the ceiling applied afterwards, so the ceiling never actually prevented
+-- the turn it existed to prevent.
+--
+-- What replaces it is the CLI's own auto-compaction, which is what the editor has been doing all
+-- along. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (an env var the runner now exports, clamped by the CLI
+-- itself to 100k–1M and capped at the model's real window) sets the window; the CLI compacts at
+-- `window - 13000` and continues IN THE SAME SESSION, with a summary it wrote itself. Verified in
+-- headless mode rather than assumed: `claude -p --resume` with the window forced low emits
+-- `{"type":"system","subtype":"status","status":"compacting"}` and then a `compact_result`, so the
+-- mechanism is live under `-p` and is not a REPL-only feature. This is PROACTIVE — it fires before
+-- the turn instead of after — so it bounds spend more tightly than the thing it replaces.
+--
+-- Why the number is per conversation and not another constant. Almost every chat wants the default
+-- and never touches this. The one that does is a conversation picked up from the editor: it arrives
+-- carrying a context somebody else's session already filled, and a window smaller than what it
+-- carries cannot hold it. So the pick-up path raises THIS row to fit what it found, capped at the
+-- model's window, and the conversation resumes instead of being handed a stump of its own past.
+--
+-- NULL means the default, deliberately, rather than the default written into every row. A default
+-- that lives in one constant can be changed by changing it; one copied into ten thousand rows at
+-- insert time can only be changed by a migration that then has to guess which rows meant it.
+ALTER TABLE chats ADD COLUMN context_window INTEGER;
+
+-- Whether the CLI compacted this turn's context before answering.
+--
+-- On the run and not derived at read time, because the transcript it is read from is not kept: the
+-- stream is parsed once as it arrives and the columns are what survives. It is the same shape
+-- `context_fill` and `thought` already have, for the same reason.
+--
+-- What it buys is that compaction is VISIBLE. The complaint this whole change answers is not that
+-- the conversation was compacted — the editor compacts too — it is that something happened to the
+-- conversation and nothing said so. A turn that carries this draws a line in the transcript saying
+-- the older exchanges were summarised here, which is a fact somebody can act on, and the opposite
+-- of a fork nobody was told about.
+ALTER TABLE runs ADD COLUMN compacted INTEGER NOT NULL DEFAULT 0;
+

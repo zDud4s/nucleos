@@ -90,6 +90,13 @@ pub struct ChatSummary {
     /// a transcript that silently stopped mattering at some invisible point would be a worse lie
     /// than one that says where.
     pub cleared_after_run_id: Option<i64>,
+    /// The context window this conversation runs in, or `None` for the daemon's default.
+    ///
+    /// Travels to the window because the window draws "x of 140k" under every turn, and for a
+    /// conversation picked up from the editor that number is not 140k. A meter reading against a
+    /// constant the client keeps its own copy of is a meter that is wrong for exactly the
+    /// conversations most likely to be near their limit.
+    pub context_window: Option<i64>,
     pub created_at: String,
     /// Where this conversation's turns run, or `None` for the daemon's own directory.
     ///
@@ -107,8 +114,8 @@ pub struct ChatSummary {
     ///
     /// Travels to the list because the window draws what was already said in that conversation
     /// above the turns the daemon ran. Read off this row rather than off `assistant_sessions`,
-    /// which names the session the NEXT turn resumes and is replaced the first time a context
-    /// rotates — see 0082.
+    /// which names the session the NEXT turn resumes and is replaced the first time one is let go
+    /// of — see 0082.
     pub ide_session_id: Option<String>,
     /// The fallback title. Read from the turns rather than copied into `title` at creation, so it
     /// cannot go stale.
@@ -220,15 +227,6 @@ pub async fn set_plan_only(pool: &SqlitePool, chat_id: &str, planning: bool) -> 
     Ok(())
 }
 
-/// Which model answers this conversation, and how hard it is asked to think.
-///
-/// One query for both, and read on the turn path — matching `cwd_of` and `brain_of`, whose comments
-/// give the reason: `get` walks the whole list to answer, and this runs before every single turn.
-/// Together rather than separately because they are read together and never apart: a turn needs
-/// both to build its request, and two queries would be two round trips for one decision.
-///
-/// `(None, None)` is the state every conversation opened before this column existed is in, and it
-/// means the same thing it meant then — the daemon's configured model, at the CLI's own effort.
 /// Everything a conversation says about HOW its next turn should run.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Answering {
@@ -249,8 +247,23 @@ pub struct Answering {
     /// in `claude --resume`, so somebody looking at their own machine's sessions sees a wall of
     /// timestamps where this app's conversations are.
     pub session_name: Option<String>,
+    /// The context window this conversation runs in, or `None` for the daemon's default.
+    ///
+    /// Written only by the pick-up path, and only upward: a conversation continued from the editor
+    /// arrives carrying context somebody else's session filled, and a window smaller than what it
+    /// already holds is a window that compacts its past away on the very first turn.
+    pub context_window: Option<i64>,
 }
 
+/// Which model answers this conversation, and how hard it is asked to think.
+///
+/// **Only tests call this**, and the `#[cfg(test)]` says so rather than letting the build carry a
+/// function nothing in it reaches. It used to be the turn path's own read; `answering` below took
+/// that over when the same query grew seven more columns, and every caller that mattered moved
+/// with it. What stayed behind is eight assertions in `http.rs` that are about these two columns
+/// and no others — `(Some("opus"), None)` is one thought, and the same eight reaching into an
+/// `Answering` for two of its nine fields is not.
+#[cfg(test)]
 pub async fn model_of(
     pool: &SqlitePool,
     chat_id: &str,
@@ -263,7 +276,10 @@ pub async fn model_of(
 ///
 /// One query and one struct, because the turn path reads all of it at once and never a piece of it
 /// alone: two round trips for one decision is two chances to read a row somebody changed in
-/// between. It grew out of `model_of`, which is kept as the narrow view its callers want.
+/// between. This runs before every single turn — the same reason `cwd_of` and `brain_of` give for
+/// reading with one query what could have been read with several.
+///
+/// It grew out of `model_of`, which is now reached only from tests.
 ///
 /// A row that is not there answers `Default` rather than failing — every conversation opened before
 /// these columns existed is in exactly that state, and it means what it always meant: the daemon's
@@ -297,27 +313,41 @@ fn subagents_from(raw: Option<String>) -> Vec<crate::runner::Subagent> {
         .collect()
 }
 
+/// The row `answering` reads, in the order its `SELECT` names the columns.
+///
+/// Named rather than written out at the binding, where ten anonymous `Option`s in a row tell a
+/// reader nothing about which is which and tell the compiler nothing either — put `denied_tools`
+/// where `agents` goes and both the tuple and the query still typecheck, and the mistake surfaces
+/// as a conversation that has denied the tools it meant to define helpers with.
+///
+/// The comments are the only thing standing between the two halves of that, so they stay beside
+/// the columns. This list and the `SELECT` below are one thing written twice; changing either
+/// without the other is the bug this alias exists to make visible.
+type AnsweringRow = (
+    Option<String>, // model
+    Option<String>, // effort
+    Option<String>, // fallback_model
+    Option<String>, // extra_dirs
+    Option<f64>,    // turn_budget_usd
+    Option<String>, // agents
+    Option<String>, // system_prompt
+    Option<String>, // denied_tools
+    Option<String>, // title
+    Option<i64>,    // context_window
+);
+
 pub async fn answering(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Answering> {
-    let found: Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<f64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let found: Option<AnsweringRow> = sqlx::query_as(
         "SELECT model, effort, fallback_model, extra_dirs, turn_budget_usd, agents,
-                system_prompt, denied_tools, title
+                system_prompt, denied_tools, title, context_window
            FROM chats WHERE chat_id = ?",
     )
     .bind(chat_id)
     .fetch_optional(pool)
     .await?;
 
-    let Some((model, effort, fallback, dirs, ceiling, agents, instructions, denied, title)) = found
+    let Some((model, effort, fallback, dirs, ceiling, agents, instructions, denied, title, window)) =
+        found
     else {
         return Ok(Answering::default());
     };
@@ -359,7 +389,29 @@ pub async fn answering(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Answeri
         // an argument-vector budget that the message itself needs — see `INSTRUCTIONS_CEILING`.
         // By characters and not bytes, because a cut mid-character is not a shorter name.
         session_name: title.map(|name| name.chars().take(120).collect::<String>()),
+        context_window: window,
     })
+}
+
+/// Widens this conversation's context window to hold what it is about to be given.
+///
+/// Only ever wider. The caller is the pick-up path, which has just measured a session somebody else
+/// filled; narrowing a conversation that already contains more than the new number would compact
+/// its past away on the first turn, which is the outcome the whole change exists to stop.
+///
+/// `assistant::window_of` clamps on the way out too, so a number stored here that a later release
+/// no longer considers sane is corrected at read time rather than left to disagree with the CLI.
+pub async fn widen_window(pool: &SqlitePool, chat_id: &str, tokens: i64) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE chats SET context_window = ?
+          WHERE chat_id = ? AND (context_window IS NULL OR context_window < ?)",
+    )
+    .bind(tokens)
+    .bind(chat_id)
+    .bind(tokens)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Sets who answers when the chosen model is unavailable. Empty clears it.
@@ -684,7 +736,7 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
     sqlx::query_as::<_, ChatSummary>(
         "SELECT c.chat_id, c.title, c.brain, c.model, c.effort, c.fallback_model,
                 c.extra_dirs, c.turn_budget_usd, c.agents, c.system_prompt, c.denied_tools,
-                c.cleared_after_run_id, c.created_at, c.cwd, c.ide_session_id,
+                c.cleared_after_run_id, c.context_window, c.created_at, c.cwd, c.ide_session_id,
                 (SELECT r.prompt FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                   ORDER BY r.id ASC LIMIT 1) AS first_message,
@@ -724,9 +776,10 @@ pub async fn get(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<ChatSu
 ///
 /// Two columns, and neither is the other's fallback. `chats.ide_session_id` is where a conversation
 /// CAME FROM and never moves; `assistant_sessions.session_id` is what its next turn RESUMES and is
-/// replaced the first time a context rotates or a turn reads third-party text. A session is spoken
-/// for if either names it: without the first, a rotated conversation puts its own origin back on
-/// offer and picking it up again would put two threads on one context; without the second, the
+/// replaced the first time a turn reads third-party text or somebody asks for a fresh context. A
+/// session is spoken for if either names it: without the first, a conversation given a new session
+/// puts its own origin back on offer and picking it up again would put two threads on one context;
+/// without the second, the
 /// sessions the daemon minted here would be missing from the answer this has always given.
 ///
 /// Archiving does not release one, which is the behaviour that was already there — the
@@ -1111,9 +1164,9 @@ mod tests {
     /// on its own row.
     ///
     /// Not read back off `assistant_sessions`. That row holds the session the NEXT turn resumes,
-    /// and the daemon replaces it whenever a context rotates past its ceiling or a turn reads
-    /// third-party text — so within a message or two it names a session the CLI minted here, not
-    /// the one this conversation came from. The window needs the original every time the chat is
+    /// and the daemon replaces it whenever a turn reads third-party text or somebody asks for a
+    /// fresh context — so it can come to name a session the CLI minted here rather than the one
+    /// this conversation came from. The window needs the original every time the chat is
     /// opened, to draw what was already said in it, and the original never changes.
     #[tokio::test]
     async fn a_chat_picked_up_from_the_editor_remembers_which_conversation_it_came_from() {
@@ -1147,12 +1200,16 @@ mod tests {
 
     /// A conversation stays picked up after the session it resumes has moved on.
     ///
-    /// This is the case the column exists for. The daemon rotates a context past its ceiling by
-    /// minting a fresh session and replacing the row that named the old one — so a filter reading
-    /// only `assistant_sessions` puts the conversation's ORIGIN back on the list of things to pick
-    /// up, and picking it up a second time puts two threads on one context.
+    /// This is the case the column exists for. A conversation can be given a fresh session —
+    /// after reading third-party text, or on request — and the row that named the old one is
+    /// replaced, so a filter reading only `assistant_sessions` puts the conversation's ORIGIN
+    /// back on the list of things to pick up, and picking it up a second time puts two threads
+    /// on one context.
+    ///
+    /// It used to happen on SIZE as well, which made this an every-long-conversation problem
+    /// rather than an occasional one. Rarer now, and no less wrong when it happens.
     #[tokio::test]
-    async fn a_conversation_stays_picked_up_after_the_session_it_resumes_has_rotated() {
+    async fn a_conversation_stays_picked_up_after_the_session_it_resumes_was_replaced() {
         let pool = test_pool().await;
         let id = create(
             &pool,
@@ -1165,14 +1222,45 @@ mod tests {
             .await
             .unwrap();
 
-        // The context fills, and the next turn runs in a session the daemon minted here.
+        // The conversation is let go of, and the next turn runs in a session the daemon minted here.
         crate::assistant::upsert_session(&pool, &id, "minted-here", "2026-08-11T11:00:00+00:00")
             .await
             .unwrap();
 
         let taken = picked_up(&pool).await.unwrap();
         assert!(taken.contains(&"aaaa-1111".to_string()), "{taken:?}");
-        // And the one it resumes now, which is what kept the old filter honest before rotation.
+        // And the one it resumes now, which is what kept the old filter honest on its own.
         assert!(taken.contains(&"minted-here".to_string()), "{taken:?}");
+    }
+
+    /// A conversation's window only ever widens, and this is the whole of why.
+    ///
+    /// The writer is the pick-up path, which has just measured a session somebody else filled.
+    /// Narrowing a conversation that already holds more than the new number would have the CLI
+    /// compact its inherited past away on the very first turn — which is the outcome this whole
+    /// change exists to stop, arrived at from the other direction.
+    #[tokio::test]
+    async fn a_conversation_widens_to_hold_what_it_inherited_and_never_narrows() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+
+        assert_eq!(
+            answering(&pool, &id).await.unwrap().context_window,
+            None,
+            "an ordinary conversation names no window and runs in the default"
+        );
+
+        widen_window(&pool, &id, 190_000).await.unwrap();
+        assert_eq!(
+            answering(&pool, &id).await.unwrap().context_window,
+            Some(190_000)
+        );
+
+        widen_window(&pool, &id, 150_000).await.unwrap();
+        assert_eq!(
+            answering(&pool, &id).await.unwrap().context_window,
+            Some(190_000),
+            "a narrower window would compact away what the conversation is already carrying"
+        );
     }
 }

@@ -44,6 +44,11 @@
   --leading-tight: 1.2;
   --leading-snug: 1.35;
   --leading-normal: 1.55;
+  /* For running prose that is actually READ rather than scanned — a model's answer, and
+     nothing else so far. 1.55 is right for a label, a row, a two-line note; over the twenty
+     lines of a real reply it packs the lines close enough that the eye loses which one it
+     was on coming back from the left margin. */
+  --leading-relaxed: 1.7;
 
   /* Group labels and badges are set in small caps with air between letters;
      at 11px an untracked uppercase run is a smear. */
@@ -127,6 +132,26 @@
   --tone-info-fg: #66b5f0;
   --tone-info-bg: rgba(102, 181, 240, 0.12);
   --tone-info-border: rgba(102, 181, 240, 0.3);
+
+  /**
+   * The soft cut at both ends of a scrolling column.
+   *
+   * A hard edge cuts a line of text through the middle of its letters, and what that
+   * looks like is not "there is more" — it looks like the text is broken. Every reader
+   * worth copying fades the cut instead.
+   *
+   * One rem, and no more, on purpose: a line here is about 20px tall, so a 16px fade
+   * softens the cut without ever hiding a line you are still reading — including the
+   * last one, when the column is scrolled all the way down and the fade has nothing
+   * left to promise.
+   */
+  --scroll-fade: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--space-4),
+    #000 calc(100% - var(--space-4)),
+    transparent 100%
+  );
 
   /* ------------------------------------------------------------ shadow -- */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);

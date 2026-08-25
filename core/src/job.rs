@@ -562,6 +562,13 @@ pub enum Outcome {
 /// out of a binding they went on using; they borrow now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
+    /// Turn the sentence a job was asked with into a written brief, before anything is planned.
+    ///
+    /// First and not second, and that ordering is the whole of the node. The plan node's output is
+    /// a QUEUE — descriptions the implement nodes are handed one at a time — so whatever the
+    /// planner failed to work out about a vague request is not recoverable downstream: every item
+    /// after it inherits the misunderstanding, and the gate measures the wrong thing correctly.
+    SpawnSpec,
     SpawnPlan,
     /// The items to start now, by ordinal — **at most one** for a job without a team.
     ///
@@ -672,6 +679,23 @@ pub const DRY_ROUNDS_TO_STOP: i64 = 2;
 /// Everything the decision below needs to see, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobView {
+    /// Whether the job has a written brief, or is past the point of wanting one.
+    ///
+    /// **`planned` is deliberately part of this, and it is what makes the node safe to add to a
+    /// live system.** Every job that existed before the spec node did has a queue and no spec run,
+    /// and without this arm the first tick after the upgrade would spawn a spec node on top of work
+    /// already under way — writing a brief for a job whose items are half-done. A job that has
+    /// planned is past the moment a brief would have helped, whatever its history says.
+    ///
+    /// A spec run that ended badly still counts. The brief is context, not a gate: without one the
+    /// planner reads the raw request, which is exactly what it did before this node existed, and
+    /// failing a whole job over a document that did not get written would be a worse answer than
+    /// the behaviour it replaced.
+    pub specced: bool,
+    /// Whether a spec node is in flight right now. Same reason `planning` exists beside `planned`:
+    /// the brief does not exist in either case, and without this every tick would spawn a second
+    /// spec node on top of the first.
+    pub speccing: bool,
     /// Whether a plan node has already produced a queue. Distinct from `items` being empty, which
     /// is a planner that looked and found no work.
     pub planned: bool,
@@ -798,6 +822,16 @@ pub fn next_step(job: &JobView) -> Next {
         }
     }
 
+    // Before the plan, because a queue built from a misread request is a queue every node after it
+    // obeys. `specced` is true for any job that already planned, so this arm is unreachable for work
+    // that predates the node — see `JobView::specced`.
+    if !job.specced {
+        return if job.speccing {
+            Next::Wait
+        } else {
+            Next::SpawnSpec
+        };
+    }
     if !job.planned {
         return if job.planning {
             Next::Wait
@@ -1411,6 +1445,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             .await?;
 
     let plan_run = latest_node("plan").await?;
+    let spec_run = latest_node("spec").await?;
 
     // The replan node is what OPENS a round, so its id is the line between one round and the last —
     // which is how the review below is scoped without a `runs.round` column. Without the scoping the
@@ -1458,6 +1493,26 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         // planner that honestly found nothing to do. And a job that HAS items has plainly planned,
         // whatever its status says — which is what stops a status lost to a bad resume from
         // spawning a second planner on top of a queue that already exists.
+        // Four arms, and each one answers a job the others miss.
+        //
+        // A spec run that has ENDED, whichever way it ended — the ordinary case, and why a spec
+        // node that failed does not strand a job (see the field's own doc).
+        //
+        // **A plan node existing AT ALL**, which is the arm two tests had to teach this: a job whose
+        // planner is running, or paused waiting for a person to approve one action, has a stage of
+        // `planning` and an empty queue, so without this it read as unspecced and the very next tick
+        // sent it BACKWARDS to write a brief for a plan already under way.
+        //
+        // Then a job past the planning stage, and a job with a queue: two readings of "this predates
+        // the spec node", kept apart because a job whose status was lost to a bad resume has one of
+        // them and not the other.
+        specced: spec_run
+            .as_deref()
+            .is_some_and(|status| !node_in_flight(status))
+            || plan_run.is_some()
+            || stage != "planning"
+            || !items.is_empty(),
+        speccing: spec_run.as_deref().is_some_and(node_in_flight),
         planned: stage != "planning" || !items.is_empty(),
         planning: plan_run.as_deref().is_some_and(node_in_flight),
         items: items
@@ -2234,15 +2289,77 @@ const HISTORY_IS_THE_JOBS: &str = "The job commits the tree itself once an item'
      item should ask anyone to commit, stage or branch — that work is already done for you, and an \
      item that asks for it is skipped rather than done.";
 
+/// The prompt the spec node is given.
+///
+/// The node exists because of what the plan node produces. A plan is a QUEUE — descriptions handed
+/// to implement nodes one at a time, each in its own context window — so anything the planner
+/// misread about a vague request is not recoverable afterwards: every item inherits it, and the
+/// gate then measures the wrong work correctly. Writing the reading down first makes it a document
+/// somebody can disagree with while disagreeing is still cheap.
+///
+/// `Not this` is the section that earns the node. A request grows in the gap between what was asked
+/// and what a reader assumes, and that gap is invisible until somebody writes down which side of it
+/// they landed on.
+///
+/// It is told to keep a precise request short, deliberately. A node that must fill five headings
+/// will fill them, and a spec that restates a clear sentence at length is a document the planner
+/// then has to read past.
+pub fn spec_prompt(task: &str, artifacts: &str) -> String {
+    format!(
+        "You are the SPEC node of an autonomous job. Nothing has been planned yet and no work has \
+         started.\n\n\
+         The job was asked for in one sentence, at the bottom, and that sentence is everything \
+         anybody wrote down. Read the project first — the working tree is the project — and then \
+         write down what you understood, so that every node after you works from a considered \
+         document instead of from a sentence each of them interprets alone.\n\n\
+         {LOOK_WITH_THE_READING_TOOLS}\n\n\
+         Write it to {artifacts}/{SPEC_FILE} and change nothing else. Cover, in this order:\n\n\
+         - What is being asked, in your own words, including what was implied rather than said.\n\
+         - What it touches: the files, modules or surfaces you expect to be involved, and how you \
+         know — you have just read the project, so say what you saw rather than what you assume.\n\
+         - Done means: what has to be true for this to be finished, written so somebody else could \
+         check it without asking you.\n\
+         - Not this: what a reasonable reader might think is included and is not. This section is \
+         worth more than the other four, because it is the only one that stops the work growing.\n\
+         - Decided for you: every question the request did not answer, the answer you chose, and \
+         why. Somebody will read this to disagree with you, and that is what it is for.\n\n\
+         Do not begin any of the work, and do not write a plan or a list of tasks — the node after \
+         you does that, and it reads this file. If the request is already precise, say so and keep \
+         this short: a spec that pads a clear request is worse than no spec at all.\n\n\
+         The task:\n\n{task}"
+    )
+}
+
 /// The prompt the plan node is given.
 ///
 /// It says the file is the only thing read, because it is: §5.2 of the design takes the queue from
 /// `plan.json` and never from stdout, so that a stream truncated mid-write cannot be parsed into a
 /// plausible short queue that reads as "there was less work than expected".
-pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str, graph: Option<&Graph>) -> String {
+///
+/// `spec` is a boolean and not a path, and it is a boolean rather than "the prompt always names the
+/// file" on purpose: a sentence telling the planner to read a document that is not there is worse
+/// than saying nothing, because a node sent to a missing file spends a turn finding that out.
+pub fn plan_prompt(
+    task: &str,
+    max_items: usize,
+    artifacts: &str,
+    graph: Option<&Graph>,
+    spec: bool,
+) -> String {
+    let brief = if spec {
+        format!(
+            "A spec node has already read the project and written down what it understood, in \
+             {artifacts}/{SPEC_FILE}. Read that first and plan from it. The task at the bottom is \
+             the sentence it was written from, kept here so you can see what was actually asked; \
+             where the two differ, the spec is the considered reading — but its `Decided for you` \
+             section is decisions it took on somebody's behalf, not instructions from them.\n\n"
+        )
+    } else {
+        String::new()
+    };
     let Some(graph) = graph else {
         return format!(
-            "You are the PLAN node of an autonomous job. Break the task below into at most \
+            "{brief}You are the PLAN node of an autonomous job. Break the task below into at most \
              {max_items} items that can be done one after another, in order, in the same working \
              tree. Prefer fewer, larger items to more, smaller ones.\n\n\
              {HISTORY_IS_THE_JOBS}\n\n\
@@ -2258,7 +2375,7 @@ pub fn plan_prompt(task: &str, max_items: usize, artifacts: &str, graph: Option<
         );
     };
     format!(
-        "You are the PLAN node of an autonomous job that a TEAM will carry out. Break the task \
+        "{brief}You are the PLAN node of an autonomous job that a TEAM will carry out. Break the task \
          below into at most {max_items} items. Items that do not depend on each other are worked on \
          AT THE SAME TIME, each in a working tree of its own, so how you split the work decides how \
          much of it can happen at once.\n\n\
@@ -2699,6 +2816,14 @@ async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
 }
 
 pub const PLAN_FILE: &str = "plan.json";
+
+/// The brief a spec node writes, beside the queue a plan node writes.
+///
+/// Markdown and not JSON, unlike its sibling, because nothing parses it: it is read by the planner
+/// and by a person, and a schema would only invite a node to satisfy the shape while saying
+/// nothing. `plan.json` is machine-read and so has to be a document with fields; this is prose and
+/// is allowed to be.
+pub const SPEC_FILE: &str = "spec.md";
 
 /// Copies a round's plan aside and lists every archive the job has, newest last.
 ///
@@ -4202,13 +4327,31 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
     let artifacts = artifacts_for(&worktree.0);
 
     match next {
+        Next::SpawnSpec => {
+            let task = job.prompt.clone().unwrap_or_default();
+            let prompt = spec_prompt(&task, &artifacts);
+            spawn_node(state, job, "spec", prompt, None, worktree, NoRoom::Park).await
+        }
         Next::SpawnPlan => {
             let task = job.prompt.clone().unwrap_or_default();
+            // Asked of the disk and not of the view, because the view knows a spec NODE ran and
+            // this sentence is about a spec FILE existing. A node that ended badly, or ended well
+            // and wrote nothing, leaves the two apart — and the planner must not be sent to a file
+            // that is not there.
+            let spec_written = tokio::fs::metadata(
+                worktree
+                    .0
+                    .join(crate::worktree::ARTIFACTS_DIR)
+                    .join(SPEC_FILE),
+            )
+            .await
+            .is_ok();
             let prompt = plan_prompt(
                 &task,
                 job.max_items.max(0) as usize,
                 &artifacts,
                 graph_rules(pool, job).await.as_ref(),
+                spec_written,
             );
             spawn_node(state, job, "plan", prompt, None, worktree, NoRoom::Park).await
         }
@@ -5022,6 +5165,7 @@ mod tests {
         let state = AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: runner.clone(),
             triage_runner: None,
             local_triage_disabled: None,
@@ -5130,6 +5274,10 @@ mod tests {
     /// A job of one round, which is what every test written before rounds existed is about.
     fn view(planned: bool, items: &[ItemState], review: ReviewState) -> JobView {
         JobView {
+            // Already specced, so that every test written before the spec node
+            // existed keeps asking the question it was written to ask.
+            specced: true,
+            speccing: false,
             planned,
             planning: false,
             items: items.iter().copied().map(ItemView::plain).collect(),
@@ -5145,6 +5293,10 @@ mod tests {
     /// The same, for a job that was asked for more than one round.
     fn view_in_round(items: &[ItemState], review: ReviewState, rounds: RoundState) -> JobView {
         JobView {
+            // Already specced, so that every test written before the spec node
+            // existed keeps asking the question it was written to ask.
+            specced: true,
+            speccing: false,
             planned: true,
             planning: false,
             items: items.iter().copied().map(ItemView::plain).collect(),
@@ -5163,6 +5315,10 @@ mod tests {
     /// question the diff answers.
     fn view_with_team(items: &[ItemState], review: ReviewState) -> JobView {
         JobView {
+            // Already specced, so that every test written before the spec node
+            // existed keeps asking the question it was written to ask.
+            specced: true,
+            speccing: false,
             has_team: true,
             ..view(true, items, review)
         }
@@ -5175,6 +5331,10 @@ mod tests {
     /// slices mean exactly that. Raising the number is the thing this slice does, so it says so.
     fn view_with_parallel(items: &[ItemView], max_parallel: usize) -> JobView {
         JobView {
+            // Already specced, so that every test written before the spec node
+            // existed keeps asking the question it was written to ask.
+            specced: true,
+            speccing: false,
             planned: true,
             planning: false,
             items: items.to_vec(),
@@ -5488,6 +5648,122 @@ mod tests {
                 .await?;
         }
         Ok(job_id)
+    }
+
+    /// A job with nothing done at all: no brief, no queue, no node in flight.
+    ///
+    /// `view` answers `specced: true` on purpose — it is the shape every test written before this
+    /// node existed is about — so the one shape those tests cannot express is written here.
+    fn unspecced_view() -> JobView {
+        JobView {
+            specced: false,
+            speccing: false,
+            planned: false,
+            planning: false,
+            items: Vec::new(),
+            review: ReviewState::Pending,
+            rounds: RoundState::default(),
+            has_team: false,
+            max_parallel: 1,
+        }
+    }
+
+    /// The brief comes before the queue, and while it is being written nothing else starts.
+    ///
+    /// One walk rather than three assertions, for the reason the walk below is one: what matters is
+    /// the ORDER, and each of these three is right in isolation while being reachable at the wrong
+    /// moment.
+    #[test]
+    fn a_job_writes_a_brief_before_it_plans() {
+        let fresh = unspecced_view();
+        assert_eq!(next_step(&fresh), Next::SpawnSpec);
+
+        let writing = JobView {
+            speccing: true,
+            ..unspecced_view()
+        };
+        assert_eq!(
+            next_step(&writing),
+            Next::Wait,
+            "a second spec node must not start on top of the first"
+        );
+
+        let written = JobView {
+            specced: true,
+            ..unspecced_view()
+        };
+        assert_eq!(next_step(&written), Next::SpawnPlan);
+    }
+
+    /// The property that makes this node safe to add to a machine with jobs already running.
+    ///
+    /// Every job that existed before the spec node did has a queue and has never had a spec run, so
+    /// a `specced` computed from the run alone would answer `SpawnSpec` on the first tick after the
+    /// upgrade — writing a brief for work whose items are half done, and re-answering it forever
+    /// because the node's own output is not what this reads.
+    #[test]
+    fn um_job_a_meio_nao_recua_para_escrever_uma_spec() {
+        let midway = JobView {
+            specced: true,
+            speccing: false,
+            ..view(true, &[ItemState::Pending], ReviewState::Pending)
+        };
+        assert_eq!(
+            next_step(&midway),
+            Next::SpawnImplement(vec![0]),
+            "a job with a queue is past the moment a brief would have helped"
+        );
+    }
+
+    /// The node is told what to write and, as firmly, what not to do: a spec node that starts
+    /// planning produces a queue nothing reads, and one that starts working leaves edits in a tree
+    /// no gate has measured.
+    #[test]
+    fn a_spec_diz_onde_escrever_e_o_que_nao_fazer() {
+        let prompt = spec_prompt("make the roster useful", "/wt/.nucleos");
+
+        assert!(
+            prompt.contains("/wt/.nucleos/spec.md"),
+            "the node has to be told the exact file, or it writes somewhere nobody reads: {prompt}"
+        );
+        assert!(
+            prompt.contains("make the roster useful"),
+            "the request itself has to reach the node: {prompt}"
+        );
+        assert!(
+            prompt.contains("Not this"),
+            "the section that stops the work growing is the one this node is for: {prompt}"
+        );
+        assert!(
+            prompt.contains("do not write a plan"),
+            "a spec node that plans produces a queue the plan node then overwrites: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not begin any of the work"),
+            "a spec node that works leaves edits no gate has measured: {prompt}"
+        );
+    }
+
+    /// The planner is sent to the brief only when there is one to read. A sentence naming a missing
+    /// file costs the node a turn to find out, which is worse than not mentioning it.
+    #[test]
+    fn o_planeador_so_e_mandado_ler_a_spec_quando_ela_existe() {
+        let with = plan_prompt("t", 5, "/wt/.nucleos", None, true);
+        let without = plan_prompt("t", 5, "/wt/.nucleos", None, false);
+
+        assert!(
+            with.contains("/wt/.nucleos/spec.md"),
+            "the planner was not sent to the brief that exists: {with}"
+        );
+        assert!(
+            !without.contains("spec.md"),
+            "the planner was sent to a brief that was never written: {without}"
+        );
+        assert!(
+            with.contains("Decided for you"),
+            "the planner has to be told which part of the brief is somebody's decision and which \
+             part the spec node took on their behalf: {with}"
+        );
     }
 
     #[test]
@@ -6346,7 +6622,7 @@ mod tests {
     /// what was wrong is that the item asked for it.
     #[test]
     fn every_node_that_could_reach_for_git_is_told_the_job_commits() {
-        let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos", None);
+        let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos", None, false);
         let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos", None);
         // No hint, because what this pins is the paragraph every node gets regardless of one.
         let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None, None);
@@ -6614,7 +6890,7 @@ mod tests {
     /// about to list are numbered from 4, so any dependency it writes is a guess.
     #[test]
     fn a_teams_plan_prompt_names_the_ordinal_this_round_starts_at() {
-        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&directed(4)));
+        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&directed(4)), false);
         assert!(prompt.contains("NUMBERED FROM 4"), "{prompt}");
         assert!(prompt.contains("depends_on"));
         assert!(prompt.contains("EARLIER ordinal"));
@@ -6624,7 +6900,7 @@ mod tests {
         assert!(replan.contains("depends_on"));
 
         // And a job without a team is told none of it, because none of it applies.
-        let plain = plan_prompt("t", 5, "/wt/.nucleos", None);
+        let plain = plan_prompt("t", 5, "/wt/.nucleos", None, false);
         assert!(!plain.contains("depends_on"));
         assert!(!replan_prompt("t", 2, &[], "/wt/.nucleos", None).contains("depends_on"));
     }
@@ -6899,7 +7175,10 @@ mod tests {
         let view = load_view(&pool, job_id).await.unwrap();
 
         assert!(!view.planned);
-        assert_eq!(next_step(&view), Next::SpawnPlan);
+        // The queue is what this test is about, and it still does not exist. What comes FIRST
+        // changed: a job with nothing at all writes its brief before it plans, so the queue is now
+        // two nodes away rather than one.
+        assert_eq!(next_step(&view), Next::SpawnSpec);
     }
 
     #[tokio::test]
@@ -7065,7 +7344,7 @@ mod tests {
         let job = live_jobs(&pool).await.unwrap().pop().unwrap();
 
         let rules = graph_rules(&pool, &job).await.expect("a job with a team");
-        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&rules));
+        let prompt = plan_prompt("t", 5, "/wt/.nucleos", Some(&rules), false);
 
         assert!(prompt.contains("agent_id"), "{prompt}");
         assert!(prompt.contains("ana"), "{prompt}");
@@ -7483,6 +7762,49 @@ mod tests {
         assert!(
             second.is_ok(),
             "the row no longer holds exclusivity; the slot ceiling does"
+        );
+    }
+
+    /// The seam between the pure decision and the database, which is where a spec node would break
+    /// silently: `spawn_node` writes `runs.stage`, `load_view` reads it back, and if the two ever
+    /// disagreed on the word "spec" the job would spawn a spec node on every single tick — each one
+    /// invisible to the read that is supposed to notice the last one.
+    #[tokio::test]
+    async fn um_no_de_spec_em_voo_e_visto_como_em_voo_e_depois_como_feito() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "planning")
+            .await
+            .expect("a job that has not planned yet");
+
+        let fresh = load_view(&pool, job_id).await.unwrap();
+        assert!(
+            !fresh.specced && !fresh.speccing,
+            "a job with no spec run has no brief and none in flight"
+        );
+        assert_eq!(next_step(&fresh), Next::SpawnSpec);
+
+        let run_id = seed_node(&pool, job_id, "spec", "running").await;
+        let running = load_view(&pool, job_id).await.unwrap();
+        assert!(
+            running.speccing && !running.specced,
+            "a spec node in flight is speccing and not yet specced"
+        );
+        assert_eq!(next_step(&running), Next::Wait);
+
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let done = load_view(&pool, job_id).await.unwrap();
+        assert!(
+            done.specced && !done.speccing,
+            "a spec node that finished leaves the job specced"
+        );
+        assert_eq!(
+            next_step(&done),
+            Next::SpawnPlan,
+            "the queue is what comes after the brief"
         );
     }
 
@@ -9066,15 +9388,21 @@ mod tests {
 
         assert_eq!(walk(&state, job_id).await, "completed");
 
-        // Four runs from one trigger: plan, two items, review. This number IS the feature — one run
-        // per trigger being the ceiling is the whole thing the design exists to remove.
+        // Five runs from one trigger: spec, plan, two items, review. This number IS the feature —
+        // one run per trigger being the ceiling is the whole thing the design exists to remove.
+        //
+        // `spec` leads, and it was four runs until it did. The brief is written before the queue,
+        // because a queue built from a misread request is one that every node after it obeys.
         let stages: Vec<String> =
             sqlx::query_scalar("SELECT stage FROM runs WHERE job_id = ? ORDER BY id")
                 .bind(job_id)
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stages, vec!["plan", "implement", "implement", "review"]);
+        assert_eq!(
+            stages,
+            vec!["spec", "plan", "implement", "implement", "review"]
+        );
 
         // One worktree, shared by all four. A second row would give the directory two owners and
         // let the GC collect it out from under a job still working in it.
@@ -9169,7 +9497,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             stages,
-            vec!["plan", "implement", "implement", "review"],
+            vec!["spec", "plan", "implement", "implement", "review"],
             "the whole queue runs, and the review still gets to see what came out of it"
         );
 
@@ -9234,9 +9562,12 @@ mod tests {
         resume(&pool, job_id).await.unwrap();
 
         assert_eq!(job_status(&pool, job_id).await, "planning");
+        // Still the property this test is named for: it came back knowing it has NOT planned, which
+        // is the whole of what `resume_status` protects. This job was parked before it had done
+        // anything at all, so what it comes back to is the brief rather than the queue.
         assert_eq!(
             next_step(&load_view(&pool, job_id).await.unwrap()),
-            Next::SpawnPlan
+            Next::SpawnSpec
         );
     }
 
@@ -10587,7 +10918,7 @@ mod tests {
     /// legitimate answer — otherwise a model asked to plan will find something to plan.
     #[test]
     fn the_plan_node_is_told_the_file_is_the_only_thing_read() {
-        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos", None);
+        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos", None, false);
         assert!(prompt.contains("advance the backlog"));
         assert!(prompt.contains("/wt/.nucleos/plan.json"));
         assert!(prompt.contains("at most 5"));
@@ -10600,7 +10931,7 @@ mod tests {
     /// context window in the wrong place.
     #[test]
     fn plan_prompt_asks_for_optional_file_hints() {
-        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos", None);
+        let prompt = plan_prompt("advance the backlog", 5, "/wt/.nucleos", None, false);
 
         assert!(
             prompt.contains(r#""files""#),

@@ -49,6 +49,19 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
 ///
 /// Kept as one query so the roster's `queue_full` flag and this gate stay the same arithmetic.
 ///
+/// **The `shadow_decisions` term is scoped to `runs.mode = 'shadow'`, and that scope is not
+/// incidental — it is the fix for a real defect, not a tidy-up.** A `worktree`-mode decision was
+/// already ENFORCED: the command ran, and there is no verdict left for a human to give it. If the
+/// classifier had withheld it instead, it became a `pending_approval` proposal, which the FIRST
+/// term above already counts — so an unfiltered second term either double-counts a proposal or
+/// counts an enforced action as if it were still waiting on someone, and a project that has only
+/// ever run in `worktree` mode can accumulate thousands of such rows with nobody ever able to clear
+/// them. That breaks the promise at the top of this module: this brake is NOT self-clearing without
+/// the filter, because nothing will ever present a `worktree`-mode row for review, so it can never
+/// be reviewed, so it never releases. Restricting the term to `shadow`-mode runs is what makes
+/// "releases the moment the human reviews something" true again — shadow decisions are the only
+/// ones a human can still render a verdict on.
+///
 /// **Excluding `skipped-item` is load-bearing and not tidying.** It and `action-approval` arrive
 /// through the same function in `hooks.rs` and say opposite things about the scarce resource this
 /// limit protects:
@@ -88,7 +101,8 @@ pub const OPEN_REVIEW_ITEMS_SQL: &str = "SELECT
     +
     (SELECT COUNT(*) FROM shadow_decisions
      JOIN runs ON shadow_decisions.run_id = runs.id
-     WHERE runs.project_id = ?1 AND shadow_decisions.human_verdict IS NULL)";
+     WHERE runs.project_id = ?1 AND shadow_decisions.human_verdict IS NULL
+       AND runs.mode = 'shadow')";
 
 pub async fn open_proposals(pool: &SqlitePool, project_id: &str) -> sqlx::Result<i64> {
     sqlx::query_scalar(OPEN_REVIEW_ITEMS_SQL)
@@ -170,11 +184,23 @@ mod tests {
     /// with no human verdict yet. This is what a shadow run actually produces — no proposal is ever
     /// minted — which is why the brake has to see it.
     async fn add_unreviewed_shadow_decisions(pool: &SqlitePool, project_id: &str, count: usize) {
+        add_unreviewed_decisions_in_mode(pool, project_id, "shadow", count).await;
+    }
+
+    /// Same shape as `add_unreviewed_shadow_decisions`, but the owning run can be seeded under any
+    /// mode — in particular `worktree`, to prove an already-enforced decision does not count here.
+    async fn add_unreviewed_decisions_in_mode(
+        pool: &SqlitePool,
+        project_id: &str,
+        mode: &str,
+        count: usize,
+    ) {
         let run_id = sqlx::query(
             "INSERT INTO runs (project_id, prompt, status, mode, created_at)
-             VALUES (?, 'shadow work', 'completed', 'shadow', '2026-07-27T00:00:00Z')",
+             VALUES (?, 'work', 'completed', ?, '2026-07-27T00:00:00Z')",
         )
         .bind(project_id)
+        .bind(mode)
         .execute(pool)
         .await
         .unwrap()
@@ -290,6 +316,68 @@ mod tests {
             wip_permits_new_run(&pool, "project-a").await,
             WipDecision::Defer { .. }
         ));
+    }
+
+    /// A `worktree`-mode decision was already ENFORCED — the command ran — so there is no verdict
+    /// left for a human to give it, and it must not spend the review-backlog limit.
+    ///
+    /// Measured on the real database this task fixes: 1226 unreviewed `worktree`-mode `allow` rows,
+    /// against a `wip_limit` of 3, with an empty review queue. Without this filter every one of
+    /// those projects refuses to start new work forever, because nothing will ever present those
+    /// rows for a human to clear.
+    #[tokio::test]
+    async fn uma_decisao_aplicada_em_worktree_nao_e_fila_de_revisao() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_unreviewed_decisions_in_mode(&pool, "project-a", "worktree", 50).await;
+
+        assert_eq!(
+            open_proposals(&pool, "project-a").await.unwrap(),
+            0,
+            "an enforced worktree decision is not a review backlog"
+        );
+        assert_eq!(
+            wip_permits_new_run(&pool, "project-a").await,
+            WipDecision::Allow
+        );
+    }
+
+    /// The §8.4 case this module exists for must stay intact: a shadow run mints no proposal, so
+    /// its unreviewed decisions are the only signal the brake has that a busy watched branch is
+    /// piling up review work faster than a human clears it. Restricting the term to `shadow` mode
+    /// must not simply switch the brake off — it must keep braking on the mode it was built for.
+    #[tokio::test]
+    async fn uma_decisao_em_modo_shadow_continua_a_travar() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_unreviewed_decisions_in_mode(&pool, "project-a", "shadow", 5).await;
+
+        assert_eq!(open_proposals(&pool, "project-a").await.unwrap(), 5);
+        let WipDecision::Defer { reason } = wip_permits_new_run(&pool, "project-a").await else {
+            panic!("unreviewed shadow decisions must still brake new work");
+        };
+        assert!(reason.contains('5'), "got: {reason}");
+    }
+
+    /// The FIRST term is untouched by this change: pending proposals still count in full, and the
+    /// `skipped-item` / `fleet-exclusion` exclusions argued at length above still hold. Only the
+    /// SECOND term (`shadow_decisions`) gained a mode filter.
+    #[tokio::test]
+    async fn as_propostas_continuam_a_contar_e_as_excecoes_continuam_fora() {
+        let pool = test_pool().await;
+        add_project(&pool, "project-a").await;
+        add_pending_proposals(&pool, "project-a", 2).await;
+        add_skipped_items(&pool, "project-a", 5).await;
+        add_pending_exclusions(&pool, "project-a", 5).await;
+        add_unreviewed_decisions_in_mode(&pool, "project-a", "shadow", 1).await;
+        add_unreviewed_decisions_in_mode(&pool, "project-a", "worktree", 50).await;
+
+        assert_eq!(
+            open_proposals(&pool, "project-a").await.unwrap(),
+            3,
+            "2 pending proposals + 1 shadow decision; skipped items, exclusions and the \
+             worktree decisions must not count"
+        );
     }
 
     #[tokio::test]
