@@ -80,9 +80,16 @@ fn bounded(source: &str) -> (&str, bool) {
     if source.len() <= MAX_SPEC_BYTES {
         return (source, false);
     }
-    let cut = source[..MAX_SPEC_BYTES]
-        .rfind('\n')
-        .unwrap_or(MAX_SPEC_BYTES);
+    // Backed off to a character boundary before slicing at all. These specs are Portuguese, so
+    // byte 60_000 lands inside a `ç`, an `ã` or a `§` often enough, and `&source[..60_000]`
+    // panics there rather than truncating. A daemon that died because a document happened to be
+    // the wrong length would be the worst shape this failure could take — invisible until the one
+    // spec that triggers it, and then fatal.
+    let mut ceiling = MAX_SPEC_BYTES;
+    while ceiling > 0 && !source.is_char_boundary(ceiling) {
+        ceiling -= 1;
+    }
+    let cut = source[..ceiling].rfind('\n').unwrap_or(ceiling);
     (&source[..cut], true)
 }
 
@@ -213,5 +220,16 @@ mod tests {
         let prompt = extraction_prompt("slug", &long);
         assert!(prompt.contains("truncated"));
         assert!(prompt.len() < long.len() + 4_000);
+    }
+
+    #[test]
+    fn a_long_document_in_the_language_these_specs_are_written_in_does_not_panic() {
+        // The test above uses ASCII, where every byte index is a character boundary. These specs
+        // are Portuguese, and `&source[..60_000]` panics when byte 60_000 lands inside a `ã`.
+        // Seven bytes per repeat, so it does.
+        let long = "çã§x".repeat(MAX_SPEC_BYTES);
+        let prompt = extraction_prompt("slug", &long);
+        assert!(prompt.contains("truncated"));
+        assert!(prompt.len() < long.len());
     }
 }
