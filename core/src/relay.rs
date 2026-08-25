@@ -221,17 +221,25 @@ pub enum Refusal {
 /// migration's own header, so this column can only ever be a courtesy to a person skimming the
 /// table, never the thing a caller relies on.
 ///
-/// **`body` has nothing to read yet.** `admit` takes no `body` parameter — no caller in this
-/// codebase produces relay text to hand it, and inventing one to satisfy this function alone would
-/// be deciding a caller's shape from inside the callee. `chat_relays.body` is `NOT NULL`, so the row
-/// is written with the empty string until the caller that actually composes a message exists to
-/// supply it; that wiring is out of scope here (see this task's boundaries).
+/// **`body` is written, and the row is worth reading because of it.** This parameter did not exist
+/// when `admit` was first written: there was no caller composing relay text, so every row went in
+/// with the empty string. `http::relay_send_to_chat` has held that text all along, which made
+/// `chat_relays` a table recording that SOMETHING was relayed and never what — an audit trail whose
+/// one interesting column was blank on every row. Passed in rather than read back out of the
+/// destination's own turn afterwards: a queued relay has no turn yet, and one that is refused
+/// downstream never gets one, so the message would be unrecoverable in exactly the cases somebody
+/// would go looking for it.
+///
+/// Not truncated, and not redacted. What a conversation said to another conversation is already in
+/// `runs.prompt` on the receiving turn once one exists; this is the same words, in the row that
+/// says where they came from, and shortening them here would make the two disagree.
 pub async fn admit(
     pool: &sqlx::SqlitePool,
     from_chat_id: &str,
     to_chat_id: &str,
     sending_run_id: i64,
     origin: crate::assistant::Origin,
+    body: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<i64, Refusal> {
     // Cheapest and least specific first: one lookup, no chain to walk yet. Reusing `chats::brain_of`
@@ -310,7 +318,7 @@ pub async fn admit(
     .bind(from_chat_id)
     .bind(to_chat_id)
     .bind(sending_run_id)
-    .bind("")
+    .bind(body)
     .bind(depth)
     .bind(now.to_rfc3339())
     .fetch_one(pool)
@@ -320,6 +328,36 @@ pub async fn admit(
         error: error.to_string(),
     })?;
     Ok(relay_id)
+}
+
+/// Records that `relay_id` became `run_id` — the mirror of `runs.from_relay_id`, written from the
+/// other side once the receiving turn exists.
+///
+/// **Auditing, and its failure mode says so.** `Result` is returned rather than swallowed, but no
+/// caller may treat an `Err` as a failed turn: 0117's header is explicit that the property this
+/// module protects — that a chain is always reconstructible, and therefore always boundable —
+/// hangs entirely on `runs.from_relay_id`, written in the same INSERT that creates the run.
+/// `chain_of` walks that column and never this one. What is lost when this write fails is a
+/// person's ability to ask "did this relay land, and where", which is worth a warning in the log
+/// and is not worth undoing a turn that has already started.
+///
+/// A second statement, necessarily: the run's id does not exist until the run is inserted, and the
+/// relay row was written before that, by `admit`, as the thing whose id the run then points at.
+/// The window between them is the reason the two pointers are not equally trusted, and the reason
+/// `delivered_to_run_id` being NULL is an ordinary state rather than a defect — the relay was
+/// admitted and has not been claimed yet, or was queued and is still waiting, or was dropped by a
+/// drain that found a brake newly engaged.
+pub async fn mark_delivered(
+    pool: &sqlx::SqlitePool,
+    relay_id: i64,
+    run_id: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chat_relays SET delivered_to_run_id = ? WHERE id = ?")
+        .bind(run_id)
+        .bind(relay_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -578,7 +616,7 @@ mod tests {
         seed_owner_present(&pool, now).await;
         let run_id = seed_chain(&pool, &["A"]).await;
 
-        let refusal = admit(&pool, "A", "Z", run_id, Origin::Shell, now)
+        let refusal = admit(&pool, "A", "Z", run_id, Origin::Shell, "relayed words", now)
             .await
             .expect_err("an archived destination must be refused");
         assert_eq!(
@@ -599,9 +637,17 @@ mod tests {
         seed_owner_present(&pool, now).await;
         let run_id = seed_chain(&pool, &["A"]).await;
 
-        let refusal = admit(&pool, "A", "ghost", run_id, Origin::Shell, now)
-            .await
-            .expect_err("a destination that was never created must be refused");
+        let refusal = admit(
+            &pool,
+            "A",
+            "ghost",
+            run_id,
+            Origin::Shell,
+            "relayed words",
+            now,
+        )
+        .await
+        .expect_err("a destination that was never created must be refused");
         assert_eq!(
             refusal,
             Refusal::NoSuchDestination {
@@ -621,9 +667,17 @@ mod tests {
         seed_owner_present(&pool, now).await;
         let run_id = seed_chain(&pool, &["A"]).await;
 
-        let refusal = admit(&pool, "A", "B", run_id, Origin::Telegram, now)
-            .await
-            .expect_err("a Telegram-origin turn must be refused");
+        let refusal = admit(
+            &pool,
+            "A",
+            "B",
+            run_id,
+            Origin::Telegram,
+            "relayed words",
+            now,
+        )
+        .await
+        .expect_err("a Telegram-origin turn must be refused");
         assert_eq!(refusal, Refusal::TelegramOrigin);
     }
 
@@ -638,7 +692,7 @@ mod tests {
         seed_owner_present(&pool, now).await;
         let run_id = seed_chain(&pool, &["A", "B"]).await;
 
-        let refusal = admit(&pool, "B", "A", run_id, Origin::Shell, now)
+        let refusal = admit(&pool, "B", "A", run_id, Origin::Shell, "relayed words", now)
             .await
             .expect_err("relaying back to the root must be refused as a cycle");
         assert_eq!(
@@ -661,7 +715,7 @@ mod tests {
         seed_owner_present(&pool, now).await;
         let run_id = seed_chain(&pool, &["A", "B", "C", "D"]).await;
 
-        let refusal = admit(&pool, "D", "E", run_id, Origin::Shell, now)
+        let refusal = admit(&pool, "D", "E", run_id, Origin::Shell, "relayed words", now)
             .await
             .expect_err("a fourth relay must be refused for length alone");
         assert_eq!(refusal, Refusal::Chain(Verdict::TooDeep));
@@ -679,9 +733,17 @@ mod tests {
         seed_chat(&pool, "B", false).await;
         seed_owner_present(&pool, now).await;
 
-        let refusal = admit(&pool, "A", "B", 999_999, Origin::Shell, now)
-            .await
-            .expect_err("a chain that cannot be read must be refused, not panic");
+        let refusal = admit(
+            &pool,
+            "A",
+            "B",
+            999_999,
+            Origin::Shell,
+            "relayed words",
+            now,
+        )
+        .await
+        .expect_err("a chain that cannot be read must be refused, not panic");
         match refusal {
             Refusal::Unreadable { step, .. } => assert_eq!(step, "chain walk"),
             other => panic!("expected Refusal::Unreadable naming the chain walk, got {other:?}"),
@@ -698,7 +760,7 @@ mod tests {
         seed_chat(&pool, "B", false).await;
         let run_id = seed_chain(&pool, &["A"]).await;
 
-        let refusal = admit(&pool, "A", "B", run_id, Origin::Shell, now)
+        let refusal = admit(&pool, "A", "B", run_id, Origin::Shell, "relayed words", now)
             .await
             .expect_err("an away owner must refuse the relay");
         assert_eq!(refusal, Refusal::OwnerAway);
@@ -715,12 +777,19 @@ mod tests {
         seed_owner_present(&pool, now).await;
         let run_id = seed_chain(&pool, &["A"]).await;
 
-        let relay_id = admit(&pool, "A", "B", run_id, Origin::Shell, now)
+        let relay_id = admit(&pool, "A", "B", run_id, Origin::Shell, "relayed words", now)
             .await
             .expect("every brake is clear; the relay must be admitted");
 
-        let (from_chat_id, to_chat_id, sending_run_id): (String, String, i64) = sqlx::query_as(
-            "SELECT from_chat_id, to_chat_id, sending_run_id FROM chat_relays WHERE id = ?",
+        let (from_chat_id, to_chat_id, sending_run_id, body, delivered): (
+            String,
+            String,
+            i64,
+            String,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT from_chat_id, to_chat_id, sending_run_id, body, delivered_to_run_id
+               FROM chat_relays WHERE id = ?",
         )
         .bind(relay_id)
         .fetch_one(&pool)
@@ -730,5 +799,13 @@ mod tests {
         assert_eq!(from_chat_id, "A");
         assert_eq!(to_chat_id, "B");
         assert_eq!(sending_run_id, run_id);
+        // The words, and not the empty string this column held on every row until `admit` was given
+        // something to write there. A table that records a relay happened and not what it said is
+        // an audit trail with its one interesting column blank.
+        assert_eq!(body, "relayed words");
+        // Undelivered at this point, and that is the correct answer rather than a missing one:
+        // `admit` decides and records the hop, and `relay::mark_delivered` stamps this from the
+        // other side once a run exists to name. Pinned so the two never collapse into one write.
+        assert_eq!(delivered, None);
     }
 }
