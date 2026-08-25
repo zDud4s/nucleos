@@ -41,6 +41,7 @@ function rules(overrides: Partial<ProjectRules> = {}): ProjectRules {
     rules_file: "present",
     rules_error: null,
     gate_command: "cargo test -p nucleos-core",
+    gate_before_publish: false,
     schedules: [],
     repo_triggers: [],
     wip_limit: null,
@@ -258,6 +259,37 @@ describe("Projects - a rules file that cannot be read", () => {
     // The gitignored file is absent in every worktree and every fresh clone, so
     // it must not raise an alarm.
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("Projects - whether a merge waits for the gate", () => {
+  it("says a merge does not wait, which is the default and the quiet one", async () => {
+    answerWith(projectsWorld({ rules: rules({ gate_before_publish: false }) }));
+
+    await renderProjects("/projects/alpha/rules");
+
+    expect(await screen.findByText(/Merges do not wait for it/)).toBeDefined();
+  });
+
+  it("says a merge waits, because a landing that takes twenty minutes needs a reason", async () => {
+    answerWith(projectsWorld({ rules: rules({ gate_before_publish: true }) }));
+
+    await renderProjects("/projects/alpha/rules");
+
+    expect(await screen.findByText(/Merges wait for it/)).toBeDefined();
+  });
+
+  // The state the daemon refuses every merge in. Drawn rather than left to be
+  // inferred from two lines that each look fine on their own: a queue that turns
+  // every landing away, over a key nobody can see, is the worst of the three.
+  it("names the contradiction when a gate is asked for and none is configured", async () => {
+    answerWith(
+      projectsWorld({ rules: rules({ gate_before_publish: true, gate_command: null }) }),
+    );
+
+    await renderProjects("/projects/alpha/rules");
+
+    expect(await screen.findByText(/none is configured, so the queue refuses them/)).toBeDefined();
   });
 });
 

@@ -2460,6 +2460,11 @@ struct ProjectRules {
     /// `schedules:` stopped all autonomy for the project and looked like nothing had happened.
     rules_error: Option<String>,
     gate_command: Option<String>,
+    /// Whether the VCS queue measures a merge into this project's target branch before publishing
+    /// it. Served beside `gate_command` because it decides whether that command runs at a second
+    /// moment entirely — and a brake nobody can see through this route is one nobody thinks to
+    /// check when a landing takes twenty minutes.
+    gate_before_publish: bool,
     schedules: Vec<ScheduleView>,
     repo_triggers: Vec<RepoTriggerView>,
     /// The effective open-proposal ceiling: the project's own, else the global default. `null` means
@@ -2593,6 +2598,7 @@ async fn get_project_rules(
         rules_file,
         rules_error,
         gate_command: loaded.gate_command.clone(),
+        gate_before_publish: loaded.gate_before_publish,
         schedules,
         repo_triggers,
         wip_limit,
@@ -4180,6 +4186,31 @@ pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
     }
 }
 
+/// What the caller is told, beside the status `create_run_status` gives.
+///
+/// Written here rather than in the route for the reason the function above it is: two places
+/// deciding what one refusal is CALLED would drift, and a status and a sentence that disagree is
+/// worse than either alone.
+///
+/// **`Invalid`'s own words travel and the other two's do not**, and that split is the whole of this
+/// function. `Invalid` is a `&'static str` this codebase wrote about the request — "worktree mode
+/// requires project_id and cwd" — and it was being thrown away, so a caller got a bare 400 for a
+/// mistake it could have fixed in a second. A `sqlx::Error` and an `io::Error` are about the inside
+/// of this daemon: they go to the log, where whoever can act on them is reading, and the caller gets
+/// the fact rather than the internals.
+pub(crate) fn create_run_reason(error: &CreateRunError) -> String {
+    match error {
+        CreateRunError::Invalid(reason) => (*reason).to_owned(),
+        CreateRunError::Busy => {
+            "this project has no free slot right now, so nothing was started".to_owned()
+        }
+        CreateRunError::Worktree(_) => {
+            "the run's checkout could not be provisioned; the daemon logged why".to_owned()
+        }
+        CreateRunError::Db(_) => "the run could not be recorded; the daemon logged why".to_owned(),
+    }
+}
+
 /// The search endpoints never return more than this many rows, even when a caller requests more.
 const SEARCH_LIMIT_MAX: i64 = 200;
 
@@ -4799,17 +4830,29 @@ async fn delete_preset(
 async fn run_preset(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<runs::CreateRunResponse>, StatusCode> {
+) -> Result<Json<runs::CreateRunResponse>, (StatusCode, String)> {
     let preset = presets::get(&state.pool, id)
         .await
         .map_err(|error| {
             tracing::warn!(preset_id = id, %error, "reading preset to run failed");
-            preset_status(&error)
+            (
+                preset_status(&error),
+                "the preset could not be read; the daemon logged why".to_owned(),
+            )
         })?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or((StatusCode::NOT_FOUND, format!("there is no preset {id}")))?;
 
     // Delegate to the sole person-initiated run front door. It owns the fail-closed global kill
     // switch, uncancellable launch window, and conversion from run-domain errors to HTTP status.
+    //
+    // **Which now includes the project's autopilot mode, and a preset is subject to it like any
+    // other request.** A preset stored with an unattended mode against a project since switched off
+    // is refused here rather than run — the alternative being a saved button that quietly does what
+    // the same request typed by hand would be refused for, which is the shape of hole this door was
+    // just closed against.
+    //
+    // The refusal's own sentence travels back out through this route rather than being flattened to
+    // a bare status, which is why this signature changed with the door's.
     runs::create_run(
         State(state),
         Json(runs::CreateRunRequest {

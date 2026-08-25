@@ -237,7 +237,7 @@ pub struct RunStatusResponse {
 pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
-) -> Result<Json<CreateRunResponse>, StatusCode> {
+) -> Result<Json<CreateRunResponse>, (StatusCode, String)> {
     // Checked here and not only in the tick loops, because the loops are not the only way a run
     // starts. An autonomous run's own key no longer opens this route (`auth::Scope::Run`), so the
     // original escape — a stopped run spawning its own successors through this endpoint — is closed
@@ -251,10 +251,78 @@ pub async fn create_run(
     // Fails closed: a switch that cannot be read stops runs rather than starting them.
     match crate::autopilot::kill_switch_engaged(&state.pool).await {
         Ok(false) => {}
-        Ok(true) => return Err(StatusCode::CONFLICT),
+        Ok(true) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "the emergency stop is engaged, so nothing was started".to_owned(),
+            ));
+        }
         Err(error) => {
             tracing::warn!(%error, "create_run: could not read the kill switch — refusing");
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the emergency stop could not be read, so nothing was started".to_owned(),
+            ));
+        }
+    }
+
+    // **The project's autopilot mode, asked at the door — and until this line nothing here asked
+    // it.** `grep -n 'autopilot::Mode' core/src/runs.rs` returned nothing, while `POST /jobs` has
+    // always refused a job for a project whose mode does not permit one. A job IS a chain of
+    // `worktree` runs, so the same person asking for the same work got two different answers
+    // depending on which door they came in by: the phone's, which derives the mode from the
+    // project, or this one, which took whatever the request body said.
+    //
+    // **Two narrowings, and each is a decision rather than an oversight.**
+    //
+    // *Only an unattended mode.* `real` is untouched, because the paragraph above about the kill
+    // switch is the house rule and it holds here too: a person asking for a run in their own
+    // checkout, watching it happen, is not the proactive autonomy these brakes pace.
+    // `runs_unattended` names the modes that run with nobody in the room, and those are what the
+    // project's mode governs.
+    //
+    // *Only `off`.* Refusing `worktree` on a project in `shadow` is the stricter rule the design
+    // implies, and it is not the rule this repository is developed under today — its own project sat
+    // in `shadow` while every session worked through exactly that mode. Tightening it is the
+    // owner's call and they took it: close the case nobody can defend — a project switched OFF still
+    // starting work nobody is watching — and leave the rest for the day a project is deliberately
+    // activated.
+    //
+    // A project this daemon has never heard of reads as `off` as well, because `project_mode`
+    // answers `Off` for a missing row. That is the right answer rather than an accident: an
+    // unattended run against a project with no autopilot state is one that no mode, budget or
+    // scoped stop can pace.
+    if runs_unattended(&req.mode)
+        && let Some(project) = req.project_id.as_deref()
+    {
+        match crate::autopilot::project_mode(&state.pool, project).await {
+            Ok(crate::autopilot::Mode::Off) => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "`{project}` is off, and a `{}` run is one nobody is watching — put the \
+                         project in shadow or active first. A project this daemon does not know \
+                         reads as off too.",
+                        req.mode
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            // Fails closed, like the kill switch above it and for the same reason: a mode that could
+            // not be read is not permission to work unwatched.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    project,
+                    "create_run: could not read the project's autopilot mode — refusing"
+                );
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "`{project}`'s autopilot mode could not be read, so nothing was started"
+                    ),
+                ));
+            }
         }
     }
 
@@ -274,8 +342,19 @@ pub async fn create_run(
         )
         .await
     })
-    .await?
-    .map_err(|error| crate::http::create_run_status(&error))?;
+    .await
+    .map_err(|status| {
+        (
+            status,
+            "the run could not be created; the daemon logged why".to_owned(),
+        )
+    })?
+    .map_err(|error| {
+        (
+            crate::http::create_run_status(&error),
+            crate::http::create_run_reason(&error),
+        )
+    })?;
 
     Ok(Json(CreateRunResponse { id }))
 }
@@ -6759,7 +6838,10 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         )
         .await;
 
-        assert!(matches!(result, Err(StatusCode::CONFLICT)));
+        assert!(
+            matches!(result, Err((StatusCode::CONFLICT, _))),
+            "the emergency stop must refuse the endpoint too"
+        );
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
             .await
@@ -6786,6 +6868,139 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         assert!(result.is_ok(), "the switch is off; this must go through");
     }
 
+    /// **A project that is off starts nothing nobody is watching, whichever door the request came
+    /// in by.**
+    ///
+    /// Paired with the test below it on purpose: the two requests are IDENTICAL except for the
+    /// project's mode, so what they measure is the mode gate and nothing else. Neither names a
+    /// `cwd`, which means a request that gets PAST the gate fails a little further in with the
+    /// validation `worktree` mode has always had — and that is exactly what makes the pair
+    /// readable. `off` refuses with 422 before the row exists; `shadow` reaches 400 and complains
+    /// about the missing field, which is the door letting it through.
+    #[tokio::test]
+    async fn uma_run_nao_vigiada_e_recusada_a_um_projecto_desligado() {
+        let state = test_state().await;
+        project_in_mode(&state.pool, "proj", "off").await;
+
+        let refusal = create_run(
+            State(state.clone()),
+            Json(CreateRunRequest {
+                prompt: "work on it all night".to_owned(),
+                project_id: Some("proj".to_owned()),
+                cwd: None,
+                mode: "worktree".to_owned(),
+                steerable: false,
+            }),
+        )
+        .await;
+        // Matched rather than `expect_err`: the success type is an `axum::Json` of a struct with no
+        // `Debug`, and deriving one on a response type to satisfy a test would be the tail wagging.
+        let Err(refusal) = refusal else {
+            panic!("a project that is off must not start unattended work");
+        };
+
+        assert_eq!(refusal.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            refusal.1.contains("off") && refusal.1.contains("proj"),
+            "the refusal has to name the project and its state: {}",
+            refusal.1
+        );
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "no row may be written for a refused run");
+    }
+
+    /// **And `shadow` is deliberately NOT refused — this pins the decision, so tightening it later
+    /// is a change somebody makes on purpose rather than one that slides in.**
+    ///
+    /// The stricter rule the design implies is that `worktree` needs `active`, exactly as a job
+    /// does. It is not the rule this repository was developed under: its own project sat in
+    /// `shadow` while every session worked through that very mode, so adopting it would have
+    /// refused the only door the work was coming through. The owner chose to close the case nobody
+    /// can defend — a project switched OFF still starting unwatched work — and to leave the rest
+    /// until a project is deliberately activated. If this test ever has to change, that is the
+    /// decision being revisited, and it should be revisited out loud.
+    #[tokio::test]
+    async fn um_projecto_em_shadow_ainda_pode_pedir_uma_run_de_worktree() {
+        let state = test_state().await;
+        project_in_mode(&state.pool, "proj", "shadow").await;
+
+        let refusal = create_run(
+            State(state.clone()),
+            Json(CreateRunRequest {
+                prompt: "work on it all night".to_owned(),
+                project_id: Some("proj".to_owned()),
+                cwd: None,
+                mode: "worktree".to_owned(),
+                steerable: false,
+            }),
+        )
+        .await;
+        let Err(refusal) = refusal else {
+            panic!("no cwd was given, so this must fail — the question is only where");
+        };
+
+        assert_eq!(
+            refusal.0,
+            StatusCode::BAD_REQUEST,
+            "shadow must not refuse at the mode gate: {}",
+            refusal.1
+        );
+        assert!(
+            refusal.1.contains("cwd"),
+            "it must be the missing field it complains about, not the mode: {}",
+            refusal.1
+        );
+    }
+
+    /// **A run somebody is WATCHING is not what the project's mode governs, and this is the
+    /// narrowing that says so.**
+    ///
+    /// Same project, same off switch, and it goes through — because `real` runs in the caller's own
+    /// checkout with a person in the room. The comment on the kill switch in `create_run` is the
+    /// house rule and this is it applied: the scoped kills, the budget and the WIP ceiling pace
+    /// proactive autonomy, and a person clicking a button is not that. Without this test the
+    /// narrowing is a line of code nothing defends, and the first person to "make it consistent"
+    /// takes the shell's default mode away with it.
+    #[tokio::test]
+    async fn uma_run_vigiada_nao_e_travada_por_um_projecto_desligado() {
+        let state = test_state().await;
+        project_in_mode(&state.pool, "proj", "off").await;
+
+        let result = create_run(
+            State(state.clone()),
+            Json(CreateRunRequest {
+                prompt: "look at this with me".to_owned(),
+                project_id: Some("proj".to_owned()),
+                cwd: None,
+                mode: "real".to_owned(),
+                steerable: false,
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an attended run is not the proactive autonomy this brake paces"
+        );
+    }
+
+    /// A project on the roster, in the mode named. `mode` is NOT NULL with a CHECK, so the three
+    /// spellings this takes are the three the column accepts.
+    async fn project_in_mode(pool: &sqlx::SqlitePool, project_id: &str, mode: &str) {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, ?, NULL)
+             ON CONFLICT(project_id) DO UPDATE SET mode = excluded.mode",
+        )
+        .bind(project_id)
+        .bind(mode)
+        .execute(pool)
+        .await
+        .expect("put the project on the roster");
+    }
+
     /// A worktree run's row is INSERTed `running` before its worktree is provisioned, and
     /// `git worktree add` takes real time — so the window between the two is wide enough to matter.
     /// A client that disconnects cancels the request it was making, which drops the handler's future
@@ -6802,6 +7017,17 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-dropped-");
         let state = test_state().await;
+        // **The row is here for the door and not for this test's subject.** `create_run` now asks
+        // the project's autopilot mode before it does anything, and `project_mode` answers `Off` for
+        // a project it has no row for — so a `proj` that was never registered, which is what this
+        // test had and never needed, is refused at the door and the handler completes before there
+        // is anything to drop. The subject below — what happens when a request is dropped mid-
+        // provisioning — is untouched by any of that.
+        //
+        // `shadow` because it is the least this needs. If the mode rule ever tightens to require
+        // `active` for a `worktree` run, this is one of the lines that has to move, and that is the
+        // reason it is written out rather than left as a bare INSERT.
+        project_in_mode(&state.pool, "proj", "shadow").await;
         advance_run_ids_past(&state.pool, 47_000).await;
         let run_id = 47_001;
 
