@@ -92,6 +92,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
+        // The intention layer, beside the structure layer it will one day be joined to. A POST and
+        // deliberately in no table in `auth.rs`: reading a map costs nothing and a read-only key
+        // buys it, while extracting spends a model — which is not something that key ever bought.
+        .route("/projects/{id}/map/extract", post(post_project_map_extract))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -2876,6 +2880,142 @@ async fn get_project_map(
                 return StatusCode::NOT_FOUND;
             }
             tracing::warn!(%error, project_id = %id, "project map failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct MapExtractBody {
+    /// The document's name, which is its filename without the extension — what
+    /// [`crate::map_intent::spec_slug`] produces and what a decision row carries forever. NOT a
+    /// path: two projects keeping their specs in different folders must name the same document the
+    /// same way, and a path would also be a way to ask this route to read an arbitrary file.
+    spec_slug: String,
+    brain: String,
+}
+
+/// Which brain the caller named, and nothing else.
+///
+/// Deliberately stricter than [`crate::chats::Brain::from_wire`], which reads anything unfamiliar as
+/// `Cloud`. That is right for a conversation, whose default has always been the cloud and whose
+/// column carries it. It is wrong here: this is the one choice the owner explicitly asked to make,
+/// and quietly making it for them — in the direction that spends money and sends the document off
+/// the machine — is the wrong default to inherit.
+fn read_brain(value: &str) -> Option<crate::chats::Brain> {
+    match value {
+        "cloud" => Some(crate::chats::Brain::Cloud),
+        "local" => Some(crate::chats::Brain::Local),
+        _ => None,
+    }
+}
+
+/// Ask a model what one spec decided, and leave the answer waiting for its owner.
+///
+/// **Synchronous, and the spec's §9.1 says so: it returns the list.** A cloud brain makes this a
+/// slow request, and that is accepted — the owner pressed a button about one document and is
+/// waiting for the thing they asked for. The alternative is a status row, a poll and a state the
+/// page has to draw, for a wait measured in seconds.
+///
+/// **Nothing here is approved.** The list comes back so the owner can read it; it is already in the
+/// table as a pile nobody has read, and it stays that way until they answer line by line — §4.
+///
+/// **A `local` request never becomes a cloud one.** `local` is what somebody chooses when the
+/// document must not leave the machine, or when they are not paying for it, so a machine with no
+/// local model refuses rather than falling back: falling back would break both promises at once,
+/// silently, on the bill. The refusal is 503 and not 422 — the request was well formed and this
+/// machine simply cannot serve it, which is a different thing to tell the owner from "you asked
+/// wrong".
+async fn post_project_map_extract(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapExtractBody>,
+) -> Result<Json<Vec<crate::map_store::Decision>>, StatusCode> {
+    let brain = read_brain(&body.brain).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    // On `spawn_blocking` for the reason `get_project_map` gives: this walks directories and reads
+    // a file that may be tens of kilobytes, and the daemon is also answering a three-second poll.
+    // Finding the document and reading it are one hop because they are one answer — a slug that
+    // matches nothing and a file that cannot be read are the same 404 to whoever asked, and neither
+    // is a fault of this daemon.
+    let wanted = body.spec_slug.clone();
+    let source = tokio::task::spawn_blocking(move || {
+        let path = crate::map_intent::specs_in(&root)
+            .into_iter()
+            .find(|path| crate::map_intent::spec_slug(path) == wanted)?;
+        std::fs::read_to_string(root.join(path)).ok()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Bound out here because `Extractor::Loopback` borrows it and the borrow has to outlive the
+    // `match` that creates it.
+    let local_model;
+    let asked = match brain {
+        crate::chats::Brain::Cloud => crate::map_intent::Extractor::Cli(state.runner.as_ref()),
+        crate::chats::Brain::Local => {
+            // Read per request rather than cached on `AppState`, which is the argument
+            // `models_config`'s own doc comment makes: a name cached at startup is one the owner
+            // cannot change without restarting the daemon.
+            //
+            // The field is named for triage and is being reused as "the local model this machine
+            // has". That reuse is the house pattern rather than a stretch — `main.rs` already
+            // hands `voice_cleanup_model` to the web pillar as its quarantine model — and there is
+            // exactly one Ollama model configured on a machine.
+            let Some(model) = models_config().local_triage_model else {
+                tracing::warn!(
+                    project_id = %id,
+                    spec = %body.spec_slug,
+                    "the local brain was asked for and this machine has no local model configured"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            local_model = model;
+            crate::map_intent::Extractor::Loopback {
+                client: &state.web.http,
+                base_url: crate::runner::OLLAMA_BASE_URL,
+                model: &local_model,
+            }
+        }
+    };
+
+    let decisions = crate::map_intent::extract(asked, &body.spec_slug, &source)
+        .await
+        .map_err(|error| {
+            // 502 and not 500: the daemon did its part and the thing it asked did not answer. An
+            // empty list would be the other reading, and it is the one this feature exists to
+            // forbid — "this spec decided nothing" is a claim, and nobody is in a position to make
+            // it when nobody read the document.
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                spec = %body.spec_slug,
+                brain = %brain.as_str(),
+                "the extraction run failed"
+            );
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    crate::map_store::record(&state.pool, &id, &body.spec_slug, brain, &decisions)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                spec = %body.spec_slug,
+                "an extraction was read but could not be recorded"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // The whole pile and not this extraction, because the pile is what the owner reads. A window
+    // handed only what just arrived would show a shrinking list every time a second spec was read.
+    crate::map_store::pending(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the decision pile failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -11631,6 +11771,168 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// What a model answers when it has read a spec: the shape `parse_extraction` takes.
+    ///
+    /// Portuguese because the documents are, and the prompt tells the model to answer in the
+    /// document's own language — a fixture in English would be pinning a behaviour the prompt
+    /// forbids.
+    ///
+    /// Built rather than written out as a raw string literal, and not for taste: a markdown
+    /// heading is `##`, so `"## 1. Alfa` opens with the exact three characters that close an
+    /// `r#"…"#` — the literal ends in the middle of the first section and the rest of the fixture
+    /// lexes as broken Rust.
+    fn extraction_answer() -> String {
+        serde_json::json!({
+            "decisions": [
+                {"section": "## 1. Alfa", "text": "O mapa deriva-se a cada leitura.", "kind": "b"},
+                {"section": "## 1. Alfa", "text": "Nada chega aprovado.", "kind": "c"},
+            ]
+        })
+        .to_string()
+    }
+
+    /// A runner that answers an extraction, in the shape the agent CLI answers in.
+    ///
+    /// A `result` event and not bare JSON, because that is what `extract` has to unwrap: the CLI
+    /// puts the whole `stream-json` transcript in `stdout` and the answer is inside the final
+    /// event. A fixture that skipped the envelope would exercise the plain-text path instead and
+    /// prove nothing about the one this route actually uses.
+    fn extracting_runner() -> Arc<FakeCommandRunner> {
+        Arc::new(FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": extraction_answer(),
+                })
+                .to_string(),
+                stderr: String::new(),
+                session_id: Some("fake-session-id".into()),
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+            })),
+            ..Default::default()
+        })
+    }
+
+    async fn post_extract(
+        state: AppState,
+        project: &str,
+        spec_slug: &str,
+        brain: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/extract"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"spec_slug": spec_slug, "brain": brain}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn extracting_a_spec_leaves_a_pile_for_the_owner_and_approves_nothing() {
+        let mut state = test_state().await;
+        state.runner = extracting_runner();
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(dir.path().join("docs/specs/design.md"), "## 1. Alfa\n").unwrap();
+
+        let (status, body) = post_extract(state.clone(), "alpha", "design", "cloud").await;
+        assert_eq!(status, StatusCode::OK);
+        // §9.1: the route answers with the list, so the window has something to draw without a
+        // second request. It is the PILE and not this extraction — the same answer the list route
+        // gives — which is why it is read back through `pending` below rather than trusted here.
+        assert_eq!(body.as_array().unwrap().len(), 2);
+
+        let waiting = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert!(!waiting.is_empty(), "the model's proposals are in the pile");
+        assert!(
+            waiting.iter().all(|row| row.approved_at.is_none()),
+            "nothing arrives approved"
+        );
+        assert!(
+            waiting.iter().all(|row| row.brain == "cloud"),
+            "the row records which brain answered, or a thin list is mysterious"
+        );
+    }
+
+    #[tokio::test]
+    async fn extracting_a_spec_that_is_not_there_is_the_callers_mistake_and_not_the_daemons() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        assert_eq!(
+            post_extract(state, "alpha", "nowhere", "cloud").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_brain_nobody_can_read_is_refused_rather_than_guessed_at() {
+        // `chats::Brain::from_wire` falls back to Cloud, which is right for a conversation and
+        // wrong here: this is the one choice the owner explicitly asked to make, and quietly making
+        // it for them — in the direction that spends money — is the wrong default to inherit.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        assert_eq!(
+            post_extract(state, "alpha", "design", "whatever").await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn asking_the_local_brain_with_no_local_model_refuses_rather_than_going_to_the_cloud() {
+        // The most important assertion in this route. `local` is what somebody chooses when the
+        // document must not leave the machine, or when they are not paying for it. A fallback to
+        // the cloud would break both promises at once, silently, on the bill.
+        //
+        // The condition needs no setup and is not at the mercy of a file outside the repository:
+        // it is the same one `cloud_choice` documents relying on. `models_config` reads
+        // `.ai/nucleos-models.yaml` relative to the working directory, a test runs from the crate
+        // root, `core/.ai/` does not exist, and `ModelsConfig::default` has
+        // `local_triage_model: None`.
+        let mut state = test_state().await;
+        // A fake that WOULD answer, so a fallback would succeed and this test would not see it.
+        state.runner = extracting_runner();
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(dir.path().join("docs/specs/design.md"), "## 1. Alfa\n").unwrap();
+
+        let (status, _) = post_extract(state.clone(), "alpha", "design", "local").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            crate::map_store::pending(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing was recorded, so nothing was run"
+        );
     }
 
     /* --------------------------------------------------------------- workflows -- */
