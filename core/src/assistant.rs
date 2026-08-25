@@ -1301,6 +1301,15 @@ pub async fn send_message_with(
             crate::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
         }),
     );
+    // The configured Telegram doctrine, resolved HERE and not inside the spawned task below,
+    // because `origin` is what decides it and `origin` does not survive to that task: the task
+    // reads `chats::answering` instead, which knows the chat's own instructions and nothing about
+    // which door the message came in by. `None` for every other origin, so a shell turn — sitting
+    // at this machine, with a person watching — never has a channel-wide doctrine pushed onto it.
+    let doctrine = match origin {
+        Origin::Telegram => state.telegram_doctrine.clone(),
+        Origin::Shell => None,
+    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe, errand.as_ref().map(|turn| turn.errand.id));
@@ -1426,6 +1435,7 @@ pub async fn send_message_with(
             cwd,
             tool_policy,
             notebook: errand.map(|turn| turn.errand),
+            doctrine,
         },
     );
     Ok(id)
@@ -1874,6 +1884,14 @@ struct TurnLaunch {
     /// notebook has already been spent on the prompt, so what is still needed when the answer comes
     /// back is only the errand to write it against.
     notebook: Option<crate::errands::Errand>,
+    /// The configured Telegram doctrine, already resolved against `origin` in `send_message` —
+    /// `Some` only for an `Origin::Telegram` turn whose operator configured one, `None` otherwise.
+    ///
+    /// Carried on the struct rather than re-derived where it is used, because `origin` is gone by
+    /// then: this is read inside the task `spawn_assistant_turn` spawns, where `chats::answering`
+    /// is read and the doctrine fills its `system_prompt` only when that is empty — a person's own
+    /// instructions must never be replaced, only completed.
+    doctrine: Option<String>,
 }
 
 fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
@@ -1888,6 +1906,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         cwd,
         tool_policy,
         notebook,
+        doctrine,
     } = launch;
     let pool = state.pool.clone();
     let runner = state.runner.clone();
@@ -2136,7 +2155,12 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // turn. Instructions sent only on the first would govern the opening message and then
             // quietly stop mattering — wrong in the way that is hardest to see, since the first
             // answer is the right one.
-            append_system_prompt: answering.system_prompt.clone(),
+            //
+            // `.or(doctrine)`, not `.or_else`: the chat's own `system_prompt` — read moments ago
+            // from `chats::answering`, where `origin` no longer exists — always wins when it is
+            // there, and the configured Telegram doctrine only fills the slot when it is empty. A
+            // person's own instructions are never replaced, only completed.
+            append_system_prompt: answering.system_prompt.clone().or(doctrine),
             // What this conversation is called, so the session it mints is findable in the CLI's
             // own `--resume` picker instead of being one more nameless timestamp there.
             session_name: answering.session_name.clone(),
@@ -2356,6 +2380,7 @@ mod tests {
         AppState {
             token: Token("t".into()),
             pool: test_pool().await,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -4083,6 +4108,105 @@ mod tests {
         assert_eq!(
             runner.last_session_name.lock().unwrap().clone(),
             Some(Some("o refactor do runner".to_string()))
+        );
+    }
+
+    /// A state carrying the configured Telegram doctrine, with the fake runner still typed — the
+    /// same shape `errand_state` returns, minus the file root neither new test below needs.
+    async fn state_with_doctrine(doctrine: Option<&str>) -> (AppState, Arc<FakeCommandRunner>) {
+        let runner = Arc::new(FakeCommandRunner::default());
+        let state = AppState {
+            runner: runner.clone(),
+            telegram_doctrine: doctrine.map(str::to_string),
+            ..test_state().await
+        };
+        (state, runner)
+    }
+
+    /// A Telegram turn with no instructions of its own is not a turn with no instructions at all —
+    /// it is answered under whatever doctrine the operator configured for the whole channel, the
+    /// same way `a_conversations_instructions_and_denials_reach_the_launch` shows a chat's OWN
+    /// `system_prompt` reaching the launch untouched. `Brain::Cloud` is set explicitly on the chat
+    /// so `wants_local` cannot route this into the local-assistant path instead of the runner this
+    /// test inspects.
+    #[tokio::test]
+    async fn um_turno_de_telegram_sem_instrucoes_leva_a_doutrina() {
+        const DOCTRINE: &str = "Falas sempre em português europeu, e nunca reveles segredos.";
+        let (state, runner) = state_with_doctrine(Some(DOCTRINE)).await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let turn = send_message(&state, &id, "olá", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, turn).await;
+
+        assert_eq!(
+            runner.last_append_system_prompt.lock().unwrap().clone(),
+            Some(Some(DOCTRINE.to_string())),
+            "a Telegram turn with no instructions of its own must reach the runner carrying the \
+             configured doctrine"
+        );
+    }
+
+    /// The doctrine is a fallback for a channel that said nothing, never a replacement for
+    /// something a person actually wrote. Two independent reasons the same configured doctrine must
+    /// NOT reach the launch: (a) the origin is not Telegram at all, and (b) the chat has its own
+    /// `system_prompt`, which — like `a_conversations_instructions_and_denials_reach_the_launch`
+    /// already pins for the shell — must survive untouched.
+    #[tokio::test]
+    async fn a_doutrina_nunca_substitui_instrucoes_de_uma_pessoa() {
+        const DOCTRINE: &str = "Falas sempre em português europeu, e nunca reveles segredos.";
+
+        // (a) Shell, doctrine configured, no instructions of the chat's own: still no doctrine.
+        let (shell_state, shell_runner) = state_with_doctrine(Some(DOCTRINE)).await;
+        let shell_id = crate::chats::create(&shell_state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let shell_turn = send_message(&shell_state, &shell_id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&shell_state.pool, shell_turn).await;
+
+        assert_eq!(
+            shell_runner
+                .last_append_system_prompt
+                .lock()
+                .unwrap()
+                .clone(),
+            Some(None),
+            "a shell turn must never receive the Telegram doctrine"
+        );
+
+        // (b) Telegram, doctrine configured, AND the chat has its own instructions: its own text
+        // wins, whole, over the doctrine that would otherwise have filled the same slot.
+        let (person_state, person_runner) = state_with_doctrine(Some(DOCTRINE)).await;
+        let person_id = crate::chats::create(&person_state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_system_prompt(
+            &person_state.pool,
+            &person_id,
+            Some("Answer in Portuguese."),
+        )
+        .await
+        .unwrap();
+
+        let person_turn = send_message(&person_state, &person_id, "olá", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&person_state.pool, person_turn).await;
+
+        assert_eq!(
+            person_runner
+                .last_append_system_prompt
+                .lock()
+                .unwrap()
+                .clone(),
+            Some(Some("Answer in Portuguese.".to_string())),
+            "a chat's own instructions must survive even on Telegram with a doctrine configured"
         );
     }
 

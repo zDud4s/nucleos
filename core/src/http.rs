@@ -8723,6 +8723,7 @@ mod tests {
             AppState {
                 token: Token("test-token".into()),
                 pool,
+                telegram_doctrine: None,
                 runner: Arc::new(FakeCommandRunner::default()),
                 triage_runner: None,
                 local_triage_disabled: None,
@@ -9307,6 +9308,7 @@ mod tests {
         AppState {
             token: Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -16310,6 +16312,7 @@ mod tests {
         let state = AppState {
             token: Token("test-token".into()),
             pool: pool.clone(),
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
