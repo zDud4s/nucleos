@@ -162,6 +162,49 @@ fn join_relative(folder: &str, target: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Whether the file says which decision it belongs to.
+///
+/// Today this is only *"it cites something"* — the citation carries no document identity, so
+/// **which** decision is unknowable. That ambiguity is §8 of the spec and belongs to slice 6.
+/// It is still worth measuring now: the difference between *declares something* and *declares
+/// nothing at all* already separates the ~87 files that claim a purpose from the ~108 that
+/// do not, and that split is the whole first slice.
+pub fn cites_section(source: &str) -> bool {
+    source.contains('§')
+}
+
+/// Whether a Rust module carries its own tests, which is where this repo puts them.
+///
+/// It looks for `#[cfg(test)]` and nothing else — not `#[test]`, not `mod tests`, not a
+/// `tests/` directory beside the crate. That is not a shortcut but the actual convention here,
+/// and looking for the other three would find files that do not exist.
+///
+/// Like everything else in this module it is a string search, so a `#[cfg(test)]` quoted inside
+/// a string or shown in a doc-comment example counts. The cost is one module wrongly marked as
+/// proved, in a file that is already talking about test configuration — visible to anyone who
+/// opens it, and cheaper than the parser that would avoid it.
+pub fn rust_has_tests(source: &str) -> bool {
+    source.contains("#[cfg(test)]")
+}
+
+/// The path, without extension, where a TypeScript module's test would live.
+///
+/// This repo puts the test beside the file — `Meter.tsx` / `Meter.test.tsx`. Returning the
+/// path rather than a boolean leaves the "does it exist?" question to the caller that already
+/// holds the file list, so this stays a pure string operation with nothing to stub.
+///
+/// Handed a path that is already a test, this answers `Meter.test.test` — a file that cannot
+/// exist. That is not guarded here, because the caller walking the tree has a better answer
+/// than a guard would: a test is proof *about* a module and is not a module itself, so it never
+/// reaches this function at all.
+pub fn ts_test_sibling(path: &str) -> String {
+    let stem = path
+        .strip_suffix(".tsx")
+        .or_else(|| path.strip_suffix(".ts"))
+        .unwrap_or(path);
+    format!("{stem}.test")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +321,42 @@ import type { GraphNode } from "../data/workflow-graph";
         // sentence caught between them starts with a dot by accident.
         let source = "// the students'./project is done, ask the teachers' opinion";
         assert!(ts_imports("shell/src/main.tsx", source).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cites_a_section_declares_what_it_implements() {
+        assert!(cites_section(
+            "//! §6.4, and the argument for it is what the reader gets"
+        ));
+        assert!(cites_section(
+            "/// Reserved by §14 and drawn by the inspector"
+        ));
+    }
+
+    #[test]
+    fn a_file_that_cites_nothing_is_the_pile_that_nobody_asked_for() {
+        // This is not a defect of the file. It is the `code nobody asked for` category of
+        // §5.1, and it is half the reason the map exists at all.
+        assert!(!cites_section("use crate::storage;\n\npub fn thing() {}"));
+    }
+
+    #[test]
+    fn a_rust_module_proves_itself_with_a_test_module_inside_it() {
+        assert!(rust_has_tests(
+            "#[cfg(test)]\nmod tests {\n    use super::*;\n}"
+        ));
+        assert!(!rust_has_tests("pub fn untested() {}"));
+    }
+
+    #[test]
+    fn a_typescript_module_is_proved_by_the_sibling_beside_it() {
+        assert_eq!(
+            ts_test_sibling("shell/src/ui/Meter.tsx"),
+            "shell/src/ui/Meter.test"
+        );
+        assert_eq!(
+            ts_test_sibling("shell/src/data/keys.ts"),
+            "shell/src/data/keys.test"
+        );
     }
 }
