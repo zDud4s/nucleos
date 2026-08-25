@@ -229,9 +229,72 @@ fn json_object(answer: &str) -> Option<&str> {
     (end > start).then(|| &answer[start..=end])
 }
 
+use std::path::Path;
+
+/// Where a project might keep its design documents, in the order they are looked for.
+///
+/// Probed rather than configured, and rather than detected. A setting would be one more thing to
+/// fill in before the map says anything, and §10 is explicit that day one asks for nothing; a
+/// detector guessing from file contents would call a long README a spec. Three conventions cover
+/// this repository and the two tools that write specs into it, and a project matching none of them
+/// gets §11's sentence instead of a wrong answer.
+///
+/// `.ai/specs` is first and is also the folder [`crate::project_map::structure`] deliberately never
+/// walks. That is not a contradiction: the structure layer is about the product, and working
+/// material is not product. The intention layer is about what was decided, and that is exactly
+/// where the decisions are written down.
+const SPEC_FOLDERS: &[&str] = &[".ai/specs", "docs/specs", "docs/superpowers/specs"];
+
+/// Every spec of a project, by path from the root, sorted.
+///
+/// Sorted rather than in filesystem order, for the same reason [`crate::project_map::structure`]
+/// sorts: an order the filesystem chose changes between two reads for no reason anybody can see.
+pub fn specs_in(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for folder in SPEC_FOLDERS {
+        let Ok(entries) = std::fs::read_dir(root.join(folder)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") || name.starts_with('.') {
+                continue;
+            }
+            found.push(format!("{folder}/{name}"));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// What a spec is called, which is its filename without the extension.
+///
+/// Named by the file and not by the path, so that two projects keeping their specs in different
+/// folders produce the same name for the same document — the slug is what the owner reads and what
+/// a decision row carries forever.
+pub fn spec_slug(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.strip_suffix(".md").unwrap_or(file).to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// A toy tree, so no test depends on the shape of the real repository.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("nucleos-intent-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("scratch");
+        root
+    }
+
+    fn write(root: &std::path::Path, rel: &str, body: &str) {
+        let full = root.join(rel);
+        fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+        fs::write(full, body).expect("write");
+    }
 
     #[test]
     fn a_kind_survives_the_round_trip_through_the_wire() {
@@ -360,5 +423,50 @@ mod tests {
     fn an_answer_that_is_not_json_at_all_is_no_decisions_and_never_a_panic() {
         assert!(parse_extraction("I could not read that document.").is_empty());
         assert!(parse_extraction("").is_empty());
+    }
+
+    #[test]
+    fn the_specs_of_a_project_are_found_where_projects_actually_keep_them() {
+        let root = scratch("specs");
+        write(&root, ".ai/specs/2026-08-22-alfa-design.md", "# Alfa");
+        write(&root, "docs/specs/beta.md", "# Beta");
+        write(&root, "docs/superpowers/specs/gama.md", "# Gama");
+        write(&root, "docs/specs/notes.txt", "not a spec");
+        write(&root, "README.md", "not a spec either");
+
+        let found = specs_in(&root);
+
+        assert_eq!(
+            found,
+            vec![
+                ".ai/specs/2026-08-22-alfa-design.md".to_string(),
+                "docs/specs/beta.md".to_string(),
+                "docs/superpowers/specs/gama.md".to_string(),
+            ],
+            "sorted, so two reads of an unchanged project agree"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_project_with_nowhere_to_keep_specs_says_so_by_returning_none() {
+        // §11: a project with no specs shows its structure and says what is missing. An empty list
+        // is that sentence's input, and is not an error.
+        let root = scratch("nospecs");
+        write(&root, "src/main.rs", "fn main() {}");
+
+        assert!(specs_in(&root).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_spec_is_named_by_its_file_and_not_by_where_it_sits() {
+        // The slug is what the owner sees and what a decision row carries. Two projects keeping
+        // specs in different folders must produce the same name for the same document.
+        assert_eq!(spec_slug("docs/specs/beta.md"), "beta");
+        assert_eq!(spec_slug(".ai/specs/2026-08-22-alfa-design.md"), "2026-08-22-alfa-design");
+        assert_eq!(spec_slug("beta.md"), "beta");
     }
 }
