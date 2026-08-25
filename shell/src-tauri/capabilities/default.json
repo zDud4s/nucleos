@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "opener:default",
+    "core:webview:allow-set-webview-zoom",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "vscode://file/*" }]
