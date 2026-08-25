@@ -86,6 +86,8 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     thought_tokens: null,
     context_fill: null,
     context_rotates_at: 140000,
+    relayed_from_chat_id: null,
+    relayed_from_title: null,
     ...overrides,
   };
 }
@@ -334,6 +336,72 @@ describe("Chats - refusals the composer meets", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("no_local_model")).toBeDefined();
+  });
+});
+
+/* -------------------------------------------------------------- A4b: relays -- */
+
+describe("Chats - a turn another conversation handed over", () => {
+  // The whole point of the column. A relayed turn drawn under "you" tells the person reading it
+  // that they said something they did not say, in the one place they go to find out what was
+  // actually said — and there is nothing else on the row to contradict it.
+  it("names the conversation it came from instead of attributing it to you", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({
+          id: 1,
+          asked: "olha para o parser",
+          relayed_from_chat_id: "c-2",
+          relayed_from_title: "the planning conversation",
+        }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).queryByText("you")).toBeNull();
+    // A link and not a label: the conversation on the far side is a real place, and somebody
+    // reading "where did this come from" almost always wants to go and look.
+    const source = within(transcript).getByRole("link", { name: "the planning conversation" });
+    expect(source.getAttribute("href")).toBe("/chats/c-2");
+  });
+
+  // Most conversations have no title until the daemon has summarised one, and a page that printed
+  // the uuid instead would be answering a question nobody asked. The link still goes there.
+  it("still links to an unnamed conversation without printing its id", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({ id: 1, relayed_from_chat_id: "0d2b-a-uuid-9f1", relayed_from_title: null }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    const source = within(transcript).getByRole("link", { name: "an unnamed conversation" });
+    expect(source.getAttribute("href")).toBe("/chats/0d2b-a-uuid-9f1");
+    expect(within(transcript).queryByText(/0d2b-a-uuid-9f1/)).toBeNull();
+  });
+
+  // The negative, and the one that catches the likelier mistake: a note drawn above every turn
+  // reads as every message having come from somewhere else.
+  it("says nothing above a turn the person typed", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [turnRow({ id: 1, asked: "hi" })],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("you")).toBeDefined();
+    expect(within(transcript).queryByText(/handed this over/)).toBeNull();
   });
 });
 

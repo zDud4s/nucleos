@@ -104,6 +104,27 @@ export interface AssistantTurnRow {
    * is whether the model deliberated and roughly how hard.
    */
   thought_tokens: number | null;
+  /**
+   * The conversation that handed this turn its words, or null for the ordinary
+   * case — somebody typed them here.
+   *
+   * Optional on the wire because a daemon older than the column sends neither
+   * key, the same way `did` and `images` are read defensively below.
+   */
+  relayed_from_chat_id?: string | null;
+  /** What that conversation is called, or null when nobody has named it. */
+  relayed_from_title?: string | null;
+}
+
+/** Where a turn's words came from, when it was not the person reading them. */
+export interface RelayedFrom {
+  chatId: string;
+  /**
+   * Null on a conversation with no title yet, which is most of them until the
+   * daemon has summarised one. The id is what always resolves, which is why it
+   * travels alongside rather than being replaced by the name.
+   */
+  title: string | null;
 }
 
 /**
@@ -136,6 +157,17 @@ export interface Turn {
   contextFill: number | null;
   /** See `AssistantTurnRow.context_rotates_at`. */
   rotatesAt: number | null;
+  /**
+   * The conversation that handed this turn over, or null when the person whose
+   * transcript this is typed it themselves.
+   *
+   * Not a `Mark`. Those describe what changed BETWEEN two turns — the model, the
+   * session — and are drawn from comparing a turn with the one above it. This is
+   * a property of the turn itself: it is true of a relayed turn whether or not
+   * anything precedes it, including when it is the first thing in a
+   * conversation, which is exactly the case a between-turns rule would miss.
+   */
+  relayedFrom: RelayedFrom | null;
 }
 
 /** Whether a turn's status means the daemon is still working it. */
@@ -187,6 +219,13 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     // Null, not a number this side made up. A daemon that does not send the ceiling is one whose
     // ceiling this window does not know, and guessing it would draw a proportion out of nothing.
     rotatesAt: row.context_rotates_at ?? null,
+    // Keyed off the ID and never off the title: the title is null on every conversation nobody has
+    // named, so a check on it would read most relayed turns as ordinary ones. `?? null` is the
+    // daemon-older-than-the-column case, same as `did` and `images` above.
+    relayedFrom:
+      row.relayed_from_chat_id === undefined || row.relayed_from_chat_id === null
+        ? null
+        : { chatId: row.relayed_from_chat_id, title: row.relayed_from_title ?? null },
   };
 }
 

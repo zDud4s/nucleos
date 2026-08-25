@@ -502,6 +502,10 @@ export function useSendMessage(chatId: string) {
         // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],
+        // Null, and it can be nothing else here: this optimistic row exists because the PERSON at
+        // this window just sent the message. A relayed turn is never drawn this way — it is born in
+        // another conversation and reaches this one through the daemon's own read.
+        relayedFrom: null,
       };
       // A `Transcript`, because that is what this key holds. It used to hold a bare array, and
       // writing the old shape here does not fail a type check — `setQueryData` is TOLD the type —

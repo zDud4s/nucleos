@@ -936,6 +936,22 @@
   color: var(--text-faint);
 }
 
+/* A conversation's own name is not a role label, so this one drops the uppercasing the line above
+   applies. "YOU" and "NÚCLEO" are categories; "the planning conversation" is something somebody
+   named, and shouting it back at them makes it read as a third category rather than as a title. */
+.chats-turn-who-relayed {
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--tone-info-fg);
+}
+
+.chats-turn-relayed-from {
+  color: inherit;
+  font-weight: var(--weight-medium);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .chats-prose {
   display: flex;
   flex-direction: column;

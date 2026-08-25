@@ -59,6 +59,7 @@ import {
   turnIsLive,
   unreadTotal,
   type Mark,
+  type RelayedFrom,
   type Todo,
 } from "../lib/turns";
 import { blocks, lines, type Line as RichLine } from "../lib/rich";
@@ -1506,7 +1507,7 @@ function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
-      <p className="chats-turn-who">you</p>
+      <WhoAsked relayedFrom={turn.relayedFrom} />
       {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
           Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
           message they did not send. */}
@@ -1881,6 +1882,31 @@ function WhatItDid({ did }: { did: ToolCall[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+/**
+ * Who put the words at the top of this turn there.
+ *
+ * "you" is the ordinary answer and was the only one until conversations could hand messages to each
+ * other. A relayed turn drawn under "you" is not a missing decoration — it is the transcript
+ * naming the wrong speaker, telling the person reading it that they said something they did not
+ * say, in the one place they go to find out what was actually said.
+ *
+ * The name is a link because the conversation on the far side is a real place, and the next thing
+ * somebody wants after "where did this come from" is to go and look. An unnamed conversation is
+ * described rather than identified: most chats carry no title until the daemon has summarised one,
+ * and printing a uuid at a person answers a question nobody asked — the link still goes there.
+ */
+function WhoAsked({ relayedFrom }: { relayedFrom: RelayedFrom | null }) {
+  if (relayedFrom === null) return <p className="chats-turn-who">you</p>;
+  return (
+    <p className="chats-turn-who chats-turn-who-relayed">
+      <Link className="chats-turn-relayed-from" to={`/chats/${relayedFrom.chatId}`}>
+        {relayedFrom.title ?? "an unnamed conversation"}
+      </Link>{" "}
+      handed this over
+    </p>
   );
 }
 
