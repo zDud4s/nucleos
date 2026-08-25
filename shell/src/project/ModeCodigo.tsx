@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "@tanstack/react-router";
 import { useConcurrency } from "../data/fleet";
 import {
   absolutePath,
@@ -70,12 +71,14 @@ export function ModeCodigo({ projectId, run, onPickRun }: ModeCodigoProps) {
           This mode reads a run&rsquo;s worktree. When one is working here, its changed files appear
           on the left — and the whole repository stays where it is, in the editor.
         </p>
+        <InspectorLink projectId={projectId} />
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-3">
+      <InspectorLink projectId={projectId} />
       {runs.length > 1 ? (
         <nav aria-label="Runs to review" className="flex flex-wrap gap-2">
           {runs.map((candidate) => (
@@ -124,6 +127,36 @@ export function ModeCodigo({ projectId, run, onPickRun }: ModeCodigoProps) {
  * not touch, because "twelve changed" alone tells you nothing about the size of what you are
  * trusting.
  */
+/**
+ * The door to the read-only inspector, and the one place in the app that opens it.
+ *
+ * **It is not this mode with a different skin, and that is why it survives.** The Código mode reads
+ * a RUN&rsquo;s worktree: what one piece of work changed, against the branch it started from. The
+ * inspector reads the project&rsquo;s own folder as it is on disk right now — no run, no branch
+ * point — which is what somebody wants when they are asking whether a file is even there, or
+ * grepping for a name across the repository, or reading the schedule rules.
+ *
+ * The link lives here rather than in the rail because that is the design&rsquo;s rule about the
+ * rail, and here rather than on the roster because the roster answers about every project at once
+ * and this is about one. Until the Código mode grows a browse and a search of its own, removing the
+ * link would be losing a working capability quietly — which the router&rsquo;s own comment says is
+ * the failure mode to avoid.
+ */
+function InspectorLink({ projectId }: { projectId: string }) {
+  return (
+    <p className="text-xs text-text-faint">
+      <Link
+        className="underline underline-offset-2"
+        to="/projects/$projectId/inspect/$view"
+        params={{ projectId, view: "browse" }}
+      >
+        Browse, search and diff the folder itself
+      </Link>{" "}
+      — the project as it is on disk, with no run in the way.
+    </p>
+  );
+}
+
 function ChangedFiles({
   changed,
   worktree,

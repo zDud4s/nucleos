@@ -24,6 +24,7 @@ import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
+import { Roster } from "./pages/Roster";
 import { NewProject } from "./pages/NewProject";
 import { Workspace } from "./project/Workspace";
 import { RunDetail } from "./pages/RunDetail";
@@ -65,7 +66,7 @@ export const PAGES: Record<string, () => ReactNode> = {
   "/waiting": Waiting,
   "/runs": Runs,
   "/feed": Feed,
-  "/projects": Projects,
+  "/projects": Roster,
   "/learned": Learned,
   "/chats": Chats,
   "/errands": Errands,
@@ -187,6 +188,13 @@ const DETAIL_ROUTES: {
    * and `rules` is superseded by the config editor, and neither of those exists
    * yet. Removing a working capability because its replacement is designed is
    * how a rewrite loses things quietly.
+   *
+   * `/projects` is `Roster` and this is `Projects`, and until 2026-08-24 they
+   * were one component doing both: the roster drew itself above the inspector on
+   * every visit, so choosing a project to look inside meant carrying
+   * twenty-five rows down the page with you. Two questions, two pages. The way
+   * IN is a link from the Código mode, which is where somebody already reading
+   * this project's code would go looking for a file tree.
    */
   { path: "/projects/$projectId/inspect/$view", component: Projects },
   { path: "/chats/$chatId", component: Chats },
