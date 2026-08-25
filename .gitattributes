@@ -12,3 +12,11 @@
 # the fmt gate on files nobody touched. The blobs are already LF; this stops the
 # checkout from undoing that, and is why CI does not need to normalise them first.
 *.go text eol=lf
+
+# A workflow bundle's IDENTITY is the hash of its bytes — that is what makes
+# `autopilot/1.0.0` mean one thing and what `workflows.rs` answers `drifted` with.
+# These files are embedded with `include_str!`, so a CRLF checkout would give the
+# same NucleOS version a different hash on two machines, and every start on one of
+# them would report the built-in workflow as changed and restore it. Same failure
+# the `*.sql` rule at the top prevents, one directory over.
+core/assets/** text eol=lf

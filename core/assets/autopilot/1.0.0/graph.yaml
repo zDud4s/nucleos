@@ -1,0 +1,82 @@
+# The autopilot, written down.
+#
+# This is the sequence `core/src/job.rs` has always run, said in the vocabulary of §6.4 instead of
+# in the shape of a Rust enum. Nothing here changes what a job does — `next_step` is still the
+# authority until the engine learns to read this file. What it changes is that the sequence can be
+# LOOKED AT, which is the whole of the first slice.
+#
+# ## Why the agent nodes carry no `body`
+#
+# A `body` is the instructions a person wrote for a node. These three have none, and it is not an
+# omission. Their prompt is the PROTOCOL between the engine and the node — write `plan.json` with
+# these keys, your ordinals are numbered from N, these are your teammates and what each is for — and
+# the engine composes it because the engine is what enforces it. It also branches on things no file
+# knows: whether this job has a team, which round this is, what the gate printed.
+#
+# A person's workflow node has both halves: the engine's protocol, and a body saying what to do.
+# The autopilot has only the first, so the field is absent rather than pointing at a file that would
+# have to lie about what runs.
+#
+# ## Why the gate names a command instead of carrying one
+#
+# A gate is a project's own definition of green. `0032_run_gate.sql` spends its comment on it: a
+# project with no gate command has no such definition, and NULL is the honest value. A literal here
+# would either invent a definition of green for somebody else's repository or ship a placeholder
+# that runs — so the node names the project's instead, and `project_commands::resolve` answers it.
+#
+# ## What the fan says that the prose never could
+#
+# `work` repeats `implement` AND `gate` — per item, which is what the `gate_each` column of the
+# `jobs` table has always meant. `concurrency: 1` is the sequential job; a job a team directs raises
+# it from `teams.max_parallel`, and that is a property of the JOB rather than of this file. The same
+# workflow runs sequential or distributed depending on who asked for it.
+#
+# The edge back to `plan` is the replan round. `validate` does not check for cycles, deliberately,
+# and this is what that allows.
+
+nodes:
+  - id: plan
+    type: agent
+    label: Plan
+
+  - id: implement
+    type: agent
+    label: Implement
+
+  - id: gate
+    type: command
+    label: Gate
+    command: project:gate
+    timeout: 30m
+
+  - id: work
+    type: fan
+    label: The queue
+    source: plan
+    each: [implement, gate]
+    concurrency: 1
+    join: all
+
+  # The round is over: is there more to do? A NODE and not a condition written on the edge out of
+  # the fan, because §4.4 gives the condition to the decision and leaves `when` on any other edge as
+  # a label nothing evaluates. A branch that nothing would ever evaluate is worse than no branch.
+  - id: more
+    type: decision
+    label: More to do?
+    condition: plan.done != true
+
+  - id: review
+    type: agent
+    label: Review
+
+edges:
+  - {from: plan, to: work}
+  # A green gate takes a checkpoint and the queue moves on; a red one spends the item's retry budget
+  # before the tree is reverted to the previous item's footing. Both stay inside the fan, which is
+  # what "the queue carries on" means.
+  - {from: gate, to: work, verdict: pass}
+  - {from: gate, to: work, verdict: fail}
+  - {from: work, to: more}
+  # The replan round. `validate` does not check for cycles, deliberately, and this is what it allows.
+  - {from: more, to: plan, when: true}
+  - {from: more, to: review, when: false}

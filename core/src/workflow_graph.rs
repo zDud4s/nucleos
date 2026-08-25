@@ -125,13 +125,72 @@ pub struct Node {
     pub condition: Option<String>,
 
     /* fan */
-    /// What the fan-out is over.
+    /// The node whose emission the fan-out is over.
+    ///
+    /// A node **id**, not a path. A node's emission is `.nucleos/<id>.json`, by convention rather
+    /// than by configuration, so naming the file here would name one thing twice and let the two
+    /// halves drift apart. Which node is the only part a bundle gets to choose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The nodes this fan repeats once per item, in order.
+    ///
+    /// **A segment and not a node**, and the difference is what makes the field necessary at all.
+    /// What repeats today is `implement` plus the gate that measures it — the `gate_each` column of
+    /// the `jobs` table exists for exactly that — so a field that took a single id would force a
+    /// second mechanism for the per-item gate, and then there would be two of them.
+    ///
+    /// The repeated nodes stay in the graph with their own types and their own colours, which is
+    /// what keeps the vocabulary honest: a fan does not execute anything, it repeats things that
+    /// do. §6.4's whole claim is that a node's type says who runs it, and a container type that
+    /// swallowed its contents would be the first exception.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub each: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+    /// How the repeated items are brought back together. `all` is the only value.
+    ///
+    /// Not free text: a field that accepted words nobody implemented would install cleanly and then
+    /// do something other than what it says, which is the one failure a bundle format must not
+    /// allow. Another rule arrives when something honours it — see [`JOIN_RULES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<String>,
+}
+
+/// The join rules the engine honours. Extend this when the engine learns one, and never before.
+pub const JOIN_RULES: &[&str] = &["all"];
+
+/// The prefix that makes a command node's `command` a reference instead of a literal.
+pub const PROJECT_COMMAND: &str = "project:";
+
+/// Where a command node's command comes from.
+///
+/// **Not every command belongs to the workflow that runs it**, and the built-in autopilot is the
+/// proof: its gate runs whatever the PROJECT declared as its gate, because a gate is a project's
+/// own definition of green and `0032_run_gate.sql` spends its comment saying that a project without
+/// one has no such definition at all. A bundle that wrote a literal there would either invent a
+/// definition of green for somebody else's repository, or ship a placeholder that runs.
+///
+/// So a command may name one instead: `project:gate` is the command this project declared under
+/// that name, resolved through [`crate::project_commands::resolve`] — which is §8's overlay read in
+/// the one direction it had not been used in yet. The workflow declares nothing and defers wholly.
+///
+/// A reference and not an absent field, deliberately. Absent stays refused, so a bundle author who
+/// forgets `command:` still gets the refusal that rule exists to give; and the canvas shows
+/// `project:gate` rather than a string nobody wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSource<'a> {
+    /// A literal, run as written.
+    Literal(&'a str),
+    /// The command this project declared under this name.
+    Project(&'a str),
+}
+
+/// Read a command node's `command` as what it is.
+pub fn command_source(command: &str) -> CommandSource<'_> {
+    match command.trim_start().strip_prefix(PROJECT_COMMAND) {
+        Some(name) => CommandSource::Project(name.trim()),
+        None => CommandSource::Literal(command),
+    }
 }
 
 /// One edge. A condition, a verdict, or neither — never both.
@@ -182,16 +241,80 @@ pub fn validate(graph: &Graph) -> Result<(), String> {
         if !ids.insert(node.id.as_str()) {
             return Err(format!("two nodes share the id `{}`", node.id));
         }
-        // A command with nothing to run and an agent with no body are both nodes that cannot do
-        // the thing their type says they do. Caught here rather than at execution, because the
-        // canvas is where somebody is looking at the workflow and able to fix it.
-        if node.kind == Kind::Command && node.command.is_none() {
-            return Err(format!("`{}` is a command node with no command", node.id));
+        // A command with nothing to run cannot do the thing its type says it does. Caught here
+        // rather than at execution, because the canvas is where somebody is looking at the workflow
+        // and able to fix it.
+        //
+        // **An agent with no body is NOT refused**, and this comment used to claim it was. The
+        // check never existed, and it turns out it must not: an agent node's prompt has two halves
+        // — the protocol the engine contributes (write this file, with these keys, your ordinals
+        // start at N) and the body a person wrote saying what to do. A node with only the first is
+        // an ordinary node, and the built-in autopilot's four agent nodes are all of them.
+        if node.kind == Kind::Command {
+            let Some(command) = node.command.as_deref() else {
+                return Err(format!("`{}` is a command node with no command", node.id));
+            };
+            // A reference has to name something, and the name has to be one a project could have
+            // declared — the same two rules `project_commands::validate` applies to the other side
+            // of the same lookup. `project:` alone reads as a command and would run as nothing.
+            if let CommandSource::Project(name) = command_source(command) {
+                if name.is_empty() {
+                    return Err(format!(
+                        "`{}` names a project command with no name",
+                        node.id
+                    ));
+                }
+                if name.chars().count() > crate::project_commands::MAX_NAME {
+                    return Err(format!(
+                        "`{}` names a project command longer than {} characters",
+                        node.id,
+                        crate::project_commands::MAX_NAME
+                    ));
+                }
+            }
         }
         if node.kind == Kind::Decision && node.condition.is_none() {
             return Err(format!(
                 "`{}` is a decision node with no condition",
                 node.id
+            ));
+        }
+    }
+
+    // The fan rules run in a second pass because every one of them asks whether some id exists, and
+    // the loop above is what collects them. A fan is the one type whose fields point at other nodes.
+    for node in graph.nodes.iter().filter(|node| node.kind == Kind::Fan) {
+        if node.each.is_empty() {
+            return Err(format!(
+                "`{}` is a fan node with no `each`, so nothing is repeated inside it",
+                node.id
+            ));
+        }
+        for named in node.each.iter().chain(node.source.iter()) {
+            // A fan that names itself is an infinite box, in the picture and in the engine.
+            if *named == node.id {
+                return Err(format!("`{}` is a fan that names itself", node.id));
+            }
+            if !ids.contains(named.as_str()) {
+                return Err(format!(
+                    "`{}` names `{named}`, which is not a node here",
+                    node.id
+                ));
+            }
+        }
+        if node.source.is_none() {
+            return Err(format!(
+                "`{}` is a fan node with no `source`, so there is nothing to fan out over",
+                node.id
+            ));
+        }
+        if let Some(join) = node.join.as_deref()
+            && !JOIN_RULES.contains(&join)
+        {
+            return Err(format!(
+                "`{}` joins with `{join}`, and the only rule the engine honours is `{}`",
+                node.id,
+                JOIN_RULES.join("`, `")
             ));
         }
     }
@@ -328,6 +451,15 @@ pub fn resolve(
             fields.push(Field {
                 name: "concurrency",
                 value: concurrency.to_string(),
+                origin: None,
+            });
+        }
+        // Joined rather than sent as a list, because every other field here is one string and a
+        // second shape would make the inspector special-case exactly one row.
+        if !node.each.is_empty() {
+            fields.push(Field {
+                name: "each",
+                value: node.each.join(", "),
                 origin: None,
             });
         }
@@ -577,5 +709,150 @@ edges:
     fn an_empty_graph_file_is_a_bundle_with_no_sequence_yet() {
         assert_eq!(parse("").unwrap(), Graph::default());
         assert_eq!(parse("# nothing yet\n").unwrap(), Graph::default());
+    }
+
+    /* ------------------------------------------------------------------- fan -- */
+
+    const FAN: &str = r#"
+nodes:
+  - {id: plan, type: agent, body: skills/plan/SKILL.md}
+  - {id: implement, type: agent, body: skills/execute/SKILL.md}
+  - {id: gate, type: command, command: scripts/gate.sh}
+  - {id: work, type: fan, source: plan, each: [implement, gate], concurrency: 2, join: all}
+edges:
+  - {from: plan, to: work}
+  - {from: gate, to: work, verdict: pass}
+  - {from: gate, to: work, verdict: fail}
+"#;
+
+    /// **A fan repeats a SEGMENT, not a node**, and `each` is the only place that can say which.
+    ///
+    /// What repeats today is `implement` and the gate that measures it — which is what the
+    /// `gate_each` column of the `jobs` table exists for. A field that took a single id would force
+    /// a second mechanism for the per-item gate, and then there would be two.
+    #[test]
+    fn a_fan_names_the_segment_it_repeats() {
+        let graph = parse(FAN).unwrap();
+        let fan = graph.nodes.iter().find(|n| n.id == "work").unwrap();
+        assert_eq!(fan.kind, Kind::Fan);
+        assert_eq!(fan.each, vec!["implement".to_string(), "gate".to_string()]);
+        assert_eq!(fan.source.as_deref(), Some("plan"));
+        assert_eq!(fan.concurrency, Some(2));
+    }
+
+    /// Caught where the bundle goes in, and not halfway through a night.
+    ///
+    /// The same argument as every other rule in [`validate`]: this is something that would produce
+    /// a picture that is *wrong* rather than a picture that is missing — a fan drawn with a segment
+    /// inside it that is not there.
+    #[test]
+    fn a_fan_that_repeats_a_node_the_graph_does_not_have_is_refused() {
+        let error =
+            parse("nodes:\n  - {id: work, type: fan, source: work, each: [ghost]}\n").unwrap_err();
+        assert!(error.contains("ghost"), "{error}");
+        assert!(error.contains("work"), "{error}");
+    }
+
+    /// The two real nodes a fan needs around it, so these tests break one rule at a time.
+    fn fan_with(fields: &str) -> String {
+        format!(
+            "nodes:\n  \
+             - {{id: plan, type: agent, body: b.md}}\n  \
+             - {{id: implement, type: agent, body: b.md}}\n  \
+             - {{id: work, type: fan, {fields}}}\n"
+        )
+    }
+
+    /// `source` names a NODE, because a node's emission is `.nucleos/<id>.json` by convention —
+    /// naming the file instead would name the same thing twice and let the two drift apart.
+    #[test]
+    fn a_fan_whose_source_is_not_a_node_is_refused() {
+        let error = parse(&fan_with("source: nowhere, each: [implement]")).unwrap_err();
+        assert!(error.contains("nowhere"), "{error}");
+    }
+
+    /// A fan with nothing to repeat cannot do the thing its type says it does — the same rule the
+    /// command and the decision already have, applied to the third type with a field it cannot
+    /// work without.
+    #[test]
+    fn a_fan_with_no_segment_is_refused() {
+        let error = parse(&fan_with("source: plan")).unwrap_err();
+        assert!(error.contains("each"), "{error}");
+        assert!(error.contains("work"), "{error}");
+    }
+
+    /// A fan cannot fan over itself, in either field: it is an infinite box in the picture and an
+    /// infinite regress in the engine.
+    #[test]
+    fn a_fan_that_names_itself_is_refused() {
+        for fields in [
+            "source: work, each: [implement]",
+            "source: plan, each: [work]",
+        ] {
+            let error = parse(&fan_with(fields)).unwrap_err();
+            assert!(error.contains("names itself"), "{fields}: {error}");
+        }
+    }
+
+    /// **`all` is the only join anybody implemented**, and a field that accepted words nothing
+    /// honours is a bundle that installs and then does something other than what it says.
+    #[test]
+    fn a_join_rule_nobody_implemented_is_refused_rather_than_ignored() {
+        let error = parse(&fan_with(
+            "source: plan, each: [implement], join: first-failure",
+        ))
+        .unwrap_err();
+        assert!(error.contains("first-failure"), "{error}");
+        assert!(error.contains("all"), "{error}");
+    }
+
+    /* --------------------------------------------------------------- command -- */
+
+    /// A gate is a project's own definition of green, so the built-in workflow names it instead of
+    /// inventing one. Everything else is what it says it is.
+    #[test]
+    fn a_command_is_either_a_literal_or_the_projects_own() {
+        assert_eq!(
+            command_source("project:gate"),
+            CommandSource::Project("gate")
+        );
+        assert_eq!(
+            command_source("  project: gate "),
+            CommandSource::Project("gate")
+        );
+        assert_eq!(
+            command_source("cargo test"),
+            CommandSource::Literal("cargo test")
+        );
+        // A path that merely contains a colon is not a reference.
+        assert_eq!(
+            command_source("./scripts/gate.sh --strict"),
+            CommandSource::Literal("./scripts/gate.sh --strict")
+        );
+    }
+
+    /// `project:` on its own reads as a command and would run as nothing at all.
+    #[test]
+    fn a_project_command_reference_has_to_name_something() {
+        let error =
+            parse("nodes:\n  - {id: gate, type: command, command: 'project:'}\n").unwrap_err();
+        assert!(error.contains("no name"), "{error}");
+    }
+
+    /// Absent stays refused, and that is the point of using a reference rather than an absence:
+    /// somebody who forgets the field still gets the refusal the rule exists to give.
+    #[test]
+    fn a_command_node_with_no_command_is_still_refused() {
+        let error = parse("nodes:\n  - {id: gate, type: command}\n").unwrap_err();
+        assert!(error.contains("no command"), "{error}");
+    }
+
+    /// The inspector's job is to say what a node IS, so the segment shows up beside the rest of it.
+    #[test]
+    fn the_segment_a_fan_repeats_is_shown_on_the_node() {
+        let painted = resolve(&parse(FAN).unwrap(), &BTreeMap::new());
+        let fan = painted.nodes.iter().find(|n| n.id == "work").unwrap();
+        let each = fan.fields.iter().find(|f| f.name == "each").unwrap();
+        assert_eq!(each.value, "implement, gate");
     }
 }
