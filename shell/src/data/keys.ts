@@ -124,6 +124,8 @@ export const keys = {
       ["projects", projectId, "grep", q, path] as const,
     diff: (projectId: string, path: string) => ["projects", projectId, "diff", path] as const,
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
+    /** The project's structure layer, derived off disk on every read. */
+    map: (projectId: string) => ["projects", projectId, "map"] as const,
     /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
     ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
     /** What this project can be asked to do to itself, and what each of them last said. */

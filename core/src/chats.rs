@@ -227,15 +227,6 @@ pub async fn set_plan_only(pool: &SqlitePool, chat_id: &str, planning: bool) -> 
     Ok(())
 }
 
-/// Which model answers this conversation, and how hard it is asked to think.
-///
-/// One query for both, and read on the turn path — matching `cwd_of` and `brain_of`, whose comments
-/// give the reason: `get` walks the whole list to answer, and this runs before every single turn.
-/// Together rather than separately because they are read together and never apart: a turn needs
-/// both to build its request, and two queries would be two round trips for one decision.
-///
-/// `(None, None)` is the state every conversation opened before this column existed is in, and it
-/// means the same thing it meant then — the daemon's configured model, at the CLI's own effort.
 /// Everything a conversation says about HOW its next turn should run.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Answering {
@@ -264,6 +255,15 @@ pub struct Answering {
     pub context_window: Option<i64>,
 }
 
+/// Which model answers this conversation, and how hard it is asked to think.
+///
+/// **Only tests call this**, and the `#[cfg(test)]` says so rather than letting the build carry a
+/// function nothing in it reaches. It used to be the turn path's own read; `answering` below took
+/// that over when the same query grew seven more columns, and every caller that mattered moved
+/// with it. What stayed behind is eight assertions in `http.rs` that are about these two columns
+/// and no others — `(Some("opus"), None)` is one thought, and the same eight reaching into an
+/// `Answering` for two of its nine fields is not.
+#[cfg(test)]
 pub async fn model_of(
     pool: &SqlitePool,
     chat_id: &str,
@@ -276,7 +276,10 @@ pub async fn model_of(
 ///
 /// One query and one struct, because the turn path reads all of it at once and never a piece of it
 /// alone: two round trips for one decision is two chances to read a row somebody changed in
-/// between. It grew out of `model_of`, which is kept as the narrow view its callers want.
+/// between. This runs before every single turn — the same reason `cwd_of` and `brain_of` give for
+/// reading with one query what could have been read with several.
+///
+/// It grew out of `model_of`, which is now reached only from tests.
 ///
 /// A row that is not there answers `Default` rather than failing — every conversation opened before
 /// these columns existed is in exactly that state, and it means what it always meant: the daemon's
@@ -310,23 +313,27 @@ fn subagents_from(raw: Option<String>) -> Vec<crate::runner::Subagent> {
         .collect()
 }
 
-/// The row `answering` reads, in the order its SELECT names the columns.
+/// The row `answering` reads, in the order its `SELECT` names the columns.
 ///
-/// A named alias and not the tuple written inline, because the tuple crossed the width at which it
-/// stops being readable the moment `context_window` joined it. The order here IS the contract with
-/// the query below — ten positions, matched by position and nothing else — so the two live within a
-/// screen of each other on purpose.
+/// Named rather than written out at the binding, where ten anonymous `Option`s in a row tell a
+/// reader nothing about which is which and tell the compiler nothing either — put `denied_tools`
+/// where `agents` goes and both the tuple and the query still typecheck, and the mistake surfaces
+/// as a conversation that has denied the tools it meant to define helpers with.
+///
+/// The comments are the only thing standing between the two halves of that, so they stay beside
+/// the columns. This list and the `SELECT` below are one thing written twice; changing either
+/// without the other is the bug this alias exists to make visible.
 type AnsweringRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<f64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
+    Option<String>, // model
+    Option<String>, // effort
+    Option<String>, // fallback_model
+    Option<String>, // extra_dirs
+    Option<f64>,    // turn_budget_usd
+    Option<String>, // agents
+    Option<String>, // system_prompt
+    Option<String>, // denied_tools
+    Option<String>, // title
+    Option<i64>,    // context_window
 );
 
 pub async fn answering(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Answering> {

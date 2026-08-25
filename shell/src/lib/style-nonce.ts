@@ -38,6 +38,22 @@ import { setNonce } from "get-nonce";
  * Nothing here weakens anything: a value that changes every load and is never written down cannot
  * be used by an attacker who could not already run script, and `script-src 'self'` is what stops
  * that.
+ *
+ * # Measured, in the window
+ *
+ * Everything above about what Tauri sends was read out of Tauri's source, and the gate that keeps
+ * it honest runs in Chromium over `http://127.0.0.1` rather than in a WebView2 window over the
+ * custom protocol. `scripts/csp-in-the-window.mjs` closes that distance: it builds the application,
+ * attaches to the real window, and reports the policy the document was actually served under.
+ *
+ * ```
+ * document:  http://tauri.localhost/
+ * style-src: style-src 'self' 'self' 'nonce-2596694693578650474'
+ * ```
+ *
+ * The nonce is there, it differs on every load, and a `<style>` signed with the value this module
+ * hands out is accepted and applied while an unsigned one is refused. The doubled `'self'` is Tauri
+ * appending to what the configuration already said, and is not a fault.
  */
 
 /**

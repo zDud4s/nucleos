@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen } from "@testing-library/react";
 import { NAV_PATHS } from "./app/nav";
 import { PAGES, createAppRouter } from "./router";
+import { Bench } from "./team/Bench";
 import { daemonFetch, daemonState, renderApp } from "./test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -68,6 +69,29 @@ describe("the app router", () => {
     const paths = Object.values(byId).map((route) => route.fullPath);
     expect(paths).toContain("/teams/$teamId");
     expect(paths).toContain("/team-runs/$runId");
+  });
+
+  /**
+   * The bench is its own component, and the console is not it.
+   *
+   * `/teams/$teamId` used to be a second mounting of `Teams`, which served both
+   * routes in the Council pattern. Splitting them is the whole point of the
+   * redesign, and it is the kind of change that is easy to make in one file and
+   * forget in the other: `Bench.test.tsx` builds its own router — for the
+   * reasons it states — so its whole suite passes whether or not the real tree
+   * ever reaches `Bench`. This is the assertion that file cannot make about
+   * itself.
+   */
+  it("sends /teams/$teamId to the bench and /teams to the console", () => {
+    const router = createAppRouter();
+    const byId = router.routesById as unknown as Record<
+      string,
+      { options?: { component?: unknown } }
+    >;
+
+    expect(byId["/teams/$teamId"]?.options?.component).toBe(Bench);
+    expect(byId["/teams"]?.options?.component).toBe(PAGES["/teams"]);
+    expect(byId["/teams"]?.options?.component).not.toBe(Bench);
   });
 
   /**
