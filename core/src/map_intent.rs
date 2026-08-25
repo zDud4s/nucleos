@@ -68,6 +68,80 @@ impl Kind {
     }
 }
 
+/// How much of a document is sent. Beyond this it is cut at a line boundary and the cut is stated.
+///
+/// Not a token count, because this module does not know which model will answer and the two runners
+/// it feeds count differently. Bytes are the honest unit for a limit whose only job is to keep one
+/// document from being larger than any of them.
+pub const MAX_SPEC_BYTES: usize = 60_000;
+
+/// The document, cut at a line if it must be, and whether it was.
+fn bounded(source: &str) -> (&str, bool) {
+    if source.len() <= MAX_SPEC_BYTES {
+        return (source, false);
+    }
+    let cut = source[..MAX_SPEC_BYTES]
+        .rfind('\n')
+        .unwrap_or(MAX_SPEC_BYTES);
+    (&source[..cut], true)
+}
+
+/// What to ask a model about one spec.
+///
+/// **The whole design of this slice is in this string**, so it is worth saying what each rule is
+/// buying. A model that invents produces an approved line nothing decided, and the owner then owes
+/// a stamp on it forever — that is the failure that makes the map worse than no map. A line with no
+/// section can never be anchored to code, so it sits in the list being neither true nor false. And
+/// the three kinds are what decide whether this costs an afternoon a week or thirty seconds a day,
+/// which is why they are spelled out rather than named.
+///
+/// Deliberately says nothing about the document's language. These specs are Portuguese and the
+/// decisions must come back in the document's own words: a translated decision is a paraphrase, and
+/// a paraphrase is exactly the thing the owner cannot check at a glance.
+pub fn extraction_prompt(spec_slug: &str, source: &str) -> String {
+    let (body, was_cut) = bounded(source);
+    let cut_note = if was_cut {
+        "\n\n[The document was truncated at a line boundary to fit. Decisions after the cut are \
+         not yours to guess at.]"
+    } else {
+        ""
+    };
+
+    format!(
+        "You are reading one design document and listing the decisions it fixes.\n\
+         \n\
+         A decision is something the document SETTLES about the product — a rule that code either \
+         follows or does not. Three kinds exist, and only two of them belong in your list.\n\
+         \n\
+         1. About scope, process, or the document itself. No code can implement it. Example: \"Two \
+         specs, and the page comes first.\" LEAVE THESE OUT ENTIRELY.\n\
+         2. Names something countable — a number, a set, a coverage claim — so that something could \
+         later count the code and agree or disagree. Example: \"agent, command, decision, fan\", \
+         which is four kinds and an enum that has four. kind = \"b\".\n\
+         3. About character: what a thing IS or IS NOT. No count decides it. Example: \"Code mode is \
+         a review surface, not an IDE.\" kind = \"c\".\n\
+         \n\
+         Rules:\n\
+         - One entry per decision. Never merge two into one line.\n\
+         - `section` is the heading the decision came from, copied verbatim from the document, \
+         including its number. If you cannot point at one heading, leave it out.\n\
+         - `text` is ONE sentence saying what was decided, in the document's own language. Not a \
+         summary of the section — the decision.\n\
+         - Invent nothing. If the document settles four things, return four. An empty list is a \
+         valid answer.\n\
+         - At most 20 entries, and prefer fewer.\n\
+         \n\
+         Answer with JSON only, shaped exactly like this and nothing else:\n\
+         {{\"decisions\":[{{\"section\":\"...\",\"text\":\"...\",\"kind\":\"b\"}}]}}\n\
+         \n\
+         The document is `{spec_slug}`:\n\
+         \n\
+         ----- BEGIN DOCUMENT -----\n\
+         {body}\n\
+         ----- END DOCUMENT -----{cut_note}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +177,41 @@ mod tests {
         );
         // The storage form is NOT the JSON form, and this is the assertion that says so.
         assert!(serde_json::from_str::<Kind>("\"b\"").is_err());
+    }
+
+    #[test]
+    fn the_prompt_carries_the_document_and_says_what_a_decision_is() {
+        let prompt = extraction_prompt("2026-08-22-workspace-de-projeto-design", "## 1. Alfa\n");
+
+        // The document itself, or the model is answering about nothing.
+        assert!(prompt.contains("## 1. Alfa"));
+        // The slug, so a model that answers about the wrong file is visibly answering about it.
+        assert!(prompt.contains("2026-08-22-workspace-de-projeto-design"));
+        // The three kinds, because §4.1 is the whole of what makes this cheap to approve.
+        assert!(prompt.contains("scope, process, or the document itself"));
+        assert!(prompt.contains(r#""b""#));
+        assert!(prompt.contains(r#""c""#));
+    }
+
+    #[test]
+    fn the_prompt_refuses_the_two_failures_that_would_cost_the_most() {
+        let prompt = extraction_prompt("slug", "body");
+
+        // Inventing is the failure that makes the map worse than no map: an approved line that
+        // nothing decided becomes a decision the owner then owes a stamp on forever.
+        assert!(prompt.to_lowercase().contains("invent"));
+        // A line with no section can never be anchored to code in slice 3, so it is a line that
+        // will sit in the list forever being neither true nor false.
+        assert!(prompt.contains("leave it out"));
+    }
+
+    #[test]
+    fn a_document_too_long_to_send_is_cut_at_a_line_and_says_so() {
+        // Not a silent truncation: a model handed half a document with no notice answers
+        // confidently about a document that does not exist.
+        let long = "x".repeat(MAX_SPEC_BYTES + 500);
+        let prompt = extraction_prompt("slug", &long);
+        assert!(prompt.contains("truncated"));
+        assert!(prompt.len() < long.len() + 4_000);
     }
 }
