@@ -4238,14 +4238,21 @@ mod tests {
                 "type": "tool_use", "id": "toolu_1", "name": "Bash",
                 "input": {"command": "cargo test dates::"}
             }])),
-            answered("toolu_1", serde_json::json!("test result: ok. 3 passed"), false),
+            answered(
+                "toolu_1",
+                serde_json::json!("test result: ok. 3 passed"),
+                false,
+            ),
         ]
         .join("\n");
 
         let live = live_from_stream(&stream);
 
         assert_eq!(live.did.len(), 1);
-        assert_eq!(live.did[0].result.as_deref(), Some("test result: ok. 3 passed"));
+        assert_eq!(
+            live.did[0].result.as_deref(),
+            Some("test result: ok. 3 passed")
+        );
         assert_eq!(live.did[0].result_chars, Some(25));
         assert!(!live.did[0].result_failed);
         // And the tool has stopped running, which is the behaviour that was already here.
@@ -4299,7 +4306,10 @@ mod tests {
 
         let live = live_from_stream(&stream);
 
-        assert_eq!(live.did[0].result.as_ref().map(|kept| kept.chars().count()), Some(RESULT_LIMIT));
+        assert_eq!(
+            live.did[0].result.as_ref().map(|kept| kept.chars().count()),
+            Some(RESULT_LIMIT)
+        );
         assert_eq!(live.did[0].result_chars, Some((RESULT_LIMIT + 500) as i64));
     }
 
@@ -4312,7 +4322,11 @@ mod tests {
                 "type": "tool_use", "id": "toolu_1", "name": "Bash",
                 "input": {"command": "cargo test"}
             }])),
-            answered("toolu_1", serde_json::json!("error: could not compile"), true),
+            answered(
+                "toolu_1",
+                serde_json::json!("error: could not compile"),
+                true,
+            ),
         ]
         .join("\n");
 
@@ -4390,7 +4404,10 @@ mod tests {
 
         let json = serde_json::to_string(&bare).unwrap();
 
-        assert!(!json.contains("result"), "the empty answer was serialised: {json}");
+        assert!(
+            !json.contains("result"),
+            "the empty answer was serialised: {json}"
+        );
     }
 
     #[test]
