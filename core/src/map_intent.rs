@@ -248,22 +248,135 @@ fn json_object(answer: &str) -> Option<&str> {
     (end > start).then(|| &answer[start..=end])
 }
 
-/// Ask one runner about one spec.
+/// The shape a local model is sampled into.
 ///
-/// **The runner is the parameter, and that is the whole of the owner's choice.** `OllamaRunner` and
-/// `ClaudeCliRunner` both implement [`crate::runner::CommandRunner`], so a local brain and a cloud
-/// one arrive here as the same type and leave as the same answer. There is no second code path to
-/// keep in step, and no heuristic deciding which one was good enough — the owner decided.
+/// A grammar the sampler enforces, which the CLI path has no equivalent of — there the shape is
+/// asked for in the prompt and checked afterwards by [`parse_extraction`]. Both arms end at that
+/// same parse, so a local answer is not trusted more for having been constrained; it is only
+/// likelier to arrive well-formed. This is the same posture `web::summarise` takes.
+///
+/// **`a` is admitted here on purpose, and dropped afterwards.** §4.1's type A must not become a
+/// row, and a grammar offering only `b` and `c` looks like the way to guarantee that. It is the
+/// opposite: it leaves the model nowhere to put a type A, so one arrives mislabelled as `b` or `c`
+/// rather than dropped. The grammar would be manufacturing the wrong answer instead of preventing
+/// it. [`Kind::from_wire`] drops `a`, in the one place that drop already lives.
+fn extraction_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "section": {"type": "string", "minLength": 1},
+                        "text": {"type": "string", "minLength": 1},
+                        "kind": {"type": "string", "enum": ["a", "b", "c"]}
+                    },
+                    "required": ["section", "text", "kind"]
+                }
+            }
+        },
+        "required": ["decisions"]
+    })
+}
+
+/// How many `assistant` events one extraction may emit before the daemon stops reading.
+///
+/// **Not `1`, and the reason is that the ceiling counts something other than what "ask once" means.**
+/// [`crate::runner::over_turn_ceiling`] is `turns >= ceiling` and
+/// [`crate::runner::turns_from_line`] increments on every `assistant` AND every `turn.completed`
+/// event, so `Some(1)` breaks the stream ON the first assistant message — before the `result` event
+/// carrying the answer has been read. The cloud arm would then return a truncated transcript and
+/// `TURN_CEILING_EXIT_CODE` for every run that had in fact succeeded, which the exit-code check
+/// below would turn into a reported failure. `the_turn_ceiling_lets_the_answer_arrive` pins both
+/// halves of that against the runner's own pure functions.
+///
+/// **A margin rather than a budget, and it brakes nothing that could run away.** The ceiling exists
+/// to stop a tool loop, and [`crate::runner::ToolPolicy::None`] leaves no tool to loop on: the model
+/// is handed a document, answers, and the process ends. What this has to survive is one answer
+/// arriving as more than one event — a `turn.completed` beside the `assistant` is already two — not
+/// a run that will not converge. Four is that margin and nothing more; it is not a number this is
+/// expected to approach.
+const MAX_EXTRACTION_TURNS: i64 = 4;
+
+/// Who is being asked, which is the whole of the owner's choice.
+///
+/// **Two arms and not one, and the reason is behavioural rather than typed.** Both `OllamaRunner`
+/// and `ClaudeCliRunner` implement [`crate::runner::CommandRunner`], so a single call through the
+/// trait looks like it would serve both — and it does not. `OllamaRunner` is the TRIAGE runner
+/// wearing the trait: it imposes a `{id, class, summary}` grammar on every prompt it is given,
+/// validates the answer as a triage verdict, and pins the context to `triage::LOCAL_NUM_CTX`. An
+/// extraction sent through it comes back a triage array, is judged unusable, and parses to nothing.
+///
+/// So the local brain is asked at the loopback endpoint directly, which is what
+/// [`crate::runner::ollama_chat`] is `pub` for — `web.rs`, `voice.rs` and `pii_shadow.rs` all reach
+/// it that way, and this is the fourth. The cost is one `match` in one function; the alternative
+/// was making the grammar per-request in the runner, which would rewrite shipped mail triage to
+/// serve a feature that had not shipped yet.
+pub enum Extractor<'a> {
+    /// The agent CLI, through the trait every runner implements.
+    Cli(&'a dyn crate::runner::CommandRunner),
+    /// The model on this machine, asked where it lives.
+    Loopback {
+        client: &'a reqwest::Client,
+        base_url: &'a str,
+        model: &'a str,
+    },
+}
+
+/// Ask one brain about one spec.
+///
+/// **Which brain is the parameter, and that is the whole of the owner's choice.** Not a fallback,
+/// not a heuristic scoring one answer against the other — the owner picked, and the picking is the
+/// argument. What differs between the arms is only how each brain is reached; both end at the same
+/// [`parse_extraction`], so neither is trusted more than the other for the shape of what came back.
 ///
 /// **An empty list and a failure are different answers and never collapse.** Empty means a model
 /// read the document and found nothing to fix; an error means nobody read anything. Telling the
 /// owner the first when the second happened is precisely the false confidence this feature exists
 /// to cure, in the one place it would be easiest to introduce.
 pub async fn extract(
-    runner: &dyn crate::runner::CommandRunner,
+    asked: Extractor<'_>,
     spec_slug: &str,
     source: &str,
 ) -> std::io::Result<Vec<Extracted>> {
+    let runner = match asked {
+        Extractor::Cli(runner) => runner,
+        Extractor::Loopback {
+            client,
+            base_url,
+            model,
+        } => {
+            let answer = crate::runner::ollama_chat(
+                client,
+                base_url,
+                model,
+                &extraction_prompt(spec_slug, source),
+                // **A window this machine has not proved it has, and that is a known limit rather
+                // than an oversight.** The startup probe only ever established that the configured
+                // model holds `triage::LOCAL_NUM_CTX` — 8192 — while [`MAX_SPEC_BYTES`] lets a
+                // document reach 60 000. A local model whose real window is smaller will answer
+                // about less of the document than it was handed, and will say nothing about having
+                // done so.
+                //
+                // What keeps that from being a silently wrong answer is the column: `map_decisions`
+                // records WHICH brain answered every row, so a thin local list is attributable
+                // rather than mysterious, and the owner reads the two lists beside each other.
+                // Visibly approximate is the bargain this slice makes; silently wrong is not.
+                serde_json::json!({"num_ctx": 32_768, "temperature": 0}),
+                Some(extraction_format()),
+                false,
+            )
+            .await?;
+            // Straight to the same parse the other arm ends at. There is no `extract_reply` here
+            // because there is no stream to unwrap: `ollama_chat` returns `message.content`, which
+            // is the model's words and nothing else.
+            return Ok(parse_extraction(&answer));
+        }
+    };
+
     // Every field is spelled out because `RunRequest` deliberately has no `Default` — its own doc
     // comment says why: a flag added later must not silently inherit a value nobody chose. Copied
     // from `council.rs`'s cloud seat, which is the closest neighbour (one question, no tools, no
@@ -282,8 +395,9 @@ pub async fn extract(
         // anything else outright — so the local half of the owner's choice depends on this value.
         tool_policy: crate::runner::ToolPolicy::None,
         progress_timeout: None,
-        // Asks once and reads the answer. There is no tool call for a second turn to follow up on.
-        max_turns: Some(1),
+        // Asks once and reads the answer — but the ceiling counts events, not questions, so the
+        // number that expresses "once" is not `1`. See [`MAX_EXTRACTION_TURNS`].
+        max_turns: Some(MAX_EXTRACTION_TURNS),
         session_id: None,
         fork_session: false,
         // Nobody is watching this stream; the answer is read once, whole, at the end.
@@ -331,14 +445,33 @@ pub async fn extract(
 
     let outcome = runner.run_prompt(request, session_tx, transcript).await?;
 
-    // The two runners do not answer in the same shape, and this is the seam where that shows.
-    // `OllamaRunner` puts the model's words straight into `stdout`; `ClaudeCliRunner` puts the whole
-    // `--output-format stream-json` transcript there, one event per line, with the answer inside the
-    // final `result`. Handed that stream, `parse_extraction` takes the first `{` and the last `}` of
-    // the WHOLE thing and deserialises nothing — so every cloud extraction would come back "this
-    // spec decided nothing" while the model had in fact answered. `extract_reply` is what the rest
-    // of this daemon uses for exactly that, and it returns `None` for an answer that is not a
-    // stream, which is why the local runner's plain text passes through it untouched.
+    // **A run that failed says so, rather than arriving as a document that decided nothing.** The
+    // CLI runner reports most failures as `Ok` with a non-zero code and not as `Err` — a tool policy
+    // the `init` event contradicted, a progress deadline, a turn ceiling, a stream that died
+    // mid-transcript, or the CLI's own non-zero exit. Every one of those means nobody finished
+    // reading the spec, and letting them fall through to `parse_extraction` would produce an empty
+    // list: exactly the collapse `a_runner_that_fails_is_reported_rather_than_read_as_an_empty_spec`
+    // exists to forbid, reached by the door that does not look like a failure.
+    //
+    // Safe because a clean run's code is the CLI process's own, which is 0 — every other arm of the
+    // runner's `match` is a named failure. `stderr` travels with it, because "the run failed" and
+    // "the run was stopped after 4 turns" are different things to find in a log.
+    if outcome.exit_code != 0 {
+        return Err(std::io::Error::other(format!(
+            "the extraction run failed with exit code {}: {}",
+            outcome.exit_code,
+            outcome.stderr.trim()
+        )));
+    }
+
+    // The two paths into this arm do not answer in the same shape, and this is the seam where that
+    // shows. `ClaudeCliRunner` puts the whole `--output-format stream-json` transcript into `stdout`,
+    // one event per line, with the answer inside the final `result`. Handed that stream,
+    // `parse_extraction` takes the first `{` and the last `}` of the WHOLE thing and deserialises
+    // nothing — so every cloud extraction would come back "this spec decided nothing" while the
+    // model had in fact answered. `extract_reply` is what the rest of this daemon uses for exactly
+    // that (`team.rs`, `voice.rs`, `assistant.rs`), and it returns `None` for an answer that is not
+    // a stream, so a runner answering in plain text passes through it untouched.
     let answer = crate::runner::extract_reply(&outcome.stdout).unwrap_or(outcome.stdout);
     Ok(parse_extraction(&answer))
 }
@@ -655,7 +788,9 @@ mod tests {
             r#"{"decisions":[{"section":"§1","text":"Alfa.","kind":"c"}]}"#,
         );
 
-        let found = extract(&runner, "slug", "## §1\nbody").await.expect("extract");
+        let found = extract(Extractor::Cli(&runner), "slug", "## §1\nbody")
+            .await
+            .expect("extract");
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].text, "Alfa.");
@@ -666,7 +801,12 @@ mod tests {
         // The owner pressed a button. "This spec produced nothing, press again or pick another
         // brain" is a sentence; a 500 is not.
         let runner = fake_answering("I am unable to help with that.");
-        assert!(extract(&runner, "slug", "body").await.expect("extract").is_empty());
+        assert!(
+            extract(Extractor::Cli(&runner), "slug", "body")
+                .await
+                .expect("extract")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -675,7 +815,7 @@ mod tests {
         // a failure means nobody read anything, and telling the owner the first when the second
         // happened is exactly the false confidence this whole feature exists to cure.
         let runner = fake_failing();
-        assert!(extract(&runner, "slug", "body").await.is_err());
+        assert!(extract(Extractor::Cli(&runner), "slug", "body").await.is_err());
     }
 
     #[tokio::test]
@@ -684,7 +824,9 @@ mod tests {
         // is the only place either can be observed. A reader that could edit the repository is not
         // reading it.
         let runner = fake_answering(r#"{"decisions":[]}"#);
-        let _ = extract(&runner, "the-slug", "## 1. Alfa\n").await.expect("extract");
+        let _ = extract(Extractor::Cli(&runner), "the-slug", "## 1. Alfa\n")
+            .await
+            .expect("extract");
 
         let prompt = runner.last_prompt.lock().unwrap().clone().expect("a prompt was sent");
         assert!(prompt.contains("## 1. Alfa"));
@@ -709,9 +851,149 @@ mod tests {
 {"type":"result","subtype":"success","result":"{\"decisions\":[{\"section\":\"§1\",\"text\":\"Alfa.\",\"kind\":\"b\"}]}"}"#,
         );
 
-        let found = extract(&runner, "slug", "body").await.expect("extract");
+        let found = extract(Extractor::Cli(&runner), "slug", "body")
+            .await
+            .expect("extract");
 
         assert_eq!(found.len(), 1, "the answer lives inside the final `result` event");
         assert_eq!(found[0].text, "Alfa.");
+    }
+
+    #[tokio::test]
+    async fn a_cli_run_that_ended_badly_is_an_error_and_not_a_document_that_decided_nothing() {
+        // The CLI runner reports most of its failures as `Ok` with a non-zero code — a tool policy
+        // the `init` event contradicted, a progress deadline, a turn ceiling, a stream that died
+        // mid-transcript. Every one means nobody finished reading the spec, and each would parse to
+        // an empty list: the same collapse as above, through the door that does not look like one.
+        let runner = fake_answering("");
+        *runner.canned.lock().unwrap() = Some(crate::runner::RunOutcome {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "nucleos: stream failed after launch".to_string(),
+            session_id: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+
+        let failed = extract(Extractor::Cli(&runner), "slug", "body").await;
+
+        let error = failed.expect_err("a non-zero exit is a failure").to_string();
+        // The stderr travels with it, because "the run failed" and "the stream died after launch"
+        // are different things to find in a log at three in the morning.
+        assert!(error.contains("stream failed after launch"), "got: {error}");
+    }
+
+    #[test]
+    fn the_turn_ceiling_lets_the_answer_arrive() {
+        // Asserted against the runner's own pure functions, because this is the one property of the
+        // request that no fake can observe: `FakeCommandRunner` records `max_turns` nowhere and
+        // enforces no ceiling, so a value that strangles every real run would ship green.
+        //
+        // `Some(1)` reads like "ask once" and is not: `turns_from_line` counts `assistant` events,
+        // `over_turn_ceiling` is `turns >= ceiling`, and the stream BREAKS at that point — before
+        // the `result` event carrying the answer has been read. Every successful cloud extraction
+        // would come back truncated and non-zero.
+        let assistant = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
+        let after_one_answer = crate::runner::turns_from_line(assistant, 0);
+        assert_eq!(after_one_answer, 1);
+
+        assert!(
+            crate::runner::over_turn_ceiling(after_one_answer, Some(1)),
+            "Some(1) stops the stream on the first answer, before the result event"
+        );
+        assert!(
+            !crate::runner::over_turn_ceiling(after_one_answer, Some(MAX_EXTRACTION_TURNS)),
+            "the ceiling this asks for lets one answer finish"
+        );
+        // A `turn.completed` beside the `assistant` is already two events for one answer, which is
+        // why the margin is not two either.
+        let after_completion = crate::runner::turns_from_line(
+            r#"{"type":"turn.completed"}"#,
+            after_one_answer,
+        );
+        assert_eq!(after_completion, 2);
+        assert!(!crate::runner::over_turn_ceiling(after_completion, Some(MAX_EXTRACTION_TURNS)));
+    }
+
+    /// A loopback Ollama, answering with this and keeping every body it was posted.
+    ///
+    /// Copied from `runner.rs`'s own `ollama_runner_capturing`, which is `#[cfg(test)]` inside that
+    /// module and so cannot be reached from here. Its `/api/show` route is deliberately NOT part of
+    /// the copy: that route exists for the startup context probe, and `ollama_chat` posts straight
+    /// to `/api/chat` without probing anything. A route nothing calls would read as a step this
+    /// path takes and does not.
+    async fn loopback_answering(
+        answer: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let recorder = std::sync::Arc::clone(&seen);
+        let app = axum::Router::new()
+            .fallback(axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorder = std::sync::Arc::clone(&recorder);
+                    async move {
+                        recorder.lock().unwrap().push(body);
+                        axum::Json(serde_json::json!({
+                            "response": answer,
+                            "message": {"role": "assistant", "content": answer},
+                            "done": true
+                        }))
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    #[tokio::test]
+    async fn the_local_brain_is_asked_where_it_lives_and_not_through_the_triage_runner() {
+        let (base_url, seen) =
+            loopback_answering(r#"{"decisions":[{"section":"§1","text":"Alfa.","kind":"b"}]}"#)
+                .await;
+        let client = reqwest::Client::new();
+
+        let found = extract(
+            Extractor::Loopback {
+                client: &client,
+                base_url: &base_url,
+                model: "qwen2",
+            },
+            "slug",
+            "## §1\nbody",
+        )
+        .await
+        .expect("extract");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "Alfa.");
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|body| body.get("format").is_some())
+            .cloned()
+            .expect("a chat request carrying a grammar was posted");
+        // THE assertion of this test. `OllamaRunner` would have sampled this into
+        // `{id, class, summary}` — the triage grammar it imposes on every prompt — and the answer
+        // would have parsed to nothing. That this body carries `decisions` is the proof the
+        // extraction did not go through it.
+        assert!(
+            body["format"]["properties"]["decisions"].is_object(),
+            "the grammar is the extraction's, not triage's: {body}"
+        );
+        assert!(body["format"]["properties"]["decisions"]["items"]["properties"]["kind"]["enum"]
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "a")),
+            "type A is offered so the model has somewhere to put one, and dropped at the parse");
     }
 }
