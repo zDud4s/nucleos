@@ -1314,9 +1314,16 @@ pub async fn send_message_with(
     // reads `chats::answering` instead, which knows the chat's own instructions and nothing about
     // which door the message came in by. `None` for every other origin, so a shell turn — sitting
     // at this machine, with a person watching — never has a channel-wide doctrine pushed onto it.
+    //
+    // Voice sits with the shell here, and by decision rather than by omission: a spoken turn is
+    // somebody at this machine talking into its microphone, which is the same presence the
+    // exemption is about — the argument `tool_policy_for` makes at length. Written out rather than
+    // swept up by a wildcard, so that the next origin — which will arrive over a network, as every
+    // origin after the first has — is a compile error here instead of silently inheriting the
+    // doctrine a Telegram channel was given.
     let doctrine = match origin {
         Origin::Telegram => state.telegram_doctrine.clone(),
-        Origin::Shell => None,
+        Origin::Shell | Origin::Voice => None,
     };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
