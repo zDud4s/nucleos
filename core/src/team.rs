@@ -2514,6 +2514,7 @@ async fn spawn_agent(
         append_system_prompt: None,
         denied_tools: Vec::new(),
         session_name: None,
+        context_window: None,
         // The economy half of the boundary — see `mcp_tools::TEAM_TOOLS`.
         allowed_mcp_tools: Some(crate::mcp_tools::TEAM_TOOLS),
     };

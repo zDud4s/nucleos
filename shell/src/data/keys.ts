@@ -124,6 +124,8 @@ export const keys = {
       ["projects", projectId, "grep", q, path] as const,
     diff: (projectId: string, path: string) => ["projects", projectId, "diff", path] as const,
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
+    /** The project's structure layer, derived off disk on every read. */
+    map: (projectId: string) => ["projects", projectId, "map"] as const,
     /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
     ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
     /** What this project can be asked to do to itself, and what each of them last said. */
@@ -242,6 +244,17 @@ export const keys = {
     /** Keyed by the query too: each keystroke is a different question, and its own cached answer. */
     files: (chatId: string, query: string) => ["chats", "files", chatId, query] as const,
     commands: (chatId: string, query: string) => ["chats", "commands", chatId, query] as const,
+    /**
+     * What one turn's tools answered — `GET /assistant/turns/{id}/tools`.
+     *
+     * Keyed by the turn and NOT a child of `detail`, deliberately: invalidating a conversation
+     * happens on every poll tick, and these are settled facts about a run that has ended. A turn's
+     * answers do not change, and re-reading two thousand characters per tool because a different
+     * turn landed would be work for nothing.
+     */
+    turnTools: (turnId: number) => ["chats", "turn-tools", turnId] as const,
+    /** Something that was said, across every conversation. Keyed by the query, like `files`. */
+    said: (query: string) => ["chats", "said", query] as const,
   },
 
   council: {

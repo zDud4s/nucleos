@@ -81,6 +81,10 @@ pub async fn record_decision(
     Ok(result.last_insert_rowid())
 }
 
+/// The review queue a human actually works from: unreviewed decisions from `shadow`-mode runs
+/// only, so this list shows exactly what `shadow_readiness` counts toward promotion and nothing
+/// else. A `worktree`-mode decision was already enforced — there is no verdict left to collect —
+/// so it must not appear here for someone to be asked about it.
 pub async fn list_unreviewed(
     pool: &SqlitePool,
     project_id: &str,
@@ -90,6 +94,7 @@ pub async fn list_unreviewed(
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.project_id = ? AND shadow_decisions.human_verdict IS NULL
+           AND runs.mode = 'shadow'
          ORDER BY shadow_decisions.id",
     )
     .bind(project_id)
@@ -642,8 +647,8 @@ mod tests {
     #[tokio::test]
     async fn list_unreviewed_returns_only_null_verdicts_for_project() {
         let pool = test_pool().await;
-        let run_a = insert_run(&pool, "project-a").await;
-        let run_b = insert_run(&pool, "project-b").await;
+        let run_a = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let run_b = insert_run_with_mode(&pool, "project-b", "shadow").await;
         let expected = insert_shadow(&pool, run_a, "read-local", "allow", None).await;
         insert_shadow(&pool, run_a, "destructive", "deny", Some("reject")).await;
         insert_shadow(&pool, run_b, "read-local", "allow", None).await;
@@ -653,6 +658,23 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].id, expected);
         assert_eq!(decisions[0].human_verdict, None);
+    }
+
+    /// `list_unreviewed` shows exactly what `shadow_readiness` counts toward promotion: unreviewed
+    /// decisions from `shadow`-mode runs, and nothing from a `worktree`-mode run, which was already
+    /// enforced and has no verdict left to collect.
+    #[tokio::test]
+    async fn a_lista_de_revisao_so_mostra_o_que_conta_para_promocao() {
+        let pool = test_pool().await;
+        let shadow_run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        let expected = insert_shadow(&pool, shadow_run, "read-local", "allow", None).await;
+        insert_shadow(&pool, worktree_run, "read-local", "allow", None).await;
+
+        let decisions = list_unreviewed(&pool, "project-a").await.unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].id, expected);
     }
 
     #[tokio::test]
