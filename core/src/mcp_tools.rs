@@ -71,6 +71,16 @@ struct JobParams {
     /// that has already learned the tool.
     budget_usd: Option<f64>,
     max_rounds: Option<i64>,
+    /// Which team directs this job. Absent is the job every caller has always got: one checkout,
+    /// one item at a time. Named, the director splits the work over its members, each in a worktree
+    /// of its own — so this is the only field here that changes what actually runs, where the two
+    /// above are still inert.
+    ///
+    /// A team id that names nothing is REFUSED by the daemon rather than quietly dropped, and that
+    /// refusal is why there is no fallback to the sequential job: one that ran sequentially anyway
+    /// would report `completed`, leaving "the parallelism I asked for never seems to happen" as the
+    /// only symptom.
+    team_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -346,6 +356,20 @@ impl NucleosTools {
         json_result(self.client.list_projects().await)
     }
 
+    // Here for `create_job`'s sake and not for its own. A caller that may name a team and cannot
+    // learn which teams exist can only guess an id, and `job::start` refuses a guess — so without
+    // this the `team_id` parameter beside it is reachable only by somebody who already knew the
+    // answer, which is nobody on a phone.
+    #[tool(
+        description = "List the teams this daemon knows: each one's id, mission, director, members \
+                       and the ceilings it was given (max_rounds, max_parallel, budget_usd). Call \
+                       this before passing team_id to create_job — that field takes an id from \
+                       here, and an id that exists nowhere is refused rather than ignored."
+    )]
+    async fn list_teams(&self) -> String {
+        json_result(self.client.list_teams().await)
+    }
+
     // The four project reads (orchestrator eyes). Each reaches the project's OWN checkout — never
     // a run's worktree — so there is no `run` parameter to any of them; that is a different
     // question, answered by `get_run`. Use these BEFORE proposing work, to see what is actually
@@ -492,7 +516,11 @@ impl NucleosTools {
                        the work is too large for one context window, or when asked to work through \
                        something end to end or over a long period. Use create_run instead for \
                        anything one context window can finish. The project must be in active mode. \
-                       budget_usd and max_rounds are accepted but have no effect yet."
+                       Pass team_id to have a team direct it: the work is split over that team's \
+                       members, each in a worktree of its own, instead of one item at a time. Call \
+                       list_teams first — a team id that exists nowhere is refused, not ignored. \
+                       Omit team_id for the sequential job. budget_usd and max_rounds are accepted \
+                       but have no effect yet."
     )]
     async fn create_job(
         &self,
@@ -501,11 +529,18 @@ impl NucleosTools {
             prompt,
             budget_usd,
             max_rounds,
+            team_id,
         }): Parameters<JobParams>,
     ) -> String {
         match self
             .client
-            .create_job(&project_id, &prompt, budget_usd, max_rounds)
+            .create_job(
+                &project_id,
+                &prompt,
+                budget_usd,
+                max_rounds,
+                team_id.as_deref(),
+            )
             .await
         {
             Ok(job_id) => serde_json::json!({"job_id": job_id}).to_string(),
@@ -1520,6 +1555,11 @@ fn redact_json_strings(value: &mut serde_json::Value) {
 /// stay where the person can see what they are agreeing to. `vcs_request` is absent for the reason
 /// stated below it in `TOOL_EFFECTS`: it is the only effect on this server that outlives the daemon
 /// and that its owner cannot take back from here.
+///
+/// `list_teams` is here because `create_job` is, and only because of that. `create_job` now takes a
+/// `team_id`, and a turn that may start a job but cannot learn which teams exist can only name one
+/// by guessing — which the daemon refuses. Offering the act without the read that makes it nameable
+/// is offering a parameter nobody on a phone can fill in.
 pub const LOCAL_TOOLS: &[&str] = &[
     "create_job",
     "create_run",
@@ -1532,6 +1572,7 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "list_jobs",
     "list_projects",
     "list_proposals",
+    "list_teams",
     "vcs_ticket",
 ];
 
@@ -1814,6 +1855,11 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("list_jobs", ToolEffect::ReadsOwn),
     ("list_projects", ToolEffect::ReadsOwn),
     ("list_proposals", ToolEffect::ReadsOwn),
+    // The catalogue of departments. `ReadsOwn` without the doubt `get_run` and `github_read` carry:
+    // every word of a team row — its mission, its members, its ceilings — was written by the owner
+    // in the Teams tab, so there is no path by which a stranger's text arrives in this answer and
+    // therefore nothing for `effect_of_call` to second-guess by argument.
+    ("list_teams", ToolEffect::ReadsOwn),
     // The four project reads, and this is the weakest line on this page, so it is argued rather
     // than asserted. `ReadsUntrusted` would kill the feature at birth: the turn would read the
     // repository and from that moment every `Acts` tool is refused — including `create_run` and
@@ -2060,6 +2106,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
         let answer = match name {
             "list_projects" => self.tools.list_projects().await,
             "list_proposals" => self.tools.list_proposals().await,
+            "list_teams" => self.tools.list_teams().await,
             "get_budget" => self.tools.get_budget().await,
             "get_kill" => self.tools.get_kill().await,
             "get_run" => self.tools.get_run(Parameters(parsed!(IdParams))).await,
@@ -2879,6 +2926,7 @@ mod tests {
                 "list_jobs",
                 "list_projects",
                 "list_proposals",
+                "list_teams",
                 "project_cat",
                 "project_diff",
                 "project_grep",
@@ -3953,6 +4001,46 @@ mod tests {
         assert!(
             refusal_is_visible,
             "the call was not dispatched and the caller was not told why: {refused:?}"
+        );
+    }
+
+    /// **`create_job` publishes `team_id`, or the roster is unreachable from the one place the
+    /// request is supposed to enter from.**
+    ///
+    /// Asserted against the schema the router publishes and not against `JobParams`, for the reason
+    /// the test below this one gives: the schema is what the model actually reads, and a field the
+    /// struct has and the schema does not is a field no caller can fill in.
+    ///
+    /// The second half is the one that would go unnoticed. `team_id` must be OPTIONAL: required, it
+    /// would break every caller that wants the sequential job — which is every caller there has ever
+    /// been — and it would break them by making the tool uncallable rather than by misbehaving.
+    #[test]
+    fn create_job_deixa_nomear_a_equipa_e_nao_a_exige() {
+        let tool = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "create_job")
+            .expect("create_job is registered");
+
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("create_job publishes its parameters");
+        assert!(
+            properties.contains_key("team_id"),
+            "no team can be named from a phone: {properties:?}"
+        );
+
+        let required: Vec<&str> = tool
+            .input_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|names| names.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&"team_id"),
+            "a job with no team is what every caller has always got: {required:?}"
         );
     }
 

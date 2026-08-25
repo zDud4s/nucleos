@@ -88,6 +88,22 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// The catalogue of departments, handed back as the daemon writes it.
+    ///
+    /// `Value` rather than a typed roster on purpose. `ProjectSummary` above is typed because
+    /// `resolve_run_request` and `job::resolve_start` DECIDE on its fields; nothing in this client
+    /// decides on a team's, so a struct here would be a second copy of `team::TeamView` that could
+    /// only drift from it. Whether the named team exists is answered by `job::start`, at the row.
+    pub async fn list_teams(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/teams")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn create_run(&self, project_id: &str, prompt: &str) -> Result<i64, String> {
         let projects = self.list_projects().await?;
         let body = resolve_run_request(&projects, project_id, prompt)?;
@@ -124,19 +140,35 @@ impl DaemonClient {
         prompt: &str,
         budget_usd: Option<f64>,
         max_rounds: Option<i64>,
+        team_id: Option<&str>,
     ) -> Result<i64, String> {
         let projects = self.list_projects().await?;
         crate::job::resolve_start(&projects, project_id)
             .map_err(|refusal| refusal.reason(project_id))?;
 
+        // Whether the team EXISTS is deliberately not checked here, unlike the project above, and
+        // the asymmetry is the same one `job::start` states at the route: the catalogue can change
+        // between a request being written and it landing, so the answer has to be read where the row
+        // is made. A courtesy check here would only be able to disagree with it.
+        //
+        // Built up rather than written as one literal because `team_id` is OMITTED when absent
+        // instead of travelling as `null`. `CreateJobRequest::team_id` is `#[serde(default)]` and
+        // reads the two the same way, so this buys exactly one thing: a job asked for with no team
+        // sends the body it sent before teams existed, byte for byte. That turns "this parameter
+        // changed nothing for callers who do not use it" from a claim into something a test holds.
+        let mut body = serde_json::json!({
+            "project_id": project_id,
+            "prompt": prompt,
+            "budget_usd": budget_usd,
+            "max_rounds": max_rounds,
+        });
+        if let Some(team_id) = team_id {
+            body["team_id"] = Value::String(team_id.to_owned());
+        }
+
         let response: Value = self
             .request(reqwest::Method::POST, "/jobs")
-            .json(&serde_json::json!({
-                "project_id": project_id,
-                "prompt": prompt,
-                "budget_usd": budget_usd,
-                "max_rounds": max_rounds,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -1403,6 +1435,123 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}")
+    }
+
+    /// **A team asked for reaches the daemon.**
+    ///
+    /// The assertion is on the BODY that travelled and not on the return value, and that is the
+    /// whole of the test. `create_job` hands back a job id either way, so a version of this that
+    /// checked the id would pass with `team_id` dropped on the floor — which is precisely the state
+    /// this change exists to end, and it is a state whose only symptom is work running sequentially
+    /// while reporting `completed`.
+    #[tokio::test]
+    async fn uma_equipa_pedida_viaja_ate_ao_corpo_do_pedido() {
+        let (url, seen) = job_recording_daemon().await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        let job_id = client
+            .create_job("live-project", "build the thing", None, None, Some("crew"))
+            .await
+            .expect("the fake daemon accepts the job");
+        assert_eq!(job_id, 7);
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no POST /jobs was sent");
+        assert_eq!(
+            body["team_id"].as_str(),
+            Some("crew"),
+            "the team never left this client: {body}"
+        );
+    }
+
+    /// And the half that says the change cost nobody anything: no team named, and the body is the
+    /// one this client sent before teams existed.
+    ///
+    /// `team_id` ABSENT rather than `null`. Both deserialize to `None` at the route, so this is not
+    /// a claim about the daemon — it is the claim that adding the parameter changed nothing for the
+    /// callers who do not use it, which is worth nothing unless something checks it.
+    ///
+    /// `.get()` and not `[]`: indexing a missing key yields `Null`, so `body["team_id"].is_null()`
+    /// would pass for both an omitted field and a `null` one — the exact confusion the test is here
+    /// to rule out.
+    #[tokio::test]
+    async fn sem_equipa_o_corpo_sai_como_sempre_saiu() {
+        let (url, seen) = job_recording_daemon().await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        client
+            .create_job("live-project", "build the thing", None, None, None)
+            .await
+            .expect("the fake daemon accepts the job");
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no POST /jobs was sent");
+        assert!(
+            body.get("team_id").is_none(),
+            "a job with no team must not mention one at all: {body}"
+        );
+        // The rest of the body, or "nothing else changed" is being asserted about a single key.
+        assert_eq!(body["project_id"].as_str(), Some("live-project"));
+        assert_eq!(body["prompt"].as_str(), Some("build the thing"));
+        assert!(body["budget_usd"].is_null());
+        assert!(body["max_rounds"].is_null());
+    }
+
+    /// A daemon that answers the two calls `create_job` makes and keeps the JSON body of the second.
+    ///
+    /// `recording_daemon` beside it records the URI, which is the right question for a read whose
+    /// argument travels in the query string and the wrong one here: `POST /jobs` always has the same
+    /// path, and everything this test is about is inside the body.
+    async fn job_recording_daemon() -> (String, std::sync::Arc<std::sync::Mutex<Option<Value>>>) {
+        let seen: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = seen.clone();
+        let roster = serde_json::to_string(&[summary_for(
+            "live-project",
+            Mode::Active,
+            Some("C:/projects/live"),
+        )])
+        .expect("a roster serializes");
+
+        let app = axum::Router::new()
+            .route(
+                "/projects",
+                axum::routing::get(move || {
+                    let roster = roster.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            roster,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/jobs",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        *recorded.lock().unwrap() = Some(body);
+                        (
+                            axum::http::StatusCode::CREATED,
+                            axum::Json(serde_json::json!({"job_id": 7})),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), seen)
     }
 
     /// A daemon that answers `{}` to everything and remembers the exact path+query of the last
