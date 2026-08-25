@@ -17261,8 +17261,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             stage.as_deref(),
-            Some("plan"),
-            "the tick has to pick this job up and start its plan node, exactly as for a scheduled one"
+            Some("spec"),
+            "the tick has to pick this job up and start its FIRST node, exactly as for a scheduled \
+             one. That node is the spec rather than the plan since `job::next_step` grew a spec \
+             step; what this test is about is the tick reaching the job at all."
         );
     }
 
