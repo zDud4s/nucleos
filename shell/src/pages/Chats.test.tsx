@@ -3554,7 +3554,8 @@ describe("Chats - the shapes an answer is written in", () => {
  * On `Element.prototype` because the box under test is found by class, not by identity, and the
  * undo is returned rather than left to `afterEach` so a test that fails still gives them back.
  */
-function withLayout(scrollHeight: number, clientHeight: number) {
+function withLayout(startingHeight: number, clientHeight: number) {
+  let scrollHeight = startingHeight;
   const names = ["scrollHeight", "clientHeight", "scrollTop"] as const;
   const kept = names.map((name) => [
     name,
@@ -3580,12 +3581,27 @@ function withLayout(scrollHeight: number, clientHeight: number) {
     },
   });
 
-  return () => {
+  const undo = () => {
     for (const [name, was] of kept) {
       if (was === undefined) Reflect.deleteProperty(Element.prototype, name);
       else Object.defineProperty(Element.prototype, name, was);
     }
   };
+
+  /**
+   * Content arriving, in the only terms this environment has for it.
+   *
+   * Load-bearing for the live-turn tests, and the reason is worth stating: the mechanism this
+   * replaced was `scrollIntoView`, which jsdom does not implement AT ALL. A test that only checked
+   * the box had not moved would have passed against the broken code and the fixed code alike. The
+   * box has to be made to GROW, so that following it means landing somewhere it could not already
+   * have been.
+   */
+  const grewTo = (height: number) => {
+    scrollHeight = height;
+  };
+
+  return Object.assign(undo, { grewTo });
 }
 
 /** The one scrolling box on the page: the record of the conversation. */
@@ -3669,6 +3685,82 @@ describe("Chats - a conversation opens at its end", () => {
       expect(box.scrollTop).toBe(0);
     } finally {
       undo();
+    }
+  });
+
+  it("keeps up with a turn that is still writing", async () => {
+    // The words of a live turn arrive on that component's OWN poll — the list above it does not
+    // re-render — so the door's scroll effect never fires for any of them. The box has to be made
+    // to grow for this to mean anything: see `grewTo`.
+    const layout = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch(
+          [chatSummary({ chat_id: "c-1" })],
+          { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+          { live: { 1: { text: "primeiro", doing: null } } },
+        ),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("primeiro");
+      const box = theBox(container);
+      await waitFor(() => expect(box.scrollTop).toBe(2000));
+
+      // More words, and the page taller for them.
+      layout.grewTo(3000);
+      await act(async () => {
+        queryClient.setQueryData(keys.chats.live(1), {
+          text: "primeiro e depois muito mais",
+          doing: null,
+          did: [],
+          thought: [],
+          thought_tokens: null,
+        });
+      });
+      await screen.findByText("primeiro e depois muito mais");
+
+      expect(box.scrollTop).toBe(3000);
+    } finally {
+      layout();
+    }
+  });
+
+  it("does not haul a reader back down while a turn writes", async () => {
+    // Reading something further up while an answer writes was a thing the page undid once a
+    // second. This guards the direction rather than the old defect: the mechanism that caused it
+    // was `scrollIntoView`, which jsdom does not implement, so nothing here could have caught it
+    // before the fix. It catches the next person who makes the live turn scroll unconditionally.
+    const layout = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch(
+          [chatSummary({ chat_id: "c-1" })],
+          { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+          { live: { 1: { text: "primeiro", doing: null } } },
+        ),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("primeiro");
+      const box = theBox(container);
+      await waitFor(() => expect(box.scrollTop).toBe(2000));
+
+      box.scrollTop = 0;
+      fireEvent.scroll(box);
+      layout.grewTo(3000);
+      await act(async () => {
+        queryClient.setQueryData(keys.chats.live(1), {
+          text: "primeiro e depois muito mais",
+          doing: null,
+          did: [],
+          thought: [],
+          thought_tokens: null,
+        });
+      });
+      await screen.findByText("primeiro e depois muito mais");
+
+      expect(box.scrollTop).toBe(0);
+    } finally {
+      layout();
     }
   });
 

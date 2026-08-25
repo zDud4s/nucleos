@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import {
   DropdownMenu,
@@ -1006,6 +1013,19 @@ const FOLLOWS_WITHIN_PX = 48;
  * draws differently because of it, and state here would re-render the whole transcript on every
  * scroll event.
  */
+/**
+ * How something deep in the transcript reaches the box it is drawn into.
+ *
+ * A context and not two more props. `LiveAnswer` is the only thing that needs this and it sits
+ * under `Transcript` and `TurnBlock`, neither of which has anything to do with scrolling — passing
+ * a callback about the page's scrollbar through both would be threading a concern through two
+ * components that never touch it, to reach one leaf.
+ *
+ * The default does nothing, so drawing a live turn outside a scrolling box — a test, or a door not
+ * written yet — is not a crash. Nothing scrolls, which is the honest answer when there is no box.
+ */
+const KeepsUp = createContext<() => void>(() => {});
+
 function useFollowsItsEnd() {
   const box = useRef<HTMLDivElement | null>(null);
   const follows = useRef(true);
@@ -1116,6 +1136,7 @@ function ChatDetail({
             more={transcript.data.more}
             find={find}
             follows={follows}
+            keepUp={keepUp}
             onReuse={(text) => setReuse({ text, at: Date.now() })}
           />
         )}
@@ -3151,6 +3172,7 @@ function Transcript({
   more,
   find,
   follows,
+  keepUp,
   onReuse,
 }: {
   turns: Turn[];
@@ -3162,6 +3184,8 @@ function Transcript({
   find: { turnId: number; at: number } | null;
   /** Whether the box this is drawn in still follows its end. See `useFollowsItsEnd`. */
   follows: { current: boolean };
+  /** Takes that box to its end, if it still follows it. Handed to the turns through `KeepsUp`. */
+  keepUp: () => void;
   /** Puts a question that was already asked back in the box. See `TurnBlock`. */
   onReuse: (text: string) => void;
 }) {
@@ -3211,7 +3235,9 @@ function Transcript({
   if (turns.length === 0)
     return <p className="chats-empty">nothing has been said yet.</p>;
   return (
-    <>
+    /* Around the turns and not around the whole door, because this is the only subtree that draws
+       one: a turn in flight is the one thing here that grows the page on a poll of its own. */
+    <KeepsUp.Provider value={keepUp}>
       {/* Above the oldest turn on the page, because that is where the rest of the conversation
           is. It used to simply not be there: a hundred turns came back, the hundred-and-first was
           dropped in silence, and nothing distinguished a conversation that began where you were
@@ -3248,7 +3274,7 @@ function Transcript({
           />
         ))}
       </ul>
-    </>
+    </KeepsUp.Provider>
   );
 }
 
@@ -3633,13 +3659,24 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
   const live = useLiveTurn(turnId, true);
   const text = live.data?.text ?? "";
   const doing = live.data?.doing ?? null;
-  const end = useRef<HTMLParagraphElement | null>(null);
+  const keepUp = useContext(KeepsUp);
 
-  // Follows itself down. The list above does not re-render while a turn writes -- the words arrive
-  // on this component's own poll -- so the transcript's scroll effect never fires for any of it.
+  /*
+   * Follows the words down, and its own here is the only place that can: the list above does not
+   * re-render while a turn writes — the words arrive on this component's poll — so the door's
+   * scroll effect never fires for any of it.
+   *
+   * `keepUp` and not `scrollIntoView` on a line of its own. This used to bring the spinner into
+   * view, which is not the end of the box: `Stop`, the turn's footing and anything the run changed
+   * are all drawn under it, so a turn in flight sat with its own controls off the bottom.
+   *
+   * And it went where it liked. `keepUp` declines when the reader has scrolled away, so reading
+   * something further up while an answer writes is no longer a thing the page undoes once a
+   * second.
+   */
   useEffect(() => {
-    end.current?.scrollIntoView({ block: "end" });
-  }, [text, doing]);
+    keepUp();
+  }, [keepUp, text, doing]);
 
   return (
     <>
@@ -3655,7 +3692,7 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
           on every poll — and the database column they would be fetched from is not written until
           the turn ends. */}
       <WhatItDid did={live.data?.did ?? []} turnId={turnId} settled={false} />
-      <p className="chats-turn-live" ref={end}>
+      <p className="chats-turn-live">
         {/* Turning, because the three words below can stand unchanged for two minutes while a
             build runs and a page that never moves is a page that looks stopped. `base.css`
             already clamps every animation for anybody who asked for less motion. */}

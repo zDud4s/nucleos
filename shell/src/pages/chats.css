@@ -76,12 +76,15 @@
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  /* The mask below fades the last 16px of the box, which is right while there is more underneath
-     and wrong at the bottom, where it was fading out the newest thing said. The padding is the
-     same 16px, so the end of the conversation comes to rest above the fade instead of inside it.
-     (The same is true of the first 16px at the top; left alone, because the head above it already
-     spaces the first line and adding it there would push everything down for no one's benefit.) */
-  padding-bottom: var(--space-4);
+  /* The mask below fades the first and last 16px of the box, which is right while there is more
+     past them and wrong at either end, where it was fading out the newest thing said and the line
+     the conversation starts on. The padding is the same 16px at both ends, so the content comes to
+     rest clear of the fade instead of inside it.
+     (Said here once and applied twice: the top was left alone when the bottom was fixed, on the
+     reasoning that the head above it already spaces the first line. It does — but spacing above
+     the box does nothing about a mask that dims the first line INSIDE it, which is a different
+     thing and was still happening.) */
+  padding-block: var(--space-4);
   padding-right: var(--space-3);
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);
