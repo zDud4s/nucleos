@@ -64,6 +64,7 @@ mod secrets;
 mod sessions;
 mod shadow;
 mod sidecar;
+mod speak;
 mod state;
 mod storage;
 mod team;

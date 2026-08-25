@@ -1582,6 +1582,61 @@
   gap: var(--space-1);
 }
 
+/* ------------------------------------------------------------- hands free -- */
+
+/* Sits with the other things you set about a message, and is shaped like them: `.chats-planning`'s
+   proportions, because a toggle that looked different from the toggle beside it would read as
+   belonging to something else. */
+.chats-handsfree {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  cursor: pointer;
+}
+
+/* An open microphone is worth a colour. This control is the only one in the row whose "on" state
+   means something is being recorded, and it must not be mistakable for the "off" state at a glance. */
+.chats-handsfree-on {
+  color: var(--accent);
+  background: var(--accent-quiet);
+}
+
+.chats-handsfree-phase {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* Under the box, where every other answer about a message already appears. Wrapping rather than
+   growing: the transcript is a whole spoken sentence, and a row that widened for it would move the
+   controls above as somebody talks. */
+.chats-handsfree-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* Kept to one line. What matters is seeing AT A GLANCE that the question was heard wrong; reading
+   all of a long one back is what the chat's own transcript is for. */
+.chats-handsfree-status > span {
+  max-width: 48ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Pushes send to the far end without giving the row a `space-between`, which
    would scatter the tools apart from each other as soon as there are three. */
 .chats-composer-gap {

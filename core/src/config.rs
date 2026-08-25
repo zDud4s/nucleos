@@ -411,8 +411,26 @@ pub struct VoiceConfig {
     /// contains spaces, which anything installed under `C:\Program Files` needs. Empty means there is
     /// no transcriber, which is indistinguishable from the pillar being off and is treated as such.
     pub stt_command: String,
+    /// Split into program + args exactly as `stt_command` is, but the text goes on STDIN and a WAV
+    /// comes back on STDOUT — `speak.rs` explains why the two contracts differ. Empty means the
+    /// núcleo has no voice, which is a smaller loss than having no transcriber: conversation still
+    /// works, it just answers in writing.
+    pub tts_command: String,
+    /// A resident engine on loopback, e.g. `http://127.0.0.1:5017` for Piper's own HTTP server.
+    ///
+    /// **Preferred over `tts_command` when both are set**, because the difference is not marginal:
+    /// measured here, spawning costs ~2.8 s of model loading per sentence against ~0.2 s for the
+    /// resident server. `speak.rs` carries the numbers. Somebody who configured both meant the one
+    /// that works, so this wins rather than erroring — but it says so in the log, because silently
+    /// ignoring a line somebody wrote is how a config file stops being believed.
+    pub tts_url: String,
     pub hotkey: String,
     pub memo_hotkey: String,
+    /// Toggles hands-free conversation mode. A third chord and not a mode of the first, because the
+    /// two do opposite things with the same recording: dictation pastes it into whatever had focus,
+    /// conversation sends it to the agent. A single key that guessed between them would guess wrong
+    /// in the direction that types a question into a terminal.
+    pub conversation_hotkey: String,
     /// Dictations are a searchable record of everything said, in a pillar whose first requirement is
     /// privacy, so they expire. Memos do not: those are documents somebody asked for.
     pub retain_dictations_days: u8,
@@ -427,8 +445,11 @@ impl Default for VoiceConfig {
         Self {
             enabled: false,
             stt_command: String::new(),
+            tts_command: String::new(),
+            tts_url: String::new(),
             hotkey: "Ctrl+Alt+Space".to_string(),
             memo_hotkey: "Ctrl+Alt+M".to_string(),
+            conversation_hotkey: "Ctrl+Alt+C".to_string(),
             retain_dictations_days: 7,
             hints: Vec::new(),
             cleanup_prompt: DEFAULT_CLEANUP_PROMPT.to_string(),
@@ -443,6 +464,20 @@ impl VoiceConfig {
     /// have nowhere to send the audio, which presents as the feature being broken rather than absent.
     pub fn armed(&self) -> bool {
         self.enabled && !self.stt_command.trim().is_empty()
+    }
+
+    /// Whether this machine can say anything out loud.
+    ///
+    /// Deliberately NOT folded into `armed`, and the asymmetry is the design. A pillar with no
+    /// transcriber is off, because every entry point starts with a recording. A pillar with no
+    /// speaker still works: the question is heard, the agent answers, and the answer is read rather
+    /// than spoken. Collapsing the two would take a conversation away from someone who has an STT
+    /// engine and no TTS one — which is every machine on the day this ships.
+    ///
+    /// Gated on `armed` all the same: a voice with nothing to say it in response to is not a
+    /// capability, and reporting it as one would put a control in the window for a pillar that is off.
+    pub fn speaks(&self) -> bool {
+        self.armed() && (!self.tts_url.trim().is_empty() || !self.tts_command.trim().is_empty())
     }
 
     fn validated(mut self) -> Self {

@@ -734,6 +734,12 @@ pub fn build_mcp_config(exe_path: &str, errand: Option<i64>) -> serde_json::Valu
 pub enum Origin {
     Shell,
     Telegram,
+    /// Spoken into the microphone of the machine this daemon runs on.
+    ///
+    /// A variant and not a flag on `Shell`, because the two differ in what happens to the ANSWER:
+    /// a shell turn is read, a voice turn is spoken. Recorded on the row for the same reason the
+    /// other two are — a queued message must be sent as the thing it was.
+    Voice,
 }
 
 impl Origin {
@@ -742,6 +748,7 @@ impl Origin {
     pub fn from_wire(value: Option<&str>) -> Self {
         match value {
             Some("telegram") => Self::Telegram,
+            Some("voice") => Self::Voice,
             _ => Self::Shell,
         }
     }
@@ -754,6 +761,7 @@ impl Origin {
     pub fn as_wire(self) -> &'static str {
         match self {
             Self::Telegram => "telegram",
+            Self::Voice => "voice",
             Self::Shell => "shell",
         }
     }
@@ -1835,6 +1843,18 @@ async fn spawn_local_turn(
 /// `McpOnly` because the policy — not the MCP allowlist, which only grants — is the one thing that
 /// keeps a message arriving over the network away from this machine's filesystem and shell.
 ///
+/// `Origin::Voice` joins `Shell` here EXPLICITLY, and the explicitness is the point: letting it fall
+/// through to `_` would be the same question answered with a weaker policy for having been spoken,
+/// with nothing anywhere saying so. It belongs on this arm because the fact the arm turns on is
+/// physical presence, and a microphone is a stricter proof of it than a keyboard — a spoken turn
+/// requires being in the room, while a typed one only requires reaching the machine.
+///
+/// The argument against, which is real and loses: a transcript is a GUESS at what was said, and
+/// whisper mishears. But the guess is shown to the person as the turn is sent, the answer is spoken
+/// back to them, and the `PreToolUse` classifier this arm defers to is still the thing deciding. What
+/// would not survive scrutiny is the alternative — trusting a message that crossed the network more
+/// than one spoken into the machine's own microphone.
+///
 /// **A wired hook.** `Unrestricted` is not "ungoverned": it hands the decision to the `PreToolUse`
 /// classifier. But that hook is COOPERATIVE — it runs only if the `.claude/settings.json` resolved
 /// from the run's working directory registers it — so in a directory that never onboarded,
@@ -1851,7 +1871,7 @@ pub(crate) fn tool_policy_for(
     hook_is_wired: bool,
 ) -> crate::runner::ToolPolicy {
     match (cwd, origin, hook_is_wired) {
-        (Some(_), Origin::Shell, true) => crate::runner::ToolPolicy::Unrestricted,
+        (Some(_), Origin::Shell | Origin::Voice, true) => crate::runner::ToolPolicy::Unrestricted,
         _ => crate::runner::ToolPolicy::McpOnly,
     }
 }
@@ -4679,7 +4699,7 @@ mod tests {
     /// whatever else changes here, none of them may pick up the filesystem by accident.
     #[test]
     fn a_conversation_with_no_directory_keeps_exactly_the_policy_it_always_had() {
-        for origin in [Origin::Shell, Origin::Telegram] {
+        for origin in [Origin::Shell, Origin::Telegram, Origin::Voice] {
             for wired in [true, false] {
                 assert_eq!(
                     tool_policy_for(None, origin, wired),
@@ -4687,6 +4707,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A question does not get a weaker policy for having been spoken.**
+    ///
+    /// The security decision of the voice-conversation design, written as the test that fails if
+    /// somebody reverts it. `Origin::Voice` is on the `Unrestricted` arm because the fact that arm
+    /// turns on is physical presence, and a microphone is a stricter proof of it than a keyboard: a
+    /// spoken turn requires being in the room, a typed one only requires reaching the machine.
+    ///
+    /// The failure this prevents is silent and would be very hard to recognise. Drop `Origin::Voice`
+    /// from the arm and nothing errors — voice turns simply fall to `McpOnly`, so the SAME question
+    /// that works when typed answers "I cannot do that" when spoken, in a directory that is onboarded
+    /// and with the hook wired. Nothing on screen would connect that to the microphone.
+    #[test]
+    fn a_spoken_turn_is_trusted_exactly_as_much_as_a_typed_one() {
+        for wired in [true, false] {
+            assert_eq!(
+                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, wired),
+                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Shell, wired),
+                "a spoken turn diverged from a typed one at wired={wired}"
+            );
+        }
+        // And the direction is the permissive one, so this cannot pass by both being McpOnly.
+        assert_eq!(
+            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, true),
+            crate::runner::ToolPolicy::Unrestricted
+        );
+    }
+
+    /// Voice does not lift Telegram along with it.
+    ///
+    /// The arm names two origins now, and a third could be added to it by a careless edit — so the
+    /// thing that must stay true is stated separately: what keeps a message that crossed the network
+    /// away from this machine's shell is the policy, not the MCP allowlist.
+    #[test]
+    fn a_message_over_the_network_is_still_kept_off_the_machine() {
+        assert_eq!(
+            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Telegram, true),
+            crate::runner::ToolPolicy::McpOnly
+        );
     }
 
     /// A session the daemon never started has no rows in `runs`, so both of `get_session`'s

@@ -528,6 +528,13 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::browser::get_writes),
         )
         .route("/voice/config", get(crate::voice::get_config))
+        // One unit of a turn's answer, as audio. Indexed rather than streamed, because the repo's
+        // live-turn transport is a poll over a tail buffer and a second transport for the same job
+        // would be a second thing to keep correct. Sentences arrive seconds apart; poll is enough.
+        .route(
+            "/voice/turns/{turn_id}/speech/{index}",
+            get(crate::voice::get_turn_speech),
+        )
         .route("/voice/memos", get(crate::voice::list_memos))
         // Read by hand for prompt tuning, not by the shell — see voice.rs's `list_dictations`.
         .route("/voice/dictations", get(crate::voice::list_dictations))

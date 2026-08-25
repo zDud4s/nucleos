@@ -34,6 +34,8 @@ import {
   ArrowUp,
   ChevronDown,
   ImagePlus,
+  Mic,
+  MicOff,
   MoreHorizontal,
   PanelLeft,
   PanelLeftClose,
@@ -112,6 +114,8 @@ import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
 import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
+import { ConversationView, useVoiceConversation } from "../data/conversation";
+import type { ConversationPhase } from "../lib/conversation";
 import {
   Button,
   ConfirmButton,
@@ -4192,6 +4196,9 @@ function Composer({
   const [attached, setAttached] = useState<Attachment[]>([]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
+  // Held here rather than inside the toggle, because the toggle and the status line below the box
+  // are two views of ONE conversation. Two `useVoiceConversation` calls would be two microphones.
+  const voice = useVoiceConversation(chatId);
 
   /**
    * A question put back in the box, and the caret at the end of it.
@@ -4434,6 +4441,7 @@ function Composer({
             />
           )}
           <Planning chatId={chatId} />
+          <HandsFreeToggle voice={voice} />
           <span className="chats-composer-gap" />
           <button
             type="submit"
@@ -4445,10 +4453,92 @@ function Composer({
           </button>
         </div>
       </div>
+      <HandsFreeStatus voice={voice} />
       {send.isError && <MessageRefusal error={send.error} />}
     </form>
   );
 }
+
+/**
+ * Talking to this chat instead of typing to it.
+ *
+ * Lives beside the model and the plan-only toggle rather than in the Voice tab, because it belongs
+ * to a CONVERSATION and the Voice tab has none: a spoken turn has to name the chat it joins, and
+ * `core/src/voice.rs` refuses one that does not rather than guessing. The Voice tab still owns the
+ * chord that toggles this, for the unrelated reason that registering hotkeys is indivisible.
+ *
+ * Split from its own status line because the two want different places. The control belongs with the
+ * other things you set about a message; what was heard and what went wrong belong under the box,
+ * where every other answer about a message already appears.
+ *
+ * Every decision it appears to make is somewhere else: `lib/conversation.ts` decides what the phases
+ * are, `lib/vad.ts` and `lib/silero.ts` decide when somebody is talking, and `data/conversation.ts`
+ * runs the microphone.
+ */
+function HandsFreeToggle({ voice }: { voice: ConversationView }) {
+  const on = voice.phase !== "off";
+
+  return (
+    <button
+      type="button"
+      className={on ? "chats-handsfree chats-handsfree-on" : "chats-handsfree"}
+      aria-pressed={on}
+      aria-label={on ? "Stop talking" : "Talk"}
+      title={
+        on
+          ? "stop the hands-free conversation"
+          : "talk to this conversation instead of typing — it answers out loud"
+      }
+      onClick={voice.toggle}
+    >
+      {on ? (
+        <MicOff className="chats-tool-icon" aria-hidden="true" />
+      ) : (
+        <Mic className="chats-tool-icon" aria-hidden="true" />
+      )}
+      {on && <span className="chats-handsfree-phase">{HANDS_FREE_PHASES[voice.phase]}</span>}
+    </button>
+  );
+}
+
+/** What the conversation heard, and anything that stopped it working. */
+function HandsFreeStatus({ voice }: { voice: ConversationView }) {
+  const on = voice.phase !== "off";
+  if (!on && voice.heard === null && voice.trouble === null) return null;
+
+  return (
+    <div className="chats-handsfree-status">
+      {/* Shown as soon as it is heard and BEFORE the answer, because a misheard question that only
+          becomes visible once it has been answered is a question nobody got to correct. */}
+      {voice.heard !== null && <span>heard: “{voice.heard}”</span>}
+      {on && !voice.hasVoice && (
+        <span>no voice on this machine — the answer will be written</span>
+      )}
+      {/* Only when it is the fallback. Saying "silero" every time would be noise about the thing
+          working; saying nothing when it is NOT would leave somebody watching turns open on a fan
+          with no reason to suspect the detector rather than the microphone. */}
+      {on && voice.listeningWith === "energy" && (
+        <span>listening by loudness — noise may open a turn</span>
+      )}
+      {voice.trouble !== null && <ErrorNote>{voice.trouble}</ErrorNote>}
+    </div>
+  );
+}
+
+/**
+ * What each phase is called on screen.
+ *
+ * `speaking` says "answering" rather than "speaking" so the two participants are never described
+ * with the same word — with the microphone open during the answer, which of the two is talking is
+ * exactly what a person needs to be able to tell at a glance.
+ */
+const HANDS_FREE_PHASES: Record<ConversationPhase, string> = {
+  off: "",
+  listening: "listening",
+  hearing: "hearing you",
+  thinking: "thinking",
+  speaking: "answering",
+};
 
 /**
  * What the caret is offering, above the box rather than below it.
