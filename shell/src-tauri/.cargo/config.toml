@@ -1,0 +1,30 @@
+# This crate builds into its own `target/`, out of the build tree every worktree shares.
+#
+# `$CARGO_HOME/config.toml` on the machine this was written for points `build.target-dir` at one
+# directory for all worktrees, and the reason is good: nine checkouts of this repository were each
+# paying disk for the same 293 núcleo dependencies — 34.9 GB, with the disk reaching 339 MB free
+# three times in one day. Cargo keys every artefact by a hash of crate, version, features and flags,
+# so two branches write different filenames and never read each other's. Sharing is safe there.
+#
+# It is not safe HERE, and the difference is `build.rs`. This crate's build script shells out to
+# `windres` to compile `resource.rc` into `libresource.a`, and that hash is derived from the package
+# rather than from where the package lives — so two worktrees building this crate aim the same
+# external tool at the identical path. The second one meets `os error 32`, "the process cannot
+# access the file because it is being used by another process", and the whole gate step fails.
+#
+# Measured before writing this, because "it is the shared directory" is a claim and not an
+# observation: `shell/src-tauri: clippy` failed that way in a feature worktree AND in the main
+# checkout on master, with the crate untouched in both, and passed — clippy clean, 18 tests green —
+# the moment it was given a target directory of its own. What was never pinned down is WHICH process
+# held the handle; a concurrent build and a virus scanner reading the freshly written archive are
+# both consistent with the evidence. This fix does not depend on the answer.
+#
+# The disk argument barely applies to this crate anyway, which is what makes the exception cheap:
+# the shared tree exists so that many worktrees stop duplicating the NÚCLEO's dependency graph, and
+# Tauri's is a different graph the núcleo does not share. This crate is also outside the cargo
+# workspace (see the root `Cargo.toml`) and is compiled only by `scripts/gates.sh shell`.
+#
+# On a machine with no shared setting this file changes nothing: `target` is already where cargo
+# would put it. A config nearer the crate wins over `$CARGO_HOME`'s, which is the whole mechanism.
+[build]
+target-dir = "target"
