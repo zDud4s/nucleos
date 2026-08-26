@@ -151,7 +151,11 @@ pub async fn measure(pool: &SqlitePool, scope: Scope) -> sqlx::Result<Report> {
                     && steps_of(item.tools_used.as_deref(), item.num_turns).is_none()
             })
             .count(),
-        rollups: roll_up(&items),
+        rollups: {
+            let mut rollups = roll_up(&items);
+            judge(&mut rollups);
+            rollups
+        },
     }))
 }
 
@@ -197,6 +201,8 @@ pub struct AgentRollup {
     pub peak_p90: Option<i64>,
     pub steps_median: Option<i64>,
     pub fit: Fit,
+    /// Preenchido por `judge`, nunca por `roll_up`.
+    pub verdicts: Vec<Verdict>,
 }
 
 /// Uma linha por `(round, agent_id)`, na ordem dos rounds.
@@ -254,9 +260,128 @@ fn roll_up(items: &[Item]) -> Vec<AgentRollup> {
                 peak_p90: percentile(&peaks, 0.9),
                 steps_median: percentile(&steps, 0.5),
                 fit: fit(&points),
+                verdicts: Vec::new(),
             }
         })
         .collect()
+}
+
+/// Calibracao das leituras. Primeiros palpites, deliberadamente conservadores.
+///
+/// Nenhum destes numeros foi medido: `team_runs` estava vazia quando isto se escreveu, logo nao
+/// havia contra o que calibrar. Estao aqui juntos e com nome para serem revistos depois dos
+/// primeiros jobs a serio, e e ISSO que se espera que aconteca -- nao que fiquem.
+mod calibracao {
+    /// Quantas vezes acima da mediana dos pares do round conta como carregar o round sozinho.
+    pub const DESEQUILIBRIO: f64 = 2.0;
+    /// Abaixo disto, "mais itens que os pares" e ruido e nao sinal.
+    pub const ITENS_MINIMOS: usize = 3;
+    /// Subida do primeiro ao ultimo round, em fraccao, para o handoff contar como pesado.
+    pub const SUBIDA_ENTRE_ROUNDS: f64 = 0.25;
+    /// Que fatia da ocupacao tipica ja la esta antes do agente fazer nada.
+    pub const ARRANQUE_DOMINANTE: f64 = 0.5;
+    /// Acima disto o arranque amortiza-se e deixa de ser o problema.
+    pub const PASSOS_QUE_AMORTIZAM: i64 = 10;
+}
+
+/// O que a evidencia sugere fazer a forma da equipa. Nunca e feito automaticamente.
+///
+/// Nao sao exclusivos: um agente pode disparar `SplitSpeciality` e `TrimPrompt` ao mesmo tempo, e
+/// isso e informacao -- enche cedo E trabalha pouco, logo o problema esta quase todo no briefing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Os itens deste agente compactaram: a especialidade cobre superficie a mais.
+    SplitSpeciality,
+    /// Carrega o round quase sozinho: falta gente nesta layer.
+    MoreAgents,
+    /// O contexto sobe de round para round: o handoff entre layers traz de mais.
+    MoreLayers,
+    /// Nasce caro e trabalha pouco. Repartir aqui PIORA -- cada metade volta a pagar o arranque.
+    TrimPrompt,
+}
+
+/// Preenche `verdicts` em cada rollup da fatia.
+///
+/// Recebe a fatia inteira e nao um rollup porque metade das leituras sao comparacoes:
+/// `MoreAgents` mede um agente contra os outros do mesmo round, `MoreLayers` mede-o contra si
+/// proprio noutros rounds. Um julgador de um so rollup nao teria como as ver.
+///
+/// **Nenhuma das quatro usa um limiar absoluto em tokens.** A janela do modelo nao e conhecida por
+/// run -- `runner.rs::window_env` so a passa quando a pergunta a traz, e uma run de agente nao traz
+/// -- portanto todas comparam o agente consigo proprio ou com os pares.
+fn judge(rollups: &mut [AgentRollup]) {
+    // Uma copia dos tres campos que as comparacoes leem, tirada antes de se escrever em qualquer
+    // rollup: um julgamento tem de ver a fatia como ela chegou, nao meio-escrita.
+    let seen: Vec<(i64, String, usize, Option<i64>)> = rollups
+        .iter()
+        .map(|rollup| {
+            (
+                rollup.round,
+                rollup.agent_id.clone(),
+                rollup.items,
+                rollup.peak_p50,
+            )
+        })
+        .collect();
+
+    for index in 0..rollups.len() {
+        let mut verdicts = Vec::new();
+        let rollup = &rollups[index];
+
+        // Verdade-terreno da propria CLI: nao coube. Uma vez basta.
+        if rollup.compacted_items >= 1 {
+            verdicts.push(Verdict::SplitSpeciality);
+        }
+
+        let peers: Vec<i64> = seen
+            .iter()
+            .filter(|(round, agent, ..)| *round == rollup.round && *agent != rollup.agent_id)
+            .map(|(_, _, items, _)| *items as i64)
+            .collect();
+        if !peers.is_empty() && rollup.items >= calibracao::ITENS_MINIMOS {
+            let mut sorted = peers;
+            sorted.sort_unstable();
+            // O piso de 1 impede que uma layer onde os pares nao fizeram nada divida por zero e
+            // declare desequilibrio infinito.
+            let baseline = percentile(&sorted, 0.5).unwrap_or(1).max(1) as f64;
+            if rollup.items as f64 >= calibracao::DESEQUILIBRIO * baseline {
+                verdicts.push(Verdict::MoreAgents);
+            }
+        }
+
+        let mut mine: Vec<(i64, Option<i64>)> = seen
+            .iter()
+            .filter(|(_, agent, ..)| *agent == rollup.agent_id)
+            .map(|(round, _, _, p50)| (*round, *p50))
+            .collect();
+        mine.sort_by_key(|(round, _)| *round);
+        // Prende-se ao ULTIMO round em que o agente aparece, que e onde a subida ja e visivel
+        // inteira.
+        if mine.len() >= 2
+            && mine.last().map(|(round, _)| *round) == Some(rollup.round)
+            && let Some(peaks) = mine
+                .iter()
+                .map(|(_, p50)| *p50)
+                .collect::<Option<Vec<i64>>>()
+            && peaks.windows(2).all(|pair| pair[1] > pair[0])
+            && peaks[0] > 0
+            && (peaks[peaks.len() - 1] - peaks[0]) as f64 / peaks[0] as f64
+                >= calibracao::SUBIDA_ENTRE_ROUNDS
+        {
+            verdicts.push(Verdict::MoreLayers);
+        }
+
+        if let Fit::Line { intercept, .. } = &rollup.fit
+            && let Some(p50) = rollup.peak_p50
+            && let Some(steps) = rollup.steps_median
+            && *intercept >= calibracao::ARRANQUE_DOMINANTE * p50 as f64
+            && steps <= calibracao::PASSOS_QUE_AMORTIZAM
+        {
+            verdicts.push(Verdict::TrimPrompt);
+        }
+
+        rollups[index].verdicts = verdicts;
+    }
 }
 
 /// Percentil por interpolação linear sobre os valores presentes, ordenados.
@@ -508,6 +633,127 @@ mod tests {
             ),
             num_turns: None,
         }
+    }
+
+    /// Um rollup no estado neutro: nada compactou, ocupacao tipica, passos que amortizam, sem
+    /// ajuste. Cada teste mexe so no campo que lhe interessa, e o resto fica explicitamente
+    /// inofensivo.
+    fn r(round: i64, agent: &str, items: usize) -> AgentRollup {
+        AgentRollup {
+            round,
+            agent_id: agent.to_string(),
+            agent_name: agent.to_string(),
+            items,
+            items_with_steps: items,
+            compacted_items: 0,
+            peak_p50: Some(100_000),
+            peak_p90: Some(100_000),
+            steps_median: Some(20),
+            fit: Fit::Insufficient,
+            verdicts: Vec::new(),
+        }
+    }
+
+    /// Julga a fatia e devolve os veredictos de um agente num round.
+    fn verdicts_of(rollups: &mut Vec<AgentRollup>, agent: &str, round: i64) -> Vec<Verdict> {
+        judge(rollups);
+        rollups
+            .iter()
+            .find(|x| x.agent_name == agent && x.round == round)
+            .expect("o rollup pedido existe")
+            .verdicts
+            .clone()
+    }
+
+    #[test]
+    fn an_agent_whose_items_compact_is_told_to_split() {
+        // Uma compactacao basta. Nao e um limiar: e a CLI a dizer que nao coube.
+        let mut rs = vec![r(1, "Nucleo", 3)];
+        rs[0].compacted_items = 1;
+        assert!(verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::SplitSpeciality));
+    }
+
+    #[test]
+    fn a_high_peak_that_never_compacted_is_slack_and_not_pressure() {
+        // 180k sem compactacao e folga. E a distincao inteira que o veredicto guarda, e a razao de
+        // o sinal ser `compacted` e nao uma contagem de tokens.
+        let mut rs = vec![r(1, "Nucleo", 3)];
+        rs[0].peak_p90 = Some(180_000);
+        assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::SplitSpeciality));
+    }
+
+    #[test]
+    fn an_agent_carrying_the_round_alone_wants_company() {
+        // 4 itens contra pares com 1: 4 >= 2 x max(1, mediana 1).
+        let mut rs = vec![r(1, "Nucleo", 4), r(1, "Concha", 1), r(1, "Portao", 1)];
+        assert!(verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::MoreAgents));
+    }
+
+    #[test]
+    fn an_even_round_wants_nothing() {
+        let mut rs = vec![r(1, "Nucleo", 3), r(1, "Concha", 3)];
+        assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::MoreAgents));
+    }
+
+    #[test]
+    fn two_items_against_one_is_noise_and_not_imbalance() {
+        // 2 >= 2 x 1 e verdade, mas 2 < ITENS_MINIMOS. O piso existe exactamente para este caso.
+        let mut rs = vec![r(1, "Nucleo", 2), r(1, "Concha", 1)];
+        assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::MoreAgents));
+    }
+
+    #[test]
+    fn an_agent_alone_in_its_round_is_not_called_imbalanced() {
+        // Sem pares nao ha desequilibrio possivel -- so uma layer de um. Guarda contra o
+        // `max(1, ...)` transformar "nao ha mediana" em "a mediana e 1".
+        let mut rs = vec![r(1, "Nucleo", 5)];
+        assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::MoreAgents));
+    }
+
+    #[test]
+    fn context_climbing_across_rounds_asks_for_a_layer() {
+        // 100k -> 150k: +50%, acima de SUBIDA_ENTRE_ROUNDS. O veredicto prende-se ao ultimo round.
+        let mut rs = vec![r(1, "Nucleo", 2), r(2, "Nucleo", 2)];
+        rs[0].peak_p50 = Some(100_000);
+        rs[1].peak_p50 = Some(150_000);
+        assert!(verdicts_of(&mut rs, "Nucleo", 2).contains(&Verdict::MoreLayers));
+    }
+
+    #[test]
+    fn context_that_holds_steady_does_not() {
+        let mut rs = vec![r(1, "Nucleo", 2), r(2, "Nucleo", 2)];
+        rs[0].peak_p50 = Some(100_000);
+        // +5%, ruido.
+        rs[1].peak_p50 = Some(105_000);
+        assert!(!verdicts_of(&mut rs, "Nucleo", 2).contains(&Verdict::MoreLayers));
+    }
+
+    #[test]
+    fn a_high_start_with_little_work_is_a_prompt_problem() {
+        // Arranque de 60k numa ocupacao tipica de 100k, e mediana de 4 passos: nasce caro e faz
+        // pouco.
+        let mut rs = vec![r(1, "Nucleo", 3)];
+        rs[0].fit = Fit::Line {
+            intercept: 60_000.0,
+            slope: 900.0,
+            r2: 0.8,
+        };
+        rs[0].steps_median = Some(4);
+        assert!(verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::TrimPrompt));
+    }
+
+    #[test]
+    fn a_high_start_that_does_a_lot_of_work_is_not() {
+        // O mesmo arranque, 40 passos: amortiza-se. Repartir aqui pagava-o outra vez, e e o erro
+        // que este veredicto existe para impedir.
+        let mut rs = vec![r(1, "Nucleo", 3)];
+        rs[0].fit = Fit::Line {
+            intercept: 60_000.0,
+            slope: 900.0,
+            r2: 0.8,
+        };
+        rs[0].steps_median = Some(40);
+        assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::TrimPrompt));
     }
 
     #[test]
