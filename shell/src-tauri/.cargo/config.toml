@@ -15,9 +15,27 @@
 # Measured before writing this, because "it is the shared directory" is a claim and not an
 # observation: `shell/src-tauri: clippy` failed that way in a feature worktree AND in the main
 # checkout on master, with the crate untouched in both, and passed — clippy clean, 18 tests green —
-# the moment it was given a target directory of its own. What was never pinned down is WHICH process
-# held the handle; a concurrent build and a virus scanner reading the freshly written archive are
-# both consistent with the evidence. This fix does not depend on the answer.
+# the moment it was given a target directory of its own. This fix does not depend on knowing which
+# process held the handle, and was right to be written without it.
+#
+# It is known now (2026-08-26), and it was neither of the two this paragraph used to guess at. The
+# holder was the NucleOS app itself, left running: `shell.exe` launched from the shared tree keeps
+# the executable that `clippy --all-targets` and `test` replace. Three things were measured. The
+# step failed twenty consecutive times over fifteen minutes, which no scanner and no build of a
+# bounded length explains. `libresource.a` — the file the error NAMES — opened exclusively without
+# complaint throughout, so the message points at the wrong file; the locked one was
+# `.cargo-target\debug\shell.exe`. And closing that app made the full gate pass on the shared tree,
+# first try, with nothing else changed.
+#
+# What that costs the reader is worth saying, because it survives this fix: the gate still cannot
+# run against a target a running app was launched from. It is now one worktree's problem instead of
+# every worktree's, which is the whole improvement.
+#
+# Stop `npm run tauri dev`, and not just the window. Confirmed the same hour, in this checkout,
+# against its own `target/`: closing the app freed nothing, because `tauri dev` keeps a `cargo run`
+# above it and had relaunched the binary under a new pid before the next gate run reached this step.
+# Somebody who closes the window, sees the identical failure and concludes the advice is wrong will
+# go looking for the wrong cause a second time.
 #
 # The disk argument barely applies to this crate anyway, which is what makes the exception cheap:
 # the shared tree exists so that many worktrees stop duplicating the NÚCLEO's dependency graph, and
