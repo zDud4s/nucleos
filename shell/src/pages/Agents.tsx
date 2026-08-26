@@ -487,7 +487,13 @@ function Tools({ agent }: { agent: Agent }) {
  *
  * The glyphs are the matrix's own, with the matrix's meanings — `◉` directs,
  * `●` on staff — on purpose. Two vocabularies for one relation is how the two
- * pages start to look like they are about different things.
+ * pages start to look like they are about different things. So is two
+ * arithmetics: a department gets ONE standing here, exactly as `standingOf`
+ * gives it one there, which is what makes these two figures add up to the
+ * number of departments the agent is in. Counted the other way, a director who
+ * is also on the roster of the department it directs drew `◉ 1 ● 1` — one
+ * department, read as two by anybody who added them, under a heading that
+ * invites adding them.
  *
  * Three arms and not two, because "not known yet" and "nobody" are opposite
  * answers and only one of them is worth acting on. Until `GET /teams` returns,

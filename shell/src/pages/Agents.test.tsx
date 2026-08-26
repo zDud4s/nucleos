@@ -308,6 +308,37 @@ describe("Agents - how much of an agent is spoken for", () => {
     expect(await screen.findByText(/directs Finanças/)).toBeDefined();
   });
 
+  it("counts a department once when the same agent directs it and is on its roster", async () => {
+    // The two figures sit side by side under a heading that invites adding
+    // them, so they have to be addable. Drawn as `◉ 1 ● 1`, one department read
+    // as two.
+    const own = [team({ name: "Segurança", director_agent_id: "sysadmin", members: ["sysadmin"] })];
+    daemon.apiFetch.mockImplementation(
+      agentsFetch([agent({ id: "sysadmin", name: "sysadmin" })], { teams: own }),
+    );
+    renderWithQuery(<Agents />);
+
+    const cell = (await screen.findByRole("button", { name: "sysadmin" }))
+      .closest("tr")
+      ?.querySelector(".agents-figure") as HTMLElement;
+    expect(cell.textContent).toContain("directs Segurança");
+    expect(cell.textContent).not.toContain("on the roster of");
+  });
+
+  it("draws both marks only when they are genuinely two departments", async () => {
+    const two = [
+      team({ id: "seguranca", name: "Segurança", director_agent_id: "sysadmin", members: ["sysadmin"] }),
+      team({ id: "informatica", name: "Informática", director_agent_id: "closer", members: ["sysadmin"] }),
+    ];
+    daemon.apiFetch.mockImplementation(
+      agentsFetch([agent({ id: "sysadmin", name: "sysadmin" })], { teams: two }),
+    );
+    renderWithQuery(<Agents />);
+
+    expect(await screen.findByText(/directs Segurança/)).toBeDefined();
+    expect(screen.getByText(/on the roster of Informática/)).toBeDefined();
+  });
+
   it("marks an agent no department names, and says so in the headline", async () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "spare", name: "spare", model: "sonnet" })], { teams: departments }),

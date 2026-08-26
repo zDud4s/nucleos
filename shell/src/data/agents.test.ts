@@ -126,11 +126,38 @@ describe("employmentOf", () => {
     expect(employmentOf("controller", teams)).toEqual({ directs: ["Finanças"], staffs: [] });
   });
 
-  it("counts a director who is also on the roster in both, and does not merge them", () => {
-    // The daemon stores the two separately, so this is one person with two
-    // standings in one department and not a duplicate row.
+  it("gives a department one standing, and directing is the one that wins", () => {
+    // The daemon stores the director apart from the roster, so a director is
+    // usually in `members` too. Counted under both, the two figures sit side by
+    // side in a column headed Employed and cannot be added: one department
+    // reads as two. `RosterMatrix.standingOf` already resolves this exact
+    // overlap the same way, and the two pages have to agree.
     const both = [team({ name: "Segurança", director_agent_id: "sysadmin", members: ["sysadmin"] })];
-    expect(employmentOf("sysadmin", both)).toEqual({ directs: ["Segurança"], staffs: ["Segurança"] });
+    expect(employmentOf("sysadmin", both)).toEqual({ directs: ["Segurança"], staffs: [] });
+  });
+
+  it("still counts two when they are genuinely two departments", () => {
+    const spread = [
+      team({ id: "seguranca", name: "Segurança", director_agent_id: "sysadmin", members: ["sysadmin"] }),
+      team({ id: "informatica", name: "Informática", director_agent_id: "closer", members: ["sysadmin"] }),
+    ];
+    expect(employmentOf("sysadmin", spread)).toEqual({
+      directs: ["Segurança"],
+      staffs: ["Informática"],
+    });
+  });
+
+  it("adds up to the number of distinct departments, which is what the column claims", () => {
+    const spread = [
+      team({ id: "a", name: "A", director_agent_id: "sysadmin", members: ["sysadmin"] }),
+      team({ id: "b", name: "B", director_agent_id: "closer", members: ["sysadmin"] }),
+      team({ id: "c", name: "C", director_agent_id: "closer", members: [] }),
+    ];
+    const employment = employmentOf("sysadmin", spread);
+    const distinct = spread.filter(
+      (one) => one.director_agent_id === "sysadmin" || one.members.includes("sysadmin"),
+    ).length;
+    expect(employment.directs.length + employment.staffs.length).toBe(distinct);
   });
 
   it("answers empty for somebody no department names", () => {

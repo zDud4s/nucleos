@@ -115,7 +115,13 @@ export const TEAMS: TeamView[] = [
     name: "Informática",
     mission: "Keep the machines patched and the backups restorable, and prove the second one.",
     director_agent_id: "sysadmin",
-    members: ["sysadmin", "reviewer", "researcher"],
+    /* `closer` directs Vendas and serves here: until this line no director in
+       the fixture served a second department, so two things were never drawn.
+       `Who`'s accent ring and dashed outline together — leading one place and
+       shared with another — and the catalogue's employment column showing both
+       of its marks at once, which is the only case where `◉ 1 ● 1` means two
+       departments rather than one counted twice. */
+    members: ["sysadmin", "reviewer", "researcher", "closer"],
     grants: [{ kind: "file_document", mode: "allow" }],
     max_rounds: 3,
     max_parallel: 4,

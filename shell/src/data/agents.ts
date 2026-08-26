@@ -153,20 +153,36 @@ export interface Employer {
  * much, and the two are not the same question. This is the one that decides
  * whether an agent can be deleted, and whether anybody is using it at all.
  *
- * `directs` and `staffs` are separate and a department can be in both: the
- * daemon stores the director apart from the roster (`core/src/team.rs`), so a
- * director is not necessarily in `members`, and a director that IS in `members`
- * is not a duplicate to be merged away.
+ * **One department, one standing, and directing wins.** The daemon stores the
+ * director apart from the roster (`core/src/team.rs`), so a director is very
+ * often in `members` as well — and counting that person under both made the two
+ * figures un-addable while sitting side by side in a column headed *Employed*.
+ * `◉ 1 ● 1` was one department read as two by anybody who added them, which was
+ * five of eleven rows in the preview and would be most rows in a real house.
+ *
+ * The resolution is not invented here: `RosterMatrix.standingOf` already
+ * decides the same overlap the same way — a cell is `leads` OR `staff` OR
+ * `none`, never two of them. So `directs` plus `staffs` is now the count of
+ * DISTINCT departments, which is what the column says it is, and the two pages
+ * answer the same relation with the same arithmetic.
+ *
+ * (Corrected 2026-08-26. `staffs` used to include the departments the agent
+ * directs.)
  */
 export interface Employment {
+  /** Departments this agent directs, whether or not the roster names it too. */
   directs: string[];
+  /** Departments whose roster names it and which it does NOT direct. */
   staffs: string[];
 }
 
 export function employmentOf(agentId: string, teams: Employer[]): Employment {
+  const leads = (team: Employer) => team.director_agent_id === agentId;
   return {
-    directs: teams.filter((team) => team.director_agent_id === agentId).map((team) => team.name),
-    staffs: teams.filter((team) => team.members.includes(agentId)).map((team) => team.name),
+    directs: teams.filter(leads).map((team) => team.name),
+    staffs: teams
+      .filter((team) => !leads(team) && team.members.includes(agentId))
+      .map((team) => team.name),
   };
 }
 
