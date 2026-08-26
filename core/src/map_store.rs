@@ -240,13 +240,29 @@ pub struct Stamp {
     /// The anchor code as it stood when this was written, in `map_stamp`'s canonical form.
     ///
     /// Three states, and flattening any two of them is the bug this field exists to prevent.
-    /// `None` is *nobody could compute one* — a folder that is not a repository, a `git` that did
-    /// not answer — which is a fact about this daemon at that moment. `Some("")` is *computed, and
-    /// this decision has no readable anchor*, which is a fact about the decision, is permanent, and
-    /// is what makes a stamp that can never expire. `Some(text)` is the digest. An
+    /// `None` is *nobody could compute one* — **git is there and would not answer**, which is a fact
+    /// about this daemon at that moment and is transient. `Some("")` is *computed, and there is
+    /// nothing here to watch*, which is a fact about the decision or about its project, is
+    /// permanent, and is what makes a stamp that can never expire. `Some(text)` is the digest. An
     /// `unwrap_or_default()` anywhere downstream turns the first into the second and mints a green
     /// that never comes back to ask; `0118`'s CHECK stops `settled` reaching the table as `None` at
     /// all, and this type is what keeps the other two apart afterwards.
+    ///
+    /// **A project with no git repository writes `Some("")` and not `None`**, and the reason is
+    /// §11: such a project is not broken, and with no repository there is genuinely nothing that
+    /// could ever move — so refusing the stamp, or storing it as *could not compute* and telling its
+    /// owner to try again for ever, would both be answers about a fault that does not exist. Which
+    /// of the silences a `Some("")` came from is deliberately not recorded here:
+    /// [`crate::map_stamp::standing`] re-derives it on every read from what the project looks like
+    /// now, and a copy in this column would be a second place for it to be wrong — and the one that
+    /// goes stale, because a project can gain a repository and this row cannot notice.
+    ///
+    /// **`0118`'s own header still lists *no repository* among the things NULL means, and it is
+    /// wrong; this paragraph is the correction.** It is not fixed in the SQL because `sqlx::migrate!`
+    /// checksums that file byte for byte and a migration that has already run somewhere would then
+    /// panic with `Migrate(VersionMismatch)` — the trap `.gitattributes` and `0115`'s header both
+    /// describe. Correcting a comment is not worth a daemon that will not start, so the correction
+    /// lives here, where the type that enforces it is.
     pub code_digest: Option<String>,
     pub note: Option<String>,
 }
@@ -264,8 +280,9 @@ pub struct Stamp {
 /// it is a verdict on, so a stamp for a decision that fails the `WHERE` cannot be constructed at
 /// all.
 ///
-/// `code_digest` is `None` when it could not be computed and `Some("")` when it was computed and
-/// came back empty, and the table refuses the first for `settled`: §7.1 makes *está como quero* the
+/// `code_digest` is `None` only when git was there and would not answer, and `Some("")` when the
+/// anchor set came back empty — including in a project with no repository at all. The table refuses
+/// the first for `settled`: §7.1 makes *está como quero* the
 /// only verdict the code moving can falsify, so it is the only one that may not be recorded without
 /// knowing what it is anchored to. A caller that has no digest for a green must fail the request —
 /// `503`, because it is this machine that is unable, not the owner who is wrong — rather than store

@@ -175,25 +175,71 @@ pub enum Standing {
     },
 }
 
-/// Whether a settled stamp has anything to watch, and why not when it has not.
+/// What a settled stamp is standing on: whether it will ever come back to ask, how certain the
+/// thing it is watching is, and — when it will never ask — why not.
 ///
-/// **Three, and the third arrived from a live measurement rather than from the design.** This was a
-/// `watched: bool` until task 3 ran the digest over this repository's own decisions: of ten real
-/// anchor paths, **eight came back with a blob and two did not — `AGENTS.md` and `CLAUDE.md`, which
-/// this very repository gitignores.** So `false` was quietly carrying two facts at once, and they
-/// have different cures. One is §8 unfixed and is repaired by slice 6 putting slugs on citations;
-/// the other is a line in a `.gitignore` and has nothing to do with §8 at all. A single number that
-/// means both is a number its owner cannot act on — which is the shape of the problem this whole
-/// map exists to cure, reappearing one level down.
+/// **Five, and not one of them was in the design; every one arrived from a measurement.** This was a
+/// `watched: bool`. Task 3 ran the digest over this repository's own decisions and split `false` in
+/// two: of ten real anchor paths, **eight came back with a blob and two did not — `AGENTS.md` and
+/// `CLAUDE.md`, which this very repository gitignores.** Reviewing that split then found that `true`
+/// was hiding something worse, and §11 supplied the fifth.
+///
+/// **The rule the five exist to enforce: a value here may never let an approximate basis wear a
+/// certain word.** Each has a different cure, and one number covering several would be a number its
+/// owner cannot act on — which is the shape of the problem this whole map exists to treat,
+/// reappearing one level down inside the treatment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Watch {
-    /// Anchors exist, git tracks them, this stamp expires when they move.
+    /// Anchors exist, git tracks them, and a citation names the **document** as well as the section
+    /// ([`crate::map_join::Anchor::Declared`]). This stamp expires when they move, and the thing it
+    /// is watching is the thing the decision is about. The only certain one.
+    ///
+    /// **What it claims is *at least one* anchor is certain, not that every one is** — and that
+    /// weaker reading is the true one, so it is written down rather than left to be assumed.
+    /// `map_join` sets [`crate::map_join::Anchor::Declared`] when **any** module names the document,
+    /// while [`crate::map_join::Anchored::modules`] collects **every** module naming the section, so
+    /// a decision can be `Declared` and still carry number-only matches in its anchor set. No sixth
+    /// gradation for it: what the owner can act on is *is this basis certain or a guess*, and a
+    /// per-module certainty is a rendering question for slice 7 if it ever is one at all.
     Watched,
+    /// Anchors exist and git tracks them, but the map matched them by section **number** alone
+    /// ([`crate::map_join::Anchor::Ambiguous`]). This stamp will expire — and it may expire because
+    /// a file that happens to write the same `§N` about a **different document** changed.
+    ///
+    /// **Today this is every anchored stamp in this repository**, because `Anchor::Declared` has
+    /// zero instances until §8's slug edit lands. Without this value a green over a guess and a
+    /// green over a certainty serialise identically, and the one field carrying the colour says
+    /// nothing about which it is — a visibly-green answer resting on a silently-approximate basis,
+    /// which is the one thing this feature may not do.
+    ///
+    /// **`guessed` going to zero is slice 6's scoreboard**, and a better one than counting
+    /// `Anchor::Declared`: it is weighted by what the owner actually stamped, so it measures whether
+    /// §8's repair reached the decisions anybody cares about rather than the ones nobody has looked
+    /// at. Written down because the obvious metric is the other one.
+    ///
+    /// `Guessed` and not `Presumed` or `Inferred`. The blunt word is the one that makes somebody
+    /// stop and ask, and a green that does not make them ask is what the word is there to prevent.
+    Guessed,
     /// No readable module names this decision's section. §8 unfixed; slice 6 is the repair.
     NoAnchor,
-    /// Modules name it and git tracks none of them. A `.gitignore` question, not a §8 one.
+    /// Modules name it and git reports none of them.
+    ///
+    /// **Two causes, and naming only the first would send the owner to the wrong file.** The path is
+    /// gitignored — `AGENTS.md` and `CLAUDE.md` here, which real decisions anchor to — or it is
+    /// simply a file nobody has run `git add` on yet, which is what a young project looks like and
+    /// makes every decision in it arrive here at once. The cure is a `.gitignore` line in the first
+    /// case and a `git add` in the second, and nothing this module can see tells the two apart: git
+    /// answers *I have no entry for that path* either way.
     Untracked,
+    /// This project's folder is not a git repository, so nothing here can ever expire.
+    ///
+    /// §11's ordinary case rather than a fault: a project added from outside may have no specs and
+    /// no repository, and it still deserves an honest answer. Distinct from
+    /// [`Lapse::Unreadable`], which is *I could not look **just now*** and asks the owner to try
+    /// again — there is nothing here to try again, and a map that said so would be sending somebody
+    /// to retry a thing that cannot succeed.
+    NoRepository,
 }
 
 /// Why a stamp lapsed, and the diff §7 promises.
@@ -223,16 +269,25 @@ pub enum Lapse {
     /// budged. *I could not look* is the only one of the three that is true, and it is also the only
     /// one a reader can act on.
     ///
-    /// Three ways to arrive here, and all three are the same fact. The expected one is a settled
-    /// stamp whose **current** digest could not be computed — the folder was a git repository when
-    /// it was stamped and is not one now, or `git` did not answer. The second is a settled stamp
-    /// holding **no** digest, a row `0118`'s `CHECK (verdict <> 'settled' OR code_digest IS NOT
-    /// NULL)` refuses at the table; it is answered here anyway because the tempting alternative,
-    /// a settled green with nothing to watch, is that CHECK's own defect moved from write to read —
-    /// a transient *git was unreadable* silently promoted to a permanent *there is nothing to
-    /// watch*. The third is an amber whose `stamped_at` will not parse, so its age cannot be
-    /// computed; `map_store::stamp` writes `chrono::Utc::now().to_rfc3339()` and so cannot produce
-    /// one, and the honest answer to a clock that will not read is still *I could not look*.
+    /// Four ways to arrive here, and all four are the same fact. The expected one is
+    /// [`Anchors::Failed`] — git is there and would not answer. The second is a settled stamp that
+    /// **was** anchored to real blobs in a folder that is no longer a repository: the comparison it
+    /// depends on cannot be made, and the alternative — reading it as a settled green with nothing
+    /// to watch — would silently promote a stamp that used to expire into one that never will, over
+    /// code that may well have moved since. The third is a settled stamp holding **no** digest, a
+    /// row `0118`'s `CHECK (verdict <> 'settled' OR code_digest IS NOT NULL)` refuses at the table;
+    /// it is answered here anyway because the tempting alternative is that CHECK's own defect moved
+    /// from write to read — a transient *git was unreadable* silently promoted to a permanent
+    /// *there is nothing to watch*. The fourth is an amber whose `stamped_at` will not parse, so its
+    /// age cannot be computed; `map_store::stamp` writes `chrono::Utc::now().to_rfc3339()` and so
+    /// cannot produce one, and the honest answer to a clock that will not read is still *I could not
+    /// look*.
+    ///
+    /// **What is deliberately NOT here: a project that simply has no repository.** That used to
+    /// arrive as this, and it was wrong in a way nobody would have noticed — every read said *I
+    /// could not look* about a folder there was never anything to look at in, for ever, and the
+    /// only advice this variant carries is *try again*. §11 says such a project must still get an
+    /// honest answer, and [`Watch::NoRepository`] is that answer.
     Unreadable,
 }
 
@@ -259,62 +314,126 @@ pub struct StampCounts {
     /// Not in the header line. Withdrawn decisions still exist and their documents still lie —
     /// §5.2 wants them out of the way, not out of sight.
     pub withdrawn: usize,
+    /// How many of [`StampCounts::settled`] will expire against an anchor set matched by section
+    /// number alone. See [`Watch::Guessed`], which argues the value and names what this number is
+    /// for: **`guessed` reaching zero is slice 6's scoreboard.**
+    ///
+    /// **Deliberately NOT part of [`StampCounts::unwatched`].** A guessed anchor does expire; what
+    /// is uncertain is whether it is expiring against the right files. Adding it to the greens that
+    /// will never come back to ask would merge two different complaints into one number, which is
+    /// the mistake the whole of [`Watch`] exists to stop being made.
+    pub guessed: usize,
     /// How many of [`StampCounts::settled`] are green over a section no readable module names.
     ///
-    /// **The pair of numbers that keeps `N carimbadas` honest.** Without them the header reports a
-    /// count of greens without saying how many of them will never come back to ask, which reads as
-    /// confidence and is not. Two counts rather than one for the reason [`Watch`] is three-valued:
-    /// this one is §8 unfixed and is repaired by slice 6, and [`StampCounts::untracked`] beside it
-    /// is repaired by editing a `.gitignore`. One number would leave the owner unable to tell which
-    /// of the two they were being asked to do.
+    /// **The three numbers that keep `N carimbadas` honest.** Without them the header reports a
+    /// count of greens without saying how many will never come back to ask, which reads as
+    /// confidence and is not. Three counts rather than one because the cures differ: this one is §8
+    /// unfixed and is repaired by slice 6, [`StampCounts::untracked`] is repaired by an edit to a
+    /// `.gitignore` or by a `git add`, and [`StampCounts::no_repository`] is not a defect at all.
+    /// One number would leave the owner unable to tell which of the three they were being asked to
+    /// do — and one of the three is *nothing*.
     pub no_anchor: usize,
-    /// How many of [`StampCounts::settled`] name modules that git tracks none of.
+    /// How many of [`StampCounts::settled`] name modules git reports none of.
     ///
     /// Expected to be small and expected to be non-zero: this repository gitignores `AGENTS.md` and
-    /// `CLAUDE.md`, both of which real decisions anchor to. See [`Watch::Untracked`].
+    /// `CLAUDE.md`, both of which real decisions anchor to. See [`Watch::Untracked`], including the
+    /// second cause it names.
     pub untracked: usize,
-    /// Every approved decision, so the five above can be asserted to reconcile.
+    /// How many of [`StampCounts::settled`] are in a project with no git repository (§11).
+    pub no_repository: usize,
+    /// The greens that will never come back to ask: `no_anchor + untracked + no_repository`.
+    ///
+    /// **Derived, and derived HERE rather than by whoever draws the panel.** §9.3 makes `core/` the
+    /// single owner of this map's derivations, and this is the number the panel actually prints —
+    /// *"X destas nunca vão caducar"*. A shell adding the three itself would be a second
+    /// implementation of it, free to drift the day a fourth silence is added, and the drift would
+    /// surface as a header quietly disagreeing with the rows beneath it.
+    ///
+    /// A redundant field is a field that can disagree with its parts, which is why this was left out
+    /// once and is back with an invariant instead of a promise: a test pins the sum, exactly as one
+    /// pins [`StampCounts::decisions`] against the five standings. A derived field whose invariant is
+    /// enforced by a test is this feature's existing discipline; one promised by a comment is not.
+    pub unwatched: usize,
+    /// Every approved decision, so the five standings above can be asserted to reconcile.
     pub decisions: usize,
+}
+
+/// What one reading of the repository knows about one decision's anchor set.
+///
+/// **Three facts that only a caller holding both the join and the git call has**, bundled so
+/// [`standing`] can stay pure and so §7.1's rules stay exercisable with no repository anywhere near
+/// them. Passed rather than inferred because none of the three can be recovered from the digest
+/// alone: an empty digest cannot say whether anything was asked for, and a full one cannot say
+/// whether the map knew which document it was reading about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchoring<'a> {
+    /// This decision's anchor set as it stands now, sliced out of whatever the reading computed.
+    pub current: &'a Anchors,
+    /// How many readable modules name this decision's section — [`crate::map_join::Anchored::modules`]
+    /// `.len()` and nothing else.
+    ///
+    /// It exists because [`Anchors::Computed`] holding `""` cannot say which of two silences made
+    /// it. Zero means nothing was ever asked of git, which is [`Watch::NoAnchor`]; a non-zero count
+    /// with an empty digest means git was asked about real files and reports none of them, which is
+    /// [`Watch::Untracked`]. Handing this the count of *tracked* anchors instead would collapse the
+    /// two again and report `NoAnchor` for ever.
+    pub named: usize,
+    /// Whether the join could name the **document**, not merely the section number —
+    /// [`crate::map_join::Anchor::Declared`] rather than [`crate::map_join::Anchor::Ambiguous`].
+    ///
+    /// The difference between [`Watch::Watched`] and [`Watch::Guessed`], and today it is `false`
+    /// everywhere in this repository. Read `Watched`'s own comment for what the `true` case does and
+    /// does not claim.
+    pub declared: bool,
+}
+
+/// What one `git ls-files` over an anchor set came back with.
+///
+/// **Three, and the third exists because collapsing it into the second told somebody to retry a
+/// thing that can never succeed.** This was an `Option<String>`, where `None` meant *no digest* and
+/// carried two facts at once: **git would not answer just now**, which is transient and whose honest
+/// advice is *try again*; and **this folder is not a git repository at all**, which is §11's ordinary
+/// case, is permanent, and has nothing to retry. Written alike, a project added from outside with no
+/// repository got `503 Service Unavailable` on every stamp for ever and a screenful of *I could not
+/// look* on every read — a daemon insisting it was having a bad moment about a fact that was never
+/// going to change.
+///
+/// [`Anchors::Computed`] holding the empty string is a fourth thing again and is not a failure at
+/// all: **computed, and there is no anchor to watch.** That one is a fact about the decision, and
+/// keeping it apart from the two above is what `0118`'s `code_digest` column spends its longest
+/// comment on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anchors {
+    /// The digest, in [`canonical`] form. Empty means the anchor set was empty or git reports none
+    /// of its paths — never that something went wrong.
+    Computed(String),
+    /// This folder is not a git repository. Permanent, and §11's ordinary case rather than a fault.
+    NoRepository,
+    /// Git is here, and would not answer. Transient, and the one of the three worth retrying.
+    Failed,
 }
 
 /// One decision's standing, at one instant.
 ///
-/// **Both `Option`s are load-bearing and they mean different things.** `stamp` is `None` when
+/// **The two absences are load-bearing and they mean different things.** `stamp` is `None` when
 /// **nobody has stamped this decision** — §5.3's `K nunca vistas`, which on day one is nearly every
-/// row. `current` is `None` when **this reading could not compute a digest just now**: the folder is
-/// not a repository, `git` did not answer, the call failed. `Some("")` is a third thing again —
-/// computed, and this decision has no readable anchor to watch — which is a permanent fact about the
-/// decision rather than a transient one about this daemon.
+/// row. [`Anchoring::current`] carries the other, in the four states [`Anchors`] argues for.
 ///
 /// **Neither may be flattened into a default, and the inner one is the dangerous one.** An
-/// `unwrap_or_default()` on `current` is all it takes: every settled stamp holding a real digest
+/// `unwrap_or_default()` on the digest is all it takes: every settled stamp holding a real digest
 /// would then be compared against `""`, every anchor file in the project would land in
 /// `Lapse::Moved { gone }` at once, and the panel would report that all of them disappeared when
 /// nothing whatsoever happened. That lapse storm costs exactly what the silent green costs, from the
 /// other side — a reader nagged about nothing stops reading, and the one real lapse then arrives on
-/// a screen nobody looks at. `0118`'s header spends a paragraph keeping the three states apart at
-/// write time; this is where that has to survive the read.
+/// a screen nobody looks at. `0118`'s header spends a paragraph keeping those states apart at write
+/// time; this is where that has to survive the read.
 ///
 /// `now` is a parameter and this function never reads a clock, which is what lets §7.1's three rules
 /// be exercised as three. Note which of them uses it: amber, and only amber. A settled stamp's
 /// `stamped_at` is carried through untouched and never parsed, because time is not an input to its
 /// expiry, and a withdrawal's for the same reason — so a corrupt timestamp cannot make a green rot
 /// or a withdrawal return.
-///
-/// **`anchors` is how many readable modules name this decision's section — `Anchored::modules.len()`
-/// and nothing else** — and it exists because a digest of `""` cannot say which of [`Watch`]'s two
-/// silences produced it. Zero anchors means nothing was ever asked of git; a non-zero count with an
-/// empty digest means git was asked about real files and tracks none of them. Only a caller holding
-/// both the join and the digest can tell those apart, so the distinction is passed in rather than
-/// guessed at here — which is also what keeps this function pure, and §7.1's three rules exercisable
-/// without a repository. Handing it the count of *tracked* anchors instead would collapse the two
-/// again and always report [`Watch::NoAnchor`].
-pub fn standing(
-    stamp: Option<&Stamp>,
-    current: Option<&str>,
-    anchors: usize,
-    now: DateTime<Utc>,
-) -> Standing {
+pub fn standing(stamp: Option<&Stamp>, anchoring: Anchoring<'_>, now: DateTime<Utc>) -> Standing {
     let Some(stamp) = stamp else {
         return Standing::Never;
     };
@@ -324,17 +443,35 @@ pub fn standing(
     // are three. A boolean with a note beside it — the shape this nearly was — would have let one
     // rule quietly serve two verdicts, which is how *a meio* ends up expiring by code.
     match stamp.verdict {
-        Verdict::Settled => match (stamp.code_digest.as_deref(), current) {
-            (Some(was), Some(is)) => match moved(was, is) {
+        Verdict::Settled => match (stamp.code_digest.as_deref(), anchoring.current) {
+            (Some(was), Anchors::Computed(is)) => match moved(was, is) {
                 Some(why) => Standing::Lapsed { stamped_at, why },
                 // `is` empty here means `was` was too, since nothing moved. That is the green with
                 // nothing to watch, and it is the only place `watch` can be anything else.
                 None => Standing::Settled {
                     stamped_at,
-                    watch: watch(is, anchors),
+                    watch: watch(is, anchoring),
                 },
             },
-            (None, _) | (_, None) => Standing::Lapsed {
+            // A stamp made in a project that has no repository. `''` was the honest thing to store
+            // — with no repository there is nothing that could ever move — and this is that same
+            // sentence read back out, in the one word that says the stamp will never come and ask.
+            (Some(""), Anchors::NoRepository) => Standing::Settled {
+                stamped_at,
+                watch: Watch::NoRepository,
+            },
+            // But a stamp that WAS anchored to real blobs, in a folder that is no longer a
+            // repository, is not that. **The stamped digest decides, not the current reading**, and
+            // the direction matters: reporting it as a settled green with nothing to watch would
+            // silently promote a stamp that used to expire into one that never will, over code that
+            // may well have changed since. *I could not look* is the true answer, it is the first
+            // case `Lapse::Unreadable` names, and it errs where this whole feature errs — asking
+            // costs a re-stamp, not asking costs the trust.
+            (Some(_), Anchors::NoRepository) => Standing::Lapsed {
+                stamped_at,
+                why: Lapse::Unreadable,
+            },
+            (None, _) | (_, Anchors::Failed) => Standing::Lapsed {
                 stamped_at,
                 why: Lapse::Unreadable,
             },
@@ -378,16 +515,21 @@ pub fn standing(
     }
 }
 
-/// Which of [`Watch`]'s three a green with this digest is standing on.
+/// Which of [`Watch`]'s values a green over this digest is standing on.
 ///
 /// A digest with anything in it is being watched, whatever the anchor count says — a decision whose
-/// modules are half tracked still expires when the tracked half moves, and reporting it as unwatched
-/// because one file is gitignored would hide an expiry that genuinely works.
-fn watch(current: &str, anchors: usize) -> Watch {
-    match (current.is_empty(), anchors) {
-        (false, _) => Watch::Watched,
-        (true, 0) => Watch::NoAnchor,
-        (true, _) => Watch::Untracked,
+/// modules are half tracked still expires when the tracked half moves, and calling that unwatched
+/// because one file is gitignored would hide an expiry that genuinely works. Whether it is watching
+/// the right files is the other axis, and [`Anchoring::declared`] is the only thing that knows.
+///
+/// [`Watch::NoRepository`] is not decided here: it is not a property of a digest but of there being
+/// no digest to have, so [`standing`] answers it before this is reached.
+fn watch(current: &str, anchoring: Anchoring<'_>) -> Watch {
+    match (current.is_empty(), anchoring.named, anchoring.declared) {
+        (false, _, true) => Watch::Watched,
+        (false, _, false) => Watch::Guessed,
+        (true, 0, _) => Watch::NoAnchor,
+        (true, _, _) => Watch::Untracked,
     }
 }
 
@@ -405,8 +547,11 @@ pub fn counts(standings: &[Standing]) -> StampCounts {
         never: 0,
         lapsed: 0,
         withdrawn: 0,
+        guessed: 0,
         no_anchor: 0,
         untracked: 0,
+        no_repository: 0,
+        unwatched: 0,
         decisions: standings.len(),
     };
     for standing in standings {
@@ -414,10 +559,24 @@ pub fn counts(standings: &[Standing]) -> StampCounts {
             Standing::Never => counts.never += 1,
             Standing::Settled { watch, .. } => {
                 counts.settled += 1;
+                // `unwatched` is incremented beside each of its three parts rather than summed at
+                // the bottom, so the field and the parts are written by one pass over one match and
+                // cannot fall out of step with each other. A test pins the sum regardless.
                 match watch {
                     Watch::Watched => {}
-                    Watch::NoAnchor => counts.no_anchor += 1,
-                    Watch::Untracked => counts.untracked += 1,
+                    Watch::Guessed => counts.guessed += 1,
+                    Watch::NoAnchor => {
+                        counts.no_anchor += 1;
+                        counts.unwatched += 1;
+                    }
+                    Watch::Untracked => {
+                        counts.untracked += 1;
+                        counts.unwatched += 1;
+                    }
+                    Watch::NoRepository => {
+                        counts.no_repository += 1;
+                        counts.unwatched += 1;
+                    }
                 }
             }
             Standing::Partial { .. } => counts.partial += 1,
@@ -693,20 +852,30 @@ fn ls_files_entry(record: &str) -> Option<(u8, &str, &str)> {
 /// says re-stamping is one click when the diff is cosmetic. The gap between the two is one `git
 /// commit`, and it only ever opens in the direction of asking.
 ///
-/// **Three answers, and the whole reason this returns an `Option` is that they are three.**
+/// **Four answers, and the whole reason this returns an [`Anchors`] rather than an `Option<String>`
+/// is that they are four.**
 ///
-/// - `None` — *could not compute*. git is not there, the folder is not a repository, the call failed
-///   or came back non-zero. A fact about this daemon at this instant, and transient.
-/// - `Some("")` — *computed, and there is no readable anchor to watch*. A fact about the decision,
-///   permanent until §8's slug edit lands, and what makes a green that can never expire.
-/// - `Some(text)` — the digest.
+/// - [`Anchors::Failed`] — *git is here and would not answer*. A fact about this daemon at this
+///   instant, transient, and the one worth retrying. `503` on the way in, `Lapse::Unreadable` on the
+///   way out.
+/// - [`Anchors::NoRepository`] — *this folder is not a git repository*. §11's ordinary case, and
+///   permanent. Told apart from the above by one extra spawn on the failure path — see [`why_not`],
+///   which also argues why *git would not run at all* is deliberately counted as the first.
+/// - `Computed("")` — *computed, and there is no anchor to watch*. A fact about the decision,
+///   and what makes a green that can never expire.
+/// - `Computed(text)` — the digest.
 ///
-/// An `unwrap_or_default()` anywhere between here and the column collapses the first into the second
-/// and mints exactly the silent green §1 describes. `0118`'s `CHECK (verdict <> 'settled' OR
-/// code_digest IS NOT NULL)` refuses the collapse at the table and [`standing`] refuses it on the way
-/// back out; this is the third side of the same argument, on the way in. The `warn!` on every `None`
-/// is the other half — a transient failure nobody can see in a log is one nobody can tell apart from
-/// a permanent one.
+/// This returned `Option<String>` until the second and third were noticed to be one value, and what
+/// that cost is worth recording: a project added from outside with no repository got `503 Service
+/// Unavailable` on every stamp for ever, and *I could not look* against every decision on every
+/// read — a daemon insisting it was having a bad moment about a fact that was never going to change.
+///
+/// An `unwrap_or_default()` anywhere between here and the column collapses a failure into
+/// `Computed("")` and mints exactly the silent green §1 describes. `0118`'s `CHECK (verdict <>
+/// 'settled' OR code_digest IS NOT NULL)` refuses the collapse at the table and [`standing`] refuses
+/// it on the way back out; this is the third side of the same argument, on the way in. The `warn!`
+/// on every failure is the other half — a transient failure nobody can see in a log is one nobody
+/// can tell apart from a permanent one.
 ///
 /// **An empty `paths` never asks git anything**, and that is a correctness rule rather than an
 /// optimisation. Measured: `git ls-files -s -z --` with nothing after the `--` does not list nothing,
@@ -738,9 +907,9 @@ fn ls_files_entry(record: &str) -> Option<(u8, &str, &str)> {
 /// operation — no worktree is claimed, nothing is written, there is no budget to spend down. It is a
 /// read on an HTTP path with a ceiling of its own, [`LS_FILES_TIMEOUT`]; `git_exec`'s list has been
 /// amended to say so rather than left to read as though this had slipped past it.
-pub async fn digest(root: &Path, paths: &[String]) -> Option<String> {
+pub async fn digest(root: &Path, paths: &[String]) -> Anchors {
     if paths.is_empty() {
-        return Some(String::new());
+        return Anchors::Computed(String::new());
     }
 
     let mut lowest: BTreeMap<String, (u8, String)> = BTreeMap::new();
@@ -758,7 +927,7 @@ pub async fn digest(root: &Path, paths: &[String]) -> Option<String> {
                     tail = %answer.output_tail.trim(),
                     "git would not list the anchor blobs, so this anchor set has no digest"
                 );
-                return None;
+                return why_not(root).await;
             }
             Err(reason) => {
                 tracing::warn!(
@@ -767,7 +936,7 @@ pub async fn digest(root: &Path, paths: &[String]) -> Option<String> {
                     %reason,
                     "could not run git to list the anchor blobs, so this anchor set has no digest"
                 );
-                return None;
+                return why_not(root).await;
             }
         };
 
@@ -782,7 +951,10 @@ pub async fn digest(root: &Path, paths: &[String]) -> Option<String> {
                     record,
                     "git printed something this cannot read as an index entry, so this anchor set has no digest"
                 );
-                return None;
+                // Not `why_not`: git demonstrably ran and demonstrably answered, so the repository
+                // is there and the probe could only ever say so. What failed is this module's
+                // reading of what it said, which is exactly [`Anchors::Failed`].
+                return Anchors::Failed;
             };
             match lowest.get(path) {
                 Some((held, _)) if *held <= stage => {}
@@ -795,11 +967,51 @@ pub async fn digest(root: &Path, paths: &[String]) -> Option<String> {
 
     // Sorted by `canonical` on the way out, which is what makes merging the chunks above safe to do
     // in whatever order they came back.
-    Some(canonical(
+    Anchors::Computed(canonical(
         lowest
             .iter()
             .map(|(path, (_, blob))| (path.as_str(), blob.as_str())),
     ))
+}
+
+/// Why the `ls-files` above did not answer: because there is no repository, or because git would
+/// not.
+///
+/// **One extra spawn, on the failure path only**, which is what makes the distinction free in the
+/// common case. `git rev-parse --git-dir` reads no index — measured, because the fixture that makes
+/// this function matter is a repository whose index is corrupt, and a probe that also read the index
+/// would fail alongside the call it is explaining and report every broken repository as no
+/// repository at all: `ls-files` exits 128 with *index file smaller than expected* while `rev-parse
+/// --git-dir` exits 0 and prints `.git`.
+///
+/// **The three outcomes, and the direction each errs in:**
+///
+/// - git ran and said yes → the repository is there, so something else broke → [`Anchors::Failed`].
+/// - git ran and said no → there is no repository → [`Anchors::NoRepository`]. This also covers a
+///   root that is not there at all: git starts, cannot change directory, and exits 128. The route
+///   never meets that case, because the structure walk answers 404 for a missing folder long before
+///   this is reached.
+/// - **git could not run at all → [`Anchors::Failed`], and that asymmetry is the whole safety of
+///   this function.** `run_git` reserves `Err` for *we could not find out*, and a machine with no
+///   git on it produces that for both calls. Reading it as *no repository* would let a perfectly
+///   good repository be stamped as one that has none — `code_digest = ''`, a green anchored to
+///   nothing, expiring never — which is the exact row this feature exists to prevent, minted by the
+///   failure of an unrelated tool. `Failed` costs a `503` and a retry; the other reading costs the
+///   trust.
+async fn why_not(root: &Path) -> Anchors {
+    let argv: Vec<&OsStr> = ["rev-parse", "--git-dir"].iter().map(OsStr::new).collect();
+    match run_git(root, &argv, LS_FILES_TIMEOUT).await {
+        Ok(answer) if answer.succeeded() => Anchors::Failed,
+        Ok(_) => Anchors::NoRepository,
+        Err(reason) => {
+            tracing::warn!(
+                root = %root.display(),
+                %reason,
+                "git would not run at all, so whether this folder is a repository is unknown"
+            );
+            Anchors::Failed
+        }
+    }
 }
 
 #[cfg(test)]
@@ -855,6 +1067,35 @@ mod tests {
         }
     }
 
+    /// A digest this reading computed, as [`Anchors`] carries it.
+    fn computed(digest: &str) -> Anchors {
+        Anchors::Computed(digest.to_owned())
+    }
+
+    /// A reading whose anchor set the map matched by section **number** alone.
+    ///
+    /// The default the tests below reach for, because it is what this repository actually contains:
+    /// [`crate::map_join::Anchor::Declared`] has zero instances until slice 6, so every anchored
+    /// decision here is one of these. A test asserting [`Watch::Watched`] therefore has to say
+    /// [`certain`] out loud, which is the right way round — certainty is the claim that has to be
+    /// earned.
+    fn guessing(current: &Anchors, named: usize) -> Anchoring<'_> {
+        Anchoring {
+            current,
+            named,
+            declared: false,
+        }
+    }
+
+    /// A reading whose citation named the document as well as the section.
+    fn certain(current: &Anchors, named: usize) -> Anchoring<'_> {
+        Anchoring {
+            current,
+            named,
+            declared: true,
+        }
+    }
+
     fn lapsed(why: Lapse) -> Standing {
         Standing::Lapsed {
             stamped_at: STAMPED_AT.to_owned(),
@@ -893,12 +1134,14 @@ mod tests {
         let three = hand_digest(&[("core/src/map_store.rs", BLOB_C)]);
 
         let digests = [None, Some(""), Some(one.as_str()), Some(two.as_str())];
+        // Every state a reading can be in, including the two that used to be one value.
         let currents = [
-            None,
-            Some(""),
-            Some(one.as_str()),
-            Some(two.as_str()),
-            Some(three.as_str()),
+            Anchors::Failed,
+            Anchors::NoRepository,
+            computed(""),
+            computed(&one),
+            computed(&two),
+            computed(&three),
         ];
         let notes = [None, Some("falta migrar as páginas de pilar")];
         let verdicts = [Verdict::Settled, Verdict::Partial, Verdict::Withdrawn];
@@ -909,20 +1152,29 @@ mod tests {
             NOTE_LIFETIME + Duration::seconds(1),
             Duration::days(4000),
         ];
-        // Both sides of the distinction `Watch` exists for: a decision no readable module names, and
-        // one whose modules are real and none of which git tracks.
+        // Both sides of each distinction `Watch` exists for: a decision no readable module names
+        // against one whose modules are real, and a citation that named its document against one
+        // matched by number alone.
         let anchor_counts = [0, 2];
+        let certainties = [false, true];
 
         let mut every = Vec::new();
-        for current in currents {
+        for current in &currents {
             for clock in clocks {
-                for anchors in anchor_counts {
-                    every.push(standing(None, current, anchors, at(clock)));
-                    for verdict in verdicts {
-                        for stamped in digests {
-                            for note in notes {
-                                let stamp = stamp_of(verdict, stamped, note);
-                                every.push(standing(Some(&stamp), current, anchors, at(clock)));
+                for named in anchor_counts {
+                    for declared in certainties {
+                        let anchoring = Anchoring {
+                            current,
+                            named,
+                            declared,
+                        };
+                        every.push(standing(None, anchoring, at(clock)));
+                        for verdict in verdicts {
+                            for stamped in digests {
+                                for note in notes {
+                                    let stamp = stamp_of(verdict, stamped, note);
+                                    every.push(standing(Some(&stamp), anchoring, at(clock)));
+                                }
                             }
                         }
                     }
@@ -937,21 +1189,32 @@ mod tests {
             tally.decisions,
             "the five standings must cover every decision exactly once: {tally:?}"
         );
+
+        // A8: `unwatched` is derived, so what makes it safe to publish is this line rather than a
+        // comment promising the three were added up. A field whose invariant is asserted is this
+        // feature's discipline; one whose invariant is described is the thing it treats.
+        assert_eq!(
+            tally.unwatched,
+            tally.no_anchor + tally.untracked + tally.no_repository,
+            "unwatched is exactly its three parts and nothing else: {tally:?}"
+        );
         assert!(
-            tally.no_anchor + tally.untracked <= tally.settled,
-            "a green with nothing to watch is a green, so the two can never outnumber them: {tally:?}"
+            tally.unwatched + tally.guessed <= tally.settled,
+            "every one of these is a green, so they cannot outnumber the greens: {tally:?}"
         );
 
-        // A property nothing exercises is a property nobody proved. Each of the five, and both
-        // silences a green can stand on, has to actually occur in the mix above or the assertion is
-        // vacuous.
+        // A property nothing exercises is a property nobody proved. Each of the five standings, both
+        // certainties a watched green can rest on, and all three silences have to actually occur in
+        // the mix above or the assertions are vacuous.
         assert!(tally.never > 0, "{tally:?}");
         assert!(tally.settled > 0, "{tally:?}");
         assert!(tally.partial > 0, "{tally:?}");
         assert!(tally.lapsed > 0, "{tally:?}");
         assert!(tally.withdrawn > 0, "{tally:?}");
+        assert!(tally.guessed > 0, "{tally:?}");
         assert!(tally.no_anchor > 0, "{tally:?}");
         assert!(tally.untracked > 0, "{tally:?}");
+        assert!(tally.no_repository > 0, "{tally:?}");
     }
 
     #[test]
@@ -965,7 +1228,11 @@ mod tests {
         // Eleven years on, because time is not an input to this rule and the test says so rather
         // than a comment promising it.
         assert_eq!(
-            standing(Some(&stamp), Some(&anchors), 2, at(Duration::days(4000))),
+            standing(
+                Some(&stamp),
+                certain(&computed(&anchors), 2),
+                at(Duration::days(4000))
+            ),
             settled(Watch::Watched)
         );
     }
@@ -986,7 +1253,11 @@ mod tests {
         // hash of it. Naming the one file that moved — and not the one that did not — is that
         // promise being kept.
         assert_eq!(
-            standing(Some(&stamp), Some(&now), 2, at(Duration::zero())),
+            standing(
+                Some(&stamp),
+                certain(&computed(&now), 2),
+                at(Duration::zero())
+            ),
             lapsed(moved_to(&["core/src/map_store.rs"], &[], &[]))
         );
     }
@@ -1003,13 +1274,21 @@ mod tests {
         // A new file citing the section is as much a change as an edit to an old one — arguably
         // more, because it is code nobody weighed when the stamp was made.
         assert_eq!(
-            standing(Some(&stamp), Some(&grown), 2, at(Duration::zero())),
+            standing(
+                Some(&stamp),
+                certain(&computed(&grown), 2),
+                at(Duration::zero())
+            ),
             lapsed(moved_to(&[], &["core/src/map_store.rs"], &[]))
         );
 
         let grown_stamp = stamp_of(Verdict::Settled, Some(&grown), None);
         assert_eq!(
-            standing(Some(&grown_stamp), Some(&was), 2, at(Duration::zero())),
+            standing(
+                Some(&grown_stamp),
+                certain(&computed(&was), 2),
+                at(Duration::zero())
+            ),
             lapsed(moved_to(&[], &[], &["core/src/map_store.rs"]))
         );
 
@@ -1018,30 +1297,38 @@ mod tests {
         // did not exist, so it has to come back and ask.
         let unwatched = stamp_of(Verdict::Settled, Some(""), None);
         assert_eq!(
-            standing(Some(&unwatched), Some(&was), 1, at(Duration::zero())),
+            standing(
+                Some(&unwatched),
+                certain(&computed(&was), 1),
+                at(Duration::zero())
+            ),
             lapsed(moved_to(&[], &["core/src/map_join.rs"], &[]))
         );
     }
 
-    /// The two silences a green can stand on, told apart by the one input that can tell them apart.
+    /// The three silences a green can stand on, told apart by the inputs that can tell them apart.
     ///
-    /// Neither is a bug and neither is hidden. `Anchor::Declared` has zero instances in this
-    /// repository today, so a green with nothing to watch is the COMMON case rather than the corner,
-    /// and it is exactly the silent green this feature exists to kill — reported, and reported as
-    /// such. What this test pins is that the report says WHICH: the same empty digest is `NoAnchor`
-    /// when no module names the section and `Untracked` when modules name it and git tracks none of
-    /// them, and the two have different cures — slice 6 for the first, a `.gitignore` line for the
-    /// second.
+    /// None is a bug and none is hidden. `Anchor::Declared` has zero instances in this repository
+    /// today, so a green with nothing to watch is the COMMON case rather than the corner, and it is
+    /// exactly the silent green this feature exists to kill — reported, and reported as such. What
+    /// this test pins is that the report says WHICH, because the three have three different cures:
+    /// slice 6 for `NoAnchor`, a `.gitignore` line or a `git add` for `Untracked`, and nothing at
+    /// all for `NoRepository`, which is not a defect.
     #[test]
-    fn a_green_with_nothing_to_watch_says_which_of_the_two_silences_it_is() {
+    fn a_green_with_nothing_to_watch_says_which_of_the_three_silences_it_is() {
         let stamp = stamp_of(Verdict::Settled, Some(""), None);
+        let nothing = computed("");
 
         assert_eq!(
-            standing(Some(&stamp), Some(""), 0, at(Duration::zero())),
+            standing(Some(&stamp), guessing(&nothing, 0), at(Duration::zero())),
             settled(Watch::NoAnchor)
         );
         assert_eq!(
-            standing(Some(&stamp), Some(""), 0, at(Duration::days(4000))),
+            standing(
+                Some(&stamp),
+                guessing(&nothing, 0),
+                at(Duration::days(4000))
+            ),
             settled(Watch::NoAnchor),
             "nothing to watch means nothing time can do to it either"
         );
@@ -1049,12 +1336,30 @@ mod tests {
         // The live case the bool could not express: `AGENTS.md` and `CLAUDE.md` are named by real
         // decisions in this repository and gitignored by it, so git answers about them with silence.
         assert_eq!(
-            standing(Some(&stamp), Some(""), 2, at(Duration::zero())),
+            standing(Some(&stamp), guessing(&nothing, 2), at(Duration::zero())),
             settled(Watch::Untracked)
         );
         assert_eq!(
-            standing(Some(&stamp), Some(""), 2, at(Duration::days(4000))),
+            standing(
+                Some(&stamp),
+                guessing(&nothing, 2),
+                at(Duration::days(4000))
+            ),
             settled(Watch::Untracked)
+        );
+
+        // §11's project, added from outside with no repository at all. The stamp was stored as `''`
+        // because that was true — with no repository nothing can ever move — and the word here is
+        // what stops it reading as one of the two above, which are defects, or as
+        // `Lapse::Unreadable`, whose only advice is *try again* and which has nothing to offer
+        // somebody with nothing to retry.
+        assert_eq!(
+            standing(
+                Some(&stamp),
+                guessing(&Anchors::NoRepository, 2),
+                at(Duration::zero())
+            ),
+            settled(Watch::NoRepository)
         );
 
         // And a digest with anything in it is watched however many modules were named, because the
@@ -1062,21 +1367,94 @@ mod tests {
         let anchored = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
         let half = stamp_of(Verdict::Settled, Some(&anchored), None);
         assert_eq!(
-            standing(Some(&half), Some(&anchored), 2, at(Duration::zero())),
+            standing(
+                Some(&half),
+                certain(&computed(&anchored), 2),
+                at(Duration::zero())
+            ),
             settled(Watch::Watched)
         );
+    }
+
+    /// A5: a green that expires against files matched by section NUMBER alone says so.
+    ///
+    /// **This is the defect that survived four reviews as a `true`.** `Watch::Watched` and
+    /// `Watch::Guessed` are the same stamp, over the same files, expiring on the same event — the
+    /// only difference is whether this map knows the files are about the decision. `§7` appears in
+    /// 21 files in this repository and not one of them says of what, and `Anchor::Declared` has zero
+    /// instances until slice 6, so **every anchored stamp here is the guessed kind**. One word for
+    /// both would put a green on screen whose basis is a guess and give the owner no way to see
+    /// that, which is the visibly-approximate-versus-silently-wrong line this whole map is drawn
+    /// along.
+    #[test]
+    fn a_green_watching_files_matched_by_number_alone_says_it_is_a_guess() {
+        let anchored = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
+        let stamp = stamp_of(Verdict::Settled, Some(&anchored), None);
+        let current = computed(&anchored);
+
+        assert_eq!(
+            standing(Some(&stamp), guessing(&current, 1), at(Duration::zero())),
+            settled(Watch::Guessed)
+        );
+        assert_eq!(
+            standing(Some(&stamp), certain(&current, 1), at(Duration::zero())),
+            settled(Watch::Watched),
+            "the same stamp over the same file, once a citation names the document"
+        );
+
+        // The certainty changes what the green CLAIMS and never when it expires: both lapse on the
+        // same move, and a guessed anchor that stops being a guess must not lapse for that reason
+        // alone.
+        let moved_on = computed(&hand_digest(&[("core/src/map_join.rs", BLOB_B)]));
+        for anchoring in [guessing(&moved_on, 1), certain(&moved_on, 1)] {
+            assert_eq!(
+                standing(Some(&stamp), anchoring, at(Duration::zero())),
+                lapsed(moved_to(&["core/src/map_join.rs"], &[], &[]))
+            );
+        }
+
+        // And the silences are silent whichever way the citation went: there is no such thing as a
+        // certainly-absent anchor.
+        let nothing = computed("");
+        for anchoring in [guessing(&nothing, 0), certain(&nothing, 0)] {
+            assert_eq!(
+                standing(
+                    Some(&stamp_of(Verdict::Settled, Some(""), None)),
+                    anchoring,
+                    at(Duration::zero())
+                ),
+                settled(Watch::NoAnchor)
+            );
+        }
     }
 
     #[test]
     fn a_settled_stamp_that_cannot_be_compared_says_so_rather_than_guessing_either_way() {
         let anchors = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
 
-        // `None` current: the folder was a repository when it was stamped and is not one now, or
-        // `git` did not answer. Unchanged would be a green nobody checked; moved would nag over
-        // nothing; *I could not look* is the only one of the three that is true.
+        // Git is there and would not answer. Unchanged would be a green nobody checked; moved would
+        // nag over nothing; *I could not look* is the only one of the three that is true.
         let stamp = stamp_of(Verdict::Settled, Some(&anchors), None);
         assert_eq!(
-            standing(Some(&stamp), None, 1, at(Duration::zero())),
+            standing(
+                Some(&stamp),
+                certain(&Anchors::Failed, 1),
+                at(Duration::zero())
+            ),
+            lapsed(Lapse::Unreadable)
+        );
+
+        // **A stamp that WAS anchored, in a folder that is no longer a repository.** Not
+        // `Watch::NoRepository`: that word is for a stamp made when there was nothing to watch, and
+        // saying it here would silently promote a green that used to expire into one that never
+        // will, over code that may have moved since `.git` went away. The stamped digest decides,
+        // and it says this stamp was watching something.
+        assert_eq!(
+            standing(
+                Some(&stamp),
+                certain(&Anchors::NoRepository, 1),
+                at(Duration::zero())
+            ),
             lapsed(Lapse::Unreadable)
         );
 
@@ -1086,17 +1464,25 @@ mod tests {
         // a transient *git was unreadable* promoted to a permanent *there is nothing to watch*.
         let undigested = stamp_of(Verdict::Settled, None, None);
         assert_eq!(
-            standing(Some(&undigested), Some(&anchors), 1, at(Duration::zero())),
+            standing(
+                Some(&undigested),
+                certain(&computed(&anchors), 1),
+                at(Duration::zero())
+            ),
             lapsed(Lapse::Unreadable)
         );
 
         // And when the stamp says *nothing readable* but this reading cannot confirm it still holds.
         // The anchor count is deliberately zero here, which is the input that would otherwise say
-        // `Watch::NoAnchor`: an unreadable digest outranks it, because *I could not look* is a fact
-        // about this instant and *there is nothing to watch* is a claim about the decision.
+        // `Watch::NoAnchor`: a failed digest outranks it, because *I could not look* is a fact about
+        // this instant and *there is nothing to watch* is a claim about the decision.
         let unwatched = stamp_of(Verdict::Settled, Some(""), None);
         assert_eq!(
-            standing(Some(&unwatched), None, 0, at(Duration::zero())),
+            standing(
+                Some(&unwatched),
+                guessing(&Anchors::Failed, 0),
+                at(Duration::zero())
+            ),
             lapsed(Lapse::Unreadable)
         );
     }
@@ -1114,15 +1500,20 @@ mod tests {
         };
 
         let elsewhere = hand_digest(&[("sidecars/web/main.go", BLOB_C)]);
-        assert_eq!(
-            standing(Some(&stamp), Some(&elsewhere), 1, at(Duration::zero())),
-            amber
-        );
-        assert_eq!(
-            standing(Some(&stamp), Some(""), 1, at(Duration::zero())),
-            amber
-        );
-        assert_eq!(standing(Some(&stamp), None, 1, at(Duration::zero())), amber);
+        // Every state a reading can be in, including the two that are not failures at all: amber
+        // never looks at any of them.
+        for current in [
+            computed(&elsewhere),
+            computed(""),
+            Anchors::Failed,
+            Anchors::NoRepository,
+        ] {
+            assert_eq!(
+                standing(Some(&stamp), guessing(&current, 1), at(Duration::zero())),
+                amber,
+                "{current:?}"
+            );
+        }
     }
 
     #[test]
@@ -1139,27 +1530,33 @@ mod tests {
 
         // Both sides of the boundary, because an off-by-one here nags a day early forever, and the
         // window is stated against the constant so the two cannot drift apart.
+        let unread = Anchors::Failed;
         assert_eq!(
             standing(
                 Some(&stamp),
-                None,
-                1,
+                guessing(&unread, 1),
                 at(NOTE_LIFETIME - Duration::seconds(1))
             ),
             amber
         );
-        assert_eq!(standing(Some(&stamp), None, 1, at(NOTE_LIFETIME)), amber);
+        assert_eq!(
+            standing(Some(&stamp), guessing(&unread, 1), at(NOTE_LIFETIME)),
+            amber
+        );
         assert_eq!(
             standing(
                 Some(&stamp),
-                None,
-                1,
+                guessing(&unread, 1),
                 at(NOTE_LIFETIME + Duration::seconds(1))
             ),
             stale
         );
         assert_eq!(
-            standing(Some(&stamp), None, 1, at(NOTE_LIFETIME + Duration::days(1))),
+            standing(
+                Some(&stamp),
+                guessing(&unread, 1),
+                at(NOTE_LIFETIME + Duration::days(1))
+            ),
             stale
         );
 
@@ -1180,28 +1577,42 @@ mod tests {
         };
 
         assert_eq!(
-            standing(Some(&stamp), Some(&was), 1, at(Duration::zero())),
+            standing(
+                Some(&stamp),
+                guessing(&computed(&was), 1),
+                at(Duration::zero())
+            ),
             withdrawn
         );
         assert_eq!(
             standing(
                 Some(&stamp),
-                Some(&hand_digest(&[("core/src/http.rs", BLOB_C)])),
-                1,
+                guessing(&computed(&hand_digest(&[("core/src/http.rs", BLOB_C)])), 1),
                 at(Duration::days(4000))
             ),
             withdrawn
         );
-        assert_eq!(
-            standing(Some(&stamp), None, 1, at(Duration::days(4000))),
-            withdrawn
-        );
+        for current in [Anchors::Failed, Anchors::NoRepository] {
+            assert_eq!(
+                standing(
+                    Some(&stamp),
+                    guessing(&current, 1),
+                    at(Duration::days(4000))
+                ),
+                withdrawn,
+                "{current:?}"
+            );
+        }
 
         // The one that has to hold for the third verdict to mean anything: it waits for the
         // document, and nothing this module can measure is allowed to move it.
         let bare = stamp_of(Verdict::Withdrawn, None, None);
         assert_eq!(
-            standing(Some(&bare), None, 0, at(Duration::days(4000))),
+            standing(
+                Some(&bare),
+                guessing(&Anchors::Failed, 0),
+                at(Duration::days(4000))
+            ),
             Standing::Withdrawn {
                 stamped_at: STAMPED_AT.to_owned(),
                 note: None,
@@ -1222,14 +1633,17 @@ mod tests {
 
         let stamp = stamp_of(Verdict::Settled, Some(&nothing), None);
         assert_eq!(
-            standing(Some(&stamp), Some(&empty_file), 1, at(Duration::zero())),
+            standing(
+                Some(&stamp),
+                certain(&computed(&empty_file), 1),
+                at(Duration::zero())
+            ),
             lapsed(moved_to(&[], &["core/src/placeholder.rs"], &[]))
         );
         assert_eq!(
             standing(
                 Some(&stamp_of(Verdict::Settled, Some(&empty_file), None)),
-                Some(&empty_file),
-                1,
+                certain(&computed(&empty_file), 1),
                 at(Duration::zero())
             ),
             settled(Watch::Watched)
@@ -1259,7 +1673,11 @@ mod tests {
 
         let stamp = stamp_of(Verdict::Settled, Some(&forwards), None);
         assert_eq!(
-            standing(Some(&stamp), Some(&backwards), 3, at(Duration::zero())),
+            standing(
+                Some(&stamp),
+                certain(&computed(&backwards), 3),
+                at(Duration::zero())
+            ),
             settled(Watch::Watched)
         );
     }
@@ -1381,6 +1799,19 @@ mod tests {
         paths.iter().map(|path| (*path).to_owned()).collect()
     }
 
+    /// The digest git computed, for the tests whose subject is the text rather than the failure.
+    ///
+    /// It panics on either failure rather than returning an `Option`, so a fixture that silently
+    /// stopped being a repository fails loudly instead of being read as an empty anchor set — which
+    /// is the exact collapse [`Anchors`] exists to prevent, and a test suite is no more entitled to
+    /// make it than the route is.
+    async fn digest_text(root: &Path, paths: &[String]) -> String {
+        match digest(root, paths).await {
+            Anchors::Computed(text) => text,
+            other => panic!("a repository can be read, and this one answered {other:?}"),
+        }
+    }
+
     /// A directory name and a file count chosen so the argument list is over the measured ceiling
     /// and not far over it: 500 paths of 81 characters is 42 000 characters of command line against
     /// [`COMMAND_LINE_CEILING`]'s 32 767, which forces exactly two chunks. Two is the number that
@@ -1411,9 +1842,7 @@ mod tests {
         commit(root, "seed");
 
         let anchors = owned(&["core/src/map_join.rs", "core/src/map_store.rs"]);
-        let text = digest(root, &anchors)
-            .await
-            .expect("a repository can be read");
+        let text = digest_text(root, &anchors).await;
         let read = parse(&text);
 
         // Checked against a SECOND computation of the same hash rather than against a sha copied out
@@ -1450,13 +1879,16 @@ mod tests {
         // count is asserted from git rather than assumed, so the test still means this if the
         // fixture grows.
         assert_eq!(git_says(root, &["ls-files"]).lines().count(), 2);
-        assert_eq!(digest(root, &[]).await, Some(String::new()));
+        assert_eq!(digest(root, &[]).await, computed(""));
 
         // And the proof that git was never asked, rather than asked and ignored: a folder that is
         // not a repository is the one input that makes a git call fail, and the answer here is still
-        // `Some("")`. If the empty list ever reaches the process spawn, this line turns red.
+        // `Computed("")` rather than `NoRepository`. If the empty list ever reaches the process
+        // spawn, this line turns red — which is also what keeps a decision with no anchors on
+        // `Watch::NoAnchor` in a project that has no repository, where `NoRepository` would be true
+        // about the folder and useless about the decision.
         let outside = scratch("nucleos-digest-empty-outside-");
-        assert_eq!(digest(outside.path(), &[]).await, Some(String::new()));
+        assert_eq!(digest(outside.path(), &[]).await, computed(""));
     }
 
     /// **Absent, and the absence is the answer: an untracked anchor contributes no entry at all.**
@@ -1481,9 +1913,7 @@ mod tests {
         commit(root, "seed");
         write(root, "untracked.rs", "//! §7 written and never staged\n");
 
-        let text = digest(root, &owned(&["tracked.rs", "untracked.rs"]))
-            .await
-            .expect("a repository can be read");
+        let text = digest_text(root, &owned(&["tracked.rs", "untracked.rs"])).await;
         let read = parse(&text);
         assert_eq!(read.len(), 1, "{text}");
         assert!(read.contains_key("tracked.rs"), "{text}");
@@ -1492,39 +1922,82 @@ mod tests {
         // A path that does not exist on disk at all is the same fact from the other side, and git
         // says so the same way: exit 0 and no record. It is NOT an error, so it must not become one.
         assert_eq!(
-            digest(root, &owned(&["tracked.rs", "never/existed.rs"]))
-                .await
-                .as_deref(),
-            Some(text.as_str())
+            digest(root, &owned(&["tracked.rs", "never/existed.rs"])).await,
+            computed(&text)
         );
 
-        // A decision anchored to nothing git tracks: `Some("")`, which is *computed, and there is
-        // nothing to watch*, and is a different answer from the `None` that means *I could not look*.
-        // Collapsing the two is the bug the whole `Option` exists to prevent.
-        assert_eq!(
-            digest(root, &owned(&["untracked.rs"])).await,
-            Some(String::new())
-        );
+        // A decision anchored to nothing git tracks: `Computed("")`, which is *computed, and there
+        // is nothing to watch*, and is a different answer from both failures. Collapsing any of the
+        // three is the bug the whole enum exists to prevent.
+        assert_eq!(digest(root, &owned(&["untracked.rs"])).await, computed(""));
     }
 
     #[tokio::test]
-    async fn a_folder_that_is_not_a_repository_is_none_rather_than_an_empty_digest() {
-        // §11: a project added from outside has zero specs, and may have no repository either. Both
-        // wrong answers here are quiet ones — `Some("")` would say *this decision has nothing to
-        // watch*, which is permanent and false, and would mint a green that never comes back to ask.
-        // `None` is transient, and `standing` turns it into `Lapse::Unreadable`.
+    async fn a_folder_that_is_not_a_repository_says_so_rather_than_reporting_a_failure() {
+        // §11: a project added from outside has zero specs, and may have no repository either. Three
+        // wrong answers here and every one of them is quiet. `Computed("")` would say *this decision
+        // has nothing to watch* — true about the folder, and it would mint a green over anchors
+        // nobody checked if the repository ever came back. `Failed` is the one this used to give, and
+        // it is transient: `standing` turns it into `Lapse::Unreadable`, whose only advice is *try
+        // again*, and the route turns it into a `503` — so a project that will never have a
+        // repository was told to retry, for ever, on every stamp and every read.
         let outside = scratch("nucleos-digest-not-a-repo-");
         write(outside.path(), "core/src/map_join.rs", "//! §7\n");
         let anchors = owned(&["core/src/map_join.rs"]);
 
-        let answer = digest(outside.path(), &anchors).await;
-        assert_eq!(answer, None);
-        assert_ne!(answer, Some(String::new()));
+        assert_eq!(
+            digest(outside.path(), &anchors).await,
+            Anchors::NoRepository
+        );
 
         // And a root that is not there at all, which is how a project folder somebody moved arrives.
-        // git fails to change directory rather than failing to find a `.git`, and the answer must be
-        // the same one.
-        assert_eq!(digest(&outside.path().join("gone"), &anchors).await, None);
+        // git starts, fails to change directory and exits 128, so the probe answers the same way —
+        // there is no repository reachable at that path, which is true. The map route never meets
+        // this case: the structure walk answers 404 for a missing folder long before the digest.
+        assert_eq!(
+            digest(&outside.path().join("gone"), &anchors).await,
+            Anchors::NoRepository
+        );
+    }
+
+    /// A6: a repository that is there and will not answer is not a folder that has no repository.
+    ///
+    /// **The fixture is a real corrupt index, because the probe has to be one git command that does
+    /// not read it.** `git ls-files -s` exits 128 with *index file smaller than expected* while
+    /// `git rev-parse --git-dir` exits 0 and prints `.git` — measured before [`why_not`] was written
+    /// to rely on it. A probe that also read the index would fail alongside the call it is
+    /// explaining and report every broken repository as a folder with no repository at all, which
+    /// would let a settled stamp be stored as `''`: a green anchored to nothing, expiring never,
+    /// inside a repository that was working an hour ago.
+    #[tokio::test]
+    async fn a_repository_whose_index_will_not_read_is_a_failure_and_not_a_missing_repository() {
+        let repo = repository("nucleos-digest-broken-index-");
+        let root = repo.path();
+        write(root, "a.rs", "//! §7\n");
+        commit(root, "seed");
+        let anchors = owned(&["a.rs"]);
+        assert_eq!(
+            digest(root, &anchors).await,
+            computed(&digest_text(root, &anchors).await)
+        );
+
+        std::fs::write(root.join(".git/index"), "not an index").expect("overwrite the index");
+
+        // The fixture has to actually break the call it names, or the test is vacuous — and it has
+        // to leave the probe working, or it is testing the wrong branch.
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["ls-files", "-s"])
+                .status()
+                .expect("git should start")
+                .success(),
+            "the corrupt index must actually stop `ls-files`"
+        );
+        assert_eq!(git_says(root, &["rev-parse", "--git-dir"]), ".git");
+
+        assert_eq!(digest(root, &anchors).await, Anchors::Failed);
     }
 
     #[tokio::test]
@@ -1542,9 +2015,7 @@ mod tests {
         );
         assert!(chunked(root, &paths).len() > 1, "one chunk is not a merge");
 
-        let text = digest(root, &paths)
-            .await
-            .expect("a repository can be read");
+        let text = digest_text(root, &paths).await;
         let read = parse(&text);
 
         // Every one of them, and not merely the right count: a chunk silently lost would be a stamp
@@ -1575,9 +2046,7 @@ mod tests {
             "the merge across chunks is the point of this test"
         );
 
-        let text = digest(root, &paths)
-            .await
-            .expect("a repository can be read");
+        let text = digest_text(root, &paths).await;
         let named: Vec<&str> = text
             .lines()
             .filter_map(|line| line.split_once(' '))
@@ -1593,7 +2062,7 @@ mod tests {
         // a stamp over nothing — and a false alarm costs exactly the trust this feature is trying to
         // earn.
         paths.reverse();
-        assert_eq!(digest(root, &paths).await.as_deref(), Some(text.as_str()));
+        assert_eq!(digest(root, &paths).await, computed(&text));
     }
 
     #[tokio::test]
@@ -1637,9 +2106,7 @@ mod tests {
             "the fixture must actually conflict"
         );
 
-        let text = digest(root, &owned(&["a.rs", "b.rs"]))
-            .await
-            .expect("a repository can be read");
+        let text = digest_text(root, &owned(&["a.rs", "b.rs"])).await;
         let read = parse(&text);
 
         assert_eq!(

@@ -2958,23 +2958,30 @@ struct MapAnswer {
     /// **One fact about this whole reading, and never a fact about any single decision.**
     ///
     /// `map_stamp::digest` is all-or-nothing on purpose — one record it cannot parse takes the
-    /// entire call to `None`, because dropping an anchor would read as `gone`, a file that never
+    /// entire call to a failure, because dropping an anchor would read as `gone`, a file that never
     /// went anywhere. Correct for one anchor set; combined with this route calling it **once** for
     /// the union of every decision's anchors, it means a git that will not answer takes every
     /// settled stamp in the project to [`crate::map_stamp::Lapse::Unreadable`] at the same instant.
     ///
     /// That blast radius is accepted — the alternative is up to 350 process spawns on a route the
     /// window calls every time the map opens — and this flag is the price of accepting it. The
-    /// owner meets one sentence saying git could not be read, rather than a screen of identical
-    /// rows saying it 350 times, which is a wall of noise nobody reads to the bottom of and is how
-    /// the one real lapse underneath it goes unseen.
+    /// owner meets one sentence saying git would not answer, rather than a screen of identical rows
+    /// saying it 350 times, which is a wall of noise nobody reads to the bottom of and is how the
+    /// one real lapse underneath it goes unseen.
     ///
-    /// Named in the plural and about *anchors* rather than about a digest, because the singular
-    /// would read as a property of the decision beside it. A decision with no anchor paths is
-    /// untouched by this: git was never asked about it, so its digest is `""` however git is
-    /// faring, and it stays [`crate::map_stamp::Watch::NoAnchor`] rather than flapping to
-    /// *unreadable* every time this flag goes up.
-    anchors_unreadable: bool,
+    /// **Named for git refusing, and it was renamed from `anchors_unreadable` to make one thing
+    /// impossible: printing *try again* at somebody with nothing to retry.** This flag is
+    /// [`crate::map_stamp::Anchors::Failed`] and nothing else. A project with no git repository at
+    /// all — §11's ordinary case — leaves it `false`, because there is nothing wrong there and no
+    /// retry that could help; what that project gets instead is
+    /// [`crate::map_stamp::Watch::NoRepository`] on each of its greens, which is a permanent fact
+    /// and reads as one. The older name covered both, and the sentence a shell would have written
+    /// under it was false for exactly the project that could do least about it.
+    ///
+    /// A decision with no anchor paths is untouched by this either way: git was never asked about
+    /// it, so its digest is `""` however git is faring, and it stays
+    /// [`crate::map_stamp::Watch::NoAnchor`] rather than flapping every time this goes up.
+    git_would_not_answer: bool,
 }
 
 /// The project's whole graph: modules, imports, and what the approved decisions do or do not
@@ -3041,7 +3048,10 @@ async fn get_project_map(
     let anchors = crate::map_stamp::digest(&root, &union).await;
     // Parsed once and not once per decision: 350 decisions against a 52 KB digest is 350 walks of
     // the same text for an answer that cannot change between them.
-    let tracked = anchors.as_deref().map(crate::map_stamp::parse);
+    let tracked = match &anchors {
+        crate::map_stamp::Anchors::Computed(text) => Some(crate::map_stamp::parse(text)),
+        _ => None,
+    };
 
     let stamped = crate::map_store::stamps(&state.pool, &id)
         .await
@@ -3060,23 +3070,41 @@ async fn get_project_map(
     let now = chrono::Utc::now();
     let mut standings = std::collections::BTreeMap::new();
     for anchored in &junction.decisions {
+        // A decision with no anchor paths is `Computed("")` whatever became of the git call, because
+        // `digest` itself never asks git for an empty list — so a project with no repository leaves
+        // these on `Watch::NoAnchor`, which is the fact the owner can act on, rather than on
+        // `Watch::NoRepository`, which would be true about the folder and useless about the decision.
         let current = if anchored.modules.is_empty() {
-            Some(String::new())
+            crate::map_stamp::Anchors::Computed(String::new())
         } else {
-            tracked.as_ref().map(|tracked| {
-                crate::map_stamp::canonical(anchored.modules.iter().filter_map(|path| {
-                    tracked
-                        .get(path.as_str())
-                        .map(|blob| (path.as_str(), blob.as_str()))
-                }))
-            })
+            match (&anchors, &tracked) {
+                (crate::map_stamp::Anchors::Computed(_), Some(tracked)) => {
+                    crate::map_stamp::Anchors::Computed(crate::map_stamp::canonical(
+                        anchored.modules.iter().filter_map(|path| {
+                            tracked
+                                .get(path.as_str())
+                                .map(|blob| (path.as_str(), blob.as_str()))
+                        }),
+                    ))
+                }
+                (crate::map_stamp::Anchors::NoRepository, _) => {
+                    crate::map_stamp::Anchors::NoRepository
+                }
+                _ => crate::map_stamp::Anchors::Failed,
+            }
         };
         standings.insert(
             anchored.decision_id,
             crate::map_stamp::standing(
                 latest.get(&anchored.decision_id).copied(),
-                current.as_deref(),
-                anchored.modules.len(),
+                crate::map_stamp::Anchoring {
+                    current: &current,
+                    named: anchored.modules.len(),
+                    // `Declared` and not merely *something names this section*. §8 is unfixed, so
+                    // this is `false` for every decision in this repository today, and that is the
+                    // measurement rather than a defect — see `Watch::Guessed`.
+                    declared: anchored.anchor == crate::map_join::Anchor::Declared,
+                },
                 now,
             ),
         );
@@ -3097,7 +3125,7 @@ async fn get_project_map(
         junction,
         standings,
         stamps,
-        anchors_unreadable: anchors.is_none(),
+        git_would_not_answer: anchors == crate::map_stamp::Anchors::Failed,
     }))
 }
 
@@ -3444,12 +3472,25 @@ struct MapStampBody {
 ///   as a 500, which reads as this daemon having broken; a malformed request is the client's fault
 ///   and has to read as one. §5.2 makes the note the whole of amber — *falta migrar as páginas de
 ///   pilar* is worth more than the colour is — so an empty one is not a lesser amber, it is not one.
-/// - `503` for a `settled` whose digest came back `None`. **Not `500`**: git being unreadable for a
-///   moment is transient, and the honest thing to tell the owner is *try again*, whereas a 500 reads
-///   as a fault here and puts a warning in a log for an ordinary Tuesday. §7.1 makes *está como
-///   quero* the only verdict the code moving can falsify, so it is the only one that may not be
-///   recorded without knowing what it is anchored to; the other two take a NULL digest without
-///   complaint, because neither has an expiry the code can reach.
+/// - `503` for a `settled` when git is there and **would not answer**. **Not `500`**: that is
+///   transient, and the honest thing to tell the owner is *try again*, whereas a 500 reads as a
+///   fault here and puts a warning in a log for an ordinary Tuesday. §7.1 makes *está como quero*
+///   the only verdict the code moving can falsify, so it is the only one that may not be recorded
+///   without knowing what it is anchored to; the other two take a NULL digest without complaint,
+///   because neither has an expiry the code can reach. **A project with no git repository is not
+///   this case** and gets a `204` — see the `NoRepository` arm below, and [`crate::map_stamp::Anchors`]
+///   for what telling the two apart cost when they were one value.
+///
+/// **The tree walk on this path is deliberate, and it is the second one this click pays for.** The
+/// shell will do `GET /map`, then this, then invalidate and `GET /map` again — three walks of a
+/// thousand-file tree per stamp. It is not an oversight and it must not be optimised away by
+/// computing the anchor set from anything cheaper: the write has to derive it **exactly** as the
+/// read expires it, or a stamp is anchored to one set and compared against another and lapses the
+/// instant it is given, with a diff nobody can explain. That is the false-alarm failure that costs
+/// precisely the trust §7 is buying. In particular, an optimistic update in the shell may show the
+/// verdict immediately and may **not** invent the `Standing` that goes with it — `Watch` is decided
+/// by a git call and by the join, and a client guessing `Watched` would put a certain word on screen
+/// over an anchor set nobody has read yet.
 ///
 /// **The decision is looked up here, and that is not the handler check [`crate::map_store::decide`]
 /// argues against.** `map_store::stamp` still puts `project_id`, `approved_at` and `retired_at` in
@@ -3487,13 +3528,25 @@ async fn post_project_map_stamp(
     // `Anchored::modules` and never `foreign` beside it. `Anchor::Declared` spends a paragraph on
     // why: watching an anchor means being able to read it, and promising an expiry over a Go file
     // this map cannot parse is a promise the read side cannot keep.
-    let digest = crate::map_stamp::digest(&root, &anchors).await;
+    let digest = match crate::map_stamp::digest(&root, &anchors).await {
+        crate::map_stamp::Anchors::Computed(text) => Some(text),
+        // §11: a project added from outside may have no git repository at all, and that is not a
+        // fault of anything. The stamp is **allowed**, and `''` is not a lie here — with no
+        // repository there is genuinely nothing that could ever move, which is the same claim `''`
+        // makes for a decision no module names. Refusing instead would make this feature useless on
+        // exactly the projects §11 says must still get an honest answer, and refusing it with a
+        // `503` would tell their owner to try again at something that cannot succeed.
+        // `Watch::NoRepository` is what carries the reason back out, so the green is visible as one
+        // that will never come and ask rather than passing for one that will.
+        crate::map_stamp::Anchors::NoRepository => Some(String::new()),
+        crate::map_stamp::Anchors::Failed => None,
+    };
     if digest.is_none() && body.verdict == crate::map_stamp::Verdict::Settled {
         tracing::warn!(
             project_id = %id,
             decision = body.decision_id,
             anchors = anchors.len(),
-            "a green was asked for and the anchor digest could not be read, so it was refused"
+            "a green was asked for and git would not say what its anchors are, so it was refused"
         );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -12649,17 +12702,29 @@ mod tests {
         let map = get_json(&state, "/projects/alpha/map").await;
         let standing = &map["standings"][id.to_string()];
         assert_eq!(standing["state"], "settled");
+        // **`guessed` and not `watched`, and the difference is the point.** A module names the
+        // section and git tracks it, so this green really does expire when the file moves — but
+        // `core/src/a.rs` writes `§1` and never says of which document, which is the same
+        // `Anchor::Ambiguous` the junction test next door asserts. It will expire; it may expire
+        // because a file that happens to write `§1` about something else changed. `watched` would
+        // say the map knows what it is watching, and here it does not.
+        assert_eq!(standing["watch"], "guessed");
         assert_eq!(
-            standing["watch"], "watched",
-            "a module names the section and git tracks it, so this green expires when it moves"
+            map["junction"]["decisions"][0]["anchor"], "ambiguous",
+            "the standing's certainty has to follow the join's, not a second opinion"
         );
         assert!(standing["stamped_at"].is_string());
         assert_eq!(map["stamps"]["settled"], 1);
+        assert_eq!(map["stamps"]["guessed"], 1);
         assert_eq!(map["stamps"]["no_anchor"], 0);
         assert_eq!(map["stamps"]["untracked"], 0);
         assert_eq!(
-            map["anchors_unreadable"], false,
-            "git answered, so nothing about this reading is approximate"
+            map["stamps"]["unwatched"], 0,
+            "a guess still expires, so it is not one of the greens that never will"
+        );
+        assert_eq!(
+            map["git_would_not_answer"], false,
+            "git answered, so there is nothing for the window to say about this reading"
         );
 
         // The digest is the DAEMON's and the body never carried one — a client that could supply
@@ -12758,17 +12823,27 @@ mod tests {
         );
     }
 
+    /// A `503` for the one case that is actually transient: git is there and will not answer.
+    ///
+    /// **This test used to name a project with no repository, and it was asserting a lie.** For that
+    /// project the refusal was permanent and the word `503` says *try again* — so the suite was
+    /// green over a daemon telling somebody to retry something that could never succeed. The
+    /// fixture is now a real repository whose index is corrupt, which is a state that genuinely does
+    /// come back; `a_project_with_no_repository_can_still_be_stamped_and_says_nothing_will_ever_expire`
+    /// covers the other half.
     #[tokio::test]
-    async fn a_settled_stamp_is_refused_with_503_when_the_anchor_digest_cannot_be_read() {
-        // The folder is not a repository, so git cannot say what the anchor code is. `503` and not
-        // `500`: nothing here is broken, and the honest thing to tell the owner is *try again*.
-        // Storing the green anyway would be the one row this whole feature exists to prevent — a
-        // *está como quero* with nothing to expire it, and `0118`'s CHECK is the backstop that
-        // would have turned it into a 500 instead.
+    async fn a_settled_stamp_is_refused_with_503_when_git_will_not_answer() {
+        // `503` and not `500`: nothing in this daemon is broken, so the honest thing to say is *try
+        // again*. Storing the green anyway would be the one row this whole feature exists to
+        // prevent — a *está como quero* with nothing to expire it — and `0118`'s CHECK is the
+        // backstop that would have turned it into a 500 instead.
         let state = test_state().await;
-        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
         std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
         std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+        std::fs::write(dir.path().join(".git/index"), "not an index").unwrap();
         let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
 
         assert_eq!(
@@ -12799,6 +12874,59 @@ mod tests {
             )
             .await,
             StatusCode::NO_CONTENT
+        );
+
+        // And the reading says the same thing once, for the whole map, rather than per decision.
+        let map = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(map["git_would_not_answer"], true);
+    }
+
+    #[tokio::test]
+    async fn a_project_with_no_repository_can_still_be_stamped_and_says_nothing_will_ever_expire() {
+        // §11: a project added from outside has no specs and may have no repository. Refusing here
+        // would make the whole feature useless on exactly the projects that spec says must still get
+        // an honest answer — and refusing with a `503` would tell their owner to try again at
+        // something that will never work, which is what this route did before the two failures were
+        // told apart.
+        //
+        // `''` is not a lie for this project: with no repository there is genuinely nothing that
+        // could ever move. What must not happen is that green passing for one that will come back
+        // and ask, and `Watch::NoRepository` is what stops it.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        let anchored = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let nameless = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        for id in [anchored, nameless] {
+            assert_eq!(
+                post_stamp(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(
+            map["standings"][anchored.to_string()]["watch"],
+            "no_repository",
+            "modules name it, and there is no repository to say anything about them"
+        );
+        // The decision no module names is `no_anchor` even here, and that is not a detail: git was
+        // never asked about it, so the answer the owner can act on is §8's, not §11's. A route that
+        // painted the whole project `no_repository` would bury the one thing slice 6 will fix.
+        assert_eq!(map["standings"][nameless.to_string()]["watch"], "no_anchor");
+        assert_eq!(map["stamps"]["no_repository"], 1);
+        assert_eq!(map["stamps"]["no_anchor"], 1);
+        assert_eq!(map["stamps"]["unwatched"], 2);
+        assert_eq!(
+            map["git_would_not_answer"], false,
+            "nothing here failed, so there is nothing to tell this owner to retry"
         );
     }
 
@@ -12944,8 +13072,9 @@ mod tests {
         assert_eq!(map["stamps"]["untracked"], 1);
         assert_eq!(map["stamps"]["no_anchor"], 1);
         assert_eq!(map["stamps"]["settled"], 2);
+        assert_eq!(map["stamps"]["unwatched"], 2);
         assert_eq!(
-            map["anchors_unreadable"], false,
+            map["git_would_not_answer"], false,
             "git answered perfectly well; it simply had nothing to say about that path"
         );
     }
@@ -12957,20 +13086,21 @@ mod tests {
         // the project to `Lapse::Unreadable` at the same instant. That is accepted: the alternative
         // is one process spawn per decision, which is ~350 of them on a read the window makes every
         // time it opens. What is not accepted is the owner meeting it as a screenful of identical
-        // rows, so the whole reading carries ONE flag saying the digest could not be read, and the
-        // window has one sentence to print instead of a wall of noise.
+        // rows, so the whole reading carries ONE flag saying git would not answer, and the window
+        // has one sentence to print instead of a wall of noise.
         let state = test_state().await;
-        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
         std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
         std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
         std::fs::write(dir.path().join("core/src/c.rs"), "//! §2\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
         let one = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
         let two = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
 
-        // Written straight to the store, because the route would refuse to mint these: the folder
-        // is not a repository, and a settled stamp with no digest is exactly what `503` prevents.
-        // The state under test is the one that arrives later — stamped when the folder WAS a
-        // repository, read once it is not.
+        // Written straight to the store rather than through the route, because the state under test
+        // is the one that arrives LATER: stamped while git was answering, read once it is not. The
+        // digests are hand-made so the read has something real to fail to compare against.
         for (id, path) in [(one, "core/src/a.rs"), (two, "core/src/c.rs")] {
             let digest =
                 crate::map_stamp::canonical([(path, "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567")]);
@@ -12988,14 +13118,19 @@ mod tests {
             );
         }
 
+        // Git is here and will not answer: the repository is intact enough for `rev-parse` and its
+        // index is not readable at all. A folder with no repository would be a different answer —
+        // permanent, nothing to retry — and is the test two above.
+        std::fs::write(dir.path().join(".git/index"), "not an index").unwrap();
+
         let map = get_json(&state, "/projects/alpha/map").await;
 
         assert_eq!(
-            map["anchors_unreadable"], true,
+            map["git_would_not_answer"], true,
             "one flag for the whole reading: {map}"
         );
         assert!(
-            map["anchors_unreadable"].is_boolean(),
+            map["git_would_not_answer"].is_boolean(),
             "one sentence and not a list that grows with the decisions"
         );
         for id in [one, two] {
