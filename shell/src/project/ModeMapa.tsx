@@ -1,5 +1,6 @@
 import { useProjectMap } from "../data/project-map";
 import { buildMap } from "../canvas/map-model";
+import { Carimbos } from "./Carimbos";
 import { ExtrairSpec } from "./ExtrairSpec";
 import { Juncao } from "./Juncao";
 import { MapaPorAprovar } from "./MapaPorAprovar";
@@ -7,13 +8,18 @@ import { MapaPorAprovar } from "./MapaPorAprovar";
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
  *
- * Two of the three layers are here, and now the join between them: the structure, derived off disk
- * and always true; the intention — a model reading one spec and proposing the decisions it fixes,
- * which nothing enters the map without the owner answering line by line; and the junction, which is
- * decision 3 of the spec and the reason the other two are worth deriving. Evidence and the owner's
- * verdict are not here, and neither are two of §5.1's four derived states, and the mode says so in
- * words rather than showing a map that looks complete and is not. A surface that implies it has
- * layers it does not have is the false confidence again, with better pixels.
+ * Two of the three layers are here, the join between them, and now the owner's own axis: the
+ * structure, derived off disk and always true; the intention — a model reading one spec and
+ * proposing the decisions it fixes, which nothing enters the map without the owner answering line
+ * by line; the junction, which is decision 3 of the spec and the reason the other two are worth
+ * deriving; and the stamps, which are what the owner said about each line and whether it is still
+ * true. The evidence layer is not here, and neither are two of §5.1's four derived states, and the
+ * mode says so in words rather than showing a map that looks complete and is not. A surface that
+ * implies it has layers it does not have is the false confidence again, with better pixels.
+ *
+ * **The junction and the stamps are two axes and never one reading.** §5 refuses to flatten them —
+ * *"achatá-las numa só punha o triador e o dono a falar pela mesma boca"* — so they are two panels
+ * with two headings, and no number on this screen has already decided how they combine.
  *
  * **The three panels below read three different questions, and one failing does not silence the
  * others.** The structure is derived by walking the project's folder; the pile is a table the
@@ -40,10 +46,10 @@ export function ModeMapa({ projectId }: ModeMapaProps) {
       <ExtrairSpec projectId={projectId} />
       <MapaPorAprovar projectId={projectId} />
       <p className="max-w-prose text-sm text-text-muted">
-        Structure, intention, and the join between them. Evidence and the stamp that carries your
-        verdict are slices that do not exist yet, and two of §5.1&rsquo;s four derived states need
-        a triager that does not exist either — so nothing here yet says whether anybody looked at a
-        node, or whether the code still keeps what you approved.
+        Structure, intention, the join between them, and your verdict on each line. The evidence
+        layer is a slice that does not exist yet, and two of §5.1&rsquo;s four derived states need
+        a triager that does not exist either — so nothing here says whether anybody other than you
+        has looked at a node.
       </p>
     </div>
   );
@@ -81,7 +87,7 @@ function Derived({ projectId }: { projectId: string }) {
     return <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>;
   }
 
-  const { modules, imports, unread, junction } = map.data;
+  const { modules, imports, unread, junction, standings, stamps, git_would_not_answer } = map.data;
   // `buildMap` rather than `imports.length`, and the difference is the whole point: this counts
   // the links the map would actually draw, which drops any edge with an end it cannot find. The
   // núcleo sends none of those today, and the day it does this number must not quietly start
@@ -105,6 +111,20 @@ function Derived({ projectId }: { projectId: string }) {
         </p>
       </div>
       <Juncao junction={junction} />
+      {/*
+        Drawn here rather than as a panel of its own for the reason the junction is: the standings,
+        the header and `git_would_not_answer` come back on this same answer, flattened. A query of
+        its own would ask the daemon to walk a thousand-file tree twice per open, and would put two
+        readings of one question on one screen, free to disagree about a project whose folder moved
+        between them.
+      */}
+      <Carimbos
+        projectId={projectId}
+        junction={junction}
+        standings={standings}
+        stamps={stamps}
+        gitWouldNotAnswer={git_would_not_answer}
+      />
     </div>
   );
 }

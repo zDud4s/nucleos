@@ -433,6 +433,24 @@ describe("the project workspace", () => {
               unmatched: 0,
             },
           },
+          // The verdict half, which arrives on this same answer. Left out, every count the stamp
+          // panel reads would be `undefined` and the mode would go down with it — which is what
+          // `junction` did one slice ago, on this exact mock.
+          standings: {},
+          stamps: {
+            settled: 0,
+            partial: 0,
+            never: 0,
+            lapsed: 0,
+            withdrawn: 0,
+            guessed: 0,
+            no_anchor: 0,
+            untracked: 0,
+            no_repository: 0,
+            unwatched: 0,
+            decisions: 0,
+          },
+          git_would_not_answer: false,
         };
       }
       return daemonFetch(state)(path, init);

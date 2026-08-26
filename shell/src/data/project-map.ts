@@ -208,6 +208,110 @@ export interface Junction {
   counts: Counts;
 }
 
+/**
+ * The owner's three answers, and the only three (§5.2).
+ *
+ * **`snake_case` on the wire because `map_stamp::Verdict` derives it, and the daemon parses this
+ * field with the derived `Deserialize` rather than a lenient reader of its own** — a fourth word is
+ * refused before the handler runs, which is the earliest place it can be refused and the only one
+ * where nothing has yet had a chance to guess what was meant. So a typo here is a `422` and never a
+ * verdict nobody gave.
+ */
+export type Verdict = "settled" | "partial" | "withdrawn";
+
+/**
+ * What a settled stamp is standing on: whether it will ever come back to ask, and — when it will
+ * not — which of the reasons it will not.
+ *
+ * **Five, and merging any of them would be the defect this whole feature treats, one level down.**
+ * Four of the five are a green that is worth less than it looks, and each of the four has a
+ * different cure: `guessed` is repaired by putting a document slug on a citation (§8), `no_anchor`
+ * by writing a citation at all, `untracked` by a `.gitignore` line **or** by a `git add` — nothing
+ * can tell which — and `no_repository` by nothing, because it is not a defect. A single word for
+ * all of them would be a word its reader cannot act on.
+ */
+export type Watch = "watched" | "guessed" | "no_anchor" | "untracked" | "no_repository";
+
+/**
+ * Why a stamp stopped being true, tagged on `kind`.
+ *
+ * §7 promises a lapsed node shows the diff between what was stamped and what is there now, because
+ * *"re-carimbar é um clique quando o diff é cosmético, e é o momento certo para olhar quando não
+ * é"* — and that judgement is only available to somebody who can see the paths. Hence three lists
+ * inside `moved` and not one: a blob that changed asks *is this still what you wanted?*, a path
+ * that appeared asks *did you ever look at this?*, and a path that is gone asks *was that
+ * deliberate?*.
+ *
+ * **`unreadable` is not a `moved` with empty lists and must never be drawn as one.** It says the
+ * comparison could not be made at all; reading it as *everything vanished* would report a change
+ * that nothing measured, which is the silently-wrong answer this map exists to stop.
+ */
+export type Lapse =
+  | { kind: "moved"; changed: string[]; added: string[]; gone: string[] }
+  | { kind: "stale"; note: string }
+  | { kind: "unreadable" };
+
+/**
+ * What became of one decision's verdict, read at one instant — tagged on `state`.
+ *
+ * **Five, exhaustive and mutually exclusive**, so {@link StampCounts} reconciles against them the
+ * way {@link Counts} reconciles against the anchors.
+ *
+ * **This is the verdict axis with expiry applied, and it is not §5.1's derived state.** §5 refuses
+ * to flatten the two, so nothing here borrows the triager's vocabulary: `lapsed` is what became of
+ * something *the owner* said, while §5.1's *à espera* is what the **triager** thinks is worth the
+ * owner's attention. Slice 5 builds the second and needs that word; spending it here would also
+ * read on screen as the model having decided this, which is the authority §6 takes away from it and
+ * §6.1 refuses to hand back through the rendering door.
+ */
+export type Standing =
+  | { state: "never" }
+  | { state: "settled"; stamped_at: string; watch: Watch }
+  | { state: "partial"; stamped_at: string; note: string }
+  | { state: "lapsed"; stamped_at: string; why: Lapse }
+  | { state: "withdrawn"; stamped_at: string; note: string | null };
+
+/**
+ * §5.3's header, plus the numbers §5.3 does not carry and the panel must.
+ *
+ * `settled + partial + never + lapsed + withdrawn === decisions`, and the núcleo asserts it rather
+ * than promising it — a header is exactly where a reader stops checking, so a total that does not
+ * reconcile is §1's false confidence reappearing inside its own cure.
+ *
+ * **Not a percentage, and never one.** §12 refuses coverage metrics as a percentage outright, and
+ * dividing any pair of these would manufacture the single collapsed number §5 forbids.
+ *
+ * `unwatched` is `no_anchor + untracked + no_repository`, and it is derived in the núcleo rather
+ * than here on purpose: §9.3 makes `core/` the single owner of this map's derivations, and a shell
+ * adding the three itself would be a second implementation free to drift the day a fourth silence
+ * is added. `guessed` is deliberately **not** part of it — a guessed anchor does expire; what is
+ * uncertain is whether it is expiring against the right files.
+ */
+export interface StampCounts {
+  /** §5.3's `N carimbadas`. */
+  settled: number;
+  /** §5.3's `M a meio`. */
+  partial: number;
+  /** §5.3's `K nunca vistas`. Debt, and it is supposed to be uncomfortable (§5.3, §10). */
+  never: number;
+  /** §5.3's `J à tua espera` — today. Slice 5's triager adds to it out of `never`, not out of here. */
+  lapsed: number;
+  /** Not in the header. §5.2 wants a withdrawal out of the way, not out of sight. */
+  withdrawn: number;
+  /** How many of `settled` expire against an anchor set matched by section number alone. */
+  guessed: number;
+  /** How many of `settled` are green over a section no readable module names. */
+  no_anchor: number;
+  /** How many of `settled` name modules git reports none of. */
+  untracked: number;
+  /** How many of `settled` are in a project with no git repository (§11). */
+  no_repository: number;
+  /** The greens that will never come back to ask: `no_anchor + untracked + no_repository`. */
+  unwatched: number;
+  /** Every approved decision, so the five standings above can be seen to reconcile. */
+  decisions: number;
+}
+
 export interface ProjectMap {
   modules: MapModule[];
   imports: MapImport[];
@@ -223,6 +327,39 @@ export interface ProjectMap {
   /** The subset of {@link ProjectMap.unread} that names a `§` at all, with the sections it names. */
   foreign: ForeignFile[];
   junction: Junction;
+  /**
+   * Where each decision stands, **keyed by `decision_id` as a string**.
+   *
+   * `Record<string, Standing>` and not `Record<number, …>`, because the núcleo sends a
+   * `BTreeMap<i64, _>` and JSON object keys are strings — there is no number key in the wire
+   * format for one to survive as. Typed with `number` this compiles, and then
+   * `standings[row.decision_id]` reads `undefined` at runtime for every row on the screen, which
+   * is the shape of failure this whole feature exists to prevent: a surface that looks like it
+   * measured something and measured nothing. Join with `String(id)`.
+   *
+   * A map and never a parallel array. `map_join::join` says out loud that its order is
+   * deterministic rather than final — §10 wants a different one, by recency of the anchor code's
+   * last change — and two arrays that must stay index-aligned would survive that re-sort by
+   * drawing one decision's verdict against another's text, with nothing on screen looking wrong.
+   */
+  standings: Record<string, Standing>;
+  /** §5.3's header, tallied by the núcleo from exactly the standings above. */
+  stamps: StampCounts;
+  /**
+   * **One fact about this whole reading, and never a fact about any single decision.**
+   *
+   * The route computes one digest for the union of every decision's anchors — the alternative is
+   * up to 350 process spawns per open — so a git that will not answer takes every settled stamp in
+   * the project to `Lapse.unreadable` at the same instant. This flag is what buys the owner one
+   * sentence instead of 350 identical rows saying it, which is a wall of noise nobody reads to the
+   * bottom of and is how the one real lapse underneath goes unseen.
+   *
+   * **`false` for a project with no git repository at all**, which is §11's ordinary case and not
+   * a fault: there is nothing there to retry, and the copy under this flag says *try again*. Such
+   * a project gets `Watch` `"no_repository"` on its greens instead, which is a permanent fact and
+   * reads as one.
+   */
+  git_would_not_answer: boolean;
 }
 
 /**
@@ -368,6 +505,67 @@ export function useDecideMapLine(projectId: string) {
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.projects.mapDecisions(projectId) });
+      void queryClient.invalidateQueries({ queryKey: keys.projects.map(projectId) });
+    },
+  });
+}
+
+/** What {@link useCarimbar} sends: the line, the owner's verdict on it, and whatever they wrote. */
+export interface CarimbarInput {
+  decisionId: number;
+  verdict: Verdict;
+  /**
+   * Obligatory on `partial` and optional on the other two (§7).
+   *
+   * `null` and never `""` for *said nothing*, because the two are different and `0118` stores the
+   * first as NULL. The daemon trims before it checks, so a note of one space is an empty one.
+   */
+  note: string | null;
+}
+
+/**
+ * The owner's verdict on one decision — the one act in this whole mode (§5.2, §7).
+ *
+ * **204, so there is no body** (`post_project_map_stamp`) — `void` is the honest type, and
+ * `apiFetch` exempts 204 from its JSON parse, the way {@link useDecideMapLine} already does for its
+ * own bodyless answer. Four refusals, and they are four different things to tell whoever asked:
+ *
+ * - `400` — an amber with nothing in its note. §5.2 makes the note the whole of amber, so an empty
+ *   one is not a lesser amber, it is not one. **A surface that can send this has a defect**: the
+ *   panel must not offer amber without somewhere to type, because a button that can only fail is a
+ *   worse answer than a field.
+ * - `404` — the decision is not this project's, or nobody approved it, or it never existed. The
+ *   daemon collapses the three deliberately: all three mean *that line is not yours to stamp now*,
+ *   and telling them apart would say which ids exist in projects the caller cannot see.
+ * - `503` — git is there and **would not answer**, and the verdict was `settled`. §7.1 makes *está
+ *   como quero* the only verdict the code moving can falsify, so it is the only one that may not be
+ *   recorded without knowing what it is anchored to. **It is transient and the copy has to say
+ *   *try again*.** The owner did nothing wrong and a second attempt works; reading it as a failure
+ *   would put the blame on the person who pressed the button for a git that was busy.
+ * - `422` — a verdict outside the three, which is this client having sent something
+ *   {@link Verdict} does not admit. Not a case a screen writes copy for.
+ *
+ * **No optimistic update, and its absence is not laziness.** The `Standing` that goes with a
+ * verdict is decided by a git call and by the join — a client guessing `watch: "watched"` would put
+ * a certain word on screen over an anchor set nobody has read yet, which is exactly the visibly-green
+ * answer resting on a silently-approximate basis this feature may not produce. So the verdict shows
+ * up when the map is read again, and not before.
+ *
+ * **One key invalidated, and it is the map.** A stamp changes nothing about the pile: the pile
+ * holds lines nobody has approved, and a decision has to be approved before it can be stamped at
+ * all. That the map key is a *prefix* of the pile's, and so drags it along, is a shape of
+ * `keys.projects` and not an intention here — the intention is one line, and it is written as one.
+ */
+export function useCarimbar(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ decisionId, verdict, note }: CarimbarInput) =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/map/stamps`, {
+        method: "POST",
+        body: JSON.stringify({ decision_id: decisionId, verdict, note }),
+      }),
+    retry: false,
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.projects.map(projectId) });
     },
   });
