@@ -429,6 +429,32 @@ impl DaemonClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
+    /// One member of a department leaves words for another.
+    ///
+    /// **Neither the run nor the sender is an argument**, for `read_team_file`'s reason: the
+    /// department is named by the key that authenticated the call, and WHICH NODE is calling comes
+    /// from `RUN_ID_HEADER`, added by `request()` from an id this process cannot alter. A body field
+    /// naming the sender would let a specialist sign a colleague's name to its own finding, which is
+    /// the one thing the receiving node cannot check.
+    ///
+    /// `to` names an `agents.id` and the daemon resolves it against the run's own roster. Naming
+    /// somebody who is not on it is not a broken call — it is the ordinary way a model gets a name
+    /// slightly wrong, and the refusal says so in a sentence it can act on while it still has the
+    /// roster in front of it.
+    ///
+    /// Through `json_or_refusal`, like `send_to_chat` and unlike the two `propose_*` methods above:
+    /// every refusal on this route is already a sentence the daemon wrote for this failure, so the
+    /// generic wrapper says everything a bespoke status check would.
+    pub async fn send_team_note(&self, to: &str, body: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/team-notes")
+            .json(&serde_json::json!({ "to": to, "body": body }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "leaving a note for a colleague").await
+    }
+
     /// A director asks the owner for a specialist its department does not have.
     ///
     /// The whole request travels as one object rather than as seven parameters, because it is one

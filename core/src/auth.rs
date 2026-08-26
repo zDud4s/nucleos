@@ -426,21 +426,36 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
     // The run's own folder, and the only route of the teams design that this scope opens. Which
     // folder is decided by the token, never by an argument — see `team.rs`.
     (Method::POST, "/team-files/read"),
-    // **The only route in this table that is not a read, and the only one there will ever be.** It
-    // does not perform anything: it records what the department asked for, and the core acts later
-    // if a human agrees (`team::propose_action`). That is what keeps this table from growing one
-    // entry per action a department might want — a `POST /email/send` here would have been the
-    // first of six, and by the sixth this scope would no longer be describable in a sentence.
+    // The first of the three routes in this table that are not reads. It does not perform anything:
+    // it records what the department asked for, and the core acts later if a human agrees
+    // (`team::propose_action`). That is what keeps this table from growing one entry per action a
+    // department might want — a `POST /email/send` here would have been the first of six, and by the
+    // sixth this scope would no longer be describable in a sentence.
     //
     // Its GET twin, which lists the queue, is deliberately absent: a department may ask, and may not
     // read what every other department has asked for.
+    //
+    // **This comment used to end "and the only one there will ever be", and the line below it used
+    // to open "The second and last".** Both were written as promises and neither survived the next
+    // feature. What they were reaching for is worth keeping and is said here once instead: a route
+    // is added to this table only when it lets a department SAY something — ask for an action, ask
+    // for a colleague, tell a colleague — never when it lets one DO something. That rule has held
+    // three times; the counting has not.
     (Method::POST, "/team-actions"),
-    // The second and last. Like the one above it, it records a request rather than performing one:
-    // nobody joins the catalogue until a person says so. Unlike it, the daemon answers differently
-    // depending on WHICH NODE of the run is calling — a specialist is refused — and that is decided
-    // inside the handler against `team_runs.director_run_id`, because `permits` answers about keys
-    // and a key belongs to the run rather than to a node.
+    // Like the one above it, it records a request rather than performing one: nobody joins the
+    // catalogue until a person says so. Unlike it, the daemon answers differently depending on WHICH
+    // NODE of the run is calling — a specialist is refused — and that is decided inside the handler
+    // against `team_runs.director_run_id`, because `permits` answers about keys and a key belongs to
+    // the run rather than to a node.
     (Method::POST, "/team-recruits"),
+    // Words for a colleague in the same department. The one route here whose effect is entirely
+    // INSIDE the run that calls it: nothing leaves the machine, nobody is asked to approve, and what
+    // it writes is read by another node holding this very same key.
+    //
+    // That containment is why the tool behind it is graded `WritesOwn` while the two above are
+    // `Acts` — see `mcp_tools::TOOL_EFFECTS`. It is also why this route needs no ceiling in
+    // `permits`: what bounds it is a per-run count the handler reads, and a scope cannot count.
+    (Method::POST, "/team-notes"),
     (Method::GET, "/email/queue"),
     (Method::GET, "/email/{id}"),
     (Method::GET, "/files"),
@@ -798,7 +813,7 @@ mod tests {
             .route("/email/incoming", post(|| async { "" }))
             .route("/email/triage", post(|| async {}))
             .route("/email/{id}/attachments", get(|| async {}))
-            // The three a team run reaches beside `/files`, plus the one it must never reach.
+            // The four a team run reaches beside `/files`, plus the one it must never reach.
             // `/email/{id}` sits beside `/email/{id}/attachments` on purpose: the table is matched
             // segment by segment, so a scope holding the shorter pattern must not inherit the
             // longer one.
@@ -812,6 +827,7 @@ mod tests {
             // an action and may not LIST the queue — is answered by `permits` rather than by the
             // router not knowing the path.
             .route("/team-actions", post(|| async {}).get(|| async {}))
+            .route("/team-notes", post(|| async {}))
             .route("/team-recruits", post(|| async {}).get(|| async {}))
             .route("/files", get(|| async {}).delete(|| async {}))
             .route("/files/folder", post(|| async {}))
@@ -1973,6 +1989,7 @@ mod tests {
             ("propose_action", Method::POST, "/team-actions"),
             ("propose_teammate", Method::POST, "/team-recruits"),
             ("read_team_file", Method::POST, "/team-files/read"),
+            ("send_team_note", Method::POST, "/team-notes"),
             ("web_read", Method::POST, "/web/read"),
             ("web_search", Method::POST, "/web/search"),
         ];

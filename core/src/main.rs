@@ -63,6 +63,7 @@ mod sidecar;
 mod state;
 mod storage;
 mod team;
+mod team_notes;
 mod team_trigger;
 mod token_efficiency;
 mod transcribe;

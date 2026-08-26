@@ -139,6 +139,12 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::team::post_team_action).get(crate::team::list_open_actions),
         )
         .route("/team-recruits", post(crate::team::post_team_recruit))
+        // POST only, and no GET twin, for the reason `/team-actions` has one and `/team-recruits`
+        // does not: a member may leave words for a colleague, and may not read the department's
+        // mail. What each node is told arrives in its prompt, chosen by the daemon, and a route that
+        // let a specialist read every note of the run would hand it the conversation it was
+        // deliberately not part of.
+        .route("/team-notes", post(crate::team::post_team_note))
         // All Control, and NONE of them in `auth::TEAM_ROUTES`. A department neither arms nor fires
         // a rule, and that is not an oversight: it is what stops a chain feeding itself underneath
         // the graph the cycle check walks.
