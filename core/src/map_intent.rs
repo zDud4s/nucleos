@@ -200,9 +200,9 @@ struct RawDecision {
 /// dropped rather than repaired. §4.1's type A arrives here as `"a"` and is dropped by exactly the
 /// same rule, which is what the missing `Kind` variant buys.
 pub fn parse_extraction(answer: &str) -> Vec<Extracted> {
-    let Some(raw) = json_object(answer).and_then(|slice| {
-        serde_json::from_str::<RawAnswer>(slice).ok()
-    }) else {
+    let Some(raw) =
+        json_object(answer).and_then(|slice| serde_json::from_str::<RawAnswer>(slice).ok())
+    else {
         return Vec::new();
     };
 
@@ -531,7 +531,8 @@ mod tests {
 
     /// A toy tree, so no test depends on the shape of the real repository.
     fn scratch(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("nucleos-intent-{}-{name}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("nucleos-intent-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("scratch");
         root
@@ -566,8 +567,14 @@ mod tests {
         // Two forms on purpose — the column holds `b`/`c` under a CHECK, the window reads
         // `countable`/`character`. Pinned here because nothing else compares them, and a rename
         // on either side would otherwise be found by whichever consumer broke first.
-        assert_eq!(serde_json::to_string(&Kind::Countable).unwrap(), "\"countable\"");
-        assert_eq!(serde_json::to_string(&Kind::Character).unwrap(), "\"character\"");
+        assert_eq!(
+            serde_json::to_string(&Kind::Countable).unwrap(),
+            "\"countable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Kind::Character).unwrap(),
+            "\"character\""
+        );
         assert_eq!(
             serde_json::from_str::<Kind>("\"character\"").unwrap(),
             Kind::Character
@@ -635,7 +642,10 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].section, "## 2. Onde vive");
         assert_eq!(found[0].kind, Kind::Character);
-        assert_eq!(found[0].ordinal, 1, "ordinals are 1-based and are the reading order");
+        assert_eq!(
+            found[0].ordinal, 1,
+            "ordinals are 1-based and are the reading order"
+        );
         assert_eq!(found[1].ordinal, 2);
     }
 
@@ -663,7 +673,10 @@ mod tests {
 
         assert_eq!(found.len(), 1, "only the last one is whole");
         assert_eq!(found[0].text, "Gama.");
-        assert_eq!(found[0].ordinal, 1, "the ordinal counts what survived, not what was proposed");
+        assert_eq!(
+            found[0].ordinal, 1,
+            "the ordinal counts what survived, not what was proposed"
+        );
     }
 
     #[test]
@@ -713,7 +726,10 @@ mod tests {
         // The slug is what the owner sees and what a decision row carries. Two projects keeping
         // specs in different folders must produce the same name for the same document.
         assert_eq!(spec_slug("docs/specs/beta.md"), "beta");
-        assert_eq!(spec_slug(".ai/specs/2026-08-22-alfa-design.md"), "2026-08-22-alfa-design");
+        assert_eq!(
+            spec_slug(".ai/specs/2026-08-22-alfa-design.md"),
+            "2026-08-22-alfa-design"
+        );
         assert_eq!(spec_slug("beta.md"), "beta");
     }
 
@@ -732,7 +748,11 @@ mod tests {
 
         let found = parse_extraction(answer);
 
-        assert_eq!(found.len(), 1, "the whole line survives; the two half-formed ones do not");
+        assert_eq!(
+            found.len(),
+            1,
+            "the whole line survives; the two half-formed ones do not"
+        );
         assert_eq!(found[0].text, "Alfa.");
     }
 
@@ -743,7 +763,10 @@ mod tests {
         let found = parse_extraction(answer);
 
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].ordinal, 1, "the ordinal counts what survived, not what was proposed");
+        assert_eq!(
+            found[0].ordinal, 1,
+            "the ordinal counts what survived, not what was proposed"
+        );
     }
 
     /// A runner that answers with exactly this stdout and records what it was handed.
@@ -784,9 +807,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_decisions_of_a_spec_come_back_from_whichever_brain_was_asked() {
-        let runner = fake_answering(
-            r#"{"decisions":[{"section":"§1","text":"Alfa.","kind":"c"}]}"#,
-        );
+        let runner =
+            fake_answering(r#"{"decisions":[{"section":"§1","text":"Alfa.","kind":"c"}]}"#);
 
         let found = extract(Extractor::Cli(&runner), "slug", "## §1\nbody")
             .await
@@ -815,7 +837,11 @@ mod tests {
         // a failure means nobody read anything, and telling the owner the first when the second
         // happened is exactly the false confidence this whole feature exists to cure.
         let runner = fake_failing();
-        assert!(extract(Extractor::Cli(&runner), "slug", "body").await.is_err());
+        assert!(
+            extract(Extractor::Cli(&runner), "slug", "body")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -828,7 +854,12 @@ mod tests {
             .await
             .expect("extract");
 
-        let prompt = runner.last_prompt.lock().unwrap().clone().expect("a prompt was sent");
+        let prompt = runner
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a prompt was sent");
         assert!(prompt.contains("## 1. Alfa"));
         assert!(prompt.contains("the-slug"));
         assert_eq!(
@@ -855,7 +886,11 @@ mod tests {
             .await
             .expect("extract");
 
-        assert_eq!(found.len(), 1, "the answer lives inside the final `result` event");
+        assert_eq!(
+            found.len(),
+            1,
+            "the answer lives inside the final `result` event"
+        );
         assert_eq!(found[0].text, "Alfa.");
     }
 
@@ -882,7 +917,9 @@ mod tests {
 
         let failed = extract(Extractor::Cli(&runner), "slug", "body").await;
 
-        let error = failed.expect_err("a non-zero exit is a failure").to_string();
+        let error = failed
+            .expect_err("a non-zero exit is a failure")
+            .to_string();
         // The stderr travels with it, because "the run failed" and "the stream died after launch"
         // are different things to find in a log at three in the morning.
         assert!(error.contains("stream failed after launch"), "got: {error}");
@@ -898,7 +935,8 @@ mod tests {
         // `over_turn_ceiling` is `turns >= ceiling`, and the stream BREAKS at that point — before
         // the `result` event carrying the answer has been read. Every successful cloud extraction
         // would come back truncated and non-zero.
-        let assistant = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
+        let assistant =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
         let after_one_answer = crate::runner::turns_from_line(assistant, 0);
         assert_eq!(after_one_answer, 1);
 
@@ -912,12 +950,13 @@ mod tests {
         );
         // A `turn.completed` beside the `assistant` is already two events for one answer, which is
         // why the margin is not two either.
-        let after_completion = crate::runner::turns_from_line(
-            r#"{"type":"turn.completed"}"#,
-            after_one_answer,
-        );
+        let after_completion =
+            crate::runner::turns_from_line(r#"{"type":"turn.completed"}"#, after_one_answer);
         assert_eq!(after_completion, 2);
-        assert!(!crate::runner::over_turn_ceiling(after_completion, Some(MAX_EXTRACTION_TURNS)));
+        assert!(!crate::runner::over_turn_ceiling(
+            after_completion,
+            Some(MAX_EXTRACTION_TURNS)
+        ));
     }
 
     /// A loopback Ollama, answering with this and keeping every body it was posted.
@@ -929,23 +968,25 @@ mod tests {
     /// path takes and does not.
     async fn loopback_answering(
         answer: &'static str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
         let recorder = std::sync::Arc::clone(&seen);
-        let app = axum::Router::new()
-            .fallback(axum::routing::post(
-                move |axum::Json(body): axum::Json<serde_json::Value>| {
-                    let recorder = std::sync::Arc::clone(&recorder);
-                    async move {
-                        recorder.lock().unwrap().push(body);
-                        axum::Json(serde_json::json!({
-                            "response": answer,
-                            "message": {"role": "assistant", "content": answer},
-                            "done": true
-                        }))
-                    }
-                },
-            ));
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "response": answer,
+                        "message": {"role": "assistant", "content": answer},
+                        "done": true
+                    }))
+                }
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -991,9 +1032,11 @@ mod tests {
             body["format"]["properties"]["decisions"].is_object(),
             "the grammar is the extraction's, not triage's: {body}"
         );
-        assert!(body["format"]["properties"]["decisions"]["items"]["properties"]["kind"]["enum"]
-            .as_array()
-            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "a")),
-            "type A is offered so the model has somewhere to put one, and dropped at the parse");
+        assert!(
+            body["format"]["properties"]["decisions"]["items"]["properties"]["kind"]["enum"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "a")),
+            "type A is offered so the model has somewhere to put one, and dropped at the parse"
+        );
     }
 }

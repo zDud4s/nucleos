@@ -129,7 +129,11 @@ pub async fn decide(
     approved: bool,
 ) -> sqlx::Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
-    let column = if approved { "approved_at" } else { "retired_at" };
+    let column = if approved {
+        "approved_at"
+    } else {
+        "retired_at"
+    };
     let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE map_decisions SET {column} = ?
           WHERE id = ? AND project_id = ? AND approved_at IS NULL AND retired_at IS NULL"
@@ -200,7 +204,10 @@ mod tests {
         let waiting = pending(&pool, "alpha").await.unwrap();
         assert_eq!(waiting.len(), 2);
         assert!(waiting[0].approved_at.is_none(), "nothing arrives approved");
-        assert_eq!(waiting[0].ordinal, 1, "in the order the owner will read them");
+        assert_eq!(
+            waiting[0].ordinal, 1,
+            "in the order the owner will read them"
+        );
     }
 
     #[tokio::test]
@@ -233,7 +240,10 @@ mod tests {
         assert!(decide(&pool, "alpha", waiting[0].id, false).await.unwrap());
 
         assert_eq!(pending(&pool, "alpha").await.unwrap().len(), 1);
-        assert_eq!(retired_texts(&pool, "alpha").await, vec!["Alfa.".to_string()]);
+        assert_eq!(
+            retired_texts(&pool, "alpha").await,
+            vec!["Alfa.".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -272,6 +282,9 @@ mod tests {
 
         assert!(decide(&pool, "alpha", id, true).await.unwrap());
         assert!(!decide(&pool, "alpha", id, false).await.unwrap());
-        assert!(retired_texts(&pool, "alpha").await.is_empty(), "the approval stands");
+        assert!(
+            retired_texts(&pool, "alpha").await.is_empty(),
+            "the approval stands"
+        );
     }
 }
