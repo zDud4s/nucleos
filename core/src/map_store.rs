@@ -4,10 +4,19 @@
 //! parse are the part worth testing without a database, and this is the part worth testing without
 //! a model. Slices 4 and 5 add `map_stamps` and `map_triage` beside this table, and the SQL of the
 //! three wants to be together and far from `http.rs`, which is already 19,000 lines.
+//!
+//! **Three tables, three axes, and this module is where they are kept from becoming one.** A
+//! decision carries what the code says about it (`map_join`), what its owner said (`map_stamps`) and
+//! what the triager thought (`map_triage`), and §5 forbids flattening them — *"achatá-las numa só
+//! punha o triador e o dono a falar pela mesma boca"*. Nothing here joins the three into a single
+//! state; each reader answers about one axis and the caller pairs them. That is deliberate, and it
+//! is why [`stamps`] and [`judgements`] are two functions returning two shapes rather than one
+//! returning a verdict.
 
 use crate::chats::Brain;
 use crate::map_intent::{Extracted, Kind};
 use crate::map_stamp::Verdict;
+use crate::map_triage::Judgement;
 use serde::Serialize;
 
 /// A decision as it sits in the table.
@@ -392,6 +401,179 @@ pub async fn stamps(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<V
     .await?;
 
     Ok(rows.into_iter().filter_map(stamp_from_row).collect())
+}
+
+/// One triage judgement, as it sits in the table.
+///
+/// No `id` and no `project_id`, for the two reasons [`Stamp`] gives: the current answer is the last
+/// row, so nothing addresses an individual judgement, and the project is a fact about the decision
+/// rather than about the judgement.
+///
+/// **`inputs_digest` is on the row and is not compared here**, which is the same split slice 4 made
+/// with [`crate::map_stamp::standing`] and is worth saying out loud because the tempting shape is a
+/// reader that answers only *current* judgements. Deciding staleness needs the digest of the inputs
+/// **as they are now** — the decision's text, its anchor set, the anchor blobs — and computing that
+/// means reading the repository, which is exactly what this module is kept away from so its SQL
+/// stays exercisable with no git anywhere near it. So [`judgements`] returns the latest row whatever
+/// its digest says, and whoever holds the current reading compares.
+///
+/// Dropping the field and returning only fresh rows would also have been wrong in a quieter way: a
+/// judgement that went stale would become indistinguishable from one that never happened, and the
+/// silenced pile §6.2 requires to be *sempre acessível* would lose exactly the rows most worth
+/// looking at — the ones whose reason was written about code that has since moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Judged {
+    pub decision_id: i64,
+    /// Flagged or silenced, and never a third thing. See [`Judgement`], and `0119`'s CHECK, which is
+    /// the copy of that rule a caller cannot go round.
+    pub judgement: Judgement,
+    /// Why, in the triager's own words. Never empty — the table refuses it — because §6.2 makes the
+    /// readable reason the only mitigation §13 has for a triager that silences what it should have
+    /// shown.
+    pub reason: String,
+    /// Which brain answered, as `Brain::as_str` spells it. The other half of §6.2: the repair for a
+    /// triager that silences too much is to stop using that triager, and that is not a decision
+    /// anybody can take about a pile that will not say who filled it.
+    pub model: String,
+    pub computed_at: String,
+    /// What the triager looked at, hashed. Compared against a freshly computed digest by whoever has
+    /// one; see this struct's own doc for why that comparison does not happen here.
+    pub inputs_digest: String,
+}
+
+/// Append one triage judgement, and say whether it landed on anything.
+///
+/// **Never an UPDATE**, for `map_stamps`' reason and for one of its own. §13 rates *o triador
+/// silencia o que devia mostrar* a real residual risk whose only mitigation is that the pile stays
+/// visible with its reasons — so the row proving a silence happened IS the mitigation, and a writer
+/// that replaced the previous row would delete it. A triager that flagged something last week and
+/// silences it today is exactly the case somebody will want to read back.
+///
+/// The ownership check is inside the INSERT rather than beside it, which is the whole point of the
+/// `INSERT ... SELECT`: the row is written *from* the decision it is a judgement on, so a judgement
+/// for a decision that fails the `WHERE` cannot be constructed at all. The alternative — read,
+/// check three things in Rust, then write — is two statements that agree only while somebody keeps
+/// them agreeing, and it is the check-in-the-handler [`decide`] already argues against.
+///
+/// `approved_at IS NOT NULL AND retired_at IS NULL` is [`approved`]'s filter verbatim, repeated for
+/// the reason [`stamps`] repeats it: two readers of one pile that disagree produce counts that do
+/// not reconcile. It is also §4's rule reappearing — triaging a line still waiting would have the
+/// model pass judgement on something the owner never agreed exists, which is the authority §6 takes
+/// away from it arriving back through a different door.
+///
+/// **`model` and `inputs_digest` are `&str` rather than typed**, and that is where this function is
+/// weakest: `record` takes a `Brain` and writes `Brain::as_str()`, while this takes whatever the
+/// caller has. The reason is that §6.2 asks for *o modelo*, which is not always the same thing as
+/// the brain — a brain resolves to a model name, and the pile is more useful naming the one that
+/// actually answered. `0119` refuses both columns blank, which is the floor the type would have
+/// given for free and is why the looser signature costs nothing that matters.
+///
+/// `false` means no row was written, and it covers the four things [`stamp`] lists, which are one
+/// answer to whoever asked. An `Err` is the table refusing the row itself — a blank reason, a blank
+/// model, a blank digest — and that is a bug in the caller, so it is not flattened into `false`
+/// where it would look like a missing decision.
+// Task 3 of this slice gives it its first real caller: `POST /projects/{id}/map/triage`, which
+// sweeps the decisions nobody has stamped. Delete this attribute then.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn triage(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    decision_id: i64,
+    judgement: Judgement,
+    reason: &str,
+    model: &str,
+    inputs_digest: &str,
+) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO map_triage (decision_id, verdict, reason, model, computed_at, inputs_digest)
+         SELECT id, ?, ?, ?, ?, ? FROM map_decisions
+          WHERE id = ? AND project_id = ? AND approved_at IS NOT NULL AND retired_at IS NULL",
+    )
+    .bind(judgement.as_str())
+    .bind(reason)
+    .bind(model)
+    .bind(&now)
+    .bind(inputs_digest)
+    .bind(decision_id)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The columns every read of `map_triage` selects, named once for the reason [`DecisionRow`] gives,
+/// and with more cause here than either table above it: four of the six are `String`, so a `SELECT`
+/// that swapped any pair of them would still typecheck and surface as a silenced pile whose reasons
+/// are all the same timestamp, or whose model is somehow a hash.
+type JudgedRow = (i64, String, String, String, String, String);
+
+/// The single place a row becomes a [`Judged`].
+///
+/// `None` for a verdict this module cannot read, which drops the judgement and so leaves the
+/// decision *not looked at*. Unreachable while `0119`'s CHECK stands — it admits exactly the two
+/// [`Judgement::from_wire`] accepts — and written anyway, because the alternative to dropping is
+/// defaulting, and both defaults are worse than the absence: silencing a row nobody could read would
+/// clear a decision out of the owner's queue on the strength of a parse failure, and flagging it
+/// would raise an alarm the reason column cannot explain.
+fn judged_from_row(
+    (decision_id, verdict, reason, model, computed_at, inputs_digest): JudgedRow,
+) -> Option<Judged> {
+    Some(Judged {
+        decision_id,
+        judgement: Judgement::from_wire(&verdict)?,
+        reason,
+        model,
+        computed_at,
+        inputs_digest,
+    })
+}
+
+/// The latest judgement per decision, for one project's approved decisions.
+///
+/// Decisions the triager has never looked at are simply absent, as unstamped ones are from
+/// [`stamps`]: the caller pairs this against [`approved`], and the third pile — *not looked at* — is
+/// what is missing from both. A placeholder would make the absence something a reader has to
+/// interpret rather than something they can count, and §5.3 requires these categories to add up.
+///
+/// **Returned whether or not the judgement is still about the same thing.** `inputs_digest` comes
+/// back on the row and is not compared here — see [`Judged`], which argues why the comparison
+/// belongs to whoever holds the current reading of the repository, and what returning only fresh
+/// rows would have cost the silenced pile §6.2 requires to be *sempre acessível*.
+///
+/// The JOIN is load-bearing rather than decorative. `map_triage` carries no `project_id`, so it
+/// reaches one only through its decision, and this is what keeps one owner's pile out of another's.
+///
+/// **The subquery picks a row id and not a maximum timestamp, and the tie-break matters more here
+/// than it did for stamps.** `computed_at` is a clock and not a counter, and a triage run sweeps a
+/// project's whole *never seen* pile in one batch — so judgements sharing an instant are the
+/// ordinary case rather than the contrived one. `MAX(computed_at)` would match several rows and let
+/// SQLite's plan choose the winner, which is a decision that reads silenced on one refresh and
+/// flagged on the next with nothing having happened. `id DESC` breaks it on insertion order, which
+/// is the order the triager actually answered in.
+// Task 4 of this slice gives it its first real caller: `MapAnswer` gains the judgements by decision
+// id, and `GET /projects/{id}/map/silenced` reads the pile §6.2 requires. Delete this then.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn judgements(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Judged>> {
+    let rows = sqlx::query_as::<_, JudgedRow>(
+        "SELECT t.decision_id, t.verdict, t.reason, t.model, t.computed_at, t.inputs_digest
+           FROM map_triage t
+           JOIN map_decisions d ON d.id = t.decision_id
+          WHERE d.project_id = ?
+            AND d.approved_at IS NOT NULL
+            AND d.retired_at IS NULL
+            AND t.id = (SELECT latest.id
+                          FROM map_triage latest
+                         WHERE latest.decision_id = t.decision_id
+                         ORDER BY latest.computed_at DESC, latest.id DESC
+                         LIMIT 1)
+          ORDER BY t.decision_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(judged_from_row).collect())
 }
 
 #[cfg(test)]
@@ -1010,5 +1192,393 @@ mod tests {
             "computed, and there was nothing readable to watch"
         );
         assert_eq!(digest_of(unknown), None, "nobody could compute one");
+    }
+
+    /// Every judgement ever recorded on one decision, oldest first, straight off the table.
+    ///
+    /// [`judgements`] answers with the last one only, so the history it holds back can be asserted
+    /// from nowhere else — and that history is not bookkeeping. §13 rates *o triador silencia o que
+    /// devia mostrar* a **real** residual risk whose only mitigation is that the pile stays visible
+    /// with its reasons, so the row proving a silence happened is the whole of the cure.
+    async fn every_judgement(pool: &sqlx::SqlitePool, decision_id: i64) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT verdict FROM map_triage WHERE decision_id = ? ORDER BY id",
+        )
+        .bind(decision_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// One judgement written past [`triage`] and straight at the table.
+    ///
+    /// Necessary rather than convenient: [`Judgement`] has two variants and no third, so a test
+    /// going through [`triage`] could only ever assert that a Rust enum is a Rust enum. What is
+    /// being asked here is what the **table** admits, and that answer has to hold for the caller
+    /// who never touches the enum — which is the only caller the CHECK exists for.
+    async fn raw_triage(
+        pool: &sqlx::SqlitePool,
+        decision_id: i64,
+        verdict: &str,
+        reason: &str,
+    ) -> sqlx::Result<sqlx::sqlite::SqliteQueryResult> {
+        sqlx::query(
+            "INSERT INTO map_triage
+               (decision_id, verdict, reason, model, computed_at, inputs_digest)
+             VALUES (?, ?, ?, 'local', '2026-08-26T08:00:00+00:00', 'e3b0c442')",
+        )
+        .bind(decision_id)
+        .bind(verdict)
+        .bind(reason)
+        .execute(pool)
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_triage_verdict_the_model_is_not_allowed_to_reach_is_refused_by_the_table() {
+        // §6's table names exactly one thing the triager is forbidden to do — **Aprovar** — and a
+        // prohibition written in a comment, a handler and a Rust enum is a prohibition with three
+        // ways round it. The column is the one that survives a caller who reaches for none of the
+        // three, and this test is that boundary written down where it cannot be forgotten.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        // `approved` is §6's forbidden word verbatim. `settled` is worse, and is the reason this
+        // list is not one item long: it is the word that actually turns something green in this
+        // codebase, and it is what a caller reaching for `map_stamps`' vocabulary would write —
+        // §6.1's *devolvida pela porta da renderização*, arriving through the column instead. The
+        // two tables share a column NAME and may never share a VALUE. `FLAGGED` is the same
+        // mistake a third way: SQLite compares text case-sensitively, the storage form is lower
+        // case, and `Judgement::from_wire` reads nothing else — so such a row would be a judgement
+        // no reader can ever return, leaving the decision among the ones nobody looked at while a
+        // row in the table insists somebody did.
+        for verdict in ["approved", "settled", "partial", "withdrawn", "FLAGGED", ""] {
+            assert!(
+                raw_triage(&pool, id, verdict, "porque sim").await.is_err(),
+                "the table admitted {verdict:?}"
+            );
+        }
+        assert!(
+            every_judgement(&pool, id).await.is_empty(),
+            "and not one of the six left a row behind"
+        );
+
+        for verdict in ["flagged", "silenced"] {
+            assert!(
+                raw_triage(&pool, id, verdict, "porque sim").await.is_ok(),
+                "{verdict:?} is one of the two it is allowed to reach"
+            );
+        }
+        assert_eq!(
+            every_judgement(&pool, id).await,
+            vec!["flagged".to_string(), "silenced".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silencing_with_no_reason_is_refused() {
+        // §6.2 keeps the silenced pile readable *com a razão de cada silenciamento*, because *um
+        // triador que silencia o que não devia é um bug do triador, e um bug só é corrigível se
+        // for visível*. §13 rates that bug a real residual risk and names this pile as its only
+        // mitigation — so a silence carrying nothing to read deletes the mitigation one row at a
+        // time, and the table is what refuses to let it.
+        //
+        // Required on a flag too, and that is not symmetry for its own sake: a flag with no reason
+        // is a nag the owner cannot answer, and a nag nobody can answer is one they stop reading —
+        // which costs the same trust the silent green costs, from the other side.
+        //
+        // A tab is whitespace too, and bare `trim` in SQLite strips spaces and nothing else, so
+        // `0119` names the characters it must actually see through. The same hole `0118`'s note
+        // CHECK already argues, owed here twice over.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        for judgement in [Judgement::Silenced, Judgement::Flagged] {
+            for reason in ["", "   ", "\t", "\n \r"] {
+                assert!(
+                    triage(&pool, "alpha", id, judgement, reason, "local", "e3b0c442")
+                        .await
+                        .is_err(),
+                    "{judgement:?} carrying {reason:?} for a reason"
+                );
+            }
+        }
+        assert!(
+            every_judgement(&pool, id).await.is_empty(),
+            "and none of the eight left a row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_judgement_that_names_no_model_or_looked_at_nothing_is_refused() {
+        // The other half of §6.2, which asks for the reason *e o modelo que o produziu*: a pile
+        // that cannot say which brain silenced a row is a pile nobody can act on, because the
+        // repair for a triager that silences too much is to stop using that triager.
+        //
+        // `inputs_digest` is refused blank for a sharper reason, and it is the one place in this
+        // table where an empty value is not merely unreadable but actively wrong. Staleness is
+        // decided by comparing the stored digest against the one computed now; a hash is never
+        // empty, so a stored `''` can only have come from a caller that failed to compute one —
+        // and if a reader ever computes `''` the same way, the two compare EQUAL and a judgement
+        // about a decision that has since changed is presented as current. That is `0118`'s
+        // collapse of *could not compute* into *nothing to watch*, reappearing one table over and
+        // one slice later, and it is refused here for the reason it is refused there.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        for blank in ["", "   ", "\t"] {
+            assert!(
+                triage(
+                    &pool,
+                    "alpha",
+                    id,
+                    Judgement::Flagged,
+                    "porque sim",
+                    blank,
+                    "e3b0c442"
+                )
+                .await
+                .is_err(),
+                "a judgement whose model is {blank:?}"
+            );
+            assert!(
+                triage(
+                    &pool,
+                    "alpha",
+                    id,
+                    Judgement::Flagged,
+                    "porque sim",
+                    "local",
+                    blank
+                )
+                .await
+                .is_err(),
+                "a judgement whose inputs_digest is {blank:?}"
+            );
+        }
+        assert!(every_judgement(&pool, id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn re_triaging_adds_a_row_and_the_last_one_is_read() {
+        // Append-only, as `map_stamps` is, and for a reason of its own: a triager that silenced
+        // something it should have shown is a bug, and the row recording that it did so is the
+        // only way anybody finds it (§13). A writer that replaced the previous row would erase
+        // exactly the evidence the risk table names as that bug's own mitigation.
+        //
+        // Both halves are asserted, because only the pair discriminates — a table that kept
+        // everything and a reader that showed everything would be a map with two answers for one
+        // decision.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Flagged,
+                "o tipo B deixou de bater com o código",
+                "local",
+                "d1"
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Silenced,
+                "nada mexeu desde a extracção",
+                "local",
+                "d2"
+            )
+            .await
+            .unwrap()
+        );
+
+        assert_eq!(
+            every_judgement(&pool, id).await,
+            vec!["flagged".to_string(), "silenced".to_string()],
+            "the flag it later took back is still there to be found"
+        );
+        let latest = judgements(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            latest.len(),
+            1,
+            "one answer per decision, not one per judgement"
+        );
+        assert_eq!(latest[0].judgement, Judgement::Silenced);
+        assert_eq!(latest[0].reason, "nada mexeu desde a extracção");
+        assert_eq!(latest[0].model, "local");
+        assert_eq!(latest[0].inputs_digest, "d2");
+
+        // The tie, and why `MAX(computed_at)` alone would not settle it. This row is given the
+        // timestamp of the one before it, which is what two judgements written inside one tick of
+        // the clock look like — and a triage run sweeps a project's whole *never seen* pile in a
+        // batch, so the collision is the ordinary case here rather than the contrived one. Without
+        // the `id DESC` tie-break the winner is whichever row SQLite reached first, and a decision
+        // that is silenced on one read and flagged on the next with nothing having happened is the
+        // portrait this map refuses to be.
+        let when = latest[0].computed_at.clone();
+        sqlx::query(
+            "INSERT INTO map_triage
+               (decision_id, verdict, reason, model, computed_at, inputs_digest)
+             VALUES (?, 'flagged', 'e voltou a não bater', 'local', ?, 'd3')",
+        )
+        .bind(id)
+        .bind(&when)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let latest = judgements(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            latest[0].judgement,
+            Judgement::Flagged,
+            "of two judgements sharing an instant, the one written later is the current one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_judgement_whose_inputs_moved_still_comes_back_for_the_caller_to_judge() {
+        // The split slice 4 already made with `standing`, owed again here. Deciding whether a
+        // judgement is stale needs the digest of the inputs **as they are now**, and computing
+        // that means reading the repository — which is exactly what this module is kept away from
+        // so that its SQL stays testable without one. So the row comes back whatever its digest
+        // says, and the caller compares.
+        //
+        // What this pins is the direction of the omission: `inputs_digest` is ON the returned row.
+        // A reader that dropped it would leave the caller unable to tell a current judgement from
+        // a stale one, at which point every stale silence reads as a current one — a claim about
+        // code nobody has looked at since it changed, which is the silent wrong this map refuses.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Silenced,
+                "nada de estranho",
+                "local",
+                "as it was"
+            )
+            .await
+            .unwrap()
+        );
+
+        let latest = judgements(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            latest[0].inputs_digest, "as it was",
+            "the row says what it looked at, and says nothing about whether that is still true"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_project_s_triage_never_reaches_another_project_s_map() {
+        // `map_triage` has no `project_id`; it reaches one only through `decision_id`, so the JOIN
+        // is the whole of what stands between two owners' piles. The id is a global integer, and a
+        // check that lived in the HTTP handler is a check the second caller forgets — the argument
+        // `decide` makes, owed by both the reader and the writer here.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Flagged,
+                "vale o olhar",
+                "local",
+                "d1"
+            )
+            .await
+            .unwrap()
+        );
+
+        assert_eq!(judgements(&pool, "alpha").await.unwrap().len(), 1);
+        assert!(judgements(&pool, "beta").await.unwrap().is_empty());
+
+        assert!(
+            !triage(
+                &pool,
+                "beta",
+                id,
+                Judgement::Silenced,
+                "nada de estranho",
+                "local",
+                "d2"
+            )
+            .await
+            .unwrap(),
+            "and a judgement aimed at another project's decision lands nowhere"
+        );
+        assert_eq!(
+            every_judgement(&pool, id).await,
+            vec!["flagged".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_nobody_approved_cannot_be_triaged() {
+        // The other two clauses of the same `WHERE`, and neither is ceremony. Triaging a line
+        // still waiting in the pile would have the model pass judgement on something the owner
+        // never agreed exists — §4 reserves *deciding that a decision exists* to the owner, and
+        // this is that authority arriving back through the triager instead. Triaging a retired one
+        // would nag about a line somebody explicitly stood down.
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        let waiting = pending(&pool, "alpha").await.unwrap();
+
+        assert!(
+            !triage(
+                &pool,
+                "alpha",
+                waiting[0].id,
+                Judgement::Flagged,
+                "vale o olhar",
+                "local",
+                "d1"
+            )
+            .await
+            .unwrap(),
+            "a line still waiting to be read"
+        );
+        assert!(decide(&pool, "alpha", waiting[1].id, false).await.unwrap());
+        assert!(
+            !triage(
+                &pool,
+                "alpha",
+                waiting[1].id,
+                Judgement::Silenced,
+                "nada de estranho",
+                "local",
+                "d1"
+            )
+            .await
+            .unwrap(),
+            "a line the owner said no to"
+        );
+        assert!(
+            !triage(
+                &pool,
+                "alpha",
+                9_999,
+                Judgement::Flagged,
+                "vale o olhar",
+                "local",
+                "d1"
+            )
+            .await
+            .unwrap(),
+            "an id that names nothing at all"
+        );
+        assert!(judgements(&pool, "alpha").await.unwrap().is_empty());
     }
 }

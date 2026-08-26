@@ -42,6 +42,7 @@ mod map_intent;
 mod map_join;
 mod map_stamp;
 mod map_store;
+mod map_triage;
 mod mcp_tools;
 mod mentions;
 mod notes;
