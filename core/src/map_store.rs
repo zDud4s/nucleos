@@ -7,6 +7,7 @@
 
 use crate::chats::Brain;
 use crate::map_intent::{Extracted, Kind};
+use crate::map_stamp::Verdict;
 use serde::Serialize;
 
 /// A decision as it sits in the table.
@@ -204,6 +205,151 @@ pub async fn decide(
     Ok(result.rows_affected() > 0)
 }
 
+// This is a bin-only crate, so dead-code reachability starts at `main`, and nothing in production
+// reaches the two functions below yet: their caller is `POST /projects/{id}/map/stamps`, which lands
+// with the rest of the route work. Every previous slice of this map landed its store and its handler
+// together and so needed none of this; this one splits them, because the table and the reader are
+// what the next tasks are built on and a store nobody can review until the HTTP is written is a
+// store nobody reviews. Measured rather than assumed: the suppression sits on the two entry points
+// and on nothing else, and with it in place the compiler names no other item — `Stamp`, `StampRow`
+// and `stamp_from_row` stay reachable *through* them, so one of the three going unused would still
+// say so. The instruction, not a description: DELETE BOTH ATTRIBUTES with the change adding the
+// route.
+//
+// Scoped to the non-test build, the way `contacts.rs` and `errands.rs` scope theirs. Under
+// `cfg(test)` the lint stays live — this module's own tests exercise both — so one that stops being
+// exercised there warns rather than going quiet.
+
+/// One stamp, as it sits in the table.
+///
+/// No `id` and no `project_id`, and neither is an omission. The id is never needed by a caller,
+/// because §9.2 makes the current state "the last row" and nothing addresses an individual stamp;
+/// exposing it would invite the update this table exists to refuse. The project is a fact about the
+/// decision rather than about the stamp, and a second copy of it here would be a second place for
+/// it to be wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Stamp {
+    pub decision_id: i64,
+    pub verdict: Verdict,
+    pub stamped_at: String,
+    /// The anchor code as it stood when this was written, in `map_stamp`'s canonical form. Empty
+    /// means *no readable anchor*, which is not the same fact as *nothing has moved*.
+    pub code_digest: String,
+    pub note: Option<String>,
+}
+
+/// Append one stamp, and say whether it landed on anything.
+///
+/// **Never an UPDATE.** §9.2: re-carimbar acrescenta uma linha. A writer that replaced the previous
+/// row would erase the evidence that this decision had once been settled, and that evidence is
+/// precisely what the owner comes looking for when the doubt returns.
+///
+/// The ownership check is inside the INSERT rather than beside it, and that is the point of the
+/// `INSERT ... SELECT`. The alternative — read the decision, check three things in Rust, then write
+/// — is two statements that agree only as long as somebody keeps them agreeing, and it is the same
+/// check-in-the-handler that [`decide`] argues against. Here the row is written *from* the decision
+/// it is a verdict on, so a stamp for a decision that fails the `WHERE` cannot be constructed at
+/// all.
+///
+/// `false` means no row was written, and it covers four things that are one answer to whoever
+/// asked: an id that names nothing, a decision belonging to another project, a line still waiting in
+/// the pile (§4 — nothing reaches the map unapproved), and a line already retired. None of them is a
+/// failure of this daemon. An `Err`, by contrast, is the table refusing the row itself — an amber
+/// with no note is the case that exists today — and that one is a bug in the caller, so it is not
+/// flattened into `false` where it would look like a missing decision.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn stamp(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    decision_id: i64,
+    verdict: Verdict,
+    code_digest: &str,
+    note: Option<&str>,
+) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO map_stamps (decision_id, verdict, stamped_at, code_digest, note)
+         SELECT id, ?, ?, ?, ? FROM map_decisions
+          WHERE id = ? AND project_id = ? AND approved_at IS NOT NULL AND retired_at IS NULL",
+    )
+    .bind(verdict.as_str())
+    .bind(&now)
+    .bind(code_digest)
+    .bind(note)
+    .bind(decision_id)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The columns every read of `map_stamps` selects, named once for the reason [`DecisionRow`] gives:
+/// three of the five are `TEXT` in a row, so a `SELECT` that swapped two of them would still
+/// typecheck and would surface as a verdict whose timestamp is somehow a digest.
+type StampRow = (i64, String, String, String, Option<String>);
+
+/// The single place a row becomes a [`Stamp`].
+///
+/// `None` for a verdict this module cannot read, which drops the stamp and so leaves the decision
+/// among the ones nobody has looked at. Unreachable while the `CHECK` in `0118` stands — it admits
+/// exactly the three [`Verdict::from_wire`] accepts — and written anyway, because the alternative to
+/// dropping is defaulting, and every default here is a sentence put in the owner's mouth. Visible
+/// debt is the honest failure; a green nobody gave is the one this map exists to prevent.
+fn stamp_from_row(
+    (decision_id, verdict, stamped_at, code_digest, note): StampRow,
+) -> Option<Stamp> {
+    Some(Stamp {
+        decision_id,
+        verdict: Verdict::from_wire(&verdict)?,
+        stamped_at,
+        code_digest,
+        note,
+    })
+}
+
+/// The current verdict on each of one project's approved decisions.
+///
+/// One row per decision at most, and decisions nobody has stamped are simply absent — the caller
+/// pairs this against [`approved`] and what is missing is §5.3's `K nunca vistas`, which is debt
+/// and is meant to be large on day one. Returning a placeholder for them would make the absence
+/// something a reader has to interpret instead of something they can count.
+///
+/// The JOIN is load-bearing rather than decorative. `map_stamps` carries no `project_id`, so it
+/// reaches one only through its decision, and this is where one owner's pile is kept out of
+/// another's. `approved_at IS NOT NULL AND retired_at IS NULL` repeats [`approved`]'s own filter for
+/// the same two reasons it gives: a decision nobody approved is not material the map is made of, and
+/// one that was withdrawn stopped driving the map without leaving the table.
+///
+/// **The subquery picks a row id and not a maximum timestamp, and the tie-break is why.**
+/// `stamped_at` comes from `chrono::Utc::now().to_rfc3339()`, which is a clock and not a counter:
+/// two stamps written close enough together share an instant, and a test that stamps twice in a row
+/// does it easily. `MAX(stamped_at)` would then match both rows, and which one came back would be
+/// whichever plan SQLite happened to choose — so a decision's verdict could change between two reads
+/// with nothing having happened, which is the portrait this map refuses to be. `id DESC` breaks it
+/// on insertion order, which is the order the owner actually stamped in.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn stamps(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Stamp>> {
+    let rows = sqlx::query_as::<_, StampRow>(
+        "SELECT s.decision_id, s.verdict, s.stamped_at, s.code_digest, s.note
+           FROM map_stamps s
+           JOIN map_decisions d ON d.id = s.decision_id
+          WHERE d.project_id = ?
+            AND d.approved_at IS NOT NULL
+            AND d.retired_at IS NULL
+            AND s.id = (SELECT latest.id
+                          FROM map_stamps latest
+                         WHERE latest.decision_id = s.decision_id
+                         ORDER BY latest.stamped_at DESC, latest.id DESC
+                         LIMIT 1)
+          ORDER BY s.decision_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(stamp_from_row).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +384,30 @@ mod tests {
                 kind: Kind::Character,
             },
         ]
+    }
+
+    /// One of `two_decisions`, approved — the only state a stamp is allowed to land on.
+    async fn an_approved_decision(pool: &sqlx::SqlitePool, project_id: &str) -> i64 {
+        record(pool, project_id, "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        let id = pending(pool, project_id).await.unwrap()[0].id;
+        assert!(decide(pool, project_id, id, true).await.unwrap());
+        id
+    }
+
+    /// Every verdict ever stamped on one decision, oldest first, straight off the table.
+    ///
+    /// [`stamps`] deliberately answers with the last one only, so the history it is hiding can be
+    /// asserted from nowhere else.
+    async fn every_stamp(pool: &sqlx::SqlitePool, decision_id: i64) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT verdict FROM map_stamps WHERE decision_id = ? ORDER BY id",
+        )
+        .bind(decision_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
     }
 
     async fn retired_texts(pool: &sqlx::SqlitePool, project_id: &str) -> Vec<String> {
@@ -451,5 +621,226 @@ mod tests {
             retired_texts(&pool, "alpha").await.is_empty(),
             "the approval stands"
         );
+    }
+
+    #[tokio::test]
+    async fn re_stamping_adds_a_row_and_the_last_one_is_what_is_read() {
+        // Append-only is §9.2, and it is not an implementation detail: a *mudei de ideias* that
+        // overwrote would erase the proof that this decision had once been settled, which is
+        // exactly what somebody wants to see when the doubt comes back. Both halves are asserted,
+        // because only the pair is discriminating — a table that kept everything and a reader that
+        // showed everything would be a map with two answers for one decision.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        assert!(
+            stamp(
+                &pool,
+                "alpha",
+                id,
+                Verdict::Settled,
+                "a1b2 core/src/x.rs",
+                None
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            stamp(&pool, "alpha", id, Verdict::Withdrawn, "", None)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            every_stamp(&pool, id).await,
+            vec!["settled".to_string(), "withdrawn".to_string()],
+            "the settled one is still there to be shown"
+        );
+        let latest = stamps(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            latest.len(),
+            1,
+            "one answer per decision, not one per stamp"
+        );
+        assert_eq!(latest[0].verdict, Verdict::Withdrawn);
+
+        // The tie, and why `MAX(stamped_at)` alone would not settle it. This row is given the
+        // timestamp of the one before it, which is what two stamps written inside one tick of the
+        // clock look like — `stamp` reads `Utc::now()` itself and so cannot be asked to collide on
+        // purpose. Without the `id DESC` tie-break the winner here is whichever row SQLite reached
+        // first, and a decision whose verdict changes between two reads for no reason anybody can
+        // see is the portrait this map refuses to be.
+        let when = latest[0].stamped_at.clone();
+        sqlx::query(
+            "INSERT INTO map_stamps (decision_id, verdict, stamped_at, code_digest, note)
+             VALUES (?, 'settled', ?, '', NULL)",
+        )
+        .bind(id)
+        .bind(&when)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let latest = stamps(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            latest[0].verdict,
+            Verdict::Settled,
+            "of two stamps sharing an instant, the one written later is the current one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_amber_stamp_without_a_note_is_refused_by_the_table() {
+        // §5.2 makes the note the entire point of amber — *falta migrar as páginas de pilar* is
+        // worth more than the colour is — so an empty *a meio* is a row that should not exist
+        // rather than a row a handler remembers to reject. Refused by the CHECK, because a handler
+        // is a check the second caller forgets: the argument `decide` already makes about
+        // `project_id`, owed here for the same reason.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        // A tab is whitespace too, and bare `trim` in SQLite strips spaces and nothing else, so
+        // the CHECK in `0118` names the characters it must actually see through.
+        for note in [None, Some(""), Some("   "), Some("\t"), Some("\n \r")] {
+            assert!(
+                stamp(&pool, "alpha", id, Verdict::Partial, "", note)
+                    .await
+                    .is_err(),
+                "amber carrying {note:?} for a note"
+            );
+        }
+        assert!(
+            every_stamp(&pool, id).await.is_empty(),
+            "and none of the three left a row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_stamp_needs_no_note_and_neither_does_a_withdrawal() {
+        // The CHECK guards one verdict and must not spread to the other two. §7 says the note is
+        // obligatory on *a meio* and optional on the others, and a constraint that asked for one
+        // everywhere would make the cheapest verdict — *está como quero*, which should be a single
+        // click — cost a sentence nobody has to write.
+        let pool = test_pool().await;
+        let alfa = an_approved_decision(&pool, "alpha").await;
+        let beta = pending(&pool, "alpha").await.unwrap()[0].id;
+        assert!(decide(&pool, "alpha", beta, true).await.unwrap());
+
+        assert!(
+            stamp(
+                &pool,
+                "alpha",
+                alfa,
+                Verdict::Settled,
+                "a1b2 core/src/x.rs",
+                None
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            stamp(&pool, "alpha", beta, Verdict::Withdrawn, "", None)
+                .await
+                .unwrap()
+        );
+
+        let latest = stamps(&pool, "alpha").await.unwrap();
+        assert_eq!(latest.len(), 2);
+        assert!(
+            latest.iter().all(|row| row.note.is_none()),
+            "a note nobody wrote comes back as None and not as an empty sentence"
+        );
+
+        // Optional and not forbidden. Withdrawing is an assertion rather than a forgetting (§5.2),
+        // and the owner is allowed to say what they changed their mind about.
+        assert!(
+            stamp(
+                &pool,
+                "alpha",
+                beta,
+                Verdict::Withdrawn,
+                "",
+                Some("o spec está velho")
+            )
+            .await
+            .unwrap()
+        );
+        let latest = stamps(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            latest
+                .iter()
+                .find(|row| row.decision_id == beta)
+                .expect("the withdrawn decision")
+                .note
+                .as_deref(),
+            Some("o spec está velho")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_project_s_stamps_never_reach_another_project_s_map() {
+        // `map_stamps` has no `project_id`; it reaches one only through `decision_id`, so the JOIN
+        // is the whole of what stands between two owners' piles. The id is a global integer, and a
+        // check that lived in the HTTP handler is a check the second caller forgets — the argument
+        // `decide` makes, owed by both the reader and the writer here.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+        assert!(
+            stamp(
+                &pool,
+                "alpha",
+                id,
+                Verdict::Settled,
+                "a1b2 core/src/x.rs",
+                None
+            )
+            .await
+            .unwrap()
+        );
+
+        assert_eq!(stamps(&pool, "alpha").await.unwrap().len(), 1);
+        assert!(stamps(&pool, "beta").await.unwrap().is_empty());
+
+        assert!(
+            !stamp(&pool, "beta", id, Verdict::Withdrawn, "", None)
+                .await
+                .unwrap(),
+            "and a stamp aimed at another project's decision lands nowhere"
+        );
+        assert_eq!(every_stamp(&pool, id).await, vec!["settled".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_decision_nobody_approved_cannot_be_stamped() {
+        // The other two clauses of the same `WHERE`, and neither is ceremony. A stamp on a line
+        // still waiting in the pile would be a verdict on something the owner never agreed exists
+        // (§4), which is the model being handed back the authority §6 took from it. A stamp on a
+        // retired one would put a verdict on a decision somebody explicitly stood down.
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        let waiting = pending(&pool, "alpha").await.unwrap();
+
+        assert!(
+            !stamp(&pool, "alpha", waiting[0].id, Verdict::Settled, "", None)
+                .await
+                .unwrap(),
+            "a line still waiting to be read"
+        );
+        assert!(decide(&pool, "alpha", waiting[1].id, false).await.unwrap());
+        assert!(
+            !stamp(&pool, "alpha", waiting[1].id, Verdict::Settled, "", None)
+                .await
+                .unwrap(),
+            "a line the owner said no to"
+        );
+        assert!(
+            !stamp(&pool, "alpha", 9_999, Verdict::Settled, "", None)
+                .await
+                .unwrap(),
+            "an id that names nothing at all"
+        );
+        assert!(stamps(&pool, "alpha").await.unwrap().is_empty());
     }
 }
