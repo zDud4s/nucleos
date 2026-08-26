@@ -803,7 +803,8 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Mirrors a live run's context fill into `runs.context_fill` until the returned guard is dropped.
+/// Mirrors a live run's context fill into `runs.context_fill`, and the fullest it has been into
+/// `runs.context_peak`, until the returned guard is dropped.
 ///
 /// The number was measured from the stream all along, but it only ever reached the database in the
 /// terminal UPDATE — so `GET /runs/{id}` answered `context_fill: null` for the entire life of every
@@ -825,16 +826,27 @@ fn mirror_context_fill(
     AbortOnDrop(
         tokio::spawn(async move {
             let mut persisted: Option<i64> = None;
+            let mut persisted_peak: Option<i64> = None;
+            // The peak lives here and only here — no second `Arc`, and nothing added to
+            // `RunOutcome`. The paths that most need it are the ones that never see an outcome.
+            let mut peak: Option<i64> = None;
             loop {
                 tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL).await;
                 let current = context_fill.lock().map(|fill| *fill).unwrap_or(None);
-                if current.is_none() || current == persisted {
+                let Some(now) = current else { continue };
+                peak = Some(peak.map_or(now, |seen: i64| seen.max(now)));
+                // The short-circuit was `current == persisted`, and that was right with one column.
+                // With two, "nothing changed" means both agree: the fill can fall on a compaction
+                // while the peak stands still, and the peak can rise on a tick where the fill did
+                // not move.
+                if current == persisted && peak == persisted_peak {
                     continue;
                 }
                 let written = sqlx::query(
-                    "UPDATE runs SET context_fill = ? WHERE id = ? AND status = 'running'",
+                    "UPDATE runs SET context_fill = ?, context_peak = ? WHERE id = ? AND status = 'running'",
                 )
                 .bind(current)
+                .bind(peak)
                 .bind(id)
                 .execute(&pool)
                 .await;
@@ -842,6 +854,7 @@ fn mirror_context_fill(
                 // retried on the next tick instead of being remembered as done.
                 if written.is_ok() {
                     persisted = current;
+                    persisted_peak = peak;
                 }
             }
         })
@@ -1450,6 +1463,23 @@ fn spawn_run(
                             "failed"
                         };
                     let context_fill = observed_context_fill(&context_fill, &o.stdout);
+                    // Read from the same stream everything else came from, and kept here because
+                    // here is where an agent run ends. `assistant.rs` does the equivalent in its
+                    // own terminal write; the difference is that an agent never passes through
+                    // there, and that is why the column was empty in 168 runs in a row.
+                    //
+                    // An empty list is stored as `[]`, which says "used no tools". NULL stays
+                    // reserved for "nobody asked" — the distinction `compacted` lost by being
+                    // `NOT NULL DEFAULT 0`.
+                    let tools_used = serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    // The peak comes off the whole stream, at full fidelity. The periodic mirror
+                    // writes a peak too, sampled every 500ms; this write comes after it and is the
+                    // more exact of the two.
+                    let context_peak = o
+                        .stdout
+                        .lines()
+                        .fold(None, |peak, line| crate::runner::context_peak_from_line(line, peak));
                     append_run_events(&pool, id, &o.stdout).await;
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
@@ -1489,7 +1519,7 @@ fn spawn_run(
                         None => (None, None, None),
                     };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, context_fill = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, context_fill = ?, context_peak = ?, compacted = ?, tools_used = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(terminal_status)
                     .bind(o.exit_code)
@@ -1503,6 +1533,9 @@ fn spawn_run(
                     .bind(o.cache_creation_tokens)
                     .bind(o.num_turns)
                     .bind(context_fill)
+                    .bind(context_peak)
+                    .bind(o.compacted)
+                    .bind(&tools_used)
                     .bind(&completed_at)
                     .bind(attempt as i64)
                     .bind(gate_status)
@@ -1674,13 +1707,24 @@ fn spawn_run(
                         .map(|shared| shared.clone())
                         .unwrap_or_default();
                     let context_fill = observed_context_fill(&context_fill, &seen);
+                    // Off the partial transcript, for the same reason the branch above persists it:
+                    // this is the run most worth reading afterwards. There is no outcome here, so
+                    // `seen` is the whole record — and `compacted` cannot be known from it, which is
+                    // why only these two are written.
+                    let context_peak = seen
+                        .lines()
+                        .fold(None, |peak, line| crate::runner::context_peak_from_line(line, peak));
+                    let tools_used = serde_json::to_string(&crate::runner::live_from_stream(&seen).did)
+                        .unwrap_or_else(|_| "[]".to_string());
                     append_run_events(&pool, id, &seen).await;
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let timed_out = sqlx::query(
-                        "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?, context_peak = ?, tools_used = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(&seen)
                     .bind(context_fill)
+                    .bind(context_peak)
+                    .bind(&tools_used)
                     .bind(&completed_at)
                     .bind(attempt as i64)
                     .bind(id)
@@ -5718,6 +5762,155 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run did not reach completed status in time, last status: {status}");
+    }
+
+    /// A run that ran out of time is the one that MOST needs measuring: it went too far.
+    ///
+    /// Losing the denominator here is being blind in exactly the case the metric exists to see —
+    /// and the two fullest runs in the whole database are a `timed_out` and a `cancelled`.
+    ///
+    /// Four events 200ms apart against a 600ms wall clock, the same numbers the merge-cancellation
+    /// test above uses, so the first two lines are in the transcript when the clock drops the run.
+    #[tokio::test]
+    async fn a_run_that_ran_out_of_time_still_says_how_far_it_got() {
+        let (mut state, runner) =
+            test_state_with_runner(Some(Duration::from_millis(200)), Duration::from_millis(600))
+                .await;
+        state.progress_timeout = Duration::from_secs(30);
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: [
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":189000},"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":500,"cache_read_input_tokens":39500},"content":[]}}"#,
+                r#"{"type":"assistant","message":{"content":[]}}"#,
+                r#"{"type":"result","result":"never arrives"}"#,
+            ]
+            .join("
+"),
+            stderr: String::new(),
+            session_id: Some("timed-out-session".into()),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "a run that goes too far").await;
+
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = get_run_status(&app, created.id).await.status;
+            if status == "timed_out" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, "timed_out", "the wall clock must terminate this run");
+
+        let (tools, peak): (Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT tools_used, context_peak FROM runs WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(peak, Some(190_000), "the peak — the stream did get to speak");
+        let tools: Vec<serde_json::Value> =
+            serde_json::from_str(&tools.expect("tools_used written")).unwrap();
+        assert!(!tools.is_empty(), "the tools it used before it died");
+    }
+
+    /// The 72 runs no terminal write reaches: `superseded`, `interrupted`, `cancelled`.
+    ///
+    /// None of them sees the stream — `finalize_termination` is another actor holding an id and a
+    /// status — which is why the periodic mirror exists at all. The peak rides along in a local of
+    /// its own, so a run that was killed at its fullest still says how full it was.
+    #[tokio::test]
+    async fn a_cancelled_run_still_carries_the_peak_the_mirror_saw() {
+        let pool = retention_pool().await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, created_at)
+             VALUES (44001, 'a run somebody killed', 'running', 'worktree', '2026-08-26T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mirror = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        let _guard = mirror_context_fill(&pool, 44001, std::sync::Arc::clone(&mirror));
+        *mirror.lock().unwrap() = Some(190_000);
+        tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL * 3).await;
+        *mirror.lock().unwrap() = Some(40_000); // it compacted
+        tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL * 3).await;
+
+        let (fill, peak): (Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT context_fill, context_peak FROM runs WHERE id = ?")
+                .bind(44001_i64)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(fill, Some(40_000), "the fill follows the mirror down");
+        assert_eq!(peak, Some(190_000), "the peak does not come down — that is its whole job");
+    }
+
+    /// The three columns a pressure reading needs, and the reason two of them are separate.
+    ///
+    /// `context_fill` is where the window ENDED and `context_peak` is where it WENT. They only
+    /// differ when the run compacted, and that is exactly the run worth measuring — reading the
+    /// pressure off the first would report the agent with the least slack as the one with the most.
+    #[tokio::test]
+    async fn a_finished_agent_run_records_its_tools_its_peak_and_whether_it_compacted() {
+        let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        // A stream that climbs to 190k, compacts, and ends at 40k.
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: [
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":189000},"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":500,"cache_read_input_tokens":39500},"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.rs"}}]}}"#,
+            ]
+            .join("
+"),
+            stderr: String::new(),
+            session_id: Some("pressure-session".into()),
+            cost_usd: Some(0.02),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: Some(2),
+            compacted: true,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "measure the pressure").await;
+
+        for _ in 0..40 {
+            if get_run_status(&app, created.id).await.status == "completed" {
+                let measured: (Option<String>, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+                    "SELECT tools_used, context_peak, context_fill, compacted FROM runs WHERE id = ?",
+                )
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                let (tools, peak, fill, compacted) = measured;
+
+                let tools: Vec<serde_json::Value> =
+                    serde_json::from_str(&tools.expect("tools_used written")).unwrap();
+                assert_eq!(tools.len(), 2, "the two calls the stream made");
+                assert_eq!(peak, Some(190_000), "the peak");
+                assert_eq!(fill, Some(40_000), "the end — and why both columns exist");
+                assert_eq!(compacted, 1, "it compacted, and the column has to say so");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run did not reach completed status in time");
     }
 
     #[tokio::test]
