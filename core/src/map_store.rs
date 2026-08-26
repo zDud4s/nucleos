@@ -257,12 +257,15 @@ pub struct Stamp {
     /// now, and a copy in this column would be a second place for it to be wrong — and the one that
     /// goes stale, because a project can gain a repository and this row cannot notice.
     ///
-    /// **`0118`'s own header still lists *no repository* among the things NULL means, and it is
-    /// wrong; this paragraph is the correction.** It is not fixed in the SQL because `sqlx::migrate!`
-    /// checksums that file byte for byte and a migration that has already run somewhere would then
-    /// panic with `Migrate(VersionMismatch)` — the trap `.gitattributes` and `0115`'s header both
-    /// describe. Correcting a comment is not worth a daemon that will not start, so the correction
-    /// lives here, where the type that enforces it is.
+    /// **`0118`'s header briefly listed *no repository* among the things NULL means, which A6 made
+    /// wrong; it says `''` now.** Editing an applied migration is normally forbidden — `sqlx::migrate!`
+    /// checksums the file byte for byte and one that has already run panics with
+    /// `Migrate(VersionMismatch)`, the trap `.gitattributes` and `0115`'s header both describe, and
+    /// which this feature has already sprung twice on the numbering alone. It was safe here only
+    /// because `0118` had **never been applied**: checked against
+    /// `%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db` on 2026-08-26, whose `_sqlx_migrations`
+    /// stopped at `117 map decisions`. `0117` is applied and must never be touched. **Check before
+    /// editing any migration; do not infer from this one that it is allowed.**
     pub code_digest: Option<String>,
     pub note: Option<String>,
 }

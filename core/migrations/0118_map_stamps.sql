@@ -75,15 +75,23 @@ CREATE TABLE map_stamps (
 
   -- The anchor code as it stood at this instant: one line per anchor file, `<git-blob-sha> <path>`,
   -- sorted by path. The git blob hashes and not a hash of the bytes on disk (§7), so the stamp
-  -- expires at the commit rather than at every keystroke; and the canonical TEXT rather than a hash
+  -- expires at a `git add` rather than at every keystroke; and the canonical TEXT rather than a hash
   -- of it, because §7 requires a lapsed decision to show WHAT moved, and a scalar can only say that
   -- something did.
   --
-  -- NULL is *this daemon could not compute one* — no repository, git unavailable, `run_git` failed.
-  -- `''` is *computed, and there are no readable anchors to watch*, which is a fact about the
-  -- decision and not about the moment, and is what yields a stamp that can never expire. Anything
-  -- else is the digest. Nothing may collapse the first two: see the header, and note that an
+  -- NULL is *this daemon could not compute one* — git unavailable, or `run_git` failed. `''` is
+  -- *computed, and there is nothing readable to watch*, which is a fact about the decision and not
+  -- about the moment, and is what yields a stamp that can never expire. Anything else is the
+  -- digest. Nothing may collapse the first two: see the header, and note that an
   -- `unwrap_or_default()` on the way out is all it would take.
+  --
+  -- **A folder that is not a git repository stores `''`, not NULL** — §11's project added from
+  -- outside is an ordinary case rather than a failure, and there really is nothing there to watch,
+  -- for ever. Answering NULL would have made `settled` unstampable on exactly the projects §11 says
+  -- must still get an honest answer, and would have had the route tell their owner *try again* about
+  -- something that can never succeed. `map_stamp::Anchors` is the three-way split that keeps the
+  -- permanent case apart from the transient one, and `map_stamp::Watch::NoRepository` is what the
+  -- reader sees.
   code_digest  TEXT,
 
   -- What the owner wanted to say. NULL where they said nothing, which is allowed on `settled` and
