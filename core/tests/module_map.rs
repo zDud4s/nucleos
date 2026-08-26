@@ -1,10 +1,46 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The package this test is *running in*, checked against the one it was *compiled in*.
+///
+/// **`env!("CARGO_MANIFEST_DIR")` is baked at compile time, and with a shared target directory that
+/// makes it a claim about a different checkout.** `CARGO_HOME/config.toml` on this machine points
+/// every crate at `C:/Projects/.cargo-target`, so a `module_map-<hash>.exe` compiled inside a
+/// worktree is reused by the main checkout whenever the hashes line up. That binary looks for
+/// `AGENTS.md` under the *worktree's* `core/`, does not find it — no worktree has one — takes the
+/// early return below, and reports PASS having checked nothing.
+///
+/// **Measured 2026-08-26, and it had already happened.** The shared `deps/` held two binaries at
+/// once: `module_map-fbe301874ed541e2.exe` with `C:\Projects\nucleos\core` baked in, and
+/// `module_map-71f5cbac06dd4edb.exe` with `C:\Projects\nucleos-conversas\core`. Which one cargo
+/// runs is invisible from the output, so the gate was a coin flip that always looked green — and
+/// `map_stamp.rs` landed with no row in the map while this test said everything was fine.
+///
+/// That is the exact shape of the false confidence the project-map feature exists to cure, sitting
+/// inside this repository's own gate. So the mismatch is an ASSERTION and not a fallback: a test
+/// that quietly reads another checkout's files is worse than one that refuses to run.
+///
+/// Cargo sets the working directory of an integration test to the package root, so
+/// `current_dir` is the honest answer to *which checkout am I looking at*.
+fn package_root() -> PathBuf {
+    let built_in = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let running_in = std::env::current_dir().expect("the working directory should be readable");
+    assert_eq!(
+        built_in,
+        running_in.as_path(),
+        "this test binary was compiled in {} and is running in {} — a shared target directory has \
+         handed this checkout a binary built somewhere else, so every path below would name the \
+         other checkout's files. Touch this file to force a rebuild.",
+        built_in.display(),
+        running_in.display(),
+    );
+    running_in
+}
 
 #[test]
 fn the_module_map_matches_the_files_on_disk() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = package_root();
     let map_path = manifest_dir.join("AGENTS.md");
 
     // AGENTS.md is ignored, so its absence means this checkout does not carry the map to check.
@@ -14,7 +50,25 @@ fn the_module_map_matches_the_files_on_disk() {
     // happens to run from a worktree and RED from the checkout — intermittent-looking, entirely
     // deterministic, and nothing in the output says which of the two just happened. A red here is
     // never a race: it is two modules added without a row, and the fix is to write the rows.
+    //
+    // **Only a worktree may take it, and that is now checked rather than assumed.** A worktree's
+    // `.git` is a FILE pointing at the real directory; the main checkout's is a directory. So the
+    // one place that must never skip this gate cannot: a main checkout missing the map fails here
+    // instead of passing in silence. Without this the return is unfalsifiable — it is indeed
+    // correct for a worktree, and it was also covering the case above.
     if !map_path.exists() {
+        let git = manifest_dir
+            .parent()
+            .expect("the package root should have a parent")
+            .join(".git");
+        assert!(
+            git.is_file(),
+            "{} has no AGENTS.md and {} is not a worktree's .git file, so this is the main \
+             checkout and the module map is simply missing. Skipping here would report a gate as \
+             green that checked nothing.",
+            manifest_dir.display(),
+            git.display(),
+        );
         return;
     }
 
@@ -82,7 +136,11 @@ fn the_module_map_matches_the_files_on_disk() {
 /// module and the thing being forbidden is calling it directly.
 #[test]
 fn nothing_sets_the_worktree_root_without_restoring_it() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // `package_root` and not `env!`, for the reason it documents: `src/` exists in every worktree,
+    // so this test would not have gone red on a binary built elsewhere — it would have read the
+    // other checkout's modules and reported on those. Quieter than the map check's failure and the
+    // same defect.
+    let src = package_root().join("src");
     let mut offenders = Vec::new();
 
     for entry in fs::read_dir(&src).expect("the source directory should be readable") {
