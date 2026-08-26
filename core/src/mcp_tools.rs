@@ -268,6 +268,12 @@ struct ProposeActionParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ReportParams {
+    /// What to tell the owner, in your own words. It travels verbatim.
+    body: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct TeamNoteParams {
     /// Which colleague, by the id on the left of their line in your department's roster.
     to: String,
@@ -468,6 +474,24 @@ impl NucleosTools {
         Parameters(ProposeActionParams { kind, payload, why }): Parameters<ProposeActionParams>,
     ) -> String {
         json_result(self.client.propose_action(&kind, &payload, &why).await)
+    }
+
+    #[tool(
+        description = "Say something to the owner, now, in the conversation this department was \
+                       pointed at when it was started. Use it for what will not keep until the \
+                       delivery: a source that turned out to be dead, work that is already done \
+                       somewhere else, a request that cannot mean what it appears to mean. It is \
+                       SHOWN and not answered — no turn starts, nobody replies, and you must not \
+                       wait for anything. You cannot choose where it goes; there is one \
+                       conversation or there is none, and if this department was not pointed at one \
+                       you will be told so and should put it in your delivery instead. Only a \
+                       director may call this: a department speaks to its owner with one voice."
+    )]
+    async fn report_to_owner(
+        &self,
+        Parameters(ReportParams { body }): Parameters<ReportParams>,
+    ) -> String {
+        json_result(self.client.report_to_owner(&body).await)
     }
 
     #[tool(
@@ -1470,6 +1494,7 @@ pub const TEAM_TOOLS: &[&str] = &[
     // act on — which is better than hiding the tool from a list the two nodes share.
     "propose_teammate",
     "read_team_file",
+    "report_to_owner",
     "send_team_note",
     "web_read",
     "web_search",
@@ -1685,6 +1710,28 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // the laundering path on both the CLI and the local dispatcher, since both consult this same
     // table. `send_to_chat` never reaching `LOCAL_TOOLS` or `TEAM_TOOLS` narrows WHO can call it;
     // this line is what makes calling it safe for the callers who can.
+    // `WritesOwn`, and the argument for it is not the one `send_team_note` makes below — this one
+    // does reach outside the department, to a PERSON, which is exactly where `send_to_chat` earns
+    // its `Acts`.
+    //
+    // What separates them is that a department ALREADY speaks to its owner, without any barrier at
+    // all: the delivery is a document the owner opens and reads, written by a director that has been
+    // reading the folder, the web and its colleagues' answers all along. Grading this `Acts` would
+    // put a lock on a side door standing beside an open main one — and it would bite constantly
+    // rather than rarely, because the delivery node is told in its own prompt to read files with
+    // `read_team_file`, which taints it. The tool would be offered to a director and refused to it
+    // in the same breath, on nearly every run.
+    //
+    // What actually protects the owner here is not a grading but ATTRIBUTION: the words are drawn
+    // quoted, named, and marked as a department's, never as the conversation's own. A person weighing
+    // a message they can see the source of is the mechanism; a taint flag on a channel whose audience
+    // is human would be theatre.
+    //
+    // The audience is the whole of it. Nothing runs, nothing is spent, and no model reads this — a
+    // notice is deliberately absent from `recent_exchanges` and from the CLI's resumed session, so
+    // there is no context for a stranger's words to be laundered INTO. That is what makes this a
+    // report rather than a relay, and it is why `send_to_chat` one line down keeps its `Acts`.
+    ("report_to_owner", ToolEffect::WritesOwn),
     // `WritesOwn` and NOT `Acts`, and the line below it is the reason the two differ. Both put words
     // in front of a model that did not write them; what separates them is what that model can then
     // do. `send_to_chat` lands in a conversation a PERSON reads, whose next turn holds the whole
@@ -1933,6 +1980,11 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "propose_teammate" => {
                 self.tools
                     .propose_teammate(Parameters(parsed!(ProposeTeammateParams)))
+                    .await
+            }
+            "report_to_owner" => {
+                self.tools
+                    .report_to_owner(Parameters(parsed!(ReportParams)))
                     .await
             }
             // No `spend_is_permitted` guard, for `propose_action`'s reason: leaving words for a
@@ -2724,6 +2776,7 @@ mod tests {
                 "propose_teammate",
                 "read_team_file",
                 "reject_proposal",
+                "report_to_owner",
                 // The pair a reader will want to tell apart, and they are next to each other by
                 // accident of the alphabet rather than by kinship. `send_team_note` is
                 // `WritesOwn` and reaches another node of the caller's own department;

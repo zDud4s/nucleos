@@ -55,6 +55,7 @@ import {
   type Turn,
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
+import { type ChatNotice } from "../data/chats";
 import {
   anyTurnLive,
   marksBetween,
@@ -384,6 +385,10 @@ function chatRowLabel(row: ChatSummary, live: boolean): string {
   // it: one is their own conversation answering, the other is a different one pulling them in.
   const relayed = row.relayed_waiting ?? 0;
   if (relayed > 0) parts.push(`${relayed} from another conversation`);
+  // Said as its own clause and not added to the number above it, because it IS its own axis: a
+  // department speaking is not the conversation answering, and nothing ran for it.
+  const said = row.notices_waiting ?? 0;
+  if (said > 0) parts.push(`${said} from a department`);
   return parts.join(", ");
 }
 
@@ -400,6 +405,15 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
         <Badge tone={row.brain === "local" ? "active" : "info"}>{row.brain}</Badge>
         {row.cwd !== null && <span className="chats-row-cwd">{row.cwd}</span>}
         {live && <span className="chats-row-live">thinking…</span>}
+        {(row.notices_waiting ?? 0) > 0 && (
+          <span
+            className="chats-row-said"
+            aria-hidden="true"
+            title={`${row.notices_waiting} said by a department you set going`}
+          >
+            {row.notices_waiting}
+          </span>
+        )}
         {row.waiting > 0 && (
           <span
             className={
@@ -753,6 +767,7 @@ function ChatDetail({
       {transcript.data !== undefined && (
         <Transcript
           turns={transcript.data.turns}
+          notices={transcript.data.notices}
           precededBy={(pickedUp.data?.said ?? []).length > 0}
           chatId={chatId}
         />
@@ -1469,10 +1484,12 @@ function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
 
 function Transcript({
   turns,
+  notices,
   precededBy,
   chatId,
 }: {
   turns: Turn[];
+  notices: ChatNotice[];
   precededBy: boolean;
   chatId: string;
 }) {
@@ -1494,22 +1511,103 @@ function Transcript({
 
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
-  if (turns.length === 0 && precededBy) return null;
-  if (turns.length === 0) return <p className="chats-empty">nothing has been said yet.</p>;
+  //
+  // A conversation holding only departmental reports is NOT empty, which is why `notices` counts
+  // here. It is the shape of a conversation somebody opened, set a department going from, and has
+  // not typed in since — and telling them nothing has been said over a screen of what a department
+  // told them would be the window contradicting itself.
+  if (turns.length === 0 && notices.length === 0 && precededBy) return null;
+  if (turns.length === 0 && notices.length === 0) {
+    return <p className="chats-empty">nothing has been said yet.</p>;
+  }
   return (
     <>
       <ul className="chats-turns" aria-label="Transcript">
-        {turns.map((turn, index) => (
-          <TurnBlock
-            key={turn.id}
-            turn={turn}
-            previous={index === 0 ? null : turns[index - 1]}
-            chatId={chatId}
-          />
-        ))}
+        {interleave(turns, notices).map((entry, index, all) =>
+          entry.kind === "notice" ? (
+            <DepartmentSaid key={`notice-${entry.notice.id}`} notice={entry.notice} />
+          ) : (
+            <TurnBlock
+              key={entry.turn.id}
+              turn={entry.turn}
+              previous={previousTurn(all, index)}
+              chatId={chatId}
+            />
+          ),
+        )}
       </ul>
       <div ref={end} className="chats-turns-end" />
     </>
+  );
+}
+
+/** One thing on the transcript: a turn, or a department speaking. */
+type Entry = { kind: "turn"; turn: Turn; at: string } | { kind: "notice"; notice: ChatNotice; at: string };
+
+/**
+ * PURE: the two lists in one, oldest first.
+ *
+ * By `created_at` and not by id, because the two come from different tables with independent
+ * sequences — notice 1 and turn 900 say nothing about which happened first. Ties break toward the
+ * TURN, so a department reporting in the same second a turn landed reads as a remark on it rather
+ * than as something the turn was answering; nothing was answering it either way, and one of the two
+ * orders is less misleading.
+ *
+ * A stable sort, which `Array.prototype.sort` is required to be, so two notices written in the same
+ * second keep the order they were written in.
+ */
+function interleave(turns: Turn[], notices: ChatNotice[]): Entry[] {
+  const entries: Entry[] = [
+    ...turns.map((turn): Entry => ({ kind: "turn", turn, at: turn.createdAt })),
+    ...notices.map((notice): Entry => ({ kind: "notice", notice, at: notice.created_at })),
+  ];
+  return entries.sort((left, right) => {
+    if (left.at !== right.at) return left.at < right.at ? -1 : 1;
+    if (left.kind === right.kind) return 0;
+    return left.kind === "turn" ? -1 : 1;
+  });
+}
+
+/**
+ * PURE: the turn a turn follows, skipping whatever a department said in between.
+ *
+ * `TurnBlock` uses its predecessor to decide which marks to draw above itself — a change of brain, a
+ * restart, a rotated context — and all of those are facts about consecutive TURNS. Passing it a
+ * notice, or the turn before a notice as though nothing intervened, are both wrong; only the first
+ * is a type error, which is why this exists rather than an index arithmetic at the call site.
+ */
+function previousTurn(all: Entry[], index: number): Turn | null {
+  for (let at = index - 1; at >= 0; at -= 1) {
+    const entry = all[at];
+    if (entry.kind === "turn") return entry.turn;
+  }
+  return null;
+}
+
+/**
+ * What a department said here, drawn as a message and never as a turn.
+ *
+ * **Attributed, always, and that is the whole of what protects the reader.** The words come from an
+ * agent that may have been reading the web all afternoon, and nothing filtered them: the tool that
+ * writes one is graded `WritesOwn` precisely because a department ALREADY speaks to its owner
+ * through its delivery, unfiltered, so a barrier on this door would have stood beside an open one.
+ * What replaces the barrier is the reader being able to see whose words these are — so the source
+ * is not a tooltip and not a hover, it is on the line.
+ *
+ * No answer, no cost, no status. A notice has none of those and drawing a turn's chrome around it
+ * would be claiming a run that does not exist — the same reason `queued` is not drawn as a turn.
+ */
+function DepartmentSaid({ notice }: { notice: ChatNotice }) {
+  return (
+    <li className="chats-notice">
+      <p className="chats-notice-who">
+        <Link className="chats-notice-from" to={`/teams/runs/${notice.team_run_id}`}>
+          {notice.from_agent_id}
+        </Link>{" "}
+        said this while working
+      </p>
+      <p className="chats-notice-body">{notice.body}</p>
+    </li>
   );
 }
 

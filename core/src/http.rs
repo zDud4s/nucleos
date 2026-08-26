@@ -145,6 +145,10 @@ pub fn build_router(state: AppState) -> Router {
         // let a specialist read every note of the run would hand it the conversation it was
         // deliberately not part of.
         .route("/team-notes", post(crate::team::post_team_note))
+        // POST only, again, and here the absent GET matters more: a department that could READ the
+        // conversation it reports into would be reading the owner's chat. It may speak there and it
+        // may not listen.
+        .route("/team-reports", post(crate::team::post_team_report))
         // All Control, and NONE of them in `auth::TEAM_ROUTES`. A department neither arms nor fires
         // a rule, and that is not an oversight: it is what stops a chain feeding itself underneath
         // the graph the cycle check walks.
@@ -4069,6 +4073,13 @@ struct TranscriptOut {
     /// turn is live, which is exactly when a question can appear — a route of its own would need a
     /// second poll at the same speed to say "nothing" almost every time.
     asks: Vec<crate::hooks::Ask>,
+    /// What departments said in this conversation, oldest first. Empty for almost every chat.
+    ///
+    /// A list of its own beside `turns` rather than folded into them, because a notice is not a
+    /// turn: nothing was asked, nothing ran, nothing was spent, and there is no answer. Giving it a
+    /// turn's shape would mean inventing a prompt nobody typed. The window interleaves the two by
+    /// `created_at`, which is the only place the two orders have to meet.
+    notices: Vec<crate::chat_notices::ChatNotice>,
 }
 
 /// How many turns of a conversation are read back. A chat is read from its recent end.
@@ -4545,6 +4556,12 @@ async fn get_assistant_chat(
         handed,
         queued,
         asks: crate::hooks::asks_for(&chat_id),
+        // Empty on a failure rather than a 500, the same trade the two reads above make: a
+        // transcript is the point of this request, and losing a department's aside is a smaller loss
+        // than a conversation that will not open.
+        notices: crate::chat_notices::for_chat(&state.pool, &chat_id)
+            .await
+            .unwrap_or_default(),
         turns: turns
             .into_iter()
             .map(|turn| {

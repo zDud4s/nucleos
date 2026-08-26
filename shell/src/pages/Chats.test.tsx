@@ -29,6 +29,7 @@ import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
   Ask,
+  ChatNotice,
   ChatProject,
   ChatSummary,
   Command,
@@ -140,6 +141,8 @@ function chatsFetch(
     asks?: Record<string, Ask[]>;
     /** The path each relayed turn travelled, by turn id. */
     chains?: Record<number, Array<{ chat_id: string; title: string | null }>>;
+    /** What departments said in each conversation, by chat id. */
+    notices?: Record<string, ChatNotice[]>;
     /** Called with the destination and body of every forward the page posts. */
     onForward?: (toChatId: string, body: { from_turn_id: number; text: string }) => void;
     /**
@@ -241,6 +244,7 @@ function chatsFetch(
         handed: opts.handed?.[match[1]] ?? [],
         queued: opts.queued?.[match[1]] ?? [],
         asks: opts.asks?.[match[1]] ?? [],
+        notices: opts.notices?.[match[1]] ?? [],
         turns: transcripts[match[1]] ?? [],
       };
     }
@@ -569,6 +573,98 @@ describe("Chats - the sidebar tells a relay from an answer", () => {
     // where they came from, not about there being any.
     const ordinary = screen.getByRole("link", { name: /ali, cloud, 2 unread$/ });
     expect(ordinary).toBeDefined();
+  });
+});
+
+describe("Chats - what a department said", () => {
+  /** A report, with the fields the daemon actually sends. */
+  function notice(overrides: Partial<ChatNotice> = {}): ChatNotice {
+    return {
+      id: 1,
+      chat_id: "c-1",
+      team_run_id: "tr-1",
+      from_agent_id: "director",
+      from_run_id: 9,
+      body: "a fonte que deste está morta",
+      created_at: "2026-08-26T10:00:00Z",
+      ...overrides,
+    };
+  }
+
+  // The words and the source, both. A report drawn without a source reads as something the OWNER
+  // wrote — the exact failure the relay side already had once — and here it matters more: nothing
+  // filtered these words, because the tool that writes them is `WritesOwn` precisely so a
+  // department that read the web all afternoon can still speak.
+  it("draws the words and says which department said them", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([summary], { "c-1": [turnRow({ id: 1, answer: "feito" })] }, {
+        notices: { "c-1": [notice()] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("a fonte que deste está morta")).toBeDefined();
+    expect(within(transcript).getByRole("link", { name: "director" })).toBeDefined();
+  });
+
+  // Interleaved by the CLOCK and not by id: the two come from different tables with independent
+  // sequences, so notice 1 and turn 900 say nothing about which happened first. Asserted by DOM
+  // order, because that is the only thing a reader actually experiences.
+  it("puts a report where it happened, between the turns around it", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({ id: 1, asked: "primeira", answer: "uma", created_at: "2026-08-26T09:00:00Z" }),
+        turnRow({ id: 2, asked: "segunda", answer: "duas", created_at: "2026-08-26T11:00:00Z" }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([summary], transcripts, {
+        notices: { "c-1": [notice({ body: "no meio disto" })] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    const text = transcript.textContent ?? "";
+    expect(text.indexOf("uma")).toBeLessThan(text.indexOf("no meio disto"));
+    expect(text.indexOf("no meio disto")).toBeLessThan(text.indexOf("duas"));
+  });
+
+  // A conversation somebody opened, set a department going from, and has not typed in since. Saying
+  // "nothing has been said yet" over a screen of what a department told them is the window
+  // contradicting itself.
+  it("is not an empty conversation when only a department has spoken", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([summary], { "c-1": [] }, { notices: { "c-1": [notice()] } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText("a fonte que deste está morta")).toBeDefined();
+    expect(screen.queryByText("nothing has been said yet.")).toBeNull();
+  });
+
+  // Its own clause in the sidebar, never added to the unread count. A department speaking is not the
+  // conversation answering — nothing ran for it — and one number cannot say two things.
+  it("says out loud how many came from a department", async () => {
+    const chats = [
+      chatSummary({ chat_id: "c-1", title: "aqui", waiting: 2, notices_waiting: 1 }),
+      chatSummary({ chat_id: "c-2", title: "ali", waiting: 2, notices_waiting: 0 }),
+    ];
+    daemon.apiFetch.mockImplementation(chatsFetch(chats, {}));
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByRole("link", { name: /1 from a department/ })).toBeDefined();
+    // The count of turns is untouched by it: two unread answers are still two, not three.
+    expect(screen.getByRole("link", { name: /aqui, cloud, 2 unread, 1 from a department$/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /ali, cloud, 2 unread$/ })).toBeDefined();
   });
 });
 

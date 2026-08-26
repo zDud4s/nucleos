@@ -971,11 +971,23 @@ impl std::fmt::Display for StartError {
 /// the four things that cannot be discovered later without wasting money: a team with nobody in it,
 /// a director that was deleted, a local member on a machine with no local model, and a house budget
 /// that is already spent.
-pub async fn start(state: &AppState, team_id: &str, request: &str) -> Result<String, StartError> {
-    start_with(state, team_id, request, Lineage::default()).await
+pub async fn start(
+    state: &AppState,
+    team_id: &str,
+    request: &str,
+    report_to_chat_id: Option<&str>,
+) -> Result<String, StartError> {
+    start_with(
+        state,
+        team_id,
+        request,
+        Lineage::default(),
+        report_to_chat_id,
+    )
+    .await
 }
 
-/// `start`, for a caller that knows where the run came from.
+/// `start`, for a caller that knows where the run came from — and, now, where it should speak.
 ///
 /// One function and not two paths: a triggered run is an ordinary run with four columns filled in,
 /// and every refusal above applies to it unchanged. What a trigger adds — the depth, the tree
@@ -986,10 +998,30 @@ pub async fn start_with(
     team_id: &str,
     request: &str,
     lineage: Lineage,
+    report_to_chat_id: Option<&str>,
 ) -> Result<String, StartError> {
     let request = request.trim();
     if request.is_empty() {
         return Err(StartError::Invalid("the request is empty".to_owned()));
+    }
+
+    // Refused HERE and not when the department first tries to speak. A destination that does not
+    // exist is a mistake by whoever started the run, and they are present, at a keyboard, right now;
+    // discovering it two hours later means the refusal reaches a director mid-turn instead — which
+    // can do nothing about it except write the words into a delivery nobody asked for.
+    //
+    // `chats::brain_of` rather than a second `archived_at IS NULL` clause, for `relay::admit`'s
+    // reason: "still there" has exactly one definition in this codebase and this is not a second.
+    if let Some(chat_id) = report_to_chat_id {
+        let lives = crate::chats::brain_of(&state.pool, chat_id)
+            .await
+            .map_err(|error| StartError::Unavailable(error.to_string()))?
+            .is_some();
+        if !lives {
+            return Err(StartError::Invalid(format!(
+                "there is no conversation `{chat_id}` for this department to report in"
+            )));
+        }
     }
 
     let team = get(&state.pool, team_id)
@@ -1062,8 +1094,9 @@ pub async fn start_with(
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO team_runs (id, team_id, request, workspace, token, state, created_at,
-                                updated_at, trigger_id, parent_id, root_id, depth)
-         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
+                                updated_at, trigger_id, parent_id, root_id, depth,
+                                report_to_chat_id)
+         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&team.team.id)
@@ -1079,6 +1112,9 @@ pub async fn start_with(
     // is a tree ceiling read off the wrong run.
     .bind(lineage.root_id.as_deref().unwrap_or(&id))
     .bind(lineage.depth)
+    // NULL for nearly every run, which is what makes a department that reports nowhere behave
+    // exactly as it did before this column existed.
+    .bind(report_to_chat_id)
     .execute(&state.pool)
     .await
     .map_err(|error| StartError::Unavailable(error.to_string()))?;
@@ -1243,6 +1279,176 @@ pub struct ProposeActionResponse {
     pub id: i64,
     pub proposal_id: Option<i64>,
     pub outcome: String,
+}
+
+/// How many times one run may speak to its owner unbidden.
+///
+/// `MAX_ROUNDS_CEILING` director nodes plus the delivery is seven — the most nodes that could ever
+/// have something to say — and eight leaves one over. It is a belt rather than a brake: what
+/// actually bounds this is that only a DIRECTOR may report and a run has a small, fixed number of
+/// director nodes.
+pub const MAX_REPORTS_PER_RUN: i64 = 8;
+
+/// A department saying something to its owner.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReportRequest {
+    pub body: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ReportResponse {
+    pub id: i64,
+    pub outcome: String,
+}
+
+/// Why a department could not speak. Every variant is handed to the AGENT, mid-turn.
+#[derive(Debug)]
+pub enum ReportError {
+    /// Not a `Scope::TeamRun` at all.
+    NotADepartment,
+    /// The run named by the key is gone.
+    NoSuchRun,
+    /// A specialist tried. A department speaks to its owner with one voice, and the sentence says
+    /// what to do instead — the same shape `propose_teammate` uses for the same refusal.
+    NotTheDirector,
+    /// This run was not pointed at a conversation, which is the ordinary state of nearly every run
+    /// and therefore not an error to be retried. Named on its own so the sentence can say so.
+    NowhereToReport,
+    /// It was pointed at one and that conversation has since been archived. Distinct from
+    /// `NowhereToReport` because they lead somewhere different: one means this department was never
+    /// given a voice, the other that the room it was given has been closed.
+    DestinationGone(String),
+    /// Nothing to say.
+    Empty,
+    /// This run has spoken as often as it may.
+    Ceiling(i64),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ReportError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl std::fmt::Display for ReportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotADepartment => {
+                formatter.write_str("only a department reports to the owner this way")
+            }
+            Self::NoSuchRun => formatter.write_str("no such team run"),
+            Self::NotTheDirector => formatter.write_str(
+                "only the director speaks for this department — put it in your answer and let the \
+                 director pass it on",
+            ),
+            Self::NowhereToReport => formatter.write_str(
+                "this department was not pointed at a conversation when it was started, so there is \
+                 nowhere to say this; put it in your delivery instead",
+            ),
+            Self::DestinationGone(chat_id) => write!(
+                formatter,
+                "the conversation `{chat_id}` this department was told to report in has been \
+                 archived; put it in your delivery instead"
+            ),
+            Self::Empty => formatter.write_str("say something, or say nothing at all"),
+            Self::Ceiling(ceiling) => write!(
+                formatter,
+                "this department has already spoken {ceiling} times this run, which is as many as \
+                 it may; put the rest in your delivery"
+            ),
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+/// A director says something in the conversation its run was pointed at. Nothing runs.
+///
+/// **The destination is read from the run and never from the request.** `team_runs.report_to_chat_id`
+/// is written when the run is started, by the person starting it; there is no parameter here, no
+/// tool that takes one, and no route a department could use to discover what conversations exist. A
+/// department cannot choose who it talks to — it can only answer to the address it was given.
+///
+/// **Only the director**, narrowed here against `team_runs.director_run_id` exactly as
+/// `propose_teammate` is, and for the same two reasons: a department speaks to its owner with one
+/// voice, and the key names the RUN rather than the node, so this cannot be a question for
+/// `auth::permits`.
+pub async fn report(
+    state: &AppState,
+    scope: &crate::auth::Scope,
+    headers: &axum::http::HeaderMap,
+    request: &ReportRequest,
+) -> Result<ReportResponse, ReportError> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err(ReportError::NotADepartment);
+    };
+
+    let body = request.body.trim();
+    if body.is_empty() {
+        return Err(ReportError::Empty);
+    }
+
+    let destination: Option<String> =
+        sqlx::query_scalar("SELECT report_to_chat_id FROM team_runs WHERE id = ?")
+            .bind(team_run_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or(ReportError::NoSuchRun)?;
+    let Some(chat_id) = destination else {
+        return Err(ReportError::NowhereToReport);
+    };
+
+    // The director check comes AFTER the destination one on purpose. A specialist calling this in a
+    // department that reports nowhere should be told the thing it can act on — there is nowhere to
+    // say this, put it in your answer — rather than a rule about who may speak that would not have
+    // helped it even if it were the director.
+    let Some((from_agent_id, from_run_id)) =
+        agent_of_caller(&state.pool, team_run_id, headers).await?
+    else {
+        return Err(ReportError::NotTheDirector);
+    };
+    if calling_node(&state.pool, team_run_id, headers).await != Caller::Director {
+        return Err(ReportError::NotTheDirector);
+    }
+
+    // Checked again here even though `start_with` refused an absent one: a run lasts up to four
+    // hours and a conversation can be archived inside that. Reported as its own refusal rather than
+    // written into a conversation nobody will open again.
+    if crate::chats::brain_of(&state.pool, &chat_id)
+        .await?
+        .is_none()
+    {
+        return Err(ReportError::DestinationGone(chat_id));
+    }
+
+    let said: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_notices WHERE team_run_id = ?")
+        .bind(team_run_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if said >= MAX_REPORTS_PER_RUN {
+        return Err(ReportError::Ceiling(MAX_REPORTS_PER_RUN));
+    }
+
+    let id = crate::chat_notices::post(
+        &state.pool,
+        &chat_id,
+        team_run_id,
+        &from_agent_id,
+        from_run_id,
+        body,
+    )
+    .await?;
+
+    Ok(ReportResponse {
+        id,
+        // Says the part a model would otherwise assume away: it was SHOWN, not answered. A director
+        // that believes it has started a conversation waits for a reply that is never coming, and
+        // spends its remaining turns waiting.
+        outcome:
+            "shown to the owner. Nobody will answer it — it is a message on their screen, not \
+                  a question — so carry on, and put anything that matters in your delivery as well."
+                .to_owned(),
+    })
 }
 
 /// One member of a department leaving words for another.
@@ -3707,6 +3913,13 @@ pub async fn delete_team(
 #[derive(serde::Deserialize)]
 pub struct StartRequest {
     pub request: String,
+    /// Where this run may speak while it works, or nothing.
+    ///
+    /// Optional, and absent on nearly every start: a department that reports nowhere behaves exactly
+    /// as it did before this existed. Given here rather than configured on the team, so the address
+    /// belongs to THIS piece of work and is chosen by the person starting it.
+    #[serde(default)]
+    pub report_to_chat_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -3721,7 +3934,14 @@ pub async fn post_team_run(
     Path(id): Path<String>,
     Json(body): Json<StartRequest>,
 ) -> Result<(StatusCode, Json<StartResponse>), (StatusCode, String)> {
-    match start(&state, &id, &body.request).await {
+    match start(
+        &state,
+        &id,
+        &body.request,
+        body.report_to_chat_id.as_deref(),
+    )
+    .await
+    {
         Ok(id) => Ok((StatusCode::ACCEPTED, Json(StartResponse { id }))),
         Err(error @ StartError::NotFound) => Err((StatusCode::NOT_FOUND, error.to_string())),
         Err(error @ StartError::Invalid(_)) => Err((StatusCode::BAD_REQUEST, error.to_string())),
@@ -3970,6 +4190,42 @@ pub async fn post_team_note(
                 // is the part that governs what the model does next.
                 NoteError::Ceiling(_) => StatusCode::TOO_MANY_REQUESTS,
                 NoteError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
+        })
+}
+
+/// `POST /team-reports` — a department says something to its owner, and nothing runs.
+///
+/// The fourth and last route of this scope, and the only one that reaches outside the department at
+/// all. It is still a SAYING rather than a DOING, which is the rule `auth::TEAM_ROUTES` keeps: no
+/// turn starts, nothing is spent, and the daemon picks the destination out of a column the
+/// department can neither read nor set.
+///
+/// 403 for a specialist, with the sentence that says what to do instead — `post_team_recruit`'s
+/// shape, because a model reading only the code would retry.
+pub async fn post_team_report(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ReportRequest>,
+) -> Result<Json<ReportResponse>, (StatusCode, String)> {
+    report(&state, &scope, &headers, &request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = match &error {
+                ReportError::NotADepartment | ReportError::NotTheDirector => StatusCode::FORBIDDEN,
+                ReportError::NoSuchRun => StatusCode::NOT_FOUND,
+                // 409 for both, and not 404: the run exists and so does the request. What is absent
+                // is a place to speak — either never given or since closed — and neither is fixed by
+                // asking again differently, which is what a 4xx about the REQUEST would suggest.
+                ReportError::NowhereToReport | ReportError::DestinationGone(_) => {
+                    StatusCode::CONFLICT
+                }
+                ReportError::Empty => StatusCode::UNPROCESSABLE_ENTITY,
+                ReportError::Ceiling(_) => StatusCode::TOO_MANY_REQUESTS,
+                ReportError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (status, error.to_string())
         })
@@ -4622,7 +4878,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        start(state, "marketing", "write the launch post")
+        start(state, "marketing", "write the launch post", None)
             .await
             .unwrap()
     }
@@ -4660,7 +4916,7 @@ mod tests {
     async fn a_department_with_no_alcada_may_ask_for_nothing() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "write the launch post")
+        let run_id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -4970,7 +5226,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let support_run = start(&state, "support", "answer the backlog")
+        let support_run = start(&state, "support", "answer the backlog", None)
             .await
             .unwrap();
         ask(&state, &support_run, "send_email", an_email())
@@ -5219,6 +5475,254 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
+    // Reporting to the owner
+    // -----------------------------------------------------------------------------------------
+
+    /// Reports as one node of a run, through the same surface the route uses.
+    async fn report_from(
+        state: &AppState,
+        team_run_id: &str,
+        run_id: i64,
+        body: &str,
+    ) -> Result<ReportResponse, ReportError> {
+        report(
+            state,
+            &crate::auth::Scope::TeamRun(team_run_id.to_owned()),
+            &as_node(run_id),
+            &ReportRequest {
+                body: body.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Starts a department pointed at a conversation, and hands back both ids.
+    async fn run_reporting_into(state: &AppState) -> (String, String) {
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let id = start_with(
+            state,
+            "marketing",
+            "write the launch post",
+            Lineage::default(),
+            Some(&chat_id),
+        )
+        .await
+        .unwrap();
+        (id, chat_id)
+    }
+
+    /// The whole of part B: a director says something, and it is in the conversation, attributed.
+    ///
+    /// Asserted on `chat_notices` and on the unread count rather than on a return value, because
+    /// what this feature promises is that a person sitting in that conversation is CALLED BACK to
+    /// it. A row nobody is told about is the same as no row.
+    #[tokio::test]
+    async fn what_a_director_says_lands_in_the_conversation_and_calls_the_owner_back() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, chat_id) = run_reporting_into(&state).await;
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        report_from(
+            &state,
+            &id,
+            director_run,
+            "a fonte que deste está morta desde Março",
+        )
+        .await
+        .expect("a director may speak in the conversation its run was pointed at");
+
+        let told = crate::chat_notices::for_chat(&state.pool, &chat_id)
+            .await
+            .unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].body, "a fonte que deste está morta desde Março");
+        assert_eq!(told[0].from_agent_id, "director");
+        assert_eq!(told[0].team_run_id, id);
+
+        assert_eq!(
+            crate::chats::get(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .expect("the conversation exists")
+                .notices_waiting,
+            1,
+            "the department spoke and nothing called the owner back to the conversation"
+        );
+
+        // And nothing ran. This is the line that separates a report from a relay: `send_to_chat`
+        // would have started a turn here, spent money, and been refused outright if the owner were
+        // away.
+        let turns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE chat_id = ? AND mode = 'assistant'",
+        )
+        .bind(&chat_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(turns, 0, "a report started a turn, which makes it a relay");
+    }
+
+    /// A specialist is refused, and told what to do instead.
+    ///
+    /// A department speaks to its owner with one voice: eight specialists reporting into a
+    /// conversation are eight interruptions about one piece of work.
+    #[tokio::test]
+    async fn a_specialist_may_not_speak_for_the_department() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, chat_id) = run_reporting_into(&state).await;
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        let refusal = report_from(&state, &id, copywriter_run, "eu acho que...")
+            .await
+            .expect_err("a specialist spoke for the whole department");
+
+        assert!(matches!(refusal, ReportError::NotTheDirector));
+        assert!(
+            refusal.to_string().contains("let the director pass it on"),
+            "the refusal did not say what to do with the finding: {refusal}"
+        );
+        assert!(
+            crate::chat_notices::for_chat(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A department nobody pointed anywhere is told so, plainly, and it is not an error.
+    ///
+    /// This is the ordinary state of nearly every run — `report_to_chat_id` is NULL unless somebody
+    /// filled it — so the sentence matters more than the code: a model that reads it should write
+    /// the words into its delivery, not retry.
+    #[tokio::test]
+    async fn a_department_pointed_nowhere_is_told_to_put_it_in_the_delivery() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        let refusal = report_from(&state, &id, director_run, "olha lá")
+            .await
+            .expect_err("a department with no destination spoke somewhere");
+
+        assert!(matches!(refusal, ReportError::NowhereToReport));
+        assert!(
+            refusal
+                .to_string()
+                .contains("put it in your delivery instead")
+        );
+    }
+
+    /// Naming a conversation that does not exist is refused when the RUN is started.
+    ///
+    /// Refused there and not two hours later: the mistake belongs to whoever started the run, and
+    /// they are at a keyboard now. A director discovering it mid-turn can do nothing about it.
+    #[tokio::test]
+    async fn a_department_cannot_be_pointed_at_a_conversation_that_is_not_there() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+
+        let refusal = start_with(
+            &state,
+            "marketing",
+            "write the launch post",
+            Lineage::default(),
+            Some("no-such-chat"),
+        )
+        .await
+        .expect_err("a department was pointed at a conversation that does not exist");
+
+        assert!(matches!(refusal, StartError::Invalid(_)));
+        assert!(refusal.to_string().contains("no-such-chat"));
+    }
+
+    /// A conversation archived while the department worked is refused mid-run, on its own line.
+    ///
+    /// Distinct from `NowhereToReport` because the two lead somewhere different: never given a
+    /// voice, versus given a room that has since been closed. A run lasts up to four hours and a
+    /// conversation can be put away inside that, so this is not a hypothetical.
+    #[tokio::test]
+    async fn a_conversation_put_away_mid_run_is_named_as_such() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, chat_id) = run_reporting_into(&state).await;
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        crate::chats::archive(&state.pool, &chat_id).await.unwrap();
+
+        let refusal = report_from(&state, &id, director_run, "tarde demais")
+            .await
+            .expect_err("a department spoke into an archived conversation");
+
+        assert!(matches!(refusal, ReportError::DestinationGone(_)));
+        assert!(refusal.to_string().contains(&chat_id));
+    }
+
+    /// A department that only talks is stopped, and told where the rest goes.
+    #[tokio::test]
+    async fn a_department_may_not_fill_a_conversation_with_its_own_voice() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, _chat_id) = run_reporting_into(&state).await;
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        for _ in 0..MAX_REPORTS_PER_RUN {
+            report_from(&state, &id, director_run, "mais uma")
+                .await
+                .expect("under the ceiling");
+        }
+
+        let refusal = report_from(&state, &id, director_run, "e mais uma")
+            .await
+            .expect_err("a department spoke past its ceiling");
+        assert!(matches!(refusal, ReportError::Ceiling(_)));
+        assert!(
+            refusal
+                .to_string()
+                .contains("put the rest in your delivery")
+        );
+    }
+
+    /// A rule that fires when nobody is asking points its run at no conversation.
+    ///
+    /// The one place this could have gone wrong quietly: `team_trigger::fire` passes `None`, so a
+    /// department started by a cron rule at four in the morning has nowhere to speak and says so —
+    /// rather than inheriting an address from a conversation nobody is in.
+    #[tokio::test]
+    async fn a_triggered_run_speaks_nowhere() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start_with(
+            &state,
+            "marketing",
+            "the nightly sweep",
+            Lineage {
+                trigger_id: Some(1),
+                parent_id: None,
+                root_id: None,
+                depth: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let destination: Option<String> =
+            sqlx::query_scalar("SELECT report_to_chat_id FROM team_runs WHERE id = ?")
+                .bind(&id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(destination.is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Notes between colleagues
     // -----------------------------------------------------------------------------------------
 
@@ -5266,7 +5770,7 @@ mod tests {
     async fn what_one_specialist_tells_another_is_at_the_top_of_their_next_brief() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5334,7 +5838,7 @@ mod tests {
     async fn a_node_handed_a_colleagues_words_is_born_having_read_them() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5426,7 +5930,7 @@ mod tests {
     async fn a_note_is_signed_by_the_node_that_made_the_call() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5461,7 +5965,7 @@ mod tests {
     async fn a_specialist_can_tell_the_director_and_the_director_reads_it() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5516,7 +6020,7 @@ mod tests {
     async fn a_node_nobody_recognises_may_not_leave_an_unsigned_note() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         director_and_specialist(&state, &id).await;
@@ -5540,7 +6044,7 @@ mod tests {
     async fn a_name_off_the_roster_is_refused_with_the_roster_in_the_answer() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5568,7 +6072,7 @@ mod tests {
     async fn a_member_may_not_leave_a_note_for_itself() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5584,7 +6088,7 @@ mod tests {
     async fn a_department_that_only_talks_is_stopped_at_the_ceiling() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5619,7 +6123,7 @@ mod tests {
     async fn words_nobody_read_are_handed_to_the_delivery() {
         let (state, _root) = state_with_root().await;
         let team = marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
@@ -5648,7 +6152,7 @@ mod tests {
     async fn a_specialist_is_told_who_else_is_in_the_department() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let run = load_run(&state, &id).await;
@@ -5695,7 +6199,7 @@ mod tests {
     async fn only_the_director_recruits_and_a_specialist_hears_why_not() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, specialist_run) = director_and_specialist(&state, &run_id).await;
@@ -5736,7 +6240,7 @@ mod tests {
     async fn hiring_writes_the_agent_and_the_roster_together() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5792,7 +6296,7 @@ mod tests {
     async fn a_director_does_not_ask_for_the_same_person_twice() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5833,7 +6337,7 @@ mod tests {
     async fn a_department_that_asked_for_nobody_reads_the_prompt_it_always_did() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let run: TeamRun = sqlx::query_as(
@@ -5859,7 +6363,7 @@ mod tests {
     async fn a_name_already_in_the_catalogue_says_to_add_them_instead() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5890,7 +6394,7 @@ mod tests {
     async fn what_is_hired_is_what_the_owner_approved_and_not_what_was_proposed() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5961,7 +6465,7 @@ mod tests {
     async fn a_refused_recruitment_may_be_asked_for_again() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -6056,7 +6560,7 @@ mod tests {
         .await
         .expect("a half-built team is a legitimate thing to save");
 
-        let refusal = start(&state, "empty", "do some work").await;
+        let refusal = start(&state, "empty", "do some work", None).await;
         assert!(
             matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("no members")),
             "got {refusal:?}"
@@ -6088,7 +6592,7 @@ mod tests {
         .await
         .unwrap();
 
-        let refusal = start(&state, "local", "do some work").await;
+        let refusal = start(&state, "local", "do some work", None).await;
         assert!(
             matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("local model")),
             "got {refusal:?}"
@@ -6109,7 +6613,7 @@ mod tests {
             ..state
         };
 
-        let refusal = start(&state, "marketing", "write the launch post").await;
+        let refusal = start(&state, "marketing", "write the launch post", None).await;
         assert!(
             matches!(&refusal, Err(StartError::Unavailable(why)) if why.contains("files folder")),
             "got {refusal:?}"
@@ -6126,7 +6630,7 @@ mod tests {
         let (state, root) = state_with_root().await;
         marketing(&state).await;
 
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6167,7 +6671,7 @@ mod tests {
     async fn an_ordinal_is_unique_across_the_whole_run() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6225,7 +6729,7 @@ mod tests {
     async fn reconciliation_fails_the_items_a_dead_daemon_abandoned() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6270,7 +6774,7 @@ mod tests {
     async fn a_director_node_that_completed_unread_is_ingested_and_not_repeated() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6316,7 +6820,7 @@ mod tests {
     async fn ingesting_the_same_director_node_twice_does_not_advance_the_round_twice() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         sqlx::query("UPDATE team_runs SET state = 'working', round = 0 WHERE id = ?")
@@ -6377,7 +6881,7 @@ mod tests {
     async fn a_failed_specialist_does_not_stop_the_run() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         sqlx::query("UPDATE team_runs SET state = 'working' WHERE id = ?")
@@ -6436,7 +6940,7 @@ mod tests {
     async fn the_core_files_a_specialists_answer_under_a_name_it_chose() {
         let (state, root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6487,7 +6991,7 @@ mod tests {
                 now - chrono::Duration::days(TEAM_WORKSPACE_RETENTION_DAYS + 1),
             ),
         ] {
-            let id = start(&state, "marketing", id_hint).await.unwrap();
+            let id = start(&state, "marketing", id_hint, None).await.unwrap();
             sqlx::query("UPDATE team_runs SET state = 'done', finished_at = ? WHERE id = ?")
                 .bind(finished.to_rfc3339())
                 .bind(&id)
@@ -6521,7 +7025,9 @@ mod tests {
     async fn the_gc_never_touches_a_live_run() {
         let (state, root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "still going").await.unwrap();
+        let id = start(&state, "marketing", "still going", None)
+            .await
+            .unwrap();
         sqlx::query("UPDATE team_runs SET finished_at = ? WHERE id = ?")
             .bind((chrono::Utc::now() - chrono::Duration::days(999)).to_rfc3339())
             .bind(&id)
@@ -6547,7 +7053,7 @@ mod tests {
     async fn cancelling_leaves_no_run_still_spending() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6594,7 +7100,7 @@ mod tests {
     async fn a_finished_run_cannot_be_cancelled_into_a_different_ending() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let run = fetch_run(&state, &id).await;
@@ -6615,8 +7121,8 @@ mod tests {
     async fn a_runs_spend_counts_the_directors_nodes_and_not_another_runs() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let mine = start(&state, "marketing", "mine").await.unwrap();
-        let theirs = start(&state, "marketing", "theirs").await.unwrap();
+        let mine = start(&state, "marketing", "mine", None).await.unwrap();
+        let theirs = start(&state, "marketing", "theirs", None).await.unwrap();
 
         for (team_run, cost) in [(&mine, 1.5), (&mine, 0.5), (&theirs, 10.0)] {
             let (run_id, _) = open_run(&state, team_run, "work", false).await.unwrap();
@@ -6656,7 +7162,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6681,7 +7187,7 @@ mod tests {
     async fn a_run_past_its_lifetime_expires() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6711,7 +7217,7 @@ mod tests {
     async fn a_pass_does_not_launch_a_second_director_while_one_is_in_flight() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6751,7 +7257,7 @@ mod tests {
     async fn a_pass_launches_the_planner_when_nothing_is_in_flight() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 

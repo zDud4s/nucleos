@@ -456,6 +456,11 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
     // `Acts` — see `mcp_tools::TOOL_EFFECTS`. It is also why this route needs no ceiling in
     // `permits`: what bounds it is a per-run count the handler reads, and a scope cannot count.
     (Method::POST, "/team-notes"),
+    // Words for the OWNER, in the one conversation this run was pointed at. It reaches outside the
+    // department, which every other entry in this table does not — and it is still a SAYING and not
+    // a DOING, which is the rule this table keeps: nothing runs, nothing is spent, and the daemon
+    // chooses the destination from a column the department cannot read or set.
+    (Method::POST, "/team-reports"),
     (Method::GET, "/email/queue"),
     (Method::GET, "/email/{id}"),
     (Method::GET, "/files"),
@@ -813,7 +818,7 @@ mod tests {
             .route("/email/incoming", post(|| async { "" }))
             .route("/email/triage", post(|| async {}))
             .route("/email/{id}/attachments", get(|| async {}))
-            // The four a team run reaches beside `/files`, plus the one it must never reach.
+            // The five a team run reaches beside `/files`, plus the one it must never reach.
             // `/email/{id}` sits beside `/email/{id}/attachments` on purpose: the table is matched
             // segment by segment, so a scope holding the shorter pattern must not inherit the
             // longer one.
@@ -828,6 +833,7 @@ mod tests {
             // router not knowing the path.
             .route("/team-actions", post(|| async {}).get(|| async {}))
             .route("/team-notes", post(|| async {}))
+            .route("/team-reports", post(|| async {}))
             .route("/team-recruits", post(|| async {}).get(|| async {}))
             .route("/files", get(|| async {}).delete(|| async {}))
             .route("/files/folder", post(|| async {}))
@@ -1989,6 +1995,7 @@ mod tests {
             ("propose_action", Method::POST, "/team-actions"),
             ("propose_teammate", Method::POST, "/team-recruits"),
             ("read_team_file", Method::POST, "/team-files/read"),
+            ("report_to_owner", Method::POST, "/team-reports"),
             ("send_team_note", Method::POST, "/team-notes"),
             ("web_read", Method::POST, "/web/read"),
             ("web_search", Method::POST, "/web/search"),

@@ -39,6 +39,7 @@ function turn(overrides: Partial<Turn> = {}): Turn {
   return {
     id: 1,
     asked: "hello",
+    createdAt: "2026-08-26T10:00:00Z",
     answer: null,
     status: "completed",
     cost_usd: null,

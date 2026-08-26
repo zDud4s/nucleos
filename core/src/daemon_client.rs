@@ -429,6 +429,29 @@ impl DaemonClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
+    /// A director says something to the owner, in the conversation its run was pointed at.
+    ///
+    /// **No destination parameter, and that absence is the governance of this feature.** Where a
+    /// department reports is `team_runs.report_to_chat_id`, chosen by whoever started the run; the
+    /// department has no tool that takes a conversation, no way to list the ones on this machine,
+    /// and no way to reach one it was not handed. A `chat_id` here would undo all three.
+    ///
+    /// Which node is speaking comes from `RUN_ID_HEADER`, as everywhere else on this client, and the
+    /// daemon refuses a specialist — a department speaks to its owner with one voice.
+    ///
+    /// Through `json_or_refusal`: the refusal that matters most is "this department was not pointed
+    /// at a conversation", which is not an error at all but the ordinary state of nearly every run,
+    /// and a model that reads it should put the words in its delivery rather than retry.
+    pub async fn report_to_owner(&self, body: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/team-reports")
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "reporting to the owner").await
+    }
+
     /// One member of a department leaves words for another.
     ///
     /// **Neither the run nor the sender is an argument**, for `read_team_file`'s reason: the

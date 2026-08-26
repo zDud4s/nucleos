@@ -11,6 +11,7 @@ mod browser_policy;
 mod browser_wheel;
 mod budget;
 mod calendar;
+mod chat_notices;
 mod chats;
 mod classifier;
 mod collision;

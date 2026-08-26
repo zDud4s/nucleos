@@ -55,6 +55,19 @@ export interface ChatSummary {
    * reads as zero, which is the honest answer for a daemon with no relays.
    */
   relayed_waiting?: number;
+  /**
+   * How many departments have said something here since this conversation was
+   * last opened.
+   *
+   * Its own axis and NOT a subset of `waiting`, unlike `relayed_waiting`: a
+   * notice is not a turn at all — nothing ran and nothing was spent — so it
+   * cannot be a share of a count of turns.
+   *
+   * Optional because a daemon older than the column sends no such key, and it
+   * reads as zero, which is the honest answer for a daemon with no departments
+   * reporting.
+   */
+  notices_waiting?: number;
 }
 
 /**
@@ -203,6 +216,34 @@ export interface Transcript {
    * a turn's own speed while a turn is live, which is exactly when one appears.
    */
   asks: Ask[];
+  /**
+   * What departments said in this conversation, oldest first. Empty for almost
+   * every chat.
+   *
+   * A list of its own beside `turns` rather than folded into them, because a
+   * notice is not a turn: nothing was asked, nothing ran, nothing was spent, and
+   * there is no answer. The page interleaves the two by `created_at`, which is
+   * the only place the two orders have to meet.
+   */
+  notices: ChatNotice[];
+}
+
+/**
+ * One thing a department said in a conversation, shown and never answered.
+ *
+ * `from_agent_id` is the member of the department that said it and `team_run_id`
+ * is the piece of work it belongs to. Both are drawn: a message from "the
+ * marketing department" says less than one from its director, on the run that
+ * was asked to write the launch post.
+ */
+export interface ChatNotice {
+  id: number;
+  chat_id: string;
+  team_run_id: string;
+  from_agent_id: string;
+  from_run_id: number;
+  body: string;
+  created_at: string;
 }
 
 /**
@@ -335,6 +376,7 @@ export function useChatTranscript(chatId: string | null) {
         turns: AssistantTurnRow[];
         queued: Waiting[];
         asks: Ask[];
+        notices: ChatNotice[];
       }>(
         `/assistant/chats/${encodeURIComponent(chatId ?? "")}`,
       );
@@ -347,6 +389,7 @@ export function useChatTranscript(chatId: string | null) {
         handed: read.handed ?? [],
         queued: read.queued ?? [],
         asks: read.asks ?? [],
+        notices: read.notices ?? [],
         turns: merge(fresh, local),
       };
     },
@@ -584,6 +627,11 @@ export function useSendMessage(chatId: string) {
         // Nothing has been relayed by a turn that has not started. The daemon's own read replaces
         // this the moment one is.
         relayedTo: [],
+        // This window's clock and not the daemon's, and it is the honest value for a row the daemon
+        // has not written yet. It only decides where the bubble sits among a department's reports,
+        // and the daemon's own timestamp replaces it on the very next poll — a few milliseconds of
+        // skew cannot reorder anything, because nothing else landed in them.
+        createdAt: new Date().toISOString(),
         // Null, and it can be nothing else here: this optimistic row exists because the PERSON at
         // this window just sent the message. A relayed turn is never drawn this way — it is born in
         // another conversation and reaches this one through the daemon's own read.
@@ -601,6 +649,9 @@ export function useSendMessage(chatId: string) {
         // conversation is being HELD on, blanked by an optimistic write, would take the answer
         // buttons off the screen while the turn behind them went on waiting.
         asks: current?.asks ?? [],
+        // Carried through untouched, like `handed` and `queued`: what a department said is not this
+        // write's business, and dropping it would make a report vanish the moment somebody typed.
+        notices: current?.notices ?? [],
         turns: merge(current?.turns ?? [], [optimistic]),
       }));
       // The list's "thinking…" reading and its `waiting` count both depend on

@@ -161,6 +161,16 @@ export interface RelayedFrom {
 export interface Turn {
   id: number;
   asked: string;
+  /**
+   * When the daemon wrote this turn's row.
+   *
+   * Carried through because the transcript is no longer turns alone: a
+   * department's report lives in a different table with its own id sequence, so
+   * ids say nothing about which of the two happened first and only the clock
+   * does. Nothing DRAWS it — the page has never shown a timestamp on a turn —
+   * which is why it is here rather than in the row type alone.
+   */
+  createdAt: string;
   answer: string | null;
   status: string;
   cost_usd: number | null;
@@ -231,6 +241,7 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
   return {
     id: row.id,
     asked: row.asked,
+    createdAt: row.created_at,
     answer: settled ? firstNonEmpty(row.answer, row.error) : null,
     status: row.status,
     cost_usd: row.cost_usd,

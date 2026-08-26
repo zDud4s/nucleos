@@ -1604,3 +1604,62 @@
 .chats-forward-refused {
   color: var(--tone-danger-fg);
 }
+
+/* -------------------------------------------------- what a department said -- */
+
+/* A message, not a turn. No avatar column, no cost, no status chip: a notice has
+   none of those, and a turn's chrome around it would be claiming a run that does
+   not exist. The left rule and the tinted ground are what say "this arrived here,
+   it did not happen here" without a single word of UI text. */
+.chats-notice {
+  margin: var(--space-3) 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--tone-info-fg);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background: var(--tone-info-bg);
+}
+
+.chats-notice-who {
+  margin: 0 0 var(--space-1);
+  color: var(--tone-info-fg);
+  font-size: var(--text-xs);
+}
+
+/* Underlined rather than merely coloured. Whose words these are IS the safeguard
+   here — the tool that writes one is `WritesOwn`, so nothing filtered them — and
+   a source that reads as decoration is one people stop seeing. */
+.chats-notice-from {
+  color: inherit;
+  font-weight: var(--weight-medium);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* `pre-wrap` for the reason every other body in this file has it: a department
+   writes in paragraphs and lists, and collapsing them turns a report into a
+   wall. `break-word` because an agent quoting a URL is routine. */
+.chats-notice-body {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+/* Beside the unread count and never merged into it: a department speaking is not
+   the conversation answering, and nothing ran for it. Same shape as the unread
+   pill so the row still reads as one thing, different tone so the two numbers
+   are never mistaken for one. */
+.chats-row-said {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}

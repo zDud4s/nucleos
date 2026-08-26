@@ -837,7 +837,11 @@ async fn fire(
         return note(why).await;
     }
 
-    match crate::team::start_with(state, &trigger.team_id, &request, lineage).await {
+    // `None`: a triggered run reports nowhere. A rule fires when nobody is asking, so there is
+    // no conversation anybody is reading for it to speak into — and inventing one would mean a
+    // department talking to a room with nobody in it. What a triggered run has to say goes where it
+    // already went: the delivery, and the feed.
+    match crate::team::start_with(state, &trigger.team_id, &request, lineage, None).await {
         Ok(id) => Some(id),
         Err(error) => note(error.to_string()).await,
     }
@@ -1067,7 +1071,7 @@ mod tests {
         arm(&state, on_finish("beta", "alpha")).await;
 
         // The root: a person asked, so it is its own tree and carries alpha's $1 ceiling.
-        let root = crate::team::start(&state, "alpha", "start the chain")
+        let root = crate::team::start(&state, "alpha", "start the chain", None)
             .await
             .unwrap();
         finish_costing(&state, &root, 1.0).await;
@@ -1102,7 +1106,7 @@ mod tests {
         team(&state, "beta", None).await;
         arm(&state, on_finish("beta", "alpha")).await;
 
-        let root = crate::team::start(&state, "alpha", "start the chain")
+        let root = crate::team::start(&state, "alpha", "start the chain", None)
             .await
             .unwrap();
         finish_costing(&state, &root, 3.0).await;
@@ -1170,7 +1174,7 @@ mod tests {
         arm(&state, on_finish("gamma", "beta")).await;
         arm(&state, on_finish("delta", "gamma")).await;
 
-        let mut current = crate::team::start(&state, "alpha", "start the chain")
+        let mut current = crate::team::start(&state, "alpha", "start the chain", None)
             .await
             .unwrap();
         let mut depths = vec![0_i64];
@@ -1208,7 +1212,7 @@ mod tests {
             team(&state, "beta", None).await;
             arm(&state, on_finish("beta", "alpha")).await;
 
-            let root = crate::team::start(&state, "alpha", "start the chain")
+            let root = crate::team::start(&state, "alpha", "start the chain", None)
                 .await
                 .unwrap();
             sqlx::query("UPDATE team_runs SET state = ?, finished_at = ? WHERE id = ?")
@@ -1256,7 +1260,9 @@ mod tests {
                 .unwrap();
         assert_eq!(rows, 0, "an unarmed rule has nothing to fire from");
 
-        let root = crate::team::start(&state, "alpha", "go").await.unwrap();
+        let root = crate::team::start(&state, "alpha", "go", None)
+            .await
+            .unwrap();
         finish_costing(&state, &root, 0.0).await;
         team_trigger_tick(&state, Utc::now()).await;
         assert_eq!(runs_of(&state, "beta").await, 0);
@@ -1277,10 +1283,12 @@ mod tests {
         team(&state, "beta", None).await;
         arm(&state, on_finish("beta", "alpha")).await;
 
-        crate::team::start(&state, "beta", "something else")
+        crate::team::start(&state, "beta", "something else", None)
             .await
             .unwrap();
-        let root = crate::team::start(&state, "alpha", "go").await.unwrap();
+        let root = crate::team::start(&state, "alpha", "go", None)
+            .await
+            .unwrap();
         finish_costing(&state, &root, 0.0).await;
 
         team_trigger_tick(&state, Utc::now()).await;
@@ -1308,8 +1316,10 @@ mod tests {
         .await
         .unwrap();
 
-        let root = crate::team::start(&state, "alpha", "go").await.unwrap();
-        let live = crate::team::start(&state, "beta", "already going")
+        let root = crate::team::start(&state, "alpha", "go", None)
+            .await
+            .unwrap();
+        let live = crate::team::start(&state, "beta", "already going", None)
             .await
             .unwrap();
         finish_costing(&state, &root, 0.0).await;
@@ -1341,7 +1351,9 @@ mod tests {
             .unwrap();
         arm(&state, on_finish("beta", "alpha")).await;
 
-        let root = crate::team::start(&state, "alpha", "go").await.unwrap();
+        let root = crate::team::start(&state, "alpha", "go", None)
+            .await
+            .unwrap();
         finish_costing(&state, &root, 0.0).await;
 
         let (first, second) = tokio::join!(
@@ -1445,7 +1457,7 @@ mod tests {
         let trigger = arm(&state, every_minute).await;
         let before = read_last_fired(&state.pool, trigger.id).await.unwrap();
         // Already running, so a ceiling refuses AFTER the claim.
-        crate::team::start(&state, "alpha", "already going")
+        crate::team::start(&state, "alpha", "already going", None)
             .await
             .unwrap();
 

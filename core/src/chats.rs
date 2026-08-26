@@ -81,6 +81,14 @@ pub struct ChatSummary {
     /// did not start is the one worth a second glance — which is precisely the one a single count
     /// disguised as the other.
     pub relayed_waiting: i64,
+    /// How many departments have said something here since this conversation was last opened.
+    ///
+    /// Its own axis and NOT a subset of `waiting`, unlike `relayed_waiting` above: a notice is not a
+    /// turn at all — nothing ran and nothing was spent — so it cannot be a share of a count of
+    /// turns. The window says the two separately for the reason `relayed_waiting` exists: one
+    /// number cannot say two things, and "a department you set going has something to tell you" is
+    /// not "your conversation answered you".
+    pub notices_waiting: i64,
 }
 
 /// Opens a conversation. The id is minted HERE, not accepted from the caller.
@@ -371,7 +379,15 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                     AND r.status NOT IN ('running', 'pending')
                     AND r.from_relay_id IS NOT NULL
-                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS relayed_waiting
+                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS relayed_waiting,
+                -- A third count and NOT a subset of the first, unlike the one above it. A notice is
+                -- not a turn: nothing ran, nothing was spent, and it lives in its own table with its
+                -- own watermark. Adding it to `waiting` would make one number the sum of two things
+                -- with different meanings, and the window could no longer say which of them the
+                -- person is being called back for.
+                (SELECT COUNT(*) FROM chat_notices n
+                  WHERE n.chat_id = c.chat_id
+                    AND n.id > COALESCE(c.last_seen_notice_id, 0)) AS notices_waiting
            FROM chats c
           WHERE c.archived_at IS NULL
           ORDER BY COALESCE(last_activity, c.created_at) DESC",
@@ -461,7 +477,15 @@ pub async fn mark_seen(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
                     WHERE r.chat_id = chats.chat_id
                       AND r.mode = 'assistant'
                       AND r.status NOT IN ('running', 'pending')),
-                  last_seen_turn_id)
+                  last_seen_turn_id),
+                -- The notices own watermark, written in the same statement so there is exactly
+                -- one moment at which a conversation becomes read. There is no still-landing case
+                -- to skip here, unlike the turns above: a notice is written complete or not at all,
+                -- so every id is one somebody could have seen. COALESCE for the reason above -- a
+                -- chat with no notices must not have its watermark cleared by being opened.
+                last_seen_notice_id = COALESCE(
+                  (SELECT MAX(n.id) FROM chat_notices n WHERE n.chat_id = chats.chat_id),
+                  last_seen_notice_id)
           WHERE chat_id = ?",
     )
     .bind(chat_id)
