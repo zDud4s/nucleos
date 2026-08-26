@@ -33,11 +33,46 @@ pub struct Decision {
     pub approved_at: Option<String>,
 }
 
-/// Write one extraction's worth of proposals, all unapproved.
+/// Write one extraction's worth of proposals, all unapproved, and retire the pile the last
+/// extraction of this spec left unread.
 ///
 /// One timestamp for the whole batch rather than one per row: they were proposed together, the
 /// owner reads them together, and `UNIQUE (project_id, spec_slug, ordinal, extracted_at)` uses it
-/// to keep two extractions of one spec from colliding on ordinal.
+/// to keep two extractions of one spec from colliding on ordinal. The same instant is what the
+/// superseded rows are retired at, so the retirement and the extraction that caused it read as one
+/// event rather than two that happened to be close.
+///
+/// **Superseding was promised by `0117` and never implemented, and the gap had a cost.** That
+/// migration's `retired_at` column says in its own comment: *"Set when the owner says no, **or when
+/// a later extraction supersedes this one**."* Only the first half existed, so re-extracting a spec
+/// left both lists live, and approving the second put two copies of every decision into the map —
+/// two model calls per line in triage, two rows against every count, and no way for the owner to
+/// tell which copy they were reading. The `UPDATE` below is that sentence, finally written.
+///
+/// **It retires only what is still PENDING** — `approved_at IS NULL AND retired_at IS NULL` — and
+/// the restriction is the important half of this function, not a caution:
+///
+/// - **An approved row is the owner's act, and this is a model's.** §4 and §6 reserve approval to a
+///   human; an extractor that could take it back would be the model recovering, through a side door,
+///   the one authority the whole design removes from it. That the taking-back would be well
+///   intentioned is exactly why it has to be refused here rather than judged case by case.
+/// - **`map_stamps.decision_id` and `map_triage.decision_id` point at those rows.** Retiring one
+///   drops it out of [`approved`], so its stamps and its judgements go on existing in their tables
+///   while vanishing from every reader — the owner's verdict erased by a re-extraction they would
+///   never connect to it. Neither foreign key cascades, on purpose, so nothing would even error.
+///
+/// **So a duplicate can still arise, and this is a known gap rather than a solved problem:** extract,
+/// approve, extract again, approve again, and the spec has two live copies of a line. The honest
+/// repair is not here — it is for the extract route to tell the owner how many approved decisions
+/// from an earlier extraction of that spec are still live and let them decide what becomes of them.
+/// This function must not make that choice silently, and a later reader reaching for `OR approved_at
+/// IS NOT NULL` to "finish the job" would be making it for them.
+///
+/// **It does not break §5.3's header**, and that is worth writing down so nobody repairs arithmetic
+/// that is not broken. The duplicates are distinct `decision_id`s, each with exactly one standing and
+/// at most one current judgement, so `map_stamp::StampCounts`' five categories still reconcile to the
+/// number of decisions. What is wrong is the number of decisions itself — duplication on screen, not
+/// a total that stops adding up.
 pub async fn record(
     pool: &sqlx::SqlitePool,
     project_id: &str,
@@ -46,6 +81,22 @@ pub async fn record(
     decisions: &[Extracted],
 ) -> sqlx::Result<usize> {
     let now = chrono::Utc::now().to_rfc3339();
+
+    // One `UPDATE` before the loop and inside this same function, so the retirement and the write
+    // that supersedes cannot drift the way a check in a handler drifts from the write it guards —
+    // the argument [`decide`] already makes about `project_id`. Scoped to one spec of one project:
+    // a second document's pending pile has nothing to do with this one having been re-read.
+    sqlx::query(
+        "UPDATE map_decisions SET retired_at = ?
+          WHERE project_id = ? AND spec_slug = ?
+            AND approved_at IS NULL AND retired_at IS NULL",
+    )
+    .bind(&now)
+    .bind(project_id)
+    .bind(spec_slug)
+    .execute(pool)
+    .await?;
+
     let mut written = 0;
     for row in decisions {
         sqlx::query(
@@ -646,6 +697,123 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_second_extraction_supersedes_the_pile_nobody_had_read() {
+        // `0117`'s `retired_at` column says it is set "when the owner says no, **or when a later
+        // extraction supersedes this one**", and only the first half was ever written. Without the
+        // second, re-reading a spec left both lists live and approving the new one put two copies of
+        // every line into the map — two model calls per line in triage, and no way for the owner to
+        // tell which copy they were looking at.
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        assert_eq!(pending(&pool, "alpha").await.unwrap().len(), 2);
+
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+
+        let waiting = pending(&pool, "alpha").await.unwrap();
+        assert_eq!(
+            waiting.len(),
+            2,
+            "the owner reads one list per spec, not one per time it was read"
+        );
+        assert_eq!(
+            retired_texts(&pool, "alpha").await,
+            vec!["Alfa.".to_owned(), "Beta.".to_owned()],
+            "superseded rather than deleted — a row that is gone cannot say it was once proposed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_extraction_leaves_an_approved_decision_alone() {
+        // **The half that must never be "tidied up" into the half above**, and the two reasons are
+        // the whole of why the `UPDATE` says `approved_at IS NULL`.
+        //
+        // First, approval is the owner's act and §4 and §6 reserve it to a human; an extractor that
+        // could take it back would be the model recovering the one authority this design removes
+        // from it, through a door nobody is watching.
+        //
+        // Second, and this is the one that would go unnoticed: `map_stamps.decision_id` and
+        // `map_triage.decision_id` point at approved rows. Retiring one drops it out of `approved`,
+        // so the owner's verdict and the triager's judgement go on existing in their tables while
+        // vanishing from every reader — erased by a re-extraction nobody would connect to it. This
+        // test stamps the decision first precisely so that is what it is asserting.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+        assert!(
+            stamp(&pool, "alpha", id, Verdict::Settled, Some("aaa a.rs"), None)
+                .await
+                .unwrap()
+        );
+
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+
+        let live: Vec<i64> = approved(&pool, "alpha")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            live,
+            vec![id],
+            "the approved decision is still in the map the stamp was made against"
+        );
+        assert_eq!(
+            stamps(&pool, "alpha").await.unwrap().len(),
+            1,
+            "and its stamp is still reachable, which is what retiring it would have broken"
+        );
+        // The line that was still waiting when the re-read happened IS superseded — this test is
+        // about the approved row and not about weakening the rule above it.
+        assert_eq!(
+            retired_texts(&pool, "alpha").await,
+            vec!["Beta.".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_is_scoped_to_one_spec_and_one_project() {
+        // A second document being re-read has nothing to do with this one, and another owner's pile
+        // has nothing to do with either. `map_decisions.id` is a global integer, so the project is
+        // the only thing standing between two owners — the argument `decide` already makes, owed
+        // again by every statement that writes without being handed an id.
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        record(&pool, "alpha", "outra", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        record(&pool, "beta", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            retired_texts(&pool, "alpha").await,
+            vec!["Alfa.".to_owned(), "Beta.".to_owned()],
+            "only the spec that was re-read loses its unread pile"
+        );
+        assert_eq!(
+            pending(&pool, "alpha").await.unwrap().len(),
+            4,
+            "the other spec's two are untouched, beside this spec's fresh two"
+        );
+        assert!(
+            retired_texts(&pool, "beta").await.is_empty(),
+            "another project's identically named spec is not this project's business"
+        );
     }
 
     #[tokio::test]

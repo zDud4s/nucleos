@@ -277,6 +277,34 @@ fn kind_says(kind: crate::map_intent::Kind) -> &'static str {
     }
 }
 
+/// Which question the triager was asked, bumped by hand when the question changes.
+///
+/// **A hand-bumped integer and never a hash of the prompt text**, following
+/// `classifier::CLASSIFIER_VERSION`, which is this codebase's existing answer to the same problem.
+/// Hashing [`triage_prompt`]'s output would re-triage a whole backlog for a typo fix, a reflowed
+/// line or a comma — real money spent to re-learn what the model already said. The question this
+/// number answers is whether the question *materially* changed, and only a person knows that.
+///
+/// **What obliges a bump**, so that nobody has to guess:
+///
+/// - a change to **what is asked** — the two answers, what `silenced` is defined to mean, the
+///   instruction to flag when unsure, the shape of the reason;
+/// - a change to **what evidence is included** — a field added to or removed from the decision
+///   block, the two anchor lists, [`anchor_says`] or [`kind_says`] saying something different about
+///   a state;
+/// - a change to the **answer vocabulary** — anything [`parse_answer`] would read differently.
+///
+/// Reformatting does not. Rewrapping a sentence, renaming a heading, fixing a typo: the model is
+/// being asked the same thing, and a judgement it already gave is still an answer to it.
+///
+/// **In the digest and therefore in the staleness rule**, which is the half slice 4 does not need:
+/// a stamp is the owner's and nothing about how it was asked for can make it wrong, while this pile
+/// is a model's opinions and the question is half of what produced them. Without this field, editing
+/// [`triage_prompt`] leaves every stored judgement claiming to be current about a question that no
+/// longer exists — an approximate answer wearing an exact one's clothes, which is the one trade this
+/// feature never makes.
+const TRIAGE_PROMPT_VERSION: u32 = 1;
+
 /// What to ask a model about one decision.
 ///
 /// **One question, and the whole design of this module is in this string** (§6: *"Por nó, com a
@@ -567,8 +595,10 @@ fn anchor_tag(anchor: &crate::map_join::Anchor) -> &'static str {
 /// **What it covers is everything whose change would make the answer wrong, and nothing else:** the
 /// decision's `text` and `section`, because the model read them; the anchor set — `modules` and
 /// `foreign`, apart — because those are the proof it was shown; the [`crate::map_join::Anchor`]
-/// variant, because *declared* and *guessed* are different evidence about the very same paths; and
-/// the anchor blobs, because §10's first trigger is the anchor code moving.
+/// variant, because *declared* and *guessed* are different evidence about the very same paths; the
+/// anchor blobs, because §10's first trigger is the anchor code moving; and
+/// [`TRIAGE_PROMPT_VERSION`], because the evidence is only half of what produced an answer and the
+/// question is the other half.
 ///
 /// **[`crate::map_stamp::Standing`] is deliberately NOT covered.** §10 gives the triager one scope —
 /// a decision *"se nunca foi vista"* — so a decision that leaves `Never` leaves triage altogether.
@@ -604,10 +634,27 @@ fn anchor_tag(anchor: &crate::map_join::Anchor) -> &'static str {
 // the map. Delete this attribute then.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn inputs_digest(evidence: Evidence<'_>) -> String {
+    digest_against(evidence, TRIAGE_PROMPT_VERSION)
+}
+
+/// [`inputs_digest`] with the prompt version handed in rather than read off the constant.
+///
+/// **It exists so the version can be tested at all.** A constant folded in at the only call site is
+/// a field no test can vary, so a later edit could drop it and every test would stay green — which
+/// is the shape of false green this repository has already been bitten by once, in its own module-map
+/// gate. Private, and `inputs_digest` is the only door in production: nothing outside gets to choose
+/// which question a judgement is recorded against.
+fn digest_against(evidence: Evidence<'_>, prompt_version: u32) -> String {
     use crate::map_stamp::Anchors;
 
     let decision = evidence.decision;
     let mut buffer = Vec::new();
+    // The question first, and in its own labelled fixed-width field rather than folded in with the
+    // evidence. The tag is length-prefixed like every other field, so nothing that follows can land
+    // at this offset and imitate a different version; the four bytes after it are the whole of the
+    // number, so 1 and 11 cannot be confused the way `"1"` and `"11"` running together would be.
+    feed(&mut buffer, "triage-prompt-version");
+    buffer.extend_from_slice(&prompt_version.to_le_bytes());
     feed(&mut buffer, &decision.text);
     feed(&mut buffer, &decision.section);
     feed(&mut buffer, anchor_tag(&decision.anchor));
@@ -997,6 +1044,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_judgement_does_not_survive_a_change_to_the_question_that_produced_it() {
+        // The evidence is only half of what makes an answer; the question is the other half. Without
+        // the prompt version in the hash, editing `triage_prompt` — narrowing what `silenced` means,
+        // adding a field to the decision block, changing what `anchor_says` claims about a state —
+        // leaves every stored judgement claiming to be current about a question that no longer
+        // exists. That is an approximate answer wearing an exact one's clothes, which is the one
+        // trade this feature never makes.
+        //
+        // Slice 4 needs none of this and the difference is worth saying: a stamp is the owner's, and
+        // nothing about how it was asked for can make it wrong. This pile is a model's opinions.
+        let decision = decision(Anchor::Ambiguous, &["core/src/map_triage.rs"], &[]);
+        let anchors = Anchors::Computed("aaa core/src/map_triage.rs".to_owned());
+        let evidence = Evidence {
+            decision: &decision,
+            anchors: &anchors,
+        };
+
+        assert_ne!(
+            digest_against(evidence, 1),
+            digest_against(evidence, 2),
+            "a judgement made against one question is not an answer to a different one"
+        );
+        // And the version the module actually ships is the one `inputs_digest` uses, or the field is
+        // in the hash without being in the answer anybody stores.
+        assert_eq!(
+            inputs_digest(evidence),
+            digest_against(evidence, TRIAGE_PROMPT_VERSION)
+        );
+    }
+
+    #[test]
+    fn exposes_current_triage_prompt_version() {
+        // Pinned the way `classifier::exposes_current_classifier_version` pins its own, and for the
+        // reason that test's doc gives: a constant that moves without anybody narrating what moved
+        // is a constant nobody can read back. This is version 1 — the first question this module
+        // ever asked — so there is nothing yet to narrate.
+        //
+        // **Bumping this is not free and is not tidy-up.** Every judgement in every project goes
+        // stale at once and the triager re-runs over the whole `Never` pile, which is real money.
+        // Bump it when the question materially changed, and not when a line was rewrapped; see
+        // [`TRIAGE_PROMPT_VERSION`] for the three things that oblige it.
+        assert_eq!(TRIAGE_PROMPT_VERSION, 1);
     }
 
     #[test]
