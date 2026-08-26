@@ -150,13 +150,6 @@ pub async fn pending(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<
 /// both hold ordinal 1 and both be approved. Without the third key the order is whatever plan
 /// SQLite chose, and a map that changes shape between two reads for no reason anybody can see is
 /// the portrait decision 1 refuses.
-// Scoped to the non-test build, and to this one function rather than the module: the other three
-// have routes in `http.rs` calling them, and only this reader is waiting for one. The map route is
-// what calls it. The instruction, not a description: DELETE THIS LINE with the change that adds
-// that route. `contacts.rs` is the precedent for the per-item form; `map_join.rs` argues for the
-// module-wide one, and the difference is that there the whole module waits on a caller and here it
-// is one function among four.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn approved(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Decision>> {
     let rows = sqlx::query_as::<_, DecisionRow>(
         "SELECT id, spec_slug, section, ordinal, text, kind, brain, extracted_at, approved_at

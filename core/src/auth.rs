@@ -196,10 +196,16 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // permission to write one — `POST /projects/{id}/write` is in no table at all — and a fence
     // only a privileged caller can see is a fence nobody can argue with.
     //
-    // `map` lists every source path in the project and the import graph between them, and
-    // nothing else. A reader who already reaches `cat`, `grep` and `blame` can already read the
-    // contents of those same files, so a list of their names grants nothing it did not already
-    // have.
+    // `map` lists every source path in the project and the import graph between them — and, since
+    // the junction moved onto this route, the text of every approved decision read against that
+    // graph. A reader who already reaches `cat`, `grep` and `blame` can already read the contents
+    // of those same files, so a list of their names grants nothing it did not already have; and
+    // the decisions are the grant `map/decisions` is justified under in the next paragraph, on an
+    // argument that does not weaken by their being approved — either way they are sentences lifted
+    // out of a spec sitting in a folder this reader can `cat` whole. So the permission does not
+    // change and no row is added: `map` was already in this table. The sentence is corrected
+    // rather than left standing, because a comment that still read "and nothing else" is how the
+    // next reader concludes the decisions arrived on this route without anybody weighing them.
     //
     // `map/decisions` is the pile nobody has read yet: sentences a model lifted out of a document
     // already sitting in that project's folder. A reader who reaches `map` and `cat` can read the

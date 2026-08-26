@@ -40,29 +40,6 @@
 //! it to be found. What this module refuses is the silent error — a citation confidently tied to
 //! the wrong document — which is why nothing here decides anything.
 
-// This is a bin-only crate, so dead-code reachability starts at `main`, and nothing reaches here
-// yet — which is now true one step further out than it was. `join` gives `section_number` and the
-// `Citation` fields a caller inside this module, and `join` itself has none: the HTTP route that
-// serves the map is a later task, and until it lands everything here is reachable only from the
-// tests. The instruction, not a description: DELETE THIS LINE with the change that gives `join` a
-// production caller.
-//
-// Still one line rather than an attribute per item. When this module held five items, three
-// scattered attributes would have covered them — measured, not assumed: an `#[allow]` seeds its
-// item as a liveness root, so covering `citations` and `section_number` also covered
-// `leading_number` and `candidate`, which nothing but those two call, and only `Citation` needed
-// its own because its fields are written and never read outside the tests. The join added four
-// more public types of exactly that last shape, which argues for the module-wide form rather than
-// against it: a count of attributes that has to be recomputed every time the module grows is one
-// somebody eventually gets wrong, and getting it wrong here is silent.
-//
-// Scoped to the non-test build so it silences only the absence of that caller. Under `cfg(test)`
-// the lint stays live — every item below is exercised by this module's tests, and one that stops
-// being exercised has to say so. `errands.rs:28` is the precedent for the module-wide form;
-// `contacts.rs` scopes to `not(test)` the same way but hangs its attributes on individual fields,
-// which is right there and wrong here, where the whole module is waiting on one caller.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crate::map_intent::Kind;
 use crate::map_store::Decision;
 use crate::project_map::{Foreign, Module};
