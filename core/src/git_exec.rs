@@ -33,6 +33,58 @@ pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// How much of a command's output is kept for the row.
 const OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 
+/// How many git processes this crate has spawned against each repository.
+///
+/// **A test seam in transport, which wants an argument rather than a shrug.** `map_recency`'s whole
+/// reason for existing is a cost — one walk of the recent commits instead of a `git log` per anchor
+/// file, ~700 spawns on this repository, on a route the map performs every time it opens — and a
+/// cost is not observable in an answer. Every other test of that module passes just as well against
+/// the per-path loop it exists to refuse, so the one test that guards the argument has to count
+/// processes, and nothing outside this function knows how many were started.
+///
+/// **Keyed by repository and never one global number**, which is what makes it an assertion instead
+/// of a race dressed as one: the suite runs in parallel and a good deal of it spawns git, so a
+/// process-wide counter would be read while `vcs`, `worktree` and `gate` were all incrementing it.
+/// A fixture in its own temp directory is the only writer of its own row.
+///
+/// The key is the `repo` path exactly as it was passed and is deliberately not canonicalised: a
+/// caller reading its own count hands the same `&Path` it handed to the call, and canonicalising
+/// would introduce a second way for the two to differ (`\\?\` prefixes, 8.3 short names) in service
+/// of a case no test has.
+#[cfg(test)]
+pub mod spawns {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    static COUNTS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn record(repo: &Path) {
+        *COUNTS
+            .lock()
+            .expect("the spawn counter is only ever held for one insert")
+            .entry(repo.to_path_buf())
+            .or_default() += 1;
+    }
+
+    /// How many git processes this crate has tried to start against `repo` since the daemon began.
+    ///
+    /// Attempts and not successes, because the cost being asserted is paid at the `CreateProcess`
+    /// and a loop that fails seven hundred times cost seven hundred of them.
+    ///
+    /// Read before and after rather than compared against zero, because a fixture that also builds
+    /// its repository through [`super::run_git`] would start above it.
+    pub fn against(repo: &Path) -> usize {
+        COUNTS
+            .lock()
+            .expect("the spawn counter is only ever held for one read")
+            .get(repo)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// How long a *finished* git command is given to finish emptying its pipes.
 ///
 /// Its own budget rather than a share of the operation's, for the reason `gate.rs` gives about the
@@ -131,6 +183,13 @@ pub async fn run_git(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     crate::process_tree::spawn_in_own_group(&mut command);
+
+    // Counted at the one place every git process in this crate goes through, rather than in the
+    // module whose cost is being asserted — a counter the caller increments beside its own call is
+    // one a refactor moving that call takes with it, which is exactly the refactor the count exists
+    // to catch. Compiled out of the daemon entirely; see [`spawns`].
+    #[cfg(test)]
+    spawns::record(repo);
 
     let mut child = command
         .spawn()

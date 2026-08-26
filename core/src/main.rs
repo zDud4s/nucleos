@@ -40,6 +40,7 @@ mod logging;
 mod mailsend;
 mod map_intent;
 mod map_join;
+mod map_recency;
 mod map_stamp;
 mod map_store;
 mod map_triage;

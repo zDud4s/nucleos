@@ -344,8 +344,9 @@ pub struct Anchored {
 /// count of files whose only measured property is that they contain a `§`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Junction {
-    /// Ordered by `spec_slug`, then `ordinal`, then id — see [`join`] for why that order is
-    /// deterministic rather than final.
+    /// Ordered by `spec_slug`, then `ordinal`, then id — see [`join`] for why that is the order a
+    /// pure function can give, and `map_recency::order` for the one §10 asks for, which both
+    /// readers of the map put this list into before it reaches anybody.
     pub decisions: Vec<Anchored>,
     /// Modules naming no section at all. §5.1's *code nobody asked for*.
     pub unclaimed: Vec<String>,
@@ -496,14 +497,15 @@ fn evidence(cites: &[Citation], section: &str, spec_slug: &str, spec_slugs: &[St
 /// those four in it, which is a wrong answer wearing the right word.
 ///
 /// **The ordering is deterministic and is not the one §10 asks for.** §10 wants recency of the
-/// anchor code's last change — *what moved since I last looked?* — which needs git, and nothing in
-/// this crate reads git yet. It arrives with the slice that adds `map_stamps` (§9.2), which
-/// already has to know when the anchor code moved in order to expire a stamp (§7.1). Until then
-/// the order is `spec_slug`, `ordinal`, id, and the id is there because ordinal alone is not a
-/// total order: `map_decisions` is unique on `(project_id, spec_slug, ordinal, extracted_at)`, so
-/// two extractions of one spec can both hold ordinal 1 and both be approved. Determinism here is
-/// the absence of a wobble, not the intended answer, and a test pins it so the day §10's order
-/// lands it is a visible change rather than a silent one.
+/// anchor code's last change — *what moved since I last looked?* — which needs git, and this
+/// function is pure. It landed in `map_recency`, which both readers of the map apply to this list
+/// before anybody sees it; the order here is what that sort falls back to on every tie, which on a
+/// real repository is most of the list, so it is load-bearing rather than provisional. It is
+/// `spec_slug`, `ordinal`, id, and the id is there because ordinal alone is not a total order:
+/// `map_decisions` is unique on `(project_id, spec_slug, ordinal, extracted_at)`, so two
+/// extractions of one spec can both hold ordinal 1 and both be approved. A test pins it, which used
+/// to be so that §10's order would arrive as a visible change and is now so that the tie-break
+/// keeping two readings of an unchanged repository identical cannot quietly stop being one.
 pub fn join(
     decisions: &[Decision],
     modules: &[Module],
@@ -1193,9 +1195,11 @@ mod tests {
 
     #[test]
     fn the_order_is_by_spec_then_ordinal_and_every_path_list_is_sorted() {
-        // Deterministic, and deterministic is not the same as right: §10 wants the order to be
-        // recency of the anchor code's last change, which needs git and is not in this slice.
-        // Pinned so that when that lands it is a visible change rather than a silent one.
+        // Deterministic, and deterministic is not the same as final: §10's order is recency of the
+        // anchor code's last change, and it needs git, so it lives in `map_recency` and is applied
+        // to this list by both readers of the map. What is pinned here is what that sort falls back
+        // to on a tie — which on a real repository is most of the list, and is the whole of why two
+        // readings of a repository nothing has happened to agree.
         let decisions = [
             decided(3, SLUGS[1], "## 7. O carimbo", 2),
             decided(1, SLUGS[1], "## 7. O carimbo", 1),

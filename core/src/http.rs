@@ -2953,10 +2953,11 @@ struct MapAnswer {
     /// Where each decision stands, by `decision_id`.
     ///
     /// **A map and never a parallel array.** Two arrays that must stay index-aligned is a bug
-    /// waiting for the first re-sort, and [`crate::map_join::join`] says out loud that its order is
-    /// deterministic rather than final — §10 wants a different one, by recency of the anchor code's
-    /// last change. Keyed by id, the client survives that change; keyed by position it would draw
-    /// one decision's verdict against another's text, and nothing on the screen would look wrong.
+    /// waiting for the first re-sort, and the re-sort duly arrived: `junction.decisions` leaves
+    /// [`crate::map_join::join`] in `spec_slug, ordinal, id` and leaves this handler in §10's
+    /// recency order. Keyed by id, the client survived that; keyed by position it would now be
+    /// drawing one decision's verdict against another's text, and nothing on the screen would look
+    /// wrong.
     standings: std::collections::BTreeMap<i64, crate::map_stamp::Standing>,
     /// §5.3's header, tallied from exactly the standings above.
     stamps: crate::map_stamp::StampCounts,
@@ -2987,6 +2988,15 @@ struct MapAnswer {
     /// it, so its digest is `""` however git is faring, and it stays
     /// [`crate::map_stamp::Watch::NoAnchor`] rather than flapping every time this goes up.
     git_would_not_answer: bool,
+    /// §10's ordering — what `junction.decisions` is sorted by, and how far that sort can see.
+    ///
+    /// **Beside the list rather than folded into it, because the order is only half the answer.**
+    /// A list carries the sequence and nothing about which part of it is a fact: on this repository
+    /// 83 of the 112 anchor files fall inside the window and every decision behind the other 29
+    /// ties, so a panel drawing this without [`crate::map_recency::Recency::window`] would present
+    /// a mostly arbitrary tail with the same confidence as the head. §10 offers this ordering as
+    /// *um facto do git*, and the honest way to keep that true is to say how far the git looked.
+    recency: crate::map_recency::Recency,
 }
 
 /// The project's whole graph: modules, imports, and what the approved decisions do or do not
@@ -3027,12 +3037,18 @@ async fn get_project_map(
     Path(id): Path<String>,
 ) -> Result<Json<MapAnswer>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
-    let (structure, junction) = project_junction(&state, &id, root.clone()).await?;
+    let (structure, mut junction) = project_junction(&state, &id, root.clone()).await?;
 
     // One `git ls-files` for the union of every decision's anchor paths, sliced per decision
     // afterwards, and the same reading `POST /map/triage` shows the model. See [`anchor_digests`]
     // for why it is one call and one function.
     let (readings, anchors) = anchor_digests(&root, &junction.decisions).await;
+
+    // §10's order, and the SAME call `POST /map/triage` makes before its sweep. Two orderings would
+    // be two answers to one sentence of the spec, and the one deciding which twenty decisions get a
+    // model call spent on them would be the one nobody ever looked at.
+    let walked = crate::map_recency::walk(&root).await;
+    let recency = crate::map_recency::order(&mut junction.decisions, &walked);
 
     let stamped = crate::map_store::stamps(&state.pool, &id)
         .await
@@ -3084,6 +3100,7 @@ async fn get_project_map(
         standings,
         stamps,
         git_would_not_answer: anchors == crate::map_stamp::Anchors::Failed,
+        recency,
     }))
 }
 
@@ -3317,11 +3334,15 @@ struct MapExtractBody {
 /// screen, not merely the log.
 ///
 /// **It drains rather than starves, and that is a property of the skip and not of this number.**
-/// The sweep is in `map_store::approved`'s order — `spec_slug, ordinal, id`, stable across reads —
-/// so the same twenty come first every time; what stops them being the only twenty ever looked at
-/// is that a judgement still current costs no call, so the next press starts where the last one
-/// stopped. §10's ordering — by recency of the anchor code's last change — is the shell's task and
-/// will change which twenty go first, not whether the rest are ever reached.
+/// What stops the first twenty being the only twenty ever looked at is that a judgement still
+/// current costs no call, so the next press starts where the last one stopped.
+///
+/// **Which twenty is [`crate::map_recency`]'s answer and not this constant's**, and the two were
+/// separated late: the sweep used to run in `map_store::approved`'s order — `spec_slug, ordinal,
+/// id` — which meant a saturated cap paid for the first twenty decisions alphabetically by
+/// document, every press, for ever. §10 says the order is by recency of the anchor code's last
+/// change, and until that landed this comment recorded the gap rather than pretending the order had
+/// been chosen. It changes which twenty go first; it does not change whether the rest are reached.
 const MAX_TRIAGE_BATCH: usize = 20;
 
 /// Which brain the caller named, and nothing else.
@@ -3793,8 +3814,19 @@ async fn post_project_map_triage(
 ) -> Result<Json<TriageReport>, StatusCode> {
     let brain = read_brain(&body.brain).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
     let root = resolve_read_root(&state, &id, None).await?;
-    let (_, junction) = project_junction(&state, &id, root.clone()).await?;
+    let (_, mut junction) = project_junction(&state, &id, root.clone()).await?;
     let (readings, _) = anchor_digests(&root, &junction.decisions).await;
+
+    // **§10's order, and on this route it is a spending decision rather than a display one.** The
+    // sweep below caps at [`MAX_TRIAGE_BATCH`] and spends one model call per decision, so the order
+    // it walks in decides which twenty of a three-hundred-row backlog get money spent on them —
+    // every press, for as long as the cap stays saturated, which `MAX_TRIAGE_BATCH`'s own
+    // measurement says is the state this repository lives in. `map_store::approved`'s order is
+    // `spec_slug, ordinal, id`, so what that bought was the first twenty decisions alphabetically by
+    // document. The answer is discarded here and kept by `GET /map`: what this route needs is the
+    // order, and what the panel needs is the order plus the window it is a fact about.
+    let walked = crate::map_recency::walk(&root).await;
+    let _ = crate::map_recency::order(&mut junction.decisions, &walked);
 
     let stamped = crate::map_store::stamps(&state.pool, &id)
         .await
@@ -3866,15 +3898,10 @@ async fn post_project_map_triage(
     let mut report = TriageReport::default();
     let mut attempted = 0usize;
 
-    // **`map_store::approved`'s order — `spec_slug, ordinal, id` — and §10 says it should not be.**
-    // *"Dentro do que chega, a ordem é por recência de alteração do código âncora, não por
-    // importância."* Alphabetical by document is close to the least useful order there is, and it
-    // matters more on this route than on the panel: there it decides what a reader sees first, here
-    // it decides which decisions get money spent on them every time the cap saturates. The recency
-    // walk — one `git log --format=%ct --name-only`, not a `git log` per anchor file — is its own
-    // task, landing before the panel so that this route and the panel share one ordering rather than
-    // the panel getting it and this keeping alphabetical. The seam is here, deliberately visible, so
-    // the next reader does not conclude alphabetical was chosen.
+    // In §10's order, sorted above: *"dentro do que chega, a ordem é por recência de alteração do
+    // código âncora, não por importância."* What that changes here is which decisions the cap
+    // reaches, not whether the rest are ever reached — a judgement still current costs no call, so
+    // the next press starts where this one stopped, which is the drain `MAX_TRIAGE_BATCH` describes.
     for anchored in &junction.decisions {
         let current = anchor_reading(&readings, anchored.decision_id);
         let standing = crate::map_stamp::standing(
