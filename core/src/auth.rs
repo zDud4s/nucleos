@@ -200,6 +200,15 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // nothing else. A reader who already reaches `cat`, `grep` and `blame` can already read the
     // contents of those same files, so a list of their names grants nothing it did not already
     // have.
+    //
+    // `map/decisions` is the pile nobody has read yet: sentences a model lifted out of a document
+    // already sitting in that project's folder. A reader who reaches `map` and `cat` can read the
+    // spec they came from whole, so the extract of it grants nothing they did not already have.
+    // Only the GET. `POST /projects/{id}/map/extract` and `POST /projects/{id}/map/decisions/{n}`
+    // are in NO table, here or in `RUN_CREATING_ROUTES`, which leaves them to Admin and the control
+    // token by default-deny — and both belong there. Extracting spends a model, which a read-only
+    // key never bought; approving is the owner's stamp, and it is the act that puts a line in the
+    // map. Neither is a read, and neither is a thing done on the owner's behalf by a weaker key.
     (Method::GET, "/projects/{id}/readings"),
     (Method::GET, "/projects/{id}/log"),
     (Method::GET, "/projects/{id}/branches"),
@@ -208,6 +217,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/worktree"),
     (Method::GET, "/projects/{id}/ownership"),
     (Method::GET, "/projects/{id}/map"),
+    (Method::GET, "/projects/{id}/map/decisions"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),

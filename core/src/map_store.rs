@@ -58,12 +58,42 @@ pub async fn record(
     Ok(written)
 }
 
+/// The columns every read of this table selects, named rather than written out at the binding.
+///
+/// Six of the eight are `TEXT` in one tuple, so a `SELECT` that reordered two of them would still
+/// typecheck and the mistake would surface as a decision whose section is somehow the name of a
+/// brain. This alias and the `SELECT` below are one thing written twice; changing either without
+/// the other is what it exists to make visible. The house shape — see `ErrandRow` in `errands.rs`
+/// and `Row` in `project_commands.rs`, both a row of this size read the same way.
+type DecisionRow = (i64, String, String, i64, String, String, String, String);
+
+/// The single place a row becomes a [`Decision`].
+///
+/// `None` for a `kind` the CHECK should have refused. Dropped rather than defaulted: the same
+/// argument `Kind::from_wire` makes, and a row that reaches here unreadable is a row nobody can act
+/// on either way.
+fn from_row(
+    (id, spec_slug, section, ordinal, text, kind, brain, extracted_at): DecisionRow,
+) -> Option<Decision> {
+    Some(Decision {
+        id,
+        spec_slug,
+        section,
+        ordinal,
+        text,
+        kind: Kind::from_wire(&kind)?,
+        brain,
+        extracted_at,
+        approved_at: None,
+    })
+}
+
 /// What is waiting for the owner in this project.
 ///
 /// Not approved, not retired, oldest extraction first — a pile read in the order it arrived is a
 /// pile that ends, and one ordered by anything else is a pile that never does.
 pub async fn pending(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Decision>> {
-    let rows: Vec<(i64, String, String, i64, String, String, String, String)> = sqlx::query_as(
+    let rows = sqlx::query_as::<_, DecisionRow>(
         "SELECT id, spec_slug, section, ordinal, text, kind, brain, extracted_at
            FROM map_decisions
           WHERE project_id = ? AND approved_at IS NULL AND retired_at IS NULL
@@ -73,25 +103,7 @@ pub async fn pending(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|(id, spec_slug, section, ordinal, text, kind, brain, extracted_at)| {
-            // A kind the CHECK should have refused. Dropped rather than defaulted: this is the
-            // same argument `Kind::from_wire` makes, and a row that reaches here unreadable is a
-            // row nobody can act on either way.
-            Some(Decision {
-                id,
-                spec_slug,
-                section,
-                ordinal,
-                text,
-                kind: Kind::from_wire(&kind)?,
-                brain,
-                extracted_at,
-                approved_at: None,
-            })
-        })
-        .collect())
+    Ok(rows.into_iter().filter_map(from_row).collect())
 }
 
 /// The owner's answer to one line, and whether it landed on anything.

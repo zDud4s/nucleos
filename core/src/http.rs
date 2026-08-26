@@ -96,6 +96,21 @@ pub fn build_router(state: AppState) -> Router {
         // deliberately in no table in `auth.rs`: reading a map costs nothing and a read-only key
         // buys it, while extracting spends a model — which is not something that key ever bought.
         .route("/projects/{id}/map/extract", post(post_project_map_extract))
+        // The pile and the answer to one line of it. The GET is a read and is in
+        // `READ_ONLY_ROUTES`; the POST is in no table, beside `extract` above and for a sharper
+        // reason — approving is the owner's stamp, and it is what puts a line in the map.
+        //
+        // One id in the path and no bulk form. §4 says the list is approved line by line, and a
+        // route that took the whole list would be the thousand-line plan again, wearing a smaller
+        // shape.
+        .route(
+            "/projects/{id}/map/decisions",
+            get(get_project_map_decisions),
+        )
+        .route(
+            "/projects/{id}/map/decisions/{decision}",
+            post(post_project_map_decision),
+        )
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -3018,6 +3033,73 @@ async fn post_project_map_extract(
             tracing::warn!(%error, project_id = %id, "reading the decision pile failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// What is waiting for this project's owner, on a route of its own.
+///
+/// The same list `POST …/map/extract` hands back. Separate because a window that was already open
+/// has to be able to refresh the pile, and the only other way to ask for it costs a model run.
+///
+/// Ordered by [`crate::map_store::pending`]: oldest extraction first, because a pile read in the
+/// order it arrived is a pile that ends.
+///
+/// The project is resolved first, the way `map` and `map/extract` do it, so an id nobody registered
+/// is a 404 rather than an empty list — "nothing is waiting for you" and "there is no such project"
+/// are different answers, and only one of them is true. It asks nothing of the disk beyond that:
+/// `resolve_project_root` reads the row and never the folder, so a project whose folder has moved
+/// still has a pile, which is exactly what somebody looking at a broken project wants.
+async fn get_project_map_decisions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::map_store::Decision>>, StatusCode> {
+    resolve_project_root(&state, &id).await?;
+    crate::map_store::pending(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the decision pile failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct MapDecisionBody {
+    /// `true` approves the line and lets it into the map; `false` retires it, which is what stops
+    /// it being proposed for that spec again. Required, with no `serde(default)`: a body that omits
+    /// it is a client that has not decided, and defaulting would decide for them in a direction.
+    approved: bool,
+}
+
+/// The owner's answer to ONE line.
+///
+/// **No bulk form, and that is §4 rather than an omission.** The list is approved line by line; a
+/// route that took the whole list would be the thousand-line plan again, wearing a smaller shape.
+///
+/// `204` when a row changed and `404` when none did. [`crate::map_store::decide`] returns `false`
+/// for three different reasons — a line belonging to another project, an id that never existed, and
+/// a line somebody already answered — and they are deliberately one answer here. All three mean
+/// *that line is not yours to answer now*; telling them apart would tell a caller which ids exist
+/// in projects it cannot see; and none of them is a fault of this daemon worth a 500.
+///
+/// **No `resolve_project_root` here, unlike the GET above.** `decide` puts `project_id` in its own
+/// `WHERE` and its doc comment argues for exactly that — a check that lives in a handler is a check
+/// the second caller forgets. An unregistered project therefore already gets this route's 404, from
+/// the store, and a resolve on top would be a second query that cannot change the answer.
+/// `delete_project_command`, the same shape one pillar over, relies on its store for the same
+/// reason.
+async fn post_project_map_decision(
+    State(state): State<AppState>,
+    Path((id, decision)): Path<(String, i64)>,
+    Json(body): Json<MapDecisionBody>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::map_store::decide(&state.pool, &id, decision, body.approved).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, project_id = %id, decision, "answering a decision failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Who last touched each line of a file, in the project or in one run's worktree.
@@ -11932,6 +12014,135 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "nothing was recorded, so nothing was run"
+        );
+    }
+
+    /// Two unapproved lines in a project's pile, put there the way the extract route puts them.
+    ///
+    /// Through `map_store::record` and not raw SQL: the same door the routes use, so a test that
+    /// passes cannot be passing against a row shape the writer never produces.
+    async fn seed_two_pending(state: &AppState, project: &str) {
+        crate::map_store::record(
+            &state.pool,
+            project,
+            "design",
+            crate::chats::Brain::Cloud,
+            &[
+                crate::map_intent::Extracted {
+                    section: "## 1. Alfa".to_owned(),
+                    ordinal: 1,
+                    text: "O mapa deriva-se a cada leitura.".to_owned(),
+                    kind: crate::map_intent::Kind::Countable,
+                },
+                crate::map_intent::Extracted {
+                    section: "## 2. Beta".to_owned(),
+                    ordinal: 2,
+                    text: "Nada chega aprovado.".to_owned(),
+                    kind: crate::map_intent::Kind::Character,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The owner's answer to one line, as the window sends it: the status and nothing else.
+    async fn post_decision(state: AppState, project: &str, id: i64, approved: bool) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/decisions/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"approved": approved}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_pile_of_a_project_is_served_and_one_line_can_be_answered() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        seed_two_pending(&state, "alpha").await;
+
+        let listed = get_json(&state, "/projects/alpha/map/decisions").await;
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+
+        let id = listed[0]["id"].as_i64().unwrap();
+        assert_eq!(
+            post_decision(state.clone(), "alpha", id, true).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let left = get_json(&state, "/projects/alpha/map/decisions").await;
+        assert_eq!(
+            left.as_array().unwrap().len(),
+            1,
+            "the answered one has left the pile"
+        );
+    }
+
+    #[tokio::test]
+    async fn answering_a_line_of_another_project_answers_nothing_over_http() {
+        // The id is a global integer, so the project in the path is the only thing standing
+        // between one project's owner and another project's pile. `map_store::decide` already
+        // filters by project; this asserts the route actually passes it and turns "no row changed"
+        // into a 404 rather than a cheerful 204 about nothing.
+        let state = test_state().await;
+        let _a = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _b = project_with_rules(&state, "beta", "gate_command: x\n").await;
+        seed_two_pending(&state, "alpha").await;
+        let id = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap()[0]
+            .id;
+
+        assert_eq!(
+            post_decision(state.clone(), "beta", id, true).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            crate::map_store::pending(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "alpha's pile is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_answered_twice_is_answered_once() {
+        // A stale list in a window somebody left open, or two clicks. The second must be a 404 and
+        // must not overturn the first answer.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_two_pending(&state, "alpha").await;
+        let id = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap()[0]
+            .id;
+
+        assert_eq!(
+            post_decision(state.clone(), "alpha", id, true).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post_decision(state.clone(), "alpha", id, false).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            crate::map_store::pending(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
