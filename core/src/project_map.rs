@@ -13,7 +13,14 @@
 //! and Go files therefore come back in [`Structure::unread`] rather than vanishing. A map that
 //! pretends `sidecars/` does not exist is lying about the architecture; one that says "I
 //! cannot read this" is not.
+//!
+//! Not reading a language is still not an excuse to lose what it said out loud. A file nobody
+//! here can interpret may still name a `§`, and [`Structure::foreign`] carries those sections
+//! without promoting the file to a module — because *I cannot read this, and it claims §9* and
+//! *nothing in this repository claims §9* are opposite answers, and only one of them is true of
+//! the 77 Go files that name a section.
 
+use crate::map_join::{Citation, citations};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -223,6 +230,32 @@ const SKIP: &[&str] = &[
     "build",
 ];
 
+/// Extensions read for citations alone, by a map that cannot read the language itself.
+///
+/// **An allowlist and not "whatever landed in `unread`"**, and the difference is the whole
+/// safety of it. `unread` is every file this map could not interpret, which in this tree includes
+/// a `.woff2`, an `.onnx` and an `.icns` — all three of which match `§` as a raw byte pattern
+/// without containing a citation, or text, at all. `read_to_string` fails on them and
+/// `unwrap_or_default()` would swallow that failure into an empty string, so a denylist would be
+/// correct here by luck rather than by design. Naming the extensions makes the binaries
+/// unreachable instead of merely harmless.
+///
+/// **`.md` is absent on purpose, and must stay absent.** A design spec cites its own sections
+/// constantly — a heading *is* a citation — so reading specs for citations would report every
+/// decision as claimed by the very document that decided it. That is not a performance choice; it
+/// is the difference between a map and a mirror. The specs in `.ai/` are already out of the walk,
+/// so what this actually keeps out today is `AGENTS.md`, `THREAT_MODEL.md` and their kin: prose
+/// *about* the code, citing sections it discusses rather than implements. Both readings say the
+/// same thing — a document that talks about a section is not code that implements one.
+const FOREIGN: &[&str] = &[
+    ".go", ".sql", ".css", ".sh", ".py", ".toml", ".yaml", ".yml", ".js", ".mjs", ".cjs", ".jsx",
+];
+
+/// Whether a file nobody reads is still worth scanning for the sections it names.
+fn foreign_source(path: &str) -> bool {
+    FOREIGN.iter().any(|extension| path.ends_with(extension))
+}
+
 /// A file of the project, and what is known about it without asking any model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Module {
@@ -231,6 +264,13 @@ pub struct Module {
     pub reader: Reader,
     /// It cites a spec section. `false` is the *code nobody asked for* pile of §5.1.
     pub declares: bool,
+    /// The sections this module names, at full resolution.
+    ///
+    /// **Deliberately alongside `declares` and not instead of it**, and the two can disagree on
+    /// purpose. `declares` is *this file gestures at a section*; `cites` is *these are the sections
+    /// it names*. A file holding a bare `§` with no number is `declares: true, cites: []` — and that
+    /// difference is a fact worth being able to count, not a bug to normalize away.
+    pub cites: Vec<Citation>,
     /// Something tests it.
     pub tested: bool,
 }
@@ -242,6 +282,13 @@ pub struct Import {
     pub to: String,
 }
 
+/// A file that names a section in a language no reader here understands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Foreign {
+    pub path: String,
+    pub cites: Vec<Citation>,
+}
+
 /// The whole structure layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Structure {
@@ -249,6 +296,14 @@ pub struct Structure {
     pub imports: Vec<Import>,
     /// Files found that no reader here knows how to interpret (§11).
     pub unread: Vec<String>,
+    /// Sections named by files no reader here understands. **Not modules**: nothing here can say
+    /// what a Go file imports or whether anything tests it, and calling one a module would be the
+    /// collapse this map refuses everywhere else.
+    ///
+    /// Kept at all because without them the junction's *declared, with no code* is a lie. 77 Go
+    /// files in `sidecars/` name a `§`, and a decision one of them implements would otherwise be
+    /// reported as unclaimed — a confident wrong answer about a whole language.
+    pub foreign: Vec<Foreign>,
 }
 
 /// Whether a file is proof or a declaration *about* a module rather than a module itself.
@@ -286,6 +341,7 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
     let present: BTreeSet<&str> = files.iter().map(String::as_str).collect();
     let mut modules = Vec::new();
     let mut unread = Vec::new();
+    let mut foreign = Vec::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
     for path in &files {
@@ -293,7 +349,23 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
             continue;
         }
         let Some(reader) = reader_for(path) else {
+            // `unread` counts every file nobody read, exactly as it did before this list existed,
+            // and `foreign` is an extra reading of a subset — never a filter on it. Moving a Go
+            // file out of `unread` because its sections were recovered would shrink the count §11
+            // reports, which is the one number that says what this map cannot see.
             unread.push(path.clone());
+            if foreign_source(path) {
+                let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+                let cites: Vec<Citation> = citations(&source).into_iter().collect();
+                // An entry with no citation is a row that says nothing the `unread` line beside
+                // it does not already say.
+                if !cites.is_empty() {
+                    foreign.push(Foreign {
+                        path: path.clone(),
+                        cites,
+                    });
+                }
+            }
             continue;
         };
         let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
@@ -309,6 +381,7 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
             path: path.clone(),
             reader,
             declares: cites_section(&source),
+            cites: citations(&source).into_iter().collect(),
             tested,
         });
         sources.insert(path.clone(), source);
@@ -384,6 +457,7 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
         modules,
         imports,
         unread,
+        foreign,
     })
 }
 
@@ -758,6 +832,150 @@ import type { GraphNode } from "../data/workflow-graph";
         let found = structure(&root).expect("structure");
         assert!(found.modules.is_empty());
         assert!(found.unread.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_module_that_names_a_section_carries_it() {
+        let root = scratch("cites");
+        write(
+            &root,
+            "core/src/a.rs",
+            // `§7,` and not `§7 is`: a lowercase word after the number is a slug
+            // *candidate* whatever it means in English, so `is` would come back as
+            // `Some("is")`. That is `map_join`'s decision and not a defect — it hands the
+            // join every candidate rather than the ones it liked the look of — but it is
+            // not what this test is about.
+            "//! §6.4 workspace-de-projeto — four kinds\n/// and §7, the other one\n",
+        );
+
+        let found = structure(&root).expect("structure");
+        let a = found
+            .modules
+            .iter()
+            .find(|m| m.path == "core/src/a.rs")
+            .expect("a");
+
+        assert!(a.declares, "it names sections, so it gestures at one");
+        assert_eq!(
+            a.cites,
+            vec![
+                Citation {
+                    section: "6.4".to_string(),
+                    named: Some("workspace-de-projeto".to_string()),
+                },
+                Citation {
+                    section: "7".to_string(),
+                    named: None,
+                },
+            ],
+            "both sections, at the resolution the join needs, in the set's own order"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bare_paragraph_mark_declares_without_citing_anything() {
+        // `declares` and `cites` are two questions and they may honestly disagree. A file holding
+        // a `§` with no number after it gestures at a section without naming one, and that is a
+        // fact worth being able to count rather than a disagreement to normalize away: it is the
+        // difference between a file that forgot the number and one that never claimed anything.
+        let root = scratch("bare");
+        write(&root, "core/src/a.rs", "//! the § symbol, and no number\n");
+
+        let found = structure(&root).expect("structure");
+        let a = found
+            .modules
+            .iter()
+            .find(|m| m.path == "core/src/a.rs")
+            .expect("a");
+
+        assert!(a.declares, "the sign is there");
+        assert!(a.cites.is_empty(), "and it names nothing");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_go_file_naming_a_section_is_foreign_and_not_a_module() {
+        // 77 Go files in `sidecars/` name a section. Without collecting them a decision one of
+        // them implements is reported as having no code at all — a confident wrong answer about
+        // a whole language, which is the one failure this map refuses everywhere else.
+        let root = scratch("foreign-go");
+        write(
+            &root,
+            "sidecars/echo/main.go",
+            "// §9 echo — the sidecar contract\npackage main\n",
+        );
+
+        let found = structure(&root).expect("structure");
+
+        assert!(
+            found.modules.is_empty(),
+            "nothing here can say what a Go file imports, so it is not a module"
+        );
+        assert_eq!(
+            found.unread,
+            vec!["sidecars/echo/main.go".to_string()],
+            "`foreign` answers a different question and must not shrink this count"
+        );
+        assert_eq!(found.foreign.len(), 1);
+        assert_eq!(found.foreign[0].path, "sidecars/echo/main.go");
+        assert_eq!(
+            found.foreign[0].cites,
+            vec![Citation {
+                section: "9".to_string(),
+                named: Some("echo".to_string()),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_spec_is_never_read_for_citations_because_it_cites_itself() {
+        // A design document cites its own sections on every heading. Reading one for citations
+        // would report every decision as claimed by the very document that decided it — a map
+        // that has become a mirror. Still `unread`, because it is still a file nobody read.
+        let root = scratch("spec");
+        write(
+            &root,
+            "docs/design.md",
+            r###"# Design
+
+## §4.1 A decisão
+§4.1 is decided here, and §6.4 workspace-de-projeto follows from it.
+
+## §7 A outra
+§7 too.
+"###,
+        );
+
+        let found = structure(&root).expect("structure");
+
+        assert!(
+            found.foreign.is_empty(),
+            "a document that cites itself claims nothing"
+        );
+        assert_eq!(found.unread, vec!["docs/design.md".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_foreign_file_with_no_citation_is_not_listed() {
+        // An entry with an empty `cites` is a row that says nothing. `unread` already counts the
+        // file; repeating it here with nothing attached is noise in the one list whose whole
+        // purpose is to carry sections.
+        let root = scratch("foreign-silent");
+        write(&root, "sidecars/echo/quiet.go", "package main\n");
+
+        let found = structure(&root).expect("structure");
+
+        assert_eq!(found.unread, vec!["sidecars/echo/quiet.go".to_string()]);
+        assert!(found.foreign.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
