@@ -17,14 +17,18 @@ pub enum Scope {
     Job(String),
 }
 
-#[derive(Debug)]
+/// Internamente etiquetado para que `never_ran` chegue a quem le como um valor de `outcome`, e
+/// nao como a ausencia de campos. Um relatorio vazio que se le como aprovacao e pior do que nao
+/// existir, e a rota e onde essa distincao mais facilmente se achata.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Report {
     /// A equipa existe e nunca correu nada. Não é o mesmo que correr e não ter problemas.
     NeverRan { team: String },
     Measured(Measured),
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct Measured {
     pub team: String,
     pub job: String,
@@ -176,7 +180,8 @@ fn steps_of(tools_used: Option<&str>, num_turns: Option<i64>) -> Option<i64> {
     num_turns
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fit {
     /// Menos de três pontos, ou todos no mesmo x. Não há recta que se possa afirmar.
     ///
@@ -189,7 +194,7 @@ pub enum Fit {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentRollup {
     pub round: i64,
     pub agent_id: String,
@@ -288,7 +293,8 @@ mod calibracao {
 ///
 /// Nao sao exclusivos: um agente pode disparar `SplitSpeciality` e `TrimPrompt` ao mesmo tempo, e
 /// isso e informacao -- enche cedo E trabalha pouco, logo o problema esta quase todo no briefing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// Os itens deste agente compactaram: a especialidade cobre superficie a mais.
     SplitSpeciality,
