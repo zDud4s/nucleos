@@ -427,6 +427,25 @@ describe("what the triager thought, and what it never gets to decide", () => {
   });
 
   /**
+   * `unchecked` is a subset of `flagged + silenced` and not of the debt, so a project whose every
+   * judgement is a flag has nothing in `unseen` and can still be holding judgements this reading
+   * could not re-verify. That number is what says how much of the panel rests on an answer nobody
+   * could test, and it may not vanish because a different number happens to be zero.
+   */
+  it("still says how many judgements went unchecked when there is no debt at all", () => {
+    open({
+      rows: [
+        {
+          row: anchored({ decision_id: 1 }),
+          held: held({ judgement: "flagged", checked: false }),
+        },
+      ],
+    });
+
+    expect(screen.getByText(/1 of the judgements above could not be re-checked/)).toBeTruthy();
+  });
+
+  /**
    * §12 refuses coverage as a percentage outright — *"um número único é exactamente o colapso que o
    * §5 proíbe"* — and this panel is tempted by it: it holds three buckets of one population and a
    * report of seven counts, which is everything a ratio needs. A bar or a ring is the same collapse

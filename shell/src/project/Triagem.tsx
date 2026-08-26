@@ -481,15 +481,24 @@ function Silenced({ rows, recency }: { rows: Judged[]; recency: Recency }) {
  * mean.
  */
 function Debt({ counts }: { counts: TriageCounts }) {
-  if (counts.unseen === 0) return null;
+  /*
+    `unchecked` is in the guard as well as in the body, and it is not the same population as the
+    three above it: it is a subset of `flagged + silenced`, so a project whose every judgement is a
+    flag has `unseen` at zero and can still be holding judgements nothing could re-verify. Gating
+    the whole block on the debt figure dropped that number silently — which is a count of what this
+    map could not confirm, disappearing exactly when there is least else on screen to notice it by.
+  */
+  if (counts.unseen === 0 && counts.unchecked === 0) return null;
 
   return (
     <div className="flex flex-col gap-1">
-      <p className="max-w-prose text-xs text-text-muted">
-        {`${counts.unseen} ${plural(counts.unseen, "decision", "decisions")} nobody has ever given a verdict on.`}{" "}
-        That is §5.3&rsquo;s debt, it is meant to be uncomfortable, and nothing on this panel makes
-        it smaller.
-      </p>
+      {counts.unseen > 0 ? (
+        <p className="max-w-prose text-xs text-text-muted">
+          {`${counts.unseen} ${plural(counts.unseen, "decision", "decisions")} nobody has ever given a verdict on.`}{" "}
+          That is §5.3&rsquo;s debt, it is meant to be uncomfortable, and nothing on this panel
+          makes it smaller.
+        </p>
+      ) : null}
       {counts.silenced > 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
           {counts.silenced} of them the triager silenced, and that leaves the number above exactly
