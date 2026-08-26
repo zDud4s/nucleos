@@ -254,9 +254,19 @@ pub fn section_number(heading: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Anchor {
-    /// Something names this section **and** names a document this project has — the shape §8
-    /// prescribes, `§6.4 workspace-de-projeto`. Certain, and the only state that may be presented
-    /// as confirmed.
+    /// A **readable module** names this section and names a document this project has — the shape
+    /// §8 prescribes, `§6.4 workspace-de-projeto`. Certain, and the only state that may be
+    /// presented as confirmed.
+    ///
+    /// **Readable is part of the definition and not an accident of what this map happens to
+    /// parse.** A Go file carrying a slug would be exactly as certain about *which* section it
+    /// names, and still does not belong here, because of what this state is for downstream: a
+    /// `Declared` decision is the one that later carries a stamp and loses it when the anchor code
+    /// changes (§7). Watching an anchor means knowing what the anchor is, and a file nobody here
+    /// can read has no anchor to watch — so certifying one would be promising an expiry that the
+    /// stamp slice cannot deliver, and an *está como quero* that silently never expires is the
+    /// worst row this map could produce. The conservative rule is therefore the correct one and
+    /// not merely the safe one. Such a file lands in [`Anchor::Ambiguous`] instead.
     ///
     /// **Zero of these exist in this repository today.** That is §8 unfixed and not a bug in this
     /// code: 729 citations across 174 files, 308 carrying a candidate, every one an English word,
@@ -264,23 +274,27 @@ pub enum Anchor {
     /// that could not express certainty even once it is earned would have to be rewritten by the
     /// slice that earns it, and the count being zero is itself the measurement that says the edit
     /// has not landed.
-    ///
-    /// **Only a readable module produces it.** A Go file carrying a slug would be just as certain
-    /// about which section it names, and is held at [`Anchor::Ambiguous`] anyway — the reason is
-    /// there, and it is about what the map can show rather than about what it knows.
     Declared,
-    /// Something names this section but not which document. It may be another spec's §7 — `§7`
-    /// appears in 21 files here and `§6.4` in 10, and not one of them says of what. **Shown,
+    /// Something names this section, and this map cannot confirm it means this decision. **Shown,
     /// never counted as confirmed.**
     ///
-    /// Also where a decision lands when only the Go sidecars name it: named by code, by code this
-    /// map cannot read. That is a second kind of uncertainty wearing one word, and it is
-    /// deliberate rather than overlooked. [`Anchored::foreign`] is what tells the two apart, and
-    /// promoting a sidecar-only decision to [`Anchor::Declared`] would print *certain* above a
-    /// list of files this map has already admitted it cannot interpret — a confident claim about
-    /// code nobody here parsed, which is the one error class this module refuses. Should the two
-    /// ever need separate treatment, the answer is a fifth variant, never a reinterpretation of
-    /// this one.
+    /// **This variant carries two different uncertainties, and the doc says so because the code
+    /// cannot.** One is *which document is this?* — `§7` appears in 21 files here and `§6.4` in
+    /// 10, and not one of them says of what, so any of them may be another spec's §7. The other is
+    /// *this is code I cannot read* — a Go sidecar names the section, and nothing here knows what
+    /// Go does with it.
+    ///
+    /// **The anchor does not tell them apart; [`Anchored::modules`] and [`Anchored::foreign`]
+    /// do.** A consumer that wants the distinction has to look at the two lists, and one that
+    /// renders this state without looking is rendering the weaker of the two claims for both. That
+    /// is the cost of the cut, stated rather than hidden.
+    ///
+    /// **A fifth variant was considered and refused, and the reason is that the two are not
+    /// disjoint.** A Go file naming `§6.4` with no slug is *both* at once — unreadable *and*
+    /// unattributed — so a fifth state would have had to invent a precedence between them, and
+    /// nothing in the spec says which of the two a reader should be told about first. Inventing
+    /// that ordering is the kind of judgement §6 reserves for the owner and this layer has no
+    /// standing to make. Two honest lists beat a fifth word that quietly picks a winner.
     Ambiguous,
     /// **Nothing anywhere** names this section — no module, no Go file, no migration, nothing in
     /// any language scanned. §5.1's *declared, with no code*.
@@ -307,6 +321,15 @@ pub enum Anchor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Anchored {
     pub decision_id: i64,
+    /// The line's number within its spec's extraction, carried through untouched.
+    ///
+    /// The owner approved that spec as a **numbered list**, and *line 3 of that document* is how
+    /// they will refer to a decision afterwards — so the number they read belongs in the payload
+    /// and not only in the sort. Without it a client can only reproduce this order, never a
+    /// different one, which makes the ordering caveat on [`join`] a promise it cannot keep: §10
+    /// wants a different order eventually, and a payload that cannot be re-sorted would have to be
+    /// widened by the slice that changes it.
+    pub ordinal: i64,
     pub spec_slug: String,
     /// The heading as the model copied it — `## 4.1 Três tipos de decisão` — and not the number
     /// [`section_number`] read off it. The owner approved this string, so this is the string that
@@ -379,9 +402,10 @@ pub struct Counts {
 ///
 /// 1. The candidate has **at least two hyphen-joined segments**. A one-word candidate is an
 ///    English word until proven otherwise — `§4.4 rule` occurs twelve times here — and the rule
-///    also has to survive Portuguese: `design` is a segment of nearly every spec slug in this
-///    repository and `de` of a third of them, so a bare `de` would otherwise declare against half
-///    the intention layer.
+///    also has to survive Portuguese, where it is doing real work rather than being cautious: of
+///    the 40 spec slugs in this repository **34 carry a `design` segment and 14 carry a `de`**, so
+///    without this condition a single `§7 de` would declare against a third of the intention layer
+///    at once, and `§7 design` against nearly all of it.
 /// 2. Its segments appear as a **contiguous run** inside the slug's segments. `workspace-projeto`
 ///    names two segments the slug really has, in order, with one missing between them, and a rule
 ///    that accepted that would accept any two words a document happens to contain.
@@ -563,6 +587,7 @@ pub fn join(
 
         anchored.push(Anchored {
             decision_id: decision.id,
+            ordinal: decision.ordinal,
             spec_slug: decision.spec_slug.clone(),
             section: decision.section.clone(),
             text: decision.text.clone(),
@@ -1212,6 +1237,12 @@ mod tests {
 
         let order: Vec<i64> = junction.decisions.iter().map(|d| d.decision_id).collect();
         assert_eq!(order, [2, 1, 3], "spec_slug, then ordinal");
+        let numbers: Vec<i64> = junction.decisions.iter().map(|d| d.ordinal).collect();
+        assert_eq!(
+            numbers,
+            [9, 1, 2],
+            "the number the owner read travels with the line"
+        );
         assert_eq!(
             junction.decisions[0].modules,
             ["core/src/runs.rs", "shell/src/pages/Fleet.tsx"]
@@ -1221,6 +1252,22 @@ mod tests {
             ["core/src/gate.rs", "shell/src/ui/Meter.tsx"]
         );
         assert_eq!(junction.unmatched, ["core/src/aa.rs", "shell/src/zz.ts"]);
+
+        // The id is the third key and not decoration. `map_decisions` is unique on
+        // `(project_id, spec_slug, ordinal, extracted_at)`, so two extractions of one spec can
+        // both hold ordinal 1 and both be approved; without the tiebreak their order would be
+        // whatever the caller's query happened to hand over. Given in reverse, they come back in
+        // order.
+        let tied = [
+            decided(8, SLUGS[0], "## 7. O carimbo", 1),
+            decided(5, SLUGS[0], "## 7. O carimbo", 1),
+        ];
+        let broken: Vec<i64> = join(&tied, &[], &[], &slugs())
+            .decisions
+            .iter()
+            .map(|anchored| anchored.decision_id)
+            .collect();
+        assert_eq!(broken, [5, 8]);
     }
 
     #[test]
