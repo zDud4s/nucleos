@@ -599,8 +599,11 @@ fn judged_from_row(
 /// SQLite's plan choose the winner, which is a decision that reads silenced on one refresh and
 /// flagged on the next with nothing having happened. `id DESC` breaks it on insertion order, which
 /// is the order the triager actually answered in.
-// Task 4 of this slice gives it its second caller: `MapAnswer` gains the judgements by decision id,
-// and `GET /projects/{id}/map/silenced` reads the pile §6.2 requires.
+///
+/// **The reader of *what is true now*, and [`silencings`] is the reader of *what happened*.** This
+/// one answers `GET /map`, which needs one judgement per decision so §5.3's numbers can reconcile;
+/// that one answers §6.2's pile, which needs every row and drops none of the filters. Two readers
+/// of one table, and the pair is deliberate — see [`silencings`], which argues the other side.
 pub async fn judgements(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Judged>> {
     let rows = sqlx::query_as::<_, JudgedRow>(
         "SELECT t.decision_id, t.verdict, t.reason, t.model, t.computed_at, t.inputs_digest
@@ -622,6 +625,110 @@ pub async fn judgements(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Resu
 
     Ok(rows.into_iter().filter_map(judged_from_row).collect())
 }
+
+/// One silencing, with the decision it was about — the whole row §6.2's pile is made of.
+///
+/// **Carries the decision's own words and not merely its id**, because the pile is read by somebody
+/// who does not have the map open beside it. §6.2 asks for the reason and the model; §1 says the
+/// gesture the owner cannot perform is cross-referencing three hundred rows by hand, and a pile of
+/// ids would ask for exactly that.
+///
+/// No `inputs_digest`. This type is the record of what the triager DID, and staleness is a question
+/// about what is true now — [`Judged`] carries the digest for the reader that asks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Silencing {
+    pub decision_id: i64,
+    pub spec_slug: String,
+    pub section: String,
+    pub text: String,
+    /// Why the triager silenced it, in its own words. Never empty — `0119` refuses it.
+    pub reason: String,
+    /// Which brain or model answered. §6.2 names it: the repair for a triager that silences too
+    /// much is to stop using that triager, and that is not a decision anybody can take about a pile
+    /// that will not say who filled it.
+    pub model: String,
+    pub computed_at: String,
+    /// The decision has since been retired — the owner said no, or a later extraction superseded it.
+    ///
+    /// **On the row rather than filtered out of the query**, which is the whole point of [`silencings`]
+    /// not repeating [`approved`]'s `retired_at IS NULL`. A reader auditing the triager does not
+    /// care whether the decision survived; hiding the silencing because the decision was later
+    /// withdrawn deletes exactly the evidence §13's mitigation rests on. What the flag buys is that
+    /// the pile can say *this decision is gone* while still showing what was said about it.
+    pub retired: bool,
+}
+
+/// Every silencing this project's triager has ever written, newest first.
+///
+/// **Every row and not the latest judgement per decision, which is the difference from
+/// [`judgements`] and the reason `map_triage` was made append-only in the first place.** §6.2 asks
+/// for *"a razão de **cada** silenciamento e o modelo que o produziu"*, and a reader that returned
+/// one row per decision would lose the case the requirement most obviously covers: a decision
+/// silenced last week and flagged today has a silencing in the table and none in the pile. Nothing
+/// was reading the history until this function; the table's append-only discipline was a promise
+/// with no reader to keep it for.
+///
+/// **`retired_at` is deliberately NOT in the `WHERE`, and `approved_at IS NOT NULL` deliberately
+/// is.** They look like one filter and are two different claims. A retired decision is out of the
+/// map and its silencing is still a thing the triager did — §6.2's *sempre acessível* has no
+/// exception for a decision somebody later withdrew, and the retirement is reported on the row as
+/// [`Silencing::retired`] instead. An UNAPPROVED decision is different: §4 and §6 mean the triager
+/// never sees one, so a judgement against one is not a record to preserve, it is a defect, and a
+/// reader that quietly displayed it would be the place that defect went unnoticed.
+///
+/// **The verdict is compared against [`Judgement::Silenced`]'s own storage form** rather than the
+/// literal `'silenced'`, so the word has one owner. `0119`'s CHECK admits exactly two values and
+/// `Judgement::as_str` writes them; a third spelling here would be a filter that silently matched
+/// nothing the day either changed.
+///
+/// **Newest first, tie-broken by `id DESC` and never by `decision_id`.** A sweep silences a batch
+/// inside one instant — `computed_at` is a clock and not a counter — so ties are the ordinary case,
+/// and insertion order is the order the triager actually answered in. Ordering by decision id would
+/// interleave two runs of one project and make the last press impossible to read off the top of the
+/// pile, which is what somebody opens this for.
+pub async fn silencings(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Silencing>> {
+    let rows = sqlx::query_as::<_, SilencingRow>(
+        "SELECT t.decision_id, d.spec_slug, d.section, d.text, t.reason, t.model, t.computed_at,
+                CASE WHEN d.retired_at IS NULL THEN 0 ELSE 1 END
+           FROM map_triage t
+           JOIN map_decisions d ON d.id = t.decision_id
+          WHERE d.project_id = ?
+            AND d.approved_at IS NOT NULL
+            AND t.verdict = ?
+          ORDER BY t.computed_at DESC, t.id DESC",
+    )
+    .bind(project_id)
+    .bind(Judgement::Silenced.as_str())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(decision_id, spec_slug, section, text, reason, model, computed_at, retired)| {
+                Silencing {
+                    decision_id,
+                    spec_slug,
+                    section,
+                    text,
+                    reason,
+                    model,
+                    computed_at,
+                    retired: retired != 0,
+                }
+            },
+        )
+        .collect())
+}
+
+/// The columns [`silencings`] selects, named once for [`JudgedRow`]'s reason and with the same
+/// hazard: six of the eight are `String`, so a `SELECT` that swapped any pair would still typecheck
+/// and surface as a pile whose reasons are all section headings.
+///
+/// The last is an `i64` and not a `bool` because the expression producing it is a SQL `CASE`, and a
+/// `CASE` returning 0/1 is the portable spelling — `d.retired_at IS NOT NULL` decodes too, and
+/// leaves a reader wondering which of SQLite's truthiness rules is in play.
+type SilencingRow = (i64, String, String, String, String, String, String, i64);
 
 #[cfg(test)]
 mod tests {
@@ -1743,6 +1850,138 @@ mod tests {
             .unwrap(),
             "an id that names nothing at all"
         );
+        assert!(judgements(&pool, "alpha").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_silencing_is_in_the_pile_and_not_only_the_latest_judgement() {
+        // **§6.2 asks for *"a razão de CADA silenciamento"*, and `judgements` answers with one row
+        // per decision.** A decision silenced last week and flagged today therefore had a silencing
+        // in the table and none in the pile — the append-only discipline `map_triage` was given for
+        // exactly this, with nothing reading it. §13 rates the triager silencing what it should have
+        // shown a **real** residual risk whose only mitigation is the pile, and a mitigation that
+        // loses the row the moment the triager changes its mind is not one.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Silenced,
+                "nada de estranho na primeira leitura",
+                "local",
+                "d1"
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Silenced,
+                "continua a não me saltar nada à vista",
+                "cloud",
+                "d2"
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Flagged,
+                "afinal isto merece o teu olhar",
+                "cloud",
+                "d3"
+            )
+            .await
+            .unwrap()
+        );
+
+        let pile = silencings(&pool, "alpha").await.unwrap();
+
+        assert_eq!(
+            pile.len(),
+            2,
+            "both silencings survive the flag that overturned them: {pile:?}"
+        );
+        assert_eq!(
+            judgements(&pool, "alpha").await.unwrap()[0].judgement,
+            Judgement::Flagged,
+            "and the map's own reader still answers with the latest, which is the pair's whole \
+             point"
+        );
+        // Newest first, tie-broken by insertion order — a sweep silences a batch inside one
+        // instant, so `computed_at` alone decides almost nothing and the last press is what
+        // somebody opens this to read.
+        assert_eq!(pile[0].reason, "continua a não me saltar nada à vista");
+        assert_eq!(pile[0].model, "cloud");
+        assert_eq!(pile[1].reason, "nada de estranho na primeira leitura");
+        assert_eq!(pile[1].model, "local");
+        // The decision's own words travel with each row, or the pile is a list of ids and the
+        // reader has to do the cross-reference §1 says they cannot.
+        assert_eq!(pile[0].text, two_decisions()[0].text);
+        assert_eq!(pile[0].section, two_decisions()[0].section);
+        assert_eq!(pile[0].spec_slug, "design");
+        assert!(!pile[0].retired);
+
+        // A flag is not a silencing, and nothing here widens the pile into the whole table.
+        assert!(pile.iter().all(|row| !row.reason.contains("merece")));
+        assert!(silencings(&pool, "beta").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_silencing_survives_the_decision_being_retired() {
+        // **`retired_at` is deliberately absent from this reader's `WHERE`, and that is the one
+        // clause it does not copy from [`approved`].** A silencing of a decision the owner later
+        // said no to — or that a re-extraction superseded — is still a thing the triager did, and
+        // hiding it deletes the bug report by way of its own subject. §6.2's *sempre acessível* has
+        // no exception for a decision somebody withdrew.
+        //
+        // What IS copied is `approved_at IS NOT NULL`, and the two are different claims: the
+        // triager never sees an unapproved line (§4, §6), so a judgement against one is not a
+        // record to preserve, it is a defect, and a reader that displayed it is where that defect
+        // would go unnoticed.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Silenced,
+                "nada de estranho",
+                "local",
+                "d1"
+            )
+            .await
+            .unwrap()
+        );
+
+        sqlx::query("UPDATE map_decisions SET retired_at = ? WHERE id = ?")
+            .bind("2026-08-26T12:00:00+00:00")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let pile = silencings(&pool, "alpha").await.unwrap();
+
+        assert_eq!(pile.len(), 1, "{pile:?}");
+        assert_eq!(pile[0].reason, "nada de estranho");
+        // **Reported and not hidden**, so the pile can say the decision is gone while still showing
+        // what was said about it.
+        assert!(
+            pile[0].retired,
+            "a reader that could not tell would present a withdrawn decision as a live one"
+        );
+        // And the map's own reader drops it, which is the asymmetry stated from the other side: a
+        // retired decision is not in the map, so it has no standing there to be counted against.
         assert!(judgements(&pool, "alpha").await.unwrap().is_empty());
     }
 }
