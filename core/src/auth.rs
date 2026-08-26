@@ -238,6 +238,19 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // nothing `cat` could not already show. Naming them here is what lets the extraction button
     // offer a choice instead of a text box; it spends no model and settles nothing, so it costs
     // this key no more than `map` beside it does.
+    //
+    // `map/silenced` is the same grant a third time and needs no new argument: §6.2's pile is the
+    // decisions a model saw nothing worth the owner's time in, each one a sentence lifted out of a
+    // spec sitting in that project's folder — which a reader holding `map`, `map/decisions` and
+    // `cat` can already read whole — plus the reason the triager gave and the name of the brain
+    // that gave it. Neither of those two is a fact about anything outside this project.
+    //
+    // Listed rather than left implied, because §6.2 requires the pile to be *"sempre acessível"*
+    // and a route that answered `403` to a key holding `map` would be a filter on that
+    // accessibility wearing the shape of a permission. The `POST …/map/triage` beside it stays in
+    // NO table for the reason given four paragraphs up, and the pair is worth reading together:
+    // this is the pile a run left behind, and that one is what spends a model per decision to
+    // fill it.
     (Method::GET, "/projects/{id}/readings"),
     (Method::GET, "/projects/{id}/log"),
     (Method::GET, "/projects/{id}/branches"),
@@ -248,6 +261,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/map"),
     (Method::GET, "/projects/{id}/map/decisions"),
     (Method::GET, "/projects/{id}/map/specs"),
+    (Method::GET, "/projects/{id}/map/silenced"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),

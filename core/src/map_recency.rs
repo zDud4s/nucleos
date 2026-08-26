@@ -179,13 +179,19 @@ pub struct Walk {
     moved: BTreeMap<String, i64>,
 }
 
-/// How long ago one decision's anchor code last moved, in the four states that are not each other.
+/// How long ago one decision's anchor code last moved, in the five states that are not each other.
 ///
-/// **Four, and the three that are not [`Age::Moved`] are the reason this is an enum rather than an
+/// **Five, and the four that are not [`Age::Moved`] are the reason this is an enum rather than an
 /// `Option<i64>`.** They sort in the same region and mean entirely different things, and §10's
-/// ordering is presented to its reader as a fact about git — a screen that renders three different
+/// ordering is presented to its reader as a fact about git — a screen that renders four different
 /// silences identically is the false confidence §1 describes, arriving through the rendering door
 /// §6.1 watches.
+///
+/// **It was four for one commit, and the fifth is a correction rather than an addition.** Nothing
+/// that follows [`Age::Moved`] has a timestamp, so the temptation is to read the tail as one thing
+/// with several excuses; the whole discipline of this enum is that an excuse the panel is allowed
+/// to repeat out loud and one it is not are different values. See [`Age::ForeignOnly`], which is
+/// the flattening [`Age::Unanchored`]'s own doc used to name and keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Age {
@@ -215,13 +221,44 @@ pub enum Age {
     /// first *declarado, sem código* and puts it in front of somebody precisely so it is looked at,
     /// and a list that spelled the two alike would bury it among rows that are merely quiet.
     ///
-    /// **The one flattening in here, named rather than discovered:** a decision named only by a Go
-    /// sidecar has an empty `modules` and a non-empty `foreign`, so it lands here although there is
-    /// code that could have moved. That is `map_stamp::Watch::NoAnchor`'s flattening, taken
-    /// deliberately so the two axes do not disagree about one decision — and the payload carries
-    /// `Anchored::foreign` beside this, so a panel saying *no code names this* is choosing to,
-    /// rather than being told to.
+    /// **Nothing to move means nothing at all names it**, readable or otherwise. A decision named
+    /// only by a Go sidecar used to land here, and the sentence above was untrue of it: there is
+    /// code, it exists, and this map cannot read it. That is [`Age::ForeignOnly`] now.
     Unanchored,
+    /// Nothing this map can read names it, and something it cannot read does.
+    ///
+    /// **A fifth value rather than a corner of [`Age::Unanchored`], and the difference is what the
+    /// panel is allowed to say.** *Nothing moved because there is nothing to move* is a complete
+    /// finding; here the finding is *this map cannot tell*, and §5.1's *declarado, sem código* — a
+    /// pile that exists to be looked at — is precisely the claim that must not be made about a
+    /// decision the sidecars implement. It is the failure [`crate::map_join::Structure::foreign`]
+    /// was added in slice 3 to prevent, reappearing on the recency axis: without that list,
+    /// *declarado sem código* was a lie about a whole language.
+    ///
+    /// **Measured rather than hypothetical.** Six section numbers in this repository are named by
+    /// foreign files and by no readable module — `§1.5`, `§5.6`, `§5.8`, `§6.18`, `§9.5` and `§9.6`,
+    /// counted on 2026-08-26 over the extensions `project_map::FOREIGN` lists — and behind them sit
+    /// the browser and email sidecars and one stylesheet. A decision is per document AND per
+    /// section, so the count of DECISIONS affected is that or more, higher wherever two documents
+    /// number a section alike, which §8 says they do constantly.
+    ///
+    /// **Not the fifth [`crate::map_join::Anchor`] that module refused, and the difference is
+    /// worth a sentence because the shapes rhyme.** What `Anchor` declined to invent was a
+    /// precedence between two uncertainties that are not disjoint — a Go file naming `§6.4` with no
+    /// slug is unreadable *and* unattributed at once, and nothing says which a reader should hear
+    /// first. This asks a different question with a yes-or-no answer: is there anything under this
+    /// decision that this map could watch move? `modules` empty and `foreign` not is that answer,
+    /// whatever the anchor's certainty happens to be, so no precedence is being invented here.
+    ///
+    /// **`foreign` still does not enter the recency itself, and that exclusion is not what was
+    /// wrong.** [`order`]'s doc gives the reason: `map_stamp::digest` does not watch those files, so
+    /// a decision that rose up the list because a Go file moved would be sorted by something no
+    /// other part of this feature considers an anchor, and the recency axis and the stamp axis would
+    /// disagree about one decision. So [`Walk::age`] reads this set for whether it is EMPTY and
+    /// never for when anything in it moved — which is why this value sorts with
+    /// [`Age::Unanchored`] rather than among the timestamps. There is still nothing here to sort by.
+    /// The flattening was the problem; the exclusion is the design.
+    ForeignOnly,
     /// Anchored, and git would not say when anything moved.
     ///
     /// **Never written when there is a window**, so it can only ever mean what it says. Reporting
@@ -281,14 +318,31 @@ impl Walk {
     /// **The most recent and not the oldest, the average, or the first.** A decision is as fresh as
     /// the freshest thing under it: §10 asks what moved since the owner last looked, and one file
     /// of six having moved this morning is a yes to that question whatever the other five did.
-    pub fn age(&self, paths: &[String]) -> Age {
-        if paths.is_empty() {
-            return Age::Unanchored;
+    ///
+    /// **Two slices and not one [`Anchored`], and not one concatenated list.** `foreign` is read for
+    /// exactly one bit — whether it is empty — and never looked up in the walk, which is the whole
+    /// of [`Age::ForeignOnly`]'s argument and is a property a reader should be able to check from
+    /// the signature. Taking the decision itself would hide which two of its nine fields this reads;
+    /// taking one merged list would make a Go file able to date a decision, which [`order`] refuses
+    /// for a reason that has nothing to do with this value.
+    pub fn age(&self, modules: &[String], foreign: &[String]) -> Age {
+        if modules.is_empty() {
+            // The order matters and only in this one place: *nothing readable names it* is checked
+            // before *git would not say*, because both of these are facts about the DECISION and
+            // survive a walk that never happened, exactly as `anchor_digests` gives such a decision
+            // `Computed("")` whatever became of the git call. A decision that flapped between
+            // `ForeignOnly` and `Unknown` every time git hiccuped would be nagging about a fact
+            // that cannot change.
+            return if foreign.is_empty() {
+                Age::Unanchored
+            } else {
+                Age::ForeignOnly
+            };
         }
         if self.commits.is_none() {
             return Age::Unknown;
         }
-        match paths
+        match modules
             .iter()
             .filter_map(|path| self.moved.get(path.as_str()).copied())
             .max()
@@ -427,7 +481,12 @@ fn parse(text: &str) -> BTreeMap<String, i64> {
 pub fn order(decisions: &mut [Anchored], walk: &Walk) -> Recency {
     let ages: BTreeMap<i64, Age> = decisions
         .iter()
-        .map(|anchored| (anchored.decision_id, walk.age(&anchored.modules)))
+        .map(|anchored| {
+            (
+                anchored.decision_id,
+                walk.age(&anchored.modules, &anchored.foreign),
+            )
+        })
         .collect();
 
     decisions.sort_by_key(|anchored| {
@@ -450,7 +509,7 @@ pub fn order(decisions: &mut [Anchored], walk: &Walk) -> Recency {
 /// The sort key, newest first.
 ///
 /// [`Reverse`] on the timestamp rather than reversing the whole comparison, because only the
-/// timestamp runs backwards: the three silences behind it keep their own order, and that order is
+/// timestamp runs backwards: the four silences behind it keep their own order, and that order is
 /// an argument. [`Age::Older`] is *anchored, and quiet*; [`Age::Unknown`] is *anchored, and nobody
 /// could look*, which is a row that might deserve attention and cannot be shown to; and
 /// [`Age::Unanchored`] is last because there is nothing under it that could ever move.
@@ -458,12 +517,20 @@ pub fn order(decisions: &mut [Anchored], walk: &Walk) -> Recency {
 /// and the first only when there is — so their order relative to each other is unobservable and is
 /// written down anyway, since a `match` that has to be exhaustive is where the next reader looks
 /// for the rule.
+///
+/// **[`Age::ForeignOnly`] shares [`Age::Unanchored`]'s rank and that is not an oversight.** The two
+/// say different things and neither has a timestamp, so there is nothing here to order them by —
+/// and inventing one would be this module deciding that a decision the sidecars implement deserves
+/// the owner's attention before or after one nothing implements at all, which is the judgement §10
+/// gives to one person. Tied, the stable sort leaves them in `map_store::approved`'s order, and
+/// the difference between them reaches the panel through [`Recency::ages`], where it is a label
+/// rather than a position.
 fn rank(age: Age) -> (u8, Reverse<i64>) {
     match age {
         Age::Moved { at } => (0, Reverse(at)),
         Age::Older => (1, Reverse(0)),
         Age::Unknown => (2, Reverse(0)),
-        Age::Unanchored => (3, Reverse(0)),
+        Age::Unanchored | Age::ForeignOnly => (3, Reverse(0)),
     }
 }
 
@@ -561,6 +628,21 @@ mod tests {
         }
     }
 
+    /// A decision no readable module names, and that a file in a language this map cannot read
+    /// does.
+    ///
+    /// [`Anchor::Ambiguous`] and not [`Anchor::Silent`], because that is what `map_join` actually
+    /// produces for one: `Anchor::Declared`'s doc says a Go file carrying a slug still lands in
+    /// `Ambiguous`, and `Silent` means nothing anywhere names the section. A fixture that wrote
+    /// `Silent` here would be asserting about a decision the junction cannot make.
+    fn named_only_by(id: i64, foreign: &[&str]) -> Anchored {
+        Anchored {
+            anchor: Anchor::Ambiguous,
+            foreign: foreign.iter().map(|path| (*path).to_owned()).collect(),
+            ..decision(id, &[])
+        }
+    }
+
     fn ids(decisions: &[Anchored]) -> Vec<i64> {
         decisions.iter().map(|one| one.decision_id).collect()
     }
@@ -629,6 +711,55 @@ mod tests {
         // first among the second.
         assert_eq!(recency.ages.get(&1), Some(&Age::Unanchored));
         assert_ne!(recency.ages.get(&1), recency.ages.get(&2));
+    }
+
+    #[tokio::test]
+    async fn a_decision_named_only_by_a_sidecar_is_not_told_nothing_implements_it() {
+        // **The correction the four-valued `Age` needed.** `Unanchored`'s sentence was *nothing
+        // moved because there is nothing to move*, and that is untrue of a decision implemented
+        // only in a Go sidecar: `foreign` is not empty, real code exists, and this map cannot read
+        // it. Six section numbers in this repository are named by foreign files and by no readable
+        // module, so six decisions at least were being told nothing implements them — which is
+        // precisely the failure `Structure::foreign` was added in slice 3 to prevent, reappearing
+        // on the recency axis.
+        let repo = repository("nucleos-recency-foreign-");
+        let root = repo.path();
+        write(root, "core/src/quick.rs", "//! §1 often\n");
+        commit_at(root, "quick", OLD);
+        // Committed LAST on purpose. If `foreign` leaked into the recency itself, decision 3 would
+        // come back `Moved { at: RECENT }` and sort at the HEAD of the list — sorted by a file
+        // `map_stamp::digest` does not watch, which is the two axes disagreeing about one decision.
+        write(root, "sidecars/browser/pool/pool.go", "// §1 o pool\n");
+        commit_at(root, "sidecar", RECENT);
+        let walked = walk_within(root, 10).await;
+
+        let mut arriving = vec![
+            decision(1, &["core/src/quick.rs"]),
+            decision(2, &[]),
+            named_only_by(3, &["sidecars/browser/pool/pool.go"]),
+        ];
+        let recency = order(&mut arriving, &walked);
+
+        assert_eq!(recency.ages.get(&3), Some(&Age::ForeignOnly), "{recency:?}");
+        // **Said the other way round as well, because this is the assertion that would rot
+        // silently.** The value has to differ from the one beside it — decision 2 genuinely has
+        // nothing to move, and §5.1 puts that pile in front of somebody to be looked at — and it
+        // must not carry the sidecar's timestamp.
+        assert_ne!(recency.ages.get(&3), recency.ages.get(&2));
+        assert_ne!(recency.ages.get(&3), Some(&Age::Moved { at: RECENT }));
+        assert_eq!(ids(&arriving), vec![1, 2, 3], "{recency:?}");
+
+        // And the two silences share a RANK rather than merely sitting next to each other: with no
+        // timestamp under either, arrival order decides between them, in both directions. A
+        // `ForeignOnly` given a rank of its own would pass the assertion above and flip this one.
+        let mut reversed = vec![
+            decision(1, &["core/src/quick.rs"]),
+            named_only_by(3, &["sidecars/browser/pool/pool.go"]),
+            decision(2, &[]),
+        ];
+        let again = order(&mut reversed, &walked);
+
+        assert_eq!(ids(&reversed), vec![1, 3, 2], "{again:?}");
     }
 
     #[tokio::test]

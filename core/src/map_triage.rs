@@ -10,6 +10,13 @@
 //! model. Nothing here knows what SQL is, what HTTP is, or which model answered — it takes a
 //! decision and a reading of the repository and returns text, data, and a hash.
 //!
+//! **[`reconcile`] takes `map_store`'s row struct, and that is not the seam being crossed.** It is
+//! the same borrow `map_stamp::standing` already takes of `map_store::Stamp`: a plain struct of six
+//! fields, with no pool, no query and nothing to await. What this module still does not know is
+//! where a `Judged` came from or how to fetch another one — and §5.3's header is here rather than
+//! next door because the rule it enforces is §10's scope for the TRIAGER, which is this file's
+//! subject and not the stamp's.
+//!
 //! **The one rule this module exists to make unsayable: the triager may never approve.** §6's table
 //! names exactly one forbidden column for it — *Aprovar* — and §6.1 says why the prohibition has to
 //! survive rendering as well as storage: *"se colapsassem, a autoridade que foi retirada ao modelo
@@ -661,18 +668,45 @@ pub fn parse_answer(answer: &str) -> Result<Answer, Unreadable> {
 pub fn unreadable_flag(why: &Unreadable, said: &str) -> Answer {
     Answer {
         judgement: Judgement::Flagged,
-        // `nucleos:` in front because this daemon already marks its own words that way in the one
-        // other place a machine writes into a field a person reads — see the runner's stderr. The
-        // pile §6.2 requires is a list of sentences attributed to a model, and an unattributed one
-        // in the middle of it would be read as the model's.
         reason: clipped(
             &format!(
-                "nucleos: the triager's answer could not be read, so nobody has looked at this \
-                 decision — {why}. It said: {said}"
+                "{DAEMON_MARK} the triager's answer could not be read, so nobody has looked at \
+                 this decision — {why}. It said: {said}"
             ),
             MAX_REASON_BYTES,
         ),
     }
+}
+
+/// What a reason this daemon wrote itself opens with.
+///
+/// **A convention, and therefore something a reader must be able to test rather than remember.**
+/// This daemon already marks its own words this way in the one other place a machine writes into a
+/// field a person reads — see the runner's stderr — and here it carries a meaning §6.2 depends on:
+/// the pile is a list of sentences attributed to a model, and an unattributed one in the middle of
+/// it would be read as the model's. `map_triage.model` names the brain that ANSWERED, which is true
+/// even of the answer nobody could read, so the column alone cannot say who wrote the sentence.
+///
+/// Named as a constant rather than repeated as a literal because [`unreadable_flag`] writes it and
+/// `GET …/map/silenced` reads it, and a convention with two spellings is one that has already
+/// stopped working somewhere.
+pub const DAEMON_MARK: &str = "nucleos:";
+
+/// Did this daemon write this sentence, or did a model?
+///
+/// **Always `false` on the silenced pile today, and that is not a reason to leave it out.** The one
+/// producer of a daemon-written reason is [`unreadable_flag`], which may only ever reach
+/// [`Judgement::Flagged`] — §6 forbids the triager to approve and forbids a machine to silence for
+/// exactly the same reason — so a `silenced` row carrying this mark cannot be produced by anything
+/// in this crate. What the field buys is that a client never has to know that: a payload that let
+/// the two be told apart only by the reader's memory of a convention is one where the first
+/// machine-written silence, from wherever it comes, arrives on screen as a model's opinion.
+///
+/// A prefix test and not a parse. The rest of the sentence is prose meant for a person, and
+/// anything that tried to read structure out of it would be inventing a format the writer does not
+/// keep.
+pub fn written_by_the_daemon(reason: &str) -> bool {
+    reason.trim_start().starts_with(DAEMON_MARK)
 }
 
 /// One field into the hash, with its length in front of it.
@@ -833,6 +867,184 @@ fn digest_against(evidence: Evidence<'_>, prompt_version: u32) -> String {
 pub fn is_current(recorded: &str, current: &str) -> bool {
     let recorded = recorded.trim();
     !recorded.is_empty() && recorded == current.trim()
+}
+
+/// §5.3's two remaining numbers, and the piles they are made of.
+///
+/// **A sibling of [`crate::map_stamp::StampCounts`] and deliberately not a widening of it.** The
+/// tempting move is four more fields over there, where the rest of the header already lives. It
+/// would cost the one property this type is for: `StampCounts` is the DENOMINATOR these numbers are
+/// checked against — [`Self::unseen`] plus [`Self::flagged`] plus [`Self::silenced`] must equal
+/// `StampCounts::never` — and a single function producing both sides of that equation could not be
+/// checked by anything, because both sides would be wrong together. `map_stamp::counts` must stay
+/// callable with no judgement anywhere near it.
+///
+/// The second reason is whose rule is being applied. Everything below rests on *triage describes
+/// only [`crate::map_stamp::Standing::Never`]*, which is §10's scope for the triager and this
+/// module's subject — the same sentence [`inputs_digest`] leaves `Standing` out of the hash for.
+/// `map_stamp.rs` is the stamp and its expiry; a filter about what the MODEL is allowed to have an
+/// opinion on does not belong in it.
+///
+/// **Required to add up, and by construction rather than by subtraction — see [`reconcile`].**
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TriageCounts {
+    /// Decisions still in [`crate::map_stamp::Standing::Never`] whose current judgement is
+    /// [`Judgement::Flagged`]. These leave §5.3's `K` and join its `J`.
+    pub flagged: usize,
+    /// Decisions still in [`crate::map_stamp::Standing::Never`] whose current judgement is
+    /// [`Judgement::Silenced`].
+    ///
+    /// **Out of `K` and NOT into `J`, which is the arithmetic of §6.1.** A silence is *sem sinal de
+    /// problema*, a claim about the triager and about nothing else; it does not ask for the owner's
+    /// eyes, so it may not be counted as waiting, and it is not a stamp, so it may not be counted as
+    /// green either. Its own number is the only honest place for it — and §13 rates *o triador
+    /// silencia o que devia mostrar* a real residual risk, which is a great deal easier to notice
+    /// against a number that grows than against a pile that quietly absorbs a backlog.
+    pub silenced: usize,
+    /// §5.3's `J à tua espera` — `StampCounts::lapsed + flagged`.
+    ///
+    /// The union slice 4 wrote down and could not yet compute: *"`J` são hoje os carimbos que
+    /// caducaram. Cresce na fatia 5: o triador acrescenta-lhe as decisões que assinalar, que saem de
+    /// `K`."* The two halves reach the owner for opposite reasons — a lapse is the owner's own green
+    /// gone stale, a flag is a model asking — and they are one number because what the header
+    /// promises is *how many things want you today*, which is a count and not a taxonomy.
+    pub waiting: usize,
+    /// §5.3's `K nunca vistas` — `StampCounts::never − flagged − silenced`.
+    ///
+    /// **Counted rather than subtracted, which is the whole reason this field exists at all.** See
+    /// [`reconcile`]: every `Never` decision falls into exactly one of the three buckets above in
+    /// one pass, so this is the third bucket and not the result of an arithmetic that could go
+    /// negative and be clamped. `K` is debt and is supposed to be uncomfortable (§5.3, §10), and a
+    /// debt figure repaired by a `saturating_sub` is the one number in this header nobody would
+    /// ever catch being wrong.
+    ///
+    /// **This number is NOT safe to print alone, and the objection is recorded here rather than
+    /// left for the panel to discover.** Subtracting `silenced` is the plan's definition of `K` and
+    /// is implemented as asked, and it disagrees with §5.1 and with §5.3's own words. §5.1: a
+    /// silenced node is *"sem sinal de problema. **Ninguém olhou.** Não é verde."* §5.3, amended
+    /// when slice 4 landed: *"`K` são as que nunca foram carimbadas, e só essas"*, and the only
+    /// departure it authorises is for the flagged — *"o triador acrescenta-lhe as decisões que
+    /// assinalar, **que saem de `K`**"*, which names `J`'s growth and says nothing whatever about a
+    /// silence. So a triager that silences three hundred decisions drives this to zero, and a
+    /// header reading *0 nunca vistas* over a backlog nobody has read is §1's false confidence,
+    /// produced by the cure's own arithmetic. §6.1 forbids a silence sharing a stamp's COLOUR; the
+    /// header is a door it does not watch.
+    ///
+    /// What ships against that is the payload rather than a unilateral change to the formula:
+    /// [`Self::silenced`] is beside this, `StampCounts::never` is on the same answer, and a panel
+    /// is therefore free to print `never` as `K` and the silenced pile beside it. What it must not
+    /// do is print this number by itself and call it *nunca vistas*.
+    pub unseen: usize,
+}
+
+/// The judgements that still describe this map, and §5.3's numbers over exactly those.
+///
+/// **One value carrying both, because the header disagreeing with the rows beneath it is the
+/// disease this whole feature is the cure for.** Two functions — one filtering, one tallying —
+/// would be two chances for a caller to ship one set and count another, and the screen would look
+/// entirely correct while doing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reconciled {
+    /// What the panel may draw, by `decision_id`.
+    ///
+    /// **A map and never a parallel array**, the rule `MapAnswer::standings` and
+    /// [`crate::map_recency::Recency::ages`] already keep: `junction.decisions` is re-sorted into
+    /// §10's order after the join, and an index-aligned array would silently start drawing one
+    /// decision's verdict against another's text.
+    pub judgements: std::collections::BTreeMap<i64, crate::map_store::Judged>,
+    /// The numbers, tallied in the same pass that built the map above.
+    pub counts: TriageCounts,
+}
+
+/// Which judgements are answers about the map as it stands, and what they add up to.
+///
+/// **The two filters, and they are the whole of this function.** §5.3's arithmetic — `J = lapsed +
+/// flagged`, `K = never − flagged − silenced` — does not hold on a raw reading of the table, and it
+/// fails in two independent ways:
+///
+/// 1. **Standing.** Nothing deletes a judgement when a decision is later stamped, and nothing
+///    should: §6.2 keeps the silenced pile *sempre acessível*, with no exception for decisions that
+///    moved on, and the row proving a silence happened IS §13's mitigation. So
+///    [`crate::map_store::judgements`] returns a `Flagged` row for a decision the owner settled last
+///    week, and a naive tally counts that decision in `settled` **and** in `flagged` — two header
+///    lines on one screen disagreeing, with nobody noticing, which is precisely the failure
+///    `StampCounts` already has a property test for. Triage only ever describes
+///    [`crate::map_stamp::Standing::Never`] (§10), so the loop below walks the STANDINGS and lets
+///    the judgements answer, rather than walking the judgements and hoping.
+/// 2. **Staleness.** A judgement whose inputs have moved is not an answer about the code as it
+///    stands; counting it reports a model's opinion of a file it never saw. That filter is
+///    [`is_current`] against a digest computed now, and it cannot happen here — computing that
+///    digest means reading the repository, which is what keeps `is_current` and `map_store` on
+///    opposite sides of the same seam [`crate::map_stamp::standing`] sits on. **The caller does it,
+///    and hands over what survived.**
+///
+/// **This is the opposite of what `GET …/map/silenced` does, and the two are not an
+/// inconsistency.** This function answers *what is true now*, so a judgement about a decision that
+/// has moved on, or about code that has changed, is not an answer to it. That pile is the audit
+/// trail of *what the triager did*, and a silencing that was wrong is exactly as worth reading
+/// after the decision was stamped as before — §6.2's *um bug só é corrigível se for visível* is a
+/// rule about the record, not about the current state. Both doors are needed and neither may be
+/// made to look like the other.
+///
+/// **The reconciliation is by construction and not by arithmetic.** Every `Never` standing lands in
+/// exactly one of `flagged`, `silenced` and `unseen`, in one pass, so `flagged + silenced <= never`
+/// is not a promise a comment makes — there is no path through this loop that could break it. The
+/// alternative shape, `unseen = never - flagged - silenced`, is one `saturating_sub` away from
+/// reporting a clean-looking header over a population that does not reconcile, which is the same
+/// silent wrongness one level down inside the cure.
+///
+/// **`stamps` is read for `lapsed` alone**, and the `debug_assert` below is what pins it to the
+/// same reading as `standings`: the two arguments are meant to be one answer about one project at
+/// one instant, and a caller that mixed a fresh tally with a stale map would produce a `J` that was
+/// never true at any single moment. The `never` count is deliberately NOT taken from it — recounting
+/// it here is what makes the assertion say something.
+pub fn reconcile(
+    standings: &std::collections::BTreeMap<i64, crate::map_stamp::Standing>,
+    stamps: &crate::map_stamp::StampCounts,
+    current: Vec<crate::map_store::Judged>,
+) -> Reconciled {
+    let mut unfiltered: std::collections::BTreeMap<i64, crate::map_store::Judged> = current
+        .into_iter()
+        .map(|judged| (judged.decision_id, judged))
+        .collect();
+
+    let mut judgements = std::collections::BTreeMap::new();
+    let mut counts = TriageCounts {
+        flagged: 0,
+        silenced: 0,
+        waiting: 0,
+        unseen: 0,
+    };
+
+    for (decision_id, standing) in standings {
+        if !matches!(standing, crate::map_stamp::Standing::Never) {
+            continue;
+        }
+        // `remove` and not `get`, so a judgement can be counted at most once even if the caller
+        // handed over two rows for one decision — which `map_store::judgements` cannot produce and
+        // which a future reader of the whole append-only history could.
+        match unfiltered.remove(decision_id) {
+            Some(judged) => {
+                match judged.judgement {
+                    Judgement::Flagged => counts.flagged += 1,
+                    Judgement::Silenced => counts.silenced += 1,
+                }
+                judgements.insert(*decision_id, judged);
+            }
+            None => counts.unseen += 1,
+        }
+    }
+
+    counts.waiting = stamps.lapsed + counts.flagged;
+
+    debug_assert_eq!(
+        counts.flagged + counts.silenced + counts.unseen,
+        stamps.never,
+        "the standings this tallied and the standings the header was tallied from are one reading, \
+         or `K` is a number about two different moments"
+    );
+
+    Reconciled { judgements, counts }
 }
 
 #[cfg(test)]
@@ -1370,5 +1582,180 @@ mod tests {
         assert!(matches!(&held, Unreadable::ThirdVerdict(said) if said.ends_with(CUT_MARK)));
         assert!(format!("{held:?}").len() < 400);
         assert!(held.to_string().len() < 400);
+    }
+
+    /// One stored judgement, with only the two fields [`reconcile`] is allowed to read.
+    fn judged(decision_id: i64, judgement: Judgement) -> crate::map_store::Judged {
+        crate::map_store::Judged {
+            decision_id,
+            judgement,
+            reason: "Nada estranho à vista.".to_owned(),
+            model: "cloud".to_owned(),
+            computed_at: "2026-08-26T10:00:00+00:00".to_owned(),
+            // Whatever this says, `reconcile` may not look at it: staleness is decided by whoever
+            // holds a reading of the repository, and a tally that second-guessed that would be a
+            // second answer to *is this still about the same thing*.
+            inputs_digest: "sha256:whatever".to_owned(),
+        }
+    }
+
+    /// Every standing a decision can be in, so nothing below is asserted over the easy one.
+    fn every_standing() -> Vec<crate::map_stamp::Standing> {
+        use crate::map_stamp::{Lapse, Standing, Watch};
+        let when = "2026-08-20T09:00:00+00:00".to_owned();
+        vec![
+            Standing::Never,
+            Standing::Settled {
+                stamped_at: when.clone(),
+                watch: Watch::Guessed,
+            },
+            Standing::Settled {
+                stamped_at: when.clone(),
+                watch: Watch::NoAnchor,
+            },
+            Standing::Partial {
+                stamped_at: when.clone(),
+                note: "falta migrar as páginas de pilar".to_owned(),
+            },
+            Standing::Lapsed {
+                stamped_at: when.clone(),
+                why: Lapse::Moved {
+                    changed: vec!["core/src/map_triage.rs".to_owned()],
+                    added: Vec::new(),
+                    gone: Vec::new(),
+                },
+            },
+            Standing::Lapsed {
+                stamped_at: when.clone(),
+                why: Lapse::Unreadable,
+            },
+            Standing::Withdrawn {
+                stamped_at: when,
+                note: Some("mudei de ideias".to_owned()),
+            },
+        ]
+    }
+
+    /// The property §5.3's two remaining numbers rest on, over a generated mix rather than a clean
+    /// one.
+    ///
+    /// Every standing crossed with every judgement state a decision can be handed over in —
+    /// flagged, silenced, and never triaged — which puts a `Flagged` row against a `Settled`
+    /// decision and a `Silenced` one against a `Withdrawn` decision in the same population, because
+    /// those are exactly the rows a naive tally double-counts. Nothing deletes a judgement when a
+    /// decision is later stamped and nothing should (§6.2), so this population is not contrived: it
+    /// is what any project looks like a week after its first triage run.
+    ///
+    /// If any of the three piles ever overlapped, or any `Never` decision fell through all three,
+    /// the sum would stop matching `StampCounts::never` and this fails. That is `map_stamp`'s own
+    /// discipline for the other half of the header, copied deliberately — a header is exactly where
+    /// a reader stops checking.
+    #[test]
+    fn every_never_decision_lands_in_exactly_one_of_the_three_piles() {
+        use crate::map_stamp::Standing;
+
+        let states = [Some(Judgement::Flagged), Some(Judgement::Silenced), None];
+        let mut standings = std::collections::BTreeMap::new();
+        let mut current = Vec::new();
+        let mut id = 0i64;
+        for standing in every_standing() {
+            for state in states {
+                id += 1;
+                standings.insert(id, standing.clone());
+                if let Some(judgement) = state {
+                    current.push(judged(id, judgement));
+                }
+            }
+        }
+        let stamps = crate::map_stamp::counts(&standings.values().cloned().collect::<Vec<_>>());
+
+        let reconciled = reconcile(&standings, &stamps, current);
+        let counts = &reconciled.counts;
+
+        // **The reconciliation, and it is the reason this type exists.** `K` is not
+        // `never − flagged − silenced` computed and hoped for; the three are one pass over the
+        // standings, so this line cannot fail without the loop itself being wrong.
+        assert_eq!(
+            counts.flagged + counts.silenced + counts.unseen,
+            stamps.never,
+            "every never-stamped decision is flagged, silenced or unseen, exactly once: {counts:?}"
+        );
+        assert!(
+            counts.flagged + counts.silenced <= stamps.never,
+            "a judgement counted here is a judgement about a decision nobody stamped: {counts:?}"
+        );
+        assert_eq!(
+            counts.waiting,
+            stamps.lapsed + counts.flagged,
+            "§5.3's `J` is the lapsed stamps plus what the triager assinalou, and nothing else: \
+             {counts:?}"
+        );
+
+        // **The shipped map and the header are the same pass**, which is what makes it impossible
+        // for the rows on screen to disagree with the numbers above them.
+        assert_eq!(
+            reconciled.judgements.len(),
+            counts.flagged + counts.silenced,
+            "the map the panel draws holds exactly the judgements these numbers counted"
+        );
+        for decision_id in reconciled.judgements.keys() {
+            assert_eq!(
+                standings.get(decision_id),
+                Some(&Standing::Never),
+                "decision {decision_id} is drawn with a triage verdict and is not in scope for one"
+            );
+        }
+
+        // A property nothing exercises is a property nobody proved: the mix has to actually contain
+        // the rows this test is about — a judgement on a stamped decision, and one of each verdict
+        // on a decision still in scope.
+        assert!(
+            counts.flagged > 0 && counts.silenced > 0 && counts.unseen > 0,
+            "{counts:?}"
+        );
+        assert!(
+            stamps.settled + stamps.partial + stamps.lapsed + stamps.withdrawn > 0,
+            "the population has to contain decisions that moved on, or the filter is untested"
+        );
+    }
+
+    #[test]
+    fn a_judgement_about_a_decision_somebody_stamped_is_dropped_and_not_merely_uncounted() {
+        // The single-case reading of the property above, because the shape of the failure is worth
+        // naming: the map the panel DRAWS has to lose the row too. A tally that dropped the number
+        // and shipped the judgement would put *silenciado* on a decision the owner has already
+        // settled — the two axes §5 refuses to flatten, flattened by a payload rather than by a
+        // colour, which is the door §6.1 does not think to watch.
+        use crate::map_stamp::{Standing, Watch};
+        let standings = std::collections::BTreeMap::from([
+            (
+                1,
+                Standing::Settled {
+                    stamped_at: "2026-08-25T09:00:00+00:00".to_owned(),
+                    watch: Watch::Guessed,
+                },
+            ),
+            (2, Standing::Never),
+        ]);
+        let stamps = crate::map_stamp::counts(&standings.values().cloned().collect::<Vec<_>>());
+
+        let reconciled = reconcile(
+            &standings,
+            &stamps,
+            vec![
+                judged(1, Judgement::Flagged),
+                judged(2, Judgement::Silenced),
+            ],
+        );
+
+        assert_eq!(reconciled.counts.flagged, 0, "{:?}", reconciled.counts);
+        assert_eq!(reconciled.counts.silenced, 1, "{:?}", reconciled.counts);
+        assert_eq!(
+            reconciled.judgements.keys().copied().collect::<Vec<_>>(),
+            vec![2],
+            "the stamped decision's judgement is not on the wire either"
+        );
+        // And `J` does not grow by a flag about a decision that already has the owner's answer.
+        assert_eq!(reconciled.counts.waiting, stamps.lapsed);
     }
 }
