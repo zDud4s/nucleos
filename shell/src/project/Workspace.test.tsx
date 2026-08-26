@@ -450,9 +450,24 @@ describe("the project workspace", () => {
             unwatched: 0,
             decisions: 0,
           },
+          // The triager's axis, which arrives on this same answer too. §5.3's `K` and `J` are read
+          // off `triage_counts` and not off `stamps` since slice 5 — a mock that stopped at the
+          // stamps would leave the header printing `undefined`, which is what `junction` and then
+          // `standings` each did in turn on this exact mock.
+          triage: {},
+          triage_counts: {
+            flagged: 0,
+            silenced: 0,
+            untriaged: 0,
+            unseen: 0,
+            waiting: 0,
+            unchecked: 0,
+          },
           git_would_not_answer: false,
+          recency: { window: 200, ages: {} },
         };
       }
+      if (path.endsWith("/map/silenced")) return [];
       return daemonFetch(state)(path, init);
     });
     daemon.apiText.mockImplementation(daemonText(state));

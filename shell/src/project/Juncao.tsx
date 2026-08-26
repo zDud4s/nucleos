@@ -332,9 +332,13 @@ function Plausible({
 /**
  * What this panel cannot see, said rather than left to be assumed.
  *
- * §5.1 names four derived states and two of them mean *the triager looked*. There is no triager
- * (§6), so a panel drawing four states would be inventing two — and a surface that looks complete
- * while a layer is missing is the same false confidence with better pixels.
+ * §5.1 names four derived states and two of them mean *the triager looked*. Since slice 5 there is
+ * a triager, and the sentence had to change rather than survive: it used to say there was none, and
+ * a panel telling the owner a layer is missing while it sits on the same screen is the false
+ * confidence inverted — the map lying about itself in the direction of pessimism, which costs the
+ * same trust. What stays true is that a panel drawing four states would be answering the triager's
+ * question and the junction's with one voice, which is exactly what §5 forbids, so this panel still
+ * draws two and points at the one that owns the other two.
  *
  * The second paragraph is read off the payload rather than asserted, so it stays true for any
  * project: `declared` is the only state that means certain, and it needs a citation naming its
@@ -347,9 +351,9 @@ function Missing({ declared, decisions }: { declared: number; decisions: number 
         What this panel cannot see
       </h3>
       <p className="max-w-prose text-xs text-text-muted">
-        §5.1 names four derived states and this panel can draw two of them. The other two — waiting
-        on you, and silenced — both mean a triager looked at a node and formed an opinion about it,
-        and there is no triager yet. So nothing here says whether anybody looked.
+        §5.1 names four derived states and this panel draws two of them. The other two — waiting on
+        you, and silenced — both mean a triager looked at a node and formed an opinion about it, and
+        they belong to the triage panel below. Nothing on this panel says whether anybody looked.
       </p>
       {decisions === 0 ? null : declared === 0 ? (
         <p className="max-w-prose text-xs text-text-muted">

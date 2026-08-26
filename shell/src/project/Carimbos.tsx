@@ -1,15 +1,16 @@
-import { useState, type ReactNode } from "react";
-import { isApiRefusal } from "../data/client";
+import { type ReactNode } from "react";
 import {
-  useCarimbar,
   type Anchored,
+  type Held,
   type Junction,
   type Lapse,
   type StampCounts,
   type Standing,
+  type TriageCounts,
   type Watch,
 } from "../data/project-map";
 import { RelativeTime } from "../ui";
+import { Carimbar } from "./Carimbar";
 
 /**
  * The stamps: what you said about each decision, and what became of it.
@@ -31,9 +32,14 @@ import { RelativeTime } from "../ui";
  * this map may not do (§12); a green with nothing to watch needs a citation, or a `git add`, or
  * nothing at all; and the pile nobody has looked at needs an afternoon that §10 refuses to demand.
  *
- * **This is the one surface in this mode with buttons, and the only one.** `Juncao` has none
- * deliberately — a second place to accept without reading is the failure this mode replaces — but
- * stamping is the owner's act and §6 gives it to nobody else, so it has to happen somewhere.
+ * **This is one of the two surfaces in this mode with buttons, and it was the only one for a
+ * slice.** `Juncao` has none deliberately — a second place to accept without reading is the failure
+ * this mode replaces — but stamping is the owner's act and §6 gives it to nobody else, so it has to
+ * happen somewhere. `Triagem` is the second, and it is not a second way to accept without reading:
+ * it draws the rows §5.3 takes OUT of this panel's debt because the triager put them in front of
+ * the owner, and a flag with no verdict on it would be a nag with no answer. Both use the same
+ * three-verdict control from `Carimbar.tsx`, because §5.2 has three verdicts and a fourth would be
+ * this map made quieter.
  * **Every row carries them, including the piles where nothing is asking to be stamped.** Three of
  * the six describe verdicts that are already given and whose repair is not a verdict at all, and
  * the first draft left them bare for that reason — which made *"changed my mind"*, one click away
@@ -56,6 +62,27 @@ export interface CarimbosProps {
   standings: Record<string, Standing>;
   /** §5.3's header, tallied by the núcleo, and never recomputed here. */
   stamps: StampCounts;
+  /**
+   * What the triager said about each decision, keyed by `decision_id` **as a string**.
+   *
+   * Read here for exactly one thing: which of the never-stamped rows have been flagged, so this
+   * panel stops drawing them. They are §5.3's `J` now, they are in front of the owner on the
+   * triage panel with the reason that put them there, and a pile here listing them again would be
+   * two panels answering one question — with a count above it that says a different number.
+   */
+  triage: Record<string, Held>;
+  /**
+   * §5.3's `K nunca vistas` and `J à tua espera`, which are no longer `stamps.never` and
+   * `stamps.lapsed`.
+   *
+   * **The header would be wrong without this, and wrong in the direction that matters.** `J` is
+   * `lapsed + flagged` and `K` is `never − flagged`: a flagged decision has arrived in front of the
+   * owner, so counting it in both would put one decision on two lines of a header that is supposed
+   * to reconcile. The núcleo builds both in one pass over the same standings this panel reads, so
+   * the arithmetic has one owner — this panel's own comment promised exactly that a slice ago, and
+   * it has to be honoured by reading a different field rather than by adding two.
+   */
+  triageCounts: TriageCounts;
   /** One fact about the whole reading: git is there and would not answer. */
   gitWouldNotAnswer: boolean;
 }
@@ -93,6 +120,8 @@ export function Carimbos({
   junction,
   standings,
   stamps,
+  triage,
+  triageCounts,
   gitWouldNotAnswer,
 }: CarimbosProps) {
   /*
@@ -120,7 +149,16 @@ export function Carimbos({
   const partial = inState("partial");
   const withdrawn = inState("withdrawn");
   const green = inState("settled");
-  const never = inState("never");
+  /*
+    The never pile, **minus the ones the triager flagged**, and that subtraction is §5.3 rather
+    than tidiness: a flagged decision is in `J`, in front of the owner on the triage panel, and
+    §5.3 says counting it in both places breaks the sum. What is left is exactly
+    `triageCounts.unseen` — the silenced and the untriaged — so the pile below and the number above
+    it are the same population, which is the property a header exists to be able to trust.
+  */
+  const never = inState("never").filter(
+    (pair) => triage[String(pair.row.decision_id)]?.judgement !== "flagged",
+  );
 
   const watching = (watch: Watch) => green.filter((pair) => pair.standing.watch === watch);
 
@@ -135,13 +173,22 @@ export function Carimbos({
         what make each number a different fact; a figure lifted away from them is the collapse §12
         refuses, and the four would look like parts of a whole that could be divided.
 
-        `J` is `stamps.lapsed` today and becomes a union tomorrow: slice 5's triager also puts
-        decisions in front of the owner, and those come out of `never`, not out of here. The number
-        is read off the núcleo's tally for exactly that reason — when the definition grows, it grows
-        in one place, and this header does not need renumbering.
+        `J` and `K` are the núcleo's `triage_counts` and no longer `stamps.lapsed` and
+        `stamps.never`. Slice 5's triager puts decisions in front of the owner, and those come out
+        of `never` — so `J` is `lapsed + flagged` and `K` is `never − flagged`, and reading the two
+        stamp fields would now put one decision on two of these four numbers. That the definition
+        grows in one place was this comment's promise a slice ago; keeping it meant reading a
+        different field, not adding two here.
+
+        **A silence does NOT leave `K`, and the whole slice turns on it.** §5.1: *"o triador não
+        viu nada estranho. Ninguém olhou. Não é verde."* — so a silenced decision is still debt
+        nobody has given a verdict on. Subtracting it would let a triager that silences three
+        hundred decisions print `0 never looked at` over a backlog nobody has read, which is §1's
+        false confidence manufactured by the arithmetic of its own cure, on the one line that
+        exists to be uncomfortable.
       */}
       <p className="font-display text-2xl text-text">
-        {`${stamps.settled} stamped · ${stamps.partial} part-way · ${stamps.never} never looked at · ${stamps.lapsed} on your desk`}
+        {`${stamps.settled} stamped · ${stamps.partial} part-way · ${triageCounts.unseen} never looked at · ${triageCounts.waiting} on your desk`}
       </p>
       {stamps.decisions > 0 ? (
         <div className="flex flex-col gap-1">
@@ -169,11 +216,16 @@ export function Carimbos({
       ) : (
         <>
           {stamps.settled + stamps.partial + stamps.lapsed + stamps.withdrawn === 0 ? (
-            <DayOne never={stamps.never} />
+            <DayOne never={triageCounts.unseen} />
           ) : null}
 
           {lapsed.length > 0 ? (
-            <OnYourDesk projectId={projectId} rows={lapsed} total={stamps.lapsed} />
+            <OnYourDesk
+              projectId={projectId}
+              rows={lapsed}
+              total={stamps.lapsed}
+              flagged={triageCounts.flagged}
+            />
           ) : null}
           {partial.length > 0 ? (
             <PartWay projectId={projectId} rows={partial} total={stamps.partial} />
@@ -199,7 +251,12 @@ export function Carimbos({
             />
           ) : null}
           {never.length > 0 ? (
-            <NeverLooked projectId={projectId} rows={never} total={stamps.never} />
+            <NeverLooked
+              projectId={projectId}
+              rows={never}
+              total={triageCounts.unseen}
+              silenced={triageCounts.silenced}
+            />
           ) : null}
         </>
       )}
@@ -280,10 +337,13 @@ function OnYourDesk({
   projectId,
   rows,
   total,
+  flagged,
 }: {
   projectId: string;
   rows: Stood<Extract<Standing, { state: "lapsed" }>>[];
   total: number;
+  /** The other half of §5.3's `J`, which this panel does not draw. */
+  flagged: number;
 }) {
   const { shown, hidden } = capped(rows);
 
@@ -297,11 +357,24 @@ function OnYourDesk({
         between what you stamped and what is there now on the row: re-stamping is one click when it
         is cosmetic, and it is the right moment to look when it is not.
       </p>
+      {/*
+        §5.3's `J` is two halves and this panel draws one of them, so the header's number is larger
+        than this pile. Said out loud rather than left to be noticed: a count above a list that
+        does not match its length is exactly where a reader concludes one of the two is wrong, and
+        here neither is — they reach the owner for opposite reasons, one being their own green gone
+        stale and the other a model asking.
+      */}
+      {flagged > 0 ? (
+        <p className="max-w-prose text-xs text-text-muted">
+          The other {flagged} on your desk are not stamps of yours at all — the triager put them
+          there, and they are on its own panel below with the reason it gave.
+        </p>
+      ) : null}
       <ul aria-label="Stamps that stopped being true" className="flex flex-col gap-2">
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
             <Why why={standing.why} />
-            <Stamp projectId={projectId} row={row} />
+            <Carimbar projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>
@@ -403,7 +476,7 @@ function PartWay({
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
             <p className="max-w-prose text-sm text-text">{standing.note}</p>
-            <Stamp projectId={projectId} row={row} />
+            <Carimbar projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>
@@ -472,7 +545,7 @@ function Withdrawn({
                   {standing.note === null ? null : (
                     <p className="max-w-prose text-sm text-text">{standing.note}</p>
                   )}
-                  <Stamp projectId={projectId} row={row} />
+                  <Carimbar projectId={projectId} row={row} />
                 </Line>
               ))}
             </ul>
@@ -570,7 +643,7 @@ function Silence({
       <ul aria-label={label} className="flex flex-col gap-2">
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
-            <Stamp projectId={projectId} row={row} />
+            <Carimbar projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>
@@ -630,7 +703,7 @@ function Guessed({
           <ul aria-label="Greens over a guessed anchor" className="flex flex-col gap-2">
             {shown.map(({ row, standing }) => (
               <Line key={row.decision_id} row={row} at={standing.stamped_at} paths={row.modules}>
-                <Stamp projectId={projectId} row={row} />
+                <Carimbar projectId={projectId} row={row} />
               </Line>
             ))}
           </ul>
@@ -654,10 +727,13 @@ function NeverLooked({
   projectId,
   rows,
   total,
+  silenced,
 }: {
   projectId: string;
   rows: Stood[];
   total: number;
+  /** How many of them the triager silenced — still here, because a silence is not a verdict. */
+  silenced: number;
 }) {
   const { shown, hidden } = capped(rows);
 
@@ -669,145 +745,39 @@ function NeverLooked({
       {/*
         The ordering is disclosed rather than left to be inferred, and this is the pile where it
         matters: §10 asks for recency of the anchor code's last change — *"o que é que se mexeu
-        desde a última vez que olhei?"* — and nothing computes that yet, so the first twelve of 350
-        are the first twelve of a document. A reader who assumed otherwise would think the rows in
-        front of them were the ones that moved.
+        desde a última vez que olhei?"* — and the núcleo now computes it, so this list arrives in
+        that order and the sentence says which order it is. What it may not imply is that the order
+        is total: everything whose anchors did not move inside the walk's window ties, and the
+        triage panel below is where that window's size is stated.
       */}
       <p className="max-w-prose text-xs text-text-muted">
         {`${total} approved ${plural(total, "decision carries", "decisions carry")} no verdict of yours.`}{" "}
-        The ones shown are the first by document and line, not the ones that moved most recently —
-        that order is what §10 asks for, and nothing computes it yet.
+        Most recently moved first, which is the order §10 asks for — and it is a fact about the git
+        log rather than a ranking: everything that has not moved lately ties.
       </p>
+      {/*
+        The silenced are in this pile and not in a pile of their own, which is §5.1 rather than an
+        arrangement: *"o triador não viu nada estranho. **Ninguém olhou.** Não é verde."* A silence
+        is a claim about the triager and about nothing else, so it changes where a decision sits in
+        the queue and never whether it has been looked at.
+      */}
+      {silenced > 0 ? (
+        <p className="max-w-prose text-xs text-text-muted">
+          {silenced} of them the triager silenced, and they are still counted here: silencing says
+          the triager saw nothing worth your time, which is a claim about the triager and not about
+          the code. Nobody has looked at them.
+        </p>
+      ) : null}
       <ul aria-label="Decisions nobody has stamped" className="flex flex-col gap-2">
         {shown.map(({ row }) => (
           <Line key={row.decision_id} row={row} at={null}>
-            <Stamp projectId={projectId} row={row} />
+            <Carimbar projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>
       {hidden > 0 ? <Hidden count={hidden} /> : null}
     </div>
   );
-}
-
-/**
- * The three verdicts, on one line (§5.2).
- *
- * The mutation is per row, the way the pile one panel up gives each line its own: a refusal belongs
- * to the row it was refused about, and one shared mutation would put the last failure's sentence
- * under whichever row happened to be looking.
- *
- * **The note field is above the buttons and is always there.** The table refuses an empty amber and
- * the daemon answers `400`, so a middle button with nowhere to type is a button that can only fail
- * — a worse answer than a field. It is *disabled* until something is written rather than hidden:
- * hiding it would be this panel deciding which of the three verdicts the owner is allowed to give,
- * and §6 reserves that to them. Why it waits is said once at the top of the panel and not under
- * every row, for the reason `git_would_not_answer` gets one sentence: 350 copies of a true sentence
- * is a wall nobody reads to the bottom of.
- *
- * The names carry the document and the section, because a screen full of buttons all called
- * "part-way" is a screen full of identical announcements to anybody not looking at it, and this is
- * a surface whose whole promise is that you know what you just answered.
- */
-function Stamp({ projectId, row }: { projectId: string; row: Anchored }) {
-  const [note, setNote] = useState("");
-  const carimbar = useCarimbar(projectId);
-
-  const name = `${row.spec_slug} ${row.section}`;
-  // Trimmed here against a daemon that trims before it checks, so the button is disabled for
-  // exactly the notes the núcleo would refuse and for no others.
-  const written = note.trim();
-  const send = (verdict: "settled" | "partial" | "withdrawn") =>
-    carimbar.mutate({
-      decisionId: row.decision_id,
-      verdict,
-      // `null` and never `""`: *said nothing* and *said the empty string* are different, and the
-      // núcleo stores the first as NULL.
-      note: written === "" ? null : written,
-    });
-
-  return (
-    <div className="flex flex-col gap-2">
-      <input
-        type="text"
-        aria-label={`note for ${name}`}
-        value={note}
-        onChange={(event) => setNote(event.target.value)}
-        placeholder="what is missing, in your words"
-        className="rounded-md border border-border bg-surface-sunken px-2 py-1 text-xs text-text placeholder:text-text-faint"
-      />
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          aria-label={`stamp ${name} as what you want`}
-          disabled={carimbar.isPending}
-          onClick={() => send("settled")}
-          className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
-        >
-          as I want it
-        </button>
-        <button
-          type="button"
-          aria-label={`stamp ${name} as part-way`}
-          disabled={carimbar.isPending || written === ""}
-          onClick={() => send("partial")}
-          className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
-        >
-          part-way, and I know
-        </button>
-        <button
-          type="button"
-          aria-label={`stamp ${name} as changed your mind`}
-          disabled={carimbar.isPending}
-          onClick={() => send("withdrawn")}
-          className="rounded-md border border-border px-3 py-1.5 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
-        >
-          changed my mind
-        </button>
-      </div>
-      {carimbar.isError ? <Refused error={carimbar.error} /> : null}
-    </div>
-  );
-}
-
-/**
- * Why a verdict did not land, with the row still on screen.
- *
- * The `503` is the sentence that had to be written carefully. It means git is there and would not
- * say what this decision is anchored to, and §7.1 makes *está como quero* the only verdict the code
- * moving can falsify — so it is the only one that may not be recorded without knowing what it is
- * watching. It is transient, a second attempt works, and the owner did nothing wrong. Copy that
- * read as a failure would put the blame for a busy git on the person who pressed the button, which
- * is the opposite of what this feature is buying.
- */
-function Refused({ error }: { error: unknown }) {
-  const box =
-    "max-w-prose rounded-md border border-tone-danger-border bg-tone-danger-bg p-2 text-xs text-text-muted";
-
-  if (!isApiRefusal(error)) {
-    return <p className={box}>The núcleo did not answer, so nothing was recorded.</p>;
-  }
-
-  if (error.status === 503) {
-    return (
-      <p className={box}>
-        Git would not say what this decision is anchored to just now, so the green was not
-        recorded. Nothing you asked for was wrong — try again in a moment.
-      </p>
-    );
-  }
-  if (error.status === 404) {
-    return (
-      <p className={box}>
-        That decision is not yours to stamp now — it belongs to another project, or nobody approved
-        it.
-      </p>
-    );
-  }
-  if (error.status === 400) {
-    return <p className={box}>An amber needs a note, and this one arrived empty.</p>;
-  }
-  return <p className={box}>{error.detail}</p>;
 }
 
 /**

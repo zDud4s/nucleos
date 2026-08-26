@@ -12,9 +12,11 @@ import { ApiRefusal } from "../data/client";
 import type {
   Anchor,
   Anchored,
+  Held,
   Junction,
   StampCounts,
   Standing,
+  TriageCounts,
   Watch,
 } from "../data/project-map";
 import { renderWithQuery } from "../test/harness";
@@ -36,10 +38,24 @@ function anchored(overrides: Partial<Anchored> = {}): Anchored {
   };
 }
 
-/** A decision and where it stands, which is the only pairing this panel draws. */
+/** A decision and where it stands, plus whatever the triager said about it. */
 interface Row {
   row: Anchored;
   standing: Standing;
+  /** Only ever set on a `never` row — triage describes nothing else (§10). */
+  judged?: Held["judgement"];
+}
+
+function held(decisionId: number, judgement: Held["judgement"]): Held {
+  return {
+    decision_id: decisionId,
+    judgement,
+    reason: "O triador escreveu uma razao, porque a tabela exige uma.",
+    model: "cloud",
+    computed_at: "2026-08-26T09:00:00Z",
+    inputs_digest: "abc123",
+    checked: true,
+  };
 }
 
 function settled(watch: Watch): Standing {
@@ -96,9 +112,38 @@ function tally(standings: Record<string, Standing>): StampCounts {
   };
 }
 
+/**
+ * §5.3's `K` and `J` as `map_triage::reconcile` builds them, and never as a fixture's opinion.
+ *
+ * Every `never` decision falls in exactly one of `flagged`, `silenced` and `untriaged` in one pass;
+ * `unseen` is the last two added up and `waiting` is `lapsed + flagged`. A fixture free to hand in a
+ * disagreeing tally would let this panel pass while printing a header no daemon could ever send —
+ * and the header is exactly where a reader stops checking.
+ */
+function triageTally(rows: Row[], standings: Record<string, Standing>): TriageCounts {
+  const never = rows.filter((pair) => pair.standing.state === "never");
+  const flagged = never.filter((pair) => pair.judged === "flagged").length;
+  const silenced = never.filter((pair) => pair.judged === "silenced").length;
+  const untriaged = never.length - flagged - silenced;
+  const lapsed = Object.values(standings).filter((row) => row.state === "lapsed").length;
+  return {
+    flagged,
+    silenced,
+    untriaged,
+    unseen: silenced + untriaged,
+    waiting: lapsed + flagged,
+    unchecked: 0,
+  };
+}
+
 function open(rows: Row[], options: { gitWouldNotAnswer?: boolean; refusal?: unknown } = {}) {
   const standings: Record<string, Standing> = {};
   for (const { row, standing } of rows) standings[String(row.decision_id)] = standing;
+
+  const triage: Record<string, Held> = {};
+  for (const { row, judged } of rows) {
+    if (judged !== undefined) triage[String(row.decision_id)] = held(row.decision_id, judged);
+  }
 
   daemon.apiFetch.mockReset();
   if (options.refusal === undefined) daemon.apiFetch.mockResolvedValue(undefined);
@@ -110,6 +155,8 @@ function open(rows: Row[], options: { gitWouldNotAnswer?: boolean; refusal?: unk
       junction={junction(rows.map((pair) => pair.row))}
       standings={standings}
       stamps={tally(standings)}
+      triage={triage}
+      triageCounts={triageTally(rows, standings)}
       gitWouldNotAnswer={options.gitWouldNotAnswer ?? false}
     />,
   );
@@ -152,6 +199,62 @@ describe("the owner's verdict, and what became of it", () => {
     expect(container.querySelector("progress")).toBeNull();
     expect(container.querySelector("meter")).toBeNull();
     expect(screen.queryAllByRole("progressbar")).toHaveLength(0);
+  });
+
+  /**
+   * §5.3, after slice 5 moved two of its four numbers: `J` is `lapsed + flagged` and `K` is
+   * `never − flagged`. A flagged decision has arrived in front of the owner, so counting it in both
+   * would put one decision on two lines of a header that is supposed to reconcile — and a header is
+   * exactly where a reader stops checking.
+   */
+  it("counts a flagged decision on the desk and not in the debt", () => {
+    open([
+      { row: anchored({ decision_id: 1 }), standing: settled("watched") },
+      { row: anchored({ decision_id: 2 }), standing: { state: "never" }, judged: "flagged" },
+      { row: anchored({ decision_id: 3 }), standing: { state: "never" } },
+      {
+        row: anchored({ decision_id: 4 }),
+        standing: {
+          state: "lapsed",
+          stamped_at: "2026-08-25T09:00:00Z",
+          why: { kind: "moved", changed: ["core/src/map_stamp.rs"], added: [], gone: [] },
+        },
+      },
+    ]);
+
+    // Two never-stamped decisions, one of them flagged: one is debt and the other is on the desk
+    // beside the lapse, which makes the desk two.
+    expect(
+      screen.getByText("1 stamped · 0 part-way · 1 never looked at · 2 on your desk"),
+    ).toBeTruthy();
+    // And the flagged one is not drawn here at all: it is on the triage panel with the reason that
+    // put it there, and a second list of it would be the second panel answering one question.
+    const debt = screen.getByLabelText("Decisions nobody has stamped");
+    expect(within(debt).queryAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText(/not stamps of yours at all/)).toBeTruthy();
+  });
+
+  /**
+   * **The line the whole triage slice turns on.** §5.1: a silence is *"o triador não viu nada
+   * estranho. Ninguém olhou. Não é verde."* — so it never leaves `K`, and the pile still draws it.
+   * A triager that silenced three hundred decisions and drove the debt figure to zero would be §1's
+   * false confidence manufactured by the arithmetic of its own cure, with the sum still reconciling
+   * perfectly.
+   */
+  it("does not shrink the debt when the triager silences, and still draws what it silenced", () => {
+    open([
+      { row: anchored({ decision_id: 1 }), standing: { state: "never" }, judged: "silenced" },
+      { row: anchored({ decision_id: 2 }), standing: { state: "never" }, judged: "silenced" },
+      { row: anchored({ decision_id: 3 }), standing: { state: "never" } },
+    ]);
+
+    expect(
+      screen.getByText("0 stamped · 0 part-way · 3 never looked at · 0 on your desk"),
+    ).toBeTruthy();
+    const debt = screen.getByLabelText("Decisions nobody has stamped");
+    expect(within(debt).queryAllByRole("listitem")).toHaveLength(3);
+    expect(screen.getByText(/2 of them the triager silenced/)).toBeTruthy();
+    expect(screen.getByText(/Nobody has looked at them/)).toBeTruthy();
   });
 
   /**

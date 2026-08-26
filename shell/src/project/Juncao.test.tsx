@@ -228,14 +228,16 @@ describe("the nodes that do not match", () => {
   });
 
   /**
-   * §5.1 has four derived states and this panel can draw two. *À espera* and *silenciado* both
-   * mean a triager looked, and there is no triager — a panel that drew four would be inventing
-   * two of them.
+   * §5.1 has four derived states and this panel draws two. *À espera* and *silenciado* both mean a
+   * triager looked, and since slice 5 one exists — on its own panel. A panel drawing all four would
+   * be answering the triager's question and the junction's with one voice, which is the flattening
+   * §5 forbids; and it would be the second place on one screen saying the same thing, which is the
+   * confusion this mode removes.
    */
   it("says which derived states it cannot draw, and why", () => {
     open({ decisions: [anchored()] });
 
-    expect(screen.getByText(/there is no triager/)).toBeTruthy();
+    expect(screen.getByText(/they belong to the triage panel below/)).toBeTruthy();
     expect(screen.getByText(/needs a citation that names its own document/)).toBeTruthy();
   });
 

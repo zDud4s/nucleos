@@ -4,22 +4,27 @@ import { Carimbos } from "./Carimbos";
 import { ExtrairSpec } from "./ExtrairSpec";
 import { Juncao } from "./Juncao";
 import { MapaPorAprovar } from "./MapaPorAprovar";
+import { Triagem } from "./Triagem";
 
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
  *
- * Two of the three layers are here, the join between them, and now the owner's own axis: the
+ * Two of the three layers are here, the join between them, and the two axes read over it: the
  * structure, derived off disk and always true; the intention — a model reading one spec and
  * proposing the decisions it fixes, which nothing enters the map without the owner answering line
  * by line; the junction, which is decision 3 of the spec and the reason the other two are worth
- * deriving; and the stamps, which are what the owner said about each line and whether it is still
- * true. The evidence layer is not here, and neither are two of §5.1's four derived states, and the
- * mode says so in words rather than showing a map that looks complete and is not. A surface that
- * implies it has layers it does not have is the false confidence again, with better pixels.
+ * deriving; the stamps, which are what the owner said about each line and whether it is still true;
+ * and the triage, which is what a model thought was worth their eyes. The evidence layer is not
+ * here, and the mode says so in words rather than showing a map that looks complete and is not. A
+ * surface that implies it has layers it does not have is the false confidence again, with better
+ * pixels.
  *
- * **The junction and the stamps are two axes and never one reading.** §5 refuses to flatten them —
- * *"achatá-las numa só punha o triador e o dono a falar pela mesma boca"* — so they are two panels
- * with two headings, and no number on this screen has already decided how they combine.
+ * **The junction, the stamps and the triage are three axes and never one reading.** §5 refuses to
+ * flatten them — *"achatá-las numa só punha o triador e o dono a falar pela mesma boca"* — so they
+ * are three panels with three headings, and no number on this screen has already decided how they
+ * combine. §6.1 is the sharpest edge of that rule and it is kept by rendering rather than promised:
+ * a silence is a claim about the triager, a green is the owner's, and nothing here draws the two in
+ * a way that could be mistaken one for the other.
  *
  * **The three panels below read three different questions, and one failing does not silence the
  * others.** The structure is derived by walking the project's folder; the pile is a table the
@@ -46,10 +51,10 @@ export function ModeMapa({ projectId }: ModeMapaProps) {
       <ExtrairSpec projectId={projectId} />
       <MapaPorAprovar projectId={projectId} />
       <p className="max-w-prose text-sm text-text-muted">
-        Structure, intention, the join between them, and your verdict on each line. The evidence
-        layer is a slice that does not exist yet, and two of §5.1&rsquo;s four derived states need
-        a triager that does not exist either — so nothing here says whether anybody other than you
-        has looked at a node.
+        Structure, intention, the join between them, your verdict on each line, and what a model
+        thought was worth your eyes. The evidence layer is a slice that does not exist yet — nothing
+        here reads a test, or a gate, or asks whether the code that claims a decision actually does
+        what it says.
       </p>
     </div>
   );
@@ -87,7 +92,18 @@ function Derived({ projectId }: { projectId: string }) {
     return <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>;
   }
 
-  const { modules, imports, unread, junction, standings, stamps, git_would_not_answer } = map.data;
+  const {
+    modules,
+    imports,
+    unread,
+    junction,
+    standings,
+    stamps,
+    triage,
+    triage_counts,
+    git_would_not_answer,
+    recency,
+  } = map.data;
   // `buildMap` rather than `imports.length`, and the difference is the whole point: this counts
   // the links the map would actually draw, which drops any edge with an end it cannot find. The
   // núcleo sends none of those today, and the day it does this number must not quietly start
@@ -123,7 +139,28 @@ function Derived({ projectId }: { projectId: string }) {
         junction={junction}
         standings={standings}
         stamps={stamps}
+        triage={triage}
+        triageCounts={triage_counts}
         gitWouldNotAnswer={git_would_not_answer}
+      />
+      {/*
+        The third axis, drawn off this same answer for the reason the other two are — the
+        judgements, their tally and §10's ordering all arrive flattened onto `GET /map`, and a
+        query of its own would walk the tree twice per open and put two readings of one question on
+        one screen. It holds one query the map cannot serve: §6.2's silenced pile has a door of its
+        own, because *sempre acessível* has to survive this map failing to read a folder.
+
+        **Below the stamps, and the order is an argument.** §5.3's header sits at the top of the
+        stamp panel and is the first thing read; the triage panel is what explains two of its four
+        numbers — why `J` is larger than the lapsed pile and why silencing did not make `K`
+        smaller — so it reads as the answer to a question the header has just raised.
+      */}
+      <Triagem
+        projectId={projectId}
+        junction={junction}
+        triage={triage}
+        counts={triage_counts}
+        recency={recency}
       />
     </div>
   );

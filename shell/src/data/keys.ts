@@ -130,6 +130,14 @@ export const keys = {
     mapSpecs: (projectId: string) => ["projects", projectId, "map", "specs"] as const,
     /** The decisions waiting to be read. A table, unlike `map`, which is derived. */
     mapDecisions: (projectId: string) => ["projects", projectId, "map", "decisions"] as const,
+    /**
+     * Everything this project's triager has ever silenced (§6.2).
+     *
+     * Its own key because it is its own route, and its own route because §6.2 says the pile is
+     * *sempre acessível* — a pile reachable only as a slice of the map is one that disappears
+     * whenever the map's own reading fails. It is a table, like the pile above and unlike `map`.
+     */
+    mapSilenced: (projectId: string) => ["projects", projectId, "map", "silenced"] as const,
     /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
     ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
     /** What this project can be asked to do to itself, and what each of them last said. */

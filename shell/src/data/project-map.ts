@@ -312,6 +312,241 @@ export interface StampCounts {
   decisions: number;
 }
 
+/**
+ * The triager's answer about one decision (§6), and there are two of them.
+ *
+ * **The missing third is the whole design.** There is no `"approved"`, no `"ok"`, no `"settled"`:
+ * turning something green is the owner's act and the owner's alone (§5.2), and a third word here
+ * would hand back the authority §6 takes away. `0119`'s `CHECK (verdict IN ('flagged','silenced'))`
+ * is the copy of that rule a caller cannot go round, and this type is not allowed to be wider than
+ * it.
+ *
+ * **Neither value is a statement about the code**, which is the sentence a reader is most likely to
+ * lose. `"silenced"` does not say the decision is fine; it says the triager saw nothing worth the
+ * owner's time — *"o triador não viu nada estranho. Ninguém olhou. Não é verde."* (§5.1). §6.1
+ * refuses to let that share a colour with a stamp, and the panel that draws it uses no colour at
+ * all.
+ */
+export type Judgement = "flagged" | "silenced";
+
+/** One triage judgement as the table holds it. Field for field off `map_store::Judged`. */
+export interface Judged {
+  decision_id: number;
+  judgement: Judgement;
+  /** Why, in the triager's own words. Never empty — the table refuses it (§6.2). */
+  reason: string;
+  /** Which brain answered. The other half of §6.2: a pile that will not say who filled it cannot be repaired. */
+  model: string;
+  computed_at: string;
+  /**
+   * What the triager looked at, hashed.
+   *
+   * On the row and never compared here: the comparison needs the digest of the inputs **as they
+   * are now**, which means reading the repository. The núcleo does it and hands over what survived,
+   * marked by {@link Held.checked}.
+   */
+  inputs_digest: string;
+}
+
+/**
+ * A judgement the map is still holding, and whether this reading could re-check it.
+ *
+ * **Three-valued staleness wearing two fields.** A judgement whose inputs have moved is not an
+ * answer about the code as it stands and never arrives at all. One whose digest could not be
+ * *computed* — git would not say what the anchors are — is neither current nor expired, and it
+ * arrives with `checked: false`.
+ *
+ * **A surface may not draw such a row as verified, and may not drop it either.** Dropping it was
+ * the núcleo's first shape and it was wrong at the scale of a whole project: every stored judgement
+ * is written against a readable anchor set, so one git hiccup made all of them stale at once and
+ * the map reported a three-hundred-row backlog as *nunca vista* — a fact about the daemon presented
+ * as a fact about the project. A flag we could not re-verify is still a flag; a flag we discarded
+ * becomes a claim that nobody ever looked.
+ */
+export interface Held extends Judged {
+  checked: boolean;
+}
+
+/**
+ * §5.3's `K` and `J`, tallied over exactly the judgements the map is holding.
+ *
+ * `flagged + silenced + untriaged === stamps.never`, and `unseen === silenced + untriaged`, and
+ * `waiting === stamps.lapsed + flagged`. The núcleo builds all of it in one pass and asserts the
+ * reconciliation rather than promising it — a header is exactly where a reader stops checking.
+ *
+ * **A silence stays inside `unseen`, and that is the line this whole slice turns on.** §5.1 is
+ * explicit that *silenciado* is *"o triador não viu nada estranho. **Ninguém olhou.** Não é
+ * verde"*, so a silenced decision is still debt nobody has given a verdict on. Subtracting it would
+ * let a triager that silences three hundred decisions drive the debt figure to **zero** over a
+ * backlog nobody has read — §1's false confidence, manufactured by the cure's own arithmetic, on
+ * the one line §5.3 calls *"dívida, e é suposto incomodar"*. What a silence buys is exactly one
+ * thing: **not being in `waiting`.**
+ *
+ * **Not a percentage, and never one** (§12). Dividing any pair of these manufactures the single
+ * collapsed number §5 forbids.
+ */
+export interface TriageCounts {
+  /** In `never`, and the triager asked for the owner's eyes. The only pile that leaves `unseen`. */
+  flagged: number;
+  /** In `never`, and the triager saw nothing worth the owner's time. **Still inside `unseen`.** */
+  silenced: number;
+  /** In `never`, and no current judgement describes it: never triaged, or the answer has gone stale. */
+  untriaged: number;
+  /** §5.3's `K nunca vistas` — `silenced + untriaged`. Derived by the núcleo, never re-derived here. */
+  unseen: number;
+  /** §5.3's `J à tua espera` — `stamps.lapsed + flagged`. */
+  waiting: number;
+  /** How many of `flagged + silenced` this reading could **not** re-check. A subset, never a fourth bucket. */
+  unchecked: number;
+}
+
+/**
+ * How long ago the most recent of a decision's anchor files moved — tagged on `state`.
+ *
+ * **Five values, and the four without a timestamp are four different silences.** They sort in the
+ * same region and mean entirely different things, and §10 offers this ordering as *um facto do
+ * git*: a screen rendering four silences identically is the false confidence of §1 arriving
+ * through the rendering door §6.1 watches.
+ *
+ * - `"moved"` — inside the window, at that committer date in **Unix seconds** (not milliseconds,
+ *   and not a string).
+ * - `"older"` — anchored, and nothing moved inside the window. Says nothing about how much older:
+ *   two hundred and one commits ago and a thousand are both this, which is the approximation
+ *   {@link Recency.window} exists to announce.
+ * - `"unanchored"` — nothing to move. A fact about the decision and not about git.
+ * - `"foreign_only"` — **nothing this map can read names it, and something it cannot read does.**
+ *   It must never be drawn as *nothing implements this*: that is the failure {@link Anchored.foreign}
+ *   was added to prevent, on a new axis. Six section numbers in this repository are in this state.
+ * - `"unknown"` — anchored, and git would not say. Never written when there is a window.
+ */
+export type Age =
+  | { state: "moved"; at: number }
+  | { state: "older" }
+  | { state: "unanchored" }
+  | { state: "foreign_only" }
+  | { state: "unknown" };
+
+/**
+ * §10's ordering, and how far it can see.
+ *
+ * **Beside `junction.decisions` rather than inside it, because the order is only half the answer.**
+ * A list carries the sequence and nothing about which part of it is a fact, and a panel drawing
+ * this without saying the window's size would present a mostly arbitrary tail with the same
+ * confidence as the head.
+ *
+ * **And the head is not as ordered as it looks, today.** Measured against this repository: 71 of 80
+ * decisions land inside the window carrying **19 distinct timestamps between them, and the top
+ * eighteen share one**. The cause is §8 — while no citation says which document its `§` belongs to,
+ * a decision's anchor set is every module citing that section *number* across all forty documents,
+ * so `§5.2` alone collects 42 files and the most recent of 42 files in a repository committing ~35
+ * times a day is this morning. A flat ranked list would imply an ordering that is not there, so a
+ * tie has to render as a tie.
+ */
+export interface Recency {
+  /**
+   * How many commits the walk asked for, or `null` when git would not say — the number a panel puts
+   * in *"ordered by what moved in the last N commits"*, and the sentence it must not write when
+   * this is absent.
+   */
+  window: number | null;
+  /** Where each decision fell in that window, **keyed by `decision_id` as a string**. */
+  ages: Record<string, Age>;
+}
+
+/**
+ * One row of §6.2's pile: a silencing, with the decision it was about.
+ *
+ * **The decision's own words travel with it**, or this is a list of ids and reading it means the
+ * cross-reference of three hundred rows §1 says the owner cannot perform.
+ *
+ * **Filtered by neither standing, staleness nor retirement**, which is the exact opposite of what
+ * `GET /map` does with the same table and is deliberate on both sides. That route answers *what is
+ * true now*; this one answers *what the triager did*, and each of those filters would delete part
+ * of the record §13's only mitigation rests on — a stamp is the evidence a silence was premature, a
+ * silence written about code that has since moved is the one somebody should reread, and a
+ * retirement is reported here as {@link Silencing.retired} rather than by the row vanishing.
+ */
+export interface Silencing {
+  decision_id: number;
+  spec_slug: string;
+  section: string;
+  text: string;
+  reason: string;
+  model: string;
+  computed_at: string;
+  /** The decision has since been retired. On the row, because hiding it deletes a bug report by its own subject. */
+  retired: boolean;
+  /**
+   * This sentence was written by the daemon rather than by a model.
+   *
+   * `model` names the brain that **answered**, which stays true of an answer nobody could read — so
+   * without this field a machine's failure note arrives on screen under a model's name, as its
+   * opinion. Always `false` on this pile today, because the one producer of a daemon-written reason
+   * may only ever reach `"flagged"`; the field is what makes that a fact a client can check rather
+   * than a convention it has to remember.
+   */
+  machine_written: boolean;
+}
+
+/**
+ * What one triage run did, and — the half that is easy to leave out — what it did **not**.
+ *
+ * **Counts and never a bare success.** *"Ran the triager and nothing happened"* and *"ran the
+ * triager and everything was already current"* are different facts about a project, and a surface
+ * reporting only success makes the second look like the first. Every field here is a thing that
+ * would otherwise have happened invisibly, and they add up: `in_scope` is the total and everything
+ * else is a bucket of it.
+ */
+export interface TriageReport {
+  /** Decisions in `never`, which is the whole of what the triager is allowed to look at (§10). */
+  in_scope: number;
+  /** Judged already, against inputs that have not moved since. Cost nothing and asked nothing. */
+  already_current: number;
+  /** Answered and written this run. The only field that grew the table. */
+  judged: number;
+  /**
+   * The model answered, the answer was not a judgement, and a **flagged** row was written saying
+   * so — rows written this way, never rows withheld.
+   *
+   * Apart from {@link TriageReport.unanswered} because the two send whoever is debugging to
+   * different places: this one to the prompt, that one to the machine.
+   */
+  unreadable: number;
+  /** Nobody answered: the run itself failed. A machine that is down, not a question that is wrong. */
+  unanswered: number;
+  /** The decision stopped being one this map holds between the reading and the write. Expected to be zero. */
+  vanished: number;
+  /**
+   * Stale, and the cap stopped the run before reaching them. **The field the report exists for.**
+   *
+   * The batch is capped, and this repository normally saturates it. A run that truncated and said
+   * nothing reads as *covered everything* when it did not, which is §1's failure produced by the
+   * feature built to cure it.
+   */
+  left_over: number;
+  /** In scope, and skipped because git would not say what their anchor code is. Skipped, never triaged under a failed digest. */
+  unreadable_anchors: number;
+}
+
+/**
+ * Did the daemon write this sentence, or did a model?
+ *
+ * **A duplicate of `map_triage::DAEMON_MARK`, and it is on the wrong side of the seam.** The núcleo
+ * exposes the answer as a field — `machine_written` — on §6.2's pile, precisely so no client has to
+ * remember a convention; but the flagged judgements on `GET /map` carry no such field, and the
+ * flagged pile is the **only** place a daemon-written reason can appear today
+ * (`map_triage::unreadable_flag` may only ever reach `"flagged"`). So the one payload where the
+ * test is always false has it, and the one where it matters does not. Until `Held` carries the
+ * field too, this is the test, written once here rather than inline in a panel — a convention with
+ * two spellings is one that has already stopped working somewhere.
+ *
+ * A prefix test and not a parse: the rest of the sentence is prose meant for a person, and anything
+ * reading structure out of it would be inventing a format the writer does not keep.
+ */
+export function daemonWrote(reason: string): boolean {
+  return reason.trimStart().startsWith("nucleos:");
+}
+
 export interface ProjectMap {
   modules: MapModule[];
   imports: MapImport[];
@@ -346,6 +581,21 @@ export interface ProjectMap {
   /** §5.3's header, tallied by the núcleo from exactly the standings above. */
   stamps: StampCounts;
   /**
+   * What the triager said about each decision, **keyed by `decision_id` as a string** — and only
+   * where that is still an answer about this map.
+   *
+   * Two filters stand between the table and this field, and both are required for §5.3's numbers to
+   * add up: a judgement about a decision somebody has since stamped describes a decision that has
+   * left triage's scope (§10), and a judgement whose inputs have moved describes code that has
+   * since changed. Counting either reports something that is not true now.
+   *
+   * `Record<string, Held>` for {@link ProjectMap.standings}' reason — the núcleo sends a
+   * `BTreeMap<i64, _>` and JSON object keys are strings. Join with `String(id)`.
+   */
+  triage: Record<string, Held>;
+  /** §5.3's `J` and `K`, tallied in the same pass that built `triage`. */
+  triage_counts: TriageCounts;
+  /**
    * **One fact about this whole reading, and never a fact about any single decision.**
    *
    * The route computes one digest for the union of every decision's anchors — the alternative is
@@ -360,6 +610,14 @@ export interface ProjectMap {
    * reads as one.
    */
   git_would_not_answer: boolean;
+  /**
+   * §10's ordering — what `junction.decisions` is sorted by, and how far that sort can see.
+   *
+   * The list arrives already in this order; what this field adds is which part of it the order is a
+   * fact about. Drawing the list without {@link Recency.window} would present a tail nothing
+   * measured with the same confidence as the head.
+   */
+  recency: Recency;
 }
 
 /**
@@ -567,6 +825,78 @@ export function useCarimbar(projectId: string) {
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.projects.map(projectId) });
+    },
+  });
+}
+
+/**
+ * §6.2's pile: everything this project's triager has ever silenced, and why.
+ *
+ * **Its own query because it is its own route, and its own route because §6.2 says *sempre
+ * acessível*.** Folded into {@link useProjectMap} it would go down with the map — and the map is
+ * derived by walking a project's folder, so a project whose folder moved would lose the record of
+ * what a model decided the owner need not look at. This route asks nothing of the disk.
+ *
+ * **Not the same list as `ProjectMap.triage` filtered to `"silenced"`, and the difference is the
+ * point.** That map answers *what is true now* and drops a judgement whose decision has since been
+ * stamped, whose code has since moved, or whose decision was retired. This is the record of *what
+ * the triager did*, and drops none of the three — §13 rates *o triador silencia o que devia
+ * mostrar* a **real** residual risk whose only mitigation is that this stays readable, and each of
+ * those filters would delete part of the evidence.
+ *
+ * Read when the mode opens and not polled: nothing writes to this table except a run of the
+ * triager, which invalidates it from {@link useTriage}.
+ */
+export function useSilencedPile(projectId: string | null) {
+  return useQuery({
+    queryKey: keys.projects.mapSilenced(projectId ?? ""),
+    queryFn: () =>
+      apiFetch<Silencing[]>(`/projects/${encodeURIComponent(projectId ?? "")}/map/silenced`),
+    enabled: projectId !== null && projectId !== "",
+  });
+}
+
+/** What {@link useTriage} sends: which brain answers the one question (§6). */
+export interface TriageInput {
+  brain: Brain;
+}
+
+/**
+ * Ask a model which of the decisions nobody has stamped deserve their owner's eyes (§6, §10).
+ *
+ * **No decision id and no spec slug beside the brain, and that is §10 rather than an omission.**
+ * The triager has one scope — everything nobody has stamped — and a route that let a caller name
+ * the decisions would let it name the ones whose answer it liked.
+ *
+ * **The answer is a {@link TriageReport} and never a bare success**, and a surface that showed only
+ * `judged` would be reporting the run at its most flattering. The batch is capped, so `left_over`
+ * is the number that must reach the screen: a run that truncated in silence reads as *covered
+ * everything*.
+ *
+ * The refusals are `map/extract`'s, for the reason they are the same plumbing: `422` for a brain
+ * nobody can read, `404` for a project or folder that is not there, `503` for a `local` this
+ * machine has no model for — never a quiet fall back to the cloud — and `500` for the daemon's own
+ * failure. Deliberately **no `502`**: by the time a model fails, rows have been written, and a
+ * status that discarded the report would hide work actually done.
+ *
+ * **Two keys, and both are written out.** A run changes the judgements on the map and appends to
+ * §6.2's pile, and those are two different answers from two different routes. That
+ * `keys.projects.map` is a *prefix* of the pile's key and would drag it along is a shape of
+ * `keys.projects` rather than an intention here — the day somebody re-nests them, a pile that
+ * stopped refreshing would have nothing to say why.
+ */
+export function useTriage(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ brain }: TriageInput) =>
+      apiFetch<TriageReport>(`/projects/${encodeURIComponent(projectId)}/map/triage`, {
+        method: "POST",
+        body: JSON.stringify({ brain }),
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.projects.map(projectId) });
+      void queryClient.invalidateQueries({ queryKey: keys.projects.mapSilenced(projectId) });
     },
   });
 }
