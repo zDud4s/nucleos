@@ -242,7 +242,12 @@ pub fn parse_extraction(answer: &str) -> Vec<Extracted> {
 /// Deliberately not a JSON scanner: it takes the first `{` and the last `}`, which is wrong for an
 /// answer containing two separate objects and right for every answer this has actually been handed.
 /// The cost of being wrong is an empty list and a second press.
-fn json_object(answer: &str) -> Option<&str> {
+///
+/// Shared with [`crate::map_triage::parse_answer`] rather than respelled there, which is the model's
+/// second entrance (§6) unwrapping the same habit at the other end of the feature. Two spellings of
+/// *find the JSON a model buried in prose* would be two answers to that question, and the one that
+/// drifted would be found by whichever half of the map stopped working.
+pub(crate) fn json_object(answer: &str) -> Option<&str> {
     let start = answer.find('{')?;
     let end = answer.rfind('}')?;
     (end > start).then(|| &answer[start..=end])
