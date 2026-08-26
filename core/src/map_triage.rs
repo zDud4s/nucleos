@@ -294,6 +294,13 @@ fn kind_says(kind: crate::map_intent::Kind) -> &'static str {
 /// Reformatting does not. Rewrapping a sentence, renaming a heading, fixing a typo: the model is
 /// being asked the same thing, and a judgement it already gave is still an answer to it.
 ///
+/// **What a bump costs, in the number rather than in the phrase "not free".** Every judgement in
+/// every project goes stale at once, and recovery is bounded by the batch cap on
+/// `http::MAX_TRIAGE_BATCH`: at this repository's ~350 approved decisions and 20 a press, that is
+/// **eighteen presses of a button whose every run is minutes long**, spread over as many sittings
+/// as the owner has patience for — and until the last of them the map is missing judgements it had
+/// before the edit. Weigh a wording tweak against that, not against the word "free".
+///
 /// **In the digest and therefore in the staleness rule**, which is the half slice 4 does not need:
 /// a stamp is the owner's and nothing about how it was asked for can make it wrong, while this pile
 /// is a model's opinions and the question is half of what produced them. Without this field, editing
@@ -615,6 +622,57 @@ pub fn parse_answer(answer: &str) -> Result<Answer, Unreadable> {
         judgement,
         reason: clipped(reason, MAX_REASON_BYTES),
     })
+}
+
+/// What the daemon writes when the triager answered and nobody could read the answer.
+///
+/// **A row, and not the absence a strict reading of this module would give.** [`parse_answer`]
+/// refuses to invent a verdict and that rule is untouched — what it forbids is FABRICATING one,
+/// specifically defaulting to [`Judgement::Silenced`], which would let a confused model quietly
+/// clear the pile: §6's authority handed back through a parser, at the one door §6.1 does not think
+/// to watch. This is not that, and the difference is the whole justification:
+///
+/// - **[`Judgement::Flagged`] is the safe direction and it is always available to a machine.** §6
+///   forbids the triager to *approve* and forbids it nothing else; asking for the owner's eyes takes
+///   no authority away from anybody. A decision whose triage answer could not be read genuinely
+///   *does* deserve them — that is not a guess about the code, it is a fact about the run.
+/// - **The reason says a machine wrote it, in words a reader cannot mistake for the model's.** §6.2
+///   makes the reason column §13's only mitigation, and a mitigation that reads as *the triager
+///   thinks this is worth your time* when the triager thought nothing at all is worse than none. So
+///   the sentence names the failure first and quotes what actually came back second.
+///
+/// **What it buys, which is the reason it exists at all.** Writing nothing leaves the decision *not
+/// looked at* — honest, and starving: with no record that it was ever attempted, it is stale again
+/// on the next run and consumes a slot of the batch cap for ever. Twenty decisions that reliably
+/// confuse the model would mean nothing behind them is ever triaged again, and the report would go
+/// on saying so accurately while the map quietly stopped working. The row carries an
+/// `inputs_digest`, so the decision reads current and is not asked about again until its inputs
+/// actually change.
+///
+/// **What it costs, named rather than left to be discovered.** A transient glitch — one malformed
+/// answer from a model that would have answered properly a second later — pins that decision as
+/// flagged until its anchor code or its text moves, or until [`TRIAGE_PROMPT_VERSION`] is bumped.
+/// That is the trade, and it is the right way round: a visible wrong flag costs one unnecessary
+/// look and can be argued with, while an invisible dead queue costs the feature.
+///
+/// Clipped through the same [`MAX_REASON_BYTES`] every other reason is, and in that order — the
+/// sentence naming the failure comes first, so a cut takes the model's babble and never the
+/// explanation of why the row is there.
+pub fn unreadable_flag(why: &Unreadable, said: &str) -> Answer {
+    Answer {
+        judgement: Judgement::Flagged,
+        // `nucleos:` in front because this daemon already marks its own words that way in the one
+        // other place a machine writes into a field a person reads — see the runner's stderr. The
+        // pile §6.2 requires is a list of sentences attributed to a model, and an unattributed one
+        // in the middle of it would be read as the model's.
+        reason: clipped(
+            &format!(
+                "nucleos: the triager's answer could not be read, so nobody has looked at this \
+                 decision — {why}. It said: {said}"
+            ),
+            MAX_REASON_BYTES,
+        ),
+    }
 }
 
 /// One field into the hash, with its length in front of it.
@@ -1160,9 +1218,11 @@ mod tests {
         // ever asked — so there is nothing yet to narrate.
         //
         // **Bumping this is not free and is not tidy-up.** Every judgement in every project goes
-        // stale at once and the triager re-runs over the whole `Never` pile, which is real money.
-        // Bump it when the question materially changed, and not when a line was rewrapped; see
-        // [`TRIAGE_PROMPT_VERSION`] for the three things that oblige it.
+        // stale at once and the triager re-runs over the whole `Never` pile — which on this
+        // repository is ~350 decisions at 20 a press, so eighteen presses of a minutes-long button
+        // before the map holds what it held before the edit. Bump it when the question materially
+        // changed, and not when a line was rewrapped; see [`TRIAGE_PROMPT_VERSION`] for the three
+        // things that oblige it and for what the recovery actually costs.
         assert_eq!(TRIAGE_PROMPT_VERSION, 1);
     }
 
@@ -1255,6 +1315,38 @@ mod tests {
         assert!(!is_current("sha256:abc", ""));
         // Whitespace that crossed a text boundary is not a different answer.
         assert!(is_current(" sha256:abc ", "sha256:abc"));
+    }
+
+    #[test]
+    fn a_failure_becomes_a_flag_that_says_a_machine_wrote_it_and_never_a_silence() {
+        // The row `POST /map/triage` writes when nobody could read the answer, and every rule it
+        // has to keep. **`Flagged` and never `Silenced`** is the first: §6 forbids the triager to
+        // approve and forbids it nothing else, so asking for the owner's eyes is always available
+        // to a machine — while a silence would clear a decision out of his queue on the strength of
+        // a word nobody could read, which is the authority §6 removes, recovered by a fallback.
+        let said = r#"{"verdict":"approved","reason":"Tudo bate certo."}"#;
+        let why = parse_answer(said).expect_err("`approved` is not a verdict");
+
+        let flag = unreadable_flag(&why, said);
+
+        assert_eq!(flag.judgement, Judgement::Flagged);
+        // **Says a machine wrote it**, because §6.2's pile is read as a list of sentences a model
+        // produced, and an unattributed one in the middle of it would be read as one.
+        assert!(flag.reason.starts_with("nucleos:"), "{}", flag.reason);
+        assert!(flag.reason.contains("could not be read"));
+        // **And quotes what actually came back**, because a bug is only fixable if it is visible —
+        // both the failure this module named and the text that produced it.
+        assert!(flag.reason.contains("approved"), "{}", flag.reason);
+
+        // A model that answers with a page does not get a page into the column: cut like every
+        // other reason, and cut from the END, so the sentence explaining why the row exists is the
+        // half that survives.
+        let babble = format!("{{\"verdict\":\"{}\"}}", "z".repeat(4_000));
+        let why = parse_answer(&babble).expect_err("four thousand characters is not a verdict");
+        let flag = unreadable_flag(&why, &babble);
+        assert!(flag.reason.starts_with("nucleos: the triager"));
+        assert!(flag.reason.ends_with(CUT_MARK));
+        assert!(flag.reason.len() <= MAX_REASON_BYTES + CUT_MARK.len());
     }
 
     #[test]
