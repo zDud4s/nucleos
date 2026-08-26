@@ -41,21 +41,31 @@ export type ModuleTone = "pending" | "off" | "info";
  * the reason this mode exists. Declared but unproven is `info`: somebody asked for it, and
  * nothing shows that it runs. The two are different facts and must not share a colour.
  *
+ * **It reads `cites` and never `declares`, and the two really do disagree.** `declares` is
+ * `source.contains('§')` — the file *gestures* at a section, a bare `§` naming no number
+ * included. `cites` is what it actually names, and for a TypeScript module that includes its
+ * sibling test's citations, because a Rust module gets its `#[cfg(test)]` citations for free and
+ * one language answering differently from the other is not a distinction anybody chose. Four
+ * modules today — `Fleet.tsx`, `Home.tsx`, `Workspace.tsx`, `priority.ts` — are `declares: false`
+ * with a non-empty `cites`: their tests name what they prove, so somebody did ask for them.
+ * Colouring them as nobody's would put a second answer on screen to a question
+ * `map_join::Junction` already owns, and two panels of one mode disagreeing by four is precisely
+ * the confusion this mode exists to remove.
+ *
  * **Not a row in `state-map.ts`, and the difference is worth naming.** That table maps state
  * literals the núcleo writes — strings like `errored` or `cancelled` — so that fourteen pages
- * cannot disagree about what one word means. There is no literal here: `declares` and `tested`
- * are two booleans, and this is a derivation over them, not a translation of anything. What
- * `state-map.ts` is protecting is honoured all the same, by landing inside the same seven
- * tones rather than inventing an eighth.
+ * cannot disagree about what one word means. There is no literal here: this is a derivation over
+ * a list and a boolean, not a translation of anything. What `state-map.ts` is protecting is
+ * honoured all the same, by landing inside the same seven tones rather than inventing an eighth.
  *
- * **A fourth state is folded into the third here, and on purpose.** A module that declares
- * nothing reads as `pending` whether or not somebody happened to test it, because the axis this
- * mode reports is intent and not proof: nobody having asked for it is the fact, and a test
- * written anyway does not change it. A later slice wanting to tell *abandoned but proven* from
- * *never asked for* will need a signal of its own rather than a fourth colour.
+ * **A fourth state is folded into the third here, and on purpose.** A module that names nothing
+ * reads as `pending` whether or not somebody happened to test it, because the axis this mode
+ * reports is intent and not proof: nobody having asked for it is the fact, and a test written
+ * anyway does not change it. A later slice wanting to tell *abandoned but proven* from *never
+ * asked for* will need a signal of its own rather than a fourth colour.
  */
 export function moduleTone(module: MapModule): ModuleTone {
-  if (!module.declares) return "pending";
+  if (module.cites.length === 0) return "pending";
   return module.tested ? "off" : "info";
 }
 

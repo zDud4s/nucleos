@@ -126,6 +126,10 @@ export const keys = {
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
     /** The project's structure layer, derived off disk on every read. */
     map: (projectId: string) => ["projects", projectId, "map"] as const,
+    /** The documents this project keeps, by the name the owner reads. */
+    mapSpecs: (projectId: string) => ["projects", projectId, "map", "specs"] as const,
+    /** The decisions waiting to be read. A table, unlike `map`, which is derived. */
+    mapDecisions: (projectId: string) => ["projects", projectId, "map", "decisions"] as const,
     /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
     ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
     /** What this project can be asked to do to itself, and what each of them last said. */

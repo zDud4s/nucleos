@@ -7,7 +7,14 @@ const mod = (path: string, extra: Partial<MapModule> = {}): MapModule => ({
   path,
   reader: path.endsWith(".rs") ? "rust" : "typescript",
   declares: false,
+  cites: [],
   tested: false,
+  ...extra,
+});
+
+/** A module that names one section, which is the shape `moduleTone` actually reads. */
+const names = (extra: Partial<MapModule> = {}): Partial<MapModule> => ({
+  cites: [{ section: "7", named: null }],
   ...extra,
 });
 
@@ -23,17 +30,26 @@ describe("topFolder", () => {
 });
 
 describe("moduleTone", () => {
-  it("makes a module that declares nothing the one that catches the eye", () => {
+  it("makes a module that names nothing the one that catches the eye", () => {
     // Not an error in the file — it is the category the map exists to show.
     expect(moduleTone(mod("core/src/b.rs"))).toBe("pending");
   });
 
-  it("leaves declared and tested as the calm case", () => {
-    expect(moduleTone(mod("core/src/a.rs", { declares: true, tested: true }))).toBe("off");
+  it("leaves a named and tested module as the calm case", () => {
+    expect(moduleTone(mod("core/src/a.rs", names({ tested: true })))).toBe("off");
   });
 
-  it("never lets declared-but-unproven read as either of the other two", () => {
-    expect(moduleTone(mod("core/src/a.rs", { declares: true }))).toBe("info");
+  it("never lets named-but-unproven read as either of the other two", () => {
+    expect(moduleTone(mod("core/src/a.rs", names()))).toBe("info");
+  });
+
+  it("reads what a module names and not merely that it gestured at a section", () => {
+    // The two disagree in both directions, and the junction owns this pile. A module whose only
+    // `§` names no number gestures without claiming anything; a module whose sibling test names
+    // what it proves was asked for by somebody. Deriving from `declares` puts a second answer on
+    // screen four modules away from the one `map_join::Junction` gives.
+    expect(moduleTone(mod("core/src/a.rs", { declares: true, cites: [] }))).toBe("pending");
+    expect(moduleTone(mod("shell/src/pages/Fleet.tsx", names({ declares: false })))).toBe("info");
   });
 
   it("stays inside the app's closed colour vocabulary", () => {
@@ -42,8 +58,8 @@ describe("moduleTone", () => {
     // page in the app shares.
     const tones: BadgeTone[] = [
       moduleTone(mod("a.rs")),
-      moduleTone(mod("a.rs", { declares: true })),
-      moduleTone(mod("a.rs", { declares: true, tested: true })),
+      moduleTone(mod("a.rs", names())),
+      moduleTone(mod("a.rs", names({ tested: true }))),
     ];
     expect(new Set(tones).size).toBe(3);
   });

@@ -409,10 +409,30 @@ describe("the project workspace", () => {
     });
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path.endsWith("/map")) {
+        // The whole answer `GET /map` gives, `junction` included. A mock that stopped at the
+        // structure would be a payload the daemon cannot produce, and the mode reads both halves
+        // off this one response.
         return {
-          modules: [{ path: "core/src/a.rs", reader: "rust", declares: false, tested: false }],
+          modules: [
+            { path: "core/src/a.rs", reader: "rust", declares: false, cites: [], tested: false },
+          ],
           imports: [],
           unread: [],
+          foreign: [],
+          junction: {
+            decisions: [],
+            unclaimed: ["core/src/a.rs"],
+            unmatched: [],
+            counts: {
+              decisions: 0,
+              declared: 0,
+              ambiguous: 0,
+              silent: 0,
+              unnumbered: 0,
+              unclaimed: 1,
+              unmatched: 0,
+            },
+          },
         };
       }
       return daemonFetch(state)(path, init);
@@ -421,7 +441,10 @@ describe("the project workspace", () => {
     daemon.probeHealth.mockResolvedValue(true);
     await renderApp({ initialPath: "/projects/nucleos/mapa" });
 
-    expect(await screen.findByText(/declaring nothing they implement/)).toBeTruthy();
+    // Was `/declaring nothing they implement/`, which this mode no longer says: that count is the
+    // junction's `unclaimed` now, and the structure panel reports what it alone knows.
+    expect(await screen.findByText(/this reader could read/)).toBeTruthy();
+    expect(screen.getByText(/module nobody asked for/)).toBeTruthy();
   });
 });
 

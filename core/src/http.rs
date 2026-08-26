@@ -92,6 +92,28 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
+        // Which specs a project has, so the extraction button offers a list and not a text box.
+        // Beside `map` because it answers about the same tree, read the same way.
+        .route("/projects/{id}/map/specs", get(get_project_map_specs))
+        // The intention layer, beside the structure layer it will one day be joined to. A POST and
+        // deliberately in no table in `auth.rs`: reading a map costs nothing and a read-only key
+        // buys it, while extracting spends a model — which is not something that key ever bought.
+        .route("/projects/{id}/map/extract", post(post_project_map_extract))
+        // The pile and the answer to one line of it. The GET is a read and is in
+        // `READ_ONLY_ROUTES`; the POST is in no table, beside `extract` above and for a sharper
+        // reason — approving is the owner's stamp, and it is what puts a line in the map.
+        //
+        // One id in the path and no bulk form. §4 says the list is approved line by line, and a
+        // route that took the whole list would be the thousand-line plan again, wearing a smaller
+        // shape.
+        .route(
+            "/projects/{id}/map/decisions",
+            get(get_project_map_decisions),
+        )
+        .route(
+            "/projects/{id}/map/decisions/{decision}",
+            post(post_project_map_decision),
+        )
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -2900,32 +2922,333 @@ async fn get_project_readings(
         })
 }
 
-/// The project's structure layer: what modules there are, and what they import.
+/// The structure layer and the junction over it, in one answer.
+///
+/// **Flattened, so this is additive on the wire.** Every field the shell already reads — `modules`,
+/// `imports`, `unread`, `foreign` — stays exactly where it was and `junction` is simply new beside
+/// them. Nesting the structure under a key to make room would be a rewrite wearing the word
+/// "extension", and would break a window nobody asked to change.
+#[derive(Serialize)]
+struct MapAnswer {
+    #[serde(flatten)]
+    structure: crate::project_map::Structure,
+    junction: crate::map_join::Junction,
+}
+
+/// The project's whole graph: modules, imports, and what the approved decisions do or do not
+/// anchor to.
 ///
 /// Derived on every request and never stored — decision 1 of the spec. It goes to disk, so it
 /// runs on `spawn_blocking` the way `blame` and `grep` already do: walking a thousand-file
 /// tree on the async executor blocks the whole daemon for a good few milliseconds, and this
-/// daemon is also answering a three-second poll.
+/// daemon is also answering a three-second poll. `specs_in` walks directories too and rides the
+/// same hop, since the thread already has the root in hand.
+///
+/// **What this now answers that it did not: which decisions nothing implements.** The structure
+/// alone cannot say it — it has never heard of a decision — and the pile alone cannot say it
+/// either. Only the two read against each other can, and doing that by eye across a thousand-line
+/// plan is precisely what the owner cannot do; decision 3 says the nodes that matter are the ones
+/// that do not match, so a route that returned only the halves returned everything except the
+/// product.
+///
+/// **The join is computed here and never by whoever draws it** — §9.3 makes `core/` the single
+/// owner of that logic. A shell redoing it in TypeScript would be a second implementation, free to
+/// drift from this one, and the drift would surface as a screen quietly confident about the wrong
+/// nodes: the disease with better pixels. It also means `map_join`'s tests are tests of what ships,
+/// rather than of a library the product bypasses.
+///
+/// **Nothing here filters on `approved_at`.** [`crate::map_store::approved`] already selects
+/// `approved_at IS NOT NULL AND retired_at IS NULL`, and a second filter in this handler is the
+/// one that goes stale — the argument [`crate::map_store::decide`] makes about checks that live in
+/// handlers, and the failure `from_row` next door already had once.
+///
+/// A missing folder is a 404 and a failed query is a 500, which is not one distinction made twice:
+/// the first is something the owner did to their own machine, the second is this daemon failing.
 async fn get_project_map(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<crate::project_map::Structure>, StatusCode> {
+) -> Result<Json<MapAnswer>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
-    tokio::task::spawn_blocking(move || crate::project_map::structure(&root))
+    let walked = tokio::task::spawn_blocking(move || {
+        let structure = crate::project_map::structure(&root)?;
+        // Slugs and not paths, for the reason `get_project_map_specs` gives below: a decision row
+        // carries the slug, and the slug is what `join` checks a citation's candidate against.
+        // Handing it paths would make every candidate fail to name its document, which reads as
+        // "§8 is unfixed" and is indistinguishable from it.
+        let slugs: Vec<String> = crate::map_intent::specs_in(&root)
+            .iter()
+            .map(|path| crate::map_intent::spec_slug(path))
+            .collect();
+        Ok::<_, std::io::Error>((structure, slugs))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (structure, spec_slugs) = walked.map_err(|error| {
+        // A folder that has been renamed or deleted is something its owner did, not a
+        // fault of this daemon — and `ls`, `cat`, `grep` and `blame` already answer 404
+        // for the very same `read_dir`. Answering 500 would put a warning in the log for
+        // an ordinary Tuesday.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return StatusCode::NOT_FOUND;
+        }
+        tracing::warn!(%error, project_id = %id, "project map failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let decisions = crate::map_store::approved(&state.pool, &id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "project map decisions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let junction = crate::map_join::join(
+        &decisions,
+        &structure.modules,
+        &structure.foreign,
+        &spec_slugs,
+    );
+    Ok(Json(MapAnswer {
+        structure,
+        junction,
+    }))
+}
+
+/// Which specs this project has, named the way the owner reads them.
+///
+/// **Slugs and not paths.** The path is where the file happens to sit; the slug is what
+/// [`crate::map_intent::spec_slug`] produces, what the owner reads, what they hand back to
+/// `POST /map/extract`, and what a decision row carries forever. Two projects keeping their specs
+/// in different folders name one document alike.
+///
+/// **Empty is an answer, not an error.** A project with no specs gets a sentence about what is
+/// missing, and an empty list is that sentence's input — the same posture `map` itself takes
+/// about a folder with nothing in it.
+///
+/// [`crate::map_intent::specs_in`] probes three conventional folders rather than reading a
+/// setting, and this route inherits that whole: a project matching none of them is not broken, it
+/// is unconfigured in a way nobody has to configure.
+///
+/// On `spawn_blocking` for the reason `get_project_map` gives above: this walks directories, and
+/// the daemon is also answering a three-second poll.
+async fn get_project_map_specs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+    tokio::task::spawn_blocking(move || {
+        crate::map_intent::specs_in(&root)
+            .iter()
+            .map(|path| crate::map_intent::spec_slug(path))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct MapExtractBody {
+    /// The document's name, which is its filename without the extension — what
+    /// [`crate::map_intent::spec_slug`] produces and what a decision row carries forever. NOT a
+    /// path: two projects keeping their specs in different folders must name the same document the
+    /// same way, and a path would also be a way to ask this route to read an arbitrary file.
+    spec_slug: String,
+    brain: String,
+}
+
+/// Which brain the caller named, and nothing else.
+///
+/// Deliberately stricter than [`crate::chats::Brain::from_wire`], which reads anything unfamiliar as
+/// `Cloud`. That is right for a conversation, whose default has always been the cloud and whose
+/// column carries it. It is wrong here: this is the one choice the owner explicitly asked to make,
+/// and quietly making it for them — in the direction that spends money and sends the document off
+/// the machine — is the wrong default to inherit.
+fn read_brain(value: &str) -> Option<crate::chats::Brain> {
+    match value {
+        "cloud" => Some(crate::chats::Brain::Cloud),
+        "local" => Some(crate::chats::Brain::Local),
+        _ => None,
+    }
+}
+
+/// Ask a model what one spec decided, and leave the answer waiting for its owner.
+///
+/// **Synchronous, and the spec's §9.1 says so: it returns the list.** A cloud brain makes this a
+/// slow request, and that is accepted — the owner pressed a button about one document and is
+/// waiting for the thing they asked for. The alternative is a status row, a poll and a state the
+/// page has to draw, for a wait measured in seconds.
+///
+/// **Nothing here is approved.** The list comes back so the owner can read it; it is already in the
+/// table as a pile nobody has read, and it stays that way until they answer line by line — §4.
+///
+/// **A `local` request never becomes a cloud one.** `local` is what somebody chooses when the
+/// document must not leave the machine, or when they are not paying for it, so a machine with no
+/// local model refuses rather than falling back: falling back would break both promises at once,
+/// silently, on the bill. The refusal is 503 and not 422 — the request was well formed and this
+/// machine simply cannot serve it, which is a different thing to tell the owner from "you asked
+/// wrong".
+async fn post_project_map_extract(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapExtractBody>,
+) -> Result<Json<Vec<crate::map_store::Decision>>, StatusCode> {
+    let brain = read_brain(&body.brain).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    // On `spawn_blocking` for the reason `get_project_map` gives: this walks directories and reads
+    // a file that may be tens of kilobytes, and the daemon is also answering a three-second poll.
+    // Finding the document and reading it are one hop because they are one answer — a slug that
+    // matches nothing and a file that cannot be read are the same 404 to whoever asked, and neither
+    // is a fault of this daemon.
+    let wanted = body.spec_slug.clone();
+    let source = tokio::task::spawn_blocking(move || {
+        let path = crate::map_intent::specs_in(&root)
+            .into_iter()
+            .find(|path| crate::map_intent::spec_slug(path) == wanted)?;
+        std::fs::read_to_string(root.join(path)).ok()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Bound out here because `Extractor::Loopback` borrows it and the borrow has to outlive the
+    // `match` that creates it.
+    let local_model;
+    let asked = match brain {
+        crate::chats::Brain::Cloud => crate::map_intent::Extractor::Cli(state.runner.as_ref()),
+        crate::chats::Brain::Local => {
+            // Read per request rather than cached on `AppState`, which is the argument
+            // `models_config`'s own doc comment makes: a name cached at startup is one the owner
+            // cannot change without restarting the daemon.
+            //
+            // The field is named for triage and is being reused as "the local model this machine
+            // has". That reuse is the house pattern rather than a stretch — `main.rs` already
+            // hands `voice_cleanup_model` to the web pillar as its quarantine model — and there is
+            // exactly one Ollama model configured on a machine.
+            let Some(model) = models_config().local_triage_model else {
+                tracing::warn!(
+                    project_id = %id,
+                    spec = %body.spec_slug,
+                    "the local brain was asked for and this machine has no local model configured"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            local_model = model;
+            crate::map_intent::Extractor::Loopback {
+                client: &state.web.http,
+                base_url: crate::runner::OLLAMA_BASE_URL,
+                model: &local_model,
+            }
+        }
+    };
+
+    let decisions = crate::map_intent::extract(asked, &body.spec_slug, &source)
+        .await
+        .map_err(|error| {
+            // 502 and not 500: the daemon did its part and the thing it asked did not answer. An
+            // empty list would be the other reading, and it is the one this feature exists to
+            // forbid — "this spec decided nothing" is a claim, and nobody is in a position to make
+            // it when nobody read the document.
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                spec = %body.spec_slug,
+                brain = %brain.as_str(),
+                "the extraction run failed"
+            );
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    crate::map_store::record(&state.pool, &id, &body.spec_slug, brain, &decisions)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                spec = %body.spec_slug,
+                "an extraction was read but could not be recorded"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // The whole pile and not this extraction, because the pile is what the owner reads. A window
+    // handed only what just arrived would show a shrinking list every time a second spec was read.
+    crate::map_store::pending(&state.pool, &id)
+        .await
         .map(Json)
         .map_err(|error| {
-            // A folder that has been renamed or deleted is something its owner did, not a
-            // fault of this daemon — and `ls`, `cat`, `grep` and `blame` already answer 404
-            // for the very same `read_dir`. Answering 500 would put a warning in the log for
-            // an ordinary Tuesday.
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return StatusCode::NOT_FOUND;
-            }
-            tracing::warn!(%error, project_id = %id, "project map failed");
+            tracing::warn!(%error, project_id = %id, "reading the decision pile failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// What is waiting for this project's owner, on a route of its own.
+///
+/// The same list `POST …/map/extract` hands back. Separate because a window that was already open
+/// has to be able to refresh the pile, and the only other way to ask for it costs a model run.
+///
+/// Ordered by [`crate::map_store::pending`]: oldest extraction first, because a pile read in the
+/// order it arrived is a pile that ends.
+///
+/// The project is resolved first, the way `map` and `map/extract` do it, so an id nobody registered
+/// is a 404 rather than an empty list — "nothing is waiting for you" and "there is no such project"
+/// are different answers, and only one of them is true. It asks nothing of the disk beyond that:
+/// `resolve_project_root` reads the row and never the folder, so a project whose folder has moved
+/// still has a pile, which is exactly what somebody looking at a broken project wants.
+async fn get_project_map_decisions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::map_store::Decision>>, StatusCode> {
+    resolve_project_root(&state, &id).await?;
+    crate::map_store::pending(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the decision pile failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct MapDecisionBody {
+    /// `true` approves the line and lets it into the map; `false` retires it, which is what stops
+    /// it being proposed for that spec again. Required, with no `serde(default)`: a body that omits
+    /// it is a client that has not decided, and defaulting would decide for them in a direction.
+    approved: bool,
+}
+
+/// The owner's answer to ONE line.
+///
+/// **No bulk form, and that is §4 rather than an omission.** The list is approved line by line; a
+/// route that took the whole list would be the thousand-line plan again, wearing a smaller shape.
+///
+/// `204` when a row changed and `404` when none did. [`crate::map_store::decide`] returns `false`
+/// for three different reasons — a line belonging to another project, an id that never existed, and
+/// a line somebody already answered — and they are deliberately one answer here. All three mean
+/// *that line is not yours to answer now*; telling them apart would tell a caller which ids exist
+/// in projects it cannot see; and none of them is a fault of this daemon worth a 500.
+///
+/// **No `resolve_project_root` here, unlike the GET above.** `decide` puts `project_id` in its own
+/// `WHERE` and its doc comment argues for exactly that — a check that lives in a handler is a check
+/// the second caller forgets. An unregistered project therefore already gets this route's 404, from
+/// the store, and a resolve on top would be a second query that cannot change the answer.
+/// `delete_project_command`, the same shape one pillar over, relies on its store for the same
+/// reason.
+async fn post_project_map_decision(
+    State(state): State<AppState>,
+    Path((id, decision)): Path<(String, i64)>,
+    Json(body): Json<MapDecisionBody>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::map_store::decide(&state.pool, &id, decision, body.approved).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, project_id = %id, decision, "answering a decision failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Who last touched each line of a file, in the project or in one run's worktree.
@@ -11718,6 +12041,568 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// One approved decision in a project's map, put there through the door the routes use.
+    ///
+    /// `record` then `decide`, never an `INSERT` that stamps `approved_at` itself. The map is made
+    /// of what the owner said yes to, so a fixture that wrote the column directly would go on
+    /// passing on the day the approval path stopped writing it — which is the failure
+    /// `map_store::from_row` already had once, and the one that would have emptied this map for
+    /// every project.
+    async fn seed_approved(
+        state: &AppState,
+        project: &str,
+        section: &str,
+        ordinal: i64,
+        text: &str,
+    ) -> i64 {
+        crate::map_store::record(
+            &state.pool,
+            project,
+            "design",
+            crate::chats::Brain::Cloud,
+            &[crate::map_intent::Extracted {
+                section: section.to_owned(),
+                ordinal,
+                text: text.to_owned(),
+                kind: crate::map_intent::Kind::Countable,
+            }],
+        )
+        .await
+        .unwrap();
+        let id = crate::map_store::pending(&state.pool, project)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.text == text)
+            .expect("the line just recorded is in the pile")
+            .id;
+        assert!(
+            crate::map_store::decide(&state.pool, project, id, true)
+                .await
+                .unwrap(),
+            "the approval landed on a row"
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn the_map_carries_the_junction_beside_the_structure() {
+        // §9.1's *whole graph: nodes, edges, states* in one answer. Two lists to cross by hand is
+        // the disease this mode treats rather than a lighter version of the cure: the owner is
+        // here because they cannot tell what they asked for from what was built, and handing them
+        // a structure and a pile separately asks them to do the join that defeated them.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\nuse crate::b;\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        seed_approved(
+            &state,
+            "alpha",
+            "## 1. Alfa",
+            1,
+            "O mapa deriva-se a cada leitura.",
+        )
+        .await;
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        // The structure half, still at the top level. The shell reads these four field names
+        // today, and an answer that nested them to make room would be a rewrite wearing the word
+        // "additive".
+        assert_eq!(map["modules"].as_array().unwrap().len(), 2);
+        assert_eq!(map["imports"].as_array().unwrap().len(), 1);
+        assert!(map["unread"].is_array());
+        assert!(map["foreign"].is_array());
+
+        // The junction half: the decision and the file that names it, already read against each
+        // other by the one place that owns that reading (§9.3).
+        let junction = &map["junction"];
+        assert_eq!(junction["counts"]["decisions"], 1);
+        let decided = &junction["decisions"][0];
+        assert_eq!(decided["text"], "O mapa deriva-se a cada leitura.");
+        assert_eq!(
+            decided["section"], "## 1. Alfa",
+            "the heading the owner approved, not the number read off it"
+        );
+        assert_eq!(
+            decided["modules"],
+            serde_json::json!(["core/src/a.rs"]),
+            "the file naming §1 is the code this decision is tied to"
+        );
+        // `ambiguous` and not `declared`: `core/src/a.rs` writes `§1` and never says of which
+        // document. §8 is unfixed, and the route reports the guess as a guess.
+        assert_eq!(decided["anchor"], "ambiguous");
+        assert_eq!(
+            junction["unclaimed"],
+            serde_json::json!(["core/src/b.rs"]),
+            "the module naming nothing at all is §5.1's code nobody asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_with_no_approved_decisions_has_an_empty_junction_and_not_an_error() {
+        // Day one, and §11's posture. A project added from outside has no specs and no approvals;
+        // the structure layer costs nothing and is always true, so it comes back whole while the
+        // intention layer says out loud that it is empty. A 500, or an absent `junction`, would
+        // make the window draw nothing at all — the cheapest lie in the document.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "pub fn a() {}\n").unwrap();
+        // A pile nobody has answered, which is what day one actually looks like once somebody
+        // presses extract. §4 says it is counted apart from the real decisions, so it must not
+        // reach the map: this is the assertion that the route reads `approved` and not `pending`.
+        seed_two_pending(&state, "alpha").await;
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(
+            map["modules"].as_array().unwrap().len(),
+            1,
+            "a real structure beside the empty junction"
+        );
+        assert_eq!(map["junction"]["decisions"], serde_json::json!([]));
+        assert_eq!(map["junction"]["counts"]["decisions"], 0);
+        // Present and empty, never absent. A client that has to tell `undefined` from `[]` is a
+        // client that will one day read "no decisions" off a request that failed.
+        assert!(map["junction"]["unmatched"].is_array());
+        assert_eq!(
+            map["junction"]["unclaimed"],
+            serde_json::json!(["core/src/a.rs"]),
+            "with nothing approved, every module is code nobody asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_nothing_cites_comes_back_as_declared_without_code() {
+        // §5.1's *declared, with no code*, proven end to end rather than only inside the join. It
+        // is the state this whole feature turns on — the plan said this and the tree has not got
+        // it — and the only one the map is sound about while §8 is unfixed: if nothing anywhere
+        // names §2, then nothing claims it under any document and there is no ambiguity left.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        seed_approved(&state, "alpha", "## 2. Beta", 2, "Nada chega aprovado.").await;
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        let decided = &map["junction"]["decisions"][0];
+        assert_eq!(decided["anchor"], "silent");
+        assert_eq!(decided["modules"], serde_json::json!([]));
+        assert_eq!(
+            decided["foreign"],
+            serde_json::json!([]),
+            "and no sidecar names it either, which is what makes the silence sound"
+        );
+        assert_eq!(map["junction"]["counts"]["silent"], 1);
+        // The file citing a section nobody approved is neither matched nor an orphan, so the one
+        // number §5.1 puts in front of somebody is not inflated by it.
+        assert_eq!(
+            map["junction"]["unmatched"],
+            serde_json::json!(["core/src/a.rs"])
+        );
+        assert_eq!(map["junction"]["counts"]["unclaimed"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_project_whose_folder_moved_is_still_a_404() {
+        // The behaviour the junction must not cost. A renamed folder is something its owner did
+        // and not a fault of this daemon, and `ls`, `cat` and `grep` already answer 404 for the
+        // very same `read_dir`.
+        //
+        // Distinct from the folder-is-gone test above in the one way that matters now: this
+        // project HAS approved decisions. A handler that read the database first, or that met the
+        // structure's `NotFound` with an empty tree so it could still serve the join, would answer
+        // 200 with a map of nothing — which is the confident emptiness this mode exists to refuse,
+        // and a 404 is the one honest answer.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        seed_approved(
+            &state,
+            "alpha",
+            "## 1. Alfa",
+            1,
+            "O mapa deriva-se a cada leitura.",
+        )
+        .await;
+        let root = dir.path().to_path_buf();
+        drop(dir);
+        assert!(
+            !root.exists(),
+            "the folder is gone, but the project is still registered and still has decisions"
+        );
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/alpha/map")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn only_this_project_s_approved_decisions_reach_its_map() {
+        // `map_store::approved` puts `project_id` in its own `WHERE`; this asserts the route hands
+        // it the id from the path rather than losing it somewhere between the two. One owner's map
+        // carrying another owner's decisions is worse than a missing feature — it is the false
+        // confidence this mode treats, sourced from a project they have never opened.
+        let state = test_state().await;
+        let _a = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _b = project_with_rules(&state, "beta", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "A decisão do alpha.").await;
+        seed_approved(&state, "beta", "## 1. Alfa", 1, "A decisão do beta.").await;
+
+        let mine = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(mine["junction"]["counts"]["decisions"], 1);
+        assert_eq!(
+            mine["junction"]["decisions"][0]["text"],
+            "A decisão do alpha."
+        );
+
+        // Both halves, because only the pair is discriminating: a route that answered nothing at
+        // all would satisfy the absence on its own.
+        let theirs = get_json(&state, "/projects/beta/map").await;
+        assert_eq!(
+            theirs["junction"]["decisions"][0]["text"],
+            "A decisão do beta."
+        );
+    }
+
+    /// What a model answers when it has read a spec: the shape `parse_extraction` takes.
+    ///
+    /// Portuguese because the documents are, and the prompt tells the model to answer in the
+    /// document's own language — a fixture in English would be pinning a behaviour the prompt
+    /// forbids.
+    ///
+    /// Built rather than written out as a raw string literal, and not for taste: a markdown
+    /// heading is `##`, so `"## 1. Alfa` opens with the exact three characters that close an
+    /// `r#"…"#` — the literal ends in the middle of the first section and the rest of the fixture
+    /// lexes as broken Rust.
+    fn extraction_answer() -> String {
+        serde_json::json!({
+            "decisions": [
+                {"section": "## 1. Alfa", "text": "O mapa deriva-se a cada leitura.", "kind": "b"},
+                {"section": "## 1. Alfa", "text": "Nada chega aprovado.", "kind": "c"},
+            ]
+        })
+        .to_string()
+    }
+
+    /// A runner that answers an extraction, in the shape the agent CLI answers in.
+    ///
+    /// A `result` event and not bare JSON, because that is what `extract` has to unwrap: the CLI
+    /// puts the whole `stream-json` transcript in `stdout` and the answer is inside the final
+    /// event. A fixture that skipped the envelope would exercise the plain-text path instead and
+    /// prove nothing about the one this route actually uses.
+    fn extracting_runner() -> Arc<FakeCommandRunner> {
+        Arc::new(FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": extraction_answer(),
+                })
+                .to_string(),
+                stderr: String::new(),
+                session_id: Some("fake-session-id".into()),
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+            })),
+            ..Default::default()
+        })
+    }
+
+    async fn post_extract(
+        state: AppState,
+        project: &str,
+        spec_slug: &str,
+        brain: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/extract"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"spec_slug": spec_slug, "brain": brain}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn extracting_a_spec_leaves_a_pile_for_the_owner_and_approves_nothing() {
+        let mut state = test_state().await;
+        state.runner = extracting_runner();
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(dir.path().join("docs/specs/design.md"), "## 1. Alfa\n").unwrap();
+
+        let (status, body) = post_extract(state.clone(), "alpha", "design", "cloud").await;
+        assert_eq!(status, StatusCode::OK);
+        // §9.1: the route answers with the list, so the window has something to draw without a
+        // second request. It is the PILE and not this extraction — the same answer the list route
+        // gives — which is why it is read back through `pending` below rather than trusted here.
+        assert_eq!(body.as_array().unwrap().len(), 2);
+
+        let waiting = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert!(!waiting.is_empty(), "the model's proposals are in the pile");
+        assert!(
+            waiting.iter().all(|row| row.approved_at.is_none()),
+            "nothing arrives approved"
+        );
+        assert!(
+            waiting.iter().all(|row| row.brain == "cloud"),
+            "the row records which brain answered, or a thin list is mysterious"
+        );
+    }
+
+    #[tokio::test]
+    async fn extracting_a_spec_that_is_not_there_is_the_callers_mistake_and_not_the_daemons() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        assert_eq!(
+            post_extract(state, "alpha", "nowhere", "cloud").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_brain_nobody_can_read_is_refused_rather_than_guessed_at() {
+        // `chats::Brain::from_wire` falls back to Cloud, which is right for a conversation and
+        // wrong here: this is the one choice the owner explicitly asked to make, and quietly making
+        // it for them — in the direction that spends money — is the wrong default to inherit.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        assert_eq!(
+            post_extract(state, "alpha", "design", "whatever").await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn asking_the_local_brain_with_no_local_model_refuses_rather_than_going_to_the_cloud() {
+        // The most important assertion in this route. `local` is what somebody chooses when the
+        // document must not leave the machine, or when they are not paying for it. A fallback to
+        // the cloud would break both promises at once, silently, on the bill.
+        //
+        // The condition needs no setup and is not at the mercy of a file outside the repository:
+        // it is the same one `cloud_choice` documents relying on. `models_config` reads
+        // `.ai/nucleos-models.yaml` relative to the working directory, a test runs from the crate
+        // root, `core/.ai/` does not exist, and `ModelsConfig::default` has
+        // `local_triage_model: None`.
+        let mut state = test_state().await;
+        // A fake that WOULD answer, so a fallback would succeed and this test would not see it.
+        state.runner = extracting_runner();
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(dir.path().join("docs/specs/design.md"), "## 1. Alfa\n").unwrap();
+
+        let (status, _) = post_extract(state.clone(), "alpha", "design", "local").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            crate::map_store::pending(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing was recorded, so nothing was run"
+        );
+    }
+
+    /// Two unapproved lines in a project's pile, put there the way the extract route puts them.
+    ///
+    /// Through `map_store::record` and not raw SQL: the same door the routes use, so a test that
+    /// passes cannot be passing against a row shape the writer never produces.
+    async fn seed_two_pending(state: &AppState, project: &str) {
+        crate::map_store::record(
+            &state.pool,
+            project,
+            "design",
+            crate::chats::Brain::Cloud,
+            &[
+                crate::map_intent::Extracted {
+                    section: "## 1. Alfa".to_owned(),
+                    ordinal: 1,
+                    text: "O mapa deriva-se a cada leitura.".to_owned(),
+                    kind: crate::map_intent::Kind::Countable,
+                },
+                crate::map_intent::Extracted {
+                    section: "## 2. Beta".to_owned(),
+                    ordinal: 2,
+                    text: "Nada chega aprovado.".to_owned(),
+                    kind: crate::map_intent::Kind::Character,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The owner's answer to one line, as the window sends it: the status and nothing else.
+    async fn post_decision(state: AppState, project: &str, id: i64, approved: bool) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/decisions/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"approved": approved}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_pile_of_a_project_is_served_and_one_line_can_be_answered() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        seed_two_pending(&state, "alpha").await;
+
+        let listed = get_json(&state, "/projects/alpha/map/decisions").await;
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+
+        let id = listed[0]["id"].as_i64().unwrap();
+        assert_eq!(
+            post_decision(state.clone(), "alpha", id, true).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let left = get_json(&state, "/projects/alpha/map/decisions").await;
+        assert_eq!(
+            left.as_array().unwrap().len(),
+            1,
+            "the answered one has left the pile"
+        );
+    }
+
+    #[tokio::test]
+    async fn answering_a_line_of_another_project_answers_nothing_over_http() {
+        // The id is a global integer, so the project in the path is the only thing standing
+        // between one project's owner and another project's pile. `map_store::decide` already
+        // filters by project; this asserts the route actually passes it and turns "no row changed"
+        // into a 404 rather than a cheerful 204 about nothing.
+        let state = test_state().await;
+        let _a = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _b = project_with_rules(&state, "beta", "gate_command: x\n").await;
+        seed_two_pending(&state, "alpha").await;
+        let id = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap()[0]
+            .id;
+
+        assert_eq!(
+            post_decision(state.clone(), "beta", id, true).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            crate::map_store::pending(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "alpha's pile is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_answered_twice_is_answered_once() {
+        // A stale list in a window somebody left open, or two clicks. The second must be a 404 and
+        // must not overturn the first answer.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_two_pending(&state, "alpha").await;
+        let id = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap()[0]
+            .id;
+
+        assert_eq!(
+            post_decision(state.clone(), "alpha", id, true).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post_decision(state.clone(), "alpha", id, false).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            crate::map_store::pending(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_specs_of_a_project_are_listed_by_the_name_the_owner_will_read() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(
+            dir.path().join("docs/specs/2026-08-24-alfa-design.md"),
+            "# Alfa",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("docs/specs/beta.md"), "# Beta").unwrap();
+        std::fs::write(dir.path().join("docs/specs/notes.txt"), "not a spec").unwrap();
+
+        let listed = get_json(&state, "/projects/alpha/map/specs").await;
+
+        // The slug and not the path: it is what the owner reads, what they hand back to
+        // `/map/extract`, and what a decision row carries forever.
+        assert_eq!(
+            listed,
+            serde_json::json!(["2026-08-24-alfa-design", "beta"]),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_that_keeps_no_specs_is_an_empty_list_and_not_an_error() {
+        // A project with no specs shows its structure and says what is missing. An empty list is
+        // that sentence's input; a 404 would read as "there is no such project".
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        assert_eq!(
+            get_json(&state, "/projects/alpha/map/specs").await,
+            serde_json::json!([])
+        );
     }
 
     /* --------------------------------------------------------------- workflows -- */
