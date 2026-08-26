@@ -1670,6 +1670,10 @@ mod tests {
                 decision_id,
                 judgement,
                 reason: "Nada estranho à vista.".to_owned(),
+                // A model's sentence and not the daemon's, which is what `judged_from_row` would
+                // have computed from that reason. `reconcile` never reads it — the field is an
+                // attribution, and a tally has no opinion about who wrote a sentence.
+                machine_written: false,
                 model: "cloud".to_owned(),
                 computed_at: "2026-08-26T10:00:00+00:00".to_owned(),
                 // Whatever this says, `reconcile` may not look at it: staleness is decided by

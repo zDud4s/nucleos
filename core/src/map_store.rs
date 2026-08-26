@@ -490,6 +490,24 @@ pub struct Judged {
     /// What the triager looked at, hashed. Compared against a freshly computed digest by whoever has
     /// one; see this struct's own doc for why that comparison does not happen here.
     pub inputs_digest: String,
+    /// This sentence was written by the daemon rather than by a model.
+    ///
+    /// **Not a column, and the one field here that is derived** — which is exactly why it belongs on
+    /// the row rather than on whatever a caller happens to build out of it. [`Self::model`] names
+    /// the brain that ANSWERED, and that stays true of an answer nobody could read: the only
+    /// producer of such a sentence is [`crate::map_triage::unreadable_flag`], which records the
+    /// failure as a flag so a confused model costs a look instead of disappearing. A client handed
+    /// `reason` under `model` with nothing else has no way to tell a machine's note about a failure
+    /// from a model's opinion about the code, and that attribution is the whole of §6.2.
+    ///
+    /// **Computed in [`judged_from_row`], which is the only place a `Judged` comes into existence**,
+    /// so no reader of this table can be handed the sentence without the answer to *whose is it*.
+    /// The alternative shipped for one slice and was backwards: the field sat on the silenced pile's
+    /// row, where [`crate::map_triage::unreadable_flag`] makes it provably `false`, while the pile
+    /// that can actually carry the mark had nothing — and the client duly re-spelled
+    /// [`crate::map_triage::DAEMON_MARK`] in TypeScript to work around it, which is the second
+    /// spelling of a convention that the constant exists to prevent.
+    pub machine_written: bool,
 }
 
 /// Append one triage judgement, and say whether it landed on anything.
@@ -570,6 +588,11 @@ fn judged_from_row(
     Some(Judged {
         decision_id,
         judgement: Judgement::from_wire(&verdict)?,
+        // Read before `reason` is moved, and read HERE rather than by whoever draws the pile.
+        // `crate::map_triage::written_by_the_daemon` is the one owner of the test and this is the
+        // one place a row becomes a `Judged`, so the two facts a reader needs about a sentence —
+        // what it says and whose it is — cannot arrive separately.
+        machine_written: crate::map_triage::written_by_the_daemon(&reason),
         reason,
         model,
         computed_at,
@@ -658,6 +681,88 @@ pub struct Silencing {
     pub retired: bool,
 }
 
+/// When this project's triager last answered anything, or `None` if it never has.
+///
+/// **The one question the other three readers of this table cannot answer, and the panel was
+/// reduced to guessing at it.** [`judgements`] returns what still describes the map and
+/// [`silencings`] returns the silences; a run that flagged everything and whose answers have all
+/// since gone stale leaves both empty, which is indistinguishable from a project nobody ever pressed
+/// the button on. The panel had to hedge — *as far as this map can see, it has never run* — and a
+/// hedge is what an honest surface writes when the daemon will not answer a question it could.
+///
+/// **Unfiltered by staleness and by standing, on purpose, because the question is whether a run
+/// HAPPENED and not whether anything it produced is still true.** Filtering either way would make
+/// `None` mean *nothing it said still stands*, which is a different sentence and one the panel
+/// already says elsewhere with numbers.
+///
+/// `approved_at IS NOT NULL` is kept and `retired_at` is deliberately not, which is [`silencings`]'
+/// split verbatim: §4 and §6 mean the triager never sees an unapproved decision, so a judgement
+/// against one is a defect rather than a record — while a run that judged decisions the owner has
+/// since retired is a run that happened.
+///
+/// `MAX` over an empty set is one row holding NULL rather than no rows at all, so this is a
+/// `fetch_one` of an `Option` and never a `fetch_optional`: reading it the other way would have made
+/// *no such project* and *never run* the same answer, which is the pair
+/// [`get_project_map_decisions`] refuses to collapse one route over.
+pub async fn last_triaged(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<Option<String>> {
+    let (when,): (Option<String>,) = sqlx::query_as(
+        "SELECT MAX(t.computed_at)
+           FROM map_triage t
+           JOIN map_decisions d ON d.id = t.decision_id
+          WHERE d.project_id = ?
+            AND d.approved_at IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(when)
+}
+
+/// How many silencings one read of §6.2's pile carries.
+///
+/// **§6.2 asks for *sempre acessível*, which is not *all at once*.** `map_triage` is append-only by
+/// design — a triager that silenced something it should not have is a bug, and the row proving it
+/// did IS §13's mitigation — so this table only ever grows, and it grows by up to
+/// `MAX_TRIAGE_BATCH` rows every time somebody presses the button this feature exists to encourage.
+/// The window reads that route on every open of the map mode. Uncapped, the payload of a read grows
+/// without bound with the number of presses, which is the one axis nothing else here is bounded on:
+/// the write side was capped at twenty and the read side at nothing.
+///
+/// **Two hundred, argued from what is on the other end of it rather than rounded.** A run silences
+/// at most `MAX_TRIAGE_BATCH` = 20 decisions, so this is ten saturated runs of history — well past
+/// the point where an older silencing is being read as evidence rather than skimmed as a list. The
+/// panel draws twelve rows at a time and filters the rest against the judgements the map is still
+/// holding, so the cap has to clear the whole currently-silenced set with room over it, and this
+/// repository's approved population is ~80 decisions today against the ~350 §10 predicts. And a row
+/// is not small: the decision's own text travels with it, deliberately, because a pile of ids would
+/// ask for the cross-reference §1 says the owner cannot perform — call it ~400 bytes, so two hundred
+/// rows is ~80 KB on a route the window performs per open, the same order as
+/// [`crate::map_recency::WINDOW`]'s measured git walk on the same request.
+///
+/// **What the cap does NOT do is hide that it happened.** [`SilencedPile::total`] is counted over
+/// the uncapped set, so the remainder is always available to be said out loud — a pile that quietly
+/// stopped is the same defect as a batch that quietly truncated, which is the whole reason
+/// `TriageReport::left_over` exists one route over.
+pub const SILENCED_PAGE: usize = 200;
+
+/// §6.2's pile as one read of it: the newest rows, and how many there are altogether.
+///
+/// **The total is the count of the uncapped set and never `rows.len()`.** That is the entire point
+/// of returning a struct rather than a `Vec`: a capped list whose length is the only number
+/// available reads as the whole pile, and its reader has no way to learn otherwise. Same shape and
+/// same argument as `TriageReport::left_over`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SilencedPile {
+    /// The newest [`SILENCED_PAGE`] of them, newest first.
+    pub rows: Vec<Silencing>,
+    /// Every silencing on record for this project, including the ones the cap left out.
+    pub total: usize,
+}
+
 /// Every silencing this project's triager has ever written, newest first.
 ///
 /// **Every row and not the latest judgement per decision, which is the difference from
@@ -686,27 +791,39 @@ pub struct Silencing {
 /// and insertion order is the order the triager actually answered in. Ordering by decision id would
 /// interleave two runs of one project and make the last press impossible to read off the top of the
 /// pile, which is what somebody opens this for.
-pub async fn silencings(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Silencing>> {
+pub async fn silencings(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<SilencedPile> {
+    // `COUNT(*) OVER ()` rather than a second `SELECT COUNT(*)`, because a window function is
+    // evaluated before `LIMIT` and inside the same statement: the total and the rows are then one
+    // answer about one instant. Two statements would let a run land between them and report a
+    // remainder that was never true — small, and exactly the kind of quietly wrong number this
+    // feature exists against.
     let rows = sqlx::query_as::<_, SilencingRow>(
         "SELECT t.decision_id, d.spec_slug, d.section, d.text, t.reason, t.model, t.computed_at,
-                CASE WHEN d.retired_at IS NULL THEN 0 ELSE 1 END
+                CASE WHEN d.retired_at IS NULL THEN 0 ELSE 1 END,
+                COUNT(*) OVER ()
            FROM map_triage t
            JOIN map_decisions d ON d.id = t.decision_id
           WHERE d.project_id = ?
             AND d.approved_at IS NOT NULL
             AND t.verdict = ?
-          ORDER BY t.computed_at DESC, t.id DESC",
+          ORDER BY t.computed_at DESC, t.id DESC
+          LIMIT ?",
     )
     .bind(project_id)
     .bind(Judgement::Silenced.as_str())
+    .bind(SILENCED_PAGE as i64)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(
-            |(decision_id, spec_slug, section, text, reason, model, computed_at, retired)| {
-                Silencing {
+    // No rows means no silencings, so the one case where the window function has nowhere to put the
+    // total is also the one case where the total is knowable without it.
+    let total = rows.first().map_or(0, |row| row.8.max(0) as usize);
+
+    Ok(SilencedPile {
+        rows: rows
+            .into_iter()
+            .map(
+                |(
                     decision_id,
                     spec_slug,
                     section,
@@ -714,21 +831,48 @@ pub async fn silencings(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Resu
                     reason,
                     model,
                     computed_at,
-                    retired: retired != 0,
-                }
-            },
-        )
-        .collect())
+                    retired,
+                    _,
+                )| {
+                    Silencing {
+                        decision_id,
+                        spec_slug,
+                        section,
+                        text,
+                        reason,
+                        model,
+                        computed_at,
+                        retired: retired != 0,
+                    }
+                },
+            )
+            .collect(),
+        total,
+    })
 }
 
 /// The columns [`silencings`] selects, named once for [`JudgedRow`]'s reason and with the same
-/// hazard: six of the eight are `String`, so a `SELECT` that swapped any pair would still typecheck
+/// hazard: six of the nine are `String`, so a `SELECT` that swapped any pair would still typecheck
 /// and surface as a pile whose reasons are all section headings.
 ///
-/// The last is an `i64` and not a `bool` because the expression producing it is a SQL `CASE`, and a
-/// `CASE` returning 0/1 is the portable spelling — `d.retired_at IS NOT NULL` decodes too, and
-/// leaves a reader wondering which of SQLite's truthiness rules is in play.
-type SilencingRow = (i64, String, String, String, String, String, String, i64);
+/// The retirement flag is an `i64` and not a `bool` because the expression producing it is a SQL
+/// `CASE`, and a `CASE` returning 0/1 is the portable spelling — `d.retired_at IS NOT NULL` decodes
+/// too, and leaves a reader wondering which of SQLite's truthiness rules is in play.
+///
+/// The last is `COUNT(*) OVER ()`, repeated identically on every row of the answer: the size of the
+/// pile before [`SILENCED_PAGE`] cut it. It rides on the row because that is what makes it one
+/// answer with the rows rather than a second question asked a moment later.
+type SilencingRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+);
 
 #[cfg(test)]
 mod tests {
@@ -1903,7 +2047,7 @@ mod tests {
             .unwrap()
         );
 
-        let pile = silencings(&pool, "alpha").await.unwrap();
+        let pile = silencings(&pool, "alpha").await.unwrap().rows;
 
         assert_eq!(
             pile.len(),
@@ -1932,7 +2076,178 @@ mod tests {
 
         // A flag is not a silencing, and nothing here widens the pile into the whole table.
         assert!(pile.iter().all(|row| !row.reason.contains("merece")));
-        assert!(silencings(&pool, "beta").await.unwrap().is_empty());
+        assert!(silencings(&pool, "beta").await.unwrap().rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_silenced_pile_is_capped_and_still_says_how_big_it_is() {
+        // **§6.2 says *sempre acessível*, which is not *all at once*.** This table is append-only
+        // and grows by up to a batch per press of the button the feature exists to encourage, on a
+        // route the window performs every time the map opens — so an uncapped read grows without
+        // bound with how often somebody uses the thing. The cap is admissible only because the
+        // uncapped size comes back with it: a pile that quietly stopped is the same defect as a
+        // batch that quietly truncated, which is the whole reason `TriageReport::left_over` exists.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        let written = SILENCED_PAGE + 7;
+        for n in 0..written {
+            assert!(
+                triage(
+                    &pool,
+                    "alpha",
+                    id,
+                    Judgement::Silenced,
+                    &format!("silenciamento {n}"),
+                    "cloud",
+                    "d1",
+                )
+                .await
+                .unwrap()
+            );
+        }
+
+        let pile = silencings(&pool, "alpha").await.unwrap();
+
+        assert_eq!(pile.rows.len(), SILENCED_PAGE, "the cap is the cap");
+        assert_eq!(
+            pile.total, written,
+            "and the number it was cut from is on the answer, or the reader has no way to learn              that anything was cut at all"
+        );
+        // **The cap drops the OLDEST, which is the end it has to drop.** A sweep writes the newest
+        // rows, the current silencings are the newest per decision, and §6.2's pile is opened to
+        // read what the triager did lately. Cutting from the other end would take the rows the
+        // panel joins against the map and leave the history nobody asked for.
+        assert_eq!(
+            pile.rows[0].reason,
+            format!("silenciamento {}", written - 1)
+        );
+        assert!(
+            pile.rows.iter().all(|row| row.reason != "silenciamento 0"),
+            "the oldest is what the cap spends, and it is the one the total speaks for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reason_the_daemon_wrote_comes_back_marked_and_a_model_s_does_not() {
+        // **`model` names the brain that ANSWERED, and that stays true of an answer nobody could
+        // read.** `map_triage::unreadable_flag` records such a failure as a flag rather than
+        // dropping it, so the sentence in `reason` is sometimes this daemon's note about a model and
+        // not a model's note about the code — and a reader handed the two under one name is being
+        // shown a machine's failure as an opinion, which is the attribution §6.2 exists to protect,
+        // inverted. Computed here rather than by whoever draws the pile, because a convention spelled
+        // in two languages is one that has already stopped working somewhere.
+        let pool = test_pool().await;
+        let mine = an_approved_decision(&pool, "alpha").await;
+        let theirs = pending(&pool, "alpha").await.unwrap()[0].id;
+        assert!(decide(&pool, "alpha", theirs, true).await.unwrap());
+
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                mine,
+                Judgement::Flagged,
+                &format!(
+                    "{} o modelo respondeu e ninguém conseguiu ler",
+                    crate::map_triage::DAEMON_MARK
+                ),
+                "cloud",
+                "d1",
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                theirs,
+                Judgement::Flagged,
+                "isto contradiz o que o módulo faz",
+                "cloud",
+                "d2",
+            )
+            .await
+            .unwrap()
+        );
+
+        let read = judgements(&pool, "alpha").await.unwrap();
+        let mark = |decision_id: i64| {
+            read.iter()
+                .find(|row| row.decision_id == decision_id)
+                .expect("both judgements come back")
+                .machine_written
+        };
+
+        assert!(
+            mark(mine),
+            "a sentence opening the daemon's mark is the daemon's"
+        );
+        assert!(
+            !mark(theirs),
+            "and everything else is the model's, or the mark means nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_nobody_triaged_has_no_last_run_and_one_that_was_has_one() {
+        // **The question is whether a run HAPPENED**, which neither of the other two readers can
+        // answer: `judgements` returns what still describes the map and `silencings` returns the
+        // silences, so a run that flagged everything and whose answers later went stale comes back
+        // empty from both — indistinguishable from a project nobody ever pressed the button on. The
+        // panel was reduced to hedging over exactly that gap.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+        let _ = an_approved_decision(&pool, "beta").await;
+
+        assert!(
+            last_triaged(&pool, "alpha").await.unwrap().is_none(),
+            "never run is a real answer and it is this one"
+        );
+
+        assert!(
+            triage(
+                &pool,
+                "alpha",
+                id,
+                Judgement::Flagged,
+                "vale o olhar",
+                "cloud",
+                "d1"
+            )
+            .await
+            .unwrap()
+        );
+
+        let when = last_triaged(&pool, "alpha")
+            .await
+            .unwrap()
+            .expect("a run happened");
+        assert!(!when.is_empty());
+        assert!(
+            last_triaged(&pool, "beta").await.unwrap().is_none(),
+            "and it reaches one project only, through the JOIN that is the whole isolation"
+        );
+
+        // **Unfiltered by standing and by retirement, because the run still happened.** Filtering
+        // would make `None` mean *nothing it said still stands*, which is a different sentence and
+        // one the counts already carry.
+        sqlx::query("UPDATE map_decisions SET retired_at = ? WHERE id = ?")
+            .bind("2026-08-26T12:00:00+00:00")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            last_triaged(&pool, "alpha").await.unwrap().as_deref(),
+            Some(when.as_str()),
+            "retiring the decision does not un-run the triager"
+        );
+        assert!(
+            judgements(&pool, "alpha").await.unwrap().is_empty(),
+            "while the map's own reader drops it, which is the asymmetry stated from the other side"
+        );
     }
 
     #[tokio::test]
@@ -1970,7 +2285,7 @@ mod tests {
             .await
             .unwrap();
 
-        let pile = silencings(&pool, "alpha").await.unwrap();
+        let pile = silencings(&pool, "alpha").await.unwrap().rows;
 
         assert_eq!(pile.len(), 1, "{pile:?}");
         assert_eq!(pile[0].reason, "nada de estranho");

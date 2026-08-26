@@ -3040,6 +3040,21 @@ struct MapAnswer {
     /// a mostly arbitrary tail with the same confidence as the head. §10 offers this ordering as
     /// *um facto do git*, and the honest way to keep that true is to say how far the git looked.
     recency: crate::map_recency::Recency,
+    /// When this project's triager last answered anything, or `null` if it never has.
+    ///
+    /// **The one thing `triage` and `triage_counts` cannot say, and a panel was reduced to guessing
+    /// it.** Both of those describe what is true NOW: a run that flagged everything and whose
+    /// answers have all since gone stale leaves `triage` empty and §6.2's pile empty, which is
+    /// indistinguishable from a project nobody has ever pressed the button on. Those two are not the
+    /// same fact — the first says the triager's work expired, the second says none was ever done —
+    /// and the panel wrote *as far as this map can see, it has never run* because that was the
+    /// strongest true sentence available to it. A hedge is what an honest surface produces when the
+    /// daemon declines a question it could answer.
+    ///
+    /// **Deliberately unfiltered by staleness and by standing.** See
+    /// [`crate::map_store::last_triaged`]: filtering either way would make `null` mean *nothing it
+    /// said still stands*, which is a different sentence and one the numbers already carry.
+    last_triaged_at: Option<String>,
 }
 
 /// The project's whole graph: modules, imports, and what the approved decisions do or do not
@@ -3106,6 +3121,18 @@ async fn get_project_map(
         .iter()
         .map(|stamp| (stamp.decision_id, stamp))
         .collect();
+
+    // Read beside the judgements and never derived from them, because it answers the question they
+    // cannot: `answered` is what still describes this map, and a run whose every answer has since
+    // gone stale comes back from it empty — identical to a project nobody ever pressed the button
+    // on. One `MAX` over the table tells those two apart, and it is the difference between a panel
+    // saying *it has never run here* and a panel hedging.
+    let last_triaged_at = crate::map_store::last_triaged(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the last triage run failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // The whole pile, stale rows and all, and the staleness decided below where the reading of the
     // repository is. `map_store::judgements` cannot decide it — see `Judged`, which argues why the
@@ -3208,6 +3235,7 @@ async fn get_project_map(
         triage_counts,
         git_would_not_answer: anchors == crate::map_stamp::Anchors::Failed,
         recency,
+        last_triaged_at,
     }))
 }
 
@@ -3605,36 +3633,6 @@ async fn get_project_map_decisions(
         })
 }
 
-/// One silencing, with everything §6.2 asks a reader to be able to see about it.
-///
-/// **The decision's own words travel with it, and that is what makes this a pile rather than a list
-/// of ids.** §6.2's whole argument is that a triager silencing what it should not is a bug and *"um
-/// bug só é corrigível se for visível"* — visible means readable in one place, by somebody who has
-/// not got the map open beside it and is not going to cross-reference three hundred rows by hand,
-/// which is the gesture §1 says the owner cannot perform.
-#[derive(Serialize)]
-struct SilencedRow {
-    /// The row as the store reads it — the decision, the reason, the model, when, and whether the
-    /// decision has since been retired.
-    ///
-    /// `#[serde(flatten)]` so the wire shape is the store's row with one fact added, the
-    /// arrangement `RosterEntry` uses next door. Nothing here re-spells a column: a handler that
-    /// copied seven fields by hand is a handler that will one day copy six.
-    #[serde(flatten)]
-    silencing: crate::map_store::Silencing,
-    /// Whether this sentence was written by the daemon rather than by the model.
-    ///
-    /// **Always `false` here today, and a field rather than a convention for exactly that reason.**
-    /// The one producer of a daemon-written reason is `map_triage::unreadable_flag`, which may only
-    /// ever reach [`crate::map_triage::Judgement::Flagged`] — so no row in this pile can carry the
-    /// mark. But `model` names the brain that ANSWERED, which stays true of an answer nobody could
-    /// read, so a client seeing a machine's sentence under a model's name has no way to tell whose
-    /// words it is looking at. Exposing the test rather than the convention means the first
-    /// machine-written silence, if one is ever invented, cannot arrive on screen as a model's
-    /// opinion. See [`crate::map_triage::written_by_the_daemon`].
-    machine_written: bool,
-}
-
 /// §6.2's pile: everything this project's triager has silenced, and why.
 ///
 /// **Its own door and never a filter on the map, because §6.2 says *sempre acessível*.** A pile you
@@ -3678,27 +3676,40 @@ struct SilencedRow {
 /// The order is the store's — newest first, ties broken by insertion order — and the argument for
 /// it is [`crate::map_store::silencings`]'s. Sorted in SQL and not here, because with the whole
 /// history in the pile the tie-break has to be `id` and a handler cannot see one.
+///
+/// **Capped at [`crate::map_store::SILENCED_PAGE`], with the uncapped total on the answer.** *Sempre
+/// acessível* is not *all at once*, and this table only grows: append-only by design, by up to
+/// `MAX_TRIAGE_BATCH` rows per press of the button the feature exists to encourage, on a route the
+/// window performs every time the map opens. The write side was bounded from the first commit and
+/// this side was bounded by nothing. What makes the cap admissible rather than a quiet truncation is
+/// that the reader is handed the number it was cut from — the same bargain
+/// [`TriageReport::left_over`] strikes one route over, and the same one every capped pile in the
+/// window keeps.
+///
+/// **It answers [`crate::map_store::Silencing`] rows and nothing wrapped around them, and the
+/// wrapper's removal is a correction rather than a tidy-up.** A `SilencedRow` here added
+/// `machine_written`, which could not be `true` on this route: the one producer of a daemon-written
+/// reason is [`crate::map_triage::unreadable_flag`], which may only ever reach
+/// [`crate::map_triage::Judgement::Flagged`], while [`crate::map_store::silencings`] selects the
+/// silenced. So the payload where the answer is provably always `false` carried the field and
+/// `GET /map`'s `triage` — the only place a `nucleos:` sentence can appear at all — carried nothing,
+/// which made a client re-spell [`crate::map_triage::DAEMON_MARK`] in its own language to keep §6.2's
+/// attribution. It now lives on [`crate::map_store::Judged`], computed at the only place a row of
+/// that table becomes a value. A field that can never be true is worse than an absent one: it is a
+/// promise somebody eventually relies on, and this one would have been relied on for the wrong pile.
 async fn get_project_map_silenced(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<SilencedRow>>, StatusCode> {
+) -> Result<Json<crate::map_store::SilencedPile>, StatusCode> {
     resolve_project_root(&state, &id).await?;
 
-    let pile = crate::map_store::silencings(&state.pool, &id)
+    crate::map_store::silencings(&state.pool, &id)
         .await
+        .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading the silenced pile failed");
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(Json(
-        pile.into_iter()
-            .map(|silencing| SilencedRow {
-                machine_written: crate::map_triage::written_by_the_daemon(&silencing.reason),
-                silencing,
-            })
-            .collect(),
-    ))
+        })
 }
 
 #[derive(Deserialize)]
@@ -14668,13 +14679,22 @@ mod tests {
         );
     }
 
-    /// The silenced pile as the window asks for it.
+    /// The silenced pile as the window asks for it — the rows, with the uncapped total checked.
+    ///
+    /// The total is asserted here rather than in each caller because it is a property of every read
+    /// of this route and not of any one test: the answer is capped, and a reader that could see only
+    /// `rows.len()` would read a truncated pile as the whole of it. Every test below writes fewer
+    /// rows than `SILENCED_PAGE`, so the two must agree — the cap itself is exercised where it can
+    /// be saturated cheaply, in `map_store`.
     async fn get_silenced(state: &AppState, project: &str) -> Vec<serde_json::Value> {
-        get_json(state, &format!("/projects/{project}/map/silenced"))
-            .await
-            .as_array()
-            .expect("the pile is a list")
-            .clone()
+        let pile = get_json(state, &format!("/projects/{project}/map/silenced")).await;
+        let rows = pile["rows"].as_array().expect("the pile is a list").clone();
+        assert_eq!(
+            pile["total"].as_u64(),
+            Some(rows.len() as u64),
+            "nothing here writes past the cap, so the total is the length: {pile}"
+        );
+        rows
     }
 
     #[tokio::test]
@@ -15211,11 +15231,101 @@ mod tests {
         assert_eq!(row["section"], "## 1. Alfa");
         assert_eq!(row["spec_slug"], "design");
         assert_eq!(row["retired"], false, "{row}");
-        // **A reason that opens `nucleos:` was written by this daemon and not by the model.** No row
-        // here can carry one today — `unreadable_flag` may only ever reach `flagged` — and the
-        // payload says so rather than leaving a client to remember a convention, because `model`
-        // names the brain that ANSWERED even when nobody could read the answer.
-        assert_eq!(row["machine_written"], false, "{row}");
+        // **`machine_written` is deliberately NOT here, and its absence is the correction.** It sat
+        // on this row for one slice and could not be `true` on it: `unreadable_flag` may only ever
+        // reach `flagged` and this route selects the silenced. So the payload where the answer was
+        // provably always `false` carried the field while `GET /map`'s `triage` — the one place a
+        // `nucleos:` sentence can appear — carried nothing, and a client duly re-spelled
+        // `DAEMON_MARK` in its own language. Asserted as absent rather than left untested, because
+        // a field that cannot be true is a promise somebody eventually relies on.
+        assert!(
+            row.get("machine_written").is_none(),
+            "the mark belongs to the pile that can carry it: {row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flag_this_daemon_wrote_itself_says_so_and_is_never_the_model_s_opinion() {
+        // **This is the pile where a machine-written sentence actually appears**, which is why the
+        // field moved here. `unreadable_flag` records an answer nobody could parse as a flag rather
+        // than dropping it — a confused model costs a look instead of disappearing — and `model`
+        // names the brain that ANSWERED, which stays true of an answer nobody could read. A client
+        // handed `reason` under `model` and nothing else shows a machine's failure note as a
+        // model's opinion about the code, which is §6.2's attribution inverted.
+        let mut state = test_state().await;
+        state.runner = Arc::new(TriagingRunner {
+            answers: vec![("Alfa.".to_owned(), "isto não é um veredicto".to_owned())],
+            otherwise: judgement("flagged", "Isto contradiz o que o módulo faz."),
+            ..Default::default()
+        });
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "gate_command: x
+",
+        )
+        .await;
+        let unreadable = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let answered = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let triage = map["triage"].as_object().expect("triage is a map");
+
+        let written = &triage[&unreadable.to_string()];
+        assert_eq!(
+            written["judgement"], "flagged",
+            "an answer nobody could read costs a look and never a silence: {map}"
+        );
+        assert_eq!(
+            written["machine_written"], true,
+            "the daemon wrote that sentence, and the payload has to say so: {map}"
+        );
+        assert_eq!(
+            written["model"], "cloud",
+            "while `model` still names the brain that was asked, which is what makes the flag              ambiguous without the field beside it: {map}"
+        );
+
+        assert_eq!(
+            triage[&answered.to_string()]["machine_written"],
+            false,
+            "and a model's own sentence is the model's: {map}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_nobody_triaged_says_so_and_one_that_was_carries_the_hour() {
+        // **`triage` and `triage_counts` both describe what is true NOW, and neither can say whether
+        // a run ever happened.** A run that flagged everything and whose answers have since gone
+        // stale empties both — identical, on the wire, to a project nobody ever pressed the button
+        // on. Those are different facts and only one of them is *nobody has looked at this with a
+        // model yet*, so the panel was left hedging over the gap.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "gate_command: x
+",
+        )
+        .await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        let before = get_json(&state, "/projects/alpha/map").await;
+        assert!(
+            before["last_triaged_at"].is_null(),
+            "never run is a real answer, and null is it: {before}"
+        );
+
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let after = get_json(&state, "/projects/alpha/map").await;
+        assert!(
+            after["last_triaged_at"]
+                .as_str()
+                .is_some_and(|when| !when.is_empty()),
+            "{after}"
+        );
     }
 
     #[tokio::test]

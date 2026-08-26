@@ -302,14 +302,37 @@ pub struct StampCounts {
     pub settled: usize,
     /// `M a meio`.
     pub partial: usize,
-    /// `K nunca vistas`. Debt, and it is supposed to be uncomfortable (§5.3, §10).
-    pub never: usize,
-    /// Stamps that stopped being true. Feeds §5.3's `J à tua espera`.
+    /// Every approved decision carrying no verdict of the owner's — **including the ones the triager
+    /// has flagged**, and therefore **no longer §5.3's `K nunca vistas`**.
     ///
-    /// **`J` is this number today and becomes a union tomorrow.** Slice 5's triager also puts
-    /// decisions in front of the owner, and those come out of [`StampCounts::never`], not out of
-    /// here. Written down because a header number whose definition grows quietly between two slices
-    /// is the disease this map is the cure for.
+    /// **Read [`crate::map_triage::TriageCounts::unseen`] for `K`.** Slice 5 moved the definition:
+    /// a flagged decision has arrived in front of the owner, so §5.3 puts it in `J` and takes it out
+    /// of `K` — *"o triador acrescenta-lhe as decisões que assinalar, que saem de `K`"* — and a
+    /// header printing this field beside a panel of flags would put one decision on two of its four
+    /// numbers, on the one line whose entire discipline is that it reconciles.
+    ///
+    /// **The sentence is here because the field went on meaning something true while stopping being
+    /// the number anybody wanted, which is the shape of defect this map exists to catch.** Nothing
+    /// broke, no test failed, and the panel reading it kept printing a header that no longer added
+    /// up. What this number is still exactly right for is the population `map_triage::reconcile`
+    /// walks and the denominator it checks itself against — `flagged + silenced + untriaged` — which
+    /// is why it stays on the wire rather than being removed.
+    ///
+    /// A silence, note, is **not** taken out of either: §5.1 is explicit that *silenciado* is *"o
+    /// triador não viu nada estranho. Ninguém olhou. Não é verde."*
+    pub never: usize,
+    /// Stamps of the owner's that stopped being true — **expired stamps only, and therefore no
+    /// longer §5.3's `J à tua espera`**.
+    ///
+    /// **Read [`crate::map_triage::TriageCounts::waiting`] for `J`.** The union this field's doc
+    /// predicted one slice ago has landed: `J` is `lapsed + flagged`, and the two halves reach the
+    /// owner for opposite reasons — a lapse is their own green gone stale, a flag is a model asking.
+    /// A panel printing this as the desk under-reports it by exactly the flags, which is the same
+    /// defect as [`StampCounts::never`] running the other way.
+    ///
+    /// It stays on the wire because it is the number a panel drawing the lapsed pile needs — that
+    /// pile is this and not `waiting` — and because `waiting` is checkable only against a `lapsed`
+    /// somebody else counted.
     pub lapsed: usize,
     /// Not in the header line. Withdrawn decisions still exist and their documents still lie —
     /// §5.2 wants them out of the way, not out of sight.
