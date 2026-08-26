@@ -1433,6 +1433,10 @@ async fn send_message_inner(
         cwd.as_deref().is_some_and(|dir| {
             crate::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
         }),
+        // Whether another conversation handed this turn over. `relay_id` is the fact, already in
+        // hand, and no walk is needed to read it — which is what makes this brake one line rather
+        // than the chain-depth rule the design weighed and did not take.
+        relay_id.is_some(),
     );
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
@@ -2020,9 +2024,10 @@ pub(crate) fn tool_policy_for(
     cwd: Option<&str>,
     origin: Origin,
     hook_is_wired: bool,
+    relayed: bool,
 ) -> crate::runner::ToolPolicy {
-    match (cwd, origin, hook_is_wired) {
-        (Some(_), Origin::Shell, true) => crate::runner::ToolPolicy::Unrestricted,
+    match (cwd, origin, hook_is_wired, relayed) {
+        (Some(_), Origin::Shell, true, false) => crate::runner::ToolPolicy::Unrestricted,
         _ => crate::runner::ToolPolicy::McpOnly,
     }
 }
@@ -4424,8 +4429,13 @@ mod tests {
         assert_eq!(outcome, Err(KILL_ENGAGED.to_string()));
     }
 
-    /// Every combination, because the rule's whole value is that the three conditions are AND-ed:
-    /// stated as three separate tests, a change that dropped one of them would leave two green.
+    /// Every combination, because the rule's whole value is that the conditions are AND-ed: stated
+    /// as separate tests, a change that dropped one of them would leave the others green.
+    ///
+    /// The table below is the ordinary-turn half — a message somebody typed — and every row of it
+    /// passes `false` for the fourth condition. The relayed half is
+    /// `a_relayed_turn_never_gets_the_tools_however_rooted_the_conversation_is`, below, which is
+    /// where that condition is actually exercised.
     #[test]
     fn only_a_rooted_conversation_spoken_to_from_the_machine_with_a_wired_hook_gets_the_tools() {
         use crate::runner::ToolPolicy;
@@ -4484,11 +4494,59 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                tool_policy_for(cwd, origin, wired),
+                tool_policy_for(cwd, origin, wired, false),
                 expected,
                 "{why}: cwd={cwd:?} origin={origin:?} wired={wired}"
             );
         }
+    }
+
+    /// A turn another conversation handed over never gets the CLI's tools, however rooted the
+    /// conversation receiving it happens to be.
+    ///
+    /// **This was decided by accident before it was decided on purpose, and in the permissive
+    /// direction.** A relay is DELIVERED with `Origin::Shell` — correctly, because it arrives
+    /// through this daemon and not from Telegram, and because the destination routes its brain on
+    /// that value — and the same value was the one this function read to hand out a filesystem. So
+    /// a relay into a rooted conversation with a wired hook collected the whole tool surface, and
+    /// nobody chose that.
+    ///
+    /// What makes it wrong is not that the tools are dangerous in themselves; it is who asked. A
+    /// person typing into a rooted conversation is pointing this machine at that repository, right
+    /// then. A relayed turn was composed by another conversation, for an owner who never saw the
+    /// words, in a repository they did not point anything at — and `MAX_RELAY_DEPTH` allows that
+    /// three times over from one thing somebody typed.
+    ///
+    /// Delegation is not lost, it is elsewhere: a team node has its own box (`TEAM_TOOLS`), chosen
+    /// deliberately and reviewed on its own terms. Granting it here as well would be a second,
+    /// weaker path to the same power, beside the one that already exists.
+    ///
+    /// Every row of the table above, re-run with the fourth condition true: the point is that NO
+    /// combination of the other three rescues it.
+    #[test]
+    fn a_relayed_turn_never_gets_the_tools_however_rooted_the_conversation_is() {
+        for cwd in [None, Some("C:/repo")] {
+            for origin in [Origin::Shell, Origin::Telegram] {
+                for wired in [true, false] {
+                    assert_eq!(
+                        tool_policy_for(cwd, origin, wired, true),
+                        crate::runner::ToolPolicy::McpOnly,
+                        "relayed: cwd={cwd:?} origin={origin:?} wired={wired}"
+                    );
+                }
+            }
+        }
+
+        // The one row that would otherwise have been `Unrestricted`, stated on its own so the
+        // difference this test exists for is legible without reading the loop above.
+        assert_eq!(
+            tool_policy_for(Some("C:/repo"), Origin::Shell, true, false),
+            crate::runner::ToolPolicy::Unrestricted
+        );
+        assert_eq!(
+            tool_policy_for(Some("C:/repo"), Origin::Shell, true, true),
+            crate::runner::ToolPolicy::McpOnly
+        );
     }
 
     /// The conversations that exist today have no root, and this is the line that says so out loud:
@@ -4498,7 +4556,7 @@ mod tests {
         for origin in [Origin::Shell, Origin::Telegram] {
             for wired in [true, false] {
                 assert_eq!(
-                    tool_policy_for(None, origin, wired),
+                    tool_policy_for(None, origin, wired, false),
                     crate::runner::ToolPolicy::McpOnly
                 );
             }
@@ -4575,7 +4633,8 @@ mod tests {
             tool_policy_for(
                 Some(dir),
                 Origin::Shell,
-                crate::autopilot::classifier_hook_is_wired(root.path())
+                crate::autopilot::classifier_hook_is_wired(root.path()),
+                false
             ),
             crate::runner::ToolPolicy::McpOnly,
         );
@@ -4586,7 +4645,8 @@ mod tests {
             tool_policy_for(
                 Some(dir),
                 Origin::Shell,
-                crate::autopilot::classifier_hook_is_wired(root.path())
+                crate::autopilot::classifier_hook_is_wired(root.path()),
+                false
             ),
             crate::runner::ToolPolicy::Unrestricted,
         );

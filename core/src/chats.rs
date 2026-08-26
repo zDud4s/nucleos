@@ -71,6 +71,16 @@ pub struct ChatSummary {
     /// watermark rather than stored, so it is right after a crash without anything having been
     /// written when the turn ended.
     pub waiting: i64,
+    /// How many of those came from ANOTHER conversation rather than from something you asked.
+    ///
+    /// A subset of `waiting`, never a separate axis: a relay still being written is not yet
+    /// something to come back to, for the same reason any other running turn is not.
+    ///
+    /// It exists because one number cannot say two things. "Your conversation answered you" and
+    /// "a different conversation pulled you into its subject" are different events, and the one you
+    /// did not start is the one worth a second glance — which is precisely the one a single count
+    /// disguised as the other.
+    pub relayed_waiting: i64,
 }
 
 /// Opens a conversation. The id is minted HERE, not accepted from the caller.
@@ -352,7 +362,16 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
                 (SELECT COUNT(*) FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                     AND r.status NOT IN ('running', 'pending')
-                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS waiting
+                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS waiting,
+                -- The same predicate, narrowed by the one column that says a turn was handed over
+                -- (0117). Written out rather than derived from `waiting` because SQLite has no way
+                -- to reuse a select-list alias in a sibling expression, and a subquery that
+                -- disagreed with the one above by a word would be a count nobody could reconcile.
+                (SELECT COUNT(*) FROM runs r
+                  WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
+                    AND r.status NOT IN ('running', 'pending')
+                    AND r.from_relay_id IS NOT NULL
+                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS relayed_waiting
            FROM chats c
           WHERE c.archived_at IS NULL
           ORDER BY COALESCE(last_activity, c.created_at) DESC",
@@ -708,6 +727,60 @@ mod tests {
 
     async fn waiting_in(pool: &SqlitePool, chat_id: &str) -> i64 {
         get(pool, chat_id).await.unwrap().unwrap().waiting
+    }
+
+    /// A relay that landed counts twice over: as something waiting, and as something ANOTHER
+    /// conversation put there.
+    ///
+    /// The sidebar has one number, and until now a relay was indistinguishable from an answer to
+    /// something you asked. They are not the same event: one is your own conversation coming back
+    /// to you, the other is a different conversation pulling you into its subject. A single count
+    /// makes the second look like the first, which is exactly backwards — the one you did not
+    /// start is the one worth a second glance.
+    ///
+    /// A subset of `waiting` and not a separate axis: both are unseen settled turns, so a relay
+    /// still being written is not yet something to come back to, for the same reason any other
+    /// running turn is not.
+    #[tokio::test]
+    async fn a_relay_that_landed_is_counted_apart_from_an_ordinary_answer() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        let relay_id: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('outra', ?, 1, 'vem de fora', 1, ?) RETURNING id",
+        )
+        .bind(&id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        turn_in(&pool, &id, "completed").await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, from_relay_id, created_at)
+             VALUES ('vem de fora', 'completed', 'assistant', ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(relay_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let summary = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(summary.waiting, 2, "both landed and neither has been seen");
+        assert_eq!(
+            summary.relayed_waiting, 1,
+            "only one of them came from another conversation"
+        );
+
+        mark_seen(&pool, &id).await.unwrap();
+        let summary = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(summary.waiting, 0);
+        assert_eq!(
+            summary.relayed_waiting, 0,
+            "opening the conversation clears both counts, not just the total"
+        );
     }
 
     #[tokio::test]
