@@ -35,6 +35,7 @@ pub struct Measured {
     /// Itens com run mas sem `tools_used` nem `num_turns` — entram na ocupação, ficam fora do
     /// ajuste.
     pub items_without_steps: usize,
+    pub rollups: Vec<AgentRollup>,
 }
 
 /// Uma linha por item planeado, com o que a sua run gastou — ou nada, se nunca correu.
@@ -150,6 +151,7 @@ pub async fn measure(pool: &SqlitePool, scope: Scope) -> sqlx::Result<Report> {
                     && steps_of(item.tools_used.as_deref(), item.num_turns).is_none()
             })
             .count(),
+        rollups: roll_up(&items),
     }))
 }
 
@@ -181,6 +183,100 @@ pub enum Fit {
         slope: f64,
         r2: f64,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentRollup {
+    pub round: i64,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub items: usize,
+    pub items_with_steps: usize,
+    pub compacted_items: usize,
+    pub peak_p50: Option<i64>,
+    pub peak_p90: Option<i64>,
+    pub steps_median: Option<i64>,
+    pub fit: Fit,
+}
+
+/// Uma linha por `(round, agent_id)`, na ordem dos rounds.
+///
+/// Aritmética e mais nada — não julga. Dois dos quatro veredictos não são propriedade de um rollup
+/// isolado: um compara o agente com os outros do mesmo round, outro compara-o consigo próprio
+/// noutros rounds. Quem julga recebe a fatia inteira, e chega a seguir.
+fn roll_up(items: &[Item]) -> Vec<AgentRollup> {
+    let mut order: Vec<(i64, String)> = Vec::new();
+    for item in items {
+        let key = (item.round, item.agent_id.clone());
+        if !order.contains(&key) {
+            order.push(key);
+        }
+    }
+    order
+        .into_iter()
+        .map(|(round, agent_id)| {
+            let group: Vec<&Item> = items
+                .iter()
+                .filter(|item| item.round == round && item.agent_id == agent_id)
+                .collect();
+            let mut peaks: Vec<i64> = group.iter().filter_map(|item| item.context_peak).collect();
+            peaks.sort_unstable();
+            let mut steps: Vec<i64> = group
+                .iter()
+                .filter_map(|item| steps_of(item.tools_used.as_deref(), item.num_turns))
+                .collect();
+            steps.sort_unstable();
+            // Só os itens que têm as DUAS coisas entram no ajuste: um ponto com um eixo em falta não
+            // é meio ponto, é nenhum.
+            let points: Vec<(f64, f64)> = group
+                .iter()
+                .filter_map(|item| {
+                    match (
+                        steps_of(item.tools_used.as_deref(), item.num_turns),
+                        item.context_peak,
+                    ) {
+                        (Some(steps), Some(peak)) => Some((steps as f64, peak as f64)),
+                        _ => None,
+                    }
+                })
+                .collect();
+            AgentRollup {
+                round,
+                agent_name: group
+                    .first()
+                    .map(|item| item.agent_name.clone())
+                    .unwrap_or_default(),
+                agent_id,
+                items: group.len(),
+                items_with_steps: steps.len(),
+                compacted_items: group.iter().filter(|item| item.compacted).count(),
+                peak_p50: percentile(&peaks, 0.5),
+                peak_p90: percentile(&peaks, 0.9),
+                steps_median: percentile(&steps, 0.5),
+                fit: fit(&points),
+            }
+        })
+        .collect()
+}
+
+/// Percentil por interpolação linear sobre os valores presentes, ordenados.
+///
+/// Escrito à mão e não trazido de uma dependência: são sete linhas e o repositório não tem nenhuma
+/// crate de estatística. Com dois valores o p50 é a média dos dois, e não o menor — as duas
+/// respostas são defensáveis e esta é a que está aqui.
+fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
+    if sorted.is_empty() {
+        // Nenhum valor não é o valor zero.
+        return None;
+    }
+    let rank = p * (sorted.len() - 1) as f64;
+    let low = rank.floor() as usize;
+    let high = rank.ceil() as usize;
+    if low == high {
+        return Some(sorted[low]);
+    }
+    let frac = rank - low as f64;
+    Some((sorted[low] as f64 + (sorted[high] - sorted[low]) as f64 * frac).round() as i64)
 }
 
 /// Mínimos quadrados a uma variável, com R² ao lado.
@@ -395,6 +491,69 @@ mod tests {
             m.items_without_run, 1,
             "não corridos contam-se; deitá-los fora seria dizer que a layer teve menos trabalho do que teve"
         );
+    }
+
+    /// Um `Item` com o que os testes de rollup precisam de dizer, e nada mais.
+    fn item(round: i64, agent: &str, peak: Option<i64>, compacted: bool, tools: usize) -> Item {
+        Item {
+            round,
+            agent_id: agent.to_string(),
+            agent_name: agent.to_string(),
+            run_id: Some(1),
+            context_peak: peak,
+            compacted,
+            // Uma lista com `tools` chamadas — o conteúdo não importa, o comprimento sim.
+            tools_used: Some(
+                serde_json::to_string(&vec![serde_json::json!({"name": "Bash"}); tools]).unwrap(),
+            ),
+            num_turns: None,
+        }
+    }
+
+    #[test]
+    fn a_rollup_keeps_rounds_apart() {
+        // O mesmo agente em dois rounds dá duas linhas, nunca uma soma. Somar apagaria a subida
+        // entre rounds, que é precisamente o terceiro veredicto.
+        let rollups = roll_up(&[
+            item(1, "Nucleo", Some(100_000), false, 10),
+            item(2, "Nucleo", Some(150_000), false, 10),
+        ]);
+        assert_eq!(rollups.len(), 2);
+        assert_eq!(rollups[0].round, 1);
+        assert_eq!(rollups[1].round, 2);
+    }
+
+    #[test]
+    fn percentiles_come_from_the_items_that_have_a_peak() {
+        let rollups = roll_up(&[
+            item(1, "Nucleo", Some(100_000), false, 5),
+            // Sem pico: conta para `items`, não para o p50.
+            item(1, "Nucleo", None, false, 5),
+            item(1, "Nucleo", Some(200_000), false, 5),
+        ]);
+        let r = &rollups[0];
+        assert_eq!(r.items, 3, "o item sem pico continua a ser um item da layer");
+        assert_eq!(r.peak_p50, Some(150_000), "mediana de [100k, 200k]");
+    }
+
+    #[test]
+    fn an_agent_with_no_peaks_at_all_has_no_percentiles() {
+        // Nenhum pico não é pico zero. Zero seria uma afirmação, e falsa.
+        let rollups = roll_up(&[item(1, "Nucleo", None, false, 5)]);
+        assert_eq!(rollups[0].peak_p50, None);
+        assert_eq!(rollups[0].peak_p90, None);
+    }
+
+    #[test]
+    fn compacted_items_are_counted_and_not_just_flagged() {
+        // O primeiro veredicto conta-os; saber que «algum» compactou não chega para o relatório
+        // dizer quantos dos quantos.
+        let rollups = roll_up(&[
+            item(1, "Nucleo", Some(100_000), true, 5),
+            item(1, "Nucleo", Some(100_000), false, 5),
+        ]);
+        assert_eq!(rollups[0].compacted_items, 1);
+        assert_eq!(rollups[0].items, 2);
     }
 
     #[test]
