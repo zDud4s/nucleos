@@ -33,7 +33,9 @@ import {
   useChatFiles,
   useChatProject,
   useDropQueued,
+  useForwardTurn,
   useLiveTurn,
+  useRelayChain,
   useLocalModel,
   usePatchChat,
   usePostChatSeen,
@@ -52,6 +54,7 @@ import {
   type ToolCall,
   type Turn,
 } from "../data/chats";
+import { type RelaySent } from "../lib/turns";
 import {
   anyTurnLive,
   marksBetween,
@@ -376,6 +379,11 @@ function chatRowLabel(row: ChatSummary, live: boolean): string {
   const parts = [row.title ?? row.first_message ?? "New conversation", row.brain];
   if (live) parts.push("thinking");
   if (row.waiting > 0) parts.push(`${row.waiting} unread`);
+  // Said out loud rather than left to the mark beside the number, which is `aria-hidden`. Somebody
+  // listening to this list has the same reason to treat the two differently as somebody looking at
+  // it: one is their own conversation answering, the other is a different one pulling them in.
+  const relayed = row.relayed_waiting ?? 0;
+  if (relayed > 0) parts.push(`${relayed} from another conversation`);
   return parts.join(", ");
 }
 
@@ -393,7 +401,22 @@ function ChatRow({ row, active, live }: { row: ChatSummary; active: boolean; liv
         {row.cwd !== null && <span className="chats-row-cwd">{row.cwd}</span>}
         {live && <span className="chats-row-live">thinking…</span>}
         {row.waiting > 0 && (
-          <span className="chats-row-unread" aria-hidden="true">
+          <span
+            className={
+              (row.relayed_waiting ?? 0) > 0
+                ? "chats-row-unread chats-row-unread-relayed"
+                : "chats-row-unread"
+            }
+            aria-hidden="true"
+            /* The count stays the total. A second number beside it would make a person add two
+               figures to learn one thing; the mark says "some of these came from elsewhere", and
+               the conversation itself says which. */
+            title={
+              (row.relayed_waiting ?? 0) > 0
+                ? `${row.relayed_waiting} handed over by another conversation`
+                : undefined
+            }
+          >
             {row.waiting}
           </span>
         )}
@@ -1507,7 +1530,7 @@ function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
-      <WhoAsked relayedFrom={turn.relayedFrom} />
+      <WhoAsked relayedFrom={turn.relayedFrom} chatId={chatId} turnId={turn.id} />
       {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
           Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
           message they did not send. */}
@@ -1527,6 +1550,8 @@ function TurnBlock({
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">no answer recorded</p>
       )}
+      {!live && <RelaySentNote sent={turn.relayedTo} />}
+      {!live && <ForwardTurn chatId={chatId} turn={turn} />}
       <div className="chats-turn-foot">
         {/* Money only. The daemon's turn rows carry no token breakdown — see `CostLineProps`. */}
         <CostLine costUsd={turn.cost_usd} />
@@ -1898,15 +1923,179 @@ function WhatItDid({ did }: { did: ToolCall[] }) {
  * described rather than identified: most chats carry no title until the daemon has summarised one,
  * and printing a uuid at a person answers a question nobody asked — the link still goes there.
  */
-function WhoAsked({ relayedFrom }: { relayedFrom: RelayedFrom | null }) {
+function WhoAsked({
+  relayedFrom,
+  chatId,
+  turnId,
+}: {
+  relayedFrom: RelayedFrom | null;
+  chatId: string;
+  turnId: number;
+}) {
   if (relayedFrom === null) return <p className="chats-turn-who">you</p>;
   return (
     <p className="chats-turn-who chats-turn-who-relayed">
       <Link className="chats-turn-relayed-from" to={`/chats/${relayedFrom.chatId}`}>
         {relayedFrom.title ?? "an unnamed conversation"}
       </Link>{" "}
-      handed this over
+      handed this over <RelayChain chatId={chatId} turnId={turnId} />
     </p>
+  );
+}
+
+/**
+ * What this turn handed to another conversation.
+ *
+ * Drawn from what the daemon WROTE, not from the tool call the model made — the two part company
+ * every time a relay is refused, and a sender's transcript built from the asks would show messages
+ * that never arrived. An empty list is the ordinary case and draws nothing.
+ *
+ * The words are shown, not just the destination. "Sent something to «planning»" is the shape that
+ * makes somebody open the other conversation to find out what; the point of putting this here at
+ * all is that they should not have to.
+ */
+function RelaySentNote({ sent }: { sent: RelaySent[] }) {
+  if (sent.length === 0) return null;
+  return (
+    <ul className="chats-relay-sent" aria-label="Handed to other conversations">
+      {sent.map((relay, index) => (
+        <li key={index} className="chats-relay-sent-item">
+          <span className="chats-relay-sent-to">
+            {"handed to "}
+            <Link className="chats-turn-relayed-from" to={`/chats/${relay.chat_id}`}>
+              {relay.title ?? "an unnamed conversation"}
+            </Link>
+          </span>
+          <span className="chats-relay-sent-body">{relay.body}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The whole path a relayed turn travelled, opened on demand.
+ *
+ * Behind a button rather than always drawn, and fetched only once opened: with three hops allowed,
+ * "B spoke to me" hides that A began it — but that is a question somebody asks occasionally, and
+ * the transcript around it is re-read every second and a half.
+ *
+ * The conversation being read is the last step of its own chain, and is drawn like the rest. It is
+ * where the path ENDS, and a path drawn without its destination is one you have to hold the missing
+ * end of in your head.
+ */
+function RelayChain({ chatId, turnId }: { chatId: string; turnId: number }) {
+  const [open, setOpen] = useState(false);
+  const chain = useRelayChain(chatId, turnId, open);
+
+  return (
+    <span className="chats-relay-chain">
+      <button
+        type="button"
+        className="chats-relay-chain-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((was) => !was)}
+      >
+        {open ? "hide the path" : "where did this start?"}
+      </button>
+      {open && chain.data !== undefined && (
+        <ol className="chats-relay-chain-steps" aria-label="The path this turn travelled">
+          {chain.data.chain.map((step) => (
+            <li key={step.chat_id}>
+              <Link className="chats-turn-relayed-from" to={`/chats/${step.chat_id}`}>
+                {step.title ?? "an unnamed conversation"}
+              </Link>
+            </li>
+          ))}
+        </ol>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Hands this turn to another conversation.
+ *
+ * The gesture the model already had and the person did not: `send_to_chat` is on the model's tool
+ * list and there was no button anywhere that did the same thing.
+ *
+ * The text starts as what the turn answered and stays editable, because forwarding is rarely
+ * verbatim — the useful version is usually "look at this, and here is why". What travels is what is
+ * in the box when it is sent, never what the box was filled with.
+ *
+ * A turn with no answer offers nothing to forward. Drawing the button anyway would put an empty
+ * message one click away, and an empty relay is a turn started in another conversation about
+ * nothing.
+ */
+function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const chats = useChats();
+  const forward = useForwardTurn();
+
+  if (turn.answer === null) return null;
+
+  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId);
+
+  return (
+    <div className="chats-forward">
+      <button
+        type="button"
+        className="chats-forward-open"
+        aria-expanded={open}
+        onClick={() => {
+          setText(turn.answer ?? "");
+          setOpen((was) => !was);
+        }}
+      >
+        {open ? "cancel" : "hand to another conversation"}
+      </button>
+      {open && (
+        <div className="chats-forward-panel">
+          <label className="chats-forward-label" htmlFor={`forward-${turn.id}`}>
+            What to send
+          </label>
+          <textarea
+            id={`forward-${turn.id}`}
+            className="chats-forward-text"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+          />
+          {elsewhere.length === 0 && (
+            <p className="chats-forward-empty">there is no other conversation to hand this to.</p>
+          )}
+          <ul className="chats-forward-targets" aria-label="Hand it to">
+            {elsewhere.map((row) => (
+              <li key={row.chat_id}>
+                <button
+                  type="button"
+                  className="chats-forward-target"
+                  disabled={forward.isPending || text.trim() === ""}
+                  onClick={() => {
+                    forward.mutate(
+                      { toChatId: row.chat_id, fromTurnId: turn.id, text },
+                      { onSuccess: () => setOpen(false) },
+                    );
+                  }}
+                >
+                  {row.title ?? row.first_message ?? "New conversation"}
+                </button>
+              </li>
+            ))}
+          </ul>
+          {/* The daemon's own word for why, not a sentence this side invented: `relay_cycle`,
+              `relay_too_deep`, `owner_away`. A refusal shown as "something went wrong" is one
+              nobody can act on, and each of these has a different answer. */}
+          {forward.isError && (
+            <p className="chats-forward-refused" role="status">
+              {isApiRefusal(forward.error)
+                ? (MESSAGE_SENTENCES[forward.error.code] ?? forward.error.code)
+                : "could not hand it over"}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1944,6 +2133,17 @@ const MESSAGE_SENTENCES: Record<string, string> = {
   kill_switch: "the kill switch is engaged; nothing autonomous starts until it is released, and this cannot be sent either",
   no_local_model: "no local model is available on this machine, and this conversation is set to answer locally",
   errand_not_answering: "the errand behind this conversation is not answering right now",
+  // The relay's own refusals. Each has a different answer, which is why they are sentences here
+  // rather than one "something went wrong": a cycle is a different conversation to pick, a chain
+  // too deep is nothing you can fix from this window, and an absent owner clears by itself.
+  no_such_destination: "that conversation no longer exists, or was archived",
+  relay_to_self: "this is the conversation you are already in",
+  relay_cycle: "that conversation already handed this one a message — passing it back would go in circles",
+  relay_too_deep: "this has already been handed on as far as it goes",
+  owner_away: "nothing is handed over while nobody is at the machine to see it arrive",
+  telegram_origin: "a turn that arrived from Telegram cannot be handed to another conversation",
+  unknown_origin: "this turn does not record where it came from, so it cannot be handed on",
+  unknown_sender: "the turn being handed over could not be found",
 };
 
 /**

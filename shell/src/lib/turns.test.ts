@@ -30,6 +30,7 @@ function row(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     context_rotates_at: 140000,
     relayed_from_chat_id: null,
     relayed_from_title: null,
+    relayed_to: [],
     ...overrides,
   };
 }
@@ -50,6 +51,7 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     contextFill: null,
     rotatesAt: 140000,
     relayedFrom: null,
+    relayedTo: [],
     ...overrides,
   };
 }

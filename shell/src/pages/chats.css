@@ -1459,3 +1459,148 @@
   font-size: var(--text-xs);
   cursor: pointer;
 }
+
+/* ============================================================== relays == */
+
+/* Some of what is waiting came from a different conversation. The count stays the total — a second
+   number beside it would make somebody add two figures to learn one thing — and this says "not all
+   of these are yours" without spending a digit on it. */
+.chats-row-unread-relayed {
+  background: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+}
+
+/* What a turn handed to another conversation, under the answer that did it. */
+.chats-relay-sent {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2);
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  border-left: 2px solid var(--tone-info-fg);
+  background: var(--surface-sunken);
+  border-radius: var(--radius-sm);
+}
+
+.chats-relay-sent-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chats-relay-sent-to {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* The words that travelled, whole. Shortening them here would make somebody open the other
+   conversation to find out what was sent, which is the errand this note exists to spare them. */
+.chats-relay-sent-body {
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chats-relay-chain {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+}
+
+.chats-relay-chain-toggle {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* Numbered, because the order IS the fact: root first, ending at the conversation being read. */
+.chats-relay-chain-steps {
+  display: inline-flex;
+  gap: var(--space-2);
+  margin: 0;
+  padding-left: var(--space-3);
+  font-size: var(--text-xs);
+}
+
+.chats-forward {
+  margin-top: var(--space-2);
+}
+
+.chats-forward-open {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.chats-forward-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.chats-forward-label {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-forward-text {
+  min-height: 4rem;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+
+.chats-forward-targets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chats-forward-target {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-raised);
+  color: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.chats-forward-target:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.chats-forward-empty,
+.chats-forward-refused {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-forward-refused {
+  color: var(--tone-danger-fg);
+}

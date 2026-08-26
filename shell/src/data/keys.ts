@@ -168,6 +168,14 @@ export const keys = {
     /** Keyed by the query too: each keystroke is a different question, and its own cached answer. */
     files: (chatId: string, query: string) => ["chats", "files", chatId, query] as const,
     commands: (chatId: string, query: string) => ["chats", "commands", chatId, query] as const,
+    /**
+     * The whole path one relayed turn travelled.
+     *
+     * Keyed by the turn and not by the chat: a chain is a property of the turn,
+     * and two relayed turns of one conversation came from different places.
+     */
+    relayChain: (chatId: string, turnId: number) =>
+      ["chats", "relay-chain", chatId, turnId] as const,
   },
 
   council: {

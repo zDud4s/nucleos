@@ -114,6 +114,27 @@ export interface AssistantTurnRow {
   relayed_from_chat_id?: string | null;
   /** What that conversation is called, or null when nobody has named it. */
   relayed_from_title?: string | null;
+  /**
+   * The relays this turn SENT. Empty on almost every turn.
+   *
+   * Optional on the wire for the reason the two above are: a daemon older than
+   * the column sends no such key.
+   */
+  relayed_to?: RelaySent[];
+}
+
+/**
+ * One relay a turn sent: where it went, and what it said.
+ *
+ * `body` is what the daemon actually wrote down, not what the model asked for.
+ * The two differ every time a relay is refused, and a sender's transcript built
+ * from the asks would show messages that never arrived.
+ */
+export interface RelaySent {
+  chat_id: string;
+  /** Null on a conversation nobody has named yet. */
+  title: string | null;
+  body: string;
 }
 
 /** Where a turn's words came from, when it was not the person reading them. */
@@ -168,6 +189,14 @@ export interface Turn {
    * conversation, which is exactly the case a between-turns rule would miss.
    */
   relayedFrom: RelayedFrom | null;
+  /**
+   * The relays this turn sent, oldest first.
+   *
+   * The mirror of `relayedFrom`, and it exists because that side shipped alone:
+   * the conversation certain to be watched by the person who caused a relay was
+   * the one that could not say what it had done.
+   */
+  relayedTo: RelaySent[];
 }
 
 /** Whether a turn's status means the daemon is still working it. */
@@ -226,6 +255,9 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
       row.relayed_from_chat_id === undefined || row.relayed_from_chat_id === null
         ? null
         : { chatId: row.relayed_from_chat_id, title: row.relayed_from_title ?? null },
+    // Defaulted for the reason `did` and `images` are: a daemon older than the column sends no
+    // such key, and a turn drawn without the note beats a page that refuses to draw the turn.
+    relayedTo: row.relayed_to ?? [],
   };
 }
 

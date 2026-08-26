@@ -47,6 +47,14 @@ export interface ChatSummary {
   last_activity: string | null;
   /** Answers landed since this conversation was last opened. */
   waiting: number;
+  /**
+   * How many of those another conversation put there rather than something you
+   * asked. A subset of `waiting`, never a separate axis.
+   *
+   * Optional because a daemon older than the column sends no such key — and it
+   * reads as zero, which is the honest answer for a daemon with no relays.
+   */
+  relayed_waiting?: number;
 }
 
 /**
@@ -394,6 +402,77 @@ export function useIdeSessions(enabled: boolean, watch = false) {
  * that project's hook — and both of those are mutations in this window that invalidate it. A timer
  * would be re-stating a filesystem to itself.
  */
+/** One conversation on a relayed turn's path. */
+export interface ChainStep {
+  chat_id: string;
+  /** Null on a conversation nobody has named yet. */
+  title: string | null;
+}
+
+/**
+ * The whole path a relayed turn travelled, root first — including the
+ * conversation reading it.
+ *
+ * `enabled` because this is asked on hover and never on load: the transcript is
+ * polled every second and a half while a turn is live, and a chain is read when
+ * somebody actually wants one. Fetching it for every relayed turn on every poll
+ * would pay a query per turn to answer a question almost nobody asks.
+ *
+ * `staleTime: Infinity` because a chain cannot change. It is the history of one
+ * turn, and history does not get rewritten — so once fetched, hovering again
+ * costs nothing.
+ */
+export function useRelayChain(chatId: string, turnId: number, enabled: boolean) {
+  return useQuery({
+    queryKey: keys.chats.relayChain(chatId, turnId),
+    queryFn: () =>
+      apiFetch<{ chain: ChainStep[] }>(
+        `/assistant/chats/${encodeURIComponent(chatId)}/turns/${turnId}/chain`,
+      ),
+    enabled,
+    staleTime: Infinity,
+  });
+}
+
+/**
+ * Hands a turn to another conversation, as the person rather than as the model.
+ *
+ * `chatId` is the DESTINATION, matching the daemon's route and every other
+ * `/assistant/chats/{id}/...` call in this file. The source is derived from the
+ * turn, because a turn belongs to exactly one conversation and sending it twice
+ * would be inviting the two to disagree.
+ *
+ * Both sides are invalidated on success and neither is optimistic. The
+ * destination gains a turn this window did not write and cannot predict the id
+ * of; the sender gains a `relayed_to` entry only if the daemon actually admitted
+ * the hop, which it may not — a cycle, a chain too deep, an owner who has walked
+ * away. Drawing either before the answer would be drawing a message that may
+ * never have left.
+ */
+export function useForwardTurn() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      toChatId,
+      fromTurnId,
+      text,
+    }: {
+      toChatId: string;
+      fromTurnId: number;
+      text: string;
+    }) =>
+      apiFetch<{ turn_id?: number; queued?: boolean }>(
+        `/assistant/chats/${encodeURIComponent(toChatId)}/forward`,
+        { method: "POST", body: JSON.stringify({ from_turn_id: fromTurnId, text }) },
+      ),
+    retry: false,
+    onSuccess: (_result, { toChatId }) => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(toChatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
 export function useChatProject(chatId: string) {
   return useQuery({
     queryKey: keys.chats.project(chatId),
@@ -502,6 +581,9 @@ export function useSendMessage(chatId: string) {
         // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],
+        // Nothing has been relayed by a turn that has not started. The daemon's own read replaces
+        // this the moment one is.
+        relayedTo: [],
         // Null, and it can be nothing else here: this optimistic row exists because the PERSON at
         // this window just sent the message. A relayed turn is never drawn this way — it is born in
         // another conversation and reaches this one through the daemon's own read.
