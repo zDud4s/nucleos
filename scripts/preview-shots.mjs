@@ -224,13 +224,19 @@ await mkdir(SHOTS, { recursive: true });
  * that reads well above the fold and falls apart below it is exactly the defect
  * a viewport-sized screenshot hides.
  */
-async function shoot(name, { path, tab, theme = "dark" }) {
+async function shoot(name, { path, tab, press, theme = "dark" }) {
   await send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-color-scheme", value: theme }],
   }, sessionId);
 
   pageErrors.length = 0;
-  const query = new URLSearchParams({ path, ...(tab === undefined ? {} : { tab }) });
+  const query = new URLSearchParams({
+    path,
+    ...(tab === undefined ? {} : { tab }),
+    /* The label of a button to click once the page has settled — how a surface
+       that opens from a control gets photographed at all. See `preview/main.tsx`. */
+    ...(press === undefined ? {} : { press }),
+  });
   await send("Page.navigate", { url: `${origin}/preview.html?${query}` }, sessionId);
 
   const deadline = Date.now() + READY_TIMEOUT;
@@ -306,6 +312,14 @@ const SHOTS_TO_TAKE = [
   ["07-bench-no-ceiling", { path: "/teams/seguranca", tab: "Routines" }],
   ["08-bench-empty", { path: "/teams/operacoes", tab: "Charter" }],
   ["09-bench-charter-light", { path: "/teams/financas", tab: "Charter", theme: "light" }],
+  ["10-catalogue-dark", { path: "/agents" }],
+  ["11-catalogue-light", { path: "/agents", theme: "light" }],
+  /* The editor, which is the half of the page that is not on screen at rest —
+     and the row it opens from is the renamed one, so the shot carries the two
+     things this page exists for at once. */
+  ["12-catalogue-editor", { path: "/agents", press: "Auditor Sénior" }],
+  ["13-catalogue-editor-light", { path: "/agents", press: "Auditor Sénior", theme: "light" }],
+  ["14-catalogue-new", { path: "/agents", press: "New agent" }],
 ];
 
 let clean = true;

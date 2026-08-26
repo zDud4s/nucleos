@@ -1,3 +1,4 @@
+import type { Agent } from "../data/agents";
 import type { BudgetView } from "../data/system";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 
@@ -114,7 +115,13 @@ export const TEAMS: TeamView[] = [
     name: "Informática",
     mission: "Keep the machines patched and the backups restorable, and prove the second one.",
     director_agent_id: "sysadmin",
-    members: ["sysadmin", "reviewer", "researcher"],
+    /* `closer` directs Vendas and serves here: until this line no director in
+       the fixture served a second department, so two things were never drawn.
+       `Who`'s accent ring and dashed outline together — leading one place and
+       shared with another — and the catalogue's employment column showing both
+       of its marks at once, which is the only case where `◉ 1 ● 1` means two
+       departments rather than one counted twice. */
+    members: ["sysadmin", "reviewer", "researcher", "closer"],
     grants: [{ kind: "file_document", mode: "allow" }],
     max_rounds: 3,
     max_parallel: 4,
@@ -372,29 +379,144 @@ export const RECRUITS = [
 
 /* ------------------------------------------------------------- the agents -- */
 
-const NAMES = [
-  "controller",
-  "auditor",
-  "researcher",
-  "reviewer",
-  "editor",
-  "writer",
-  "closer",
-  "analyst",
-  "sysadmin",
-];
+/**
+ * The catalogue, pinned to the app's own type.
+ *
+ * It was nine copies of one row built by `NAMES.map` into an untyped object,
+ * and every part of it that mattered was wrong: `speciality: ""` on all nine
+ * when `agent::validate` refuses an empty one, `prompt: ""` likewise, and
+ * `tool_policy: "read_only"` — a value the daemon has never accepted. `tsc`
+ * never saw any of it, because the array went into `answer`'s `unknown` return
+ * with nothing on the way to check it. That is precisely the drift the note on
+ * the budget fixture below warns about, and the fix is the same one: a builder
+ * that returns `Agent`, so a field renamed in the núcleo breaks the build.
+ *
+ * The ids are load-bearing — `TEAMS` above points at them — so they stay as
+ * they were. Awkward on purpose, as the header asks: a renamed agent whose id
+ * no longer matches, four rows with no model of their own, a `local` engine, an
+ * agent with no tools, two nobody employs, and a name long enough to test the
+ * column.
+ */
+function agent(overrides: Partial<Agent>): Agent {
+  return {
+    id: "x",
+    name: "x",
+    speciality: "",
+    prompt: "",
+    engine: "claude",
+    model: null,
+    tool_policy: "mcp_only",
+    created_at: ago(90 * DAY),
+    updated_at: ago(30 * DAY),
+    ...overrides,
+  };
+}
 
-export const AGENTS = NAMES.map((name) => ({
-  id: name,
-  name,
-  speciality: "",
-  prompt: "",
-  engine: "claude",
-  model: null,
-  tool_policy: "read_only",
-  created_at: ago(90 * DAY),
-  updated_at: ago(90 * DAY),
-}));
+export const AGENTS: Agent[] = [
+  agent({
+    id: "controller",
+    name: "controller",
+    speciality: "Runs the books: reconciles the ledger and decides what is worth chasing.",
+    prompt: "You are the controller. Reconcile first, judge second, and never guess at a figure.",
+    model: "claude-opus-5",
+    updated_at: ago(3 * DAY),
+  }),
+  /* Renamed after it was created, which is the permanent state of the id and the
+     name disagreeing — and the one fact only this page can show. */
+  agent({
+    id: "auditor",
+    name: "Auditor Sénior",
+    speciality: "Checks the controller's work and says so plainly when it does not add up.",
+    prompt: "You audit. Assume the number is wrong until the second source agrees with it.",
+    updated_at: ago(11 * DAY),
+  }),
+  agent({
+    id: "researcher",
+    name: "researcher",
+    speciality: "Goes and finds the thing nobody has bothered to look up yet.",
+    prompt: "You research. Cite where each claim came from, or do not make it.",
+    model: "claude-sonnet-5",
+    updated_at: ago(21 * DAY),
+  }),
+  /* No tools at all — a policy that decides what the agent can do, and reads as
+     decoration until something says so. */
+  agent({
+    id: "reviewer",
+    name: "reviewer",
+    speciality: "Reads what the others wrote and refuses it when it is not ready.",
+    prompt: "You review. Be specific about what is wrong and where.",
+    model: "claude-sonnet-5",
+    tool_policy: "none",
+    updated_at: ago(6 * DAY),
+  }),
+  agent({
+    id: "editor",
+    name: "editor",
+    speciality:
+      "Keeps everything that goes out sounding like one company rather than eleven, and cuts what does not earn its line.",
+    prompt: "You edit. Shorter, and in the house voice.",
+    model: "claude-opus-5",
+    updated_at: ago(2 * DAY),
+  }),
+  agent({
+    id: "writer",
+    name: "writer",
+    speciality: "Writes the first draft so somebody has something to argue with.",
+    prompt: "You write drafts. Plain sentences, no throat-clearing.",
+    engine: "codex",
+    model: "gpt-5-codex",
+    updated_at: ago(14 * DAY),
+  }),
+  agent({
+    id: "closer",
+    name: "closer",
+    speciality: "Answers the people who wrote in, and remembers what was promised to whom.",
+    prompt: "You close. Never promise a date the team has not agreed to.",
+    updated_at: ago(9 * DAY),
+  }),
+  /* Runs on this machine, which is the one engine that spends nothing. */
+  agent({
+    id: "analyst",
+    name: "analyst",
+    speciality: "Reads what the scanners say and decides which of it is actually true.",
+    prompt: "You triage findings. A false positive costs more than a slow answer.",
+    engine: "local",
+    model: "qwen3-coder:30b",
+    updated_at: ago(4 * DAY),
+  }),
+  /* A policy this shell has no reading for. The daemon cannot send one today —
+     `validate` takes `mcp_only` and `none` and nothing else — which is exactly
+     why it is here: the arm that says so is otherwise unreachable, and an
+     unreachable arm is one nobody has ever looked at. */
+  agent({
+    id: "sysadmin",
+    name: "sysadmin",
+    speciality: "Keeps the machines patched and the backups restorable, and proves the second one.",
+    prompt: "You operate. Change one thing at a time and write down what you changed.",
+    model: "claude-sonnet-5",
+    tool_policy: "read_only",
+    updated_at: ago(30 * DAY),
+  }),
+  /* Nobody employs this one, and nothing else in the app would ever say so. */
+  agent({
+    id: "tradutor",
+    name: "tradutor",
+    speciality: "Translates between pt-PT and en-GB without flattening either.",
+    prompt: "You translate. Keep the register, not just the words.",
+    model: "claude-haiku-4-5",
+    updated_at: ago(66 * DAY),
+  }),
+  /* A long name, renamed, on nobody's roster: the row that tells you whether the
+     column widths were chosen or merely happened. */
+  agent({
+    id: "revisor-de-contratos",
+    name: "Revisor de contratos, cláusulas e anexos",
+    speciality:
+      "Reads a contract end to end and lists what changed since the last version, including the annexes nobody opens.",
+    prompt: "You review contracts. Quote the clause, then say what it now means.",
+    updated_at: ago(48 * DAY),
+  }),
+];
 
 /* ------------------------------------------------------------- the router -- */
 
