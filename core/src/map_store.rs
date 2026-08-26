@@ -225,21 +225,6 @@ pub async fn decide(
     Ok(result.rows_affected() > 0)
 }
 
-// This is a bin-only crate, so dead-code reachability starts at `main`, and nothing in production
-// reaches the two functions below yet: their caller is `POST /projects/{id}/map/stamps`, which lands
-// with the rest of the route work. Every previous slice of this map landed its store and its handler
-// together and so needed none of this; this one splits them, because the table and the reader are
-// what the next tasks are built on and a store nobody can review until the HTTP is written is a
-// store nobody reviews. Measured rather than assumed: the suppression sits on the two entry points
-// and on nothing else, and with it in place the compiler names no other item — `Stamp`, `StampRow`
-// and `stamp_from_row` stay reachable *through* them, so one of the three going unused would still
-// say so. The instruction, not a description: DELETE BOTH ATTRIBUTES with the change adding the
-// route.
-//
-// Scoped to the non-test build, the way `contacts.rs` and `errands.rs` scope theirs. Under
-// `cfg(test)` the lint stays live — this module's own tests exercise both — so one that stops being
-// exercised there warns rather than going quiet.
-
 /// One stamp, as it sits in the table.
 ///
 /// No `id` and no `project_id`, and neither is an omission. The id is never needed by a caller,
@@ -293,7 +278,6 @@ pub struct Stamp {
 /// failure of this daemon. An `Err`, by contrast, is the table refusing the row itself — an amber
 /// with no note is the case that exists today — and that one is a bug in the caller, so it is not
 /// flattened into `false` where it would look like a missing decision.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn stamp(
     pool: &sqlx::SqlitePool,
     project_id: &str,
@@ -368,7 +352,6 @@ fn stamp_from_row(
 /// whichever plan SQLite happened to choose — so a decision's verdict could change between two reads
 /// with nothing having happened, which is the portrait this map refuses to be. `id DESC` breaks it
 /// on insertion order, which is the order the owner actually stamped in.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn stamps(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Stamp>> {
     let rows = sqlx::query_as::<_, StampRow>(
         "SELECT s.decision_id, s.verdict, s.stamped_at, s.code_digest, s.note

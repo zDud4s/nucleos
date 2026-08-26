@@ -210,11 +210,23 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // `map/decisions` is the pile nobody has read yet: sentences a model lifted out of a document
     // already sitting in that project's folder. A reader who reaches `map` and `cat` can read the
     // spec they came from whole, so the extract of it grants nothing they did not already have.
-    // Only the GET. `POST /projects/{id}/map/extract` and `POST /projects/{id}/map/decisions/{n}`
-    // are in NO table, here or in `RUN_CREATING_ROUTES`, which leaves them to Admin and the control
-    // token by default-deny — and both belong there. Extracting spends a model, which a read-only
-    // key never bought; approving is the owner's stamp, and it is the act that puts a line in the
-    // map. Neither is a read, and neither is a thing done on the owner's behalf by a weaker key.
+    // Only the GET. `POST /projects/{id}/map/extract`, `POST /projects/{id}/map/decisions/{n}` and
+    // `POST /projects/{id}/map/stamps` are in NO table, here or in `RUN_CREATING_ROUTES`, which
+    // leaves them to Admin and the control token by default-deny — and all three belong there.
+    // Extracting spends a model, which a read-only key never bought; approving is what puts a line
+    // in the map. Neither is a read, and neither is a thing done on the owner's behalf by a weaker
+    // key.
+    //
+    // The third has the sharpest claim of the three, and it is worth writing down because the
+    // absence of a row is the entire enforcement and an absence explains nothing to whoever reads
+    // this next. A stamp is the owner's VERDICT — *está como quero* — and §6 of the map spec takes
+    // that one act away from the model on purpose: the model may compress a spec and may say a node
+    // deserves a look, and may never put anything green. §6.1 gives the reason in one sentence:
+    // returning that authority "pela porta da renderização" turns the map back into false confidence,
+    // now carrying the authority of a traffic light. A read-only key writing one would be that same
+    // door with a different handle — an automated caller minting the owner's answer, on the one
+    // question this whole feature exists because only they can answer. Every other write here is a
+    // thing the owner could have done themselves in a moment; this one is the moment.
     //
     // `map/specs` is the list of filenames a reader can already see through `ls` — it names
     // nothing `cat` could not already show. Naming them here is what lets the extraction button

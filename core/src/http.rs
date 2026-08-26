@@ -114,6 +114,18 @@ pub fn build_router(state: AppState) -> Router {
             "/projects/{id}/map/decisions/{decision}",
             post(post_project_map_decision),
         )
+        // The owner's verdict on one decision (§5.2). In no table in `auth.rs` for the sharpest
+        // reason of the three POSTs here: §6 takes the green away from the model on purpose, and
+        // §6.1 says handing that authority back through any other door turns the map into false
+        // confidence with the authority of a traffic light. A read-only key writing one would be
+        // that door.
+        //
+        // The id is in the body and not in the path, unlike `decisions/{decision}` above. The two
+        // are different acts: that one answers a line that is in front of the owner right now and is
+        // addressed by where it sits in the pile, while a stamp is a new row about a decision that
+        // is already in the map — §9.2's *acrescenta uma linha, nunca substitui* — and it carries a
+        // verdict and a note that have to travel in a body regardless.
+        .route("/projects/{id}/map/stamps", post(post_project_map_stamp))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -2933,16 +2945,50 @@ struct MapAnswer {
     #[serde(flatten)]
     structure: crate::project_map::Structure,
     junction: crate::map_join::Junction,
+    /// Where each decision stands, by `decision_id`.
+    ///
+    /// **A map and never a parallel array.** Two arrays that must stay index-aligned is a bug
+    /// waiting for the first re-sort, and [`crate::map_join::join`] says out loud that its order is
+    /// deterministic rather than final — §10 wants a different one, by recency of the anchor code's
+    /// last change. Keyed by id, the client survives that change; keyed by position it would draw
+    /// one decision's verdict against another's text, and nothing on the screen would look wrong.
+    standings: std::collections::BTreeMap<i64, crate::map_stamp::Standing>,
+    /// §5.3's header, tallied from exactly the standings above.
+    stamps: crate::map_stamp::StampCounts,
+    /// **One fact about this whole reading, and never a fact about any single decision.**
+    ///
+    /// `map_stamp::digest` is all-or-nothing on purpose — one record it cannot parse takes the
+    /// entire call to `None`, because dropping an anchor would read as `gone`, a file that never
+    /// went anywhere. Correct for one anchor set; combined with this route calling it **once** for
+    /// the union of every decision's anchors, it means a git that will not answer takes every
+    /// settled stamp in the project to [`crate::map_stamp::Lapse::Unreadable`] at the same instant.
+    ///
+    /// That blast radius is accepted — the alternative is up to 350 process spawns on a route the
+    /// window calls every time the map opens — and this flag is the price of accepting it. The
+    /// owner meets one sentence saying git could not be read, rather than a screen of identical
+    /// rows saying it 350 times, which is a wall of noise nobody reads to the bottom of and is how
+    /// the one real lapse underneath it goes unseen.
+    ///
+    /// Named in the plural and about *anchors* rather than about a digest, because the singular
+    /// would read as a property of the decision beside it. A decision with no anchor paths is
+    /// untouched by this: git was never asked about it, so its digest is `""` however git is
+    /// faring, and it stays [`crate::map_stamp::Watch::NoAnchor`] rather than flapping to
+    /// *unreadable* every time this flag goes up.
+    anchors_unreadable: bool,
 }
 
 /// The project's whole graph: modules, imports, and what the approved decisions do or do not
 /// anchor to.
 ///
-/// Derived on every request and never stored — decision 1 of the spec. It goes to disk, so it
-/// runs on `spawn_blocking` the way `blame` and `grep` already do: walking a thousand-file
-/// tree on the async executor blocks the whole daemon for a good few milliseconds, and this
-/// daemon is also answering a three-second poll. `specs_in` walks directories too and rides the
-/// same hop, since the thread already has the root in hand.
+/// Derived on every request and never stored — decision 1 of the spec. The walk and the join are
+/// [`project_junction`], which the stamp route shares; the digest, the standings and §5.3's header
+/// are this route's own.
+///
+/// **The verdict axis arrives beside the derived one and never merged into it.** §5 refuses to
+/// flatten the two — *"achatá-las numa só punha o triador e o dono a falar pela mesma boca"* — so
+/// `junction` still says only what can be known without anybody looking, and `standings` says what
+/// the owner said and whether it is still true. A client is free to draw them together; it is not
+/// free to be handed one number that has already decided how they combine.
 ///
 /// **What this now answers that it did not: which decisions nothing implements.** The structure
 /// alone cannot say it — it has never heard of a decision — and the pile alone cannot say it
@@ -2962,13 +3008,121 @@ struct MapAnswer {
 /// one that goes stale — the argument [`crate::map_store::decide`] makes about checks that live in
 /// handlers, and the failure `from_row` next door already had once.
 ///
-/// A missing folder is a 404 and a failed query is a 500, which is not one distinction made twice:
-/// the first is something the owner did to their own machine, the second is this daemon failing.
+/// A missing folder is a 404 and a failed query is a 500 — see [`project_junction`], which is where
+/// both now happen.
 async fn get_project_map(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<MapAnswer>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
+    let (structure, junction) = project_junction(&state, &id, root.clone()).await?;
+
+    // **One `git ls-files` for the union of every decision's anchor paths, sliced per decision
+    // afterwards** — and the obvious later refactor is the per-decision loop, so both reasons it is
+    // not written that way are here rather than left to be rediscovered.
+    //
+    // The first is cost. This repository has ~350 approved decisions and the map is read every time
+    // the window opens, so a call each would be ~350 process spawns on a route somebody is waiting
+    // on. The second is the ceiling: the union of this repository's paths measures 732 entries and
+    // **24 224 characters of argv — 75 % of the 32 767 Windows allows** — so the chunking
+    // `map_stamp::digest` already does is load-bearing here rather than decorative, and a project a
+    // third larger than this one goes over it.
+    //
+    // The union must produce exactly what the per-decision loop would have, or it is an optimisation
+    // that changes answers. Two rules keep that true: the slice below is **by path**, never by the
+    // order git happened to answer in, and a decision with no anchor paths gets `Some("")` without
+    // consulting the call at all — which is what `digest` itself does with an empty list, and is why
+    // a git failure leaves those decisions on `Watch::NoAnchor` instead of flapping to *unreadable*.
+    let mut union: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for anchored in &junction.decisions {
+        union.extend(anchored.modules.iter().map(String::as_str));
+    }
+    let union: Vec<String> = union.into_iter().map(str::to_owned).collect();
+    let anchors = crate::map_stamp::digest(&root, &union).await;
+    // Parsed once and not once per decision: 350 decisions against a 52 KB digest is 350 walks of
+    // the same text for an answer that cannot change between them.
+    let tracked = anchors.as_deref().map(crate::map_stamp::parse);
+
+    let stamped = crate::map_store::stamps(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "project map stamps failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let latest: std::collections::BTreeMap<i64, &crate::map_store::Stamp> = stamped
+        .iter()
+        .map(|stamp| (stamp.decision_id, stamp))
+        .collect();
+
+    // One clock for the whole answer rather than one per decision. Two amber stamps on either side
+    // of `NOTE_LIFETIME` must be judged against the same instant, or the header can report a total
+    // that was never true at any single moment.
+    let now = chrono::Utc::now();
+    let mut standings = std::collections::BTreeMap::new();
+    for anchored in &junction.decisions {
+        let current = if anchored.modules.is_empty() {
+            Some(String::new())
+        } else {
+            tracked.as_ref().map(|tracked| {
+                crate::map_stamp::canonical(anchored.modules.iter().filter_map(|path| {
+                    tracked
+                        .get(path.as_str())
+                        .map(|blob| (path.as_str(), blob.as_str()))
+                }))
+            })
+        };
+        standings.insert(
+            anchored.decision_id,
+            crate::map_stamp::standing(
+                latest.get(&anchored.decision_id).copied(),
+                current.as_deref(),
+                anchored.modules.len(),
+                now,
+            ),
+        );
+    }
+
+    let stamps = crate::map_stamp::counts(&standings.values().cloned().collect::<Vec<_>>());
+    // The two header lines on that screen come from different places — this one from
+    // `standings.len()`, the other from the join — and they can only agree if the loop above put
+    // exactly one standing against every approved decision. A test asserts it too, because a
+    // `debug_assert` says nothing in the build the owner runs.
+    debug_assert_eq!(
+        stamps.decisions, junction.counts.decisions,
+        "one standing per approved decision, or the header disagrees with itself"
+    );
+
+    Ok(Json(MapAnswer {
+        structure,
+        junction,
+        standings,
+        stamps,
+        anchors_unreadable: anchors.is_none(),
+    }))
+}
+
+/// The structure layer and the approved decisions read against it, for the two routes that need
+/// both.
+///
+/// **One function and not two copies, because a decision's anchor set is what a stamp is anchored
+/// TO.** `GET /map` computes it to say where a decision stands; `POST /map/stamps` computes it to
+/// know what it is putting a verdict on. If the two ever derived it differently, a stamp would be
+/// written against one anchor set and expired against another — a green that lapses the instant it
+/// is given, with a diff nobody can explain, which is the false-alarm failure that costs exactly
+/// the trust §7 is trying to buy.
+///
+/// It goes to disk, so it runs on `spawn_blocking` the way `blame` and `grep` already do: walking a
+/// thousand-file tree on the async executor blocks the whole daemon for a good few milliseconds,
+/// and this daemon is also answering a three-second poll. `specs_in` walks directories too and
+/// rides the same hop, since the thread already has the root in hand.
+///
+/// A missing folder is a 404 and a failed query is a 500, which is not one distinction made twice:
+/// the first is something the owner did to their own machine, the second is this daemon failing.
+async fn project_junction(
+    state: &AppState,
+    id: &str,
+    root: PathBuf,
+) -> Result<(crate::project_map::Structure, crate::map_join::Junction), StatusCode> {
     let walked = tokio::task::spawn_blocking(move || {
         let structure = crate::project_map::structure(&root)?;
         // Slugs and not paths, for the reason `get_project_map_specs` gives below: a decision row
@@ -2996,7 +3150,7 @@ async fn get_project_map(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let decisions = crate::map_store::approved(&state.pool, &id)
+    let decisions = crate::map_store::approved(&state.pool, id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "project map decisions failed");
@@ -3009,10 +3163,7 @@ async fn get_project_map(
         &structure.foreign,
         &spec_slugs,
     );
-    Ok(Json(MapAnswer {
-        structure,
-        junction,
-    }))
+    Ok((structure, junction))
 }
 
 /// Which specs this project has, named the way the owner reads them.
@@ -3246,6 +3397,129 @@ async fn post_project_map_decision(
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(error) => {
             tracing::warn!(%error, project_id = %id, decision, "answering a decision failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MapStampBody {
+    decision_id: i64,
+    /// The owner's verdict, parsed by serde and by nothing this handler wrote.
+    ///
+    /// Typed rather than taken as a `String` and read afterwards, which is where `read_brain` next
+    /// door had to end up and why the two differ. `Brain::from_wire` reads anything unfamiliar as
+    /// `Cloud`, so that route needed a stricter reader of its own; [`crate::map_stamp::Verdict`]'s
+    /// derived `Deserialize` is already exact — §5.2 has three and `0118`'s CHECK admits three — so
+    /// a fourth is refused before this function runs at all. That is the earliest place it can be
+    /// refused, and the only one where nothing has yet had a chance to guess what was meant.
+    verdict: crate::map_stamp::Verdict,
+    /// Obligatory on amber and optional on the other two (§7).
+    ///
+    /// `serde(default)` so a client that has nothing to say may omit the field rather than having
+    /// to spell `null`. The default is `None` and never an empty string, because *said nothing* and
+    /// *said the empty string* are different, and `0118` stores the first as NULL.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// The owner's verdict on one decision, and the moment they gave it (§5.2, §7).
+///
+/// **The daemon computes the digest and the body has no field for one.** A client that could supply
+/// it is a client that could mint a green anchored to a digest nothing will ever move — a stamp that
+/// never expires, which is §1's false confidence with a signature on it. The anchor set comes from
+/// [`project_junction`], the same reading `GET /map` expires the stamp against, so the two cannot
+/// disagree about what this verdict was given over.
+///
+/// Four answers, and each is a different thing to tell whoever asked:
+///
+/// - `204` when a row was written. Nothing to say back; §9.2 makes the current state the last row,
+///   and the map is where it is read.
+/// - `404` when nothing was written — a decision belonging to another project, an id that names
+///   nothing, or a line nobody approved. All three mean *that decision is not yours to stamp now*,
+///   none is a fault of this daemon, and telling them apart would tell a caller which ids exist in
+///   projects it cannot see. §4 is why the third is in that list at all: approval is the gate, and a
+///   verdict on an unapproved line would put the owner's word on something they never let in.
+/// - `400` for an amber with nothing in its note. `0118`'s CHECK is the backstop and would surface
+///   as a 500, which reads as this daemon having broken; a malformed request is the client's fault
+///   and has to read as one. §5.2 makes the note the whole of amber — *falta migrar as páginas de
+///   pilar* is worth more than the colour is — so an empty one is not a lesser amber, it is not one.
+/// - `503` for a `settled` whose digest came back `None`. **Not `500`**: git being unreadable for a
+///   moment is transient, and the honest thing to tell the owner is *try again*, whereas a 500 reads
+///   as a fault here and puts a warning in a log for an ordinary Tuesday. §7.1 makes *está como
+///   quero* the only verdict the code moving can falsify, so it is the only one that may not be
+///   recorded without knowing what it is anchored to; the other two take a NULL digest without
+///   complaint, because neither has an expiry the code can reach.
+///
+/// **The decision is looked up here, and that is not the handler check [`crate::map_store::decide`]
+/// argues against.** `map_store::stamp` still puts `project_id`, `approved_at` and `retired_at` in
+/// its own `WHERE`, and that INSERT is what actually refuses the write — this lookup cannot replace
+/// it and does not try. It is forced: without finding the decision there is no anchor set to compute
+/// a digest from. Short-circuiting on it also fixes an ordering that would otherwise be wrong, and
+/// the wrongness is quiet: a settled verdict on a decision that does not exist, in a folder that is
+/// not a repository, would answer `503` — *git is unreadable, try again* — about a request that will
+/// never succeed however healthy git becomes.
+async fn post_project_map_stamp(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapStampBody>,
+) -> Result<StatusCode, StatusCode> {
+    // Trimmed with `str::trim` against a CHECK that strips space, tab, CR and LF. Stricter, and
+    // deliberately in that direction: a note of one non-breaking space is one the table would take
+    // and one that says nothing, and the failure that matters is being LOOSER than the CHECK, which
+    // turns a client's mistake into a 500 about this daemon.
+    let note = body.note.as_deref();
+    if body.verdict == crate::map_stamp::Verdict::Partial
+        && !note.is_some_and(|note| !note.trim().is_empty())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let root = resolve_read_root(&state, &id, None).await?;
+    let (_, junction) = project_junction(&state, &id, root.clone()).await?;
+    let anchors = junction
+        .decisions
+        .iter()
+        .find(|anchored| anchored.decision_id == body.decision_id)
+        .map(|anchored| anchored.modules.clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // `Anchored::modules` and never `foreign` beside it. `Anchor::Declared` spends a paragraph on
+    // why: watching an anchor means being able to read it, and promising an expiry over a Go file
+    // this map cannot parse is a promise the read side cannot keep.
+    let digest = crate::map_stamp::digest(&root, &anchors).await;
+    if digest.is_none() && body.verdict == crate::map_stamp::Verdict::Settled {
+        tracing::warn!(
+            project_id = %id,
+            decision = body.decision_id,
+            anchors = anchors.len(),
+            "a green was asked for and the anchor digest could not be read, so it was refused"
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    match crate::map_store::stamp(
+        &state.pool,
+        &id,
+        body.decision_id,
+        body.verdict,
+        digest.as_deref(),
+        note,
+    )
+    .await
+    {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        // Reachable despite the lookup above: the line could have been retired between the two, and
+        // the store is the authority on that rather than the reading this handler took a moment ago.
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                decision = body.decision_id,
+                verdict = body.verdict.as_str(),
+                "stamping a decision failed"
+            );
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -12276,6 +12550,464 @@ mod tests {
             theirs["junction"]["decisions"][0]["text"],
             "A decisão do beta."
         );
+    }
+
+    fn git_in_project(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A registered project whose folder is also a git repository.
+    ///
+    /// Needed by every test that wants a real anchor digest, because `map_stamp::digest` asks git
+    /// and a folder that is not a repository is exactly the input that makes it answer `None`.
+    /// `core.autocrlf false` for the reason `map_stamp`'s own fixture gives: it is `true` from the
+    /// system config on a default Windows install, and a blob hash of bytes git rewrote on the way
+    /// into the index is not the hash of the bytes the test wrote.
+    async fn project_with_repo(state: &AppState, id: &str, yaml: &str) -> tempfile::TempDir {
+        let dir = project_with_rules(state, id, yaml).await;
+        git_in_project(dir.path(), &["init", "-q"]);
+        git_in_project(dir.path(), &["config", "user.email", "test@x"]);
+        git_in_project(dir.path(), &["config", "user.name", "test"]);
+        git_in_project(dir.path(), &["config", "core.autocrlf", "false"]);
+        dir
+    }
+
+    /// The owner's verdict on one decision, as the window sends it: the status and nothing else.
+    ///
+    /// The body goes in whole rather than as typed arguments, because two of the tests below are
+    /// about bodies this route must refuse — an unknown verdict, and an amber with nothing in its
+    /// note — and a helper that could only build valid ones could not ask for them.
+    async fn post_stamp(state: AppState, project: &str, body: serde_json::Value) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/stamps"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn every_approved_decision_gets_a_standing_and_an_unstamped_one_is_never() {
+        // §5.3's `K nunca vistas`, which on day one is every row. The absence of a stamp has to
+        // arrive as a standing the client can count, not as a missing key it has to interpret: a
+        // decision that is simply not in the map is indistinguishable from one the daemon forgot,
+        // and `StampCounts::decisions` is `standings.len()`, so a decision with no standing would
+        // quietly shrink the header's own denominator.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        let one = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let two = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(map["standings"][one.to_string()]["state"], "never");
+        assert_eq!(map["standings"][two.to_string()]["state"], "never");
+        assert_eq!(map["standings"].as_object().unwrap().len(), 2);
+        assert_eq!(map["stamps"]["never"], 2);
+        assert_eq!(map["stamps"]["decisions"], 2);
+        assert_eq!(map["stamps"]["settled"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_stamp_written_through_the_route_comes_back_on_the_map() {
+        // Through the door the routes use, which is the convention `the_map_carries_the_junction`
+        // next door already follows: a fixture that wrote the row itself would go on passing on
+        // the day the writing path stopped producing it.
+        let state = test_state().await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let standing = &map["standings"][id.to_string()];
+        assert_eq!(standing["state"], "settled");
+        assert_eq!(
+            standing["watch"], "watched",
+            "a module names the section and git tracks it, so this green expires when it moves"
+        );
+        assert!(standing["stamped_at"].is_string());
+        assert_eq!(map["stamps"]["settled"], 1);
+        assert_eq!(map["stamps"]["no_anchor"], 0);
+        assert_eq!(map["stamps"]["untracked"], 0);
+        assert_eq!(
+            map["anchors_unreadable"], false,
+            "git answered, so nothing about this reading is approximate"
+        );
+
+        // The digest is the DAEMON's and the body never carried one — a client that could supply
+        // it is a client that could mint a green which never expires. Asserted by looking at what
+        // was stored: it names the anchor file, which no part of the request did.
+        let stored = crate::map_store::stamps(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let digest = stored[0]
+            .code_digest
+            .as_deref()
+            .expect("a settled stamp cannot be written without one");
+        assert!(
+            crate::map_stamp::parse(digest).contains_key("core/src/a.rs"),
+            "{digest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_header_numbers_reconcile_with_the_decisions_on_the_map() {
+        // Two header lines on the same screen disagreeing, with nobody noticing, is the disease
+        // reproduced inside the cure — and a header is exactly where a reader stops checking. The
+        // two counts come from different places on purpose: `junction.counts.decisions` from the
+        // join, `stamps.decisions` from `standings.len()`, so they can only agree if this handler
+        // produced exactly one standing per approved decision.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let settled = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let partial = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        let withdrawn = seed_approved(&state, "alpha", "## 3. Gama", 3, "Gama.").await;
+        seed_approved(&state, "alpha", "## 4. Delta", 4, "Delta.").await;
+
+        for body in [
+            serde_json::json!({"decision_id": settled, "verdict": "settled", "note": null}),
+            serde_json::json!({"decision_id": partial, "verdict": "partial",
+                               "note": "falta migrar as páginas de pilar"}),
+            serde_json::json!({"decision_id": withdrawn, "verdict": "withdrawn", "note": null}),
+        ] {
+            assert_eq!(
+                post_stamp(state.clone(), "alpha", body.clone()).await,
+                StatusCode::NO_CONTENT,
+                "{body}"
+            );
+        }
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let stamps = &map["stamps"];
+
+        assert_eq!(stamps["decisions"], map["junction"]["counts"]["decisions"]);
+        assert_eq!(stamps["decisions"], 4);
+        assert_eq!(map["standings"].as_object().unwrap().len(), 4);
+        let five = ["settled", "partial", "never", "lapsed", "withdrawn"]
+            .iter()
+            .map(|which| stamps[which].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(
+            five, 4,
+            "the five standings must cover every decision: {stamps}"
+        );
+        assert_eq!(stamps["settled"], 1);
+        assert_eq!(stamps["partial"], 1);
+        assert_eq!(stamps["withdrawn"], 1);
+        assert_eq!(stamps["never"], 1);
+    }
+
+    #[tokio::test]
+    async fn an_amber_stamp_without_a_note_is_refused_by_the_route_with_400_and_not_500() {
+        // §5.2 makes the note the whole of amber: *falta migrar as páginas de pilar* is worth more
+        // than the colour. `0118`'s CHECK refuses the row and would surface as a 500, which reads
+        // as this daemon having broken — and a malformed request is the client's fault and has to
+        // read as one.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        for note in [serde_json::Value::Null, serde_json::json!("   \t\n")] {
+            assert_eq!(
+                post_stamp(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({"decision_id": id, "verdict": "partial", "note": note}),
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "note {note}"
+            );
+        }
+
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused amber leaves no row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_stamp_is_refused_with_503_when_the_anchor_digest_cannot_be_read() {
+        // The folder is not a repository, so git cannot say what the anchor code is. `503` and not
+        // `500`: nothing here is broken, and the honest thing to tell the owner is *try again*.
+        // Storing the green anyway would be the one row this whole feature exists to prevent — a
+        // *está como quero* with nothing to expire it, and `0118`'s CHECK is the backstop that
+        // would have turned it into a 500 instead.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no green was minted over code nobody could read"
+        );
+
+        // The other two verdicts are unmoved by it: neither expires by the code, so neither needs
+        // to know what the code is. §7 still wants the digest when it can be had, and NULL when it
+        // cannot — which is exactly what `0118` lets them store.
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "withdrawn", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn stamping_a_decision_of_another_project_is_404_and_writes_nothing() {
+        // The id is a global integer, so the project in the path is the only thing between one
+        // owner's verdict and another owner's decision.
+        let state = test_state().await;
+        let _a = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _b = project_with_rules(&state, "beta", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "beta",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "alpha's decision is unstamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn stamping_a_decision_nobody_approved_is_404() {
+        // §4: approval is the gate, and nothing reaches the map without it. A verdict on an
+        // unapproved line would put the owner's own word on something they never let in — and the
+        // line is still in the pile, where a wrong stamp would be invisible.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_two_pending(&state, "alpha").await;
+        let id = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap()[0]
+            .id;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // And an id that names nothing at all, which is the same answer for the same reason.
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": 9_999, "verdict": "withdrawn", "note": null}),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_verdict_is_refused_at_the_edge() {
+        // §5.2 has three and `0118`'s CHECK admits three. A fourth is refused by serde before this
+        // handler runs at all, which is the earliest place it can be refused and the only one where
+        // no code has yet had a chance to guess what was meant — and guessing is what this map
+        // refuses: `Settled` would invent a green nobody gave, and either of the others would put
+        // words in the owner's mouth.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        for body in [
+            serde_json::json!({"decision_id": id, "verdict": "maybe", "note": null}),
+            serde_json::json!({"decision_id": id, "verdict": "Settled", "note": null}),
+            serde_json::json!({"decision_id": id, "note": null}),
+        ] {
+            assert_eq!(
+                post_stamp(state.clone(), "alpha", body.clone()).await,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+        }
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_whose_modules_are_all_untracked_is_untracked_and_not_no_anchor() {
+        // The live case a boolean could not express, measured in this very repository: of ten real
+        // anchor paths, eight got blobs and two did not — `AGENTS.md` and `CLAUDE.md`, which this
+        // repository gitignores. Both greens have nothing to watch and the two are fixed by
+        // different edits: slice 6 puts slugs on citations, and a `.gitignore` line is a
+        // `.gitignore` line. One number meaning both is one the owner cannot act on.
+        let state = test_state().await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "core/src/a.rs\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+
+        let ignored = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let nameless = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        for id in [ignored, nameless] {
+            assert_eq!(
+                post_stamp(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        // The one whose module git will not report: modules name it, so this is not §8 unfixed.
+        assert_eq!(
+            map["junction"]["decisions"][0]["modules"],
+            serde_json::json!(["core/src/a.rs"]),
+            "the decision really is anchored, which is what makes the empty digest mean something"
+        );
+        assert_eq!(map["standings"][ignored.to_string()]["watch"], "untracked");
+        // And the one no readable module names at all, which is the other silence.
+        assert_eq!(map["standings"][nameless.to_string()]["watch"], "no_anchor");
+        assert_eq!(map["stamps"]["untracked"], 1);
+        assert_eq!(map["stamps"]["no_anchor"], 1);
+        assert_eq!(map["stamps"]["settled"], 2);
+        assert_eq!(
+            map["anchors_unreadable"], false,
+            "git answered perfectly well; it simply had nothing to say about that path"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_digest_is_reported_once_and_not_per_decision() {
+        // `map_stamp::digest` is all-or-nothing by design, and the map calls it once for the union
+        // of every decision's anchors — so a git that will not answer takes every settled stamp in
+        // the project to `Lapse::Unreadable` at the same instant. That is accepted: the alternative
+        // is one process spawn per decision, which is ~350 of them on a read the window makes every
+        // time it opens. What is not accepted is the owner meeting it as a screenful of identical
+        // rows, so the whole reading carries ONE flag saying the digest could not be read, and the
+        // window has one sentence to print instead of a wall of noise.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        std::fs::write(dir.path().join("core/src/c.rs"), "//! §2\n").unwrap();
+        let one = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let two = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        // Written straight to the store, because the route would refuse to mint these: the folder
+        // is not a repository, and a settled stamp with no digest is exactly what `503` prevents.
+        // The state under test is the one that arrives later — stamped when the folder WAS a
+        // repository, read once it is not.
+        for (id, path) in [(one, "core/src/a.rs"), (two, "core/src/c.rs")] {
+            let digest =
+                crate::map_stamp::canonical([(path, "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567")]);
+            assert!(
+                crate::map_store::stamp(
+                    &state.pool,
+                    "alpha",
+                    id,
+                    crate::map_stamp::Verdict::Settled,
+                    Some(&digest),
+                    None,
+                )
+                .await
+                .unwrap()
+            );
+        }
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(
+            map["anchors_unreadable"], true,
+            "one flag for the whole reading: {map}"
+        );
+        assert!(
+            map["anchors_unreadable"].is_boolean(),
+            "one sentence and not a list that grows with the decisions"
+        );
+        for id in [one, two] {
+            let standing = &map["standings"][id.to_string()];
+            assert_eq!(standing["state"], "lapsed");
+            assert_eq!(
+                standing["why"]["kind"], "unreadable",
+                "not `moved`: nothing moved, and nagging about a diff nobody can show is the false \
+                 alarm that costs the trust this feature is built to earn"
+            );
+        }
+        assert_eq!(map["stamps"]["lapsed"], 2);
     }
 
     /// What a model answers when it has read a spec: the shape `parse_extraction` takes.

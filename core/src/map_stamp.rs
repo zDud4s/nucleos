@@ -141,7 +141,8 @@ pub enum Standing {
     /// *Está como quero*, and the anchors are as they were.
     Settled {
         stamped_at: String,
-        /// `false` when this decision has no readable anchor, so the stamp can never expire.
+        /// Whether this green will ever come back to ask, and — when it will not — which of the
+        /// two different reasons it will not.
         ///
         /// **Reported, never hidden.** A green that will never come back to ask is the precise
         /// shape of the false confidence §1 describes, and today it is the common case rather than
@@ -149,7 +150,7 @@ pub enum Standing {
         /// until §8's slug edit lands. The map is allowed to carry such a stamp — the owner may
         /// well be settled about work living in a Go sidecar — and is not allowed to let it look
         /// like the other kind.
-        watched: bool,
+        watch: Watch,
     },
     /// *A meio, e eu sei*, inside its window. The note is the whole of it (§5.2).
     Partial { stamped_at: String, note: String },
@@ -172,6 +173,27 @@ pub enum Standing {
         stamped_at: String,
         note: Option<String>,
     },
+}
+
+/// Whether a settled stamp has anything to watch, and why not when it has not.
+///
+/// **Three, and the third arrived from a live measurement rather than from the design.** This was a
+/// `watched: bool` until task 3 ran the digest over this repository's own decisions: of ten real
+/// anchor paths, **eight came back with a blob and two did not — `AGENTS.md` and `CLAUDE.md`, which
+/// this very repository gitignores.** So `false` was quietly carrying two facts at once, and they
+/// have different cures. One is §8 unfixed and is repaired by slice 6 putting slugs on citations;
+/// the other is a line in a `.gitignore` and has nothing to do with §8 at all. A single number that
+/// means both is a number its owner cannot act on — which is the shape of the problem this whole
+/// map exists to cure, reappearing one level down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Watch {
+    /// Anchors exist, git tracks them, this stamp expires when they move.
+    Watched,
+    /// No readable module names this decision's section. §8 unfixed; slice 6 is the repair.
+    NoAnchor,
+    /// Modules name it and git tracks none of them. A `.gitignore` question, not a §8 one.
+    Untracked,
 }
 
 /// Why a stamp lapsed, and the diff §7 promises.
@@ -206,7 +228,7 @@ pub enum Lapse {
     /// it was stamped and is not one now, or `git` did not answer. The second is a settled stamp
     /// holding **no** digest, a row `0118`'s `CHECK (verdict <> 'settled' OR code_digest IS NOT
     /// NULL)` refuses at the table; it is answered here anyway because the tempting alternative,
-    /// `Settled { watched: false }`, is that CHECK's own defect moved from write time to read time —
+    /// a settled green with nothing to watch, is that CHECK's own defect moved from write to read —
     /// a transient *git was unreadable* silently promoted to a permanent *there is nothing to
     /// watch*. The third is an amber whose `stamped_at` will not parse, so its age cannot be
     /// computed; `map_store::stamp` writes `chrono::Utc::now().to_rfc3339()` and so cannot produce
@@ -237,30 +259,23 @@ pub struct StampCounts {
     /// Not in the header line. Withdrawn decisions still exist and their documents still lie —
     /// §5.2 wants them out of the way, not out of sight.
     pub withdrawn: usize,
-    /// How many of [`StampCounts::settled`] have no anchor to watch: greens that can never expire.
+    /// How many of [`StampCounts::settled`] are green over a section no readable module names.
     ///
-    /// **The number that keeps `N carimbadas` honest.** Without it the header reports a count of
-    /// greens without saying how many of them will never come back to ask, which reads as
-    /// confidence and is not. Today, with `Anchor::Declared` at zero instances, this is expected to
-    /// equal `settled` outright, and that is the measurement saying §8's edit has not landed.
-    pub unwatched: usize,
+    /// **The pair of numbers that keeps `N carimbadas` honest.** Without them the header reports a
+    /// count of greens without saying how many of them will never come back to ask, which reads as
+    /// confidence and is not. Two counts rather than one for the reason [`Watch`] is three-valued:
+    /// this one is §8 unfixed and is repaired by slice 6, and [`StampCounts::untracked`] beside it
+    /// is repaired by editing a `.gitignore`. One number would leave the owner unable to tell which
+    /// of the two they were being asked to do.
+    pub no_anchor: usize,
+    /// How many of [`StampCounts::settled`] name modules that git tracks none of.
+    ///
+    /// Expected to be small and expected to be non-zero: this repository gitignores `AGENTS.md` and
+    /// `CLAUDE.md`, both of which real decisions anchor to. See [`Watch::Untracked`].
+    pub untracked: usize,
     /// Every approved decision, so the five above can be asserted to reconcile.
     pub decisions: usize,
 }
-
-// This is a bin-only crate, so dead-code reachability starts at `main`, and nothing in production
-// reaches this module yet: `standing` and `counts` are read by `GET /projects/{id}/map`, `canonical`
-// by both of them, and `digest` by that route and by the writer that records a stamp — all of which
-// land with the route work in task 4. Measured rather than assumed, the way `map_store.rs` measured
-// its pair: with the attributes stripped this module warns about **seventeen** items, and putting
-// them back on these four silences all seventeen — `#[allow]` seeds a liveness root, so everything
-// the four reach (`NOTE_LIFETIME`, `Standing`, `Lapse`, `StampCounts`, `parse`, `moved`, `argv_cost`,
-// `chunked`, `ls_files_entry` and the four `ls-files` constants) stays reachable *through* the entry
-// points, and any one of them going unused would still say so. The instruction, not a description:
-// DELETE ALL FOUR ATTRIBUTES with the change that adds the route.
-//
-// Scoped to the non-test build, as `map_store.rs`, `contacts.rs` and `errands.rs` scope theirs.
-// Under `cfg(test)` the lint stays live, and this module's tests exercise all three.
 
 /// One decision's standing, at one instant.
 ///
@@ -285,8 +300,21 @@ pub struct StampCounts {
 /// `stamped_at` is carried through untouched and never parsed, because time is not an input to its
 /// expiry, and a withdrawal's for the same reason — so a corrupt timestamp cannot make a green rot
 /// or a withdrawal return.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn standing(stamp: Option<&Stamp>, current: Option<&str>, now: DateTime<Utc>) -> Standing {
+///
+/// **`anchors` is how many readable modules name this decision's section — `Anchored::modules.len()`
+/// and nothing else** — and it exists because a digest of `""` cannot say which of [`Watch`]'s two
+/// silences produced it. Zero anchors means nothing was ever asked of git; a non-zero count with an
+/// empty digest means git was asked about real files and tracks none of them. Only a caller holding
+/// both the join and the digest can tell those apart, so the distinction is passed in rather than
+/// guessed at here — which is also what keeps this function pure, and §7.1's three rules exercisable
+/// without a repository. Handing it the count of *tracked* anchors instead would collapse the two
+/// again and always report [`Watch::NoAnchor`].
+pub fn standing(
+    stamp: Option<&Stamp>,
+    current: Option<&str>,
+    anchors: usize,
+    now: DateTime<Utc>,
+) -> Standing {
     let Some(stamp) = stamp else {
         return Standing::Never;
     };
@@ -300,10 +328,10 @@ pub fn standing(stamp: Option<&Stamp>, current: Option<&str>, now: DateTime<Utc>
             (Some(was), Some(is)) => match moved(was, is) {
                 Some(why) => Standing::Lapsed { stamped_at, why },
                 // `is` empty here means `was` was too, since nothing moved. That is the green with
-                // nothing to watch, and it is the only place `watched` can be false.
+                // nothing to watch, and it is the only place `watch` can be anything else.
                 None => Standing::Settled {
                     stamped_at,
-                    watched: !is.is_empty(),
+                    watch: watch(is, anchors),
                 },
             },
             (None, _) | (_, None) => Standing::Lapsed {
@@ -350,6 +378,19 @@ pub fn standing(stamp: Option<&Stamp>, current: Option<&str>, now: DateTime<Utc>
     }
 }
 
+/// Which of [`Watch`]'s three a green with this digest is standing on.
+///
+/// A digest with anything in it is being watched, whatever the anchor count says — a decision whose
+/// modules are half tracked still expires when the tracked half moves, and reporting it as unwatched
+/// because one file is gitignored would hide an expiry that genuinely works.
+fn watch(current: &str, anchors: usize) -> Watch {
+    match (current.is_empty(), anchors) {
+        (false, _) => Watch::Watched,
+        (true, 0) => Watch::NoAnchor,
+        (true, _) => Watch::Untracked,
+    }
+}
+
 /// §5.3's header numbers, tallied from one standing per approved decision.
 ///
 /// The caller must hand this **every** approved decision, including the ones nobody has stamped as
@@ -357,7 +398,6 @@ pub fn standing(stamp: Option<&Stamp>, current: Option<&str>, now: DateTime<Utc>
 /// header's honesty rests on. Counting decisions from some other source would let the five
 /// categories quietly stop covering the whole — and a header is the one place that would never be
 /// noticed.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn counts(standings: &[Standing]) -> StampCounts {
     let mut counts = StampCounts {
         settled: 0,
@@ -365,16 +405,19 @@ pub fn counts(standings: &[Standing]) -> StampCounts {
         never: 0,
         lapsed: 0,
         withdrawn: 0,
-        unwatched: 0,
+        no_anchor: 0,
+        untracked: 0,
         decisions: standings.len(),
     };
     for standing in standings {
         match standing {
             Standing::Never => counts.never += 1,
-            Standing::Settled { watched, .. } => {
+            Standing::Settled { watch, .. } => {
                 counts.settled += 1;
-                if !watched {
-                    counts.unwatched += 1;
+                match watch {
+                    Watch::Watched => {}
+                    Watch::NoAnchor => counts.no_anchor += 1,
+                    Watch::Untracked => counts.untracked += 1,
                 }
             }
             Standing::Partial { .. } => counts.partial += 1,
@@ -417,7 +460,6 @@ pub fn counts(standings: &[Standing]) -> StampCounts {
 /// Joined with `\n` and never `\r\n`. This working tree is CRLF, and a helper that normalised line
 /// endings on the way through would rewrite the meaning of every digest already in the table and
 /// lapse every settled stamp in the project on a single read.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn canonical<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
     let sorted: BTreeMap<&str, &str> = entries.into_iter().collect();
     sorted
@@ -492,15 +534,22 @@ fn moved(stamped: &str, current: &str) -> Option<Lapse> {
 
 /// How long one `git ls-files` is given before the answer becomes *I could not look*.
 ///
-/// **Its own constant rather than [`crate::git_exec::OPERATION_TIMEOUT`], and an order of magnitude
-/// smaller.** That 300s is the budget for a whole queued VCS operation — a worktree add, a merge, a
-/// push across a network — and it is the right size for one. This is a single read of an index git
-/// has already built, on a route the window calls every time the map opens, with a person waiting:
-/// measured at **25.7 ms** for the whole of this repository's 732 entries. Thirty seconds is over a
-/// thousand times that, which makes a timeout here evidence that something is wrong rather than that
-/// something is slow — and bounding it is what keeps a broken git a passing `Lapse::Unreadable`
-/// instead of a request nobody ever gets an answer to.
-const LS_FILES_TIMEOUT: Duration = Duration::from_secs(30);
+/// **Its own constant rather than [`crate::git_exec::OPERATION_TIMEOUT`], and nearly two orders of
+/// magnitude smaller.** That 300s is the budget for a whole queued VCS operation — a worktree add, a
+/// merge, a push across a network — and it is the right size for one. This is a single read of an
+/// index git has already built, on a route the window calls every time the map opens, with a person
+/// waiting.
+///
+/// **Five seconds, and it came down from thirty because the measurement said thirty was not a
+/// ceiling.** Task 3 timed the whole of this repository through [`digest`] — 732 paths in, 52 771
+/// bytes of `ls-files` output — at **77 ms**, and re-timing the bare git call for this change gave
+/// 54–84 ms over seven runs. Thirty seconds is four hundred times the worst of those: not a bound on
+/// a slow answer but a hang, on a read the map performs every time it opens, and a hang is
+/// indistinguishable to whoever is looking at it from an application that has broken. Five seconds
+/// is still 65× the measured figure — so it cannot fire because a cold cache or a busy disk made one
+/// call slow — and it is short enough that the failure arrives as `Lapse::Unreadable`, which is a
+/// sentence the owner can read, rather than as a window that never finishes loading.
+const LS_FILES_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The fixed argv every call carries, before the anchor paths.
 ///
@@ -628,9 +677,21 @@ fn ls_files_entry(record: &str) -> Option<(u8, &str, &str)> {
 ///
 /// **git's blobs, and not a hash of the bytes on disk.** §7 asks for exactly this and gets two things
 /// for it: the hashes are free, because git computed them when the files were staged; and the stamp
-/// expires **at the commit** rather than at every keystroke, *"que é a granularidade a que a pergunta
+/// expires at a granularity coarser than the keystroke, *"que é a granularidade a que a pergunta
 /// 'isto ainda está como eu queria?' faz sentido"*. A digest taken from the working tree would go
 /// amber while its owner was still typing, and a map that nags mid-edit is a map nobody leaves open.
+///
+/// **§7 says that granularity is the commit and §7 is wrong; it is `git add`, and this code is
+/// right.** `ls-files -s` reports the **index**, not `HEAD`. Measured while task 3 was written: with
+/// `map_stamp.rs` edited but unstaged, `ls-tree HEAD` and `ls-files -s` both said `d70b0dd` while
+/// `hash-object` on the working file said `79816ad`, and this function reported `d70b0dd` — so
+/// editing does not lapse a stamp and staging does. Written down here because the tempting
+/// correction is to make the code match the sentence by reading `ls-tree HEAD` instead, and it is
+/// the wrong direction. **The index lapses earlier, never later.** Reading `HEAD` would hold a stamp
+/// green over code its owner has already staged — a green over changed code, which is the precise
+/// failure this whole feature exists to cure — while erring early costs a re-stamp, and §7 already
+/// says re-stamping is one click when the diff is cosmetic. The gap between the two is one `git
+/// commit`, and it only ever opens in the direction of asking.
 ///
 /// **Three answers, and the whole reason this returns an `Option` is that they are three.**
 ///
@@ -677,7 +738,6 @@ fn ls_files_entry(record: &str) -> Option<(u8, &str, &str)> {
 /// operation — no worktree is claimed, nothing is written, there is no budget to spend down. It is a
 /// read on an HTTP path with a ceiling of its own, [`LS_FILES_TIMEOUT`]; `git_exec`'s list has been
 /// amended to say so rather than left to read as though this had slipped past it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn digest(root: &Path, paths: &[String]) -> Option<String> {
     if paths.is_empty() {
         return Some(String::new());
@@ -788,10 +848,10 @@ mod tests {
             + offset
     }
 
-    fn settled(watched: bool) -> Standing {
+    fn settled(watch: Watch) -> Standing {
         Standing::Settled {
             stamped_at: STAMPED_AT.to_owned(),
-            watched,
+            watch,
         }
     }
 
@@ -849,16 +909,21 @@ mod tests {
             NOTE_LIFETIME + Duration::seconds(1),
             Duration::days(4000),
         ];
+        // Both sides of the distinction `Watch` exists for: a decision no readable module names, and
+        // one whose modules are real and none of which git tracks.
+        let anchor_counts = [0, 2];
 
         let mut every = Vec::new();
         for current in currents {
             for clock in clocks {
-                every.push(standing(None, current, at(clock)));
-                for verdict in verdicts {
-                    for stamped in digests {
-                        for note in notes {
-                            let stamp = stamp_of(verdict, stamped, note);
-                            every.push(standing(Some(&stamp), current, at(clock)));
+                for anchors in anchor_counts {
+                    every.push(standing(None, current, anchors, at(clock)));
+                    for verdict in verdicts {
+                        for stamped in digests {
+                            for note in notes {
+                                let stamp = stamp_of(verdict, stamped, note);
+                                every.push(standing(Some(&stamp), current, anchors, at(clock)));
+                            }
                         }
                     }
                 }
@@ -873,18 +938,20 @@ mod tests {
             "the five standings must cover every decision exactly once: {tally:?}"
         );
         assert!(
-            tally.unwatched <= tally.settled,
-            "an unwatched stamp is a settled one, so it can never outnumber them: {tally:?}"
+            tally.no_anchor + tally.untracked <= tally.settled,
+            "a green with nothing to watch is a green, so the two can never outnumber them: {tally:?}"
         );
 
-        // A property nothing exercises is a property nobody proved. Each of the five, and the
-        // unwatched green, has to actually occur in the mix above or the assertion is vacuous.
+        // A property nothing exercises is a property nobody proved. Each of the five, and both
+        // silences a green can stand on, has to actually occur in the mix above or the assertion is
+        // vacuous.
         assert!(tally.never > 0, "{tally:?}");
         assert!(tally.settled > 0, "{tally:?}");
         assert!(tally.partial > 0, "{tally:?}");
         assert!(tally.lapsed > 0, "{tally:?}");
         assert!(tally.withdrawn > 0, "{tally:?}");
-        assert!(tally.unwatched > 0, "{tally:?}");
+        assert!(tally.no_anchor > 0, "{tally:?}");
+        assert!(tally.untracked > 0, "{tally:?}");
     }
 
     #[test]
@@ -898,8 +965,8 @@ mod tests {
         // Eleven years on, because time is not an input to this rule and the test says so rather
         // than a comment promising it.
         assert_eq!(
-            standing(Some(&stamp), Some(&anchors), at(Duration::days(4000))),
-            settled(true)
+            standing(Some(&stamp), Some(&anchors), 2, at(Duration::days(4000))),
+            settled(Watch::Watched)
         );
     }
 
@@ -919,7 +986,7 @@ mod tests {
         // hash of it. Naming the one file that moved — and not the one that did not — is that
         // promise being kept.
         assert_eq!(
-            standing(Some(&stamp), Some(&now), at(Duration::zero())),
+            standing(Some(&stamp), Some(&now), 2, at(Duration::zero())),
             lapsed(moved_to(&["core/src/map_store.rs"], &[], &[]))
         );
     }
@@ -936,13 +1003,13 @@ mod tests {
         // A new file citing the section is as much a change as an edit to an old one — arguably
         // more, because it is code nobody weighed when the stamp was made.
         assert_eq!(
-            standing(Some(&stamp), Some(&grown), at(Duration::zero())),
+            standing(Some(&stamp), Some(&grown), 2, at(Duration::zero())),
             lapsed(moved_to(&[], &["core/src/map_store.rs"], &[]))
         );
 
         let grown_stamp = stamp_of(Verdict::Settled, Some(&grown), None);
         assert_eq!(
-            standing(Some(&grown_stamp), Some(&was), at(Duration::zero())),
+            standing(Some(&grown_stamp), Some(&was), 2, at(Duration::zero())),
             lapsed(moved_to(&[], &[], &["core/src/map_store.rs"]))
         );
 
@@ -951,25 +1018,52 @@ mod tests {
         // did not exist, so it has to come back and ask.
         let unwatched = stamp_of(Verdict::Settled, Some(""), None);
         assert_eq!(
-            standing(Some(&unwatched), Some(&was), at(Duration::zero())),
+            standing(Some(&unwatched), Some(&was), 1, at(Duration::zero())),
             lapsed(moved_to(&[], &["core/src/map_join.rs"], &[]))
         );
     }
 
+    /// The two silences a green can stand on, told apart by the one input that can tell them apart.
+    ///
+    /// Neither is a bug and neither is hidden. `Anchor::Declared` has zero instances in this
+    /// repository today, so a green with nothing to watch is the COMMON case rather than the corner,
+    /// and it is exactly the silent green this feature exists to kill — reported, and reported as
+    /// such. What this test pins is that the report says WHICH: the same empty digest is `NoAnchor`
+    /// when no module names the section and `Untracked` when modules name it and git tracks none of
+    /// them, and the two have different cures — slice 6 for the first, a `.gitignore` line for the
+    /// second.
     #[test]
-    fn a_settled_stamp_with_no_readable_anchor_is_watched_false_and_never_lapses() {
-        // Not a bug and not hidden. `Anchor::Declared` has zero instances in this repository today,
-        // so a green with nothing to watch is the COMMON case rather than the corner, and it is
-        // exactly the silent green this feature exists to kill — reported, and reported as such.
+    fn a_green_with_nothing_to_watch_says_which_of_the_two_silences_it_is() {
         let stamp = stamp_of(Verdict::Settled, Some(""), None);
 
         assert_eq!(
-            standing(Some(&stamp), Some(""), at(Duration::zero())),
-            settled(false)
+            standing(Some(&stamp), Some(""), 0, at(Duration::zero())),
+            settled(Watch::NoAnchor)
         );
         assert_eq!(
-            standing(Some(&stamp), Some(""), at(Duration::days(4000))),
-            settled(false)
+            standing(Some(&stamp), Some(""), 0, at(Duration::days(4000))),
+            settled(Watch::NoAnchor),
+            "nothing to watch means nothing time can do to it either"
+        );
+
+        // The live case the bool could not express: `AGENTS.md` and `CLAUDE.md` are named by real
+        // decisions in this repository and gitignored by it, so git answers about them with silence.
+        assert_eq!(
+            standing(Some(&stamp), Some(""), 2, at(Duration::zero())),
+            settled(Watch::Untracked)
+        );
+        assert_eq!(
+            standing(Some(&stamp), Some(""), 2, at(Duration::days(4000))),
+            settled(Watch::Untracked)
+        );
+
+        // And a digest with anything in it is watched however many modules were named, because the
+        // tracked half really does expire when it moves.
+        let anchored = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
+        let half = stamp_of(Verdict::Settled, Some(&anchored), None);
+        assert_eq!(
+            standing(Some(&half), Some(&anchored), 2, at(Duration::zero())),
+            settled(Watch::Watched)
         );
     }
 
@@ -982,24 +1076,27 @@ mod tests {
         // nothing; *I could not look* is the only one of the three that is true.
         let stamp = stamp_of(Verdict::Settled, Some(&anchors), None);
         assert_eq!(
-            standing(Some(&stamp), None, at(Duration::zero())),
+            standing(Some(&stamp), None, 1, at(Duration::zero())),
             lapsed(Lapse::Unreadable)
         );
 
         // The same answer when the stamp is the unreadable half. A settled row with no digest is
         // one `0118`'s CHECK refuses, and the reason it is answered here anyway is that the
-        // tempting alternative — `Settled { watched: false }` — is D2's defect moved to read time:
+        // tempting alternative — a green with nothing to watch — is D2's defect moved to read time:
         // a transient *git was unreadable* promoted to a permanent *there is nothing to watch*.
         let undigested = stamp_of(Verdict::Settled, None, None);
         assert_eq!(
-            standing(Some(&undigested), Some(&anchors), at(Duration::zero())),
+            standing(Some(&undigested), Some(&anchors), 1, at(Duration::zero())),
             lapsed(Lapse::Unreadable)
         );
 
         // And when the stamp says *nothing readable* but this reading cannot confirm it still holds.
+        // The anchor count is deliberately zero here, which is the input that would otherwise say
+        // `Watch::NoAnchor`: an unreadable digest outranks it, because *I could not look* is a fact
+        // about this instant and *there is nothing to watch* is a claim about the decision.
         let unwatched = stamp_of(Verdict::Settled, Some(""), None);
         assert_eq!(
-            standing(Some(&unwatched), None, at(Duration::zero())),
+            standing(Some(&unwatched), None, 0, at(Duration::zero())),
             lapsed(Lapse::Unreadable)
         );
     }
@@ -1018,14 +1115,14 @@ mod tests {
 
         let elsewhere = hand_digest(&[("sidecars/web/main.go", BLOB_C)]);
         assert_eq!(
-            standing(Some(&stamp), Some(&elsewhere), at(Duration::zero())),
+            standing(Some(&stamp), Some(&elsewhere), 1, at(Duration::zero())),
             amber
         );
         assert_eq!(
-            standing(Some(&stamp), Some(""), at(Duration::zero())),
+            standing(Some(&stamp), Some(""), 1, at(Duration::zero())),
             amber
         );
-        assert_eq!(standing(Some(&stamp), None, at(Duration::zero())), amber);
+        assert_eq!(standing(Some(&stamp), None, 1, at(Duration::zero())), amber);
     }
 
     #[test]
@@ -1043,16 +1140,26 @@ mod tests {
         // Both sides of the boundary, because an off-by-one here nags a day early forever, and the
         // window is stated against the constant so the two cannot drift apart.
         assert_eq!(
-            standing(Some(&stamp), None, at(NOTE_LIFETIME - Duration::seconds(1))),
+            standing(
+                Some(&stamp),
+                None,
+                1,
+                at(NOTE_LIFETIME - Duration::seconds(1))
+            ),
             amber
         );
-        assert_eq!(standing(Some(&stamp), None, at(NOTE_LIFETIME)), amber);
+        assert_eq!(standing(Some(&stamp), None, 1, at(NOTE_LIFETIME)), amber);
         assert_eq!(
-            standing(Some(&stamp), None, at(NOTE_LIFETIME + Duration::seconds(1))),
+            standing(
+                Some(&stamp),
+                None,
+                1,
+                at(NOTE_LIFETIME + Duration::seconds(1))
+            ),
             stale
         );
         assert_eq!(
-            standing(Some(&stamp), None, at(NOTE_LIFETIME + Duration::days(1))),
+            standing(Some(&stamp), None, 1, at(NOTE_LIFETIME + Duration::days(1))),
             stale
         );
 
@@ -1073,19 +1180,20 @@ mod tests {
         };
 
         assert_eq!(
-            standing(Some(&stamp), Some(&was), at(Duration::zero())),
+            standing(Some(&stamp), Some(&was), 1, at(Duration::zero())),
             withdrawn
         );
         assert_eq!(
             standing(
                 Some(&stamp),
                 Some(&hand_digest(&[("core/src/http.rs", BLOB_C)])),
+                1,
                 at(Duration::days(4000))
             ),
             withdrawn
         );
         assert_eq!(
-            standing(Some(&stamp), None, at(Duration::days(4000))),
+            standing(Some(&stamp), None, 1, at(Duration::days(4000))),
             withdrawn
         );
 
@@ -1093,7 +1201,7 @@ mod tests {
         // document, and nothing this module can measure is allowed to move it.
         let bare = stamp_of(Verdict::Withdrawn, None, None);
         assert_eq!(
-            standing(Some(&bare), None, at(Duration::days(4000))),
+            standing(Some(&bare), None, 0, at(Duration::days(4000))),
             Standing::Withdrawn {
                 stamped_at: STAMPED_AT.to_owned(),
                 note: None,
@@ -1104,8 +1212,8 @@ mod tests {
     #[test]
     fn the_digest_of_no_files_is_not_the_digest_of_a_file_that_hashes_to_nothing() {
         // `''` means *no anchor*, and it must never collide with *an anchor whose content is
-        // empty*. If it did, a decision anchored to one empty file would carry `watched: false` and
-        // a green that never comes back to ask.
+        // empty*. If it did, a decision anchored to one empty file would carry a green with nothing
+        // to watch, and one that never comes back to ask.
         let nothing = canonical(std::iter::empty());
         let empty_file = hand_digest(&[("core/src/placeholder.rs", EMPTY_BLOB)]);
 
@@ -1114,16 +1222,17 @@ mod tests {
 
         let stamp = stamp_of(Verdict::Settled, Some(&nothing), None);
         assert_eq!(
-            standing(Some(&stamp), Some(&empty_file), at(Duration::zero())),
+            standing(Some(&stamp), Some(&empty_file), 1, at(Duration::zero())),
             lapsed(moved_to(&[], &["core/src/placeholder.rs"], &[]))
         );
         assert_eq!(
             standing(
                 Some(&stamp_of(Verdict::Settled, Some(&empty_file), None)),
                 Some(&empty_file),
+                1,
                 at(Duration::zero())
             ),
-            settled(true)
+            settled(Watch::Watched)
         );
     }
 
@@ -1150,8 +1259,8 @@ mod tests {
 
         let stamp = stamp_of(Verdict::Settled, Some(&forwards), None);
         assert_eq!(
-            standing(Some(&stamp), Some(&backwards), at(Duration::zero())),
-            settled(true)
+            standing(Some(&stamp), Some(&backwards), 3, at(Duration::zero())),
+            settled(Watch::Watched)
         );
     }
 
@@ -1356,13 +1465,14 @@ mod tests {
     /// wrong in the direction this feature cannot afford. git has never seen the file, so the stamp
     /// would carry a blob git will not produce, and the first `git add` would move the digest and
     /// lapse the stamp: the map would report that the anchor code changed when not one byte of it
-    /// had. §7 ties expiry to the commit, and a file that has never been in one has nothing to say
-    /// about whether the code moved.
+    /// had. §7 ties expiry to what git has recorded, and a file git has never recorded has nothing
+    /// to say about whether the code moved.
     ///
     /// The cost, stated rather than hidden: a decision whose only anchor is untracked comes away with
     /// `Some("")` — computed, nothing to watch — which [`standing`] reports as
-    /// `Settled { watched: false }`. That is a green which can never expire, and it is shown as one
-    /// rather than enjoyed.
+    /// `Settled { watch: Watch::Untracked }`. That is a green which can never expire, and it is shown
+    /// as one rather than enjoyed — and named apart from [`Watch::NoAnchor`], because this one is
+    /// cured by a `.gitignore` line and that one by slice 6.
     #[tokio::test]
     async fn a_path_git_does_not_track_is_absent_rather_than_guessed_at() {
         let repo = repository("nucleos-digest-untracked-");
