@@ -209,6 +209,11 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // token by default-deny — and both belong there. Extracting spends a model, which a read-only
     // key never bought; approving is the owner's stamp, and it is the act that puts a line in the
     // map. Neither is a read, and neither is a thing done on the owner's behalf by a weaker key.
+    //
+    // `map/specs` is the list of filenames a reader can already see through `ls` — it names
+    // nothing `cat` could not already show. Naming them here is what lets the extraction button
+    // offer a choice instead of a text box; it spends no model and settles nothing, so it costs
+    // this key no more than `map` beside it does.
     (Method::GET, "/projects/{id}/readings"),
     (Method::GET, "/projects/{id}/log"),
     (Method::GET, "/projects/{id}/branches"),
@@ -218,6 +223,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/ownership"),
     (Method::GET, "/projects/{id}/map"),
     (Method::GET, "/projects/{id}/map/decisions"),
+    (Method::GET, "/projects/{id}/map/specs"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),

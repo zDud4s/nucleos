@@ -92,6 +92,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
+        // Which specs a project has, so the extraction button offers a list and not a text box.
+        // Beside `map` because it answers about the same tree, read the same way.
+        .route("/projects/{id}/map/specs", get(get_project_map_specs))
         // The intention layer, beside the structure layer it will one day be joined to. A POST and
         // deliberately in no table in `auth.rs`: reading a map costs nothing and a read-only key
         // buys it, while extracting spends a model — which is not something that key ever bought.
@@ -2897,6 +2900,39 @@ async fn get_project_map(
             tracing::warn!(%error, project_id = %id, "project map failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// Which specs this project has, named the way the owner reads them.
+///
+/// **Slugs and not paths.** The path is where the file happens to sit; the slug is what
+/// [`crate::map_intent::spec_slug`] produces, what the owner reads, what they hand back to
+/// `POST /map/extract`, and what a decision row carries forever. Two projects keeping their specs
+/// in different folders name one document alike.
+///
+/// **Empty is an answer, not an error.** A project with no specs gets a sentence about what is
+/// missing, and an empty list is that sentence's input — the same posture `map` itself takes
+/// about a folder with nothing in it.
+///
+/// [`crate::map_intent::specs_in`] probes three conventional folders rather than reading a
+/// setting, and this route inherits that whole: a project matching none of them is not broken, it
+/// is unconfigured in a way nobody has to configure.
+///
+/// On `spawn_blocking` for the reason `get_project_map` gives above: this walks directories, and
+/// the daemon is also answering a three-second poll.
+async fn get_project_map_specs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+    tokio::task::spawn_blocking(move || {
+        crate::map_intent::specs_in(&root)
+            .iter()
+            .map(|path| crate::map_intent::spec_slug(path))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize)]
@@ -12143,6 +12179,42 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_specs_of_a_project_are_listed_by_the_name_the_owner_will_read() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(
+            dir.path().join("docs/specs/2026-08-24-alfa-design.md"),
+            "# Alfa",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("docs/specs/beta.md"), "# Beta").unwrap();
+        std::fs::write(dir.path().join("docs/specs/notes.txt"), "not a spec").unwrap();
+
+        let listed = get_json(&state, "/projects/alpha/map/specs").await;
+
+        // The slug and not the path: it is what the owner reads, what they hand back to
+        // `/map/extract`, and what a decision row carries forever.
+        assert_eq!(
+            listed,
+            serde_json::json!(["2026-08-24-alfa-design", "beta"]),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_that_keeps_no_specs_is_an_empty_list_and_not_an_error() {
+        // A project with no specs shows its structure and says what is missing. An empty list is
+        // that sentence's input; a 404 would read as "there is no such project".
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        assert_eq!(
+            get_json(&state, "/projects/alpha/map/specs").await,
+            serde_json::json!([])
         );
     }
 
