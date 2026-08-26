@@ -38,6 +38,7 @@ mod job;
 mod local_agent;
 mod logging;
 mod mailsend;
+mod map_anchor;
 mod map_intent;
 mod map_join;
 mod map_recency;

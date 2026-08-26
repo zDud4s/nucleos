@@ -230,7 +230,14 @@ pub fn declaration(source: &str) -> Declaration {
 /// separates the number from the sentence it sits in. `§4.` ends the sentence, `§5.2).` closes
 /// a parenthesis, and both are far more common here than a deeper subsection would be. Reading
 /// the dot greedily would invent sections `4.` and `5.2)` that no document has.
-fn leading_number(text: &str) -> Option<(String, usize)> {
+///
+/// **`pub(crate)` for one caller and not because it is generally useful.**
+/// [`crate::map_anchor::marks`] needs to know WHERE a file wrote each citation, so it can cut the
+/// sentence around it for a prompt, and the alternative was a looser search for the literal `§6.4`
+/// — which finds `§6.44` and quotes the wrong sentence under the right number. Two answers to *what
+/// is a citation* is the one divergence this feature cannot afford, so the second caller borrows
+/// this rather than approximating it.
+pub(crate) fn leading_number(text: &str) -> Option<(String, usize)> {
     let mut number = String::new();
     let mut end = 0;
     let mut after_digit = false;
@@ -542,7 +549,13 @@ pub struct Counts {
 /// over, against whichever spec happened to contain that segment — a wrong answer far more often
 /// than this is an under-reported one, and an under-report is the direction this module errs in on
 /// purpose.
-fn names_document(candidate: &str, spec_slug: &str) -> bool {
+///
+/// **`pub(crate)` because this is the one place the question is answered.**
+/// [`crate::map_anchor`] has to ask it too — a citation already carrying a document of this project
+/// is one the file's header will never govern, so it is exempt from the veto — and a second spelling
+/// there would be a second, quietly different answer to *is this a document of this project*
+/// governing the only state the map may present as confirmed.
+pub(crate) fn names_document(candidate: &str, spec_slug: &str) -> bool {
     let wanted: Vec<&str> = candidate.split('-').collect();
     if wanted.len() < 2 {
         return false;

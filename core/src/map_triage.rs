@@ -189,7 +189,13 @@ const MAX_QUOTED_VERDICT: usize = 120;
 /// there rather than truncating. `map_intent::bounded` learned this going the other way, over the
 /// document rather than over the answer; a daemon that died because a reason happened to be the
 /// wrong length would be invisible until the one decision that triggered it, and then fatal.
-fn clipped(text: &str, ceiling: usize) -> String {
+///
+/// `pub(crate)` for [`crate::map_anchor`], which cuts a file's opening comment, a model's one-line
+/// reason and a quoted-back bad answer against three different ceilings and needs the same
+/// character-boundary rule for all three. Shared rather than respelled for `map_intent::json_object`'s
+/// reason: two spellings of *cut this visibly and do not panic doing it* would agree only while
+/// somebody kept them agreeing, and the one that drifted would be found by a daemon dying.
+pub(crate) fn clipped(text: &str, ceiling: usize) -> String {
     if text.len() <= ceiling {
         return text.to_owned();
     }
