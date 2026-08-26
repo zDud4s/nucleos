@@ -60,20 +60,44 @@ pub async fn record(
 
 /// The columns every read of this table selects, named rather than written out at the binding.
 ///
-/// Six of the eight are `TEXT` in one tuple, so a `SELECT` that reordered two of them would still
+/// Six of the nine are `TEXT` in one tuple, so a `SELECT` that reordered two of them would still
 /// typecheck and the mistake would surface as a decision whose section is somehow the name of a
-/// brain. This alias and the `SELECT` below are one thing written twice; changing either without
-/// the other is what it exists to make visible. The house shape — see `ErrandRow` in `errands.rs`
-/// and `Row` in `project_commands.rs`, both a row of this size read the same way.
-type DecisionRow = (i64, String, String, i64, String, String, String, String);
+/// brain. This alias and the `SELECT`s below are one thing written three times; changing any of
+/// them without the others is what it exists to make visible. The house shape — see `ErrandRow` in
+/// `errands.rs` and `Row` in `project_commands.rs`, both a row of this size read the same way.
+///
+/// `approved_at` is the one column a reorder cannot swallow, being the only nullable one and so the
+/// only `Option<String>` in the tuple. That is luck rather than design, and it is worth saying
+/// because the same column is the one this row got wrong for longest — see [`from_row`].
+type DecisionRow = (
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 
 /// The single place a row becomes a [`Decision`].
 ///
 /// `None` for a `kind` the CHECK should have refused. Dropped rather than defaulted: the same
 /// argument `Kind::from_wire` makes, and a row that reaches here unreadable is a row nobody can act
 /// on either way.
+///
+/// **`approved_at` is read off the row and is no longer asserted here.** It used to be hardcoded to
+/// `None`, which was true of every row [`pending`] can return — its own `WHERE` says
+/// `approved_at IS NULL` — and was therefore a fact that query already stated. Restating it in the
+/// mapping quietly turned it into a property of *the type* instead of a property of *that query*,
+/// so the next reader would have inherited a field that is permanently `None` whatever the table
+/// holds. A caller filtering on it — the junction is built from approved decisions and nothing
+/// else — would then have produced an empty map for every project, with a header reading zeros:
+/// silently wrong, on the one screen that exists to stop exactly that. [`pending`] still answers
+/// `None` here, now because the row says so rather than because this function does.
 fn from_row(
-    (id, spec_slug, section, ordinal, text, kind, brain, extracted_at): DecisionRow,
+    (id, spec_slug, section, ordinal, text, kind, brain, extracted_at, approved_at): DecisionRow,
 ) -> Option<Decision> {
     Some(Decision {
         id,
@@ -84,7 +108,7 @@ fn from_row(
         kind: Kind::from_wire(&kind)?,
         brain,
         extracted_at,
-        approved_at: None,
+        approved_at,
     })
 }
 
@@ -94,10 +118,51 @@ fn from_row(
 /// pile that ends, and one ordered by anything else is a pile that never does.
 pub async fn pending(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Decision>> {
     let rows = sqlx::query_as::<_, DecisionRow>(
-        "SELECT id, spec_slug, section, ordinal, text, kind, brain, extracted_at
+        "SELECT id, spec_slug, section, ordinal, text, kind, brain, extracted_at, approved_at
            FROM map_decisions
           WHERE project_id = ? AND approved_at IS NULL AND retired_at IS NULL
           ORDER BY extracted_at, spec_slug, ordinal",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(from_row).collect())
+}
+
+/// What the owner said yes to, in this project.
+///
+/// The mirror of [`pending`], and the two must never become one query with a flag. §4 says an
+/// extraction nobody has approved is a pile apart, counted apart from the real decisions, and one
+/// query with a boolean is how those two counts come to share a call site and then a number. They
+/// also answer different questions: `pending` is a queue somebody works through and orders by
+/// arrival, this is the material the map is made of and orders by document.
+///
+/// `retired_at IS NULL` excludes two different things with one clause, and both belong out. A line
+/// the owner rejected was never approved (§4). A decision later withdrawn — §5.2's *mudei de
+/// ideias* — was, and the whole point of withdrawing it is that it stops driving the map without
+/// disappearing from the table; a reader that kept it would go on reporting a decision somebody
+/// explicitly stood down.
+///
+/// Ordered `spec_slug, ordinal, id`, which is the order [`crate::map_join::join`] sorts into
+/// anyway. Stated here rather than left to the caller because `(spec_slug, ordinal)` is not a total
+/// order: `UNIQUE (project_id, spec_slug, ordinal, extracted_at)` lets two extractions of one spec
+/// both hold ordinal 1 and both be approved. Without the third key the order is whatever plan
+/// SQLite chose, and a map that changes shape between two reads for no reason anybody can see is
+/// the portrait decision 1 refuses.
+// Scoped to the non-test build, and to this one function rather than the module: the other three
+// have routes in `http.rs` calling them, and only this reader is waiting for one. The map route is
+// what calls it. The instruction, not a description: DELETE THIS LINE with the change that adds
+// that route. `contacts.rs` is the precedent for the per-item form; `map_join.rs` argues for the
+// module-wide one, and the difference is that there the whole module waits on a caller and here it
+// is one function among four.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn approved(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Decision>> {
+    let rows = sqlx::query_as::<_, DecisionRow>(
+        "SELECT id, spec_slug, section, ordinal, text, kind, brain, extracted_at, approved_at
+           FROM map_decisions
+          WHERE project_id = ? AND approved_at IS NOT NULL AND retired_at IS NULL
+          ORDER BY spec_slug, ordinal, id",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -225,6 +290,113 @@ mod tests {
         let left = pending(&pool, "alpha").await.unwrap();
         assert_eq!(left.len(), 1, "the approved one has left the pile");
         assert_eq!(left[0].ordinal, 2);
+    }
+
+    #[tokio::test]
+    async fn an_approved_decision_comes_back_and_a_pending_one_does_not() {
+        // The two readers are mirrors, and the pile the owner has not read must never be counted
+        // among the decisions the map is made of (§4).
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        assert!(
+            approved(&pool, "alpha").await.unwrap().is_empty(),
+            "nothing arrives approved"
+        );
+
+        let waiting = pending(&pool, "alpha").await.unwrap();
+        assert!(decide(&pool, "alpha", waiting[0].id, true).await.unwrap());
+
+        let said_yes = approved(&pool, "alpha").await.unwrap();
+        assert_eq!(said_yes.len(), 1);
+        assert_eq!(said_yes[0].ordinal, 1);
+        assert_eq!(
+            pending(&pool, "alpha").await.unwrap().len(),
+            1,
+            "the other line is still waiting to be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_decision_never_comes_back() {
+        // A `no` is retired rather than deleted, so the row is still there and must be invisible to
+        // both readers: it is not waiting to be answered and it is not something the map is made
+        // of. The same clause also holds out §5.2's *mudei de ideias*, which is a decision the owner
+        // stood down after approving — kept in the table precisely so it stops mattering without
+        // vanishing.
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        let waiting = pending(&pool, "alpha").await.unwrap();
+
+        assert!(decide(&pool, "alpha", waiting[0].id, false).await.unwrap());
+        assert!(decide(&pool, "alpha", waiting[1].id, true).await.unwrap());
+
+        // Both halves asserted, because only the pair is discriminating: a reader that answered
+        // nothing at all would satisfy the absence on its own, and the failure this guards against
+        // is a `WHERE` that keeps every answered line rather than one that keeps none.
+        let said_yes = approved(&pool, "alpha").await.unwrap();
+        assert_eq!(said_yes.len(), 1, "the yes landed and the no did not");
+        assert_eq!(said_yes[0].text, "Beta.");
+        assert_eq!(
+            retired_texts(&pool, "alpha").await,
+            vec!["Alfa.".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn another_project_s_approvals_are_not_mine() {
+        // `decide` puts `project_id` in its own `WHERE` rather than trusting a handler to check it,
+        // and a reader owes the same guarantee for the same reason: the id is a global integer, so
+        // the project is the only thing between one owner and another owner's decisions.
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        let id = pending(&pool, "alpha").await.unwrap()[0].id;
+        assert!(decide(&pool, "alpha", id, true).await.unwrap());
+
+        assert_eq!(approved(&pool, "alpha").await.unwrap().len(), 1);
+        assert!(approved(&pool, "beta").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_approved_decision_carries_the_moment_it_was_approved() {
+        // The test that would have caught it. `from_row` hardcoded `approved_at: None` — true of
+        // every row `pending` can return, since its own `WHERE` says so, and a lie the moment a
+        // second reader existed. Nothing asserted the field because nothing could: the only reader
+        // was the one whose answer was `None` either way. A caller filtering on it — the junction
+        // is built from approved decisions and nothing else — would have seen an empty map for
+        // every project and a header of zeros, which is silently wrong on the one screen built to
+        // stop exactly that.
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        let waiting = pending(&pool, "alpha").await.unwrap();
+        assert!(waiting[0].approved_at.is_none(), "nothing arrives approved");
+
+        assert!(decide(&pool, "alpha", waiting[0].id, true).await.unwrap());
+
+        let said_yes = approved(&pool, "alpha").await.unwrap();
+        let moment = said_yes[0]
+            .approved_at
+            .as_deref()
+            .expect("the moment the owner said yes");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(moment).is_ok(),
+            "an instant the owner can be shown, not whatever a default would have been: {moment}"
+        );
+        assert!(
+            pending(&pool, "alpha")
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.approved_at.is_none()),
+            "and the pile still answers None, now because the row says so"
+        );
     }
 
     #[tokio::test]
