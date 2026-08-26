@@ -523,9 +523,6 @@ pub struct Judged {
 /// answer to whoever asked. An `Err` is the table refusing the row itself — a blank reason, a blank
 /// model, a blank digest — and that is a bug in the caller, so it is not flattened into `false`
 /// where it would look like a missing decision.
-// Task 3 of this slice gives it its first real caller: `POST /projects/{id}/map/triage`, which
-// sweeps the decisions nobody has stamped. Delete this attribute then.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn triage(
     pool: &sqlx::SqlitePool,
     project_id: &str,
@@ -602,9 +599,8 @@ fn judged_from_row(
 /// SQLite's plan choose the winner, which is a decision that reads silenced on one refresh and
 /// flagged on the next with nothing having happened. `id DESC` breaks it on insertion order, which
 /// is the order the triager actually answered in.
-// Task 4 of this slice gives it its first real caller: `MapAnswer` gains the judgements by decision
-// id, and `GET /projects/{id}/map/silenced` reads the pile §6.2 requires. Delete this then.
-#[cfg_attr(not(test), allow(dead_code))]
+// Task 4 of this slice gives it its second caller: `MapAnswer` gains the judgements by decision id,
+// and `GET /projects/{id}/map/silenced` reads the pile §6.2 requires.
 pub async fn judgements(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<Judged>> {
     let rows = sqlx::query_as::<_, JudgedRow>(
         "SELECT t.decision_id, t.verdict, t.reason, t.model, t.computed_at, t.inputs_digest

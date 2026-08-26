@@ -129,9 +129,6 @@ impl Judgement {
 /// outlive. `0119`'s header argues the same inclusion from *the model looked at it*, which this
 /// module makes untrue; the conclusion survives its reason being corrected, and the cost of the
 /// stricter rule is stated at [`inputs_digest`].
-// Task 3 of this slice builds these and runs the model over them; Task 4 wires the route. Delete
-// this attribute then.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct Evidence<'a> {
     pub decision: &'a crate::map_join::Anchored,
@@ -328,8 +325,6 @@ const TRIAGE_PROMPT_VERSION: u32 = 1;
 /// Says nothing about the language of the answer beyond *the decision's own*, for `map_intent`'s
 /// reason: these decisions are Portuguese, and a reason translated into English is a paraphrase the
 /// owner cannot check against the document at a glance.
-// Task 3 of this slice sends this to a model. Delete this attribute then.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn triage_prompt(evidence: Evidence<'_>) -> String {
     let decision = evidence.decision;
     let slug = &decision.spec_slug;
@@ -395,12 +390,101 @@ pub fn triage_prompt(evidence: Evidence<'_>) -> String {
     )
 }
 
+/// The shape a local model is sampled into.
+///
+/// A grammar the sampler enforces, which the CLI path has no equivalent of — there the shape is
+/// asked for in the prompt and checked afterwards by [`parse_answer`]. Both arms end at that same
+/// parse, so a local answer is not trusted more for having been constrained; it is only likelier to
+/// arrive as JSON at all. `map_intent::extraction_format` takes the same posture, and `web::summarise`
+/// took it first.
+///
+/// **`verdict` is a bare string and NOT `enum: ["flagged", "silenced"]`, and that omission is the
+/// whole of this function.** The enum looks like the way to make [`Unreadable::ThirdVerdict`]
+/// unreachable. It does the opposite, and `extraction_format` already argues the identical case for
+/// §4.1's type A: a grammar with nowhere to put a third answer does not stop the model having one,
+/// it makes the model spell its confusion as one of the two — so a confused *approved* arrives as
+/// `silenced` carrying a reason that reads like an approval, and the parse can no longer tell it
+/// from a real silence. That is §13's residual risk manufactured by the sampler rather than by the
+/// model, and it would defeat
+/// `a_model_that_answers_approved_is_a_parse_failure_and_not_a_silence` before it ran. A grammar
+/// that admits the third value which this parse then refuses is what keeps the failure visible.
+///
+/// **No `minLength` on `reason` either**, for the same shape of reason. Forcing a non-empty string
+/// out of a model that had nothing to say produces a filled column and an empty thought, which is
+/// worse than the row that never lands — and §6.2 makes that column §13's only mitigation.
+fn triage_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string"},
+            "reason": {"type": "string"}
+        },
+        "required": ["verdict", "reason"]
+    })
+}
+
+/// Ask one brain about one decision, and hand back exactly what it said.
+///
+/// **The raw text and not an [`Answer`], which is the seam this signature exists to keep open.**
+/// *Nobody answered* and *somebody answered something that is not a judgement* are two different
+/// facts about a decision, they send whoever is debugging to two different places — the machine and
+/// the prompt — and a function that parsed here could only ever report one of them. The caller gets
+/// an `Err` for the first and an [`Unreadable`] from [`parse_answer`] for the second, and counts
+/// them apart.
+///
+/// **Which brain is the parameter and there is no fallback**, exactly as `map_intent::extract` has
+/// it: the owner picked, and a `local` that quietly became a `cloud` would break the two promises
+/// that word carries — the machine and the bill — at once. The type is `map_intent`'s own rather
+/// than a second copy of it, because a second enum is a second place to add a brain, and the reason
+/// it has two arms is behavioural and holds here unchanged: `OllamaRunner` wears the
+/// [`crate::runner::CommandRunner`] trait while imposing the mail-triage `{id, class, summary}`
+/// grammar on every prompt it is handed, so a judgement sent through it comes back as a triage
+/// array and parses to nothing.
+///
+/// The local window is `triage::LOCAL_NUM_CTX`, and unlike the extraction next door that is not a
+/// window this machine has failed to prove: the startup probe establishes exactly this size, and a
+/// triage prompt is one decision plus at most [`MAX_LISTED_PATHS`] paths twice over. The extraction
+/// asks for four times it because a spec runs to 60 000 bytes; this does not, so it does not.
+pub async fn ask(
+    asked: crate::map_intent::Extractor<'_>,
+    evidence: Evidence<'_>,
+) -> std::io::Result<String> {
+    let prompt = triage_prompt(evidence);
+    match asked {
+        crate::map_intent::Extractor::Cli(runner) => {
+            crate::map_intent::ask_once(runner, prompt, "triage").await
+        }
+        crate::map_intent::Extractor::Loopback {
+            client,
+            base_url,
+            model,
+        } => {
+            crate::runner::ollama_chat(
+                client,
+                base_url,
+                model,
+                &prompt,
+                serde_json::json!({
+                    "num_ctx": crate::triage::LOCAL_NUM_CTX,
+                    // Zero, because the question has one right answer about one decision and a
+                    // sampled one would make a re-run disagree with itself over evidence that had
+                    // not moved — and `inputs_digest` is built on the premise that unchanged inputs
+                    // deserve no second call.
+                    "temperature": 0
+                }),
+                Some(triage_format()),
+                false,
+            )
+            .await
+        }
+    }
+}
+
 /// One judgement, read off a model's answer and ready for the table.
 ///
 /// Deliberately not [`crate::map_store::Judged`]: that one carries `computed_at`, the model's name
 /// and the digest, which are facts about the RUN and not about the answer. A parse that returned
 /// them would have to invent two of the three.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub judgement: Judgement,
@@ -425,7 +509,6 @@ pub struct Answer {
 /// with a reason that reads like an approval, and the parse can no longer tell. A grammar that
 /// admits a third value which this parse then refuses keeps the failure visible, which is the whole
 /// point of the enum below.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreadable {
     /// Nothing shaped like an answer came back — prose, an apology, an empty string.
@@ -509,8 +592,6 @@ struct RawAnswer {
 ///
 /// Prose around the JSON is tolerated, through the same `json_object` `map_intent` uses — models
 /// wrap answers in fences and apologies, and refusing those would spend a model call on a habit.
-// Task 3 of this slice feeds this a real answer. Delete this attribute then.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_answer(answer: &str) -> Result<Answer, Unreadable> {
     let Some(raw) = crate::map_intent::json_object(answer)
         .and_then(|slice| serde_json::from_str::<RawAnswer>(slice).ok())
@@ -630,9 +711,6 @@ fn anchor_tag(anchor: &crate::map_join::Anchor) -> &'static str {
 /// a stored value that names the function that produced it is the only way anybody tells the two
 /// apart afterwards. The hex itself comes from `workflows::hash_of`, which is this codebase's one
 /// spelling of *sha256 these bytes*; a second one would be a second answer to *did this change*.
-// Task 3 of this slice computes these per decision and compares them; Task 4 reads them back into
-// the map. Delete this attribute then.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn inputs_digest(evidence: Evidence<'_>) -> String {
     digest_against(evidence, TRIAGE_PROMPT_VERSION)
 }
@@ -694,9 +772,6 @@ fn digest_against(evidence: Evidence<'_>, prompt_version: u32) -> String {
 ///
 /// Trimmed on both sides before comparing: whitespace that crossed a text boundary is not a
 /// different answer, and this working tree is CRLF.
-// Task 3 of this slice asks it per decision before spending a model call; Task 4 asks it again
-// before counting a judgement into the header. Delete this attribute then.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_current(recorded: &str, current: &str) -> bool {
     let recorded = recorded.trim();
     !recorded.is_empty() && recorded == current.trim()

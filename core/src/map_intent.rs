@@ -287,7 +287,13 @@ fn extraction_format() -> serde_json::Value {
     })
 }
 
-/// How many `assistant` events one extraction may emit before the daemon stops reading.
+/// How many `assistant` events one question may emit before the daemon stops reading.
+///
+/// **Both of the model's entrances, and not just this one.** §6 has the model compress twice — a
+/// spec into decisions here, one node into a judgement in [`crate::map_triage`] — and both go
+/// through [`ask_once`], so this ceiling governs both. It was named for extraction while extraction
+/// was the only caller; the name was corrected rather than left to imply that the triager runs
+/// under a rule nobody wrote down.
 ///
 /// **Not `1`, and the reason is that the ceiling counts something other than what "ask once" means.**
 /// [`crate::runner::over_turn_ceiling`] is `turns >= ceiling` and
@@ -304,7 +310,7 @@ fn extraction_format() -> serde_json::Value {
 /// arriving as more than one event — a `turn.completed` beside the `assistant` is already two — not
 /// a run that will not converge. Four is that margin and nothing more; it is not a number this is
 /// expected to approach.
-const MAX_EXTRACTION_TURNS: i64 = 4;
+const MAX_ANSWER_TURNS: i64 = 4;
 
 /// Who is being asked, which is the whole of the owner's choice.
 ///
@@ -320,6 +326,10 @@ const MAX_EXTRACTION_TURNS: i64 = 4;
 /// it that way, and this is the fourth. The cost is one `match` in one function; the alternative
 /// was making the grammar per-request in the runner, which would rewrite shipped mail triage to
 /// serve a feature that had not shipped yet.
+// Copy because it is four references and nothing else, and because `map_triage::ask` is called
+// once per decision in a loop: a choice the owner made once should not have to be rebuilt for every
+// question it governs.
+#[derive(Clone, Copy)]
 pub enum Extractor<'a> {
     /// The agent CLI, through the trait every runner implements.
     Cli(&'a dyn crate::runner::CommandRunner),
@@ -347,14 +357,19 @@ pub async fn extract(
     spec_slug: &str,
     source: &str,
 ) -> std::io::Result<Vec<Extracted>> {
-    let runner = match asked {
-        Extractor::Cli(runner) => runner,
+    let answer = match asked {
+        Extractor::Cli(runner) => {
+            ask_once(runner, extraction_prompt(spec_slug, source), "extraction").await?
+        }
         Extractor::Loopback {
             client,
             base_url,
             model,
         } => {
-            let answer = crate::runner::ollama_chat(
+            // Straight to the same parse the other arm ends at, with no `extract_reply` on the way:
+            // there is no stream to unwrap here, because `ollama_chat` returns `message.content`,
+            // which is the model's words and nothing else.
+            crate::runner::ollama_chat(
                 client,
                 base_url,
                 model,
@@ -374,20 +389,46 @@ pub async fn extract(
                 Some(extraction_format()),
                 false,
             )
-            .await?;
-            // Straight to the same parse the other arm ends at. There is no `extract_reply` here
-            // because there is no stream to unwrap: `ollama_chat` returns `message.content`, which
-            // is the model's words and nothing else.
-            return Ok(parse_extraction(&answer));
+            .await?
         }
     };
+    Ok(parse_extraction(&answer))
+}
 
+/// Ask the agent CLI one question, with no tools, and hand back what it said.
+///
+/// **One builder for both of the model's entrances (§6), and that is the whole reason it exists.**
+/// The extraction here and the triage in [`crate::map_triage`] want precisely the same run — one
+/// prompt, no tools, no resume, read the answer, done — and every field below is a decision about
+/// what such a run may do. Spelled out twice, the two copies would agree only while somebody kept
+/// them agreeing, and the fields most likely to drift are the ones it would hurt most to drift on:
+/// `tool_policy`, `steerable` and `env` are what a run CAN do rather than what it happens to do.
+///
+/// `what` names the run in the failure, and only there — *the extraction run failed* and *the triage
+/// run failed* send whoever reads the log to two different halves of this feature.
+///
+/// **A run that failed says so, rather than arriving as an answer.** The CLI runner reports most
+/// failures as `Ok` with a non-zero code and not as `Err` — a tool policy the `init` event
+/// contradicted, a progress deadline, a turn ceiling, a stream that died mid-transcript, or the
+/// CLI's own non-zero exit. Every one of those means nobody finished reading, and letting them fall
+/// through to a parse would produce an empty answer: for the extraction that is "this spec decided
+/// nothing", which is the collapse `a_runner_that_fails_is_reported_rather_than_read_as_an_empty_spec`
+/// exists to forbid; for the triage it is a decision nobody looked at, reported as one that was.
+///
+/// Safe because a clean run's code is the CLI process's own, which is 0 — every other arm of the
+/// runner's `match` is a named failure. `stderr` travels with it, because "the run failed" and "the
+/// run was stopped after 4 turns" are different things to find in a log.
+pub(crate) async fn ask_once(
+    runner: &dyn crate::runner::CommandRunner,
+    prompt: String,
+    what: &str,
+) -> std::io::Result<String> {
     // Every field is spelled out because `RunRequest` deliberately has no `Default` — its own doc
     // comment says why: a flag added later must not silently inherit a value nobody chose. Copied
     // from `council.rs`'s cloud seat, which is the closest neighbour (one question, no tools, no
     // resume), and changed only where this call differs.
     let request = crate::runner::RunRequest {
-        prompt: extraction_prompt(spec_slug, source),
+        prompt,
         // Nothing to reach, so nothing to carry. A run with no tools cannot spend a token, and one
         // handed a key it has no door for is a key that leaked for no reason.
         env: Vec::new(),
@@ -401,8 +442,8 @@ pub async fn extract(
         tool_policy: crate::runner::ToolPolicy::None,
         progress_timeout: None,
         // Asks once and reads the answer — but the ceiling counts events, not questions, so the
-        // number that expresses "once" is not `1`. See [`MAX_EXTRACTION_TURNS`].
-        max_turns: Some(MAX_EXTRACTION_TURNS),
+        // number that expresses "once" is not `1`. See [`MAX_ANSWER_TURNS`].
+        max_turns: Some(MAX_ANSWER_TURNS),
         session_id: None,
         fork_session: false,
         // Nobody is watching this stream; the answer is read once, whole, at the end.
@@ -450,35 +491,27 @@ pub async fn extract(
 
     let outcome = runner.run_prompt(request, session_tx, transcript).await?;
 
-    // **A run that failed says so, rather than arriving as a document that decided nothing.** The
-    // CLI runner reports most failures as `Ok` with a non-zero code and not as `Err` — a tool policy
-    // the `init` event contradicted, a progress deadline, a turn ceiling, a stream that died
-    // mid-transcript, or the CLI's own non-zero exit. Every one of those means nobody finished
-    // reading the spec, and letting them fall through to `parse_extraction` would produce an empty
-    // list: exactly the collapse `a_runner_that_fails_is_reported_rather_than_read_as_an_empty_spec`
-    // exists to forbid, reached by the door that does not look like a failure.
-    //
-    // Safe because a clean run's code is the CLI process's own, which is 0 — every other arm of the
-    // runner's `match` is a named failure. `stderr` travels with it, because "the run failed" and
-    // "the run was stopped after 4 turns" are different things to find in a log.
+    // See this function's doc comment: a non-zero code is the CLI's ordinary way of reporting a
+    // failure, and reading one as an answer is the collapse both of the model's entrances have to
+    // refuse.
     if outcome.exit_code != 0 {
         return Err(std::io::Error::other(format!(
-            "the extraction run failed with exit code {}: {}",
+            "the {what} run failed with exit code {}: {}",
             outcome.exit_code,
             outcome.stderr.trim()
         )));
     }
 
-    // The two paths into this arm do not answer in the same shape, and this is the seam where that
-    // shows. `ClaudeCliRunner` puts the whole `--output-format stream-json` transcript into `stdout`,
-    // one event per line, with the answer inside the final `result`. Handed that stream,
-    // `parse_extraction` takes the first `{` and the last `}` of the WHOLE thing and deserialises
-    // nothing — so every cloud extraction would come back "this spec decided nothing" while the
-    // model had in fact answered. `extract_reply` is what the rest of this daemon uses for exactly
-    // that (`team.rs`, `voice.rs`, `assistant.rs`), and it returns `None` for an answer that is not
-    // a stream, so a runner answering in plain text passes through it untouched.
-    let answer = crate::runner::extract_reply(&outcome.stdout).unwrap_or(outcome.stdout);
-    Ok(parse_extraction(&answer))
+    // The CLI and a plain-text runner do not answer in the same shape, and this is the seam where
+    // that shows. `ClaudeCliRunner` puts the whole `--output-format stream-json` transcript into
+    // `stdout`, one event per line, with the answer inside the final `result`. Handed that stream,
+    // a parse that takes the first `{` and the last `}` of the WHOLE thing deserialises nothing —
+    // so every cloud extraction would come back "this spec decided nothing" while the model had in
+    // fact answered, and every cloud triage would come back unreadable. `extract_reply` is what the
+    // rest of this daemon uses for exactly that (`team.rs`, `voice.rs`, `assistant.rs`), and it
+    // returns `None` for an answer that is not a stream, so a runner answering in plain text passes
+    // through it untouched.
+    Ok(crate::runner::extract_reply(&outcome.stdout).unwrap_or(outcome.stdout))
 }
 
 use std::path::Path;
@@ -950,7 +983,7 @@ mod tests {
             "Some(1) stops the stream on the first answer, before the result event"
         );
         assert!(
-            !crate::runner::over_turn_ceiling(after_one_answer, Some(MAX_EXTRACTION_TURNS)),
+            !crate::runner::over_turn_ceiling(after_one_answer, Some(MAX_ANSWER_TURNS)),
             "the ceiling this asks for lets one answer finish"
         );
         // A `turn.completed` beside the `assistant` is already two events for one answer, which is
@@ -960,7 +993,7 @@ mod tests {
         assert_eq!(after_completion, 2);
         assert!(!crate::runner::over_turn_ceiling(
             after_completion,
-            Some(MAX_EXTRACTION_TURNS)
+            Some(MAX_ANSWER_TURNS)
         ));
     }
 

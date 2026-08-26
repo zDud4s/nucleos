@@ -210,14 +210,20 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // `map/decisions` is the pile nobody has read yet: sentences a model lifted out of a document
     // already sitting in that project's folder. A reader who reaches `map` and `cat` can read the
     // spec they came from whole, so the extract of it grants nothing they did not already have.
-    // Only the GET. `POST /projects/{id}/map/extract`, `POST /projects/{id}/map/decisions/{n}` and
-    // `POST /projects/{id}/map/stamps` are in NO table, here or in `RUN_CREATING_ROUTES`, which
-    // leaves them to Admin and the control token by default-deny — and all three belong there.
-    // Extracting spends a model, which a read-only key never bought; approving is what puts a line
-    // in the map. Neither is a read, and neither is a thing done on the owner's behalf by a weaker
-    // key.
+    // Only the GET. `POST /projects/{id}/map/extract`, `POST /projects/{id}/map/decisions/{n}`,
+    // `POST /projects/{id}/map/stamps` and `POST /projects/{id}/map/triage` are in NO table, here
+    // or in `RUN_CREATING_ROUTES`, which leaves them to Admin and the control token by
+    // default-deny — and all four belong there. Extracting spends a model, which a read-only key
+    // never bought; approving is what puts a line in the map. Neither is a read, and neither is a
+    // thing done on the owner's behalf by a weaker key.
     //
-    // The third has the sharpest claim of the three, and it is worth writing down because the
+    // The fourth is the extraction's argument doubled and is listed rather than left implied,
+    // because an enumeration that stopped at three is how the next reader concludes the triage
+    // route was weighed and allowed: it spends a model PER DECISION, so a read-only key that could
+    // reach it could spend a whole backlog's worth of somebody else's money in one request. It
+    // takes no id at all, which makes the exposure the entire project rather than one line.
+    //
+    // The third has the sharpest claim of the four, and it is worth writing down because the
     // absence of a row is the entire enforcement and an absence explains nothing to whoever reads
     // this next. A stamp is the owner's VERDICT — *está como quero* — and §6 of the map spec takes
     // that one act away from the model on purpose: the model may compress a spec and may say a node
