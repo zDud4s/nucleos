@@ -48,6 +48,7 @@ mod notify;
 mod ownership;
 mod pii_shadow;
 mod presets;
+mod pressure;
 mod priority;
 mod process_tree;
 mod project_commands;
