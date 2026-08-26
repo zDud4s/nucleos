@@ -2698,7 +2698,7 @@ impl DirectorNode {
 /// The row a launch writes before anything is spawned, so the run exists for the hook to resolve a
 /// mode from and for reconciliation to find if the daemon dies here.
 ///
-/// **`read_untrusted` is set in THIS statement and never in a second one**, for the reason 0117
+/// **`read_untrusted` is set in THIS statement and never in a second one**, for the reason 0121
 /// gives about `runs.from_relay_id`: a run born holding a colleague's words cannot be allowed to
 /// exist without saying so. The gap between an INSERT and a follow-up UPDATE is a window in which a
 /// node carrying a stranger's text, quoted into its own prompt, reads as a turn that has read
@@ -4054,11 +4054,26 @@ pub async fn delete_team_run(
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
     // Before the run, like the items and for the same reason: `team_notes.team_run_id` is a real
-    // foreign key, and `foreign_keys` is ON. A note left behind does not become an orphan, it makes
-    // the DELETE below fail — loudly, which is why the constraint is there. `team_actions` shows the
-    // other half of that bargain being forgotten: it carries the same reference and nothing anywhere
-    // deletes from it.
+    // foreign key and `foreign_keys` is ON, so a note left behind does not become an orphan — it
+    // makes the DELETE below fail. That is what the constraint is FOR, and it is only worth having
+    // if somebody remembers the other half.
     crate::team_notes::delete_for_run(&state.pool, &id)
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
+    // And the actions, which carried the identical reference since 0086 with nothing anywhere
+    // deleting them. Deleting a department that had used its alçada answered 500 with `FOREIGN KEY
+    // constraint failed` and named nothing — a run that never asked for anything deleted fine, which
+    // is why it went unseen. `a_department_that_asked_for_something_can_still_be_deleted` is what
+    // keeps it seen.
+    //
+    // The `proposals` rows they point at are deliberately LEFT. `team_actions.proposal_id` is a
+    // logical reference and not a constraint, and what a person was asked to approve is a fact about
+    // that person's queue — it does not stop having happened because the department that asked has
+    // been tidied away. Same reasoning as `runs.team_run_id` being nulled rather than cascaded, one
+    // statement up.
+    sqlx::query("DELETE FROM team_actions WHERE team_run_id = ?")
+        .bind(&id)
+        .execute(&state.pool)
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
     sqlx::query("DELETE FROM team_runs WHERE id = ?")
@@ -5472,6 +5487,52 @@ mod tests {
         .unwrap();
 
         (director_run, specialist_run)
+    }
+
+    /// A department that used its alçada can still be deleted afterwards.
+    ///
+    /// **A pre-existing bug, found by reading the schema while designing `team_notes`.**
+    /// `team_actions.team_run_id` is `TEXT NOT NULL REFERENCES team_runs(id)` (0086), `storage.rs`
+    /// runs with `foreign_keys` ON, and `delete_team_run` deletes `team_items` and `team_runs` and
+    /// nothing else — so the DELETE fails with `FOREIGN KEY constraint failed` and the owner gets a
+    /// 500 naming nothing. It bites only a run that actually asked for something, which is why it
+    /// went unnoticed: a department that never used its alçada deletes fine.
+    ///
+    /// `team_notes` was designed around this rather than repeating it: it carries the same NOT NULL
+    /// reference AND `delete_team_run` clears it, which is the whole bargain — the constraint is
+    /// what makes forgetting loud, and it is only worth having if somebody remembers.
+    ///
+    /// The proposal is left behind on purpose, exactly as `runs.team_run_id` is nulled rather than
+    /// cascaded: what a person was asked to approve is a fact about that person's queue, and it does
+    /// not stop existing because the department that asked has been tidied away.
+    #[tokio::test]
+    async fn a_department_that_asked_for_something_can_still_be_deleted() {
+        let (state, _root) = state_with_root().await;
+        let id = team_with_grant(&state, "send_email", "propose").await;
+        ask(&state, &id, "send_email", an_email())
+            .await
+            .expect("the alçada was granted");
+
+        // Only a finished run may be deleted, which is the route's own first check.
+        sqlx::query("UPDATE team_runs SET state = 'done' WHERE id = ?")
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let outcome = delete_team_run(State(state.clone()), Path(id.clone())).await;
+
+        assert!(
+            outcome.is_ok(),
+            "a department that used its alçada could not be deleted: {:?}",
+            outcome.err()
+        );
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_runs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     // -----------------------------------------------------------------------------------------

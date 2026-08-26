@@ -36,9 +36,31 @@
 -- is a historical fact about a conversation that a later archival of that conversation must not be
 -- able to invalidate or cascade into deleting.
 --
--- 0117: the highest number any branch in this repository has claimed so far is 0116, and this
--- worktree's own `core/migrations/` only reaches 0109 — see 0109's own header for what it costs to
--- guess low and be wrong.
+-- **Cut as 0117, moved to 0121, and the move is the seventh time this repository has had two files
+-- claim one version.** The header this replaces said, truthfully at the time, that 0116 was the
+-- highest any branch had claimed. Six and a half hours later `feat/mapa-juncao` committed
+-- `0117_map_decisions.sql`, and this is the part every previous collision's header warned about and
+-- that no previous one caught in time: **`map decisions` is APPLIED, successfully, on the live
+-- database of this machine.** Not proposed on a branch — recorded in `_sqlx_migrations`, version
+-- 117, by a daemon the owner runs.
+--
+-- That is what settles which of the two moves, and it is not seniority. `0084_runs_team_run_id.sql`
+-- states the rule as "the BRANCH gives way, master's lineage stands"; the principle underneath it is
+-- that what has already been APPLIED cannot move, because moving it means a checksum mismatch on a
+-- database somebody depends on. Master is the usual holder of that property and here it is not the
+-- only one. This file was chronologically first by six hours and it is still the one that gives way,
+-- because the other one is in a table and this one is in a branch.
+--
+-- The symptom, had this not moved: `sqlx::migrate!` finds version 117 already applied with a
+-- different checksum and refuses to start the daemon. There is a backup in the data directory named
+-- `pre-117-rollback-2026-08-26` — somebody hit exactly this and undid it by hand.
+--
+-- 0121 and not 0118, which was also free: 0118, 0119 and 0120 are this branch's own and already
+-- written. Sliding all four down by one to close a hole would be rewriting three files to save one
+-- number, and 0084's rule says the opposite anyway — a branch's files go to the TOP, and holes below
+-- belong to whoever has not landed yet. Nothing here depends on running before them: 0118 adds a
+-- column to `runs`, 0119 and 0120 build tables of their own, and none of the three touches
+-- `chat_relays` or `runs.from_relay_id`.
 CREATE TABLE chat_relays (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     from_chat_id        TEXT NOT NULL,

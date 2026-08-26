@@ -279,7 +279,7 @@ pub async fn enqueue_relayed(
 /// `relay_id` is written into the same INSERT that creates the row, not added by an UPDATE once the
 /// message is queued. A queued message already sits between two writes with nothing else guarding
 /// it — the enqueue and the eventual drain — and a second statement here would open a window in
-/// which the row exists with no relay recorded, exactly the gap 0117's header warns `runs` against.
+/// which the row exists with no relay recorded, exactly the gap 0121's header warns `runs` against.
 async fn enqueue_inner(
     pool: &SqlitePool,
     chat_id: &str,
@@ -372,7 +372,7 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
                     AND r.status NOT IN ('running', 'pending')
                     AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS waiting,
                 -- The same predicate, narrowed by the one column that says a turn was handed over
-                -- (0117). Written out rather than derived from `waiting` because SQLite has no way
+                -- (0121). Written out rather than derived from `waiting` because SQLite has no way
                 -- to reuse a select-list alias in a sibling expression, and a subquery that
                 -- disagreed with the one above by a word would be a count nobody could reconcile.
                 (SELECT COUNT(*) FROM runs r

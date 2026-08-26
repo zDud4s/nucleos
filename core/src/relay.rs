@@ -90,10 +90,10 @@ pub fn admits(chain: &[&str], to: &str) -> Verdict {
 /// Root first, and INCLUDES `run_id`'s own conversation — the same convention `admits` documents
 /// for `chain`, so a chain this function returns can be handed to `admits` unmodified. The walk
 /// follows `runs.from_relay_id` to `chat_relays.sending_run_id` to that run's own `from_relay_id`,
-/// and so on, stopping at a run whose `from_relay_id` is NULL: by construction (0117) that is a
+/// and so on, stopping at a run whose `from_relay_id` is NULL: by construction (0121) that is a
 /// turn a person wrote, not one handed on by another conversation, and every real chain bottoms
 /// out there. `chat_relays.depth` is deliberately not read — it is convenience for a human reading
-/// the table, not the authority the walk answers to; see 0117's header. The chain is DERIVED, never
+/// the table, not the authority the walk answers to; see 0121's header. The chain is DERIVED, never
 /// stored, and this walk is what a caller trusts when it and `depth` could ever disagree.
 ///
 /// **Bounded, not merely optimistic.** `admits` refuses, at write time, any relay that would carry
@@ -215,7 +215,7 @@ pub enum Refusal {
 /// forgotten.
 ///
 /// **`depth`, on the row this writes, is `chain.len()` — the chain as it stood before this hop, not
-/// after.** 0117's worked example is the check: the first relay out of a person's turn (a chain of
+/// after.** 0121's worked example is the check: the first relay out of a person's turn (a chain of
 /// one) is written with `depth = 1`, the next with `depth = 2`, and so on. It is read back by
 /// nobody this function trusts; `chain_of` re-derives the true chain on every read, per that
 /// migration's own header, so this column can only ever be a courtesy to a person skimming the
@@ -334,7 +334,7 @@ pub async fn admit(
 /// other side once the receiving turn exists.
 ///
 /// **Auditing, and its failure mode says so.** `Result` is returned rather than swallowed, but no
-/// caller may treat an `Err` as a failed turn: 0117's header is explicit that the property this
+/// caller may treat an `Err` as a failed turn: 0121's header is explicit that the property this
 /// module protects — that a chain is always reconstructible, and therefore always boundable —
 /// hangs entirely on `runs.from_relay_id`, written in the same INSERT that creates the run.
 /// `chain_of` walks that column and never this one. What is lost when this write fails is a
@@ -445,7 +445,7 @@ mod tests {
         );
     }
 
-    /// Builds the worked example from 0117's header by hand — a person's turn in A, relayed to B,
+    /// Builds the worked example from 0121's header by hand — a person's turn in A, relayed to B,
     /// relayed on to C — and checks that `chain_of` walks back to exactly that, root first. The
     /// second assertion is the base case rather than an afterthought: a chain of one IS what "a
     /// person wrote this, nothing relayed yet" looks like, and a walk that mishandled it would

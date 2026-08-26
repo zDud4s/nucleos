@@ -5,7 +5,7 @@
 -- it survives. Until now it lived for the length of one function call: `send_message` took it as a
 -- parameter, routed on it, and dropped it. Nothing downstream could ever ask again.
 --
--- 0117 is what made that gap cost something. `relay::admit` refuses a relay sent by a Telegram
+-- 0121 (cut as 0117 — see its header) is what made that gap cost something. `relay::admit` refuses a relay sent by a Telegram
 -- turn, `relay::Refusal::TelegramOrigin` is the variant, and there was no way to reach it: the one
 -- production caller (`http::relay_send_to_chat`) had no truer answer than `Origin::Shell` to hand
 -- it, so the brake was written, tested, and unreachable — a security boundary that reads as live

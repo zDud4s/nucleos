@@ -30,8 +30,9 @@
 --
 -- Numbered 0120, above this branch's own 0119. The rule from `0084_runs_team_run_id.sql` stands and
 -- is the reason to say so here: this branch's migrations move together and ALWAYS TO THE TOP when
--- they land, never into a hole master happens to have. See 0119's header for the collision already
--- open at 0117.
+-- they land, never into a hole master happens to have. See 0121's header for the collision that was
+-- open at 0117 and how it was settled: what has already been APPLIED cannot move, whichever file was
+-- written first.
 
 -- Where this run reports, or NULL for the vast majority that report nowhere.
 --

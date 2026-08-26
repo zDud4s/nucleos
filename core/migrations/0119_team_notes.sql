@@ -31,14 +31,15 @@
 -- trade for exactly this reason, and its comment says so — as an action it would have been shut by
 -- the errand's own first `web_read`.
 --
--- Numbered 0119. This worktree holds 0117 and 0118; the highest any branch claims is 0118, also
--- this one. That is not enough on its own and the rule from `0084_runs_team_run_id.sql` stands:
--- this branch's files move together and ALWAYS TO THE TOP when they land, never into a hole master
--- happens to have — the holes belong to branches that have not landed yet, and filling one only
--- moves the collision onto somebody else. There is already one open: `0117_chat_relays.sql` on this
--- branch and `0117_map_decisions.sql` on `feat/mapa-juncao` both claim 0117, which makes seven.
--- `storage.rs::no_two_migrations_claim_the_same_version` is what turns that into a red gate at
--- integration instead of a panic in front of a person.
+-- Numbered 0119, and the rule from `0084_runs_team_run_id.sql` stands: this branch's files move
+-- together and ALWAYS TO THE TOP when they land, never into a hole master happens to have — the
+-- holes belong to branches that have not landed yet, and filling one only moves the collision onto
+-- somebody else.
+--
+-- 0117 is exactly such a hole now. This branch cut a `0117_chat_relays.sql`, `feat/mapa-juncao` cut
+-- a `0117_map_decisions.sql` six hours later, and the second one is APPLIED on this machine's live
+-- database — so ours moved to 0121 rather than the other way round. See that file's header: what has
+-- been applied cannot move, whichever was written first.
 CREATE TABLE team_notes (
     id                  INTEGER PRIMARY KEY,
 

@@ -1321,7 +1321,7 @@ pub async fn send_relayed_or_queue(
 /// The shared body behind `send_message_with` and `send_relayed_message`.
 ///
 /// `relay_id` is written into the `INSERT INTO runs` below in the same statement that creates the
-/// row — never by an `UPDATE` once the id is known. That is the property 0117 exists for: an INSERT
+/// row — never by an `UPDATE` once the id is known. That is the property 0121 exists for: an INSERT
 /// followed by an UPDATE has a window in which a relay-born run sits with `from_relay_id IS NULL`,
 /// and `relay::chain_of` cannot tell that window apart from a turn a person actually wrote — it
 /// would stop its walk there and hand `relay::admits` a chain that reads as one hop shorter than it
@@ -1494,7 +1494,7 @@ async fn send_message_inner(
     // After the INSERT and not inside it, because the run's id does not exist until the run does —
     // which is exactly why this pointer and `runs.from_relay_id` are not equally trusted. That one
     // is written in the same statement as the run and is what `relay::chain_of` walks; this one is
-    // a second write that can fail on its own, and 0117's header says plainly that nothing
+    // a second write that can fail on its own, and 0121's header says plainly that nothing
     // security-critical may read it.
     //
     // A warning and not a refusal, therefore. The turn is already under way; undoing it because an
@@ -1854,7 +1854,7 @@ async fn spawn_local_turn(
     // After the INSERT and not inside it, because the run's id does not exist until the run does —
     // which is exactly why this pointer and `runs.from_relay_id` are not equally trusted. That one
     // is written in the same statement as the run and is what `relay::chain_of` walks; this one is
-    // a second write that can fail on its own, and 0117's header says plainly that nothing
+    // a second write that can fail on its own, and 0121's header says plainly that nothing
     // security-critical may read it.
     //
     // A warning and not a refusal, therefore. The turn is already under way; undoing it because an
@@ -4942,7 +4942,7 @@ mod tests {
     /// The relay row learns which turn answered it — the mirror of `runs.from_relay_id`, written
     /// back from the other side.
     ///
-    /// 0117 declared this column and nothing ever wrote it, so `chat_relays` could say a relay had
+    /// 0121 declared this column and nothing ever wrote it, so `chat_relays` could say a relay had
     /// been admitted and never whether it landed. That is not a security gap — `chain_of` walks
     /// `runs.from_relay_id` and never this — but it is the whole of what the table was for from a
     /// person's point of view, and a column that is NULL on every row without exception is
