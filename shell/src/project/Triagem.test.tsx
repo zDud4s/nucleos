@@ -46,6 +46,10 @@ function held(overrides: Partial<Held> = {}): Held {
     model: "cloud",
     computed_at: "2026-08-26T09:00:00Z",
     inputs_digest: "abc123",
+    // Computed by the núcleo, in the one place a row of `map_triage` becomes a value — so a fixture
+    // sets it rather than deriving it from `reason`, which is exactly the second spelling of
+    // `DAEMON_MARK` this field exists to remove.
+    machine_written: false,
     checked: true,
     ...overrides,
   };
@@ -61,7 +65,6 @@ function silencing(overrides: Partial<Silencing> = {}): Silencing {
     model: "cloud",
     computed_at: "2026-08-26T09:00:00Z",
     retired: false,
-    machine_written: false,
     ...overrides,
   };
 }
@@ -137,6 +140,14 @@ interface Open {
   recency?: Recency;
   /** §6.2's pile, as its own route answers it. */
   pile?: Silencing[];
+  /**
+   * The uncapped size of that pile. Defaults to what was handed in, which is the honest default:
+   * every fixture below writes fewer rows than the daemon's cap, so a total that differs has to be
+   * asked for explicitly.
+   */
+  pileTotal?: number;
+  /** When the triager last answered here. `null` is *never run*, and it is now a fact rather than an inference. */
+  lastTriagedAt?: string | null;
   /** What the run comes back with when the button is pressed. */
   answer?: TriageReport;
   /** Stamps that lapsed — invisible to this panel, and part of `waiting`. */
@@ -157,7 +168,10 @@ function open(options: Open = {}) {
 
   daemon.apiFetch.mockReset();
   daemon.apiFetch.mockImplementation(async (path: string) => {
-    if (path.endsWith("/map/silenced")) return options.pile ?? [];
+    if (path.endsWith("/map/silenced")) {
+      const rows = options.pile ?? [];
+      return { rows, total: options.pileTotal ?? rows.length };
+    }
     if (path.endsWith("/map/triage")) return options.answer ?? report();
     throw new Error(`no fixture for ${path}`);
   });
@@ -169,6 +183,13 @@ function open(options: Open = {}) {
       triage={triage}
       counts={tally(rows, options.lapsed ?? 0)}
       recency={recency}
+      lastTriagedAt={
+        options.lastTriagedAt === undefined
+          ? rows.some((pair) => pair.held !== undefined)
+            ? "2026-08-26T09:00:00Z"
+            : null
+          : options.lastTriagedAt
+      }
     />,
   );
 }
@@ -260,6 +281,7 @@ describe("what the triager thought, and what it never gets to decide", () => {
             judgement: "flagged",
             reason: "nucleos: o modelo respondeu e ninguem conseguiu ler a resposta.",
             model: "cloud",
+            machine_written: true,
           }),
         },
       ],
@@ -473,16 +495,35 @@ describe("what the triager thought, and what it never gets to decide", () => {
 
   /**
    * An empty pile under a heading is indistinguishable from a pile the triager looked at and found
-   * nothing in, and reading the first as the second is the false confidence this mode cures. What
-   * the map can actually see is that no judgement describes anything here and nothing was ever
-   * silenced, so the sentence says that and says what it infers from it.
+   * nothing in, and reading the first as the second is the false confidence this mode cures.
    */
   it("says plainly when the triager has never run here", async () => {
-    open({ rows: [{ row: anchored({ decision_id: 1 }) }] });
+    open({ rows: [{ row: anchored({ decision_id: 1 }) }], lastTriagedAt: null });
 
-    await waitFor(() => expect(screen.getByText(/it has never run/)).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByText(/The triager has never run on this project/)).toBeTruthy(),
+    );
     expect(screen.queryByLabelText("Decisions the triager flagged")).toBeNull();
     expect(screen.queryByLabelText("Decisions the triager silenced")).toBeNull();
+  });
+
+  /**
+   * **The correction the núcleo half of this round bought, and the reason it was worth a route
+   * change.** `triage` and its counts both describe what is true NOW: a run that flagged everything
+   * and whose answers have since gone stale empties them, and a panel inferring *never run* from
+   * that would say nobody had ever looked at a project triaged this morning. `last_triaged_at` is
+   * unfiltered by staleness on purpose, so the two fixtures below differ in nothing a reader can
+   * see except that one has been run — and the panel has to tell them apart.
+   */
+  it("does not call a project with nothing current un-triaged", async () => {
+    const never = open({ rows: [{ row: anchored({ decision_id: 1 }) }], lastTriagedAt: null });
+    expect(screen.getByText(/The triager has never run on this project/)).toBeTruthy();
+    never.unmount();
+
+    // Same empty piles — every answer that run gave has since gone stale — and a different fact.
+    open({ rows: [{ row: anchored({ decision_id: 1 }) }], lastTriagedAt: "2026-08-26T09:00:00Z" });
+    expect(screen.queryByText(/The triager has never run on this project/)).toBeNull();
+    expect(screen.getByText(/The triager last answered/)).toBeTruthy();
   });
 
   /**
@@ -502,6 +543,32 @@ describe("what the triager thought, and what it never gets to decide", () => {
     const record = await screen.findByLabelText("Silencings this map no longer holds");
     expect(within(record).getByText(/§4 Fabricar a camada/)).toBeTruthy();
     expect(within(record).getByText(/retired/i)).toBeTruthy();
+  });
+
+  /**
+   * **The daemon caps this pile, and a cap nobody is told about is the same defect as a batch that
+   * truncates in silence.** §6.2 asks for *sempre acessível*, which is not *all at once* — the table
+   * is append-only and grows with every press of the button the feature exists to encourage — so the
+   * route answers the newest page and the uncapped total beside it. The remainder is what makes the
+   * page honest, and it is said whether or not there is one.
+   */
+  it("says how much of the record this reading is not", async () => {
+    open({
+      rows: [{ row: anchored({ decision_id: 1 }) }],
+      pile: [silencing({ decision_id: 9 })],
+      pileTotal: 214,
+    });
+
+    expect(await screen.findByText(/213 older ones are not on this reading/)).toBeTruthy();
+  });
+
+  it("says so when the daemon left nothing behind", async () => {
+    open({
+      rows: [{ row: anchored({ decision_id: 1 }) }],
+      pile: [silencing({ decision_id: 9 })],
+    });
+
+    expect(await screen.findByText(/nothing was left behind by the daemon/)).toBeTruthy();
   });
 
   /**

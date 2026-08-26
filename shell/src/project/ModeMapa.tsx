@@ -103,6 +103,7 @@ function Derived({ projectId }: { projectId: string }) {
     triage_counts,
     git_would_not_answer,
     recency,
+    last_triaged_at,
   } = map.data;
   // `buildMap` rather than `imports.length`, and the difference is the whole point: this counts
   // the links the map would actually draw, which drops any edge with an end it cannot find. The
@@ -161,6 +162,7 @@ function Derived({ projectId }: { projectId: string }) {
         triage={triage}
         counts={triage_counts}
         recency={recency}
+        lastTriagedAt={last_triaged_at}
       />
     </div>
   );

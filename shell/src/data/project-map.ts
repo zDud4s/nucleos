@@ -346,6 +346,23 @@ export interface Judged {
    * marked by {@link Held.checked}.
    */
   inputs_digest: string;
+  /**
+   * This sentence was written by the daemon rather than by a model.
+   *
+   * **{@link Judged.model} names the brain that ANSWERED, and that stays true of an answer nobody
+   * could read.** `map_triage::unreadable_flag` records such a failure as a flag rather than
+   * dropping it — a confused model costs a look instead of disappearing — so the sentence in
+   * `reason` is sometimes the daemon's note about a model and not a model's note about the code.
+   * Drawn under `model` with nothing else beside it, a machine's failure note reads as an opinion,
+   * which is §6.2's attribution inverted.
+   *
+   * **Computed by the núcleo, in the one place a row of that table becomes a value.** For one slice
+   * it was not: the field sat on §6.2's pile, where `unreadable_flag` makes it provably `false`,
+   * and this client re-spelled `map_triage::DAEMON_MARK` in TypeScript to cover the pile that could
+   * actually carry the mark. A convention spelled in two languages is one that has already stopped
+   * working somewhere, so the second spelling is gone and this is the answer.
+   */
+  machine_written: boolean;
 }
 
 /**
@@ -476,16 +493,21 @@ export interface Silencing {
   computed_at: string;
   /** The decision has since been retired. On the row, because hiding it deletes a bug report by its own subject. */
   retired: boolean;
-  /**
-   * This sentence was written by the daemon rather than by a model.
-   *
-   * `model` names the brain that **answered**, which stays true of an answer nobody could read — so
-   * without this field a machine's failure note arrives on screen under a model's name, as its
-   * opinion. Always `false` on this pile today, because the one producer of a daemon-written reason
-   * may only ever reach `"flagged"`; the field is what makes that a fact a client can check rather
-   * than a convention it has to remember.
-   */
-  machine_written: boolean;
+}
+
+/**
+ * §6.2's pile as one read of it: the newest rows, and how many there are altogether.
+ *
+ * **`total` is the count before the cap and never `rows.length`.** The table is append-only and
+ * grows by up to a batch every time somebody presses the button this feature exists to encourage,
+ * on a route the window performs each time the map opens — so the read is capped. A capped list
+ * whose length is the only number available reads as the whole pile and gives its reader no way to
+ * learn otherwise, which is the same defect as a batch that truncates in silence. Print the
+ * remainder.
+ */
+export interface SilencedPile {
+  rows: Silencing[];
+  total: number;
 }
 
 /**
@@ -526,25 +548,6 @@ export interface TriageReport {
   left_over: number;
   /** In scope, and skipped because git would not say what their anchor code is. Skipped, never triaged under a failed digest. */
   unreadable_anchors: number;
-}
-
-/**
- * Did the daemon write this sentence, or did a model?
- *
- * **A duplicate of `map_triage::DAEMON_MARK`, and it is on the wrong side of the seam.** The núcleo
- * exposes the answer as a field — `machine_written` — on §6.2's pile, precisely so no client has to
- * remember a convention; but the flagged judgements on `GET /map` carry no such field, and the
- * flagged pile is the **only** place a daemon-written reason can appear today
- * (`map_triage::unreadable_flag` may only ever reach `"flagged"`). So the one payload where the
- * test is always false has it, and the one where it matters does not. Until `Held` carries the
- * field too, this is the test, written once here rather than inline in a panel — a convention with
- * two spellings is one that has already stopped working somewhere.
- *
- * A prefix test and not a parse: the rest of the sentence is prose meant for a person, and anything
- * reading structure out of it would be inventing a format the writer does not keep.
- */
-export function daemonWrote(reason: string): boolean {
-  return reason.trimStart().startsWith("nucleos:");
 }
 
 export interface ProjectMap {
@@ -618,6 +621,19 @@ export interface ProjectMap {
    * measured with the same confidence as the head.
    */
   recency: Recency;
+  /**
+   * When this project's triager last answered anything, or `null` if it never has.
+   *
+   * **The one thing {@link ProjectMap.triage} and {@link ProjectMap.triage_counts} cannot say.**
+   * Both describe what is true now, so a run that flagged everything and whose answers have since
+   * gone stale empties both — indistinguishable, from those two alone, from a project nobody has
+   * ever pressed the button on. Those are different facts, and only one of them is *nobody has
+   * looked at this with a model yet*.
+   *
+   * **Unfiltered by staleness and by standing**, so `null` means *no run has ever happened here*
+   * and never *nothing it said still stands*. The second sentence is one the counts already carry.
+   */
+  last_triaged_at: string | null;
 }
 
 /**
@@ -846,12 +862,16 @@ export function useCarimbar(projectId: string) {
  *
  * Read when the mode opens and not polled: nothing writes to this table except a run of the
  * triager, which invalidates it from {@link useTriage}.
+ *
+ * **Capped by the núcleo, which is why this answers a {@link SilencedPile} and not an array.** The
+ * remainder has to reach the screen: *sempre acessível* is not *all at once*, and a pile that
+ * quietly stopped is the same defect as a batch that quietly truncated.
  */
 export function useSilencedPile(projectId: string | null) {
   return useQuery({
     queryKey: keys.projects.mapSilenced(projectId ?? ""),
     queryFn: () =>
-      apiFetch<Silencing[]>(`/projects/${encodeURIComponent(projectId ?? "")}/map/silenced`),
+      apiFetch<SilencedPile>(`/projects/${encodeURIComponent(projectId ?? "")}/map/silenced`),
     enabled: projectId !== null && projectId !== "",
   });
 }

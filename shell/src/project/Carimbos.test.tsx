@@ -54,6 +54,7 @@ function held(decisionId: number, judgement: Held["judgement"]): Held {
     model: "cloud",
     computed_at: "2026-08-26T09:00:00Z",
     inputs_digest: "abc123",
+    machine_written: false,
     checked: true,
   };
 }

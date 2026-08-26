@@ -465,9 +465,14 @@ describe("the project workspace", () => {
           },
           git_would_not_answer: false,
           recency: { window: 200, ages: {} },
+          // `null` is *the triager has never run here*, which the panel now reads rather than
+          // infers from two empty piles — an inference that called a project triaged this morning
+          // un-triaged the moment its answers went stale.
+          last_triaged_at: null,
         };
       }
-      if (path.endsWith("/map/silenced")) return [];
+      // The pile is capped by the daemon, so it answers a page and the size it was cut from.
+      if (path.endsWith("/map/silenced")) return { rows: [], total: 0 };
       return daemonFetch(state)(path, init);
     });
     daemon.apiText.mockImplementation(daemonText(state));

@@ -1,7 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { isApiRefusal } from "../data/client";
 import {
-  daemonWrote,
   useSilencedPile,
   useTriage,
   type Age,
@@ -64,6 +63,16 @@ export interface TriagemProps {
   counts: TriageCounts;
   /** §10's ordering, and how far the walk that produced it could see. */
   recency: Recency;
+  /**
+   * When the triager last answered anything here, or `null` if it never has.
+   *
+   * **A fact and no longer an inference.** This panel used to conclude *never run* from two empty
+   * piles and hedge about it, because both of those describe what is true NOW: a run that flagged
+   * everything and whose answers have since gone stale empties them, and that is a different thing
+   * from nobody ever having pressed the button. The núcleo answers the question directly now, so
+   * the hedge is gone with it.
+   */
+  lastTriagedAt: string | null;
 }
 
 /**
@@ -90,7 +99,14 @@ interface Judged {
   held: Held;
 }
 
-export function Triagem({ projectId, junction, triage, counts, recency }: TriagemProps) {
+export function Triagem({
+  projectId,
+  junction,
+  triage,
+  counts,
+  recency,
+  lastTriagedAt,
+}: TriagemProps) {
   const pile = useSilencedPile(projectId);
 
   /*
@@ -123,19 +139,21 @@ export function Triagem({ projectId, junction, triage, counts, recency }: Triage
     razão de **cada** silenciamento"*.
   */
   const met = new Set<number>();
-  const superseded = (pile.data ?? []).filter((entry) => {
+  const superseded = (pile.data?.rows ?? []).filter((entry) => {
     const newest = !met.has(entry.decision_id);
     met.add(entry.decision_id);
     return !(newest && triage[String(entry.decision_id)]?.judgement === "silenced");
   });
 
   /*
-    Never run, as far as this map can see — and the hedge is not a hedge, it is the honest limit.
-    Nothing records *the triager ran*; what is on record is judgements and silencings. A run that
-    flagged everything and then went stale leaves both empty, which is indistinguishable from a
-    project nobody ever pressed the button on. So the sentence says what was looked for.
+    A fact, read off one field, and no longer inferred from two empty piles. The inference was
+    wrong in a way nothing on screen would have shown: `triage` and the silenced pile both describe
+    what is true NOW, so a run that flagged everything and whose answers have since gone stale
+    empties both — and the panel would have said *never run* over a project that had been triaged
+    that morning. It hedged in words because that was the strongest true sentence available to it;
+    the núcleo answers the question now, so the hedge is gone.
   */
-  const neverRun = judged.length === 0 && pile.isSuccess && (pile.data?.length ?? 0) === 0;
+  const neverRun = lastTriagedAt === null;
 
   return (
     <section aria-label="The triager" className="flex flex-col gap-6">
@@ -152,12 +170,19 @@ export function Triagem({ projectId, junction, triage, counts, recency }: Triage
 
       {neverRun ? (
         <p className="max-w-prose text-sm text-text-muted">
-          No decision here carries a judgement from the triager, and nothing has ever been silenced
-          in this project: as far as this map can see, it has never run. An empty pile under a
-          heading would look exactly like a triager that looked and found nothing, which is not what
-          happened.
+          The triager has never run on this project. Nothing below is an empty pile that a model
+          looked at and found nothing in — nothing has been looked at, which is a different answer
+          and the one that is true.
         </p>
       ) : null}
+
+      {neverRun ? null : (
+        <p className="max-w-prose text-xs text-text-muted">
+          The triager last answered <RelativeTime at={lastTriagedAt} />. Everything below is what
+          that answer became when it was read against the code as it stands now — which is not the
+          same thing, and is why a judgement can be here, gone, or unchecked.
+        </p>
+      )}
 
       <Run projectId={projectId} />
 
@@ -170,7 +195,7 @@ export function Triagem({ projectId, junction, triage, counts, recency }: Triage
 
       <Debt counts={counts} />
 
-      <Record query={pile} superseded={superseded} total={pile.data?.length ?? 0} />
+      <Record query={pile} superseded={superseded} />
     </section>
   );
 }
@@ -540,11 +565,9 @@ function Debt({ counts }: { counts: TriageCounts }) {
 function Record({
   query,
   superseded,
-  total,
 }: {
   query: ReturnType<typeof useSilencedPile>;
   superseded: Silencing[];
-  total: number;
 }) {
   if (query.isError) {
     return (
@@ -558,8 +581,14 @@ function Record({
   if (query.data === undefined) {
     return <p className="text-xs text-text-faint">Reading what the triager has silenced…</p>;
   }
+  const { rows, total } = query.data;
   if (total === 0) return null;
 
+  // What the núcleo's own cap left out, kept apart from what this panel's cap leaves out. Two
+  // truncations sit between the table and the screen and they are not the same one: the route stops
+  // at `SILENCED_PAGE` and this list stops at twelve, and a single "and N more" would let a reader
+  // believe the rest is one click away when part of it was never sent.
+  const uncollected = Math.max(0, total - rows.length);
   const { shown, hidden } = capped(superseded);
 
   return (
@@ -573,10 +602,21 @@ function Record({
         about code that has since moved, or about a decision that was retired is not an answer about
         the map as it stands — and it is worth reading more afterwards, not less.
       </p>
+      {/*
+        The núcleo's cap, said unconditionally. §6.2 asks for the pile to be *sempre acessível* and
+        the route answers the newest page of it, so the sentence a reader needs is not *here is the
+        pile* but *here is how much of it this is* — the same bargain the run's `left_over` strikes,
+        and the reason the payload carries a total that is not the length of what it sent.
+      */}
+      <p className="max-w-prose text-xs text-text-faint">
+        {uncollected === 0
+          ? "Every one of them came back on this reading — nothing was left behind by the daemon's own limit."
+          : `${uncollected} older ${plural(uncollected, "one is", "ones are")} not on this reading at all: the daemon answers the newest ${rows.length} and keeps the rest. They are in the table, and this list is not the whole record.`}
+      </p>
       {superseded.length === 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
-          All of them still describe the map, so there is nothing here you have not already seen
-          above.
+          All of the ones that came back still describe the map, so there is nothing here you have
+          not already seen above.
         </p>
       ) : (
         <>
@@ -602,7 +642,15 @@ function Record({
                   </div>
                   <p className="max-w-prose text-sm text-text">{entry.text}</p>
                   <p className="max-w-prose text-sm text-text">{entry.reason}</p>
-                  <Whose model={entry.model} machineWritten={entry.machine_written} />
+                  {/*
+                    `false`, and stated rather than read off a field, because the field is gone from
+                    this payload and its absence is the correction: `unreadable_flag` may only ever
+                    reach *flagged* and this route answers the silenced, so no row here can carry the
+                    daemon's mark. A field that can never be true is a promise somebody eventually
+                    relies on — and it was being relied on for the wrong pile, while the flags, which
+                    can carry the mark, had nothing.
+                  */}
+                  <Whose model={entry.model} machineWritten={false} />
                   {entry.retired ? (
                     <p className="max-w-prose text-xs text-text-muted">
                       That decision has since been retired, so it is not in the map any more. The
@@ -766,7 +814,7 @@ function Line({ pair, children }: { pair: Judged; children?: ReactNode }) {
       </div>
       <p className="max-w-prose text-sm text-text">{row.text}</p>
       <p className="max-w-prose text-sm text-text">{held.reason}</p>
-      <Whose model={held.model} machineWritten={daemonWrote(held.reason)} />
+      <Whose model={held.model} machineWritten={held.machine_written} />
       {held.checked ? null : (
         <p className="max-w-prose text-xs text-text-muted">
           This map could not re-check what the judgement was about — git would not say what the
@@ -789,12 +837,12 @@ function Line({ pair, children }: { pair: Judged; children?: ReactNode }) {
  * presenting a machine's failure note as a model's opinion, which is the attribution §6.2 exists to
  * protect, inverted.
  *
- * **The test is a prefix and it is done in the shell for the flagged pile only because the wire does
- * not carry it there.** `GET /map/silenced` sends `machine_written` on every row precisely so no
- * client has to remember a convention — and no row of that pile can carry the mark, because the one
- * producer of a daemon-written reason may only ever reach *flagged*. So the payload where the answer
- * is always `false` has the field, and the payload where it can be `true` does not. Until `Held`
- * carries it, this component takes whichever the caller has.
+ * **The test lives in the núcleo and is spelled once**, on the payload that can carry the mark.
+ * For one slice it was the other way round — the field sat on §6.2's pile, where it is provably
+ * always `false`, and this shell re-spelled `map_triage::DAEMON_MARK` as a TypeScript literal to
+ * cover the flags, which are the only rows a `nucleos:` sentence can appear on. A convention with
+ * two spellings is one that has already stopped working somewhere, and this one decides an
+ * attribution §6.2 exists to protect.
  */
 function Whose({ model, machineWritten }: { model: string; machineWritten: boolean }) {
   if (machineWritten) {
