@@ -1,13 +1,23 @@
 import { useProjectMap } from "../data/project-map";
 import { buildMap } from "../canvas/map-model";
+import { ExtrairSpec } from "./ExtrairSpec";
+import { MapaPorAprovar } from "./MapaPorAprovar";
 
 /**
- * "What is in here, and what did nobody ask for?"
+ * "What is in here, what did nobody ask for, and what did this project actually decide?"
  *
- * This slice draws the structure layer only. There are no stamps, no decisions and no triage
- * — and the mode says so in words rather than showing a map that looks complete and is not.
- * A surface that implies it has layers it does not have is the false confidence again, with
- * better pixels.
+ * Two of the three layers are here now: the structure, derived off disk and always true, and the
+ * intention — a model reading one spec and proposing the decisions it fixes, which nothing enters
+ * the map without the owner answering line by line. Evidence and stamps are not, and the mode says
+ * so in words rather than showing a map that looks complete and is not. A surface that implies it
+ * has layers it does not have is the false confidence again, with better pixels.
+ *
+ * **The three panels below read three different questions, and one failing does not silence the
+ * others.** The structure is derived by walking the project's folder; the pile is a table the
+ * daemon answers without touching disk at all — `get_project_map_decisions` resolves the row and
+ * never the folder, deliberately, "so a project whose folder has moved still has a pile, which is
+ * exactly what somebody looking at a broken project wants". A mode that returned a single sentence
+ * on the first failure would take that away for no reason.
  */
 
 export interface ModeMapaProps {
@@ -15,6 +25,21 @@ export interface ModeMapaProps {
 }
 
 export function ModeMapa({ projectId }: ModeMapaProps) {
+  return (
+    <div className="flex flex-col gap-8">
+      <Structure projectId={projectId} />
+      <ExtrairSpec projectId={projectId} />
+      <MapaPorAprovar projectId={projectId} />
+      <p className="text-sm text-text-muted">
+        Structure and intention. Evidence and stamps are slices that do not exist yet, so nothing
+        here yet says whether the code keeps what you approved.
+      </p>
+    </div>
+  );
+}
+
+/** The structure layer: what modules exist, and how many of them declare nothing they implement. */
+function Structure({ projectId }: { projectId: string }) {
   const map = useProjectMap(projectId);
 
   if (map.isError) {
@@ -37,24 +62,19 @@ export function ModeMapa({ projectId }: ModeMapaProps) {
   const undeclared = modules.filter((module) => !module.declares).length;
 
   return (
-    <div className="flex flex-col gap-8">
-      <div>
-        <p className="mt-1 font-display text-3xl text-text">
-          {undeclared}
-          <span className="ml-2 text-sm text-text-faint">
-            module{undeclared === 1 ? "" : "s"} declaring nothing they implement
-          </span>
-        </p>
-        <p className="mt-1 text-xs text-text-muted">
-          out of {modules.length} this reader could read, joined by {built.edges.length} link
-          {built.edges.length === 1 ? "" : "s"}
-          {unread.length > 0
-            ? ` · ${unread.length} file${unread.length === 1 ? "" : "s"} in a language it cannot read yet`
-            : ""}
-        </p>
-      </div>
-      <p className="text-sm text-text-muted">
-        The structure layer only. Intention, evidence and stamps are slices that do not exist yet.
+    <div>
+      <p className="mt-1 font-display text-3xl text-text">
+        {undeclared}
+        <span className="ml-2 text-sm text-text-faint">
+          module{undeclared === 1 ? "" : "s"} declaring nothing they implement
+        </span>
+      </p>
+      <p className="mt-1 text-xs text-text-muted">
+        out of {modules.length} this reader could read, joined by {built.edges.length} link
+        {built.edges.length === 1 ? "" : "s"}
+        {unread.length > 0
+          ? ` · ${unread.length} file${unread.length === 1 ? "" : "s"} in a language it cannot read yet`
+          : ""}
       </p>
     </div>
   );
