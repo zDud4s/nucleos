@@ -7,17 +7,25 @@
 //! `map_intent.rs` knows no database — §7.1 is three expiry rules that must stay three, and a rule
 //! that can only be exercised through a table is a rule nobody exercises.
 //!
-//! It also owns the **canonical form of the anchor digest**, even though the `git` call that
-//! produces one lands with a later task and will live beside `git_exec.rs`. The form is the
+//! It also owns the **anchor digest** — both its canonical form and the `git ls-files` call that
+//! produces one. This paragraph used to say the call would land later and live beside `git_exec.rs`;
+//! it landed here instead, and the reason is the sentence that already followed. The form is the
 //! contract between whoever writes a digest and whoever reads it back, and the two must agree byte
-//! for byte or a stamp compares unequal to the very anchor set it was made from. Keeping it next to
-//! the process call would file it as a detail of how this machine happens to ask git, when it is in
-//! fact the thing every stored digest is bound by for as long as the row exists.
+//! for byte or a stamp compares unequal to the very anchor set it was made from — which is an
+//! argument for keeping the producer and the form on one screen, not for putting them in two
+//! modules. Beside the process call the form would have been filed as a detail of how this machine
+//! happens to ask git, when it is in fact the thing every stored digest is bound by for as long as
+//! the row exists; and `git_exec.rs` is transport that knows nothing about rows or decisions, which
+//! is precisely why it is the wrong home for something that knows what an anchor is.
 
+use crate::git_exec::run_git;
 use crate::map_store::Stamp;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::Path;
+use std::time::Duration;
 
 /// The owner's verdict on one decision (§5.2).
 ///
@@ -241,14 +249,15 @@ pub struct StampCounts {
 }
 
 // This is a bin-only crate, so dead-code reachability starts at `main`, and nothing in production
-// reaches this module yet: `standing` and `counts` are read by `GET /projects/{id}/map`, and
-// `canonical` by the git reader that computes a digest at stamp time — both of which land with the
-// route work in a later task. Measured rather than assumed, the way `map_store.rs` measured its
-// pair: with the attributes stripped this module warns about **nine** items, and putting them back
-// on these three silences all nine — `#[allow]` seeds a liveness root, so `Standing`, `Lapse`,
-// `StampCounts`, `parse` and `moved` stay reachable *through* the entry points and one of them
-// going unused would still say so. The instruction, not a description: DELETE ALL THREE ATTRIBUTES
-// with the change that adds the route.
+// reaches this module yet: `standing` and `counts` are read by `GET /projects/{id}/map`, `canonical`
+// by both of them, and `digest` by that route and by the writer that records a stamp — all of which
+// land with the route work in task 4. Measured rather than assumed, the way `map_store.rs` measured
+// its pair: with the attributes stripped this module warns about **seventeen** items, and putting
+// them back on these four silences all seventeen — `#[allow]` seeds a liveness root, so everything
+// the four reach (`NOTE_LIFETIME`, `Standing`, `Lapse`, `StampCounts`, `parse`, `moved`, `argv_cost`,
+// `chunked`, `ls_files_entry` and the four `ls-files` constants) stays reachable *through* the entry
+// points, and any one of them going unused would still say so. The instruction, not a description:
+// DELETE ALL FOUR ATTRIBUTES with the change that adds the route.
 //
 // Scoped to the non-test build, as `map_store.rs`, `contacts.rs` and `errands.rs` scope theirs.
 // Under `cfg(test)` the lint stays live, and this module's tests exercise all three.
@@ -481,10 +490,263 @@ fn moved(stamped: &str, current: &str) -> Option<Lapse> {
     }
 }
 
+/// How long one `git ls-files` is given before the answer becomes *I could not look*.
+///
+/// **Its own constant rather than [`crate::git_exec::OPERATION_TIMEOUT`], and an order of magnitude
+/// smaller.** That 300s is the budget for a whole queued VCS operation — a worktree add, a merge, a
+/// push across a network — and it is the right size for one. This is a single read of an index git
+/// has already built, on a route the window calls every time the map opens, with a person waiting:
+/// measured at **25.7 ms** for the whole of this repository's 732 entries. Thirty seconds is over a
+/// thousand times that, which makes a timeout here evidence that something is wrong rather than that
+/// something is slow — and bounding it is what keeps a broken git a passing `Lapse::Unreadable`
+/// instead of a request nobody ever gets an answer to.
+const LS_FILES_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The fixed argv every call carries, before the anchor paths.
+///
+/// **`--literal-pathspecs`, because a pathspec is not a path.** `core/src/map[1].rs` is a filename
+/// to every editor and a glob to git, and a glob would fingerprint files nobody anchored: a stamp
+/// that lapses when an unrelated file moves, plus a path in §7's diff that the route cannot match
+/// back to the decision it came from. One global flag covers every path in the call; the
+/// alternative, a `:(literal)` prefix, costs ten characters *per path* against a command-line
+/// ceiling this function is already chunking to stay under.
+///
+/// **`-z`, because otherwise git C-quotes any path holding a byte above `0x7F`** — `café.rs` comes
+/// back as `"caf\303\251.rs"`. That form is self-consistent enough to compare against itself, and it
+/// would still be wrong twice: §7 shows the owner a diff, and a spelling no editor of theirs uses is
+/// not a diff they can read; and the map route slices one git call's answer per decision **by
+/// matching paths**, so a quoted path matches no decision and its anchor quietly becomes `Some("")`
+/// — the silent green, arriving through the back door. What `-z` gives up is git's escaping of a
+/// path containing a newline, which [`canonical`] cannot represent; [`ls_files_entry`] refuses such
+/// a record rather than letting it through.
+///
+/// `--` last, so an anchor called `-s` is a file and not a flag.
+const LS_FILES_ARGV: [&str; 5] = ["--literal-pathspecs", "ls-files", "-s", "-z", "--"];
+
+/// What Windows will not accept in one command line — measured, not looked up.
+///
+/// A throwaway spawning `git -C C:/Projects/nucleos --literal-pathspecs ls-files -s -z --` with a
+/// growing list of 20-character pathspecs, bisected: **1 557 paths (32 761 characters) spawned;
+/// 1 558 (32 782) failed with `os error 206`, "the filename or extension is too long"** — before git
+/// ran at all. The documented `CreateProcessW` cap is 32 767 characters counting the terminating
+/// NUL, and the bisection brackets it. It is written down as a measurement because the failure it
+/// prevents does not look like a length problem: `run_git` returns `Err`, [`digest`] returns `None`,
+/// and every anchored decision in the project reports *I could not look* at once — which reads as a
+/// broken repository and sends whoever chases it to git.
+///
+/// Windows-shaped, and applied everywhere regardless. Linux's `ARG_MAX` is two megabytes, so
+/// chunking there costs one extra process per 32 KB of paths and buys nothing; a `cfg` to skip it
+/// would be a second code path exercised on neither machine this is developed on.
+const COMMAND_LINE_CEILING: usize = 32_767;
+
+/// Held back from [`COMMAND_LINE_CEILING`], so [`argv_cost`] never has to be exact.
+///
+/// What that estimate does not model is the backslash-doubling Rust's argv escaping applies in front
+/// of a quote, which can cost a path more than the three characters counted for it. Five hundred and
+/// twelve characters is room for that to be wrong about a hundred paths in a chunk and still spawn,
+/// and it costs one extra process every 64 chunks — a trade worth making in the direction where
+/// being wrong is not a crash.
+const COMMAND_LINE_HEADROOM: usize = 512;
+
+/// What one argument costs on the command line, over-counted on purpose.
+///
+/// Its length, one separating space, and the two quotes Rust's escaping wraps around an argument
+/// containing one. Over-counts by two for the ordinary path, which has no space in it, and cannot
+/// under-count for it.
+fn argv_cost(argument: &str) -> usize {
+    argument.len() + 3
+}
+
+/// The anchor paths split into runs that each fit inside one command line.
+///
+/// **Split by characters rather than by a count of paths**, because paths are not one length: 1 557
+/// of this repository's 20-character module paths fit in a single call, and forty of a 700-character
+/// one would not. A count would have to be picked for the worst case and would then spawn dozens of
+/// processes for the ordinary one.
+///
+/// The fixed cost is computed from `root` rather than assumed, because `git -C <root>` carries the
+/// project's own path into every command line and a project living twelve directories deep spends
+/// that budget before a single anchor is named.
+///
+/// A path too long to fit even on its own still gets a chunk of its own rather than being dropped.
+/// It will fail at the spawn and take the whole digest to `None`, which is the honest answer — *I
+/// could not look* — where dropping it would quietly report that anchor as gone.
+fn chunked<'a>(root: &Path, paths: &'a [String]) -> Vec<Vec<&'a str>> {
+    let fixed = "git".len()
+        + argv_cost("-C")
+        + argv_cost(&root.to_string_lossy())
+        + LS_FILES_ARGV.iter().copied().map(argv_cost).sum::<usize>();
+    let budget = COMMAND_LINE_CEILING.saturating_sub(COMMAND_LINE_HEADROOM + fixed);
+
+    let mut chunks: Vec<Vec<&'a str>> = Vec::new();
+    let mut spent = 0;
+    for path in paths {
+        let cost = argv_cost(path);
+        match chunks.last_mut() {
+            Some(chunk) if spent + cost <= budget => {
+                chunk.push(path.as_str());
+                spent += cost;
+            }
+            _ => {
+                chunks.push(vec![path.as_str()]);
+                spent = cost;
+            }
+        }
+    }
+    chunks
+}
+
+/// One `<mode> <blob> <stage>\t<path>` record from `git ls-files -s -z`, or `None` when it is not
+/// one.
+///
+/// **Refused rather than repaired, and the caller turns a refusal into `None` for the whole digest.**
+/// A record this cannot read means git said something this module does not understand, and the two
+/// ways to carry on from there are both worse than stopping: skipping it drops an anchor, which the
+/// next read reports as `Lapse::Moved { gone }` — a file that never went anywhere — and guessing at
+/// its fields invents a blob. *I could not look* is the only true answer, and [`standing`] already
+/// has a shape for it.
+///
+/// A path holding a `\n` or a `\r` is refused for the same reason and a different cause: it parses
+/// perfectly, and [`canonical`] joins entries with `\n`, so it would silently desynchronise every
+/// line after it in the digest. `canonical`'s own note says a caller assembling entries is the one
+/// who has to keep that from happening, and `-z` gave up the escaping that used to make it
+/// impossible — so this is where it is kept. Windows cannot produce such a filename at all; a Linux
+/// project can.
+fn ls_files_entry(record: &str) -> Option<(u8, &str, &str)> {
+    let (meta, path) = record.split_once('\t')?;
+    let fields: Vec<&str> = meta.split(' ').collect();
+    let [_mode, blob, stage] = fields.as_slice() else {
+        return None;
+    };
+    if path.is_empty() || path.contains('\n') || path.contains('\r') {
+        return None;
+    }
+    Some((stage.parse().ok()?, blob, path))
+}
+
+/// The blob hashes git already computed for one decision's anchor files, in [`canonical`] form.
+///
+/// **git's blobs, and not a hash of the bytes on disk.** §7 asks for exactly this and gets two things
+/// for it: the hashes are free, because git computed them when the files were staged; and the stamp
+/// expires **at the commit** rather than at every keystroke, *"que é a granularidade a que a pergunta
+/// 'isto ainda está como eu queria?' faz sentido"*. A digest taken from the working tree would go
+/// amber while its owner was still typing, and a map that nags mid-edit is a map nobody leaves open.
+///
+/// **Three answers, and the whole reason this returns an `Option` is that they are three.**
+///
+/// - `None` — *could not compute*. git is not there, the folder is not a repository, the call failed
+///   or came back non-zero. A fact about this daemon at this instant, and transient.
+/// - `Some("")` — *computed, and there is no readable anchor to watch*. A fact about the decision,
+///   permanent until §8's slug edit lands, and what makes a green that can never expire.
+/// - `Some(text)` — the digest.
+///
+/// An `unwrap_or_default()` anywhere between here and the column collapses the first into the second
+/// and mints exactly the silent green §1 describes. `0118`'s `CHECK (verdict <> 'settled' OR
+/// code_digest IS NOT NULL)` refuses the collapse at the table and [`standing`] refuses it on the way
+/// back out; this is the third side of the same argument, on the way in. The `warn!` on every `None`
+/// is the other half — a transient failure nobody can see in a log is one nobody can tell apart from
+/// a permanent one.
+///
+/// **An empty `paths` never asks git anything**, and that is a correctness rule rather than an
+/// optimisation. Measured: `git ls-files -s -z --` with nothing after the `--` does not list nothing,
+/// it lists the **whole repository** — 732 entries here. A decision with no readable anchor would
+/// come away fingerprinted against every file in the project and lapse on the next commit to any one
+/// of them.
+///
+/// **One call per command line's worth of paths, merged.** `git ls-files` has no `--stdin` (2.50.1:
+/// `error: unknown option 'stdin'`) and `run_git` hands the child a null stdin regardless, so there
+/// is no streaming door — see [`chunked`] and [`COMMAND_LINE_CEILING`] for where the chunk size comes
+/// from. A chunk that fails takes the whole digest with it: a digest assembled from only the chunks
+/// that answered is missing anchors, and the next read would report every one of them as `gone`.
+///
+/// **The lowest stage wins**, which is stage 0 whenever the index is settled and the merge base while
+/// it is not. `git ls-files -s` prints three records for a path in an unresolved merge — stages 1, 2
+/// and 3, and no 0 — and `canonical` says out loud that de-duplicating them is the caller's job. This
+/// is not a tie-break but §7's own rule applied: the base is the last state that was committed, so
+/// the digest holds still through a conflict and moves when the merge lands. Taking `ours` or
+/// `theirs` would lapse every anchored stamp the moment a merge began and un-lapse them if it were
+/// abandoned.
+///
+/// `paths` are repository-relative, as [`crate::map_join::Anchored`] holds them, and come back
+/// spelled exactly as they went in — which the route depends on to slice one call's answer per
+/// decision.
+///
+/// This is the seventh caller of [`crate::git_exec::run_git`], whose doc names six sanctioned entries
+/// and warns that a further one "takes its `Duration` from somewhere else and quietly loses that
+/// gate". The gate in question is the VCS queue's per-operation budget, and this is not part of an
+/// operation — no worktree is claimed, nothing is written, there is no budget to spend down. It is a
+/// read on an HTTP path with a ceiling of its own, [`LS_FILES_TIMEOUT`]; `git_exec`'s list has been
+/// amended to say so rather than left to read as though this had slipped past it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn digest(root: &Path, paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
+        return Some(String::new());
+    }
+
+    let mut lowest: BTreeMap<String, (u8, String)> = BTreeMap::new();
+    for chunk in chunked(root, paths) {
+        let mut argv: Vec<&OsStr> = LS_FILES_ARGV.iter().map(|arg| OsStr::new(*arg)).collect();
+        argv.extend(chunk.iter().map(|path| OsStr::new(*path)));
+
+        let answer = match run_git(root, &argv, LS_FILES_TIMEOUT).await {
+            Ok(answer) if answer.succeeded() => answer,
+            Ok(answer) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    anchors = chunk.len(),
+                    exit = ?answer.exit_code,
+                    tail = %answer.output_tail.trim(),
+                    "git would not list the anchor blobs, so this anchor set has no digest"
+                );
+                return None;
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    anchors = chunk.len(),
+                    %reason,
+                    "could not run git to list the anchor blobs, so this anchor set has no digest"
+                );
+                return None;
+            }
+        };
+
+        for record in answer
+            .stdout
+            .split('\0')
+            .filter(|record| !record.is_empty())
+        {
+            let Some((stage, blob, path)) = ls_files_entry(record) else {
+                tracing::warn!(
+                    root = %root.display(),
+                    record,
+                    "git printed something this cannot read as an index entry, so this anchor set has no digest"
+                );
+                return None;
+            };
+            match lowest.get(path) {
+                Some((held, _)) if *held <= stage => {}
+                _ => {
+                    lowest.insert(path.to_owned(), (stage, blob.to_owned()));
+                }
+            }
+        }
+    }
+
+    // Sorted by `canonical` on the way out, which is what makes merging the chunks above safe to do
+    // in whatever order they came back.
+    Some(canonical(
+        lowest
+            .iter()
+            .map(|(path, (_, blob))| (path.as_str(), blob.as_str())),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
+    use std::process::Command;
 
     /// The instant every stamp below was made, in the shape `map_store::stamp` actually writes —
     /// `chrono::Utc::now().to_rfc3339()`, which spells the offset `+00:00` rather than `Z`.
@@ -508,8 +770,13 @@ mod tests {
         }
     }
 
-    /// An anchor set in canonical form, assembled the way task 3's git reader will assemble it.
-    fn digest(entries: &[(&str, &str)]) -> String {
+    /// An anchor set in canonical form, built by hand from literal pairs.
+    ///
+    /// Named apart from the module's own [`digest`] for the reason `moved_to` is named apart from
+    /// `moved`: this one states an expectation and that one asks git, and a test where the two share
+    /// a name reads as if it were comparing a function against itself. It was called `digest` while
+    /// task 3 was still ahead of it, which is precisely how the collision arrived.
+    fn hand_digest(entries: &[(&str, &str)]) -> String {
         canonical(entries.iter().copied())
     }
 
@@ -558,12 +825,12 @@ mod tests {
     /// not reconcile would be §1's false confidence reappearing inside its own cure.
     #[test]
     fn the_five_standings_always_add_up_to_every_decision() {
-        let one = digest(&[("core/src/map_join.rs", BLOB_A)]);
-        let two = digest(&[
+        let one = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
+        let two = hand_digest(&[
             ("core/src/map_join.rs", BLOB_B),
             ("core/src/http.rs", BLOB_C),
         ]);
-        let three = digest(&[("core/src/map_store.rs", BLOB_C)]);
+        let three = hand_digest(&[("core/src/map_store.rs", BLOB_C)]);
 
         let digests = [None, Some(""), Some(one.as_str()), Some(two.as_str())];
         let currents = [
@@ -622,7 +889,7 @@ mod tests {
 
     #[test]
     fn a_settled_stamp_survives_its_anchors_being_unchanged() {
-        let anchors = digest(&[
+        let anchors = hand_digest(&[
             ("core/src/map_join.rs", BLOB_A),
             ("core/src/map_store.rs", BLOB_B),
         ]);
@@ -638,11 +905,11 @@ mod tests {
 
     #[test]
     fn a_settled_stamp_lapses_when_one_anchor_blob_changes_and_says_which() {
-        let was = digest(&[
+        let was = hand_digest(&[
             ("core/src/map_join.rs", BLOB_A),
             ("core/src/map_store.rs", BLOB_B),
         ]);
-        let now = digest(&[
+        let now = hand_digest(&[
             ("core/src/map_join.rs", BLOB_A),
             ("core/src/map_store.rs", BLOB_C),
         ]);
@@ -659,8 +926,8 @@ mod tests {
 
     #[test]
     fn a_settled_stamp_lapses_when_an_anchor_appears_or_disappears() {
-        let was = digest(&[("core/src/map_join.rs", BLOB_A)]);
-        let grown = digest(&[
+        let was = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
+        let grown = hand_digest(&[
             ("core/src/map_join.rs", BLOB_A),
             ("core/src/map_store.rs", BLOB_B),
         ]);
@@ -708,7 +975,7 @@ mod tests {
 
     #[test]
     fn a_settled_stamp_that_cannot_be_compared_says_so_rather_than_guessing_either_way() {
-        let anchors = digest(&[("core/src/map_join.rs", BLOB_A)]);
+        let anchors = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
 
         // `None` current: the folder was a repository when it was stamped and is not one now, or
         // `git` did not answer. Unchanged would be a green nobody checked; moved would nag over
@@ -742,14 +1009,14 @@ mod tests {
         // §7.1, and it is the counter-intuitive rule: you already know it is half-done, so the code
         // moving teaches you nothing. Only the note rots.
         let note = "falta migrar as páginas de pilar";
-        let was = digest(&[("core/src/map_join.rs", BLOB_A)]);
+        let was = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
         let stamp = stamp_of(Verdict::Partial, Some(&was), Some(note));
         let amber = Standing::Partial {
             stamped_at: STAMPED_AT.to_owned(),
             note: note.to_owned(),
         };
 
-        let elsewhere = digest(&[("sidecars/web/main.go", BLOB_C)]);
+        let elsewhere = hand_digest(&[("sidecars/web/main.go", BLOB_C)]);
         assert_eq!(
             standing(Some(&stamp), Some(&elsewhere), at(Duration::zero())),
             amber
@@ -798,7 +1065,7 @@ mod tests {
     #[test]
     fn a_withdrawal_never_lapses_however_far_the_clock_or_the_code_moves() {
         let note = Some("o §4 vai ser reescrito");
-        let was = digest(&[("core/src/map_join.rs", BLOB_A)]);
+        let was = hand_digest(&[("core/src/map_join.rs", BLOB_A)]);
         let stamp = stamp_of(Verdict::Withdrawn, Some(&was), note);
         let withdrawn = Standing::Withdrawn {
             stamped_at: STAMPED_AT.to_owned(),
@@ -812,7 +1079,7 @@ mod tests {
         assert_eq!(
             standing(
                 Some(&stamp),
-                Some(&digest(&[("core/src/http.rs", BLOB_C)])),
+                Some(&hand_digest(&[("core/src/http.rs", BLOB_C)])),
                 at(Duration::days(4000))
             ),
             withdrawn
@@ -840,7 +1107,7 @@ mod tests {
         // empty*. If it did, a decision anchored to one empty file would carry `watched: false` and
         // a green that never comes back to ask.
         let nothing = canonical(std::iter::empty());
-        let empty_file = digest(&[("core/src/placeholder.rs", EMPTY_BLOB)]);
+        let empty_file = hand_digest(&[("core/src/placeholder.rs", EMPTY_BLOB)]);
 
         assert_eq!(nothing, "");
         assert_ne!(empty_file, nothing);
@@ -919,5 +1186,403 @@ mod tests {
         // The empty digest is a real value and not a missing one: *computed, and there is nothing
         // to watch*.
         assert!(parse("").is_empty());
+    }
+
+    /// A directory in the **system** temp folder, deleted when it drops.
+    ///
+    /// **Not `git_exec::space_free_tempdir`, which builds its directory under this checkout**, and
+    /// the difference is the whole of one test below: a folder inside `C:/Projects/nucleos` is
+    /// inside a git repository, so `git ls-files` there answers about nucleos instead of refusing,
+    /// and `a_folder_that_is_not_a_repository_is_none_rather_than_an_empty_digest` would pass
+    /// forever without once exercising what it names. Measured before relying on it: `git -C %TEMP%
+    /// rev-parse --show-toplevel` says *not a git repository*, so nothing above `%TEMP%` on this
+    /// machine is one either. A machine where that stops being true fails the test loudly, which is
+    /// the direction to fail in.
+    ///
+    /// A `TempDir` and not a `remove_dir_all` at the bottom of the test body, because `Drop` runs
+    /// while a panic unwinds and a line at the bottom of the body does not. This repository already
+    /// pays for that difference in stranded `%TEMP%` directories, and each of these fixtures is a
+    /// git repository — twenty-seven files for an empty one, five hundred and change for the
+    /// chunking fixture. Measured on the way in, because `remove_dir_all` refusing a read-only file
+    /// is a real Windows failure and git marks three of its own that way: it removes the whole
+    /// repository, `.git` and all.
+    fn scratch(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create a temporary directory")
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// What one git command printed, for the assertions that check this module's answer against a
+    /// **second, independent** computation of the same hash rather than against its own output.
+    fn git_says(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git should start");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// An empty repository with a deterministic identity and no line-ending rewriting.
+    ///
+    /// `core.autocrlf false` for the reason `git_exec::initialize_repo` gives about the same setting:
+    /// it is `true` from the system config on a default Windows install, and the blob hash of a file
+    /// git rewrote on the way into the index is not the hash of the bytes the test wrote — which
+    /// would make every `hash-object` cross-check below disagree with a correct implementation.
+    fn repository(prefix: &str) -> tempfile::TempDir {
+        let dir = scratch(prefix);
+        git_in(dir.path(), &["init", "-q"]);
+        git_in(dir.path(), &["config", "user.email", "test@x"]);
+        git_in(dir.path(), &["config", "user.name", "test"]);
+        git_in(dir.path(), &["config", "core.autocrlf", "false"]);
+        dir
+    }
+
+    fn write(root: &Path, path: &str, contents: &str) {
+        let file = root.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).expect("create the file's directory");
+        }
+        std::fs::write(file, contents).expect("write the file");
+    }
+
+    fn commit(root: &Path, message: &str) {
+        git_in(root, &["add", "-A"]);
+        git_in(root, &["commit", "-q", "-m", message]);
+    }
+
+    fn owned(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    /// A directory name and a file count chosen so the argument list is over the measured ceiling
+    /// and not far over it: 500 paths of 81 characters is 42 000 characters of command line against
+    /// [`COMMAND_LINE_CEILING`]'s 32 767, which forces exactly two chunks. Two is the number that
+    /// tests the merge; twenty would only test it more slowly.
+    const CHUNKED_DIR: &str = "anchors/a-directory-name-long-enough-to-make-one-command-line-hurt";
+    const CHUNKED_FILES: usize = 500;
+
+    /// A repository holding more anchor paths than one `git ls-files` can be handed.
+    fn many_anchors(prefix: &str) -> (tempfile::TempDir, Vec<String>) {
+        let repo = repository(prefix);
+        let paths: Vec<String> = (0..CHUNKED_FILES)
+            .map(|which| format!("{CHUNKED_DIR}/anchor-{which:04}.rs"))
+            .collect();
+        for (which, path) in paths.iter().enumerate() {
+            write(repo.path(), path, &format!("//! §7 — anchor {which}\n"));
+        }
+        commit(repo.path(), "many anchors");
+        (repo, paths)
+    }
+
+    #[tokio::test]
+    async fn the_digest_names_every_anchor_and_its_blob() {
+        let repo = repository("nucleos-digest-anchors-");
+        let root = repo.path();
+        write(root, "core/src/map_join.rs", "//! §7 junction\n");
+        write(root, "core/src/map_store.rs", "//! §7 rows\n");
+        write(root, "core/src/unrelated.rs", "//! nothing to do with it\n");
+        commit(root, "seed");
+
+        let anchors = owned(&["core/src/map_join.rs", "core/src/map_store.rs"]);
+        let text = digest(root, &anchors)
+            .await
+            .expect("a repository can be read");
+        let read = parse(&text);
+
+        // Checked against a SECOND computation of the same hash rather than against a sha copied out
+        // of this function's own output: `git hash-object` hashes the bytes on disk and `ls-files -s`
+        // reports what the index holds, and the two agreeing is what says the digest names the file
+        // it claims to rather than merely being stable.
+        assert_eq!(read.len(), 2, "{text}");
+        for anchor in &anchors {
+            assert_eq!(
+                read.get(anchor).map(String::as_str),
+                Some(git_says(root, &["hash-object", anchor]).as_str()),
+                "{anchor} in {text}"
+            );
+        }
+
+        // The pathspec is a scope and not a suggestion. A digest that quietly carried every file in
+        // the repository would satisfy every assertion above and lapse on the next commit to
+        // anything at all.
+        assert!(!read.contains_key("core/src/unrelated.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_anchor_list_never_calls_git_and_is_not_the_whole_repository() {
+        let repo = repository("nucleos-digest-empty-");
+        let root = repo.path();
+        write(root, "a.rs", "//! one\n");
+        write(root, "b.rs", "//! two\n");
+        commit(root, "seed");
+
+        // The mistake this test exists for does not announce itself: `git ls-files -s -z --` with
+        // nothing after the `--` lists the WHOLE repository — 732 entries in this project, and the
+        // two below in a fixture. A decision with no readable anchor would come away fingerprinted
+        // against every file in the project and lapse on the next commit to any one of them. The
+        // count is asserted from git rather than assumed, so the test still means this if the
+        // fixture grows.
+        assert_eq!(git_says(root, &["ls-files"]).lines().count(), 2);
+        assert_eq!(digest(root, &[]).await, Some(String::new()));
+
+        // And the proof that git was never asked, rather than asked and ignored: a folder that is
+        // not a repository is the one input that makes a git call fail, and the answer here is still
+        // `Some("")`. If the empty list ever reaches the process spawn, this line turns red.
+        let outside = scratch("nucleos-digest-empty-outside-");
+        assert_eq!(digest(outside.path(), &[]).await, Some(String::new()));
+    }
+
+    /// **Absent, and the absence is the answer: an untracked anchor contributes no entry at all.**
+    ///
+    /// The alternative was a placeholder — an all-zero sha, or the file's on-disk hash — and it is
+    /// wrong in the direction this feature cannot afford. git has never seen the file, so the stamp
+    /// would carry a blob git will not produce, and the first `git add` would move the digest and
+    /// lapse the stamp: the map would report that the anchor code changed when not one byte of it
+    /// had. §7 ties expiry to the commit, and a file that has never been in one has nothing to say
+    /// about whether the code moved.
+    ///
+    /// The cost, stated rather than hidden: a decision whose only anchor is untracked comes away with
+    /// `Some("")` — computed, nothing to watch — which [`standing`] reports as
+    /// `Settled { watched: false }`. That is a green which can never expire, and it is shown as one
+    /// rather than enjoyed.
+    #[tokio::test]
+    async fn a_path_git_does_not_track_is_absent_rather_than_guessed_at() {
+        let repo = repository("nucleos-digest-untracked-");
+        let root = repo.path();
+        write(root, "tracked.rs", "//! §7 committed\n");
+        commit(root, "seed");
+        write(root, "untracked.rs", "//! §7 written and never staged\n");
+
+        let text = digest(root, &owned(&["tracked.rs", "untracked.rs"]))
+            .await
+            .expect("a repository can be read");
+        let read = parse(&text);
+        assert_eq!(read.len(), 1, "{text}");
+        assert!(read.contains_key("tracked.rs"), "{text}");
+        assert!(!read.contains_key("untracked.rs"), "{text}");
+
+        // A path that does not exist on disk at all is the same fact from the other side, and git
+        // says so the same way: exit 0 and no record. It is NOT an error, so it must not become one.
+        assert_eq!(
+            digest(root, &owned(&["tracked.rs", "never/existed.rs"]))
+                .await
+                .as_deref(),
+            Some(text.as_str())
+        );
+
+        // A decision anchored to nothing git tracks: `Some("")`, which is *computed, and there is
+        // nothing to watch*, and is a different answer from the `None` that means *I could not look*.
+        // Collapsing the two is the bug the whole `Option` exists to prevent.
+        assert_eq!(
+            digest(root, &owned(&["untracked.rs"])).await,
+            Some(String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_is_not_a_repository_is_none_rather_than_an_empty_digest() {
+        // §11: a project added from outside has zero specs, and may have no repository either. Both
+        // wrong answers here are quiet ones — `Some("")` would say *this decision has nothing to
+        // watch*, which is permanent and false, and would mint a green that never comes back to ask.
+        // `None` is transient, and `standing` turns it into `Lapse::Unreadable`.
+        let outside = scratch("nucleos-digest-not-a-repo-");
+        write(outside.path(), "core/src/map_join.rs", "//! §7\n");
+        let anchors = owned(&["core/src/map_join.rs"]);
+
+        let answer = digest(outside.path(), &anchors).await;
+        assert_eq!(answer, None);
+        assert_ne!(answer, Some(String::new()));
+
+        // And a root that is not there at all, which is how a project folder somebody moved arrives.
+        // git fails to change directory rather than failing to find a `.git`, and the answer must be
+        // the same one.
+        assert_eq!(digest(&outside.path().join("gone"), &anchors).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_anchor_list_far_longer_than_a_command_line_still_gets_one_digest() {
+        let (repo, paths) = many_anchors("nucleos-digest-chunked-");
+        let root = repo.path();
+
+        // The fixture has to actually be over the ceiling, or this test quietly stops testing what
+        // it names the day somebody shortens the directory name. Asserted against the same measured
+        // constant the implementation chunks by, so the two cannot drift apart in silence.
+        let argv: usize = paths.iter().map(|path| argv_cost(path)).sum();
+        assert!(
+            argv > COMMAND_LINE_CEILING,
+            "the fixture fits in one command line at {argv} characters, so it exercises nothing"
+        );
+        assert!(chunked(root, &paths).len() > 1, "one chunk is not a merge");
+
+        let text = digest(root, &paths)
+            .await
+            .expect("a repository can be read");
+        let read = parse(&text);
+
+        // Every one of them, and not merely the right count: a chunk silently lost would be a stamp
+        // that lapses reporting hundreds of files gone.
+        assert_eq!(read.len(), paths.len(), "{} of {}", read.len(), paths.len());
+        for path in &paths {
+            assert!(read.contains_key(path), "{path} is missing from the digest");
+        }
+
+        // One from each end, checked against a second computation, so this is a digest and not a
+        // list of paths with something plausible beside them.
+        for path in [&paths[0], &paths[CHUNKED_FILES - 1]] {
+            assert_eq!(
+                read.get(path).map(String::as_str),
+                Some(git_says(root, &["hash-object", path]).as_str()),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_result_is_path_sorted_however_the_chunks_came_back() {
+        let (repo, mut paths) = many_anchors("nucleos-digest-sorted-");
+        let root = repo.path();
+        paths.reverse();
+        assert!(
+            chunked(root, &paths).len() > 1,
+            "the merge across chunks is the point of this test"
+        );
+
+        let text = digest(root, &paths)
+            .await
+            .expect("a repository can be read");
+        let named: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(_, path)| path)
+            .collect();
+        let mut sorted = named.clone();
+        sorted.sort_unstable();
+        assert_eq!(named.len(), CHUNKED_FILES);
+        assert_eq!(named, sorted, "the digest must come out path-sorted");
+
+        // The same anchor set handed over the other way round must be the same text, byte for byte.
+        // A digest that depended on the order a caller happened to assemble its paths in would lapse
+        // a stamp over nothing — and a false alarm costs exactly the trust this feature is trying to
+        // earn.
+        paths.reverse();
+        assert_eq!(digest(root, &paths).await.as_deref(), Some(text.as_str()));
+    }
+
+    #[tokio::test]
+    async fn an_anchor_in_an_unresolved_merge_reports_the_state_both_sides_started_from() {
+        // `canonical` hands this job to its caller by name: `git ls-files -s` prints THREE records
+        // for a path in an unresolved merge — stages 1, 2 and 3, and no stage 0 — and a digest
+        // carrying three entries for one path would collapse to whichever arrived last, which is
+        // `theirs` today and whatever git decides tomorrow.
+        //
+        // The lowest stage wins, which is stage 0 whenever the index is settled and the merge BASE
+        // while it is not. That is §7's own rule rather than a tie-break: the base is the last state
+        // that was committed, so an anchored stamp holds still through the conflict and is asked
+        // again when the merge lands — *ao commit, não a cada tecla*. Taking `ours` or `theirs`
+        // instead would lapse every anchored stamp in the project the moment a merge began, and
+        // un-lapse them all if it were abandoned.
+        let repo = repository("nucleos-digest-conflict-");
+        let root = repo.path();
+        write(root, "a.rs", "//! §7 as both branches found it\n");
+        write(root, "b.rs", "//! §7 untouched by either\n");
+        commit(root, "base");
+        let base_blob = git_says(root, &["rev-parse", "HEAD:a.rs"]);
+
+        git_in(root, &["checkout", "-q", "-b", "theirs"]);
+        write(root, "a.rs", "//! §7 their edit\n");
+        commit(root, "theirs");
+        git_in(root, &["checkout", "-q", "-"]);
+        write(root, "a.rs", "//! §7 our edit\n");
+        commit(root, "ours");
+
+        // Expected to fail, so it goes through `Command` directly rather than `git_in`, which
+        // asserts success — and the failure is asserted, because a fixture that quietly merged
+        // cleanly would leave this test green and vacuous.
+        let merge = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["merge", "theirs"])
+            .output()
+            .expect("git should start");
+        assert!(
+            !merge.status.success(),
+            "the fixture must actually conflict"
+        );
+
+        let text = digest(root, &owned(&["a.rs", "b.rs"]))
+            .await
+            .expect("a repository can be read");
+        let read = parse(&text);
+
+        assert_eq!(
+            read.len(),
+            2,
+            "one entry per path, not one per stage: {text}"
+        );
+        assert_eq!(
+            read.get("a.rs").map(String::as_str),
+            Some(base_blob.as_str())
+        );
+        assert_eq!(
+            read.get("b.rs").map(String::as_str),
+            Some(git_says(root, &["hash-object", "b.rs"]).as_str())
+        );
+    }
+
+    #[test]
+    fn a_record_git_did_not_print_is_refused_rather_than_half_read() {
+        // The shape, so the parse is pinned to what git actually emits and not to what this module
+        // hopes it does. Copied from a live run against this repository.
+        assert_eq!(
+            ls_files_entry(
+                "100644 c7af70690e31a98812b6f83ec58d77be288e0440 0\tcore/src/map_join.rs"
+            ),
+            Some((
+                0,
+                "c7af70690e31a98812b6f83ec58d77be288e0440",
+                "core/src/map_join.rs"
+            ))
+        );
+
+        // A path with a space in it survives, because the tab is what separates the fields and a
+        // space is only ever inside the path.
+        assert_eq!(
+            ls_files_entry(
+                "100644 0a1b2c3d4e5f60718293a4b5c6d7e8f901234567 2\tshell/src/Modo Mapa.tsx"
+            )
+            .map(|(stage, _, path)| (stage, path)),
+            Some((2, "shell/src/Modo Mapa.tsx"))
+        );
+
+        // And the four ways a record is not one. Each returns `None`, which the caller turns into
+        // `None` for the whole digest rather than into a digest with a hole in it.
+        assert_eq!(ls_files_entry("100644 abc 0 core/src/map_join.rs"), None);
+        assert_eq!(ls_files_entry("100644 abc\tcore/src/map_join.rs"), None);
+        assert_eq!(ls_files_entry("100644 abc x\tcore/src/map_join.rs"), None);
+        assert_eq!(ls_files_entry("100644 abc 0\t"), None);
+
+        // The one `-z` let back in, and the reason this guard exists: a path holding a newline parses
+        // perfectly and would then split `canonical`'s output into two lines, desynchronising every
+        // entry after it. Windows cannot make such a filename; a Linux project can.
+        assert_eq!(ls_files_entry("100644 abc 0\tcore/src/two\nlines.rs"), None);
+        assert_eq!(ls_files_entry("100644 abc 0\tcore/src/carriage\r.rs"), None);
     }
 }

@@ -77,6 +77,15 @@ impl CommandResult {
 /// loses that gate. Naming them makes the gate greppable rather than conventional. The tests below
 /// call this directly on purpose — they are testing the transport itself.
 ///
+/// **`map_stamp::digest` is a seventh caller and is deliberately outside that rule**, recorded here
+/// so the list above stays true rather than merely old. The gate the six enforce is the VCS queue's
+/// per-operation budget, and there is no operation for that one to spend down: it claims no
+/// worktree, writes nothing, and runs a `git ls-files` on an HTTP read path with a ceiling of its
+/// own. What still applies to it is everything else this function owns — argv, the tree-kill,
+/// `GIT_TERMINAL_PROMPT=0`, the drained pipes — which is why it comes through here rather than
+/// spawning its own `Command`. Any further caller should have to write a paragraph like this one, or
+/// belong behind one of the six.
+///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
 /// `TailBuffer`. That is not an oversight: a gate runs a test suite, which can print without bound
 /// for as long as it likes, while a git command's output is bounded by the size of the change. The
