@@ -153,11 +153,66 @@ pub async fn measure(pool: &SqlitePool, scope: Scope) -> sqlx::Result<Report> {
     }))
 }
 
-/// Quantos passos deu este item. Ganha os seus próprios testes e a preferência por `tools_used` na
-/// tarefa seguinte; aqui existe porque `items_without_steps` já precisa de saber contar.
+/// Quantos passos deu este item. `tools_used` primeiro, `num_turns` em recurso.
+///
+/// A ordem não é arbitrária: um turno com doze ferramentas e um turno com uma contam igual em
+/// `num_turns`. Recorrer a ele é perder resolução, e `Measured::items_without_steps` diz quantas
+/// vezes foi preciso.
+///
+/// Uma lista malformada conta como ausente e nunca como zero: lixo não é a afirmação «não usou
+/// ferramentas», e tratá-lo como tal punha um ponto falso no ajuste.
 fn steps_of(tools_used: Option<&str>, num_turns: Option<i64>) -> Option<i64> {
-    let _ = tools_used;
+    if let Some(raw) = tools_used
+        && let Ok(serde_json::Value::Array(calls)) = serde_json::from_str::<serde_json::Value>(raw)
+    {
+        return Some(calls.len() as i64);
+    }
     num_turns
+}
+
+#[derive(Debug, Clone)]
+pub enum Fit {
+    /// Menos de três pontos, ou todos no mesmo x. Não há recta que se possa afirmar.
+    ///
+    /// Devolver zeros seria afirmar «arranque 0, declive 0» — uma leitura, e falsa.
+    Insufficient,
+    Line {
+        intercept: f64,
+        slope: f64,
+        r2: f64,
+    },
+}
+
+/// Mínimos quadrados a uma variável, com R² ao lado.
+///
+/// O R² sai junto e não à parte porque, com uma variável e tarefas heterogéneas, isto é
+/// diagnóstico populacional e não previsor de um item. Um arranque sem o R² ao lado lê-se com uma
+/// confiança que não tem.
+fn fit(points: &[(f64, f64)]) -> Fit {
+    if points.len() < 3 {
+        return Fit::Insufficient;
+    }
+    let n = points.len() as f64;
+    let mx = points.iter().map(|p| p.0).sum::<f64>() / n;
+    let my = points.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxx: f64 = points.iter().map(|(x, _)| (x - mx).powi(2)).sum();
+    if sxx == 0.0 {
+        return Fit::Insufficient;
+    }
+    let sxy: f64 = points.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    let slope = sxy / sxx;
+    let intercept = my - slope * mx;
+    let sst: f64 = points.iter().map(|(_, y)| (y - my).powi(2)).sum();
+    let sse: f64 = points
+        .iter()
+        .map(|(x, y)| (y - (intercept + slope * x)).powi(2))
+        .sum();
+    Fit::Line {
+        intercept,
+        slope,
+        // Sem variação em y não há nada por explicar, e a recta explica-o todo.
+        r2: if sst == 0.0 { 1.0 } else { 1.0 - sse / sst },
+    }
 }
 
 #[cfg(test)]
@@ -340,5 +395,55 @@ mod tests {
             m.items_without_run, 1,
             "não corridos contam-se; deitá-los fora seria dizer que a layer teve menos trabalho do que teve"
         );
+    }
+
+    #[test]
+    fn steps_prefer_tools_and_fall_back_to_turns() {
+        assert_eq!(
+            steps_of(Some(r#"[{"name":"Bash"},{"name":"Read"}]"#), Some(9)),
+            Some(2)
+        );
+        assert_eq!(steps_of(None, Some(9)), Some(9));
+        assert_eq!(steps_of(None, None), None);
+    }
+
+    #[test]
+    fn an_empty_tool_list_is_zero_steps_and_not_a_fallback() {
+        // `[]` é uma afirmação: «não usou ferramentas». Não é ausência.
+        assert_eq!(steps_of(Some("[]"), Some(7)), Some(0));
+    }
+
+    #[test]
+    fn a_malformed_tool_list_is_absent_and_never_zero() {
+        // Lixo não é uma afirmação. Recorre-se aos turnos.
+        assert_eq!(steps_of(Some("{isto nao e uma lista"), Some(4)), Some(4));
+        assert_eq!(steps_of(Some("{isto nao e uma lista"), None), None);
+    }
+
+    #[test]
+    fn the_fit_needs_spread_and_says_so_when_it_has_none() {
+        // Três itens todos com 10 passos: não há declive que se possa afirmar.
+        assert!(matches!(
+            fit(&[(10.0, 100_000.0), (10.0, 110_000.0), (10.0, 105_000.0)]),
+            Fit::Insufficient
+        ));
+        // Dois pontos são uma recta trivial, não uma medição.
+        assert!(matches!(
+            fit(&[(10.0, 100_000.0), (20.0, 120_000.0)]),
+            Fit::Insufficient
+        ));
+    }
+
+    #[test]
+    fn the_fit_recovers_a_line_it_was_given() {
+        // arranque 50k, declive 1 400/passo, exacto.
+        let Fit::Line { intercept, slope, r2 } =
+            fit(&[(10.0, 64_000.0), (20.0, 78_000.0), (30.0, 92_000.0)])
+        else {
+            panic!("devia ajustar")
+        };
+        assert!((intercept - 50_000.0).abs() < 1.0);
+        assert!((slope - 1_400.0).abs() < 0.1);
+        assert!(r2 > 0.99);
     }
 }
