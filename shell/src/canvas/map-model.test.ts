@@ -7,6 +7,9 @@ const mod = (path: string, extra: Partial<MapModule> = {}): MapModule => ({
   path,
   reader: path.endsWith(".rs") ? "rust" : "typescript",
   declares: false,
+  // The wire always carries this, empty or not. The canvas ignores it on purpose: it draws the
+  // structure, and which sections a module names is the junction's question rather than this one's.
+  cites: [],
   tested: false,
   ...extra,
 });
