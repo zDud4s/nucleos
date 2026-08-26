@@ -427,6 +427,42 @@ describe("the owner's verdict, and what became of it", () => {
     expect(said.textContent ?? "").not.toMatch(/failed/i);
   });
 
+  /**
+   * *Mudei de ideias* is one click away from every other row on this screen, and §9.2 makes the
+   * current state the last row written — so a verdict is always revisable and the panel has to
+   * offer the gesture. It did not in the first draft, which made a mis-click permanent as far as
+   * anybody using it could tell: exactly the kind of trap that would cost the trust this whole
+   * feature is buying.
+   */
+  it("lets a verdict be revised, a withdrawal included", () => {
+    const row = anchored({ decision_id: 11, section: "§4 Tres modos" });
+    open([
+      {
+        row,
+        standing: { state: "withdrawn", stamped_at: "2026-08-25T09:00:00Z", note: null },
+      },
+    ]);
+
+    const name = `${row.spec_slug} ${row.section}`;
+    expect(screen.getByLabelText(`stamp ${name} as what you want`)).toBeTruthy();
+    expect(screen.getByLabelText(`note for ${name}`)).toBeTruthy();
+  });
+
+  /**
+   * The same, for a green whose anchor cannot move. Nothing on that pile is asking to be
+   * re-stamped — its repairs are a citation, a git command and nothing at all — but §6 gives the
+   * verdict to the owner, and withholding the gesture would be this panel deciding when they are
+   * allowed to change their mind.
+   */
+  it("lets a green with nothing to watch be re-stamped", () => {
+    const row = anchored({ decision_id: 13, section: "§11 Projetos sem specs" });
+    open([{ row, standing: settled("no_repository") }]);
+
+    expect(
+      screen.getByLabelText(`stamp ${row.spec_slug} ${row.section} as changed your mind`),
+    ).toBeTruthy();
+  });
+
   /** What was sent, so a test can tell a stamp that landed from one that only looked like it did. */
   it("sends the decision, the verdict and the note the owner typed", async () => {
     const row = anchored({ decision_id: 12, section: "§5.2 Veredicto do dono" });

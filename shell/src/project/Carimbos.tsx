@@ -34,6 +34,12 @@ import { RelativeTime } from "../ui";
  * **This is the one surface in this mode with buttons, and the only one.** `Juncao` has none
  * deliberately — a second place to accept without reading is the failure this mode replaces — but
  * stamping is the owner's act and §6 gives it to nobody else, so it has to happen somewhere.
+ * **Every row carries them, including the piles where nothing is asking to be stamped.** Three of
+ * the six describe verdicts that are already given and whose repair is not a verdict at all, and
+ * the first draft left them bare for that reason — which made *"changed my mind"*, one click away
+ * on every other row, a mis-click with no way back that anybody could find. `map_store::stamp`
+ * appends and §9.2 makes the current state the last row, so a verdict is always revisable; the only
+ * thing missing was somewhere to revise it.
  *
  * **Nothing here is drawn in a colour.** Every pile below is one standing, announced by its own
  * heading and its own sentence, so a badge on each row would repeat the heading in a form a tenth
@@ -172,9 +178,12 @@ export function Carimbos({
           {partial.length > 0 ? (
             <PartWay projectId={projectId} rows={partial} total={stamps.partial} />
           ) : null}
-          {withdrawn.length > 0 ? <Withdrawn rows={withdrawn} total={stamps.withdrawn} /> : null}
+          {withdrawn.length > 0 ? (
+            <Withdrawn projectId={projectId} rows={withdrawn} total={stamps.withdrawn} />
+          ) : null}
           {stamps.unwatched > 0 ? (
             <NeverExpires
+              projectId={projectId}
               stamps={stamps}
               noAnchor={watching("no_anchor")}
               untracked={watching("untracked")}
@@ -183,6 +192,7 @@ export function Carimbos({
           ) : null}
           {stamps.settled > 0 ? (
             <Guessed
+              projectId={projectId}
               stamps={stamps}
               guessed={watching("guessed")}
               certain={watching("watched").length}
@@ -414,14 +424,20 @@ function PartWay({
  * document: somebody opens one file and fixes everything this map says it still claims. A flat list
  * would make that a reading exercise before it is an edit.
  *
- * **No buttons.** §7.1 says a withdrawal expires never and waits for the spec — it leaves the list
- * when the decision is rewritten or taken out of the document, and not before. The cure is an edit
- * to a document, and §12 keeps this map out of documents.
+ * **It carries the controls even though nothing here is asking to be stamped**, and the first draft
+ * of this panel did not — which was a trap. §7.1 says a withdrawal expires never and waits for the
+ * document, so the row has no *work* attached to it; but *"changed my mind"* is one click away from
+ * every other row on this screen, and a panel that offers no way back has made a mis-click
+ * permanent as far as anybody using it can tell. The store appends and §9.2 makes the current state
+ * the last row, so a later verdict supersedes this one — the only thing missing was somewhere to
+ * give it.
  */
 function Withdrawn({
+  projectId,
   rows,
   total,
 }: {
+  projectId: string;
   rows: Stood<Extract<Standing, { state: "withdrawn" }>>[];
   total: number;
 }) {
@@ -456,6 +472,7 @@ function Withdrawn({
                   {standing.note === null ? null : (
                     <p className="max-w-prose text-sm text-text">{standing.note}</p>
                   )}
+                  <Stamp projectId={projectId} row={row} />
                 </Line>
               ))}
             </ul>
@@ -480,15 +497,21 @@ function Withdrawn({
  * a gitignored file and for a file nobody has added yet, and nothing this map can see tells the
  * two apart — so sending anybody to their `.gitignore` would be a guess wearing an instruction.
  *
- * **No buttons.** These are already stamped, and what is wrong with them is not the verdict. A
- * second stamp would change nothing, and offering one would suggest it might.
+ * **The controls are here too, and what is wrong with these rows is not the verdict.** Nothing on
+ * this pile is asking to be re-stamped — the repairs above are a citation, a git command and
+ * nothing at all, none of which is a verdict. They are here because §6 gives the verdict to the
+ * owner and to nobody else, and a panel that withheld the gesture on three of its six piles would
+ * be deciding when they are allowed to change their mind. There is nowhere else in this mode to do
+ * it.
  */
 function NeverExpires({
+  projectId,
   stamps,
   noAnchor,
   untracked,
   noRepository,
 }: {
+  projectId: string;
   stamps: StampCounts;
   noAnchor: Green[];
   untracked: Green[];
@@ -506,16 +529,19 @@ function NeverExpires({
       </p>
 
       <Silence
+        projectId={projectId}
         label="Greens with nothing to watch"
         rows={noAnchor}
         sentence={`${stamps.no_anchor} of them: no readable module names the decision's section, so there is nothing to watch. A citation naming the section — and the document it belongs to — is what would give this green something to expire against.`}
       />
       <Silence
+        projectId={projectId}
         label="Greens whose files git does not track"
         rows={untracked}
         sentence={`${stamps.untracked} of them: modules name the section and git reports none of them. Either those paths are ignored, or nothing has been added to the repository yet, and nothing this map can see tells the two apart.`}
       />
       <Silence
+        projectId={projectId}
         label="Greens in a folder with no repository"
         rows={noRepository}
         sentence={`${stamps.no_repository} of them: this project's folder is not a git repository, so there is nothing here that could ever move. That is an honest answer rather than a fault, and there is nothing to repair.`}
@@ -525,7 +551,17 @@ function NeverExpires({
 }
 
 /** One of the three silences, drawn only when it has rows, with its own reason above them. */
-function Silence({ label, rows, sentence }: { label: string; rows: Green[]; sentence: string }) {
+function Silence({
+  projectId,
+  label,
+  rows,
+  sentence,
+}: {
+  projectId: string;
+  label: string;
+  rows: Green[];
+  sentence: string;
+}) {
   if (rows.length === 0) return null;
   const { shown, hidden } = capped(rows);
   return (
@@ -533,7 +569,9 @@ function Silence({ label, rows, sentence }: { label: string; rows: Green[]; sent
       <p className="max-w-prose text-xs text-text-muted">{sentence}</p>
       <ul aria-label={label} className="flex flex-col gap-2">
         {shown.map(({ row, standing }) => (
-          <Line key={row.decision_id} row={row} at={standing.stamped_at} />
+          <Line key={row.decision_id} row={row} at={standing.stamped_at}>
+            <Stamp projectId={projectId} row={row} />
+          </Line>
         ))}
       </ul>
       {hidden > 0 ? <Hidden count={hidden} /> : null}
@@ -559,10 +597,12 @@ function Silence({ label, rows, sentence }: { label: string; rows: Green[]; sent
  * inferred by subtraction, and an inferred number on this panel is the thing the panel is against.
  */
 function Guessed({
+  projectId,
   stamps,
   guessed,
   certain,
 }: {
+  projectId: string;
   stamps: StampCounts;
   guessed: Green[];
   certain: number;
@@ -589,7 +629,9 @@ function Guessed({
         <>
           <ul aria-label="Greens over a guessed anchor" className="flex flex-col gap-2">
             {shown.map(({ row, standing }) => (
-              <Line key={row.decision_id} row={row} at={standing.stamped_at} paths={row.modules} />
+              <Line key={row.decision_id} row={row} at={standing.stamped_at} paths={row.modules}>
+                <Stamp projectId={projectId} row={row} />
+              </Line>
             ))}
           </ul>
           {hidden > 0 ? <Hidden count={hidden} /> : null}
