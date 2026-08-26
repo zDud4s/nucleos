@@ -139,11 +139,31 @@ pub async fn pending(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<
 /// also answer different questions: `pending` is a queue somebody works through and orders by
 /// arrival, this is the material the map is made of and orders by document.
 ///
-/// `retired_at IS NULL` excludes two different things with one clause, and both belong out. A line
-/// the owner rejected was never approved (§4). A decision later withdrawn — §5.2's *mudei de
-/// ideias* — was, and the whole point of withdrawing it is that it stops driving the map without
-/// disappearing from the table; a reader that kept it would go on reporting a decision somebody
-/// explicitly stood down.
+/// `retired_at IS NULL` excludes exactly ONE thing: a line the owner rejected when it was put in
+/// front of them, which was never approved and never entered the map (§4). Nothing else.
+///
+/// **Corrected 2026-08-26, when slice 4 landed.** This said the clause excluded two things, the
+/// second being a decision withdrawn under §5.2's *mudei de ideias* — approved once, later stood
+/// down, and held out here so it would stop driving the map. It does not do that and must not,
+/// because §5.2 spells out what withdrawing is: *"Fica retirada, com o spec marcado por actualizar.
+/// Pára de te chatear sem desaparecer em silêncio."* Setting `retired_at` drops the row out of this
+/// query, so [`crate::map_join::join`] never sees it, so the map never mentions it again — which is
+/// disappearing in silence, the one outcome that sentence forbids. And *com o spec marcado por
+/// actualizar* needs a row somebody still reads: a decision that has left every reader cannot mark
+/// its own document as claiming something abandoned.
+///
+/// So the two mechanisms stay apart, and each keeps one meaning. `retired_at` is **no at approval
+/// time** — [`decide`] with `approved: false`, which is the only thing 0117's header describes.
+/// `map_stamp::Verdict::Withdrawn` is **yes, and then a change of mind**: `approved_at` stays set,
+/// `retired_at` stays NULL, the row stays here and in the junction, and its derived standing says
+/// the document still claims something its owner abandoned.
+///
+/// The cost of the wrong reading, had a handler implemented withdrawal the way this comment
+/// described: the withdrawn decision leaves this query, so it leaves [`stamps`] too — which repeats
+/// this filter on purpose, so the two readers cannot disagree — and `Verdict::Withdrawn` becomes a
+/// variant no read can ever return, with its count permanently zero. §5.2 spends a paragraph on why
+/// the third verdict is not a convenience; the map would have deleted it silently and gone on
+/// nagging forever about work its owner had explicitly abandoned.
 ///
 /// Ordered `spec_slug, ordinal, id`, which is the order [`crate::map_join::join`] sorts into
 /// anyway. Stated here rather than left to the caller because `(spec_slug, ordinal)` is not a total
@@ -232,9 +252,17 @@ pub struct Stamp {
     pub decision_id: i64,
     pub verdict: Verdict,
     pub stamped_at: String,
-    /// The anchor code as it stood when this was written, in `map_stamp`'s canonical form. Empty
-    /// means *no readable anchor*, which is not the same fact as *nothing has moved*.
-    pub code_digest: String,
+    /// The anchor code as it stood when this was written, in `map_stamp`'s canonical form.
+    ///
+    /// Three states, and flattening any two of them is the bug this field exists to prevent.
+    /// `None` is *nobody could compute one* — a folder that is not a repository, a `git` that did
+    /// not answer — which is a fact about this daemon at that moment. `Some("")` is *computed, and
+    /// this decision has no readable anchor*, which is a fact about the decision, is permanent, and
+    /// is what makes a stamp that can never expire. `Some(text)` is the digest. An
+    /// `unwrap_or_default()` anywhere downstream turns the first into the second and mints a green
+    /// that never comes back to ask; `0118`'s CHECK stops `settled` reaching the table as `None` at
+    /// all, and this type is what keeps the other two apart afterwards.
+    pub code_digest: Option<String>,
     pub note: Option<String>,
 }
 
@@ -251,6 +279,14 @@ pub struct Stamp {
 /// it is a verdict on, so a stamp for a decision that fails the `WHERE` cannot be constructed at
 /// all.
 ///
+/// `code_digest` is `None` when it could not be computed and `Some("")` when it was computed and
+/// came back empty, and the table refuses the first for `settled`: §7.1 makes *está como quero* the
+/// only verdict the code moving can falsify, so it is the only one that may not be recorded without
+/// knowing what it is anchored to. A caller that has no digest for a green must fail the request —
+/// `503`, because it is this machine that is unable, not the owner who is wrong — rather than store
+/// a stamp nothing will ever expire. Amber and a withdrawal take `None` without complaint, neither
+/// having any expiry the code can reach.
+///
 /// `false` means no row was written, and it covers four things that are one answer to whoever
 /// asked: an id that names nothing, a decision belonging to another project, a line still waiting in
 /// the pile (§4 — nothing reaches the map unapproved), and a line already retired. None of them is a
@@ -263,7 +299,7 @@ pub async fn stamp(
     project_id: &str,
     decision_id: i64,
     verdict: Verdict,
-    code_digest: &str,
+    code_digest: Option<&str>,
     note: Option<&str>,
 ) -> sqlx::Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -284,9 +320,10 @@ pub async fn stamp(
 }
 
 /// The columns every read of `map_stamps` selects, named once for the reason [`DecisionRow`] gives:
-/// three of the five are `TEXT` in a row, so a `SELECT` that swapped two of them would still
-/// typecheck and would surface as a verdict whose timestamp is somehow a digest.
-type StampRow = (i64, String, String, String, Option<String>);
+/// the verdict and the timestamp are both `String` and the digest and the note are both
+/// `Option<String>`, so a `SELECT` that swapped either pair would still typecheck and would surface
+/// as a verdict that is somehow an instant, or a note that is somehow a list of blob hashes.
+type StampRow = (i64, String, String, Option<String>, Option<String>);
 
 /// The single place a row becomes a [`Stamp`].
 ///
@@ -316,9 +353,13 @@ fn stamp_from_row(
 ///
 /// The JOIN is load-bearing rather than decorative. `map_stamps` carries no `project_id`, so it
 /// reaches one only through its decision, and this is where one owner's pile is kept out of
-/// another's. `approved_at IS NOT NULL AND retired_at IS NULL` repeats [`approved`]'s own filter for
-/// the same two reasons it gives: a decision nobody approved is not material the map is made of, and
-/// one that was withdrawn stopped driving the map without leaving the table.
+/// another's. `approved_at IS NOT NULL AND retired_at IS NULL` repeats [`approved`]'s filter
+/// verbatim, and the repetition is the point: the two readers are paired against each other by every
+/// caller — a decision here and not there, or there and not here, is a count that does not
+/// reconcile. What it holds out is a line the owner rejected when it was proposed, and only that.
+/// A decision withdrawn under §5.2 keeps `retired_at` NULL and is still returned by both, carrying
+/// `Verdict::Withdrawn`; [`approved`]'s doc comment says why, and says what the other reading would
+/// have cost.
 ///
 /// **The subquery picks a row id and not a maximum timestamp, and the tie-break is why.**
 /// `stamped_at` comes from `chrono::Utc::now().to_rfc3339()`, which is a clock and not a counter:
@@ -639,14 +680,14 @@ mod tests {
                 "alpha",
                 id,
                 Verdict::Settled,
-                "a1b2 core/src/x.rs",
+                Some("a1b2 core/src/x.rs"),
                 None
             )
             .await
             .unwrap()
         );
         assert!(
-            stamp(&pool, "alpha", id, Verdict::Withdrawn, "", None)
+            stamp(&pool, "alpha", id, Verdict::Withdrawn, None, None)
                 .await
                 .unwrap()
         );
@@ -703,7 +744,7 @@ mod tests {
         // the CHECK in `0118` names the characters it must actually see through.
         for note in [None, Some(""), Some("   "), Some("\t"), Some("\n \r")] {
             assert!(
-                stamp(&pool, "alpha", id, Verdict::Partial, "", note)
+                stamp(&pool, "alpha", id, Verdict::Partial, None, note)
                     .await
                     .is_err(),
                 "amber carrying {note:?} for a note"
@@ -732,14 +773,14 @@ mod tests {
                 "alpha",
                 alfa,
                 Verdict::Settled,
-                "a1b2 core/src/x.rs",
+                Some("a1b2 core/src/x.rs"),
                 None
             )
             .await
             .unwrap()
         );
         assert!(
-            stamp(&pool, "alpha", beta, Verdict::Withdrawn, "", None)
+            stamp(&pool, "alpha", beta, Verdict::Withdrawn, None, None)
                 .await
                 .unwrap()
         );
@@ -759,7 +800,7 @@ mod tests {
                 "alpha",
                 beta,
                 Verdict::Withdrawn,
-                "",
+                None,
                 Some("o spec está velho")
             )
             .await
@@ -791,7 +832,7 @@ mod tests {
                 "alpha",
                 id,
                 Verdict::Settled,
-                "a1b2 core/src/x.rs",
+                Some("a1b2 core/src/x.rs"),
                 None
             )
             .await
@@ -802,7 +843,7 @@ mod tests {
         assert!(stamps(&pool, "beta").await.unwrap().is_empty());
 
         assert!(
-            !stamp(&pool, "beta", id, Verdict::Withdrawn, "", None)
+            !stamp(&pool, "beta", id, Verdict::Withdrawn, None, None)
                 .await
                 .unwrap(),
             "and a stamp aimed at another project's decision lands nowhere"
@@ -823,24 +864,148 @@ mod tests {
         let waiting = pending(&pool, "alpha").await.unwrap();
 
         assert!(
-            !stamp(&pool, "alpha", waiting[0].id, Verdict::Settled, "", None)
-                .await
-                .unwrap(),
+            !stamp(
+                &pool,
+                "alpha",
+                waiting[0].id,
+                Verdict::Settled,
+                Some(""),
+                None
+            )
+            .await
+            .unwrap(),
             "a line still waiting to be read"
         );
         assert!(decide(&pool, "alpha", waiting[1].id, false).await.unwrap());
         assert!(
-            !stamp(&pool, "alpha", waiting[1].id, Verdict::Settled, "", None)
-                .await
-                .unwrap(),
+            !stamp(
+                &pool,
+                "alpha",
+                waiting[1].id,
+                Verdict::Settled,
+                Some(""),
+                None
+            )
+            .await
+            .unwrap(),
             "a line the owner said no to"
         );
         assert!(
-            !stamp(&pool, "alpha", 9_999, Verdict::Settled, "", None)
+            !stamp(&pool, "alpha", 9_999, Verdict::Settled, Some(""), None)
                 .await
                 .unwrap(),
             "an id that names nothing at all"
         );
         assert!(stamps(&pool, "alpha").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_settled_stamp_whose_digest_could_not_be_computed_is_refused_by_the_table() {
+        // Name the row this refuses, because it is the whole reason the column is nullable: a green
+        // on a decision with perfectly good anchor files, recorded at a moment when `git` did not
+        // answer, and therefore anchored to nothing anybody can compare against. Nothing would ever
+        // expire it. Nobody would ever learn why. It is §1's false confidence manufactured by the
+        // feature built to cure it, and it would have looked exactly like a stamp that was working.
+        //
+        // The table and not the handler, for the reason the note CHECK gives one screen up. The
+        // route answers `503` — this machine is unable, the owner is not wrong — and this is what
+        // keeps that true for the second caller.
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        assert!(
+            stamp(&pool, "alpha", id, Verdict::Settled, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            every_stamp(&pool, id).await.is_empty(),
+            "and it left no row behind"
+        );
+
+        // The same green with a digest that was computed and came back empty is allowed. That is a
+        // decision with no readable anchor, which is a true thing about the decision and is the one
+        // §7 requires be SHOWN rather than refused — slice 6 is what starts giving these anchors.
+        assert!(
+            stamp(&pool, "alpha", id, Verdict::Settled, Some(""), None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_amber_stamp_records_no_digest_without_complaint() {
+        // §7.1: neither *a meio* nor *mudei de ideias* expires by the code moving — one expires by
+        // time and the other never — so a digest nobody could compute costs them nothing, and a
+        // CHECK that demanded one would refuse two honest rows to guard a rule that does not apply
+        // to them. The constraint is narrow on purpose, and this is the half of it that says so.
+        let pool = test_pool().await;
+        let alfa = an_approved_decision(&pool, "alpha").await;
+        let beta = pending(&pool, "alpha").await.unwrap()[0].id;
+        assert!(decide(&pool, "alpha", beta, true).await.unwrap());
+
+        assert!(
+            stamp(
+                &pool,
+                "alpha",
+                alfa,
+                Verdict::Partial,
+                None,
+                Some("falta o resto")
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            stamp(&pool, "alpha", beta, Verdict::Withdrawn, None, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(stamps(&pool, "alpha").await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_digest_that_came_back_empty_is_not_one_nobody_could_read() {
+        // The distinction the whole amendment is for, pinned at the only place it can be pinned:
+        // through the column and back. `Some("")` is *computed, and this decision has no readable
+        // anchor* — permanent, a property of the decision, and correctly a stamp that never
+        // expires. `None` is *this daemon could not compute one* — transient, a property of the
+        // moment, and no statement about the code at all.
+        //
+        // A single `unwrap_or_default()` between here and the panel collapses the second into the
+        // first and turns every failed `git` call into a permanent green. It would break nothing
+        // that compiles and no other test, which is why this one asserts the two values rather than
+        // asserting that both rows merely exist.
+        let pool = test_pool().await;
+        let empty = an_approved_decision(&pool, "alpha").await;
+        let unknown = pending(&pool, "alpha").await.unwrap()[0].id;
+        assert!(decide(&pool, "alpha", unknown, true).await.unwrap());
+
+        assert!(
+            stamp(&pool, "alpha", empty, Verdict::Settled, Some(""), None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            stamp(&pool, "alpha", unknown, Verdict::Withdrawn, None, None)
+                .await
+                .unwrap()
+        );
+
+        let latest = stamps(&pool, "alpha").await.unwrap();
+        let digest_of = |id: i64| {
+            latest
+                .iter()
+                .find(|row| row.decision_id == id)
+                .expect("a stamp for this decision")
+                .code_digest
+                .clone()
+        };
+        assert_eq!(
+            digest_of(empty),
+            Some(String::new()),
+            "computed, and there was nothing readable to watch"
+        );
+        assert_eq!(digest_of(unknown), None, "nobody could compute one");
     }
 }

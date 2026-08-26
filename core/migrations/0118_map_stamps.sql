@@ -20,6 +20,26 @@
 -- rather than a row a handler remembers to reject. A handler is a check the second caller forgets,
 -- which is the argument `map_store::decide` already makes about `project_id`.
 --
+-- **`code_digest` has three states, and NULL is one of them.** This is the most important comment
+-- in the file, because it is the difference between a green that comes back to ask and one that
+-- never does. `''` was going to carry two facts at once: *computed, and this decision has no
+-- readable anchor* — permanent, and honestly a stamp that can never expire — and *not computed,
+-- because git could not be read just then* — transient, and a fact about this daemon rather than
+-- about the code. Written alike, the second silently becomes the first and stays that way: a
+-- decision with perfectly good anchors carries a green that never comes back to ask, because git
+-- was unreadable for one second, and nobody ever learns why. That is §1's false confidence,
+-- manufactured by the feature built to cure it. So NULL is *not computed*, `''` is *computed, and
+-- there is nothing readable to watch*, and text is the digest itself.
+--
+-- **The `CHECK` on `settled` is what makes that distinction cost something.** §7.1: *está como
+-- quero* is the only verdict the code moving can falsify, so it is the only one that may not be
+-- recorded without knowing what it is anchored to. `partial` and `withdrawn` take NULL freely,
+-- because neither expires by code and a missing digest costs them nothing — §7 still asks for the
+-- digest whenever it can be had, since it is history worth keeping, so the writer stores NULL only
+-- when it truly could not compute one. `POST /projects/{id}/map/stamps` answers `503` rather than
+-- write a green it cannot anchor; this CHECK is what keeps that true when the second caller is less
+-- careful than the first, which is the argument this file already makes twice above.
+--
 -- **A foreign key, following the house.** `job_notes.job_id` (0072), `errand_events.errand_id`
 -- (0074) and `team_items.agent_id` (0071) all name their parent this way, `storage.rs` opens every
 -- pool with `foreign_keys(true)`, and a child row that reaches its project only through its parent
@@ -59,12 +79,12 @@ CREATE TABLE map_stamps (
   -- of it, because §7 requires a lapsed decision to show WHAT moved, and a scalar can only say that
   -- something did.
   --
-  -- **The empty string is legal and means *no readable anchor*.** That is a different fact from
-  -- *anchors that happen to be unchanged*, and the difference is the one this feature cannot afford
-  -- to blur: a decision with nothing to watch is a stamp that can never expire, and a green that
-  -- will never come back to ask is the exact shape of the false confidence the map exists to cure.
-  -- Stored as `''` rather than NULL so no reader has to choose between two ways of saying nothing.
-  code_digest  TEXT NOT NULL,
+  -- NULL is *this daemon could not compute one* — no repository, git unavailable, `run_git` failed.
+  -- `''` is *computed, and there are no readable anchors to watch*, which is a fact about the
+  -- decision and not about the moment, and is what yields a stamp that can never expire. Anything
+  -- else is the digest. Nothing may collapse the first two: see the header, and note that an
+  -- `unwrap_or_default()` on the way out is all it would take.
+  code_digest  TEXT,
 
   -- What the owner wanted to say. NULL where they said nothing, which is allowed on `settled` and
   -- on `withdrawn` — the first should cost one click, and the second is an assertion the owner may
@@ -77,7 +97,11 @@ CREATE TABLE map_stamps (
   CHECK (
     verdict <> 'partial'
     OR (note IS NOT NULL AND trim(note, ' ' || char(9) || char(10) || char(13)) <> '')
-  )
+  ),
+
+  -- A green may not be recorded without knowing what it is anchored to (§7.1). The other two
+  -- verdicts may, because neither of them expires by the code moving.
+  CHECK (verdict <> 'settled' OR code_digest IS NOT NULL)
 );
 
 -- Every read of this table is the same question — "the latest stamp for this decision" — so the
