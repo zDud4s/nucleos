@@ -1,5 +1,5 @@
-//! Which document a file's bare `§` numbers name: the question put to a model, the parse of what
-//! it answers, and the arithmetic that refuses an answer which cannot be right.
+//! Which document a file's bare `§` numbers name: the question put to a model about one file, the
+//! parse of what it answers, and the two facts the arithmetic can honestly add to it.
 //!
 //! **Pure, for the reason `map_intent.rs` is pure.** The prompt and the parse are where the design
 //! of this slice actually lives, and a function that needs a model running to be exercised is a
@@ -8,40 +8,86 @@
 //! [`crate::map_intent::specs_in`] does and for the same reason: where a project keeps its
 //! documents is a convention to be probed, not a setting to be filled in.
 //!
-//! **The model proposes; the arithmetic only ever vetoes. That division was measured, not
-//! preferred.** Matching a file's cited `§N` against each document's headings is the obvious
-//! mechanical design, and it is dead. Over this repository's citing files, plain overlap gives 48
-//! "unique" answers and the uniques are wrong — `map_join.rs` under `pilar-de-browser`, `http.rs`
-//! under `email-pillar`. Weighting rare section numbers by IDF makes it worse rather than better:
-//! `project_map.rs` comes out under `pilar-de-browser-design` at score 1.00 with a margin of 0.26,
-//! which passes any confidence filter anybody would think to write, and is still wrong. The cause
-//! is structural rather than a matter of tuning — `§1`, `§2` and `§7` exist in nearly every
-//! document here, so a scorer ranks by *how many headings a document has* and not by which one the
-//! file means. **So nothing in this module scores anything.** The one thing arithmetic is sound for
-//! is the opposite direction: a document that does not contain a section the file cites is
-//! certainly not that file's document. A veto has no false positives, which is exactly the
-//! asymmetry that makes it safe where scoring is not.
+//! **The model proposes, and it is the only judgement in the loop.** Matching a file's cited
+//! `§N` against each document's headings is the obvious mechanical design and it is dead. Over this
+//! repository's citing files, plain overlap gives 48 "unique" answers and the uniques are wrong —
+//! `map_join.rs` under `pilar-de-browser`, `http.rs` under `email-pillar`. Weighting rare section
+//! numbers by IDF makes it worse rather than better: `project_map.rs` comes out under
+//! `pilar-de-browser-design` at score 1.00 with a margin of 0.26, which passes any confidence
+//! filter anybody would think to write, and is still wrong. The cause is structural rather than a
+//! matter of tuning — `§1`, `§2` and `§7` exist in nearly every document here, so a scorer ranks by
+//! *how many headings a document has* and not by which one the file means. **So nothing in this
+//! module scores anything**, and the prompt deliberately does not show the model each document's
+//! headings, because that is the measured-wrong scorer handed over with a rationale attached.
 //!
-//! **And it is why the prompt does not list each document's sections.** Handing the model the
-//! headings would be handing it the scorer that was measured wrong, and inviting it to reproduce
-//! the failure with a rationale attached. The sections are the veto's business and the veto runs
-//! after the answer, where being wrong costs a refusal instead of a false confirmation.
+//! ## The veto this module used to have, why it was withdrawn, and why it must not come back
 //!
-//! **The asymmetry is sharper here than anywhere else in this feature.** A citation left bare is
-//! the status quo: the map already reports it as [`crate::map_join::Anchor::Ambiguous`] and counts
-//! it honestly. A citation carrying the WRONG document is a regression, because
-//! [`crate::map_join::Anchor::Declared`] is the one state the map may present as confirmed — so a
-//! wrong slug manufactures false confirmations at scale, which is §1's disease with better pixels.
-//! Every rule below therefore errs towards refusing, and every refusal is reported with its reason
-//! rather than folded into a total.
+//! **The obvious replacement for a scorer is a veto** — *a document that does not contain a section
+//! the file cites is certainly not that file's document* — and this module shipped one, under the
+//! claim that a veto has no false positives. **That claim is false, and it was measured.** Of 30
+//! hand-verified true file/document pairs, **nine are refused by it** — counted while this slice's
+//! ground truth was being built, and recorded there — and `map_join.rs`, the file carrying §8's own
+//! worked example, is one of them. Files legitimately cite numbers their own document lacks:
+//! cross-references (`§6.4 workspace-de-projeto`), fixture numbers invented by tests, and other
+//! documents quoted in prose.
 //!
-//! **The ways of not annotating are reported as four and never as one.** *The model did not know*
-//! ([`Outcome::Abstained`]), *the model named a document that does not exist*
-//! ([`Outcome::NoSuchDocument`]), *the model named a real document this file cannot be under*
-//! ([`Outcome::Refused`]) and *nobody could read the answer* ([`Outcome::Unreadable`]) are four
-//! different facts about a run. Collapsing them into a single *not annotated* count would hide
-//! which of the four is the problem, and each of them is fixed in a different place: the prompt,
-//! the model, the file, the runner.
+//! **`map_join.rs` measured by this module's own rules**, which is the figure to reproduce from:
+//! it cites **32** distinct sections, **16** of them absent from the map document, and **13 of
+//! those 16 exist in some other document** — so the obvious refinement, *ignore numbers no
+//! document anywhere has*, rescues three of sixteen and no whole file at all. (A hand count that
+//! skips the single-letter and fixture forms — `6c`, `7a`, `4.4a`, `6.44` — gives 27/11/10 instead;
+//! the shape is the same either way and nothing in the finding turns on which is used.)
+//!
+//! **And the deeper error, which is the half worth carrying forward: a missing section is the
+//! HARMLESS case.** Walk one through the pipeline. A bare `§6.4` in a file declaring
+//! `mapa-do-projeto-design` becomes `Citation { section: "6.4", named: Some(the map document) }`;
+//! [`crate::map_join::join`] then looks for an approved decision at §6.4 **of that document**;
+//! there is none, because that is what *missing* means; so the citation anchors nothing and no
+//! count moves. The harmful case is the exact reverse — a bare citation that belongs to document B
+//! inherits document A, and **A has that section too**, which manufactures an
+//! [`crate::map_join::Anchor::Declared`]: the one state the map may present as confirmed, wrong.
+//!
+//! So the veto filtered on precisely the citations that cannot hurt and was silent about the ones
+//! that can. Coverage does not discriminate either, in either direction: the IDF spike put
+//! `project_map.rs` under `pilar-de-browser-design` at **100% coverage** and it is wrong, while the
+//! true `map_recency.rs` pair sits at **53%**.
+//! `a_section_the_declared_document_lacks_anchors_nothing_and_a_section_it_has_is_the_danger` pins
+//! both halves of that walk-through against the real join, so the argument is executable rather
+//! than remembered.
+//!
+//! **No arithmetic discriminates here, and none may be reintroduced.** What survives is one
+//! mechanical check that genuinely has no false positives — **the proposed slug must name a
+//! document this project has** — and that is the only thing here that can reject.
+//!
+//! ## What the arithmetic is for now
+//!
+//! The unaccounted sections stop being a gate and become the module's product. [`Verdict`] carries
+//! [`Verdict::unaccounted`] — the sections a file's header would govern that the named document has
+//! no heading for — and [`Verdict::needs_override`], the subset some *other* document does have,
+//! which is the subset a person can act on by writing `§N other-slug` on those citations. That
+//! matters because of what a declaration costs: once a file declares document A it stops being
+//! evidence for any decision of document B, which is what narrows a decision's anchor set and makes
+//! §10's ordering work — and a module genuinely implementing two documents moves decisions from
+//! `Ambiguous` to `Silent` unless its exceptional citations carry overrides. Under-reporting is the
+//! safe direction and it still LOOKS like the map forgot something, so the list is named per file.
+//!
+//! ## Where the safety actually lives
+//!
+//! **Not here.** With the veto withdrawn there is no mechanical check on whether a proposal is
+//! right, and pretending otherwise would be the false confidence this feature exists to cure. The
+//! safety of this slice is, in its entirety, a **ground truth fixed before any model ran**: 21
+//! verified file/document pairs the run is scored against before a single header is written. A
+//! wrong answer there is worth roughly ten wrong files across the 209 that cite anything, so
+//! **21/21 applies and anything less stops and reports**. Whoever changes this module without
+//! changing that arrangement has removed the only thing standing between it and §1's failure.
+//!
+//! ## The four ways a file ends up unannotated, counted apart and never summed
+//!
+//! *The model did not know* ([`Outcome::Abstained`]), *it named a document that does not exist*
+//! ([`Outcome::NoSuchDocument`]) and *nobody could read the answer* ([`Outcome::Unreadable`]) are
+//! three different facts about a run, fixed in three different places — the model, the prompt, the
+//! runner. The fourth is that a file was never asked about at all ([`Skipped`]). A single
+//! *not annotated* total would be a number nobody could act on.
 
 // This is a bin-only crate, so dead-code reachability starts at `main`, and nothing in this module
 // is reached yet: it is the proposal half of §8's disambiguation, and the task that gives it a
@@ -72,7 +118,9 @@ pub struct Spec {
     pub slug: String,
     pub title: String,
     /// Every numbered heading, normalized the way [`crate::map_join::section_number`] normalizes
-    /// one. **The veto's whole input**, and never shown to the model.
+    /// one. **What [`Verdict::unaccounted`] is measured against**, and never shown to the model:
+    /// see the module comment for why handing a model the headings is handing it the scorer that
+    /// was measured wrong.
     pub sections: BTreeSet<String>,
 }
 
@@ -81,14 +129,15 @@ pub struct Spec {
 /// **Fenced blocks are skipped, and today that changes nothing.** Measured across all 43 documents
 /// this project has: a fence-blind reader invents exactly **zero** sections. The rule is here for
 /// the direction of the error rather than for its size — a `# 4.1 …` inside a ```` ``` ```` block
-/// would put a section in a document that does not have one, which makes the veto pass a proposal
-/// it should have refused. Every other approximation in this feature errs towards under-reporting;
-/// this is the one place where the cheap reading errs the other way, so it is not taken.
+/// would put a section in a document that does not have one, and this list is what says whether a
+/// citation is accounted for — a phantom heading silently accounts for a citation nothing accounts
+/// for. Every other approximation in this feature errs towards under-reporting; this is the one
+/// place where the cheap reading errs the other way, so it is not taken.
 ///
 /// A document with no numbered headings gets an empty set, and that is a real answer rather than a
 /// missing one: four of this project's documents are in that state, and a `§7` can refer to none of
-/// them. The veto refuses every proposal naming one, which is correct and costs nothing, because a
-/// file whose citations came from a document without numbers had nothing to cite.
+/// them. Every section of a file proposed under one comes back unaccounted for, which reads
+/// correctly: a `§7` cannot mean a document that has no §7.
 pub fn spec_card(slug: &str, source: &str) -> Spec {
     let mut title = String::new();
     let mut sections = BTreeSet::new();
@@ -138,8 +187,8 @@ pub fn spec_card(slug: &str, source: &str) -> Spec {
 ///
 /// A document that cannot be read is dropped rather than failing the batch, exactly as
 /// `parse_extraction` drops a line rather than the answer: the cost is one document missing from a
-/// list the model is offered, and the veto then refuses anything naming it — an under-report, in
-/// the direction this module errs on purpose.
+/// list the model is offered, and a proposal naming it is then rejected as a document this project
+/// does not have — an under-report, in the direction this module errs on purpose.
 pub fn catalogue(root: &Path) -> Vec<Spec> {
     crate::map_intent::specs_in(root)
         .into_iter()
@@ -234,25 +283,29 @@ pub struct Question {
     /// One window per distinct inheriting section, in the order the file writes them, capped at
     /// [`MAX_CITED_SECTIONS`].
     pub cited: Vec<Cited>,
-    /// **The sections a file-level declaration would govern, and therefore the veto's whole
-    /// input.** Sorted, so a report of it is stable.
+    /// **The sections a file-level declaration would govern**, and therefore what
+    /// [`Verdict::unaccounted`] is computed over. Sorted, so a report of it is stable.
     ///
     /// **All of them, and not the ones shown in [`Self::cited`].** The model answers on at most
-    /// [`MAX_CITED_SECTIONS`] windows; the arithmetic checks every section the header would touch.
-    /// The asymmetry is deliberate and it runs the safe way: a section nobody showed the model is
-    /// still a section the header claims, so leaving it out of the veto would let the cap
-    /// manufacture exactly the confident wrong answer the cap exists to make affordable.
+    /// [`MAX_CITED_SECTIONS`] windows; the arithmetic reads every section the header would touch.
+    /// The asymmetry is deliberate: a section nobody showed the model is still a section the
+    /// header claims, so leaving it out would let the cap quietly shorten the override list for
+    /// exactly the two files — `http.rs` and `map_join.rs` — whose overrides matter most.
     pub inheriting: Vec<String>,
     /// Sections every one of whose citations already names a document of this project — §8's
     /// per-citation override, already written.
     ///
-    /// **Excluded from the veto, and that exclusion is load-bearing rather than tidy.** A citation
-    /// carrying its own slug never inherits the file's declaration (see
+    /// **Excluded from [`Self::inheriting`], and the exclusion is what keeps the override list
+    /// honest.** A citation carrying its own slug never inherits the file's declaration (see
     /// [`crate::map_join::citations`], where the header is the default and the line is the
-    /// override), so refusing a proposal on account of one would be refusing it for a section the
-    /// header was never going to touch. Whether it also happens to be in [`Self::inheriting`] is
-    /// what decides: a file writing `§6.4 workspace-de-projeto` in one place and a bare `§6.4` in
-    /// another has a bare one to govern, and the veto is right to fire.
+    /// override), so counting one as unaccounted for would put a section somebody has to go and
+    /// fix onto a list of things to fix, when it is already fixed. Whether it also happens to be
+    /// in [`Self::inheriting`] is what decides: a file writing `§6.4 workspace-de-projeto` in one
+    /// place and a bare `§6.4` in another still has a bare one for the header to govern.
+    ///
+    /// This mattered more when it was a gate — without it `map_join.rs` refused itself over the
+    /// very citation §8 tells people to write. That gate is gone; the exclusion is not, because a
+    /// list naming work already done is a list nobody finishes reading.
     pub overridden: Vec<String>,
 }
 
@@ -266,7 +319,7 @@ impl Question {
 /// Why a file is never put to a model at all.
 ///
 /// **Both of these are cheaper than an answer and neither is a refusal**, which is why they are not
-/// [`Outcome`] variants: no proposal was made, so there is nothing to accept or veto. A run's report
+/// [`Outcome`] variants: no proposal was made, so there is nothing to read. A run's report
 /// counts them apart from the files that were asked about, because *we did not ask* and *we asked
 /// and got nothing usable* are different facts about the same run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,8 +368,8 @@ pub fn question(path: &str, source: &str, specs: &[Spec]) -> Result<Question, Sk
         }
     }
     // A section written bare in one place and with its document in another is governed by the
-    // header, so it belongs to the veto's input and not to the exempt list. Deciding it here rather
-    // than in the loop keeps the answer independent of the order the citations arrive in.
+    // header, so it belongs to the inheriting set and not to the exempt list. Deciding it here
+    // rather than in the loop keeps the answer independent of the order the citations arrive in.
     overridden.retain(|section| !inheriting.contains(section));
 
     if inheriting.is_empty() {
@@ -457,6 +510,26 @@ fn opening_comment(source: &str) -> String {
     collected.join("\n")
 }
 
+/// Which question this module is asking, for the record rather than for the file.
+///
+/// **Not written into the header, and that was ruled rather than overlooked.** The obvious move is
+/// `§spec <slug> v1`, mirroring `map_triage::TRIAGE_PROMPT_VERSION`, so a header carries the question
+/// that produced it. It is wrong here for a reason that does not apply next door: that version sits
+/// in a DIGEST which decides whether a stored judgement is still current, and it is read by code.
+/// This one would sit in 209 source comments, read by people, as provenance for something no code
+/// ever re-derives — noise in the product to record a fact about a run.
+///
+/// **So it goes in the run's record instead**: this constant, the proposal report Task 3 writes,
+/// and the body of the commit that applies the sweep. A header found to be wrong six months from
+/// now is then traced by `git log` to the commit, the commit to the run, and the run to the exact
+/// question that produced it — which is everything the version in the file would have bought, in
+/// the place that already keeps history.
+///
+/// Version 1 — the first question this module has asked. Bump it when the question materially
+/// changed, not when a line was rewrapped, and say in the commit what moved: a constant that moves
+/// without anybody narrating what moved is a constant nobody can read back.
+pub const ANCHOR_PROMPT_VERSION: u32 = 1;
+
 /// What to ask a model about one file.
 ///
 /// **One question per file, and the whole design of this module is in this string.** What each rule
@@ -469,14 +542,16 @@ fn opening_comment(source: &str) -> String {
 ///   reasoning attached to make it harder to catch. So abstention is named first, given its own
 ///   paragraph, and priced out loud: it costs this project nothing and a guess costs it a false
 ///   confirmation.
-/// - **The slug is to be copied exactly.** The veto compares it to the catalogue by equality, so an
+/// - **The slug is to be copied exactly.** [`adjudicate`] compares it to the catalogue by equality
+///   — the one rejection left in this module — so an
 ///   abbreviation — `mapa-do-projeto` for `2026-08-24-mapa-do-projeto-design` — is refused as a
 ///   document this project does not have. Resolving an abbreviation would mean deciding which
 ///   document it abbreviates, and deciding that from a substring is the scorer coming back in
 ///   through a side door.
 /// - **The documents come with titles.** A list of forty slugs is a list of dates.
 /// - **The sections each document has are deliberately absent.** See the module comment: they are
-///   the veto's input, and showing them invites exactly the arithmetic that was measured wrong.
+///   what [`Verdict::unaccounted`] is measured against afterwards, and showing them invites
+///   exactly the scoring that was measured wrong.
 /// - **What was left out is said.** A model shown 20 of a file's 33 sections and not told so is
 ///   reasoning about a file it believes it has seen whole.
 ///
@@ -638,9 +713,9 @@ pub struct Proposal {
     /// **Empty is tolerated here and is a parse failure in `map_triage`, and the difference is what
     /// checks the answer.** There the reason is the only mitigation §13 names for a silence nobody
     /// else examines, so a blank one is a filled column and an empty thought. Here the proposal is
-    /// checked twice more before it can do any harm — by the veto's arithmetic, and by a human
-    /// reading the diff §8 asks for — so refusing a well-formed slug because its note was blank
-    /// would cost a real answer to gain nothing.
+    /// scored against a ground truth fixed before the run, and read as a diff by a person — so
+    /// refusing a well-formed slug because its note was blank would cost a real answer to gain
+    /// nothing.
     pub why: String,
 }
 
@@ -654,8 +729,8 @@ pub struct Proposal {
 /// **A slug this project does not have is deliberately NOT one of these.** That answer is perfectly
 /// readable — it is a well-formed document name, and the model may even have been shown it and
 /// mistyped it. What is wrong with it is a fact about the project rather than about the answer, so
-/// it belongs to the veto, where it lands as [`Outcome::NoSuchDocument`] and is counted as the
-/// refusal it is.
+/// it belongs to [`adjudicate`], where it lands as [`Outcome::NoSuchDocument`] and is counted as
+/// the rejection it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreadable {
     /// Nothing shaped like an answer came back — prose, an apology, an empty string.
@@ -710,8 +785,8 @@ struct RawProposal {
 /// confirmed. There is no third default worth having: the honest outcome is that nobody read
 /// anything, and the file stays exactly as bare as it was.
 ///
-/// **The catalogue is deliberately not consulted here.** This answers *is this an answer* and the
-/// veto answers *is this a document of this project*, which is the same division `map_join` already
+/// **The catalogue is deliberately not consulted here.** This answers *is this an answer* and
+/// [`adjudicate`] answers *is this a document of this project*, the division `map_join` already
 /// keeps between reading a candidate off a citation and checking it against the project's real
 /// slugs. Keeping them apart is also what lets the two failures be counted apart — see
 /// [`Unreadable`].
@@ -750,9 +825,9 @@ pub fn parse_proposal(answer: &str) -> Result<Proposal, Unreadable> {
 ///
 /// The SHAPE half of the two conditions `map_join::names_document` applies, and only that half:
 /// lowercase, digits and hyphens, in at least two non-empty hyphen-joined segments. The other half
-/// — *and this project actually has that document* — is the veto's, because it needs the catalogue
-/// and because a well-formed name for a document that does not exist is a refusal with a reason
-/// rather than an answer nobody could read.
+/// — *and this project actually has that document* — is [`adjudicate`]'s, because it needs the
+/// catalogue and because a well-formed name for a document that does not exist is a rejection
+/// with a reason rather than an answer nobody could read.
 ///
 /// Two segments and not one for `names_document`'s measured reason: a one-word answer is an English
 /// word until proven otherwise, and 34 of this project's 40 slugs carry a `design` segment.
@@ -769,63 +844,95 @@ fn slug_shaped(said: &str) -> bool {
 
 /// What became of one file's proposal.
 ///
-/// **Five states, and no two of them may be added together into *not annotated*.** Each is fixed
-/// somewhere else: [`Self::Abstained`] by a better prompt or a better model, [`Self::NoSuchDocument`]
-/// by a prompt that makes copying the slug exactly harder to get wrong, [`Self::Refused`] by a
-/// human writing per-citation overrides into the file, [`Self::Unreadable`] by the runner. A count
-/// that merged them would be a number nobody could act on.
+/// **Five states, and two of them annotate.** [`Self::Declares`] and [`Self::DeclaresWithGaps`]
+/// both produce a header; the difference between them is a fact about the file, not permission to
+/// write one. The other three are the three ways an asked-about file ends up bare, and **no two of
+/// them may be added together into *not annotated***, because each is fixed somewhere else:
+/// [`Self::Abstained`] by a better prompt or a better model, [`Self::NoSuchDocument`] by a prompt
+/// that makes copying a slug exactly harder to get wrong, [`Self::Unreadable`] by the runner. A
+/// count that merged them would be a number nobody could act on.
+///
+/// **There is deliberately no *refused by arithmetic* state.** There was one, and it refused nine
+/// of 30 hand-verified true pairs — see the module comment for the measurement and for why the
+/// case it caught is the harmless one. Adding the variant back is the obvious change and it is the
+/// wrong one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
-    /// The proposal stands: every section this file would put under the document, the document
-    /// has. **The only outcome that may become a `§spec` header**, and it is still not a proof —
-    /// arithmetic vetoes, it does not confirm. What confirms is the human reading the diff.
+    /// The proposal stands, and the named document has a heading for every section the header
+    /// would govern.
+    ///
+    /// **Not a proof, and the distance matters.** Nothing here checked that the proposal is right;
+    /// what was checked is that the document exists. This variant means the arithmetic found
+    /// nothing further to say, which is a far smaller claim than the name looks like. What says a
+    /// proposal is right is the ground truth the run is scored against before anything is applied,
+    /// and a person reading the diff.
     Declares,
+    /// The proposal stands, and some sections the header would govern are headings the named
+    /// document does not have — [`Verdict::unaccounted`], of which [`Verdict::needs_override`] is
+    /// the actionable part.
+    ///
+    /// **Annotated all the same, and that is the whole correction this variant carries.** A missing
+    /// section is the harmless case: the citation inherits a document that has no such heading, the
+    /// join finds no approved decision there, and it anchors nothing. Refusing the file over it
+    /// would cost a true pair to prevent nothing — measured at nine true pairs out of 30, including
+    /// the file carrying §8's own worked example.
+    DeclaresWithGaps,
     /// The model answered `none`. Nothing was refused, because nothing was proposed.
     Abstained,
     /// A well-formed slug naming no document this project has.
     ///
-    /// **Vetoed without asking the arithmetic anything**, which is why [`Verdict::vetoed_by`] stays
-    /// empty here. There is no section list to compare against, and reporting *every section this
-    /// file cites is missing* would be a sentence about a document that does not exist — an
-    /// override list nobody could act on, in the one field that exists to be acted on.
+    /// **The one mechanical rejection that survives**, and the only check here that genuinely has
+    /// no false positives: a document either is in the catalogue or is not.
+    /// [`Verdict::unaccounted`] stays empty, because there is no heading list to compare against
+    /// and reporting *every section this file cites is missing* would be a sentence about a
+    /// document that does not exist — an override list nobody could act on, in the one field that
+    /// exists to be acted on.
     NoSuchDocument,
-    /// A real document that does not have sections this file cites, listed in
-    /// [`Verdict::vetoed_by`].
-    Refused,
     /// Nobody could read the answer. The file is exactly as bare as before anybody asked.
     Unreadable,
 }
 
-/// One file's proposal, and what the arithmetic did with it.
+/// One file's proposal, and the two things the arithmetic can honestly add to it.
 ///
-/// **The override list is the second output of the veto and the reason this struct is not a
-/// two-field one.** Once a file declares document A it stops being evidence for any decision of
-/// document B — that is what narrows a decision's anchor set and makes §10's ordering work — so a
-/// module that genuinely implements two documents and declares only one moves decisions from
-/// `Ambiguous` to `Silent` unless its exceptional citations carry `§N slug` overrides. Under-
-/// reporting is the safe direction and it still LOOKS like the map forgot something, so the
-/// sections that would need an override are named per file rather than left to be rediscovered.
+/// **The two section lists are this module's product and no longer a gate.** Once a file declares
+/// document A it stops being evidence for any decision of document B — that is what narrows a
+/// decision's anchor set and makes §10's ordering work — so a module genuinely implementing two
+/// documents moves decisions from `Ambiguous` to `Silent` unless its exceptional citations carry
+/// `§N slug` overrides. Under-reporting is the safe direction and it still LOOKS like the map forgot
+/// something, so the sections that would need an override are named per file rather than left to be
+/// rediscovered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Verdict {
     pub file: String,
-    /// The slug the model named, **kept even when it was refused**. A report that dropped it would
-    /// make a wrong proposal indistinguishable from an abstention on the one axis that says whether
-    /// the prompt or the model is the problem.
+    /// The slug the model named, **kept even when the document does not exist**. A report that
+    /// dropped it would make a mistyped proposal indistinguishable from an abstention on the one
+    /// axis that says whether the prompt or the model is the problem.
     pub proposed: Option<String>,
     pub outcome: Outcome,
-    /// Sections this file cites that the proposed document does not have. Non-empty exactly when
-    /// [`Outcome::Refused`].
-    pub vetoed_by: Vec<String>,
-    /// The subset of [`Self::vetoed_by`] that **some other document of this project does have** —
-    /// the sections a human can actually fix, by writing `§N other-slug` on those citations and
+    /// Sections the header would govern that the named document has no heading for. Non-empty
+    /// exactly when [`Outcome::DeclaresWithGaps`].
+    ///
+    /// **Named for what it is and not for what it used to do.** This field was `vetoed_by` and it
+    /// rejected the file. It no longer claims a refusal, because the claim was false: the same list
+    /// over the same real files refused nine of 30 verified true pairs, and the citations it names
+    /// are the ones that anchor nothing anyway.
+    pub unaccounted: Vec<String>,
+    /// The subset of [`Self::unaccounted`] that **some other document of this project does have** —
+    /// the sections a person can actually act on, by writing `§N other-slug` on those citations and
     /// letting the header take the rest.
     ///
-    /// **The difference from `vetoed_by` is actionability, and it is not cosmetic.** A section no
+    /// **The difference from `unaccounted` is actionability, and it is not cosmetic.** A section no
     /// document anywhere has cannot be overridden onto anything: it is a stale citation, a heading
-    /// that was renumbered away, or a number in prose that was never a citation. Telling the applier
-    /// to write an override for it would be telling it to name a document that does not exist, which
-    /// is the failure this whole module is arranged around.
+    /// renumbered away, or a number in prose that was never a citation at all — `map_join.rs`'s
+    /// fixtures invent `§42` and `§6.44` precisely so something tests a shape no document has.
+    /// Telling the applier to write an override for one would be telling it to name a document that
+    /// does not exist, which is the failure this whole module is arranged around.
+    ///
+    /// **It rescues less than its name suggests, and the number is worth carrying.** Of the 16
+    /// sections `map_join.rs` cites that the map document lacks, **13 exist in some other
+    /// document** — so this list is long for exactly the files that span two documents, which is
+    /// the honest answer rather than a comfortable one.
     pub needs_override: Vec<String>,
     /// The model's one sentence, or — for [`Outcome::Unreadable`] — this daemon's, marked with
     /// `map_triage::DAEMON_MARK` so that a line written by a parser is never read as a model's
@@ -833,12 +940,15 @@ pub struct Verdict {
     pub why: String,
 }
 
-/// Judge one file's answer against the project's documents.
+/// Read one file's answer against the project's documents.
 ///
 /// Takes the parse's `Result` rather than a `Proposal`, so that **every file asked about produces
 /// exactly one verdict**. A file that vanished from the report because nobody could read its answer
 /// is the under-report that looks like the map forgot things — which is the specific way this slice
 /// is expected to be misread, and the reason the override list exists at all.
+///
+/// **Rejects on one thing only.** The document has to be in the catalogue. Everything else it
+/// computes it reports, and nothing else it computes decides.
 pub fn adjudicate(
     question: &Question,
     answer: Result<Proposal, Unreadable>,
@@ -848,7 +958,7 @@ pub fn adjudicate(
         file: question.path.clone(),
         proposed: None,
         outcome: Outcome::Abstained,
-        vetoed_by: Vec::new(),
+        unaccounted: Vec::new(),
         needs_override: Vec::new(),
         why: String::new(),
     };
@@ -887,18 +997,18 @@ pub fn adjudicate(
         return verdict;
     };
 
-    let absent: Vec<String> = question
+    let unaccounted: Vec<String> = question
         .inheriting
         .iter()
         .filter(|section| !spec.sections.contains(*section))
         .cloned()
         .collect();
-    if absent.is_empty() {
+    if unaccounted.is_empty() {
         verdict.outcome = Outcome::Declares;
         return verdict;
     }
 
-    verdict.needs_override = absent
+    verdict.needs_override = unaccounted
         .iter()
         .filter(|section| {
             specs
@@ -907,23 +1017,32 @@ pub fn adjudicate(
         })
         .cloned()
         .collect();
-    verdict.vetoed_by = absent;
-    verdict.outcome = Outcome::Refused;
+    verdict.unaccounted = unaccounted;
+    // Reported, and NOT refused. See the module comment: refusing here cost nine of 30 verified
+    // true pairs and prevented nothing, because a citation inheriting a document that has no such
+    // heading anchors nothing when the join goes looking for it.
+    verdict.outcome = Outcome::DeclaresWithGaps;
     verdict
 }
 
-/// What a whole run came to, with the four ways of not annotating kept apart.
+/// What a whole run came to, with the ways of ending up bare kept apart.
+///
+/// **Two annotating counts and deliberately no total of them.** `declares + declares_with_gaps` is
+/// the number of headers a sweep would write, and a field holding it would be the field everyone
+/// quotes — at which point the gaps stop being read, which is the one thing this struct exists to
+/// keep visible. A caller wanting the total adds two numbers it has just been shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct AnchorCounts {
     pub files: usize,
     pub declares: usize,
+    pub declares_with_gaps: usize,
     pub abstained: usize,
     pub no_such_document: usize,
-    pub refused: usize,
     pub unreadable: usize,
-    /// Files whose proposal was refused and for which at least one of the refusing sections could
-    /// be carried by a per-citation override. §8's own example is one of these, and so is
-    /// `map_join.rs`.
+    /// Files carrying at least one unaccounted section that some other document does have — the
+    /// files somebody has to look at by hand. §8's own example is one of these, and so is
+    /// `map_join.rs`: it writes `§6.4 workspace-de-projeto` eight times and a **bare** `§6.4` twelve
+    /// times, so it needs overrides written into it by hand whatever any sweep does.
     pub needing_overrides: usize,
 }
 
@@ -936,9 +1055,9 @@ pub fn tally(verdicts: &[Verdict]) -> AnchorCounts {
     for verdict in verdicts {
         match verdict.outcome {
             Outcome::Declares => counts.declares += 1,
+            Outcome::DeclaresWithGaps => counts.declares_with_gaps += 1,
             Outcome::Abstained => counts.abstained += 1,
             Outcome::NoSuchDocument => counts.no_such_document += 1,
-            Outcome::Refused => counts.refused += 1,
             Outcome::Unreadable => counts.unreadable += 1,
         }
         if !verdict.needs_override.is_empty() {
@@ -952,8 +1071,8 @@ pub fn tally(verdicts: &[Verdict]) -> AnchorCounts {
 mod tests {
     use super::*;
 
-    /// Two real documents of this repository, because the veto's whole job is to check a proposal
-    /// against documents that actually exist.
+    /// Two real documents of this repository, because the one rejection left in this module is a
+    /// check against documents that actually exist.
     const MAP: &str = "2026-08-24-mapa-do-projeto-design";
     const WORKSPACE: &str = "2026-08-22-workspace-de-projeto-design";
 
@@ -983,7 +1102,7 @@ mod tests {
     }
 
     /// A stand-in catalogue: the two documents this repository's map slice is about, with the
-    /// sections each really has, plus one large document to test the veto's indifference to size.
+    /// sections each really has.
     fn specs() -> Vec<Spec> {
         vec![
             spec(
@@ -1008,15 +1127,20 @@ mod tests {
     }
 
     #[test]
-    fn a_proposal_for_a_spec_missing_a_cited_section_is_vetoed() {
-        // The one sound use of arithmetic in this whole module: the map document has no §6.4, so a
-        // file citing §6.4 is certainly not under it, whatever a model or a scorer thinks. A veto
-        // has no false positives, which is the asymmetry that makes it safe where the measured
-        // scorer was not.
+    fn a_section_the_proposed_document_lacks_is_reported_and_is_never_a_refusal() {
+        // **This test asserted the opposite when it landed, and the measurement is why it turned
+        // round.** The map document has no §6.4, so a strict reading says a file citing §6.4 is
+        // certainly not under it. That reading refused nine of 30 hand-verified true pairs,
+        // `map_join.rs` among them, and the file it refuses here IS `map_join.rs`. A file
+        // legitimately names sections its own document lacks: cross-references, fixture numbers,
+        // other documents quoted in prose.
+        //
+        // So it is reported and never refused, and the next test walks through why refusing bought
+        // nothing: a citation inheriting a document with no such heading anchors nothing.
         let file = asked(
             "core/src/map_join.rs",
-            "//! The junction. §8 asks a citation to name its document, and §6.4 of the workspace \
-             document is the example it uses.\n",
+            "//! The junction. §8 asks a citation to name its document, and §6.4 of the workspace              document is the example it uses.
+",
         );
 
         let verdict = answered(
@@ -1024,23 +1148,135 @@ mod tests {
             &format!("{{\"spec\":\"{MAP}\",\"why\":\"the module comment is about the map\"}}"),
         );
 
-        assert_eq!(verdict.outcome, Outcome::Refused);
-        assert_eq!(verdict.vetoed_by, ["6.4"]);
+        assert_eq!(verdict.outcome, Outcome::DeclaresWithGaps);
+        assert_ne!(
+            verdict.outcome,
+            Outcome::NoSuchDocument,
+            "the document exists; only a heading is missing, which is a different fact"
+        );
+        assert_eq!(verdict.unaccounted, ["6.4"]);
+        assert_eq!(
+            verdict.needs_override,
+            ["6.4"],
+            "the workspace document has it, so a person can write the override"
+        );
         assert_eq!(
             verdict.proposed.as_deref(),
             Some(MAP),
-            "a refused proposal is still the fact that says whether the prompt or the model is the \
-             problem"
-        );
-        assert_ne!(
-            verdict.outcome,
-            Outcome::Abstained,
-            "the model answered; it was wrong, which is a different report"
+            "and the header goes in, which is the whole of the correction"
         );
     }
 
     #[test]
-    fn a_proposal_the_model_declined_to_make_is_an_abstention_and_not_a_veto() {
+    fn a_section_the_declared_document_lacks_anchors_nothing_and_a_section_it_has_is_the_danger() {
+        // **The walk-through that withdrew the veto, run against the real join rather than
+        // remembered.** Both halves matter and the second is the one nothing in this module can
+        // see.
+        use crate::map_join::{Anchor, citations, join};
+        use crate::map_store::Decision;
+        use crate::project_map::{Module, Reader};
+
+        let slugs = vec![MAP.to_owned(), WORKSPACE.to_owned()];
+        let decided = |id: i64, slug: &str, section: &str| Decision {
+            id,
+            spec_slug: slug.to_owned(),
+            section: section.to_owned(),
+            ordinal: id,
+            text: format!("decision {id}"),
+            kind: crate::map_intent::Kind::Character,
+            brain: "local".to_owned(),
+            extracted_at: "2026-08-24T00:00:00Z".to_owned(),
+            approved_at: Some("2026-08-24T01:00:00Z".to_owned()),
+        };
+        let reading = |path: &str, source: &str| Module {
+            path: path.to_owned(),
+            reader: Reader::Rust,
+            declares: crate::project_map::cites_section(source),
+            cites: citations(source).into_iter().collect(),
+            tested: false,
+        };
+
+        // HALF ONE, the harmless case the veto was built to catch. The file declares the map
+        // document and writes a bare §6.4. The map document has no §6.4 at all, so no decision of
+        // it can sit there; the only §6.4 anybody approved belongs to the workspace document, and
+        // the join goes looking for §6.4 OF THE MAP DOCUMENT and finds nothing. **Nothing is
+        // confirmed, before or after.**
+        let elsewhere = [decided(1, WORKSPACE, "### 6.4 Quatro tipos")];
+        let declaring = [reading(
+            "core/src/map_join.rs",
+            &format!(
+                "//! §spec {MAP}
+/// and §6.4, bare.
+"
+            ),
+        )];
+        let bare = [reading(
+            "core/src/map_join.rs",
+            "/// and §6.4, bare.
+",
+        )];
+
+        let after = join(&elsewhere, &declaring, &[], &slugs);
+        let before = join(&elsewhere, &bare, &[], &slugs);
+
+        assert_eq!(
+            after.counts.declared, 0,
+            "no false confirmation is possible"
+        );
+        assert_eq!(before.counts.declared, 0);
+        // What it DOES cost is the guess it used to make: the decision was `Ambiguous` on the
+        // strength of a bare number and is now `Silent`, because the file said out loud that it
+        // meant another document. That is the wave the slice predicts, and it is a correction
+        // rather than damage — the honest half of a junction that admits what it does not know.
+        assert_eq!(before.counts.ambiguous, 1);
+        assert_eq!(after.counts.silent, 1);
+        assert_eq!(after.counts.ambiguous, 0);
+
+        // HALF TWO, the case that can hurt, and no arithmetic in this module sees it. The file
+        // declares the map document and writes a bare §1 it really meant of the workspace
+        // document. The map document HAS a §1, with an approved decision at it — so the header
+        // manufactures an `Anchor::Declared`: the one state the map may present as confirmed,
+        // wrong.
+        let shared = [decided(2, MAP, "## 1. O problema")];
+        let danger = [reading(
+            "core/src/x.rs",
+            &format!(
+                "//! §spec {MAP}
+/// and §1, bare.
+"
+            ),
+        )];
+        let honest = [reading(
+            "core/src/x.rs",
+            "/// and §1, bare.
+",
+        )];
+
+        assert_eq!(join(&shared, &danger, &[], &slugs).counts.declared, 1);
+        assert_eq!(join(&shared, &honest, &[], &slugs).counts.declared, 0);
+        assert_eq!(
+            join(&shared, &honest, &[], &slugs).decisions[0].anchor,
+            Anchor::Ambiguous
+        );
+
+        // And this is the sentence the whole rework turns on: on that very file, the arithmetic
+        // returns a clean bill. It cannot tell a right header from a wrong one, so it is not
+        // allowed to decide.
+        let asked_about = asked(
+            "core/src/x.rs",
+            "/// and §1, bare.
+",
+        );
+        let verdict = answered(
+            &asked_about,
+            &format!("{{\"spec\":\"{MAP}\",\"why\":\"confidently wrong\"}}"),
+        );
+        assert_eq!(verdict.outcome, Outcome::Declares);
+        assert!(verdict.unaccounted.is_empty());
+    }
+
+    #[test]
+    fn a_proposal_the_model_declined_to_make_is_an_abstention_and_not_a_rejection() {
         // *The model did not know* and *the model was wrong* are different facts about a run, they
         // are fixed in different places, and a report that added them together would say which of
         // the two nobody could act on.
@@ -1054,8 +1290,8 @@ mod tests {
         assert_eq!(verdict.outcome, Outcome::Abstained);
         assert_eq!(verdict.proposed, None);
         assert!(
-            verdict.vetoed_by.is_empty() && verdict.needs_override.is_empty(),
-            "nothing was refused, because nothing was proposed"
+            verdict.unaccounted.is_empty() && verdict.needs_override.is_empty(),
+            "nothing was measured, because nothing was proposed"
         );
         assert_eq!(
             verdict.why,
@@ -1091,8 +1327,8 @@ mod tests {
         assert_eq!(verdict.outcome, Outcome::NoSuchDocument);
         assert_eq!(verdict.proposed.as_deref(), Some(FIXTURE));
         assert!(
-            verdict.vetoed_by.is_empty(),
-            "there is no section list to be absent from"
+            verdict.unaccounted.is_empty(),
+            "there is no heading list to be absent from"
         );
         assert!(
             verdict.needs_override.is_empty(),
@@ -1148,13 +1384,17 @@ mod tests {
     }
 
     #[test]
-    fn the_veto_passes_a_file_whose_cited_sections_all_exist_even_when_the_spec_is_large() {
+    fn a_large_document_is_neither_preferred_nor_penalised_for_its_size() {
         // Fifty-nine sections is the largest document this repository has, and a scorer handed a
         // file citing `§7` ranks it first for exactly that reason — *how many headings a document
-        // has* rather than which one the file means, which is the measured failure this module
-        // exists not to reintroduce. The veto ranks nothing. It is handed one proposal and either
-        // finds a section absent or does not, and a test that let it choose between two documents
-        // would have quietly made it the decider.
+        // has* rather than which one the file means. Nothing here ranks, and this test is what says
+        // so from both sides: the small document, which is the right answer, comes back with
+        // nothing unaccounted for; the large one, which any scorer would prefer, is **still
+        // annotated** and simply carries the one section it cannot account for.
+        //
+        // The second half is the load-bearing one now. It used to assert a refusal, and a test that
+        // let the arithmetic pick between two documents is exactly how the arithmetic became the
+        // decider in the first place.
         let numbers: Vec<String> = (1..=59).map(|n| n.to_string()).collect();
         let every: Vec<&str> = numbers.iter().map(String::as_str).collect();
         let catalogue = vec![
@@ -1163,7 +1403,8 @@ mod tests {
         ];
         let file = question(
             "core/src/workflow_graph.rs",
-            "// four kinds, decided by whoever runs the node — §6.4, and §7 beside it.\n",
+            "// four kinds, decided by whoever runs the node — §6.4, and §7 beside it.
+",
             &catalogue,
         )
         .expect("worth asking about");
@@ -1177,9 +1418,8 @@ mod tests {
         );
 
         assert_eq!(small.outcome, Outcome::Declares);
-        assert!(small.vetoed_by.is_empty());
+        assert!(small.unaccounted.is_empty());
 
-        // And the large document is refused on §6.4 alone — not on a score, and not for its size.
         let large = adjudicate(
             &file,
             parse_proposal(&format!(
@@ -1188,8 +1428,13 @@ mod tests {
             &catalogue,
         );
 
-        assert_eq!(large.outcome, Outcome::Refused);
-        assert_eq!(large.vetoed_by, ["6.4"]);
+        assert_eq!(
+            large.outcome,
+            Outcome::DeclaresWithGaps,
+            "annotated, with §6.4 named as the thing it cannot account for"
+        );
+        assert_eq!(large.unaccounted, ["6.4"]);
+        assert_eq!(large.needs_override, ["6.4"]);
     }
 
     #[test]
@@ -1198,8 +1443,9 @@ mod tests {
         // `§6.4` belongs to another document of this project, so writing `§6.4 <slug>` on that one
         // citation lets the header in for everything else. `§42` belongs to nothing anywhere — a
         // heading renumbered away, a stale reference, or a number in prose that was never a
-        // citation — and no override can name a document for it. Both veto; only one is actionable,
-        // and telling the applier otherwise would be telling it to invent a document.
+        // citation — and no override can name a document for it. Both go unaccounted for; only one
+        // is actionable, and telling the applier otherwise would be telling it to invent a
+        // document.
         let file = asked(
             "core/src/map_join.rs",
             "//! §8, and the §6.4 example, and §42 which nothing has.\n",
@@ -1210,57 +1456,59 @@ mod tests {
             &format!("{{\"spec\":\"{MAP}\",\"why\":\"this module is the junction\"}}"),
         );
 
-        assert_eq!(verdict.outcome, Outcome::Refused);
-        assert_eq!(verdict.vetoed_by, ["42", "6.4"]);
+        assert_eq!(verdict.outcome, Outcome::DeclaresWithGaps);
+        assert_eq!(verdict.unaccounted, ["42", "6.4"]);
         assert_eq!(verdict.needs_override, ["6.4"]);
         assert_eq!(tally(&[verdict]).needing_overrides, 1);
     }
 
     #[test]
-    fn a_citation_that_already_names_its_own_document_never_vetoes_the_file_s_proposal() {
+    fn a_citation_that_already_names_its_own_document_stays_off_the_override_list() {
         // This repository's own flagship case. `map_join.rs` belongs to the map document and its
-        // fixtures write `§6.4 workspace-de-projeto`, which is §8's per-citation override already
-        // in place. A veto that counted that §6.4 would refuse the right answer over a citation the
-        // header was never going to touch: `citations` makes the header the default and the line
-        // the override, and the arithmetic has to read it the same way or the two disagree about
-        // the same file.
+        // fixtures write `§6.4 workspace-de-projeto`, which is §8's per-citation override already in
+        // place. `citations` makes the header the default and the line the override, so a citation
+        // that already carries a document is one the header will never govern — and putting it on
+        // the list of things somebody has to go and fix means naming work that is already done.
+        //
+        // **This used to be a gate, and losing the gate is not a reason to lose this.** Without the
+        // exclusion, `map_join.rs` was refused over the very citation §8 tells people to write. The
+        // refusal is gone; a list nobody finishes reading is still a list nobody reads.
         let file = asked(
             "core/src/map_join.rs",
-            &format!("//! The junction. §8 here, and §6.4 {WORKSPACE} in a fixture.\n"),
+            &format!(
+                "//! The junction. §8 here, and §6.4 {WORKSPACE} in a fixture.
+"
+            ),
         );
 
         assert_eq!(file.inheriting, ["8"]);
         assert_eq!(file.overridden, ["6.4"]);
-        assert_eq!(
-            answered(
-                &file,
-                &format!("{{\"spec\":\"{MAP}\",\"why\":\"the junction\"}}")
-            )
-            .outcome,
-            Outcome::Declares
+        let verdict = answered(
+            &file,
+            &format!("{{\"spec\":\"{MAP}\",\"why\":\"the junction\"}}"),
         );
+        assert_eq!(verdict.outcome, Outcome::Declares);
+        assert!(verdict.needs_override.is_empty());
 
-        // And a file that ALSO writes the section bare has one for the header to govern, so the
-        // veto is right to fire. Whether the exemption applies is a question about every citation
-        // of that section and not about the luckiest one.
+        // And a file that ALSO writes the section bare has one for the header to govern, so it
+        // belongs on the list. Whether the exclusion applies is a question about every citation of
+        // that section and not about the luckiest one.
         let mixed = asked(
             "core/src/map_join.rs",
             &format!(
-                "//! The junction. §8 here, §6.4 {WORKSPACE} in a fixture, and a bare §6.4 in the \
-                 prose.\n"
+                "//! The junction. §8 here, §6.4 {WORKSPACE} in a fixture, and a bare §6.4 in the                  prose.
+"
             ),
         );
 
         assert_eq!(mixed.inheriting, ["6.4", "8"]);
         assert!(mixed.overridden.is_empty());
-        assert_eq!(
-            answered(
-                &mixed,
-                &format!("{{\"spec\":\"{MAP}\",\"why\":\"the junction\"}}")
-            )
-            .outcome,
-            Outcome::Refused
+        let verdict = answered(
+            &mixed,
+            &format!("{{\"spec\":\"{MAP}\",\"why\":\"the junction\"}}"),
         );
+        assert_eq!(verdict.outcome, Outcome::DeclaresWithGaps);
+        assert_eq!(verdict.needs_override, ["6.4"]);
     }
 
     #[test]
@@ -1303,7 +1551,7 @@ mod tests {
         // listing is the measured-wrong scorer handed to the model with a rationale attached.
         assert!(
             !prompt.contains("4.1"),
-            "the documents' section lists are the veto's input and are never shown"
+            "the documents' heading lists are read after the answer and are never shown"
         );
     }
 
@@ -1417,10 +1665,11 @@ mod tests {
     #[test]
     fn a_document_s_card_reads_its_title_its_numbers_and_not_a_heading_inside_a_fence() {
         // A `#` inside a fenced block would put a section in a document that does not have one,
-        // which makes the veto PASS a proposal it should have refused — the one direction this
-        // feature never errs in. Measured across all 43 documents here, a fence-blind reader
-        // invents zero sections today; the rule is kept for the direction of the error, not its
-        // size.
+        // and this list is what decides whether a citation is accounted for — a phantom heading
+        // silently accounts for a citation nothing accounts for, which shortens the override list
+        // by exactly the entries somebody needed to see. Measured across all 43 documents here, a
+        // fence-blind reader invents zero sections today; the rule is kept for the direction of
+        // the error, not its size.
         let source = "# NucleOS — Mapa do projeto (design)\n\n\
                       ## 0. Decisões fixadas\n\n\
                       ### 4.1 Três tipos\n\n\
@@ -1556,14 +1805,21 @@ mod tests {
     }
 
     #[test]
-    fn the_four_ways_of_not_annotating_are_counted_apart() {
-        // Each is fixed somewhere else — the prompt, the model, the file, the runner — so a single
-        // *not annotated* total would be a number nobody could act on. This is the assertion that
-        // keeps them from being added together for the sake of a tidier report.
-        let mixed = asked("core/src/map_join.rs", "//! §8 and §6.4 together.\n");
+    fn the_five_outcomes_are_counted_apart_and_never_summed() {
+        // Two of the five annotate and three do not, and the three that do not are fixed in three
+        // different places — the model, the prompt, the runner. A single *not annotated* total would
+        // be a number nobody could act on, and a total of the two that DO annotate would become the
+        // number everyone quotes, at which point the gaps stop being read. Neither total exists,
+        // and this is the assertion that keeps it that way.
+        let mixed = asked(
+            "core/src/map_join.rs",
+            "//! §8 and §6.4 together.
+",
+        );
         let clean = asked(
             "core/src/map_store.rs",
-            "//! §9.2, and the shape it keeps.\n",
+            "//! §9.2, and the shape it keeps.
+",
         );
         let proposal = |slug: &str| format!("{{\"spec\":\"{slug}\",\"why\":\"a reason\"}}");
 
@@ -1580,12 +1836,27 @@ mod tests {
             AnchorCounts {
                 files: 5,
                 declares: 1,
+                declares_with_gaps: 1,
                 abstained: 1,
                 no_such_document: 1,
-                refused: 1,
                 unreadable: 1,
                 needing_overrides: 1,
             }
         );
+    }
+
+    #[test]
+    fn exposes_current_anchor_prompt_version() {
+        // Pinned the way `map_triage::exposes_current_triage_prompt_version` pins its own, and for
+        // the reason that test gives: a constant that moves without anybody narrating what moved is
+        // a constant nobody can read back. This is version 1, the first question this module has
+        // asked, so there is nothing yet to narrate.
+        //
+        // **What it costs to bump is different from next door, and cheaper.** A triage bump goes
+        // stale on every judgement in every project at once. This one invalidates nothing, because
+        // nothing stores it: it is provenance, carried in the run's report and the sweep's commit
+        // message rather than in the 209 headers themselves. See [`ANCHOR_PROMPT_VERSION`] for why
+        // that is the right place for it.
+        assert_eq!(ANCHOR_PROMPT_VERSION, 1);
     }
 }
