@@ -178,6 +178,14 @@ fn join_relative(folder: &str, target: &str) -> Option<String> {
 /// It is still worth measuring now: the difference between *declares something* and *declares
 /// nothing at all* already separates the ~87 files that claim a purpose from the ~108 that
 /// do not, and that split is the whole first slice.
+///
+/// **A `§spec` header counts as the gesture, and that is the right answer rather than a leak.**
+/// The marker [`crate::map_join::declaration`] reads is built on the same sign this searches for,
+/// so a file that declares its document without citing a numbered section anywhere comes back
+/// `declares: true, cites: []` — the shape this doc's neighbour on [`Module::cites`] already
+/// describes for a bare `§`, and the honest one: a file saying *my sections belong to that
+/// document* has gestured at a section even if it never numbered one. Nothing in this tree is in
+/// that state, since a header is only worth writing above citations.
 pub fn cites_section(source: &str) -> bool {
     source.contains('§')
 }
@@ -284,6 +292,24 @@ pub struct Module {
     /// tests, and a map that reports it as a difference about the code is wrong about the code.
     /// Whoever later reads the sibling read as a special case for TypeScript and removes it should
     /// know it is the opposite: it is what stops one.
+    ///
+    /// **And a file-level anchor declaration reopens that asymmetry on a new axis, which is stated
+    /// here because the reader alone cannot close it.** [`crate::map_join::declaration`] is a
+    /// property of the `&str` it is read from, so a `§spec` header governs its own file and no
+    /// other. A Rust module gets the right answer for free — its tests are in the same file, under
+    /// the same header — while a TypeScript module's sibling test is a *different* file, and its
+    /// citations fold in still bare however carefully the module declared. The symmetry this field
+    /// exists to keep would then hold for the section numbers and break for the documents.
+    ///
+    /// The fix is not code and must not become code: the sweep that writes the headers writes one
+    /// into `Fleet.test.tsx` too, since a test file is a file and the marker costs it one comment
+    /// line. Passing the module's declaration down into the sibling's read would mean a second
+    /// entry point taking a default, which is the second mechanism [`crate::map_join::citations`]
+    /// refuses to grow. **Measured, so the size of the gap is known rather than feared:** modules
+    /// here name 76 distinct sections and test files 14, of which exactly one — `§9.2` in
+    /// `shell/src/pages/Fleet.test.tsx` — is named by no module at all. The other 13 arrive twice,
+    /// and [`crate::map_join::evidence`] takes the strongest of a file's rows, so the module's own
+    /// declared citation wins and the bare copy costs nothing.
     ///
     /// The alternative — crediting the citation to the test file as a node of its own — is the one
     /// [`about_a_module`] already refuses, and for a reason that has not changed: it would double
@@ -1146,6 +1172,116 @@ mod tests {
         assert!(
             found.foreign.is_empty(),
             "and it is no foreign language either"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The document the `§spec` fixtures below declare, and **this repository does not have it.**
+    ///
+    /// `citations` is deliberately not a parser, so a `§spec` line written inside a string literal
+    /// here would be read as a declaration of *this file* when the map walks this tree — and this
+    /// file carries citations of its own. A real slug would hand them all that document and move
+    /// the junction's counts on the one commit whose safety argument is that they cannot move.
+    ///
+    /// **Which is why the fixtures interpolate this constant instead of spelling the marker out**:
+    /// the source text then never holds a whole declaration. The fictional slug is the second
+    /// defence and the durable one, since the next fixture written as a plain literal loses the
+    /// first without anything saying so. Named so that anyone who meets it on a real map reads
+    /// what it is instead of going looking for the document.
+    const FIXTURE_SLUG: &str = "documento-de-fixture";
+
+    #[test]
+    fn a_module_that_declares_its_spec_hands_the_slug_to_every_bare_citation() {
+        // §8's *quem declara a âncora é o código*, read off a file by the real walk rather than by
+        // calling the lexer directly. The declaration has to survive `structure`'s read for the
+        // junction ever to see it, and a unit test of `citations` alone passes just as happily
+        // with that wiring absent.
+        let root = scratch("declared");
+        write(
+            &root,
+            "core/src/a.rs",
+            &format!(
+                "//! §spec {FIXTURE_SLUG}\n\
+                 //! what §7, together with §9.2, is for\n\
+                 /// and §6.4 workspace-de-projeto, which is decided elsewhere\n"
+            ),
+        );
+
+        let found = structure(&root).expect("structure");
+        let a = found
+            .modules
+            .iter()
+            .find(|m| m.path == "core/src/a.rs")
+            .expect("a");
+
+        assert_eq!(
+            a.cites,
+            vec![
+                Citation {
+                    section: "6.4".to_string(),
+                    named: Some("workspace-de-projeto".to_string()),
+                },
+                Citation {
+                    section: "7".to_string(),
+                    named: Some(FIXTURE_SLUG.to_string()),
+                },
+                Citation {
+                    section: "9.2".to_string(),
+                    named: Some(FIXTURE_SLUG.to_string()),
+                },
+            ],
+            "the header is the default, and the one citation that wrote its own slug keeps it"
+        );
+        assert!(
+            a.declares,
+            "the sign is there, in the header as much as anywhere"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_declaration_governs_its_own_file_and_not_the_sibling_test_that_proves_it() {
+        // **The asymmetry `Module::cites` warns about, pinned so that it can only change on
+        // purpose.** A declaration is a property of the text it was read from, so a Rust module
+        // covers its own `#[cfg(test)]` for free and a TypeScript module does not cover a sibling
+        // in another file. The sibling's `§9.2` folds in as this module's claim — that part is
+        // unchanged and is what stops the two languages answering differently — and it folds in
+        // bare.
+        //
+        // The fix belongs to the sweep that writes the headers, which writes one into the test
+        // file too: a test file is a file, and the marker costs it one comment line. Teaching
+        // `structure` to pass the module's declaration down instead would mean a second entry
+        // point into `citations` taking a default, and one question would have two answers.
+        let root = scratch("declared-sibling");
+        write(
+            &root,
+            "shell/src/pages/Fleet.tsx",
+            &format!("// §spec {FIXTURE_SLUG}\n// the page, and what §7, exactly, is for\n"),
+        );
+        write(
+            &root,
+            "shell/src/pages/Fleet.test.tsx",
+            "// §9.2, named only by the proof\n",
+        );
+
+        let found = structure(&root).expect("structure");
+
+        assert_eq!(found.modules.len(), 1);
+        assert_eq!(
+            found.modules[0].cites,
+            vec![
+                Citation {
+                    section: "7".to_string(),
+                    named: Some(FIXTURE_SLUG.to_string()),
+                },
+                Citation {
+                    section: "9.2".to_string(),
+                    named: None,
+                },
+            ],
+            "the header reached its own file's citation and not the sibling's"
         );
 
         let _ = fs::remove_dir_all(&root);

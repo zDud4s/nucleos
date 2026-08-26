@@ -14,11 +14,19 @@
 //! exactly the ones it exists to give. A map that is confidently wrong is worse than no map: it is
 //! the disease this feature treats, with better pixels.
 //!
-//! **It names sections. It cannot name documents, and does not pretend to.** A `§7` in a Rust
-//! file is a number and nothing else; which of this repository's forty specs it points at is
-//! written down nowhere in the file. §8 mapa-do-projeto is the fix — a citation that carries a
-//! short document slug, the way `§6.4 workspace-de-projeto` does — and until the code is edited
-//! to carry one, the anchor is missing and no amount of reading recovers it.
+//! **It names sections. It names a document only where the file said which one.** A `§7` in a
+//! Rust file is a number and nothing else; which of this repository's forty-odd specs it points
+//! at is written down nowhere in the file, and no amount of reading recovers it. §8
+//! mapa-do-projeto is the fix, and this module now reads both halves of it: a slug on the
+//! citation (`§6.4 workspace-de-projeto`, the **override**) and a `§spec` line declaring one
+//! document for the whole file (the **default** — see [`declaration`]). Which of the two a given
+//! citation used is [`citations`]'s business and nobody else's.
+//!
+//! **The reader landed on a repository where not one file declares anything, and that ordering is
+//! the safety property.** Every count this module produces was measured before and after it and
+//! did not move, so the commit that writes the headers is a diff of headers alone and its effect
+//! is measurable in isolation. Until it lands, every positive join here is still a guess about
+//! which document a bare `§` meant.
 //!
 //! **[`Citation::named`] is a candidate, never a verdict.** The word after a section number has
 //! the same shape whether it is a slug or an English word, and nothing lexical tells them apart:
@@ -66,11 +74,20 @@ pub struct Citation {
     /// The section label, normalized: `7`, `6.4`, `5.3a`. Never the `§`, and never the
     /// punctuation that happened to follow it.
     pub section: String,
-    /// The word that followed it, when there was one.
+    /// The word that followed it, or — when nothing did — the document its file declared.
     ///
     /// A **candidate** for a document slug and not a document — see the module doc. The join
     /// checks it against the project's real spec slugs and drops it when it is not one. Nothing
-    /// at this layer can make that check, so nothing at this layer makes the claim.
+    /// at this layer can make that check, so nothing at this layer makes the claim. **That is
+    /// still true of a value that arrived from a [`declaration`]**: the file asserting it is no
+    /// evidence that the document exists, and a header naming a spec this project does not have
+    /// is refused by exactly the rule that refuses `§4.4 rule`.
+    ///
+    /// **Two origins, one field, and the field does not say which.** A caller cannot tell a slug
+    /// typed after the number from one inherited from the file's header, and does not need to:
+    /// the override exists so that the exceptional line can disagree with the header, and once
+    /// the disagreement is resolved the answer is the same kind of answer. [`declaration`] is
+    /// where the distinction lives, for the one caller that wants it.
     pub named: Option<String>,
 }
 
@@ -85,21 +102,122 @@ pub struct Citation {
 /// and `§7 rule` in another yields two rows. Collapsing them would mean picking which tail
 /// survives and throwing a candidate away; two rows the join resolves separately throw nothing
 /// away.
+///
+/// **A file's [`declaration`] is the default and a citation's own tail is the override.** A `§7`
+/// in a file that declared a document comes back naming that document, exactly as if the slug had
+/// been typed after the number; a `§7 something-else` keeps what its line wrote. The whole of §8
+/// is applied here, in one `or_else`, because the declaration lives in the same `&str` the
+/// citations do — and everything downstream ([`names_document`], [`evidence`], [`Anchor`]) then
+/// works unchanged, which is the point. Threading a default through [`crate::project_map::Module`]
+/// instead would be a second answer to the one question this function already answers.
 pub fn citations(source: &str) -> BTreeSet<Citation> {
+    // Read once, before the scan, and not per citation: the answer is a property of the file.
+    let declared = match declaration(source) {
+        Declaration::Absent => None,
+        Declaration::Named(slug) => Some(slug),
+        // First occurrence wins — see [`Declaration::Repeated`] for why the rule is positional.
+        Declaration::Repeated(slugs) => slugs.into_iter().next(),
+    };
+
     let mut found = BTreeSet::new();
     for (index, _) in source.match_indices('§') {
         let rest = &source[index + '§'.len_utf8()..];
         // `§§7` needs no special case: the first sign is followed by a sign, reads no number,
         // and is skipped, while the second reads `7`. One citation, without a rule for it.
+        //
+        // The `§` of a `§spec` line is skipped by this same rule and needs no case of its own:
+        // a citation is a sign followed by a DIGIT, and `s` is not one.
         let Some((section, taken)) = leading_number(rest) else {
             continue;
         };
         found.insert(Citation {
             section,
-            named: candidate(&rest[taken..]),
+            named: candidate(&rest[taken..]).or_else(|| declared.clone()),
         });
     }
     found
+}
+
+/// The marker a file writes to say which document its bare `§` numbers belong to.
+///
+/// **`§spec` and not `Spec anchor:`**, which was the plan's opening proposal, and the three
+/// properties the choice had to hold are the reason:
+///
+/// 1. **It cannot collide with a citation.** [`citations`] matches `§` followed by a digit, and
+///    `s` is not one — so the marker is invisible to the scan that shares its first character,
+///    without either of them needing to know about the other. `Spec anchor:` needs no such
+///    argument because it shares nothing, and gets a worse one instead: this codebase's comments
+///    argue at length about specs and about anchors, and *the spec anchor: a document* is a
+///    sentence somebody here will eventually write. `§spec` cannot appear in prose by accident,
+///    and did not appear anywhere in this tree — code, docs, plans, specs, `node_modules` — when
+///    it was chosen.
+/// 2. **It needs no per-language parser.** It is a substring, so it works inside `//`, `///`,
+///    `//!`, `--`, `#` and `/* */` alike, which is what keeps [`citations`] *deliberately not a
+///    parser* rather than making it one for the sake of a header.
+/// 3. **A reader who knows the convention finds it**, because it reuses the sign the whole
+///    feature is already about.
+///
+/// The slug is read by [`candidate`] — the same function, with the same shape rule, that reads a
+/// slug written after a section number. That is deliberate: the two cannot drift apart, and a
+/// declaration is refused for exactly the reasons a citation's candidate is. It also means the
+/// marker is inert unless something slug-shaped follows one space, so this module's own prose can
+/// write `§spec <slug>` while explaining the convention and declare nothing.
+const DECLARATION: &str = "§spec";
+
+/// What a file said about which document its bare `§` numbers belong to.
+///
+/// **Three states and not an `Option<String>`**, because *said nothing* and *said it twice* are
+/// different facts and the second is a defect. Collapsing them would hand every caller a slug
+/// with no way to know the file contradicted itself — the silent answer this module refuses
+/// everywhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declaration {
+    /// No `§spec` line, or none with a slug after it. The file's citations stay bare.
+    Absent,
+    /// One declaration. The file's bare citations name this document.
+    Named(String),
+    /// More than one, in the order the file wrote them. **The first wins**, and the rest are
+    /// carried rather than dropped.
+    ///
+    /// **The resolution is positional because the alternative cannot be lived with.** Refusing
+    /// both when they disagree looks safer — it is this module's usual direction, an under-report
+    /// rather than a confident answer — and it would make the convention unusable by the two
+    /// modules that implement it: their fixtures name several documents by construction, so
+    /// `map_join.rs` and `project_map.rs` could never declare their own. A declaration is a
+    /// header, a header sits at the top, and everything after it is text the file happens to
+    /// contain.
+    ///
+    /// **This variant is the report.** A second declaration is a defect worth surfacing, and it
+    /// surfaces in the type, where every `match` meets it, rather than in a log read once or a
+    /// row on the map. Not on the map deliberately: the files that *document* this convention
+    /// trip it for ever and are correct, so a panel counting them would have been wrong on the
+    /// day it shipped. Whoever writes the applier that puts these headers in — the task after
+    /// this one — is the caller this exists for, and *this file already declares something* is
+    /// precisely what it must not overwrite.
+    Repeated(Vec<String>),
+}
+
+/// The document a file declared for its bare `§` numbers, and whether it declared more than once.
+///
+/// **A `§spec` inside a string literal is still read**, exactly as a `§7` inside one still counts
+/// — [`citations`] is deliberately not a parser and neither is this. The cost is stated rather
+/// than discovered: it is one extra candidate on citations that were already bare, in a file that
+/// was already talking about the convention out loud, and it is visible to whoever opens the file.
+/// The alternative is a Rust parser, a TypeScript parser and a Go parser for a header.
+pub fn declaration(source: &str) -> Declaration {
+    let mut found: Vec<String> = Vec::new();
+    for (index, _) in source.match_indices(DECLARATION) {
+        // `candidate` wants the one space and the slug shape, so `§specular …` reads as prose,
+        // `§spec` alone declares nothing, and `§spec <slug>` in a doc is not a declaration.
+        if let Some(slug) = candidate(&source[index + DECLARATION.len()..]) {
+            found.push(slug);
+        }
+    }
+    match found.len() {
+        0 => Declaration::Absent,
+        1 => Declaration::Named(found.swap_remove(0)),
+        _ => Declaration::Repeated(found),
+    }
 }
 
 /// The section number a piece of text begins with, and how many bytes it took.
@@ -251,6 +369,12 @@ pub enum Anchor {
     /// that could not express certainty even once it is earned would have to be rewritten by the
     /// slice that earns it, and the count being zero is itself the measurement that says the edit
     /// has not landed.
+    ///
+    /// **The reader landed before the edit, on purpose, and the zero is why.** [`declaration`] can
+    /// now put a whole file under one document, so this variant has a second way to be produced —
+    /// and nothing in this tree uses either yet, which is what lets the annotation commit's effect
+    /// on the four counts be read off in isolation. A count that had already moved would have left
+    /// nothing to compare it against.
     Declared,
     /// Something names this section, and this map cannot confirm it means this decision. **Shown,
     /// never counted as confirmed.**
@@ -388,6 +512,16 @@ pub struct Counts {
 ///    names two segments the slug really has, in order, with one missing between them, and a rule
 ///    that accepted that would accept any two words a document happens to contain.
 ///
+/// **A candidate that arrived from a file's [`declaration`] is judged by these same two
+/// conditions, and no weaker pair.** A declaration is an assertion by the code rather than a
+/// guess, so there is an argument for trusting it further — and it is refused, because the
+/// conditions cost a real declaration nothing. `mapa-do-projeto-design` and its abbreviation
+/// `mapa-do-projeto` are both contiguous runs of `2026-08-24-mapa-do-projeto-design`, so a header
+/// somebody meant passes; what fails is a header with a typo in it, which is exactly the case
+/// worth failing. Relaxing the rule for declarations would put a second, weaker judgement beside
+/// the measured one, and the map would then have two answers to *is this a document of this
+/// project* — with the weaker of the two governing the only state it may present as confirmed.
+///
 /// This is why [`citations`] hands the join *every* candidate rather than pre-guessing which look
 /// slug-shaped. A parser tightened to "sounds like a document" would move the guess to the layer
 /// that has no list of documents to check it against, and the rejection here would stop meaning
@@ -450,6 +584,18 @@ enum Evidence {
 /// that names *no* document — `rule`, `approval-pause` — is different and must not be treated the
 /// same way: it leaves a citation that still names a bare section, which is ordinary ambiguous
 /// evidence and not a disqualification.
+///
+/// **A file-level [`crate::map_join::declaration`] turns that skip from a rarity into the common
+/// path, and that is the intended effect rather than a side effect.** Today 308 candidates exist
+/// in this tree and all but two name no document at all, so the branch almost never fires. Once a
+/// file declares, *every* citation in it names a document, and a file declared under one spec
+/// stops being evidence for any other spec's `§7`. Narrowing the anchor sets that way is the
+/// whole point of §8 — `§5.2` alone currently collects 42 files across forty documents — and it
+/// has a cost worth stating: a module that genuinely implements two documents and declares only
+/// one will *lose* its evidence for the other unless the exceptional citations carry the override.
+/// The decision then reads [`Anchor::Silent`] rather than [`Anchor::Ambiguous`], which is an
+/// under-report and the direction this module errs in on purpose — but it will look like the map
+/// forgot something, so it is written down here before it happens.
 fn evidence(cites: &[Citation], section: &str, spec_slug: &str, spec_slugs: &[String]) -> Evidence {
     let mut found = Evidence::Nothing;
     for cite in cites.iter().filter(|cite| cite.section == section) {
@@ -644,6 +790,33 @@ mod tests {
         SLUGS.iter().map(|slug| (*slug).to_owned()).collect()
     }
 
+    /// The slugs the `§spec` fixtures below name, and **not one of them is a document this
+    /// repository has.** That is why they exist instead of the fixtures reusing [`SLUGS`], and it
+    /// is not fastidiousness.
+    ///
+    /// [`citations`] is deliberately not a parser, so a `§spec` line written inside a string
+    /// literal in this file would be read as a declaration *of this file* the moment the map walks
+    /// this repository — and this file carries some fifty bare citations of its own. A real slug
+    /// would hand every one of them that document, which moves the junction's counts on the one
+    /// commit whose entire safety argument is that they cannot move.
+    ///
+    /// **So every fixture below interpolates rather than spelling the marker out**, which keeps
+    /// the whole declaration out of this file's own text, and the slug is fictional anyway. Two
+    /// defences on purpose: the first is easy to lose — the next fixture somebody writes as a
+    /// plain literal quietly declares this module — and the second holds whatever happens to the
+    /// first, because [`names_document`] refuses a slug no spec of the project matches. Measured
+    /// either way: with `§6.4 workspace-de-projeto` and `§8 mapa-do-projeto` already in this file,
+    /// this repository answers `declared: 2` under a stand-in intention layer both before the
+    /// reader landed and after it.
+    ///
+    /// Named so that whoever ever sees one of them on a real map reads what it is rather than
+    /// going looking for the document.
+    const FIXTURE: &str = "documento-de-fixture";
+    /// The full slug [`FIXTURE`] names, for the fixtures that need the join to accept it.
+    const FIXTURE_SPEC: &str = "2026-01-01-documento-de-fixture-design";
+    /// A slug no slug list in this file ever contains — the typo case.
+    const NO_SUCH_DOCUMENT: &str = "documento-que-nao-existe";
+
     /// An approved decision. `section` arrives exactly as a model copied it out of the document.
     fn decided(id: i64, spec_slug: &str, section: &str, ordinal: i64) -> Decision {
         Decision {
@@ -675,6 +848,23 @@ mod tests {
             reader: Reader::Rust,
             declares: !cites.is_empty(),
             cites: cited(cites),
+            tested: false,
+        }
+    }
+
+    /// A module whose citations are read out of real source text rather than handed over as
+    /// tuples.
+    ///
+    /// [`module_at`] builds the `Vec<Citation>` directly, which is the right shape for testing the
+    /// join and the wrong one for testing a file-level declaration: the declaration is applied by
+    /// [`citations`] while it reads the source, so a fixture that never runs the reader cannot
+    /// tell whether it ran at all.
+    fn module_reading(path: &str, source: &str) -> Module {
+        Module {
+            path: path.to_owned(),
+            reader: Reader::Rust,
+            declares: crate::project_map::cites_section(source),
+            cites: citations(source).into_iter().collect(),
             tested: false,
         }
     }
@@ -823,6 +1013,127 @@ mod tests {
             only("//! §7 v2-do-plano").named,
             Some("v2-do-plano".to_string())
         );
+    }
+
+    #[test]
+    fn a_file_that_declares_its_spec_gives_every_bare_citation_that_document() {
+        // §8's requirement — *quem declara a âncora é o código* — with the declaration sitting
+        // once at the top of the file instead of on all 1172 citations in the repository. Both
+        // sections below are bare, and both come back naming the document the file named.
+        let source = format!("//! §spec {FIXTURE}\n/// what §6.4, together with §7, is for\n");
+
+        let found: Vec<(String, Option<String>)> = citations(&source)
+            .into_iter()
+            .map(|cite| (cite.section, cite.named))
+            .collect();
+
+        assert_eq!(
+            found,
+            [
+                ("6.4".to_string(), Some(FIXTURE.to_string())),
+                ("7".to_string(), Some(FIXTURE.to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_citation_naming_its_own_document_overrides_the_file_s_declaration() {
+        // The precedence, and it is this way round on purpose. §8 illustrates the fix as a slug
+        // on the citation, so that form has to keep working and has to WIN — a file whose §6.4
+        // belongs to another document says so where the exception is, next to the citation, and
+        // not by deleting the header that is right about every other line.
+        let source = format!(
+            "//! §spec {FIXTURE}\n\
+             /// §6.4 workspace-de-projeto — the one line that means somewhere else\n\
+             /// and §7, which does not\n"
+        );
+
+        let found: Vec<(String, Option<String>)> = citations(&source)
+            .into_iter()
+            .map(|cite| (cite.section, cite.named))
+            .collect();
+
+        assert_eq!(
+            found,
+            [
+                ("6.4".to_string(), Some("workspace-de-projeto".to_string())),
+                ("7".to_string(), Some(FIXTURE.to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_declaration_in_one_file_is_reported_rather_than_silently_ignored() {
+        // **First occurrence wins, and the second is handed back rather than dropped.** The
+        // resolution has to be positional because the alternative — refusing both when they
+        // disagree — would make it impossible for the two modules that IMPLEMENT this convention
+        // to use it: their fixtures name several documents by construction, this one included.
+        // A declaration is a header and a header is at the top, so the first is the file's own
+        // statement and everything after it is data the file happens to contain.
+        //
+        // Dropping the rest silently is what this refuses. `Repeated` is a variant of its own, so
+        // nothing can read a file's declaration without being told the file declared twice: the
+        // report lives in the type, where a `match` meets it every time, rather than in a log
+        // read once. It is not a row on the map for the same reason it is not an error — the two
+        // files that document the convention will trip it for ever and be correct, so a panel
+        // saying so would be wrong on the day it shipped.
+        let source = format!(
+            "//! §spec {FIXTURE}\n/// §7, bare\n// and later, wrongly: §spec {NO_SUCH_DOCUMENT}\n"
+        );
+
+        assert_eq!(
+            declaration(&source),
+            Declaration::Repeated(vec![FIXTURE.to_string(), NO_SUCH_DOCUMENT.to_string()]),
+            "both are reported, in the order the file wrote them"
+        );
+        assert_eq!(
+            only(&source).named,
+            Some(FIXTURE.to_string()),
+            "and the citation took the first"
+        );
+
+        // One declaration is not a repeat, and no declaration is not an empty one.
+        assert_eq!(
+            declaration(&format!("//! §spec {FIXTURE}\n")),
+            Declaration::Named(FIXTURE.to_string())
+        );
+        assert_eq!(declaration("//! §7, and nothing else"), Declaration::Absent);
+    }
+
+    #[test]
+    fn a_declaration_inside_a_string_literal_is_still_read() {
+        // **Deliberately not a parser**, exactly as `a_citation_inside_a_string_literal_counts`
+        // says of the citation next door, and the approximation is stated here rather than left
+        // to be discovered. A `§spec` quoted in a fixture is indistinguishable from one in a doc
+        // comment without reading the language, and this module reads no language.
+        //
+        // The cost is bounded and it is not hypothetical — it is this file. Every fixture above
+        // declares something *about this module* when the map walks this repository, which is why
+        // they all name documents that do not exist: the error is then one extra candidate on a
+        // citation that was already bare, visible to whoever opens the file, and inert in every
+        // join. That is a cheaper error than pulling `syn` in to avoid it.
+        let source = format!("let header = \"§spec {FIXTURE}\";\n// and §8.4, bare\n");
+        assert_eq!(only(&source).named, Some(FIXTURE.to_string()));
+    }
+
+    #[test]
+    fn a_declaration_marker_is_never_itself_a_citation() {
+        // The marker reuses the `§` the module already scans for, and reuses it safely: a
+        // citation is `§` followed by a DIGIT, and `s` is not one. So the declaration cannot
+        // become a row on the map, and a `§spec` line adds nothing to the sections a file names.
+        assert!(citations(&format!("//! §spec {FIXTURE}\n")).is_empty());
+        // And the marker is the whole word. `§specular` is prose that starts with the same five
+        // letters, and reading it as a declaration would be exactly the accidental match the
+        // choice of `§spec` was made to avoid.
+        assert_eq!(
+            declaration(&format!("//! §specular {FIXTURE}\n")),
+            Declaration::Absent
+        );
+        // A marker with nothing slug-shaped after it declares nothing, which is what lets this
+        // module's own prose write `§spec <slug>` when it explains the convention.
+        assert_eq!(declaration("//! §spec <slug>\n"), Declaration::Absent);
+        assert_eq!(declaration("//! §spec\n"), Declaration::Absent);
+        assert_eq!(declaration("//! §spec Workspace\n"), Declaration::Absent);
     }
 
     #[test]
@@ -993,6 +1304,139 @@ mod tests {
         assert_eq!(single(&junction).anchor, Anchor::Declared);
         assert_eq!(single(&junction).modules, ["core/src/workflow_graph.rs"]);
         assert_eq!(junction.counts.declared, 1);
+    }
+
+    #[test]
+    fn a_file_s_declaration_reaches_anchor_declared_through_the_join() {
+        // **The variant that has never once been produced in this repository.** A reader that
+        // parsed the declaration and never lit `Declared` would be indistinguishable from today
+        // in every count there is, so the path from the `§spec` line to the one state the map may
+        // present as confirmed is asserted end to end rather than in two halves that each pass.
+        let mut spec_slugs = slugs();
+        spec_slugs.push(FIXTURE_SPEC.to_owned());
+        let decisions = [decided(1, FIXTURE_SPEC, "### 6.4 Quatro tipos", 4)];
+        let declared = [module_reading(
+            "core/src/workflow_graph.rs",
+            &format!(
+                "//! §spec {FIXTURE}\n/// four kinds, decided by whoever runs the node — §6.4.\n"
+            ),
+        )];
+
+        let junction = join(&decisions, &declared, &[], &spec_slugs);
+
+        assert_eq!(single(&junction).anchor, Anchor::Declared);
+        assert_eq!(single(&junction).modules, ["core/src/workflow_graph.rs"]);
+        assert_eq!(junction.counts.declared, 1);
+        assert_eq!(junction.counts.ambiguous, 0);
+
+        // The same file without its header is where this repository stands today, and the whole
+        // of slice 6 is the difference between these two lines.
+        let bare = [module_reading(
+            "core/src/workflow_graph.rs",
+            "/// four kinds, decided by whoever runs the node — §6.4.\n",
+        )];
+        let before = join(&decisions, &bare, &[], &spec_slugs);
+        assert_eq!(before.counts.declared, 0);
+        assert_eq!(single(&before).anchor, Anchor::Ambiguous);
+    }
+
+    #[test]
+    fn a_declaration_naming_a_document_this_project_does_not_have_changes_nothing() {
+        // A typo silently manufacturing an `Anchor::Declared` is the worst outcome this slice can
+        // produce, because `Declared` is the only state the map is allowed to present as
+        // confirmed. **No new rule stops it, and that is the point**: a declared slug is checked
+        // by `names_document` — the same function, with the same two conditions, that judges a
+        // candidate written on the citation itself. A declaration is an assertion by the code
+        // rather than a guess, but the conditions cost it nothing, and a weaker rule for
+        // declarations would be a second answer sitting beside the measured one.
+        //
+        // Tested anyway, and not skipped because it needed no code: "the existing rule already
+        // covers it" is a claim, and the day somebody relaxes `names_document` for a reason of
+        // its own this is what says the typo case went with it.
+        let decisions = [decided(1, SLUGS[0], "### 6.4 Quatro tipos", 4)];
+        let declared = [module_reading(
+            "core/src/x.rs",
+            &format!("//! §spec {NO_SUCH_DOCUMENT}\n/// §6.4, and nothing else\n"),
+        )];
+        let bare = [module_reading(
+            "core/src/x.rs",
+            "/// §6.4, and nothing else\n",
+        )];
+
+        let junction = join(&decisions, &declared, &[], &slugs());
+
+        assert_eq!(
+            single(&junction).anchor,
+            Anchor::Ambiguous,
+            "as bare as it was before anybody typed the header"
+        );
+        assert_eq!(junction.counts.declared, 0);
+        assert_eq!(
+            junction.counts,
+            join(&decisions, &bare, &[], &slugs()).counts,
+            "changes nothing means changes nothing, not merely does not confirm"
+        );
+    }
+
+    #[test]
+    fn the_counts_are_unchanged_on_a_repository_where_no_file_declares_anything() {
+        // **The safety property this slice's ordering exists for.** The reader lands first, on a
+        // repository where not one file carries a `§spec` line, so the next commit's diff is
+        // purely the annotations and its effect on these numbers is measurable in isolation. A
+        // reader that defaulted something quietly — an empty marker matched, a candidate
+        // inherited where the line wrote its own, a slug taken from somewhere other than a
+        // declaration — would move a number here, and the annotation commit would have nothing
+        // left to be compared against.
+        let decisions = [
+            decided(1, SLUGS[0], "### 6.4 Quatro tipos", 1),
+            decided(2, SLUGS[0], "## 4.1 Três tipos", 2),
+            decided(3, SLUGS[1], "### 9.2 Persistência", 1),
+            decided(4, SLUGS[1], "## Contrato", 2),
+        ];
+        let sources = [
+            (
+                "core/src/workflow_graph.rs",
+                "//! §6.4 workspace-de-projeto — four kinds\n",
+            ),
+            (
+                "core/src/map_store.rs",
+                "//! §9.2, and the shape it keeps\n",
+            ),
+            (
+                "shell/src/ui/Meter.tsx",
+                "// a meter, and nothing claims it\n",
+            ),
+            ("core/src/gate.rs", "// §12, which nobody approved\n"),
+        ];
+        let modules: Vec<Module> = sources
+            .iter()
+            .map(|(path, source)| module_reading(path, source))
+            .collect();
+
+        let junction = join(&decisions, &modules, &[], &slugs());
+
+        assert_eq!(
+            junction.counts,
+            Counts {
+                decisions: 4,
+                declared: 1,
+                ambiguous: 1,
+                silent: 1,
+                unnumbered: 1,
+                unclaimed: 1,
+                unmatched: 1,
+            }
+        );
+
+        // And the reason, at the resolution a header hides: every citation carries exactly what
+        // its own line wrote, and a bare one stays bare.
+        assert_eq!(
+            modules[0].cites,
+            cited(&[("6.4", Some("workspace-de-projeto"))])
+        );
+        assert_eq!(modules[1].cites, cited(&[("9.2", None)]));
+        assert!(modules[2].cites.is_empty());
+        assert_eq!(modules[3].cites, cited(&[("12", None)]));
     }
 
     #[test]
