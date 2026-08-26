@@ -264,12 +264,37 @@ pub struct Module {
     pub reader: Reader,
     /// It cites a spec section. `false` is the *code nobody asked for* pile of §5.1.
     pub declares: bool,
-    /// The sections this module names, at full resolution.
+    /// The sections this module names, at full resolution — **including the ones only its test
+    /// names**.
     ///
     /// **Deliberately alongside `declares` and not instead of it**, and the two can disagree on
     /// purpose. `declares` is *this file gestures at a section*; `cites` is *these are the sections
     /// it names*. A file holding a bare `§` with no number is `declares: true, cites: []` — and that
-    /// difference is a fact worth being able to count, not a bug to normalize away.
+    /// difference is a fact worth being able to count, not a bug to normalize away. Since the test
+    /// sibling is folded in, the disagreement also runs the other way: a module that cites nothing
+    /// itself but whose test names `§9.2` is `declares: false, cites: [9.2]`. `declares` stays the
+    /// file's own gesture, because it is what the §5.1 *code nobody asked for* count is built on
+    /// and quietly widening that count would change a shipped number without saying so.
+    ///
+    /// **A test's citation is its module's claim, and the symmetry is the reason.** A Rust module
+    /// keeps its tests in the same file, so a `§` inside `#[cfg(test)]` has always landed here for
+    /// free; the convention for TypeScript puts them in a sibling, so without reading it the same
+    /// declaration would answer differently in the two languages. That is not a property of the
+    /// decision being declared — it is a property of where each language happens to keep its
+    /// tests, and a map that reports it as a difference about the code is wrong about the code.
+    /// Whoever later reads the sibling read as a special case for TypeScript and removes it should
+    /// know it is the opposite: it is what stops one.
+    ///
+    /// The alternative — crediting the citation to the test file as a node of its own — is the one
+    /// [`about_a_module`] already refuses, and for a reason that has not changed: it would double
+    /// the shell's node count with nodes that permanently declare nothing and are permanently
+    /// untested, which is noise inside the single number this map exists to report.
+    ///
+    /// **Small today and stated as a number, because an adjective would age worse.** Across this
+    /// tree modules name 76 distinct sections and test files name 14, of which exactly one — `§9.2`
+    /// in `shell/src/pages/Fleet.test.tsx` — is named by no module at all. One section is a thin
+    /// reason to write code; the gap growing silently every time somebody tests what they named,
+    /// with nothing that would ever announce it, is not.
     pub cites: Vec<Citation>,
     /// Something tests it.
     pub tested: bool,
@@ -369,19 +394,34 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
             continue;
         };
         let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+        let mut cites = citations(&source);
         let tested = match reader {
             Reader::Rust => rust_has_tests(&source),
             Reader::Typescript => {
-                let sibling = ts_test_sibling(path);
-                present.contains(format!("{sibling}.ts").as_str())
-                    || present.contains(format!("{sibling}.tsx").as_str())
+                let stem = ts_test_sibling(path);
+                let proof = [format!("{stem}.ts"), format!("{stem}.tsx")]
+                    .into_iter()
+                    .find(|candidate| present.contains(candidate.as_str()));
+                // The sibling's sections are this module's claim — see `Module::cites`. A Rust
+                // module gets this free because its tests share its file; doing it here is what
+                // keeps the two languages answering the same question.
+                //
+                // Merged as sets and collected once, so `§4` named by both files is one row and
+                // the order is the section order rather than the order the walk happened to
+                // reach the two files in. `files` is sorted for exactly that reason, and reading
+                // a second file per module must not be the thing that reintroduces the wobble.
+                if let Some(proof) = &proof {
+                    let proved_by = std::fs::read_to_string(root.join(proof)).unwrap_or_default();
+                    cites.extend(citations(&proved_by));
+                }
+                proof.is_some()
             }
         };
         modules.push(Module {
             path: path.clone(),
             reader,
             declares: cites_section(&source),
-            cites: citations(&source).into_iter().collect(),
+            cites: cites.into_iter().collect(),
             tested,
         });
         sources.insert(path.clone(), source);
@@ -976,6 +1016,137 @@ import type { GraphNode } from "../data/workflow-graph";
 
         assert_eq!(found.unread, vec!["sidecars/echo/quiet.go".to_string()]);
         assert!(found.foreign.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_typescript_module_is_credited_with_what_its_test_names() {
+        // The sibling names a section the module itself never does. Crediting it to the module
+        // is what a Rust module already gets for free, and the alternative — a node for the test
+        // file — is the one `about_a_module` refuses.
+        let root = scratch("credited-ts");
+        write(
+            &root,
+            "shell/src/pages/Fleet.tsx",
+            "//! §4, the fleet page
+",
+        );
+        write(
+            &root,
+            "shell/src/pages/Fleet.test.tsx",
+            "// §9.2, and §4, both named here
+import { Fleet } from './Fleet';
+",
+        );
+
+        let found = structure(&root).expect("structure");
+        let fleet = found
+            .modules
+            .iter()
+            .find(|m| m.path == "shell/src/pages/Fleet.tsx")
+            .expect("fleet");
+
+        assert!(fleet.tested, "the sibling beside it is the proof");
+        assert_eq!(
+            fleet.cites,
+            vec![
+                Citation {
+                    section: "4".to_string(),
+                    named: None,
+                },
+                Citation {
+                    section: "9.2".to_string(),
+                    named: None,
+                },
+            ],
+            "§4 once and not twice, and sorted — not in the order the walk reached the two files"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rust_module_is_credited_with_what_its_own_test_module_names() {
+        // The symmetry the TypeScript merge exists to restore, asserted rather than assumed.
+        // Rust puts its tests in the same file, so `citations` has always picked these up and
+        // nothing defended that. If this ever stops being true the merge next door becomes a
+        // special case for one language, which is precisely what it must never be.
+        let root = scratch("credited-rs");
+        write(
+            &root,
+            "core/src/a.rs",
+            "pub fn a() {}
+
+#[cfg(test)]
+mod tests {
+    // §9.2, proved right here
+}
+",
+        );
+
+        let found = structure(&root).expect("structure");
+        let a = found
+            .modules
+            .iter()
+            .find(|m| m.path == "core/src/a.rs")
+            .expect("a");
+
+        assert!(a.tested);
+        assert_eq!(
+            a.cites,
+            vec![Citation {
+                section: "9.2".to_string(),
+                named: None,
+            }],
+            "a section named only inside `#[cfg(test)]` is still this module's claim"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_test_file_is_credited_to_its_module_and_appears_in_no_list_itself() {
+        // Being credited is not being drawn. The citation moves to the module; the file stays
+        // absent from every list this map returns — a node for it would permanently declare
+        // nothing and be permanently untested, landing noise inside the §5.1 count.
+        let root = scratch("credited-nowhere");
+        write(
+            &root,
+            "shell/src/pages/Fleet.tsx",
+            "export const Fleet = 1;
+",
+        );
+        write(
+            &root,
+            "shell/src/pages/Fleet.test.tsx",
+            "// §9.2, named only by the proof
+",
+        );
+
+        let found = structure(&root).expect("structure");
+
+        assert_eq!(found.modules.len(), 1);
+        assert_eq!(found.modules[0].path, "shell/src/pages/Fleet.tsx");
+        assert_eq!(
+            found.modules[0].cites,
+            vec![Citation {
+                section: "9.2".to_string(),
+                named: None,
+            }]
+        );
+        assert!(
+            !found.modules[0].declares,
+            "`declares` stays the file's own gesture, and the file itself gestured at nothing"
+        );
+        assert!(
+            found.unread.is_empty(),
+            "nothing failed to read it — it is proof about a module"
+        );
+        assert!(
+            found.foreign.is_empty(),
+            "and it is no foreign language either"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
