@@ -10,27 +10,39 @@
 //! **[`Citation::named`] is a candidate, never a verdict.** The word after a section number has
 //! the same shape whether it is a slug or an English word, and nothing lexical tells them apart:
 //! `§4.4 rule` yields `Some("rule")` exactly the way `§6.4 workspace-de-projeto` yields the slug.
-//! Today this repository is entirely the former — 204 of its citations are followed by that
-//! shape, and exactly one, `§8.4 approval-pause` in `runs.rs`, is even slug-*looking*, with
-//! `approval-pause` an English hyphenated phrase rather than a document. Checking a candidate
-//! against the project's real spec slugs is the join's job, and refusing to guess here is what
-//! keeps the join's rejection worth anything.
+//! Today this repository is entirely the former. Run over every `.rs`, `.ts`, `.tsx` and `.go`
+//! file outside this module, `citations` finds 729 citations in 174 files across 83 sections, and
+//! 308 of them carry a candidate — every one an English word. The only hyphenated candidate in
+//! shipping code is `§8.4 approval-pause` in `runs.rs`, and `approval-pause` is a phrase, not a
+//! document; the others the scan reports sit inside test fixtures in `project_map.rs` that quote
+//! the form §8 prescribes. **Zero real slug citations exist here** — §8 is unfixed until the
+//! edit that puts a slug on all of them lands. Checking a candidate against the project's actual
+//! spec slugs is the join's job, and refusing to guess at this layer is what keeps the join's
+//! rejection worth anything.
 //!
-//! **Deliberately approximate, and visibly so.** A `§` inside a string literal counts, and
-//! sections sort lexically, so `§10` comes before `§2`. Both are errors a reader sees in the
-//! answer itself. The error this module refuses is the silent one — a citation confidently tied
-//! to the wrong document — which is why nothing here decides anything.
+//! **Approximate where the error is visible, silent nowhere.** A `§` inside a string literal
+//! counts, and the scan above proves the cost is exactly that: a fixture quoting a citation is
+//! reported as one. That error is legible in the answer. The one place the approximation is
+//! *not* self-announcing is the ordering, so [`Citation`] states it outright rather than leaving
+//! it to be found. What this module refuses is the silent error — a citation confidently tied to
+//! the wrong document — which is why nothing here decides anything.
 
 // This is a bin-only crate, so dead-code reachability starts at `main`, and nothing reaches here
 // yet: this task builds the lexical half of the junction and the half that calls it — matching a
 // citation against the approved decisions and their spec slugs — is the next one. With the line
-// below removed the compiler names all five items and nothing else, so one line here says what
-// five scattered `#[allow]` attributes would. The instruction, not a description: DELETE THIS LINE
-// with the change that gives `citations` and `section_number` a production caller.
+// below removed the compiler names all five items and nothing else. Three scattered attributes
+// would cover them — measured, not assumed: an `#[allow]` seeds its item as a liveness root, so
+// covering `citations` and `section_number` also covers `leading_number` and `candidate`, which
+// nothing but those two call, and only `Citation` needs its own, because its fields are written
+// and never read outside the tests. One line beats three that have to be found and dropped
+// together. The instruction, not a description: DELETE THIS LINE with the change that gives
+// `citations` and `section_number` a production caller.
 //
-// Scoped to the non-test build, the way `errands.rs` and `contacts.rs` scope theirs, so it silences
-// only the absence of that caller. Under `cfg(test)` the lint stays live — every item below is
-// exercised by this module's tests, and one that stops being exercised has to say so.
+// Scoped to the non-test build so it silences only the absence of that caller. Under `cfg(test)`
+// the lint stays live — every item below is exercised by this module's tests, and one that stops
+// being exercised has to say so. `errands.rs:28` is the precedent for the module-wide form;
+// `contacts.rs` scopes to `not(test)` the same way but hangs its attributes on individual fields,
+// which is right there and wrong here, where the whole module is waiting on one caller.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use serde::Serialize;
@@ -39,9 +51,18 @@ use std::collections::BTreeSet;
 /// One `§` reference found in a source file.
 ///
 /// Ordering is lexical rather than numeric, because the derived `Ord` compares `section` as the
-/// string it is: `§10` sorts before `§2`. Reading order is not what the set is for — determinism
-/// is — and every numeric alternative has to first answer what `§5.3a` is worth as a number. A
-/// list a reader can re-sort beats a comparison that quietly disagrees with the document.
+/// string it is. `§10` before `§2` is the visible half. **The half that hides is the
+/// interleaving**: real sections from this repository sort
+/// `6.10, 6.19, 6.2, 6.20, 6.4` — `§6.2` lands *between* `§6.19` and `§6.20` rather than at the
+/// head of a misplaced block, and a reader scanning the list has no cue that anything is wrong.
+/// Both shapes occur here (`§6.10`, `§6.13`–`§6.16`, `§6.19`, `§6.20`, `§10`–`§14` all exist), so
+/// this is stated rather than left to be discovered: everything else in this module is
+/// approximate where the error is *visible*, and this one is not.
+///
+/// It stays lexical anyway. Determinism is what the `BTreeSet` is for, and a numeric comparison
+/// would first have to answer what `§5.3a` is worth as a number. A list a caller can re-sort for
+/// display beats an order that quietly disagrees with the document; the test below pins it so the
+/// determinism is asserted rather than assumed.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Citation {
     /// The section label, normalized: `7`, `6.4`, `5.3a`. Never the `§`, and never the
@@ -85,8 +106,9 @@ pub fn citations(source: &str) -> BTreeSet<Citation> {
 
 /// The section number a piece of text begins with, and how many bytes it took.
 ///
-/// Digits, then any number of `.digits` groups, then at most one lowercase letter — and the
-/// letter only where a digit just ended, which is what keeps `§4.a` from reading as `4.a`.
+/// Digits, then any number of `.digits` groups, then a single lowercase letter — one that a
+/// digit precedes and no second letter follows, which is what keeps `§4.a` from reading as `4.a`
+/// and `§7ab` from reading as `7a`.
 ///
 /// **A `.` only continues the number when a digit follows it**, and that single rule is what
 /// separates the number from the sentence it sits in. `§4.` ends the sentence, `§5.2).` closes
@@ -113,8 +135,19 @@ fn leading_number(text: &str) -> Option<(String, usize)> {
             after_digit = false;
             continue;
         }
-        // `§5.3a`, `§6c`, `§4.4a` — one letter, never two, and the loop ends on it either way.
-        if character.is_ascii_lowercase() && after_digit {
+        // `§5.3a`, `§6c`, `§4.4a` — and the letter is taken only when it is the LAST one. Two
+        // letters mean this was never a suffix, so `§7ab` is section `7` with `ab` as prose, not
+        // section `7a` with the `b` quietly dropped. Everywhere else here an unexpected shape
+        // ends the number and the tail becomes prose; truncating would be the one place this
+        // module answers wrongly instead of answering less, which is the asymmetry it exists to
+        // refuse.
+        if character.is_ascii_lowercase()
+            && after_digit
+            && !text[at + 1..]
+                .chars()
+                .next()
+                .is_some_and(|following| following.is_ascii_lowercase())
+        {
             number.push(character);
             end = at + 1;
         }
@@ -130,20 +163,33 @@ fn leading_number(text: &str) -> Option<(String, usize)> {
 
 /// The document slug a citation might be carrying, from whatever followed its number.
 ///
-/// One space, then a run of `[a-z0-9-]`. Both halves are enforced by the same two lines: a
-/// second space, an uppercase letter, or an apostrophe all leave the run empty, and an empty run
-/// is not a candidate. That is deliberate — the alternative is a rule per punctuation mark, and
-/// each of those is a place where prose could be mistaken for a slug.
+/// One space, then a run of `[a-z0-9-]`. A second space, an uppercase letter, or an apostrophe
+/// all leave the run empty, and an empty run is not a candidate — one rule rather than a rule per
+/// punctuation mark, each of which would be a place for prose to be mistaken for a slug.
 ///
 /// The run stops where the shape stops, so `§7 rule.` offers `rule` and keeps the full stop out
 /// of it. Whether `rule` is a document is a question for the join, which has the list.
+///
+/// **Three shapes are refused because no slug has them**, and refusing them is not the
+/// "sounds like a slug" vocabulary guess this module declines to make. A hyphen at either end
+/// (`§7 - a regra` gives `-`, a dash used as punctuation; `§7 -rule`; `§7 rule-`) and an
+/// all-digit run (`§7 2 vezes`) are ruled out by *shape*, the way an uppercase initial already
+/// is — no dictionary is consulted and no plausibility is judged. `rule` still comes back a
+/// candidate, because only the join can know it is not a document.
 fn candidate(rest: &str) -> Option<String> {
     let after = rest.strip_prefix(' ')?;
     let word: String = after
         .chars()
         .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
         .collect();
-    if word.is_empty() { None } else { Some(word) }
+    if word.is_empty()
+        || word.starts_with('-')
+        || word.ends_with('-')
+        || word.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(word)
 }
 
 /// The section number a spec heading carries, or `None` when it carries none.
@@ -158,7 +204,15 @@ fn candidate(rest: &str) -> Option<String> {
 /// approved decision that cannot be placed under a number still exists — it just anchors
 /// nothing, and saying so is the honest half of a junction that admits what it does not know.
 pub fn section_number(heading: &str) -> Option<String> {
-    let text = heading.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
+    // **The marker run is taken once and never returned to.** Stripping `#` and whitespace
+    // together — one `trim_start_matches` over both — eats the `#` of an item label as well, and
+    // `### #1 — A alçada vive numa tabela` comes back as section 1. That collides with the real
+    // `## 1. Contexto e problema` in the same document, and there are 39 such headings across
+    // five specs here. They sit under `## 2. Decisões fechadas`, which makes them precisely the
+    // decisions the intent layer harvests and copies verbatim — this function's likeliest input,
+    // not a fringe one. A `#` that survives the run is left where it is, for `leading_number` to
+    // refuse.
+    let text = heading.trim_start().trim_start_matches('#').trim_start();
     let text = text.strip_prefix('§').unwrap_or(text);
     let (number, taken) = leading_number(text)?;
     match text[taken..].chars().next() {
@@ -251,7 +305,14 @@ mod tests {
     fn two_mentions_of_the_same_section_in_one_file_are_one_citation() {
         let source = "//! §6.4 workspace-de-projeto — four kinds\n\
                       /// and §6.4 workspace-de-projeto is why this enum has four variants\n";
-        assert_eq!(citations(source).len(), 1);
+        let found = citations(source);
+        assert_eq!(found.len(), 1);
+        // Asserted, not merely counted: a length of 1 survives a candidate truncated at the
+        // first hyphen, and `workspace-de-projeto` is a real spec slug in this repository — the
+        // exact input the whole feature exists for.
+        let citation = found.iter().next().expect("one citation");
+        assert_eq!(citation.section, "6.4");
+        assert_eq!(citation.named, Some("workspace-de-projeto".to_string()));
 
         // Identical is the whole citation and not the section alone. `§7` bare and `§7 rule`
         // are two rows on purpose: collapsing them means picking which tail survives, and the
@@ -295,6 +356,81 @@ mod tests {
     }
 
     #[test]
+    fn a_slug_survives_whole_with_its_hyphens_and_its_digits() {
+        // The shape `§8 mapa-do-projeto` prescribes is the one input this module must not
+        // mangle. Truncating at the hyphen would hand the join `mapa` — a *wrong* candidate
+        // rather than a missing one, and the join has no way to tell it was cut.
+        assert_eq!(
+            only("//! §8.4 approval-pause").named,
+            Some("approval-pause".to_string())
+        );
+        assert_eq!(
+            only("//! §7 v2-do-plano").named,
+            Some("v2-do-plano".to_string())
+        );
+    }
+
+    #[test]
+    fn a_candidate_is_never_a_dash_and_never_a_bare_number() {
+        // Refused by shape, not by vocabulary: no slug opens or closes with a hyphen, and none
+        // is all digits. A lone `-` is a dash the sentence used as punctuation, and `2` in
+        // `§7 2 vezes` is a count. Judging whether a *word* sounds like a document stays the
+        // join's business — `rule` is still a candidate, and that is tested above.
+        assert_eq!(only("// §7 - a regra").named, None);
+        assert_eq!(only("// §7 -rule").named, None);
+        assert_eq!(only("// §7 rule-").named, None);
+        assert_eq!(only("// §7 2 vezes").named, None);
+    }
+
+    #[test]
+    fn a_second_lowercase_letter_means_the_first_was_never_a_suffix() {
+        // `§7ab` is section 7 with `ab` as prose. Reporting `7a` would invent a section no
+        // document has — answering wrongly where every other unexpected shape here answers
+        // less. No such citation exists in the tree today; the point is the asymmetry.
+        let citation = only("// §7ab");
+        assert_eq!(citation.section, "7");
+        assert_eq!(citation.named, None);
+        // One letter is still a suffix, and a letter followed by a space still ends the number.
+        assert_eq!(only("// §7a").section, "7a");
+        assert_eq!(only("// §7a rule").section, "7a");
+    }
+
+    #[test]
+    fn an_item_label_is_not_a_section_number() {
+        // `### #1 — …` is decision one of a list, not section one of the document. Reading the
+        // `#` markers and the whitespace in a single pass eats the label's own `#` and answers
+        // `Some("1")` — a confident, silent, wrong anchor on the input class this function most
+        // often sees, since these headings sit under `## 2. Decisões fechadas` and are exactly
+        // what the intent layer harvests. 39 headings across five specs have this shape.
+        assert_eq!(
+            section_number("### #1 — A alçada vive numa **tabela**, não num ficheiro"),
+            None
+        );
+        assert_eq!(section_number("## #11 — O tecto"), None);
+
+        // The collision is live in one document: `.ai/specs/2026-08-16-alcada-por-equipa-design.md`
+        // carries both of these, eleven lines apart. They must not answer the same thing.
+        let real = section_number("## 1. Contexto e problema");
+        let item = section_number("### #1 — A alçada vive numa **tabela**, não num ficheiro");
+        assert_eq!(real, Some("1".to_string()));
+        assert_eq!(item, None);
+        assert_ne!(real, item);
+    }
+
+    #[test]
+    fn the_order_is_lexical_and_that_interleaves_the_deep_sections() {
+        // Pins the determinism the `BTreeSet` exists for, and pins the wart with it: `§6.2`
+        // sorts BETWEEN `§6.19` and `§6.20`, which is not a misplaced block a reader would
+        // notice but an interleaving they would read straight past. Every section here is real.
+        let source = "// §6.2 §6.19 §6.20 §10 §2";
+        let order: Vec<String> = citations(source)
+            .into_iter()
+            .map(|citation| citation.section)
+            .collect();
+        assert_eq!(order, ["10", "2", "6.19", "6.2", "6.20"]);
+    }
+
+    #[test]
     fn a_spec_heading_gives_up_the_number_it_carries() {
         assert_eq!(
             section_number("## 4.1 Três tipos de decisão"),
@@ -313,6 +449,12 @@ mod tests {
             Some("0".to_string())
         );
         assert_eq!(section_number("## §8.1 A regra"), Some("8.1".to_string()));
+        // Each of the four followers, including the one that is nothing at all. A heading that
+        // is only its number is still a heading, and `)` and `:` are both in use here.
+        assert_eq!(section_number("## 7"), Some("7".to_string()));
+        assert_eq!(section_number("## 7) A regra"), Some("7".to_string()));
+        assert_eq!(section_number("## 7: A regra"), Some("7".to_string()));
+        assert_eq!(section_number("### 6.0a Estado"), Some("6.0a".to_string()));
     }
 
     #[test]
