@@ -205,7 +205,7 @@ fn render_pressure(report: &serde_json::Value) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "{:<5} {:<14} {:>5} {:>5} {:>9} {:>9} {:>7} {:>9} {:>8} {:>5}  {}",
+        "{:<5} {:<14} {:>5} {:>5} {:>9} {:>9} {:>7} {:>9} {:>8} {:>5}  veredicto",
         "round",
         "agente",
         "itens",
@@ -216,7 +216,6 @@ fn render_pressure(report: &serde_json::Value) -> String {
         "arranque",
         "declive",
         "R2",
-        "veredicto",
     );
     for rollup in report["rollups"].as_array().into_iter().flatten() {
         let fit = &rollup["fit"];

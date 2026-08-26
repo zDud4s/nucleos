@@ -4960,7 +4960,10 @@ mod tests {
             context_peak_from_line(r#"{"type":"system"}"#, Some(120_000)),
             Some(120_000)
         );
-        assert_eq!(context_peak_from_line("not json", Some(120_000)), Some(120_000));
+        assert_eq!(
+            context_peak_from_line("not json", Some(120_000)),
+            Some(120_000)
+        );
     }
 
     #[test]

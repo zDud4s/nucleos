@@ -9838,7 +9838,8 @@ mod tests {
         let state = test_state().await;
         seed_pressure_team(&state.pool, true).await;
 
-        let (status, body) = pressure_at(&pressure_router(state), "/team-pressure?team=NucleOS").await;
+        let (status, body) =
+            pressure_at(&pressure_router(state), "/team-pressure?team=NucleOS").await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["outcome"], "measured");
@@ -9858,7 +9859,8 @@ mod tests {
         let state = test_state().await;
         seed_pressure_team(&state.pool, false).await;
 
-        let (status, body) = pressure_at(&pressure_router(state), "/team-pressure?team=NucleOS").await;
+        let (status, body) =
+            pressure_at(&pressure_router(state), "/team-pressure?team=NucleOS").await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["outcome"], "never_ran");

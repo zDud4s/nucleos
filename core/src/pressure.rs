@@ -24,7 +24,9 @@ pub enum Scope {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Report {
     /// A equipa existe e nunca correu nada. Não é o mesmo que correr e não ter problemas.
-    NeverRan { team: String },
+    NeverRan {
+        team: String,
+    },
     Measured(Measured),
 }
 
@@ -86,8 +88,16 @@ async fn harvest(pool: &SqlitePool, job: &str) -> sqlx::Result<Vec<Item>> {
     Ok(rows
         .into_iter()
         .map(|row| {
-            let (round, agent_id, agent_name, run_id, context_peak, compacted, tools_used, num_turns) =
-                row;
+            let (
+                round,
+                agent_id,
+                agent_name,
+                run_id,
+                context_peak,
+                compacted,
+                tools_used,
+                num_turns,
+            ) = row;
             Item {
                 round,
                 agent_id,
@@ -330,9 +340,8 @@ fn judge(rollups: &mut [AgentRollup]) {
         })
         .collect();
 
-    for index in 0..rollups.len() {
+    for rollup in rollups.iter_mut() {
         let mut verdicts = Vec::new();
-        let rollup = &rollups[index];
 
         // Verdade-terreno da propria CLI: nao coube. Uma vez basta.
         if rollup.compacted_items >= 1 {
@@ -386,7 +395,7 @@ fn judge(rollups: &mut [AgentRollup]) {
             verdicts.push(Verdict::TrimPrompt);
         }
 
-        rollups[index].verdicts = verdicts;
+        rollup.verdicts = verdicts;
     }
 }
 
@@ -542,9 +551,11 @@ mod tests {
         for (ordinal, seed) in items.iter().enumerate() {
             let run_id: Option<i64> = match &seed.run {
                 Some(run) => {
-                    let tools =
-                        serde_json::to_string(&vec![serde_json::json!({"name": "Bash"}); run.tools])
-                            .unwrap();
+                    let tools = serde_json::to_string(&vec![
+                        serde_json::json!({"name": "Bash"});
+                        run.tools
+                    ])
+                    .unwrap();
                     let id: i64 = sqlx::query_scalar(
                         "INSERT INTO runs (prompt, status, mode, context_peak, compacted,
                                            tools_used, team_run_id, created_at)
@@ -661,7 +672,7 @@ mod tests {
     }
 
     /// Julga a fatia e devolve os veredictos de um agente num round.
-    fn verdicts_of(rollups: &mut Vec<AgentRollup>, agent: &str, round: i64) -> Vec<Verdict> {
+    fn verdicts_of(rollups: &mut [AgentRollup], agent: &str, round: i64) -> Vec<Verdict> {
         judge(rollups);
         rollups
             .iter()
@@ -784,7 +795,10 @@ mod tests {
             item(1, "Nucleo", Some(200_000), false, 5),
         ]);
         let r = &rollups[0];
-        assert_eq!(r.items, 3, "o item sem pico continua a ser um item da layer");
+        assert_eq!(
+            r.items, 3,
+            "o item sem pico continua a ser um item da layer"
+        );
         assert_eq!(r.peak_p50, Some(150_000), "mediana de [100k, 200k]");
     }
 
@@ -848,8 +862,11 @@ mod tests {
     #[test]
     fn the_fit_recovers_a_line_it_was_given() {
         // arranque 50k, declive 1 400/passo, exacto.
-        let Fit::Line { intercept, slope, r2 } =
-            fit(&[(10.0, 64_000.0), (20.0, 78_000.0), (30.0, 92_000.0)])
+        let Fit::Line {
+            intercept,
+            slope,
+            r2,
+        } = fit(&[(10.0, 64_000.0), (20.0, 78_000.0), (30.0, 92_000.0)])
         else {
             panic!("devia ajustar")
         };

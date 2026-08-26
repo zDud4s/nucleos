@@ -1471,15 +1471,15 @@ fn spawn_run(
                     // An empty list is stored as `[]`, which says "used no tools". NULL stays
                     // reserved for "nobody asked" — the distinction `compacted` lost by being
                     // `NOT NULL DEFAULT 0`.
-                    let tools_used = serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
-                        .unwrap_or_else(|_| "[]".to_string());
+                    let tools_used =
+                        serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
+                            .unwrap_or_else(|_| "[]".to_string());
                     // The peak comes off the whole stream, at full fidelity. The periodic mirror
                     // writes a peak too, sampled every 500ms; this write comes after it and is the
                     // more exact of the two.
-                    let context_peak = o
-                        .stdout
-                        .lines()
-                        .fold(None, |peak, line| crate::runner::context_peak_from_line(line, peak));
+                    let context_peak = o.stdout.lines().fold(None, |peak, line| {
+                        crate::runner::context_peak_from_line(line, peak)
+                    });
                     append_run_events(&pool, id, &o.stdout).await;
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
@@ -1711,11 +1711,12 @@ fn spawn_run(
                     // this is the run most worth reading afterwards. There is no outcome here, so
                     // `seen` is the whole record — and `compacted` cannot be known from it, which is
                     // why only these two are written.
-                    let context_peak = seen
-                        .lines()
-                        .fold(None, |peak, line| crate::runner::context_peak_from_line(line, peak));
-                    let tools_used = serde_json::to_string(&crate::runner::live_from_stream(&seen).did)
-                        .unwrap_or_else(|_| "[]".to_string());
+                    let context_peak = seen.lines().fold(None, |peak, line| {
+                        crate::runner::context_peak_from_line(line, peak)
+                    });
+                    let tools_used =
+                        serde_json::to_string(&crate::runner::live_from_stream(&seen).did)
+                            .unwrap_or_else(|_| "[]".to_string());
                     append_run_events(&pool, id, &seen).await;
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let timed_out = sqlx::query(
