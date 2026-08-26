@@ -5859,7 +5859,7 @@ fn find_ascii_ci(hay: &[char], pin: &[char]) -> Option<usize> {
         window
             .iter()
             .zip(pin)
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
 }
 
