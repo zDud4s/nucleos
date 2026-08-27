@@ -1861,7 +1861,7 @@ pub struct OllamaChat {
 /// itself is bounded again by the caller. Generous because a cold model loads from disk on the
 /// first request, and a first message that times out while Ollama is still starting looks exactly
 /// like a broken bot.
-const OLLAMA_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const OLLAMA_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl OllamaChat {
     pub fn new(base_url: String, model: String) -> Self {
@@ -1879,6 +1879,19 @@ impl OllamaChat {
                 .timeout(OLLAMA_EXCHANGE_TIMEOUT)
                 .build()
                 .expect("HTTP client for the local model (check TLS and proxy environment)"),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model,
+        }
+    }
+
+    /// Builds from a client the caller already owns, rather than one built fresh here — what
+    /// `assistants::ConfiguredAssistants` needs so every `OllamaChat` it hands out for the local
+    /// route shares the ONE `reqwest::Client` that route was constructed with, instead of a new
+    /// client per assistant. `new` above stays as it is for every other caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_client(client: reqwest::Client, base_url: String, model: String) -> Self {
+        Self {
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
         }

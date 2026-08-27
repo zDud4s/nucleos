@@ -1785,6 +1785,50 @@ pub const ERRAND_TOOLS: &[&str] = &[
     "web_search",
 ];
 
+/// The tools a hosted turn may be offered — a third-party model reached over OpenRouter, not a
+/// process this machine runs.
+///
+/// **An explicit allowlist, and not a filter over `ToolEffect`, and that distinction is the whole
+/// point of this list existing at all.** The obvious design is "every `ReadsOwn` tool" — shorter,
+/// self-maintaining, and wrong: `TOOL_EFFECTS` above records that `get_run` is `ReadsOwn` "only
+/// lexically", because a triage run's stdout is a model's answer over somebody's mail. A rule keyed
+/// on the table waves that straight through to a stranger's server, and waves through the next tool
+/// whose output quietly carries somebody else's words on the day it is added — the exact laundering
+/// `filter_outgoing`'s doc argues against for redaction, except here there is no second pass behind
+/// it to catch what the classification missed. So this list is written out by hand, once, and
+/// `every_hosted_tool_only_reads_its_own_state` holds it to the table from the OTHER direction —
+/// catching a tool reclassified out from under it — while naming the exclusions below is what
+/// catches the direction that test cannot: a tool that stayed `ReadsOwn` and simply should not have
+/// been added here.
+///
+/// The six are the daemon's own bookkeeping and nothing that carries a word another person or
+/// process wrote: the budget, the kill switch, and the job, project, proposal and team lists.
+///
+/// Named one by one, everything else is out, and why:
+/// - `get_run` and `get_job` carry a run's stdout, which for a triage run is a local model's
+///   answer over somebody's mail — see the paragraph above.
+/// - `project_cat`, `project_grep`, `project_diff`, `project_ls` carry the owner's own source, which
+///   can itself hold a vendored dependency, a saved page, or an issue body committed to a file.
+/// - `errand_files_*` and `errand_notebook_read` carry material an errand wrote down after reading
+///   the open web — a stranger's page, laundered through this machine's own disk.
+/// - `github_read` and `web_*` carry other people's prose outright.
+/// - the browser six carry a stranger's page, rendered.
+/// - `shadow_queue` and `shadow_scoreboard` are `ReadsOwn` by the table but excluded anyway:
+///   `LocalToolBox::call` has no dispatch arm for either, and a tool offered here that can only ever
+///   answer "no local dispatch" is worse than a tool never offered at all.
+/// - every one of the twelve `Acts` tools is out on a single, unconditional rule: a third-party
+///   model must never be able to start a run, spend a budget, approve or reject a proposal, send
+///   mail, move a branch, or touch the kill switch. There is no argument for any one of them that
+///   would not equally argue for all twelve, so none is considered on its own merits.
+pub const HOSTED_TOOLS: &[&str] = &[
+    "get_budget",
+    "get_kill",
+    "list_jobs",
+    "list_projects",
+    "list_proposals",
+    "list_teams",
+];
+
 /// What calling one NucleOS tool does to the turn that called it.
 ///
 /// This partition exists because an orchestrator turn is the only agent that both reads a
@@ -2111,6 +2155,15 @@ impl LocalToolBox {
     /// A council seat's box: `COUNCIL_TOOLS`, which carries nothing that acts.
     pub fn for_council(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
         Self::with_tools(base_url, token, pool, COUNCIL_TOOLS, None)
+    }
+
+    /// A hosted turn's box: `HOSTED_TOOLS`, the explicit allowlist for a third-party model reached
+    /// over OpenRouter.
+    ///
+    /// No errand: `HOSTED_TOOLS` carries none of the `errand_*` tools that field would unlock, and
+    /// passing one here would serve a box that names it nothing to do with.
+    pub fn for_hosted(base_url: String, token: String, pool: sqlx::SqlitePool) -> Self {
+        Self::with_tools(base_url, token, pool, HOSTED_TOOLS, None)
     }
 
     /// An errand's box: `ERRAND_TOOLS`, served for one errand.
@@ -3267,6 +3320,7 @@ mod tests {
         (LOCAL_TOOLS, "a chat turn"),
         (COUNCIL_TOOLS, "a council seat"),
         (TEAM_TOOLS, "a team agent"),
+        (HOSTED_TOOLS, "a hosted turn"),
     ];
 
     /// The dispatch in `LocalToolBox::call` is a second list of names beside the three above, and
@@ -4584,5 +4638,105 @@ mod tests {
                 "{name} reached ERRAND_TOOLS, a Telegram topic's box"
             );
         }
+    }
+
+    /// The hosted box offers `HOSTED_TOOLS` and NOTHING besides it.
+    ///
+    /// Asked of the box itself — `LocalToolBox::for_hosted(..).schemas()` — and not of the constant
+    /// alone, for the reason `EVERY_OFFERED_LIST`'s comment gives about a fourth constructor: a list
+    /// can be correct and a constructor can still fail to apply it. `schemas()` derives its answer
+    /// from the router's own registrations filtered by `self.allowed`, so this is the same path a
+    /// hosted turn's tool-calling loop would actually see, not a second, hand-rolled comparison of
+    /// it.
+    #[tokio::test]
+    async fn the_hosted_tool_box_offers_exactly_the_six_allowed_names() {
+        use crate::local_agent::ToolBox;
+
+        let toolbox = LocalToolBox::for_hosted(
+            "http://127.0.0.1:1".to_string(),
+            "unused".to_string(),
+            test_pool().await,
+        );
+
+        let mut offered: Vec<String> = toolbox
+            .schemas()
+            .into_iter()
+            .map(|schema| {
+                schema["function"]["name"]
+                    .as_str()
+                    .expect("every schema this router produces names its own tool")
+                    .to_string()
+            })
+            .collect();
+        offered.sort();
+
+        let mut expected: Vec<String> = HOSTED_TOOLS.iter().map(|name| name.to_string()).collect();
+        expected.sort();
+
+        assert_eq!(
+            offered, expected,
+            "the hosted box must offer exactly HOSTED_TOOLS, no more and no fewer"
+        );
+    }
+
+    /// The hosted allowlist is held to `TOOL_EFFECTS`, so reclassifying a tool it names without
+    /// revisiting this list fails here rather than shipping quietly to a third party.
+    ///
+    /// `HOSTED_TOOLS` is written out by hand for the reason its own doc comment gives at length: a
+    /// derived list would hand OpenRouter's model whatever `ReadsOwn` tool a later change adds, on
+    /// the strength of a classification nobody revisited for THIS audience — a stranger's server,
+    /// not a seat of this daemon's own council. This test is the other half of that guard: it does
+    /// not stop the list from being too short (a tool a person meant to add and forgot), only from
+    /// being wrong in the dangerous direction — a name still on it after its tool started acting, or
+    /// started carrying words this machine did not write.
+    #[test]
+    fn every_hosted_tool_only_reads_its_own_state() {
+        for name in HOSTED_TOOLS {
+            assert_eq!(
+                tool_effect(name),
+                ToolEffect::ReadsOwn,
+                "{name} is on the hosted allowlist and TOOL_EFFECTS no longer grades it ReadsOwn — \
+                 a third-party model must never be handed a tool that acts, that carries a \
+                 stranger's words, or that writes anything at all"
+            );
+        }
+
+        // And the name has to be real, for the reason `every_council_tool_only_reads` gives:
+        // `tool_effect` answers `Acts` for anything it does not recognise, so a misspelling would
+        // have passed the loop above by being refused — silently shorting the hosted route a tool
+        // somebody meant to give it.
+        let registered = every_tool_name();
+        for name in HOSTED_TOOLS {
+            assert!(
+                registered.iter().any(|tool| tool == name),
+                "{name} is on the hosted allowlist and is not a tool this server exposes"
+            );
+        }
+    }
+
+    /// `get_run` is `ReadsOwn` by the bare table and stays off the hosted allowlist anyway — pinned
+    /// here BY NAME so that deriving `HOSTED_TOOLS` from `TOOL_EFFECTS` in some future tidy-up (the
+    /// very shortcut this list's doc comment argues against) breaks a test that says why, instead of
+    /// silently handing a triage run's stdout to OpenRouter.
+    ///
+    /// `TOOL_EFFECTS` grades `get_run` `ReadsOwn` "only lexically": a triage run's stdout is a local
+    /// model's answer over somebody's mail, which only `effect_of_call` — reading the run's actual
+    /// mode from the pool — can tell apart from an ordinary run's. The hosted route has no
+    /// equivalent lookup and no barrier that shuts afterwards the way a local turn's does once it
+    /// reads something untrusted; it is a flat allowlist answered by a provider this daemon does not
+    /// run. Trusting the static table here is exactly the laundering `HOSTED_TOOLS`'s own doc warns
+    /// a classification-keyed rule commits — except with nothing downstream to catch it.
+    #[test]
+    fn get_run_stays_off_the_hosted_allowlist_even_though_the_table_calls_it_reads_own() {
+        assert_eq!(
+            tool_effect("get_run"),
+            ToolEffect::ReadsOwn,
+            "the premise this test pins: get_run reads ReadsOwn by the bare table alone"
+        );
+        assert!(
+            !HOSTED_TOOLS.contains(&"get_run"),
+            "get_run carries a run's stdout — for a triage run, a stranger's mail answered back by \
+             a local model — which is exactly what an allowlist to a third party must never carry"
+        );
     }
 }

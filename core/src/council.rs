@@ -835,7 +835,10 @@ async fn resolve_seat(
     // The check the file could not make: an agent's engine is a column, so only here is it known
     // that this seat wants this machine. Same refusal and same words as a `{ kind: local }` line —
     // where a seat came from does not change what the machine can serve.
-    if kind == SeatKind::Local && state.local_assistant.is_none() {
+    // `state.local_assistant.is_none()` before the migration to the assistant factory: the field
+    // this read no longer exists, so this call site is one of the lines that migration is allowed
+    // to touch beyond the `AppState` literal.
+    if kind == SeatKind::Local && state.assistants.serves(crate::chats::Brain::Local).is_err() {
         return Err(StartError::NoLocalModel);
     }
     // A seat's row records WHICH MODEL ANSWERED, `NOT NULL`, and that is the whole point of copying
@@ -957,7 +960,7 @@ pub async fn start(
             let wants_local = std::iter::once(chairman)
                 .chain(members.iter())
                 .any(|seat| seat.kind == Some(SeatKind::Local));
-            if wants_local && state.local_assistant.is_none() {
+            if wants_local && state.assistants.serves(crate::chats::Brain::Local).is_err() {
                 return Err(StartError::NoLocalModel);
             }
             resolve_roster(state, chairman, members).await?
@@ -2875,7 +2878,7 @@ mod tests {
             runner,
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             files_root: None,
             workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),

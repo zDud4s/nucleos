@@ -66,6 +66,19 @@ const CLEANUP_CHUNK_CHARS: usize = 2_000;
 /// comparable size out, and the instructions, with margin.
 pub const CLEANUP_NUM_CTX: usize = 4_096;
 
+/// What voice cleanup requires from a model, read by `capabilities::missing_capabilities` instead of
+/// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window: cleanup
+/// checks nothing else today, and `capabilities`' own guard test
+/// (`nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela`) fails if this ever claims more without
+/// that being a deliberate change.
+pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
+    crate::capabilities::Requirement {
+        context_tokens: CLEANUP_NUM_CTX,
+        tools: false,
+        vision: false,
+        structured_output: false,
+    };
+
 /// Which kind of capture this is. The discriminator on `voice_captures`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1017,12 +1030,18 @@ fn db_error(error: sqlx::Error) -> axum::response::Response {
 /// signal that the durable copy is now the truth.
 ///
 /// The two answer paths store their result differently, and getting this wrong would make voice work
-/// for one brain and not the other:
+/// for one brain and not the other — and, since `spawn_local_turn` now drives more than one brain
+/// itself, for one of ITS routes and not the other:
 ///
-/// - **A local turn writes `stdout` as the plain answer** (`spawn_local_turn`) and streams nothing at
-///   all, so its tail stays empty for the whole turn and everything arrives at once at the end. That
-///   is not a defect to work around: it is why `speakable` had to be a pure function of whatever text
-///   exists, rather than a subscriber to a stream that only one of the two paths has.
+/// - **Every turn `spawn_local_turn` drives writes `stdout` as the plain answer** — the local model
+///   on this machine and the hosted one over OpenRouter alike — and streams nothing at all, so its
+///   tail stays empty for the whole turn and everything arrives at once at the end. That is not a
+///   defect to work around: it is why `speakable` had to be a pure function of whatever text exists,
+///   rather than a subscriber to a stream that only the other path has. `assistant::
+///   answered_by_a_local_agent_loop` is the one place that knows which `answered_by` values these
+///   are, so this reads through it rather than spelling `"local"` out and quietly leaving a hosted
+///   turn's answer for the branch below to mangle as JSONL — which is exactly what happened here
+///   before that helper existed.
 /// - **A CLI turn streams JSONL** into the tail and stores the same stream in `stdout`, so the
 ///   finished text comes back through `extract_reply`.
 async fn answer_so_far(state: &AppState, turn_id: i64) -> Option<(String, bool)> {
@@ -1038,7 +1057,10 @@ async fn answer_so_far(state: &AppState, turn_id: i64) -> Option<(String, bool)>
             .ok()?;
     let (status, stdout, answered_by) = row?;
     let stdout = stdout.unwrap_or_default();
-    let text = if answered_by.as_deref() == Some("local") {
+    let text = if answered_by
+        .as_deref()
+        .is_some_and(crate::assistant::answered_by_a_local_agent_loop)
+    {
         stdout
     } else {
         crate::runner::extract_reply(&stdout).unwrap_or_default()
@@ -1810,7 +1832,7 @@ mod tests {
             runner: Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             // A doctrine is a Telegram channel's standing instruction. A conversation held at this
             // machine has none by definition, so `None` here is the value under test, not a stub.
             telegram_doctrine: None,
@@ -2023,6 +2045,23 @@ mod tests {
         .last_insert_rowid()
     }
 
+    /// A finished HOSTED turn whose answer is `answer`, as `spawn_local_turn` would have left it
+    /// when the model behind it was reached over OpenRouter rather than Ollama — same plain
+    /// `stdout`, same nothing streamed, and the only difference from `finished_local_turn` above is
+    /// the one wire word this whole fix is about.
+    async fn finished_hosted_turn(pool: &sqlx::SqlitePool, answer: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, stdout, created_at) \
+             VALUES ('perguntei', 'completed', 'assistant', 's', 'c', 'openrouter', ?, ?)",
+        )
+        .bind(answer)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
     /// A running turn, as it looks for every poll before the answer exists.
     async fn running_turn(pool: &sqlx::SqlitePool, status: &str) -> i64 {
         sqlx::query(
@@ -2106,6 +2145,32 @@ mod tests {
                 .into_response();
         }
         assert_eq!(fake.said(), vec!["Primeira.", "Segunda."]);
+    }
+
+    /// A hosted turn's answer is spoken, not swallowed as unparsed JSONL.
+    ///
+    /// The hazard `assistant::answered_by_a_local_agent_loop` exists to close: `spawn_local_turn`
+    /// writes `stdout` as the plain answer for a turn answered over OpenRouter exactly as it does
+    /// for a local one, but `answer_so_far` used to recognise only `answered_by == "local"` by name
+    /// — so a hosted turn's plain sentence fell to the branch built for a CLI's streamed JSONL,
+    /// `extract_reply` found no `result` event in it, and the answer came back empty. A
+    /// Voice-originated hosted chat would have spoken nothing at all, silently.
+    #[tokio::test]
+    async fn a_hosted_turns_answer_is_spoken_not_swallowed_as_unparsed_jsonl() {
+        let fake = Arc::new(crate::speak::FakeSpeaker::returning(b"RIFF"));
+        let state = conversing_state(VoiceRuntime {
+            armed: true,
+            speaker: Some(fake.clone()),
+            ..VoiceRuntime::default()
+        })
+        .await;
+        let turn = finished_hosted_turn(&state.pool, "A resposta veio do modelo alojado.").await;
+
+        let _ = get_turn_speech(State(state), Path((turn, 0)))
+            .await
+            .into_response();
+
+        assert_eq!(fake.said(), vec!["A resposta veio do modelo alojado."]);
     }
 
     /// A turn still thinking answers `204`, which means "ask again" and not "there is nothing".

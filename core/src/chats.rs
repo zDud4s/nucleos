@@ -9,6 +9,15 @@ use sqlx::SqlitePool;
 pub enum Brain {
     Cloud,
     Local,
+    /// A hosted third party, reached over OpenRouter's API.
+    ///
+    /// Not folded into `Local`: `Local` is a PROMISE that the conversation stays on this machine —
+    /// `runner::OLLAMA_BASE_URL` is loopback by construction, and local triage disables itself
+    /// rather than send a message body off it. A hosted model answering under the name `Local`
+    /// would make that promise silently false the first time somebody went looking for where their
+    /// words actually went. The route leaves the machine, so it gets its own name, and the promise
+    /// `Local` makes stays true for every row that still carries it.
+    OpenRouter,
 }
 
 impl Brain {
@@ -16,17 +25,26 @@ impl Brain {
         match self {
             Self::Cloud => "cloud",
             Self::Local => "local",
+            Self::OpenRouter => "openrouter",
         }
     }
 
     /// An unreadable value reads as `Cloud`, matching the column default. A brain nobody can parse
     /// is a brain nobody chose, and the old path is the safe one to fall to.
     ///
+    /// `openrouter` is now one of the readable spellings: `core/migrations/0123_brain_openrouter.sql`
+    /// widened the CHECK constraint that used to admit only `cloud` and `local`, so a row can hold
+    /// it and this has to hand it back. Anything still unreadable — a typo, or a spelling from some
+    /// future fourth route this function does not know yet — keeps falling to `Cloud`, same as
+    /// before.
+    ///
     /// Not `std::str::FromStr`: that trait is for parsing that can fail, and this deliberately
     /// cannot. Naming it after the trait would promise an error case there is none of.
     pub fn from_wire(value: &str) -> Self {
         if value == "local" {
             Self::Local
+        } else if value == "openrouter" {
+            Self::OpenRouter
         } else {
             Self::Cloud
         }
@@ -1332,6 +1350,45 @@ mod tests {
         // decides. Defaulting to `Cloud` here would silently move every Telegram chat off the
         // local model.
         assert_eq!(brain_of(&pool, "-100200300").await.unwrap(), None);
+    }
+
+    /// RED for the third route's read side. `from_wire` does not know `openrouter` yet — the
+    /// migration that lets a row carry the value does not exist either, so there is nothing for it
+    /// to read back today. This fails until both land, alongside `as_str` already naming the wire
+    /// spelling below.
+    #[test]
+    fn from_wire_reads_the_third_brain_back_from_its_wire_spelling() {
+        assert_eq!(Brain::from_wire("openrouter"), Brain::OpenRouter);
+    }
+
+    /// Guards the existing behaviour while the enum grows: a value nobody can parse must keep
+    /// falling to `Cloud`, not to whichever variant was added most recently. Written now rather
+    /// than left implicit, so the day `from_wire` does learn `openrouter` this assertion is still
+    /// here to say a THIRD unreadable spelling still falls the same old way.
+    #[test]
+    fn an_unreadable_brain_still_falls_to_cloud_as_the_enum_grows() {
+        assert_eq!(Brain::from_wire("um valor qualquer"), Brain::Cloud);
+    }
+
+    /// `as_str` has to name the third route on the wire before anything can even ATTEMPT to store
+    /// it — `create` and `set_brain` both bind this string straight into SQL, and the CHECK
+    /// constraint tests right below depend on it being the real spelling and not a placeholder.
+    #[test]
+    fn as_str_names_the_third_brain_openrouter_on_the_wire() {
+        assert_eq!(Brain::OpenRouter.as_str(), "openrouter");
+    }
+
+    /// The RED that matters: the enum can now NAME the third route, but the row still cannot HOLD
+    /// it. `0061_chats.sql`'s CHECK constraint only admits `cloud` and `local`, so `create` binds
+    /// `"openrouter"` and the INSERT is refused — the `.unwrap()` panics on that refusal. Writing
+    /// the migration is the next phase's job; this is what says the job is not done yet.
+    #[tokio::test]
+    async fn a_chat_can_be_created_with_the_third_brain_and_read_back() {
+        let pool = test_pool().await;
+
+        let id = create(&pool, Brain::OpenRouter, None).await.unwrap();
+
+        assert_eq!(brain_of(&pool, &id).await.unwrap(), Some(Brain::OpenRouter));
     }
 
     /// A conversation picked up from the editor remembers WHICH conversation it was picked up from,

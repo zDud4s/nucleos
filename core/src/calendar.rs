@@ -1354,7 +1354,7 @@ mod tests {
             runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             files_root: None,
             workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),

@@ -41,9 +41,9 @@ use chrono::{DateTime, Duration, Utc};
 /// The real minimum is per-model and NOT monotonic with model age — 512 tokens on Opus 5, 1024 on
 /// Opus 4.8 and Sonnet 5, 2048 on Opus 4.7, 4096 on Opus 4.6 and Haiku 4.5. Picking the largest of
 /// them is the only safe choice while nothing in the schema records WHICH model ran a given run:
-/// `runs.answered_by` stores `cloud` or `local`, not a model id. Erring high makes the signal go
-/// quiet on short prompts; erring low would make it accuse the API of a defect in the exact range
-/// where the API is behaving exactly as documented.
+/// `runs.answered_by` stores `cloud`, `local`, or `openrouter`, not a model id. Erring high makes
+/// the signal go quiet on short prompts; erring low would make it accuse the API of a defect in the
+/// exact range where the API is behaving exactly as documented.
 const MIN_CACHEABLE_PREFIX_TOKENS: i64 = 4096;
 
 /// Context a non-chat run reached without any handoff having taken it away.
