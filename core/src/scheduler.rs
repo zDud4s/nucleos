@@ -908,7 +908,13 @@ async fn should_continue(state: &AppState, errand: &crate::errands::Errand) -> V
     let Some(done_when) = errand.done_when.as_deref() else {
         return Verdict::Enough;
     };
-    let Some(assistant) = state.local_assistant.clone() else {
+    // `state.local_assistant.clone()` before the migration to the assistant factory: the field this
+    // read no longer exists, so this call site is the one line that migration is allowed to touch
+    // beyond the `AppState` literal.
+    let Ok(assistant) = state
+        .assistants
+        .assistant_for(crate::chats::Brain::Local, None)
+    else {
         tracing::info!(
             errand_id = errand.id,
             "no local model to check the criterion; the investigation stops"
@@ -1324,7 +1330,7 @@ mod tests {
             }),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),

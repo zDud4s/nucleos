@@ -33,6 +33,17 @@ pub struct ModelsConfig {
     /// change nothing at all until somebody asks for it by name.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub local_assistant_model: Option<String>,
+    /// Which model a hosted chat turn is sent to over OpenRouter — `openrouter.rs`'s
+    /// `OpenRouterChat`, the second `LocalChat` beside `local_assistant_model`'s Ollama one.
+    ///
+    /// Ship-dark, on exactly the posture `local_assistant_model` already carries: absent, nothing
+    /// about a conversation's behaviour changes, and a chat row that somehow already says
+    /// `openrouter` is refused (`assistant::NO_HOSTED_MODEL`) rather than answered by the cloud CLI
+    /// on the strength of this field never having been read. Naming a model here is what an
+    /// operator does once they have also put a key in the OS credential store — this field alone
+    /// gets a conversation no further, since `OpenRouterChat::new` still refuses without one.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub hosted_assistant_model: Option<String>,
     /// The models a conversation may be moved to, in the order the window offers them.
     ///
     /// A list here rather than a list in the window, because the window cannot know it. The agent
@@ -86,6 +97,17 @@ pub struct AssistantChoice {
     /// the one belonging to the runner it was actually started with.
     #[serde(default)]
     pub runner: Option<String>,
+    /// Whether this model declares tool calling, or `None` when nothing here knows.
+    ///
+    /// `Option<bool>` and not `bool`: "declares no tools" and "we have not asked" are different
+    /// facts and only one of them is worth warning somebody about. Filled by `marked_with`, which
+    /// never guesses — a choice absent from that function's map keeps `None`, never `Some(false)`.
+    ///
+    /// `#[serde(default)]` is required, not decoration: `AssistantChoice` is `Deserialize` and is
+    /// read from `.ai/nucleos-models.yaml`'s `assistant_choices`, so without it every existing
+    /// config file on disk — written before this field existed — stops parsing.
+    #[serde(default)]
+    pub tools: Option<bool>,
 }
 
 /// `low | medium | high | xhigh | max`, exactly as `claude --help` documents them at CLI 2.1.198.
@@ -128,6 +150,9 @@ fn default_assistant_choices() -> Vec<AssistantChoice> {
             // an untouched install runs the Claude CLI. Writing it out would suggest the field is
             // required, and a config that named the other runner would then have to edit all three.
             runner: None,
+            // Nothing has asked a cloud CLI's model whether it declares tools — `marked_with`
+            // fills this in, and an untouched install has never called it.
+            tools: None,
         })
         .collect()
 }
@@ -150,12 +175,42 @@ impl ModelsConfig {
     /// Every model a conversation may be moved to: the configured cloud list, then the local model
     /// if one is named.
     ///
-    /// The local entry is built here rather than configured, for the reason `assistant_choices`
-    /// says: `local_assistant_model` already names it, and a picker offering a local model the
-    /// assistant is not running would produce `NO_LOCAL_MODEL` at the first turn -- a refusal
-    /// earned by nothing the person did wrong. No model named, no entry, and the route is simply
-    /// not on the menu.
+    /// Delegates to `catalogue_with_installed(&[])` rather than keeping a second copy of this
+    /// logic -- "an empty installed list behaves exactly as today" is then true by construction,
+    /// not by two implementations happening to agree, and
+    /// `um_api_tags_mudo_degrada_para_o_configurado_e_nunca_para_um_menu_vazio` /
+    /// `sem_modelo_local_configurado_os_instalados_nao_entram_no_menu` both lean on that.
     pub fn catalogue(&self) -> Vec<AssistantChoice> {
+        self.catalogue_with_installed(&[])
+    }
+
+    /// `catalogue()`'s menu, with the local entry widened to every model this machine has
+    /// installed (`capabilities::installed_local_models` reads `/api/tags`; this function never
+    /// touches the network itself, `installed` is just the names that call already produced).
+    ///
+    /// **Installed models join the menu only when `local_assistant_model` is configured.** This is
+    /// not a detail: a picker offering a local model the assistant is not running would produce
+    /// `NO_LOCAL_MODEL` at the first turn -- a refusal earned by nothing the person did wrong.
+    /// `assistants::resolve_model` refuses `RouteNotConfigured` whatever a pin says when no model
+    /// is configured for the route, so a machine with Ollama running and a dozen models pulled but
+    /// no `local_assistant_model` in the file must show exactly today's menu -- no local entries at
+    /// all. Everything below the local-entry block is unchanged from before this packet.
+    ///
+    /// The configured model always appears, whether or not `installed` names it: a model can be
+    /// configured and not yet pulled, and this must not hide the one local entry the file asked
+    /// for. An installed model that is ALSO the configured one contributes no second entry -- one
+    /// id, one row: `installed` and the configured model are merged into one id list, then
+    /// deduplicated.
+    ///
+    /// Sorted rather than left in `installed`'s own order: this daemon does not control what order
+    /// `/api/tags` answers in, and a menu that reshuffles between two reads of the same machine is
+    /// one nobody can build a habit of using -- the same argument `chats.rs`'s `subagents_from`
+    /// already makes for sorting over trusting a map's order.
+    ///
+    /// `catalogue_with_installed(&[])` must equal `catalogue()` exactly, so an unreachable or quiet
+    /// Ollama degrades to precisely today's behaviour rather than to some other empty state --
+    /// trivially true here since `catalogue()` now calls this function with an empty slice.
+    pub fn catalogue_with_installed(&self, installed: &[String]) -> Vec<AssistantChoice> {
         // Only the models belonging to the CLI this daemon was actually started with. The file may
         // hold both lists — `scripts/refresh-models.py` writes both when it can reach both — and
         // offering `sonnet` to a daemon running Codex would produce a turn that dies at spawn.
@@ -181,18 +236,64 @@ impl ModelsConfig {
                     brain: "cloud".to_string(),
                     efforts: Vec::new(),
                     runner: Some(active.to_string()),
+                    // An agent CLI's capabilities are never discovered from here — see
+                    // `capabilities::declared_for_cli` — so this entry is never marked by
+                    // `marked_with` either.
+                    tools: None,
                 },
             );
         }
         if let Some(local) = &self.local_assistant_model {
+            // Merge the configured model into `installed`, then dedupe and sort so the result is
+            // independent of both the input order and of whether the configured model was already
+            // in the list -- one id, one row, in an order that does not depend on Ollama's own.
+            let mut local_ids: Vec<String> = installed.to_vec();
+            if !local_ids.contains(local) {
+                local_ids.push(local.clone());
+            }
+            local_ids.sort();
+            local_ids.dedup();
+            for id in local_ids {
+                choices.push(AssistantChoice {
+                    id: id.clone(),
+                    label: id,
+                    brain: "local".to_string(),
+                    // Ollama has no effort dial. An empty list rather than a flag, so the window
+                    // reads one thing — what levels are on offer — and never a rule about routes.
+                    efforts: Vec::new(),
+                    runner: None,
+                    // Unmarked here: `catalogue_with_installed` never touches the network, so
+                    // whether THIS local entry declares tools is `marked_with`'s job, over what
+                    // discovery actually found — never guessed at build time.
+                    tools: None,
+                });
+            }
+        }
+        if let Some(hosted) = &self.hosted_assistant_model {
             choices.push(AssistantChoice {
-                id: local.clone(),
-                label: local.clone(),
-                brain: "local".to_string(),
-                // Ollama has no effort dial. An empty list rather than a flag, so the window reads
-                // one thing — what levels are on offer — and never a rule about routes.
+                // GENERATED from the configured model, not written separately -- the same reason
+                // the local entries above are built here rather than configured: this is the one
+                // place either string is written, so the id the picker sends and the model
+                // `main.rs` built the `OpenRouterChat` with cannot come apart. A hand-written entry
+                // could name a model the daemon never built a client for, and then a person picks
+                // one model and a different one answers, silently.
+                id: hosted.clone(),
+                label: hosted.clone(),
+                brain: "openrouter".to_string(),
+                // OpenRouter is not one model behind one dial: some of the models it fronts take a
+                // reasoning effort and some do not, and a name alone does not tell this daemon
+                // which. Unlike the local entries' "Ollama has none", this is "unknown from here" --
+                // and an empty list is the only honest answer to that, so the window offers no dial
+                // for this route rather than guessing one that might not exist for the model named.
                 efforts: Vec::new(),
+                // Not filtered by `active_runner()` and never spawned as either CLI:
+                // `OpenRouterChat` is reached over HTTP, so which agent CLI is installed has
+                // nothing to do with whether this entry belongs on the menu.
                 runner: None,
+                // Unmarked here for the same reason the local entry above is: this function never
+                // touches the network, so whether OpenRouter's catalogue declares tools for this
+                // model is `marked_with`'s job, not a guess made at build time.
+                tools: None,
             });
         }
         choices
@@ -231,6 +332,27 @@ impl ModelsConfig {
     }
 }
 
+/// PURE: the menu, with each local choice marked by what its model was found to declare.
+///
+/// A model absent from `declared` stays `None` — nothing is ever marked `Some(false)` on a guess;
+/// `AssistantChoice::tools`'s own doc is the reason why. No production caller until the model
+/// picker's door wires `capabilities::DiscoveryCache`'s findings onto the menu — GREEN's job, not
+/// this phase's; `o_catalogo_marca_quem_nao_declara_ferramentas` and its sibling below exercise it
+/// in the meantime.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn marked_with(
+    choices: Vec<AssistantChoice>,
+    declared: &std::collections::HashMap<String, crate::capabilities::Declared>,
+) -> Vec<AssistantChoice> {
+    choices
+        .into_iter()
+        .map(|mut choice| {
+            choice.tools = declared.get(&choice.id).map(|found| found.tools);
+            choice
+        })
+        .collect()
+}
+
 impl Default for ModelsConfig {
     fn default() -> Self {
         ModelsConfig {
@@ -242,6 +364,7 @@ impl Default for ModelsConfig {
             plan_model: None,
             review_model: None,
             local_assistant_model: None,
+            hosted_assistant_model: None,
             assistant_choices: default_assistant_choices(),
         }
     }
@@ -1498,6 +1621,140 @@ mod tests {
         assert!(local.efforts.is_empty());
     }
 
+    // ---------------------------------------------------------------------------------------
+    // `catalogue_with_installed` -- the models this machine actually has, merged in
+    // ---------------------------------------------------------------------------------------
+
+    /// Both the configured model and every OTHER installed model must be on the menu, each as a
+    /// `brain: "local"` entry -- the whole point of this packet: a machine with a dozen models
+    /// pulled offers more than the one name in the config file.
+    #[test]
+    fn o_catalogo_lista_os_modelos_instalados_nesta_maquina() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..ModelsConfig::default()
+        };
+        let installed = vec!["qwen3.5:4b".to_string(), "llama3.2:3b".to_string()];
+
+        let catalogue = config.catalogue_with_installed(&installed);
+
+        let local_ids: Vec<&str> = catalogue
+            .iter()
+            .filter(|choice| choice.brain == "local")
+            .map(|choice| choice.id.as_str())
+            .collect();
+        assert!(
+            local_ids.contains(&"qwen3.5:4b"),
+            "the configured model is missing: {catalogue:?}"
+        );
+        assert!(
+            local_ids.contains(&"llama3.2:3b"),
+            "an installed model this machine actually has is missing: {catalogue:?}"
+        );
+    }
+
+    /// An unreachable, quiet, or never-called Ollama must degrade to EXACTLY today's menu -- never
+    /// to some other empty state invented for the occasion. Asserted against `catalogue()` itself
+    /// rather than a hand-written expectation, so "no behaviour change without a reachable Ollama"
+    /// is a fact this test enforces rather than a claim in a comment.
+    #[test]
+    fn um_api_tags_mudo_degrada_para_o_configurado_e_nunca_para_um_menu_vazio() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..ModelsConfig::default()
+        };
+
+        let with_nothing_installed = config.catalogue_with_installed(&[]);
+
+        assert_eq!(with_nothing_installed, config.catalogue());
+    }
+
+    /// A model can be configured and not yet pulled. The daemon must not hide the one entry it was
+    /// explicitly told about just because Ollama's own list disagrees with the config file.
+    #[test]
+    fn o_modelo_configurado_aparece_mesmo_que_o_api_tags_nao_o_liste() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..ModelsConfig::default()
+        };
+        let installed = vec!["llama3.2:3b".to_string()];
+
+        let catalogue = config.catalogue_with_installed(&installed);
+
+        assert!(
+            catalogue
+                .iter()
+                .any(|choice| choice.brain == "local" && choice.id == "qwen3.5:4b"),
+            "a configured-but-not-yet-pulled model must still be on the menu: {catalogue:?}"
+        );
+    }
+
+    /// The configured model and an installed model can name the same id. That must produce ONE
+    /// entry, not two rows a person cannot tell apart in the picker.
+    #[test]
+    fn um_modelo_instalado_que_ja_e_o_configurado_nao_aparece_duas_vezes() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..ModelsConfig::default()
+        };
+        let installed = vec!["qwen3.5:4b".to_string()];
+
+        let catalogue = config.catalogue_with_installed(&installed);
+
+        let matches: Vec<&AssistantChoice> = catalogue
+            .iter()
+            .filter(|choice| choice.id == "qwen3.5:4b")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "the configured model doubled up with its own installed entry: {catalogue:?}"
+        );
+    }
+
+    /// The switch rule this packet turns on: with no `local_assistant_model` configured, installed
+    /// models never reach the menu, however many this machine has pulled -- exactly what keeps
+    /// ship-dark true, and exactly what `assistants::resolve_model` needs to stay correct, since it
+    /// refuses `RouteNotConfigured` whatever a pin says when the route itself has no model.
+    #[test]
+    fn sem_modelo_local_configurado_os_instalados_nao_entram_no_menu() {
+        let config = ModelsConfig::default();
+        let installed = vec!["qwen3.5:4b".to_string(), "llama3.2:3b".to_string()];
+
+        let catalogue = config.catalogue_with_installed(&installed);
+
+        assert!(
+            catalogue.iter().all(|choice| choice.brain != "local"),
+            "installed models reached the menu with no local_assistant_model configured: {catalogue:?}"
+        );
+        assert_eq!(catalogue, config.catalogue());
+    }
+
+    /// Two reads of one unchanged machine must not reshuffle the menu -- `chats.rs`'s
+    /// `subagents_from` makes this exact argument about sorting rather than trusting a map's order,
+    /// and a picker that reorders itself between two identical reads is a picker a person cannot
+    /// build a habit of using. The two calls below deliberately reverse `installed`'s own order --
+    /// this daemon does not control the order Ollama's `/api/tags` answers in, so a genuine
+    /// guarantee has to survive the SAME models arriving in a DIFFERENT order, not just the same
+    /// slice handed back twice.
+    #[test]
+    fn a_ordem_dos_modelos_no_menu_nao_muda_entre_duas_leituras_iguais() {
+        let config = ModelsConfig {
+            local_assistant_model: Some("qwen3.5:4b".to_string()),
+            ..ModelsConfig::default()
+        };
+
+        let one = config
+            .catalogue_with_installed(&["llama3.2:3b".to_string(), "mixtral:8x7b".to_string()]);
+        let other = config
+            .catalogue_with_installed(&["mixtral:8x7b".to_string(), "llama3.2:3b".to_string()]);
+
+        assert_eq!(
+            one, other,
+            "the same installed models in a different input order must not reshuffle the menu"
+        );
+    }
+
     /// The cloud list belongs to the Claude CLI. Offering `sonnet` to a daemon running Codex would
     /// produce a turn that dies at spawn, and an effort dial Codex has never been verified to read.
     /// The shipped choices belong to the Claude CLI. A daemon started on Codex must not be offered
@@ -1528,6 +1785,7 @@ mod tests {
                 brain: "cloud".to_string(),
                 efforts: vec!["high".to_string()],
                 runner: Some("claude".to_string()),
+                tools: None,
             },
             AssistantChoice {
                 id: "gpt-5.6-terra".to_string(),
@@ -1535,6 +1793,7 @@ mod tests {
                 brain: "cloud".to_string(),
                 efforts: vec!["high".to_string(), "ultra".to_string()],
                 runner: Some("codex".to_string()),
+                tools: None,
             },
         ];
 
@@ -1608,6 +1867,118 @@ local_assistant_model: qwen3.5:4b
         let catalogue = config.catalogue();
         let ids: Vec<&str> = catalogue.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["opus", "sonnet", "fable", "qwen3.5:4b"]);
+    }
+
+    /// Ship-dark on the posture `local_assistant_model` already established: an untouched install,
+    /// and every file written before this key existed, names no hosted model — so nothing about a
+    /// conversation's behaviour can change until an operator writes the key in themselves.
+    #[test]
+    fn hosted_assistant_model_is_absent_by_default() {
+        assert_eq!(ModelsConfig::default().hosted_assistant_model, None);
+    }
+
+    /// The key round-trips through the same reader `local_assistant_model` does, once an operator
+    /// does name a model — `deserialize_optional_model` trims whitespace and turns a blank string
+    /// into `None` for this key exactly as it already does for that one, so a file edited by hand
+    /// with a trailing space does not silently misconfigure the route.
+    #[test]
+    fn a_configured_hosted_model_reads_back_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-terra
+hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
+",
+        )
+        .unwrap();
+
+        let config = load_models_config(&path).unwrap();
+
+        assert_eq!(
+            config.hosted_assistant_model.as_deref(),
+            Some("anthropic/claude-sonnet-4.5")
+        );
+    }
+
+    /// Same posture as the local route's regression guard: with no hosted model configured, the
+    /// route is simply not on the menu. Offering one anyway would let a person pick `openrouter`
+    /// and hit `NO_HOSTED_MODEL` at the first turn -- a refusal earned by nothing they did.
+    #[test]
+    fn the_catalogue_offers_no_hosted_model_when_none_is_configured() {
+        let config = ModelsConfig::default();
+
+        let catalogue = config.catalogue();
+
+        assert!(
+            catalogue.iter().all(|choice| choice.brain != "openrouter"),
+            "a hosted route was offered with no hosted model behind it: {catalogue:?}"
+        );
+    }
+
+    /// `catalogue()` must generate the hosted entry from `hosted_assistant_model`, exactly as it
+    /// already does for the local route -- the argument on `catalogue`'s own doc comment. Anything
+    /// else lets an operator hand-write an `assistant_choices` entry with `brain: "openrouter"`
+    /// whose `id` names a different model than `hosted_assistant_model`: `chosen_brain` resolves
+    /// the picked id through this same catalogue and gets `Brain::OpenRouter`, so the turn is
+    /// answered by the `OpenRouterChat` `main.rs` built from `hosted_assistant_model` -- a
+    /// different model than the one the person picked, silently.
+    #[test]
+    fn the_catalogue_names_the_hosted_model_when_one_is_configured() {
+        let config = ModelsConfig {
+            hosted_assistant_model: Some("anthropic/claude-sonnet-4.5".to_string()),
+            ..ModelsConfig::default()
+        };
+
+        let catalogue = config.catalogue();
+
+        let hosted: Vec<&AssistantChoice> = catalogue
+            .iter()
+            .filter(|choice| choice.brain == "openrouter")
+            .collect();
+        assert_eq!(
+            hosted.len(),
+            1,
+            "expected exactly one hosted entry: {catalogue:?}"
+        );
+        // Same string as the model `main.rs` actually built the `OpenRouterChat` with -- the two
+        // cannot come apart because there is only one place either of them is written.
+        assert_eq!(hosted[0].id, "anthropic/claude-sonnet-4.5");
+    }
+
+    /// The `retain` a few lines up in `catalogue()` filters `cloud` entries by `active_runner()`
+    /// because `sonnet` offered to a daemon running Codex is a turn that dies at spawn. A hosted
+    /// model has nothing to do with which agent CLI is installed -- `OpenRouterChat` is reached
+    /// over HTTP, not spawned as either CLI -- so the hosted entry must survive that filter
+    /// regardless of `primary_runner`. Pinned because someone reading the retain in isolation could
+    /// reasonably "tidy" it into filtering every entry, hosted included.
+    #[test]
+    fn the_hosted_model_stays_on_the_menu_whichever_cli_is_installed() {
+        let on_claude = ModelsConfig {
+            hosted_assistant_model: Some("anthropic/claude-sonnet-4.5".to_string()),
+            ..ModelsConfig::default()
+        };
+        let on_codex = ModelsConfig {
+            hosted_assistant_model: Some("anthropic/claude-sonnet-4.5".to_string()),
+            primary_runner: Some("codex".to_string()),
+            ..ModelsConfig::default()
+        };
+
+        for config in [&on_claude, &on_codex] {
+            let catalogue = config.catalogue();
+            let hosted: Vec<&AssistantChoice> = catalogue
+                .iter()
+                .filter(|choice| choice.brain == "openrouter")
+                .collect();
+            assert_eq!(
+                hosted.len(),
+                1,
+                "hosted entry dropped for primary_runner={:?}: {catalogue:?}",
+                config.primary_runner
+            );
+            assert_eq!(hosted[0].id, "anthropic/claude-sonnet-4.5");
+        }
     }
 
     /// The format `scripts/refresh-models.py` writes, parsed by the code that has to read it.
@@ -2560,6 +2931,92 @@ local_assistant_model: qwen3.5:4b
         assert_eq!(
             config.doctrine, None,
             "a malformed telegram.yaml must fall back to the default, not invent a doctrine"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `marked_with` — each local choice marked by what its model was found to declare
+    // ---------------------------------------------------------------------------------------
+
+    fn unmarked_choice(id: &str) -> AssistantChoice {
+        AssistantChoice {
+            id: id.to_string(),
+            label: id.to_string(),
+            brain: "local".to_string(),
+            efforts: Vec::new(),
+            runner: None,
+            tools: None,
+        }
+    }
+
+    /// `Some(true)` for a model that declared tools, `Some(false)` for one that explicitly did
+    /// not — never guessed for either, and never the same answer for two different models.
+    #[test]
+    fn o_catalogo_marca_quem_nao_declara_ferramentas() {
+        let choices = vec![
+            unmarked_choice("qwen3.5:4b"),
+            unmarked_choice("llama3.2:3b"),
+        ];
+        let mut declared = std::collections::HashMap::new();
+        declared.insert(
+            "qwen3.5:4b".to_string(),
+            crate::capabilities::Declared {
+                context: Ok(()),
+                tools: false,
+                vision: false,
+                structured_output: false,
+            },
+        );
+        declared.insert(
+            "llama3.2:3b".to_string(),
+            crate::capabilities::Declared {
+                context: Ok(()),
+                tools: true,
+                vision: false,
+                structured_output: false,
+            },
+        );
+
+        let marked = marked_with(choices, &declared);
+
+        let by_id = |id: &str| -> &AssistantChoice {
+            marked
+                .iter()
+                .find(|choice| choice.id == id)
+                .unwrap_or_else(|| panic!("marked_with dropped {id}: {marked:?}"))
+        };
+        assert_eq!(
+            by_id("qwen3.5:4b").tools,
+            Some(false),
+            "a model that explicitly did not declare tools must be marked Some(false), not left \
+             None"
+        );
+        assert_eq!(
+            by_id("llama3.2:3b").tools,
+            Some(true),
+            "a model that declared tools must be marked Some(true)"
+        );
+    }
+
+    /// A choice `declared` never mentions must stay `None` — not marked servable, not marked
+    /// broken. `AssistantChoice::tools`'s own doc is the reason: "declares no tools" and "we have
+    /// not asked" are different facts, and only one of them is worth warning anybody about.
+    #[test]
+    fn um_modelo_de_capacidades_desconhecidas_nao_e_marcado_de_lado_nenhum() {
+        let choices = vec![unmarked_choice("novo-modelo")];
+        let declared = std::collections::HashMap::new();
+
+        let marked = marked_with(choices, &declared);
+
+        assert_eq!(
+            marked.len(),
+            1,
+            "marked_with must not drop or add choices, only mark them: {marked:?}"
+        );
+        assert_eq!(
+            marked[0].tools, None,
+            "a model absent from the declared map must be marked neither servable nor broken: \
+             {marked:?}"
         );
     }
 }

@@ -2066,6 +2066,14 @@ function ModelMenu({
                     : "on this machine"}
                 </span>
               )}
+              {choice.brain === "openrouter" && (
+                /* Said before the pick, not after: the local mark above answers "is it running
+                   here", and this one answers the question that matters just as much for a
+                   hosted choice — whose machine the words end up on. */
+                <span className="chats-tool-why">
+                  off this machine — sent to a third-party provider
+                </span>
+              )}
             </DropdownMenuRadioItem>
           ))}
         </DropdownMenuRadioGroup>
@@ -4182,6 +4190,13 @@ function ToolAnswer({ call, loading }: { call: ToolCall; loading: boolean }) {
  * type now goes, and moving *to* the local model is about where the answer comes from — the two
  * directions are not mirror images of the same fact.
  *
+ * Moving *to* the hosted model earns a third sentence, not a shared one: it is not the CLI's
+ * cloud — that word is spoken for — and unlike the local model it does not run on this machine
+ * either, so falling into that branch would tell a specific lie, that an answer sent to somebody
+ * else's server "was answered on this machine". What IS true of it, the way "leaves this machine"
+ * is true of the cloud model, is that it goes to a third-party provider the owner chose from a
+ * list, which is the fact this sentence states instead.
+ *
  * A clear restarts the session too, so it could carry both marks. It carries only this one, because
  * the restart note's own words — "was read the last few exchanges back" — are exactly what a clear
  * makes untrue.
@@ -4215,7 +4230,9 @@ function MarkNote({ mark }: { mark: Mark }) {
   const text =
     mark.to === "cloud"
       ? "moved to the cloud model — from here, what you type leaves this machine"
-      : "moved to the local model — from here, this is answered on this machine";
+      : mark.to === "openrouter"
+        ? "moved to the hosted model — from here, what you type goes to a third-party provider you chose"
+        : "moved to the local model — from here, this is answered on this machine";
   return (
     <p className="chats-mark chats-mark-brain" role="status">
       {text}

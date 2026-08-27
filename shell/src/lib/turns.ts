@@ -8,8 +8,22 @@
  * mocking a daemon.
  */
 
-/** Which model answered a turn, or is about to. */
-export type Brain = "cloud" | "local";
+/**
+ * Which model answered a turn, or is about to.
+ *
+ * Three values here, not two: `"openrouter"` is a third conversation route the daemon now serves
+ * end to end (`core/src/chats.rs`'s `Brain::OpenRouter`, wire value `"openrouter"`) — a hosted third
+ * party reached over OpenRouter's API, distinct from both the cloud agent CLI and the model running
+ * on this machine.
+ *
+ * There are two OTHER `Brain` declarations in this codebase — `data/errands.ts` and
+ * `data/project-map.ts` — and both stay `"cloud" | "local"` ON PURPOSE. Do not "fix" them to match
+ * this one: an errand cannot take the hosted route at all (the daemon's own `errands::Brain` has no
+ * such variant, and its table carries two foreign keys into it, which makes that migration
+ * dangerous for no benefit anyone asked for), and the project map's `read_brain` only ever yields
+ * `cloud` or `local` in the daemon. A third value here says nothing about either of those.
+ */
+export type Brain = "cloud" | "local" | "openrouter";
 
 /**
  * A turn, exactly as `GET /assistant/chats/{chat_id}` serialises one —

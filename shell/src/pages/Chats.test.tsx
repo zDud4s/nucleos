@@ -33,12 +33,14 @@ import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
   Ask,
+  AssistantModels,
   ChatProject,
   ChatSummary,
   Command,
   Conversation,
   IdeSession,
   Mention,
+  ModelChoice,
   Transcript,
 } from "../data/chats";
 import { keys } from "../data/keys";
@@ -331,6 +333,36 @@ function chatsFetch(
     }
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
     return undefined;
+  };
+}
+
+/**
+ * `chatsFetch`'s `/assistant/models`, with one hosted choice appended.
+ *
+ * A wrapper around `chatsFetch` rather than a fifth entry baked into its fixture: the four choices
+ * there are what roughly a dozen other tests in this file assert an EXACT model menu against — one
+ * of them checks the whole set by name, another checks a fallback list that must NOT contain every
+ * brain. Folding a hosted choice into that shared list would make every one of those tests about
+ * this route whether it meant to be or not, for a feature that is not what they exist to prove.
+ */
+function chatsFetchWithHostedChoice(
+  chats: ChatSummary[],
+  transcripts: Record<string, AssistantTurnRow[]>,
+  opts: Parameters<typeof chatsFetch>[2] = {},
+): (path: string, init?: RequestInit) => Promise<unknown> {
+  const base = chatsFetch(chats, transcripts, opts);
+  const hosted: ModelChoice = {
+    id: "openrouter-gpt",
+    label: "GPT via OpenRouter",
+    brain: "openrouter",
+    efforts: [],
+  };
+  return async (path, init) => {
+    if (path === "/assistant/models") {
+      const models = (await base(path, init)) as AssistantModels;
+      return { ...models, choices: [...models.choices, hosted] };
+    }
+    return base(path, init);
   };
 }
 
@@ -701,6 +733,77 @@ describe("Chats - choosing a model", () => {
         body: JSON.stringify({ model: "fable" }),
       });
     });
+  });
+});
+
+/* --------------------------------------------- a third route: OpenRouter -- */
+
+describe("Chats - a model reached over OpenRouter", () => {
+  it("offers a hosted choice, never disabled by the local model's own availability, and marked as leaving the machine", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithHostedChoice([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, {
+        // Down on purpose: `disabled={choice.brain === "local" && localUnavailable}` is a line
+        // about the LOCAL model, and a hosted choice inheriting that flag would be disabled for
+        // an outage that has nothing to do with it — they answer over completely different wires.
+        localAvailable: false,
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const hosted = await screen.findByRole("menuitemradio", { name: /^GPT via OpenRouter/ });
+    expect(hosted.getAttribute("aria-disabled")).toBeNull();
+    // The mark is not decoration — it is the one place a person can tell, before picking it, that
+    // this conversation is about to leave the machine for somebody else's server, the same way the
+    // local choice already says whether IT is running here at all.
+    expect(within(hosted).getByText(/off this machine/i)).toBeDefined();
+
+    // And picking it is an ordinary write, same as any other choice — the daemon takes the id,
+    // not the brain, so nothing about being hosted changes how a selection is sent.
+    fireEvent.click(hosted);
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ model: "openrouter-gpt" }),
+      });
+    });
+  });
+
+  it("says something true above a turn that moved to the hosted model, rather than the local model's words", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            asked: "primeiro",
+            answer: "ok",
+            answered_by: "cloud",
+            session_id: "s-1",
+          }),
+          // Same session either side — this is a brain mark, not a restart, and the two only stay
+          // apart in the fixture if nothing else about the pair changes.
+          turnRow({
+            id: 2,
+            asked: "segundo",
+            answer: "também",
+            answered_by: "openrouter",
+            session_id: "s-1",
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // `MarkNote`'s own comment says its copy is asymmetric on purpose: "to cloud" is about where
+    // what you type goes, "to local" is about where the answer comes from. Neither sentence is
+    // true of a hosted turn — it is not the CLI's cloud, and unlike the local model it does not
+    // run on this machine either, so a hosted arrival has to earn wording of its own. Today's
+    // ternary only knows two destinations, so anything that is not "cloud" falls into the local
+    // branch and claims — falsely — that the turn "was answered on this machine".
+    expect(await screen.findByText(/moved to the hosted model/i)).toBeDefined();
+    expect(screen.queryByText(/answered on this machine/i)).toBeNull();
   });
 });
 

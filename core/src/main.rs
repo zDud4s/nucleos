@@ -1,5 +1,6 @@
 mod agent;
 mod assistant;
+mod assistants;
 mod attention;
 mod auth;
 mod autopilot;
@@ -11,6 +12,7 @@ mod browser_policy;
 mod browser_wheel;
 mod budget;
 mod calendar;
+mod capabilities;
 mod chats;
 mod classifier;
 mod collision;
@@ -45,6 +47,7 @@ mod mcp_tools;
 mod mentions;
 mod notes;
 mod notify;
+mod openrouter;
 mod ownership;
 mod pii_shadow;
 mod presets;
@@ -99,6 +102,12 @@ const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
 /// The web search provider's API key, in Credential Manager like every other secret — no key on
 /// disk, and in particular not in `.ai/web.yaml`, which is a versioned file.
 const WEB_SEARCH_KEY: &str = "web-search-api-key";
+/// OpenRouter's own API key, in Credential Manager for the same reason every secret above is: it
+/// never sits in `.ai/models.yaml`, which only ever names the model (`hosted_assistant_model`) and
+/// is a versioned file. `openrouter::OpenRouterChat::new` refuses outright when this comes back
+/// `None` — see its own doc comment for why that refusal happens before any request leaves the
+/// machine rather than after a 401 comes back.
+const OPENROUTER_KEY: &str = "openrouter-api-key";
 
 /// Reads a secret from stdin rather than from `argv`.
 ///
@@ -480,31 +489,46 @@ async fn main() {
     ) = if let Some(model) = models_config.local_triage_model.clone() {
         let local_runner =
             runner::OllamaRunner::new(runner::OLLAMA_BASE_URL.to_string(), model.clone());
-        let probe = match reqwest::Client::new()
-            .post(format!("{}/api/show", runner::OLLAMA_BASE_URL))
-            .json(&serde_json::json!({ "model": &model }))
-            .send()
-            .await
-        {
-            Ok(response) => match response.text().await {
-                Ok(body) => runner::interpret_context_probe(&body, triage::LOCAL_NUM_CTX),
-                Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
-                    "could not read the local model probe response: {error}"
-                ))),
-            },
-            Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
-                "could not reach the loopback Ollama endpoint: {error}"
-            ))),
-        };
-        match runner::local_triage_decision(probe) {
-            runner::LocalTriageDecision::Enabled => {
+        // The requirement's own field, not `triage::LOCAL_NUM_CTX` directly: this is the number
+        // that gets enforced, and it must come FROM the declaration the role states below, not
+        // sit beside it as a second copy that could drift out of step. `CAPABILITY_REQUIREMENT`
+        // is itself defined from `LOCAL_NUM_CTX`, which is the link that keeps them together.
+        let declared = capabilities::discover_ollama_as(
+            &reqwest::Client::new(),
+            runner::OLLAMA_BASE_URL,
+            &model,
+            triage::CAPABILITY_REQUIREMENT.context_tokens,
+            "local model",
+        )
+        .await;
+        let missing =
+            capabilities::missing_capabilities(&triage::CAPABILITY_REQUIREMENT, &declared);
+        match capabilities::triage_posture(&missing) {
+            capabilities::Posture::Unaffected => {
                 tracing::info!(%model, "local triage model enabled");
                 (Some(Arc::new(local_runner)), None)
             }
-            runner::LocalTriageDecision::Disabled(reason) => {
+            capabilities::Posture::SwitchedOff(reason) => {
                 // Local triage is optional at startup: a bad probe must not take down unrelated
                 // daemon services, just as a failed autostart registration does not.
                 tracing::warn!(%model, %reason, "local triage model disabled");
+                (None, Some(reason))
+            }
+            // `triage_posture` only ever returns `Unaffected` or `SwitchedOff` today —
+            // `Posture` is shared across three roles, so the compiler still requires this arm.
+            // `nucleos-core` is a daemon the OS autostarts; panicking here over a local triage
+            // model's posture would take down email, chats, runs and the scheduler along with
+            // it, which is exactly what the comment above this match says a bad probe must not
+            // do. Fail closed onto the same posture as `SwitchedOff`: triage refusing to run is
+            // the privacy-preserving direction, the whole reason this role switches off rather
+            // than falling back like the other two roles below.
+            other => {
+                tracing::error!(
+                    %model,
+                    ?other,
+                    "triage_posture returned an unexpected posture; disabling local triage"
+                );
+                let reason = format!("unexpected local-triage posture: {other:?}");
                 (None, Some(reason))
             }
         }
@@ -575,32 +599,43 @@ async fn main() {
     // exactly what `voice::clean_up` does at runtime, decided once here at startup.
     let voice_cleanup_model = match models_config.voice_cleanup_model.clone() {
         Some(model) if voice_config.armed() => {
-            let probe = match reqwest::Client::new()
-                .post(format!("{}/api/show", runner::OLLAMA_BASE_URL))
-                .json(&serde_json::json!({ "model": &model }))
-                .send()
-                .await
-            {
-                Ok(response) => match response.text().await {
-                    Ok(body) => runner::interpret_context_probe(&body, voice::CLEANUP_NUM_CTX),
-                    Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
-                        "could not read the voice cleanup probe response: {error}"
-                    ))),
-                },
-                Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
-                    "could not reach the loopback Ollama endpoint: {error}"
-                ))),
-            };
-            // Reusing the triage-named decision function on purpose: it is a pure mapping from a
-            // context-probe result to an operator-readable reason, and every message it produces talks
-            // about "the local model" rather than about mail. A second copy would drift from this one.
-            match runner::local_triage_decision(probe) {
-                runner::LocalTriageDecision::Enabled => {
+            // The requirement's own field, not `voice::CLEANUP_NUM_CTX` directly — see the same
+            // note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined from
+            // `CLEANUP_NUM_CTX`, so the two stay linked without a second number to keep in step.
+            let declared = capabilities::discover_ollama_as(
+                &reqwest::Client::new(),
+                runner::OLLAMA_BASE_URL,
+                &model,
+                voice::CAPABILITY_REQUIREMENT.context_tokens,
+                "voice cleanup",
+            )
+            .await;
+            let missing =
+                capabilities::missing_capabilities(&voice::CAPABILITY_REQUIREMENT, &declared);
+            // voice_posture reuses runner::local_triage_decision's own wording for a context gap —
+            // a pure mapping from a context-probe result to an operator-readable reason, and every
+            // message it produces talks about "the local model" rather than about mail. A second
+            // copy would drift from this one.
+            match capabilities::voice_posture(&missing) {
+                capabilities::Posture::Unaffected => {
                     tracing::info!(%model, "voice cleanup model enabled");
                     Some(model)
                 }
-                runner::LocalTriageDecision::Disabled(reason) => {
+                capabilities::Posture::Degraded(reason) => {
                     tracing::warn!(%model, %reason, "voice cleanup disabled; transcripts will be delivered raw");
+                    None
+                }
+                // voice_posture only ever returns Unaffected or Degraded today, for the same
+                // reason the local-triage match above keeps this arm despite it: `Posture` is
+                // shared across three roles. Treat an unexpected posture as Degraded rather than
+                // panic — cleanup is an enhancement, and a bad probe here must cost only the
+                // polish, never take the daemon down with it.
+                other => {
+                    tracing::error!(
+                        %model,
+                        ?other,
+                        "voice_posture returned an unexpected posture; disabling voice cleanup"
+                    );
                     None
                 }
             }
@@ -660,7 +695,9 @@ async fn main() {
         None
     };
 
-    // The model that answers a chat turn asking to be answered on this machine.
+    // The model that answers a chat turn asking to be answered on this machine — resolved here to
+    // an `Option<String>` (was, before the assistant factory, a whole `LocalAssistant` built once)
+    // and handed to `assistants::ConfiguredAssistants` below, which builds the assistant per turn.
     //
     // Probed exactly like local triage and voice cleanup, against this feature's own window: a turn
     // accumulates its tool schemas and every result on each round, so it needs more room than a
@@ -671,45 +708,43 @@ async fn main() {
     // a reason worth stating: triage refuses because the alternative is mail bodies leaving the
     // machine, while this turn reads only the daemon's own state, so the fallback is what already
     // happens today. Warning and carrying on is right here and would be wrong there.
-    let local_assistant = match models_config.local_assistant_model.clone() {
+    let local_model = match models_config.local_assistant_model.clone() {
         Some(model) => {
-            let probe = match reqwest::Client::new()
-                .post(format!("{}/api/show", runner::OLLAMA_BASE_URL))
-                .json(&serde_json::json!({ "model": &model }))
-                .send()
-                .await
-            {
-                Ok(response) => match response.text().await {
-                    Ok(body) => runner::interpret_context_probe(&body, local_agent::TURN_NUM_CTX),
-                    Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
-                        "could not read the local assistant probe response: {error}"
-                    ))),
-                },
-                Err(error) => Err(runner::ModelError::UnparseableResponse(format!(
-                    "could not reach the loopback Ollama endpoint: {error}"
-                ))),
-            };
-            match runner::local_triage_decision(probe) {
-                runner::LocalTriageDecision::Enabled => {
+            // The requirement's own field, not `local_agent::TURN_NUM_CTX` directly — see the
+            // same note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined
+            // from `TURN_NUM_CTX`, so the two stay linked without a second number to keep in
+            // step.
+            let declared = capabilities::discover_ollama_as(
+                &reqwest::Client::new(),
+                runner::OLLAMA_BASE_URL,
+                &model,
+                local_agent::CAPABILITY_REQUIREMENT.context_tokens,
+                "local assistant",
+            )
+            .await;
+            let missing =
+                capabilities::missing_capabilities(&local_agent::CAPABILITY_REQUIREMENT, &declared);
+            match capabilities::local_assistant_posture(&missing) {
+                capabilities::Posture::Unaffected => {
                     tracing::info!(%model, "local assistant enabled for chat turns that ask for it");
-                    Some(Arc::new(local_agent::LocalAssistant::new(
-                        Box::new(runner::OllamaChat::new(
-                            runner::OLLAMA_BASE_URL.to_string(),
-                            model,
-                        )),
-                        // Loopback to this same daemon, holding the control token it just loaded.
-                        // The tools are the ones the MCP subprocess exposes, through the same
-                        // handlers, so a local turn and a cloud turn cannot disagree about what a
-                        // tool does — only about which ones they are offered.
-                        Box::new(mcp_tools::LocalToolBox::new(
-                            "http://127.0.0.1:8791".to_string(),
-                            token_value.clone(),
-                            pool.clone(),
-                        )),
-                    )))
+                    Some(model)
                 }
-                runner::LocalTriageDecision::Disabled(reason) => {
+                capabilities::Posture::FellBackToCli(reason) => {
                     tracing::warn!(%model, %reason, "local assistant disabled; chat turns stay on the CLI");
+                    None
+                }
+                // local_assistant_posture only ever returns Unaffected or FellBackToCli today,
+                // for the same reason the two matches above keep this arm despite it: `Posture`
+                // is shared across three roles. Treat an unexpected posture as FellBackToCli
+                // rather than panic — the cloud CLI already exists as this role's fallback, so
+                // failing closed here costs nothing this feature does not already accept
+                // elsewhere.
+                other => {
+                    tracing::error!(
+                        %model,
+                        ?other,
+                        "local_assistant_posture returned an unexpected posture; falling back to the CLI"
+                    );
                     None
                 }
             }
@@ -717,12 +752,67 @@ async fn main() {
         None => None,
     };
 
+    // The hosted model (and key) that answer a chat turn asking to be answered over OpenRouter —
+    // `local_model`'s sibling and the same ship-dark posture: a daemon that has configured neither
+    // `hosted_assistant_model` nor an OpenRouter key behaves exactly as one that has never heard of
+    // this feature, silently, the same way `local_model` above stays `None` when
+    // `local_assistant_model` alone is absent.
+    //
+    // No probe, unlike `local_model`: that probe exists because Ollama silently truncates a prompt
+    // that does not fit its context window, and this daemon is the one that has to know the window
+    // before it happens. OpenRouter states each model's window in its own catalogue and this call
+    // never claims one of its own, so there is nothing here for a probe to catch.
+    let (hosted_model, hosted_key) = match (
+        models_config.hosted_assistant_model.clone(),
+        secrets::load_secret(OPENROUTER_KEY),
+    ) {
+        (Some(model), Ok(Some(key))) => {
+            tracing::info!(%model, "hosted assistant enabled for chat turns marked openrouter");
+            (Some(model), Some(key))
+        }
+        // A model named but no key stored: an operator part-way through turning this on. Worth a
+        // line, unlike the fully-unconfigured case below, because there is now a `chats` row this
+        // CAN reach (`assistant::NO_HOSTED_MODEL`) and somebody watching the log should know why it
+        // refuses.
+        (Some(model), Ok(None)) => {
+            tracing::info!(
+                %model,
+                "hosted_assistant_model is configured but no OpenRouter key is stored; \
+                 chats marked openrouter will refuse rather than answer"
+            );
+            (Some(model), None)
+        }
+        (Some(model), Err(error)) => {
+            tracing::warn!(
+                %model,
+                %error,
+                "could not read the OpenRouter key from Credential Manager; \
+                 chats marked openrouter will refuse rather than answer"
+            );
+            (Some(model), None)
+        }
+        // A key stored with no model named: the other half of an unfinished setup, and just as
+        // worth a line — otherwise the only sign anything is wrong is a refusal nobody can explain.
+        (None, Ok(Some(key))) => {
+            tracing::info!(
+                "an OpenRouter key is stored but hosted_assistant_model is not configured; \
+                 chats marked openrouter will refuse rather than answer"
+            );
+            (None, Some(key))
+        }
+        // Neither configured: the ship-dark default, and silent for the same reason
+        // `local_model`'s own equivalent arm is — an untouched install must look exactly like
+        // one that predates this feature.
+        (None, Ok(None)) => (None, None),
+        (None, Err(_)) => (None, None),
+    };
+
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable
     // is not something a config file can assert — startup PROVES it, and a roster naming a local
     // seat this daemon cannot answer with is refused rather than quietly re-routed to the cloud.
     let council_config = config::load_council_config(
         std::path::Path::new(".ai/council.yaml"),
-        local_assistant.is_some(),
+        local_model.is_some(),
     );
     // Minted only when there is a council to use it, and never the control token: a seat is an
     // agent CLI deciding what to call next, and `auth::COUNCIL_ROUTES` is what it can reach. A
@@ -739,13 +829,27 @@ async fn main() {
         None => None,
     };
 
+    // Assembles the assistant that answers a turn from what was just resolved above — one factory
+    // in place of the two singletons `local_assistant`/`hosted_assistant` used to be. No production
+    // caller until this packet; `AppState.assistants` below is the first one.
+    let assistants: Arc<dyn assistants::Assistants> =
+        Arc::new(assistants::ConfiguredAssistants::new(
+            local_model,
+            hosted_model,
+            hosted_key,
+            "http://127.0.0.1:8791".to_string(),
+            token_value.clone(),
+            pool.clone(),
+            runner::OLLAMA_BASE_URL.to_string(),
+        ));
+
     let state = AppState {
         token: Token(token_value),
         pool,
         runner: primary_runner,
         triage_runner,
         local_triage_disabled,
-        local_assistant,
+        assistants,
         files_root,
         // `None` when this machine has no home directory to hang a library off. Resolved here and
         // not per request, like `files_root` above: it is a fact about the machine.

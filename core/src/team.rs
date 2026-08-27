@@ -991,7 +991,10 @@ pub async fn start_with(
             })?;
         members.push(agent);
     }
-    if state.local_assistant.is_none()
+    // `state.local_assistant.is_none()` before the migration to the assistant factory: the field
+    // this read no longer exists, so this call site is the one line that migration is allowed to
+    // touch beyond the `AppState` literal.
+    if state.assistants.serves(crate::chats::Brain::Local).is_err()
         && let Some(local) = members
             .iter()
             .chain(std::iter::once(&director))
@@ -4005,7 +4008,7 @@ mod tests {
             runner: Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),

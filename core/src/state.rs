@@ -224,15 +224,31 @@ pub struct AppState {
     /// to the remote CLI there would violate that at exactly the moment nobody is watching, so triage
     /// stops instead and mail queues, the same way it already does for the kill switch and the budget.
     pub local_triage_disabled: Option<String>,
-    /// The model on this machine that answers chat turns which asked to be answered here.
+    /// The factory that builds the model answering a chat turn — the local one, the hosted one on
+    /// OpenRouter, or a refusal — resolved per turn instead of two singletons baked at startup.
     ///
-    /// `None` is the ship-dark default and means every turn goes to `runner` above, exactly as
-    /// before. Unlike `triage_runner`, a failed probe here needs no separate "disabled" field and
-    /// falls back instead of stopping — the two protect different things. Local triage exists so
-    /// mail bodies do not leave, and falling back would defeat it. A local chat turn reads only the
-    /// daemon's own state, so answering it in the cloud is what already happens today rather than a
-    /// leak the operator asked to prevent.
-    pub local_assistant: Option<Arc<crate::local_agent::LocalAssistant>>,
+    /// Replaces what used to be two separate fields, `local_assistant` and `hosted_assistant`, each
+    /// an `Option<Arc<LocalAssistant>>` built once at startup with a model string baked in. The
+    /// ship-dark default they carried is preserved, but "no route configured" is now expressed the
+    /// way this factory already expresses it — `Err(assistants::Refusal::RouteNotConfigured)` — and
+    /// is deliberately NOT wrapped in a second `Option`: an `Option` around a type that can already
+    /// say "not configured" would be two ways to say the same thing, which is two ways for a reader
+    /// to get it wrong. An untouched install gets `assistants::NoAssistants` in production wiring's
+    /// test doubles, or a `ConfiguredAssistants` whose routes are all unconfigured in production —
+    /// either way, every route refuses rather than falling through to the cloud CLI.
+    ///
+    /// The local route falls back to `runner` above when this refuses (`None` was always the
+    /// ship-dark default: every turn goes to `runner`, exactly as before). Unlike `triage_runner`, a
+    /// failed probe here needs no separate "disabled" field and falls back instead of stopping — the
+    /// two protect different things. Local triage exists so mail bodies do not leave, and falling
+    /// back would defeat it. A local chat turn reads only the daemon's own state, so answering it in
+    /// the cloud is what already happens today rather than a leak the operator asked to prevent.
+    ///
+    /// The hosted route does NOT get that same fallback: every route that reads this field and gets
+    /// a refusal for `Brain::OpenRouter` must refuse outright rather than fall through to the cloud
+    /// CLI — see `assistant::NO_HOSTED_MODEL` for why a hosted turn does not get the fallback a
+    /// local one does.
+    pub assistants: std::sync::Arc<dyn crate::assistants::Assistants>,
     /// The folder a person arranges their files in, canonicalised once at startup so every
     /// containment check compares against a path the filesystem has already resolved.
     ///
