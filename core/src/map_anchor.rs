@@ -71,15 +71,70 @@
 //! `Ambiguous` to `Silent` unless its exceptional citations carry overrides. Under-reporting is the
 //! safe direction and it still LOOKS like the map forgot something, so the list is named per file.
 //!
+//! ## A file's neighbours are evidence, and they are still not a decider
+//!
+//! **Every one of the four distinct wrong slugs the gate has produced is a vocabulary collision.**
+//! `map_store.rs`, `Carimbos.tsx` and `Triagem.tsx` all landed under
+//! `2026-07-28-retrospective-attribution-design`, because *carimbos, triador, silenciado* is that
+//! document's vocabulary as much as it is the map's. Reading harder does not fix that: the words
+//! genuinely belong to both.
+//!
+//! What does not belong to both is the import graph. **Three of the four wrong answers are
+//! neighbours of a file the model placed correctly in every run** — `Triagem.tsx`, `Carimbos.tsx`
+//! and `shell/src/canvas/map-model.ts` are all one edge from `ModeMapa.tsx` — and the fourth,
+//! `map_store.rs`, sits among the six other `map_*` modules. A right answer was one edge away each
+//! time. [`Neighbour`], [`to_reask`] and [`reask`] are that edge, put into the prompt.
+//!
+//! **Import edges only, and never directory proximity.** `map-model.ts`'s miss was argued in the
+//! model's own words from its *folder*, and `shell/src/canvas/` holds `map-model.ts` beside
+//! `workflow-model.ts`, which belongs to a different document. A signal folding in folder proximity
+//! would have confirmed the wrong answer rather than corrected it. The folder is the thing that
+//! already fooled it once.
+//!
+//! **And it proposes nothing.** The graph chooses which files are worth a second question and what
+//! they are shown; the model answers both times. There is no majority, no propagation, no
+//! neighbour's slug written into anybody's verdict. This module has crossed that line twice — a
+//! scorer and then a veto — and a third crossing wearing a graph would be the same mistake with
+//! better clothes.
+//!
+//! ### What it measured, and the half of the measurement that is not about the graph
+//!
+//! Three runs of the gate over the same 28 pairs, 2026-08-27. First pass alone — the byte-identical
+//! prompt the baseline used — **24, 25, 25**, agreeing on 21. Settled, with the second pass:
+//! **27, 27, 28**, agreeing on **26**. The rule is 28/28 across three runs, so this is a **NO-GO**:
+//! nothing was swept and no file was annotated. Both misses were **abstentions and never wrong
+//! slugs** — `errands.rs`, which has not one neighbour inside the 28 to hear from, and `map_join.rs`
+//! once, declining to place itself through both passes.
+//!
+//! Within a run, where the sampling is held still, the signal did what it was built to do:
+//! **14 second questions, 8 answers changed, all 8 to the right document, zero regressions.** The
+//! three files that had never been right in any run — `map-model.ts`, `map_anchor.rs`,
+//! `project-map.ts` — were right in all three. It cost 98 model calls against the baseline's 84.
+//!
+//! **And the half that is not about the graph, which is the more important one.** Wrong slugs went
+//! from a recorded 7 in 84 to **0 in 84** — but the unchanged first pass alone already gave **1 in
+//! 84**. That fall is not attributable to anything in this module: it happened through the old
+//! prompt. The honest reading is that **the baseline's 8.3% does not reproduce**, and that 84
+//! answers from a sampled model are too few to carry a rate like it. What is attributable here is
+//! the within-run delta and the one wrong slug the neighbourhood actually corrected —
+//! `map-model.ts` proposed under `2026-08-09-canvas-da-frota-design`, which is its **folder**
+//! arguing again, put right by the two files that import it.
+//!
 //! ## Where the safety actually lives
 //!
 //! **Not here.** With the veto withdrawn there is no mechanical check on whether a proposal is
 //! right, and pretending otherwise would be the false confidence this feature exists to cure. The
-//! safety of this slice is, in its entirety, a **ground truth fixed before any model ran**: 21
-//! verified file/document pairs the run is scored against before a single header is written. A
-//! wrong answer there is worth roughly ten wrong files across the 209 that cite anything, so
-//! **21/21 applies and anything less stops and reports**. Whoever changes this module without
+//! safety of this slice is, in its entirety, a **ground truth fixed before any model ran**: 28
+//! askable file/document pairs the run is scored against before a single header is written. A
+//! wrong answer there is worth roughly seven wrong files across the 211 that cite anything, so
+//! **28/28 applies and anything less stops and reports**. Whoever changes this module without
 //! changing that arrangement has removed the only thing standing between it and §1's failure.
+//!
+//! (Corrected 2026-08-27: this said *21 verified pairs* and *21/21 applies*, which had been the
+//! table's length before two unaskable pairs were removed from it and the other nine — the ones the
+//! withdrawn veto had refused — were counted into the denominator where they always belonged. The
+//! rule the harness enforces reads [`tests::GROUND_TRUTH`]'s own length precisely so that a number
+//! written into prose can never again be the one somebody quotes.)
 //!
 //! ## The four ways a file ends up unannotated, counted apart and never summed
 //!
@@ -263,6 +318,36 @@ pub const MAX_WHY_BYTES: usize = 500;
 /// puts a paragraph of reasoning where the document goes.
 const MAX_QUOTED: usize = 120;
 
+/// How many of a file's import neighbours are shown to it when it is asked a second time.
+///
+/// **A cap on evidence and never a filter on the answer**, so what it leaves out is said out loud,
+/// exactly as [`MAX_CITED_SECTIONS`]'s is. Measured over this repository rather than guessed: 251
+/// modules joined by 979 undirected edges, a median degree of **5**, p90 of 19, and one file —
+/// `http.rs`, which routes everything — at 75. Twelve sits above the median neighbourhood and far
+/// below the router's, which is the shape wanted: an ordinary file's neighbourhood arrives whole
+/// and a hub's arrives truncated and says so.
+///
+/// **Ordered by the neighbour's own degree, lowest first, and the ordering is what the cap is
+/// for.** A file with four edges, one of which is this one, is saying something about this one; a
+/// file with seventy is saying that it is a router. Truncating a path-sorted list instead would
+/// drop neighbours by the first letter of their folder, which is the alphabet choosing the
+/// evidence.
+pub const MAX_NEIGHBOURS: usize = 12;
+
+/// How much of a neighbour's own sentence travels with its answer.
+///
+/// **Far less than [`MAX_WHY_BYTES`], because it is a sentence about a different file.** What it
+/// buys is the one thing a bare slug cannot say: whether the neighbour is a sibling or a router.
+/// *"the module comment names the map mode"* earns its bytes beside `ModeMapa.tsx`; the remaining
+/// four hundred of a full reason do not, twelve times over.
+///
+/// It is carried at all rather than dropped, and the trade is worth stating out loud: a
+/// neighbour's reason can carry the very vocabulary collision that produced a wrong answer next
+/// door — *carimbos, triador, silenciado* belongs to two documents here, which is how three files
+/// came to be placed under the wrong one. It arrives attached to the slug it produced, which is
+/// what lets a reader weigh it. A bare slug arrives with nothing to weigh at all.
+const MAX_NEIGHBOUR_WHY: usize = 160;
+
 /// One section this file cites, with the text around it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cited {
@@ -313,6 +398,124 @@ impl Question {
     /// How many distinct inheriting sections had no window because of [`MAX_CITED_SECTIONS`].
     pub fn elided(&self) -> usize {
         self.inheriting.len().saturating_sub(self.cited.len())
+    }
+}
+
+/// One file that shares an import edge with the file being asked about, and what a first pass
+/// proposed for it.
+///
+/// **An import edge and never a folder, and the distinction is the whole reason this type is
+/// careful about its own name.** The miss it exists to correct — `shell/src/canvas/map-model.ts`
+/// put under the wrong document in every run — was justified in the model's own sentence by *the
+/// file lives in `shell/src/canvas/`*, and that folder genuinely holds `map-model.ts` and
+/// `workflow-model.ts`, which belong to **two different documents**. A signal that folded in folder
+/// proximity would have confirmed that answer rather than corrected it. What separates the two
+/// files is that one is imported by `ModeMapa.tsx` and the other by `WorkflowCanvas.tsx`; nothing
+/// about where they sit on disk separates them at all.
+///
+/// Edges are read undirected. *A imports B* and *B imports A* are the same fact about whether the
+/// two are near each other in the thing being built, and [`crate::project_map::Structure::imports`]
+/// records only the first — so a file would otherwise see the modules it uses and never the mode
+/// screen that mounts it, which is exactly the edge that carries the answer for three of the four
+/// files this signal was built for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Neighbour {
+    pub path: String,
+    /// The document proposed for it, or `None` when it abstained.
+    ///
+    /// **Never a slug this project does not have.** [`to_reask`] leaves an unusable answer out of
+    /// the neighbourhood entirely rather than printing a name the model might copy, which would
+    /// spread one [`Outcome::NoSuchDocument`] along an edge.
+    pub proposed: Option<String>,
+    /// Its own one sentence, clipped to [`MAX_NEIGHBOUR_WHY`].
+    pub why: String,
+    /// How many files it shares an edge with across the whole graph.
+    ///
+    /// **Shown to the model, because it is the one number that separates a sibling from a
+    /// router.** `Juncao.tsx` has two edges and one of them is `ModeMapa.tsx`; `http.rs` has 75 and
+    /// belongs with none of them.
+    pub degree: usize,
+}
+
+/// Everything a file is told about its neighbours, and how much of it was left out.
+///
+/// **A type rather than a slice, for [`Question::elided`]'s reason and not for tidiness.** The cap
+/// and the count of what it dropped have to travel together: a model shown 12 of a hub's 75
+/// neighbours and not told so is reasoning about a neighbourhood it believes it has seen whole,
+/// which is the identical mistake [`MAX_CITED_SECTIONS`] spends a paragraph refusing about
+/// sections. Held apart, the number is computed by whoever builds the prompt from a list that has
+/// already been truncated — which is to say, not at all.
+///
+/// [`Default`] is *nothing was heard*, and it is what every first pass hands over.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Neighbourhood {
+    /// Exactly what the model is shown, in the order it is shown — lowest degree first, capped at
+    /// [`MAX_NEIGHBOURS`]. The report carries this list rather than the untruncated one, because a
+    /// record of a question has to be a record of the question that was asked.
+    pub heard: Vec<Neighbour>,
+    /// How many neighbours with a readable answer the cap left out.
+    pub elided: usize,
+}
+
+impl Neighbourhood {
+    /// The block the prompt carries, or nothing at all.
+    ///
+    /// **Empty in, empty out, and that is load-bearing.** With no neighbours this returns the empty
+    /// string and [`anchor_prompt`] emits the string the 20/22/19 baseline was measured through,
+    /// byte for byte. See that function's heading for why a first pass that drifted by one word
+    /// would have cost the comparison this whole slice turns on.
+    fn block(&self) -> String {
+        if self.heard.is_empty() {
+            return String::new();
+        }
+        let elided = if self.elided > 0 {
+            format!(
+                ", and {} more it shares an edge with that are not shown",
+                self.elided
+            )
+        } else {
+            String::new()
+        };
+        let rows = self
+            .heard
+            .iter()
+            .map(|neighbour| {
+                format!(
+                    "  {} ({} edges) — {} — \"{}\"",
+                    neighbour.path,
+                    neighbour.degree,
+                    neighbour.proposed.as_deref().unwrap_or("none"),
+                    neighbour.why,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "\n\
+             This file does not sit alone. These are the files it imports, or that import it — an \
+             import edge, and never a folder{elided} — with what was proposed for each of them when \
+             it was asked this same question on its own, without seeing this file or any of the \
+             others:\n\
+             {rows}\n\
+             \n\
+             Read that as evidence and not as an answer. Two readings of it are legitimate and they \
+             are different:\n\
+             \n\
+             - The neighbours agree with each other, and with what this file looks like from the \
+             inside. That is corroboration, and it is the strongest thing you have been shown.\n\
+             - The neighbours disagree with each other. Then they corroborate nothing, and \"none\" \
+             is the answer unless this file itself settles it.\n\
+             \n\
+             An edge does not mean two files implement the same document. A module that runs git \
+             for another slice belongs to the document about git; a router imports much of the \
+             project and belongs with none of it. The bracketed number is how many files each \
+             neighbour shares an edge with — one with a handful of edges, of which this file is \
+             one, is telling you far more than one with seventy.\n\
+             \n\
+             None of it is more authoritative than the file itself, and none of it obliges you to \
+             agree with anybody. Answer the question again with it in front of you.\n"
+        )
     }
 }
 
@@ -528,7 +731,24 @@ fn opening_comment(source: &str) -> String {
 /// Version 1 — the first question this module has asked. Bump it when the question materially
 /// changed, not when a line was rewrapped, and say in the commit what moved: a constant that moves
 /// without anybody narrating what moved is a constant nobody can read back.
+///
+/// **Still 1 after the import signal landed, and that is the fact worth recording.** The second
+/// question is a second constant below rather than a bump of this one, because the first pass's
+/// question did not move by a byte — which is the only reason a run can say what the neighbourhood
+/// was worth.
 pub const ANCHOR_PROMPT_VERSION: u32 = 1;
+
+/// Which SECOND question this module asks, of the files a first pass left worth asking again.
+///
+/// **A constant of its own rather than a bump of [`ANCHOR_PROMPT_VERSION`], and the separation is
+/// the measurement.** The two passes ask different questions of different files and they fail
+/// differently; a single version covering both would make *the first pass was reworded* and *the
+/// neighbourhood block was reworded* the same event in the record, which is precisely the confusion
+/// that made this slice's earlier before-and-afters unreadable. A report carries both, so a header
+/// found to be wrong six months from now says which of the two questions produced it.
+///
+/// Version 1 — the first neighbourhood question. Same rule for bumping it.
+pub const NEIGHBOUR_PROMPT_VERSION: u32 = 1;
 
 /// What to ask a model about one file.
 ///
@@ -557,7 +777,28 @@ pub const ANCHOR_PROMPT_VERSION: u32 = 1;
 ///
 /// Says nothing about the language of the reason, for `map_intent`'s reason: these comments are
 /// half Portuguese and a translated observation is a paraphrase.
-pub fn anchor_prompt(question: &Question, specs: &[Spec]) -> String {
+///
+/// ## The neighbourhood block, and why an empty list has to produce the old string exactly
+///
+/// `around` is empty on every first pass, and **the prompt is then byte-for-byte the one the
+/// baseline was measured with**. That is not tidiness: three runs of the gate scored 20, 22 and 19
+/// of 28 through this string, and the only way to say whether the import signal moved that number
+/// is for the pass that does not use it to be the same question. A version of this function that
+/// reworded the first pass "while it was in here" would have spent three paid runs producing a
+/// number nothing could be compared against.
+/// [`the_first_pass_prompt_is_the_one_the_baseline_was_measured_with`] is what holds it.
+///
+/// With a neighbourhood, one block is added between the file and the document list, and what it
+/// says is chosen against a specific failure. **It must not read as a vote.** Three of the four
+/// wrong slugs sat one edge from a file the model placed correctly every time, so the pull to write
+/// *most of your neighbours said X* is strong and it is wrong — an edge is real evidence about some
+/// pairs (`ModeMapa.tsx` mounts `Triagem.tsx`) and no evidence at all about others (`git_exec.rs`
+/// runs git for the map slice and belongs to the document about git). So the block states the
+/// edges, states each neighbour's degree, and names both readings — corroboration when the
+/// neighbours agree with each other, and **`none`** when they do not. It never names a rule for
+/// picking the most common slug, because a rule like that is the mechanical decider this module
+/// withdrew once already, wearing a graph instead of arithmetic.
+pub fn anchor_prompt(question: &Question, specs: &[Spec], around: &Neighbourhood) -> String {
     let path = &question.path;
     let doc = if question.doc.is_empty() {
         "(this file has no opening comment)"
@@ -582,6 +823,7 @@ pub fn anchor_prompt(question: &Question, specs: &[Spec]) -> String {
         .map(|spec| format!("  {} — {}", spec.slug, spec.title))
         .collect::<Vec<_>>()
         .join("\n");
+    let neighbourhood = around.block();
 
     format!(
         "You are looking at ONE file of this project and answering ONE question: which design \
@@ -611,6 +853,7 @@ pub fn anchor_prompt(question: &Question, specs: &[Spec]) -> String {
          mark, not the whole of it:\n\
          {windows}\n\
          ----- END FILE -----\n\
+         {neighbourhood}\
          \n\
          The documents this project has. The slug is the filename and is what you copy; the title \
          is what the document is about:\n\
@@ -678,6 +921,12 @@ const ANCHOR_OUTPUT_CONTRACT: &str = "Answer with exactly one JSON object and no
 /// is debugging to two different places — the machine and the prompt — and a function that parsed
 /// here could only report one of them.
 ///
+/// **One entrance, and `around` empty is *nobody has been heard from yet*.** A second `ask_with_…`
+/// taking a default is the growth [`crate::map_join::citations`] refuses next door for the same
+/// reason: two entrances to one question drift, and the half that drifted is found by whichever
+/// pass stopped working. A first pass hands over [`Neighbourhood::default`] and gets the prompt it
+/// has always got.
+///
 /// Which brain is the parameter and there is no fallback, and the type is `map_intent`'s own rather
 /// than a third copy of it. Its two arms exist for a behavioural reason that holds here unchanged:
 /// `OllamaRunner` wears the `CommandRunner` trait while imposing the mail-triage grammar on every
@@ -712,8 +961,9 @@ pub async fn ask(
     asked: crate::map_intent::Extractor<'_>,
     question: &Question,
     specs: &[Spec],
+    around: &Neighbourhood,
 ) -> std::io::Result<String> {
-    let prompt = anchor_prompt(question, specs);
+    let prompt = anchor_prompt(question, specs, around);
     match asked {
         crate::map_intent::Extractor::Cli(runner) => {
             crate::map_intent::ask_once(runner, prompt, "anchor", Some(ANCHOR_OUTPUT_CONTRACT))
@@ -1192,24 +1442,265 @@ pub async fn sweep(
 ) -> Sweep {
     let mut swept = Sweep::default();
     for path in files {
-        let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
-        let about = match question(path, &source, specs) {
-            Ok(about) => about,
-            Err(why) => {
-                swept.skipped.push((path.clone(), why));
-                continue;
-            }
-        };
-        match ask(asked, &about, specs).await {
-            Err(error) => swept.failed.push((path.clone(), error.to_string())),
-            Ok(answer) => {
-                swept
-                    .verdicts
-                    .push(adjudicate(&about, parse_proposal(&answer), specs));
-            }
-        }
+        put(
+            asked,
+            root,
+            path,
+            specs,
+            &Neighbourhood::default(),
+            &mut swept,
+        )
+        .await;
     }
     swept
+}
+
+/// Put one file's question, and file what came back in whichever of the three lists it belongs to.
+///
+/// Shared by [`sweep`] and [`reask`] so that *what happens to one file* has one answer. The two
+/// passes differ in which files they walk and what they show each one; nothing about reading a
+/// file, refusing to ask, or filing an answer differs at all, and a second copy of this would be
+/// the place the two passes quietly stopped agreeing about what an unreadable file means.
+async fn put(
+    asked: crate::map_intent::Extractor<'_>,
+    root: &Path,
+    path: &str,
+    specs: &[Spec],
+    around: &Neighbourhood,
+    into: &mut Sweep,
+) {
+    let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+    let about = match question(path, &source, specs) {
+        Ok(about) => about,
+        Err(why) => {
+            into.skipped.push((path.to_owned(), why));
+            return;
+        }
+    };
+    match ask(asked, &about, specs, around).await {
+        Err(error) => into.failed.push((path.to_owned(), error.to_string())),
+        Ok(answer) => {
+            into.verdicts
+                .push(adjudicate(&about, parse_proposal(&answer), specs));
+        }
+    }
+}
+
+/// Why a file is worth a second question.
+///
+/// **Two facts about a first pass, and neither of them is a judgement about the answer.** Which one
+/// applied is in the record because they fail differently: a pile of [`Self::Silent`] says the
+/// prompt or the model could not read the files at all, and a pile of [`Self::Alone`] says the
+/// neighbourhoods of this project do not agree with themselves — which would be the finding that
+/// this signal is not a signal here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReaskReason {
+    /// The file named a document, and no neighbour that named one named that.
+    Alone,
+    /// The file named nothing usable — it abstained, it named a document this project does not
+    /// have, or nobody could read it — and at least one neighbour did name one.
+    Silent,
+}
+
+/// One file's second question, and exactly what it is shown when it is asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Reask {
+    pub file: String,
+    pub reason: ReaskReason,
+    pub around: Neighbourhood,
+}
+
+/// Which files a first pass leaves worth asking again, and what each of them is shown.
+///
+/// **Pure, and that is where this design is actually checkable.** Everything about the import
+/// signal that can be got wrong without a model running is in here: which edges count, which
+/// neighbours are evidence, which files are worth a second call. A version of this living inside
+/// the async sweep would be a rule nobody could exercise without spending money, which is how the
+/// two rules this module has already withdrawn came to be believed for as long as they were.
+///
+/// ## The rule, and the two ways it could have been wider
+///
+/// A file is asked again when **it has at least one neighbour that named a document**, and either
+/// it named nothing usable itself ([`ReaskReason::Silent`]) or **no neighbour that named a document
+/// named the one it named** ([`ReaskReason::Alone`]).
+///
+/// **A file whose neighbourhood says nothing is never re-asked**, and that is the rule that keeps
+/// this from becoming a best-of-two. A second call with no new evidence in it is a second sample of
+/// the same question, and a gate that took the better of two samples would be measuring how many
+/// times it rolled rather than what the signal is worth. `shell/src/canvas/workflow-model.ts` is
+/// the file this costs: inside the 28-pair gate not one of its three neighbours is asked about, so
+/// it is never re-asked however it answered. Under the full sweep they all are. The gate therefore
+/// under-uses the signal relative to the run it authorises, which is the safe direction and worth
+/// knowing when reading the number.
+///
+/// **Every file that disagreed with anybody is NOT re-asked**, which was the first shape of this
+/// rule and is a worse one. Cross-document edges are ordinary here — `git_exec.rs` runs git for the
+/// map slice, `http.rs` routes the whole crate — so *any neighbour disagrees* fires on nearly
+/// everything, costs a second full pass, and puts every right answer in front of a prompt that
+/// invites it to reconsider. Corroboration by **one** neighbour is enough to leave a file alone,
+/// because that is what the evidence actually is: somebody else read the same document out of a
+/// file joined to this one.
+///
+/// **What it deliberately does not do is decide.** No majority is computed, nothing is overridden,
+/// and no file's answer is changed here. The output is a list of questions. The model still
+/// answers, which is the line this module crossed twice — once with a scorer, once with a veto —
+/// and must not cross a third time wearing a graph.
+///
+/// ## One round, over a frozen first pass
+///
+/// The neighbourhood every file sees is the **first** pass's answers, including for neighbours that
+/// are themselves being re-asked in the same round. Feeding second answers back in and going round
+/// again is label propagation, and it is exactly the thing that must not be built here: it lets one
+/// wrong slug walk the graph, it converges on whatever the densest cluster said, and it turns a
+/// model that proposes into a model that seeds an algorithm that decides. Two passes is the whole
+/// of it.
+pub fn to_reask(swept: &Sweep, imports: &[crate::project_map::Import]) -> Vec<Reask> {
+    let mut edges: std::collections::BTreeMap<&str, BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for import in imports {
+        // A self-edge is what a module that names itself in its own doc comment produces, and a
+        // file corroborating itself is the one form of agreement worth nothing at all.
+        if import.from == import.to {
+            continue;
+        }
+        edges
+            .entry(import.from.as_str())
+            .or_default()
+            .insert(import.to.as_str());
+        edges
+            .entry(import.to.as_str())
+            .or_default()
+            .insert(import.from.as_str());
+    }
+
+    let answered: std::collections::BTreeMap<&str, &Verdict> = swept
+        .verdicts
+        .iter()
+        .map(|verdict| (verdict.file.as_str(), verdict))
+        .collect();
+
+    let mut again = Vec::new();
+    for verdict in &swept.verdicts {
+        let Some(adjacent) = edges.get(verdict.file.as_str()) else {
+            continue;
+        };
+        let mut heard: Vec<Neighbour> = adjacent
+            .iter()
+            .filter_map(|path| {
+                let neighbour = answered.get(*path)?;
+                let proposed = match neighbour.outcome {
+                    Outcome::Declares | Outcome::DeclaresWithGaps => neighbour.proposed.clone(),
+                    // An abstention is shown, and it is not nothing: a neighbour that read the file
+                    // beside this one and declined to place it is a fact about how legible this
+                    // corner of the project is. It just is not agreement, and the trigger below
+                    // counts it as none.
+                    Outcome::Abstained => None,
+                    // A neighbour that named no document of this project, or whose answer nobody
+                    // could read, is left out entirely. Printing it would put a slug the catalogue
+                    // rejects in front of a model that was asked to copy a slug, which is one
+                    // `NoSuchDocument` spreading along an edge — and quoting an unreadable answer
+                    // would be quoting the runner's bad day as though it were somebody's reading.
+                    Outcome::NoSuchDocument | Outcome::Unreadable => return None,
+                };
+                Some(Neighbour {
+                    path: (*path).to_owned(),
+                    proposed,
+                    why: crate::map_triage::clipped(&neighbour.why, MAX_NEIGHBOUR_WHY),
+                    degree: edges.get(*path).map_or(0, BTreeSet::len),
+                })
+            })
+            .collect();
+
+        // Nothing was heard, so there is nothing to show and a second call would be a second roll
+        // of the same dice. See this function's heading.
+        if !heard.iter().any(|neighbour| neighbour.proposed.is_some()) {
+            continue;
+        }
+
+        let reason = match verdict.outcome {
+            Outcome::Declares | Outcome::DeclaresWithGaps => {
+                let mine = verdict.proposed.as_deref();
+                if heard
+                    .iter()
+                    .any(|neighbour| neighbour.proposed.as_deref() == mine)
+                {
+                    continue;
+                }
+                ReaskReason::Alone
+            }
+            Outcome::Abstained | Outcome::NoSuchDocument | Outcome::Unreadable => {
+                ReaskReason::Silent
+            }
+        };
+
+        // Lowest degree first — see [`MAX_NEIGHBOURS`] — so that a cap drops routers rather than
+        // whichever folder sorts last.
+        heard.sort_by(|left, right| (left.degree, &left.path).cmp(&(right.degree, &right.path)));
+        let elided = heard.len().saturating_sub(MAX_NEIGHBOURS);
+        heard.truncate(MAX_NEIGHBOURS);
+        again.push(Reask {
+            file: verdict.file.clone(),
+            reason,
+            around: Neighbourhood { heard, elided },
+        });
+    }
+    again
+}
+
+/// Ask the second round, and keep what each answer came to.
+///
+/// [`sweep`]'s twin and sequential for [`sweep`]'s reason: how many calls are in flight is the
+/// caller's spending decision, and the harness shards this across lanes exactly as it shards the
+/// first pass.
+///
+/// A file whose question has stopped being a question between the passes — because the tree changed
+/// under the run — comes back in [`Sweep::skipped`], where [`settle`] leaves its first answer
+/// standing.
+pub async fn reask(
+    asked: crate::map_intent::Extractor<'_>,
+    root: &Path,
+    again: &[Reask],
+    specs: &[Spec],
+) -> Sweep {
+    let mut swept = Sweep::default();
+    for one in again {
+        put(asked, root, &one.file, specs, &one.around, &mut swept).await;
+    }
+    swept
+}
+
+/// The first pass with the second pass's answers in place of the ones it replaced.
+///
+/// **A second answer replaces a first, and a second pass that did not happen changes nothing.** The
+/// asymmetry is the safety rule of the whole arrangement: a re-ask that failed, or that could not
+/// be asked at all, must never leave a file **worse off** than if nobody had re-asked it. So this
+/// takes the second pass's verdicts and nothing else — its [`Sweep::failed`] and [`Sweep::skipped`]
+/// are the record of a call that did not land, reported by the caller from the second sweep itself,
+/// and folding them in here would delete a perfectly good first answer over a network error.
+///
+/// It also means the three lists still partition the files the first pass was handed, which is the
+/// invariant the harness asserts and the one thing that says a report is not quietly short.
+pub fn settle(first: Sweep, second: Sweep) -> Sweep {
+    let mut settled = first;
+    for verdict in second.verdicts {
+        match settled
+            .verdicts
+            .iter_mut()
+            .find(|standing| standing.file == verdict.file)
+        {
+            Some(standing) => *standing = verdict,
+            // A second answer about a file the first pass never produced a verdict for. It cannot
+            // happen through `to_reask`, which only ever names files that have one — but a caller
+            // assembling its own list can, and dropping the answer would be losing a paid call in
+            // silence.
+            None => settled.verdicts.push(verdict),
+        }
+    }
+    settled
+        .verdicts
+        .sort_by(|left, right| left.file.cmp(&right.file));
+    settled
 }
 #[cfg(test)]
 mod tests {
@@ -1668,7 +2159,7 @@ mod tests {
              and §6.4 beside it.\n",
         );
 
-        let prompt = anchor_prompt(&file, &specs());
+        let prompt = anchor_prompt(&file, &specs(), &Neighbourhood::default());
 
         for spec in specs() {
             assert!(
@@ -1701,6 +2192,418 @@ mod tests {
         assert!(
             !prompt.contains("4.1"),
             "the documents' heading lists are read after the answer and are never shown"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The import signal: which edges are evidence, who is asked again, and what they are shown.
+    // -----------------------------------------------------------------------------------------
+
+    /// A neighbour that placed a file, spelled the way a real verdict is.
+    fn placed(file: &str, slug: &str) -> Verdict {
+        Verdict {
+            file: file.to_owned(),
+            proposed: Some(slug.to_owned()),
+            outcome: Outcome::Declares,
+            unaccounted: Vec::new(),
+            needs_override: Vec::new(),
+            why: format!("the module comment is about {slug}"),
+        }
+    }
+
+    /// A neighbour that read the file and declined to place it.
+    fn declined(file: &str) -> Verdict {
+        Verdict {
+            file: file.to_owned(),
+            proposed: None,
+            outcome: Outcome::Abstained,
+            unaccounted: Vec::new(),
+            needs_override: Vec::new(),
+            why: "two documents fit equally".to_owned(),
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> crate::project_map::Import {
+        crate::project_map::Import {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }
+    }
+
+    fn swept(verdicts: Vec<Verdict>) -> Sweep {
+        Sweep {
+            verdicts,
+            ..Sweep::default()
+        }
+    }
+
+    fn asked_again<'a>(again: &'a [Reask], file: &str) -> Option<&'a Reask> {
+        again.iter().find(|one| one.file == file)
+    }
+
+    #[test]
+    fn the_first_pass_prompt_is_the_one_the_baseline_was_measured_with() {
+        // Three runs of the gate scored 20, 22 and 19 of 28 through the string this builds with an
+        // empty neighbourhood, and the only claim the import signal can honestly make is a
+        // comparison against those numbers. A first pass reworded in passing — a clearer sentence,
+        // a list reordered while somebody was in here anyway — would have made the rewording and
+        // the second pass indistinguishable, at a cost of three paid runs. So nothing about a
+        // neighbourhood may reach a prompt that has none, and adding one may not disturb a byte of
+        // what came before it.
+        let file = asked("core/src/map_join.rs", "//! The junction. §8 governs it.\n");
+
+        let bare = anchor_prompt(&file, &specs(), &Neighbourhood::default());
+        for phrase in [
+            "This file does not sit alone",
+            "import edge, and never a folder",
+            " edges) — ",
+        ] {
+            assert!(
+                !bare.contains(phrase),
+                "a first pass has heard from nobody and must not mention neighbours: {phrase}"
+            );
+        }
+
+        let around = Neighbourhood {
+            heard: vec![Neighbour {
+                path: "core/src/map_store.rs".to_owned(),
+                proposed: Some(MAP.to_owned()),
+                why: "the module comment is about the map".to_owned(),
+                degree: 8,
+            }],
+            elided: 0,
+        };
+        let told = anchor_prompt(&file, &specs(), &around);
+
+        let seam = bare
+            .find("----- END FILE -----")
+            .expect("the file block ends");
+        assert_eq!(
+            bare[..seam],
+            told[..seam],
+            "the block is added after the file's own evidence and never woven through it"
+        );
+        assert!(told.contains("This file does not sit alone"));
+        // And everything the first pass said is still said, abstention included: a prompt that
+        // added evidence and quietly dropped the paragraph pricing `none` would be the trade this
+        // slice already made once by accident — unreadable answers fell and wrong slugs doubled.
+        assert!(told.contains("If you are not sure, the answer is \"none\""));
+        assert!(told.contains("\"none\" is a complete answer and it is not a failure"));
+    }
+
+    #[test]
+    fn a_neighbourhood_is_evidence_in_the_prompt_and_never_a_vote_to_be_counted() {
+        let file = asked(
+            "shell/src/project/Triagem.tsx",
+            "// Triagem. §8 says which document a citation names.\n",
+        );
+        let around = Neighbourhood {
+            heard: vec![
+                Neighbour {
+                    path: "shell/src/project/ModeMapa.tsx".to_owned(),
+                    proposed: Some(MAP.to_owned()),
+                    why: "the module comment names the map mode".to_owned(),
+                    degree: 8,
+                },
+                Neighbour {
+                    path: "shell/src/data/project-map.ts".to_owned(),
+                    proposed: None,
+                    why: "two documents fit equally".to_owned(),
+                    degree: 10,
+                },
+            ],
+            elided: 3,
+        };
+
+        let prompt = anchor_prompt(&file, &specs(), &around);
+
+        // What it shows: the path, the answer, the sentence behind the answer, and the degree —
+        // which is the one number separating the mode screen that mounts this file from a router
+        // that imports half the project.
+        assert!(prompt.contains("shell/src/project/ModeMapa.tsx (8 edges)"));
+        assert!(prompt.contains("the module comment names the map mode"));
+        assert!(prompt.contains("shell/src/data/project-map.ts (10 edges) — none"));
+        assert!(
+            prompt.contains("3 more it shares an edge with that are not shown"),
+            "a model shown some of a neighbourhood and not told so is reasoning about a \
+             neighbourhood it believes it has seen whole"
+        );
+
+        // What it must never turn into. Three of the four wrong slugs sat one edge from a file the
+        // model placed correctly every time, so the pull to write *most of your neighbours said X*
+        // is strong and it is the mechanical decider this module has already withdrawn twice,
+        // wearing a graph. The prompt offers corroboration and abstention, and no counting rule.
+        for tally in ["majority", "most of", "the most common", "vote"] {
+            assert!(
+                !prompt.contains(tally),
+                "the graph is evidence in the prompt and never a decider: {tally}"
+            );
+        }
+        assert!(
+            prompt.contains(
+                "The neighbours disagree with each other. Then they corroborate nothing, and \
+                 \"none\" is the answer unless this file itself settles it."
+            ),
+            "a file whose neighbours disagree has to find `none` EASIER, not harder — the last \
+             change that made abstention harder roughly doubled the wrong slugs"
+        );
+        assert!(prompt.contains("An edge does not mean two files implement the same document"));
+    }
+
+    #[test]
+    fn an_import_edge_is_read_in_both_directions() {
+        // `Structure::imports` records `ModeMapa.tsx -> Triagem.tsx` and nothing the other way,
+        // because that is the direction the `import` statement is written in. Read one-way, a file
+        // sees the modules it uses and never the mode screen that mounts it — and that is precisely
+        // the edge carrying the answer for three of the four files this signal was built for. The
+        // question being asked is whether the two are near each other in the thing being built,
+        // and that question has no direction.
+        let first = swept(vec![
+            placed("shell/src/project/Triagem.tsx", WORKSPACE),
+            placed("shell/src/project/ModeMapa.tsx", MAP),
+        ]);
+        let edges = [edge(
+            "shell/src/project/ModeMapa.tsx",
+            "shell/src/project/Triagem.tsx",
+        )];
+
+        let again = to_reask(&first, &edges);
+
+        let triagem = asked_again(&again, "shell/src/project/Triagem.tsx")
+            .expect("the file the edge points AT has heard from the file it points FROM");
+        assert_eq!(triagem.reason, ReaskReason::Alone);
+        assert_eq!(triagem.around.heard.len(), 1);
+        assert_eq!(
+            triagem.around.heard[0].path,
+            "shell/src/project/ModeMapa.tsx"
+        );
+        // And symmetrically: both ends of a disagreement are asked again, because deciding which
+        // end is the suspect one would be deciding the answer.
+        assert!(asked_again(&again, "shell/src/project/ModeMapa.tsx").is_some());
+    }
+
+    #[test]
+    fn one_neighbour_agreeing_is_enough_to_leave_a_file_alone() {
+        // The first shape of this rule was *any neighbour disagrees*, and it is a worse one.
+        // Cross-document edges are ordinary here — `git_exec.rs` runs git for the map slice and
+        // belongs to the document about git — so that rule fires on nearly everything, costs a
+        // second full pass, and puts every right answer in front of a prompt inviting it to
+        // reconsider. Corroboration by one neighbour is what the evidence actually is: somebody
+        // else read the same document out of a file joined to this one.
+        let first = swept(vec![
+            placed("core/src/git_exec.rs", WORKSPACE),
+            placed("core/src/vcs.rs", WORKSPACE),
+            placed("core/src/map_recency.rs", MAP),
+            placed("core/src/map_stamp.rs", MAP),
+        ]);
+        let edges = [
+            edge("core/src/vcs.rs", "core/src/git_exec.rs"),
+            edge("core/src/map_recency.rs", "core/src/git_exec.rs"),
+            edge("core/src/map_stamp.rs", "core/src/git_exec.rs"),
+        ];
+
+        let again = to_reask(&first, &edges);
+
+        assert!(
+            asked_again(&again, "core/src/git_exec.rs").is_none(),
+            "two of its three neighbours read a different document and one read the same one; the \
+             one is the corroboration"
+        );
+        // The two map modules disagree with git_exec and agree with nobody else here, so they are
+        // asked again — which is the rule stated symmetrically rather than an opinion about which
+        // of them is wrong.
+        assert!(asked_again(&again, "core/src/map_recency.rs").is_some());
+    }
+
+    #[test]
+    fn a_file_with_nothing_new_to_hear_is_never_asked_a_second_time() {
+        // The rule that keeps this from becoming a best-of-two. A second call with no new evidence
+        // in it is a second sample of the same question, and a gate that took the better of two
+        // samples would be measuring how many times it rolled rather than what the signal is worth
+        // — which is the exact failure `ask`'s own heading records about the cloud arm, arriving
+        // through the harness instead of through the sampler.
+        let alone = swept(vec![declined("shell/src/canvas/workflow-model.ts")]);
+        assert!(
+            to_reask(&alone, &[]).is_empty(),
+            "no edges at all, so there is nothing to show it"
+        );
+
+        let deaf = swept(vec![
+            declined("shell/src/canvas/workflow-model.ts"),
+            declined("shell/src/canvas/WorkflowCanvas.tsx"),
+        ]);
+        let edges = [edge(
+            "shell/src/canvas/WorkflowCanvas.tsx",
+            "shell/src/canvas/workflow-model.ts",
+        )];
+        assert!(
+            to_reask(&deaf, &edges).is_empty(),
+            "its one neighbour abstained too, so a second call would buy a re-sample and nothing \
+             else"
+        );
+
+        // A neighbour that was never asked about is not a neighbour with an answer, which is what
+        // makes the 28-pair gate a CONSERVATIVE measurement of this signal: inside it,
+        // `workflow-model.ts` has three neighbours and none of them is asked, so it is never
+        // re-asked however it answered. Under the full sweep all three are.
+        let unasked = swept(vec![declined("shell/src/canvas/workflow-model.ts")]);
+        assert!(to_reask(&unasked, &edges).is_empty());
+    }
+
+    #[test]
+    fn a_neighbour_whose_answer_was_unusable_never_enters_a_neighbourhood() {
+        // Two different unusable answers, left out for two different reasons. A slug this project
+        // does not have would be printed in front of a model that was asked to copy a slug, which
+        // is one `NoSuchDocument` spreading along an edge; an answer nobody could read is the
+        // runner's bad day, and quoting it would dress a parse failure up as somebody's reading.
+        // An abstention IS shown, because a neighbour that looked and declined is a fact about how
+        // legible this corner of the project is — it simply is not agreement.
+        let first = swept(vec![
+            placed("core/src/map_join.rs", WORKSPACE),
+            Verdict {
+                proposed: Some("2026-01-01-nao-existe-design".to_owned()),
+                outcome: Outcome::NoSuchDocument,
+                ..placed("core/src/map_store.rs", MAP)
+            },
+            Verdict {
+                proposed: None,
+                outcome: Outcome::Unreadable,
+                why: format!("{} nobody could read it", crate::map_triage::DAEMON_MARK),
+                ..placed("core/src/map_stamp.rs", MAP)
+            },
+            declined("core/src/map_intent.rs"),
+            placed("core/src/map_triage.rs", MAP),
+        ]);
+        let edges = [
+            edge("core/src/map_join.rs", "core/src/map_store.rs"),
+            edge("core/src/map_join.rs", "core/src/map_stamp.rs"),
+            edge("core/src/map_join.rs", "core/src/map_intent.rs"),
+            edge("core/src/map_join.rs", "core/src/map_triage.rs"),
+        ];
+
+        let again = to_reask(&first, &edges);
+        let junction = asked_again(&again, "core/src/map_join.rs").expect("it is alone");
+
+        let shown: Vec<&str> = junction
+            .around
+            .heard
+            .iter()
+            .map(|neighbour| neighbour.path.as_str())
+            .collect();
+        assert_eq!(shown, ["core/src/map_intent.rs", "core/src/map_triage.rs"]);
+        assert!(
+            !junction
+                .around
+                .heard
+                .iter()
+                .any(|neighbour| neighbour.why.contains(crate::map_triage::DAEMON_MARK)),
+            "a sentence this daemon wrote must never be shown as a neighbour's reading"
+        );
+    }
+
+    #[test]
+    fn a_file_that_named_nothing_usable_is_asked_again_for_a_different_reason() {
+        // Which of the two rules fired is in the record because they fail differently. A pile of
+        // `Silent` says the prompt or the model could not read these files at all; a pile of
+        // `Alone` says the neighbourhoods of this project do not agree with themselves, which
+        // would be the finding that this signal is not a signal here.
+        let first = swept(vec![
+            declined("shell/src/canvas/map-model.ts"),
+            placed("shell/src/project/ModeMapa.tsx", MAP),
+        ]);
+        let edges = [edge(
+            "shell/src/project/ModeMapa.tsx",
+            "shell/src/canvas/map-model.ts",
+        )];
+
+        let again = to_reask(&first, &edges);
+        let model = asked_again(&again, "shell/src/canvas/map-model.ts").expect("it heard someone");
+
+        assert_eq!(model.reason, ReaskReason::Silent);
+        assert!(
+            asked_again(&again, "shell/src/project/ModeMapa.tsx").is_none(),
+            "an abstaining neighbour is not a disagreement, so the file that answered is left \
+             exactly where it was"
+        );
+    }
+
+    #[test]
+    fn the_cap_drops_routers_rather_than_whichever_folder_sorts_last() {
+        // Path order would drop neighbours by the first letter of their folder, which is the
+        // alphabet choosing the evidence. Degree order drops the file with seventy edges and keeps
+        // the one with four, because a file with four edges of which this is one is saying
+        // something about this one.
+        let subject = "core/src/subject.rs";
+        let mut verdicts = vec![placed(subject, WORKSPACE)];
+        let mut edges = Vec::new();
+        for index in 0..MAX_NEIGHBOURS + 1 {
+            let neighbour = format!("core/src/n{index:02}.rs");
+            verdicts.push(placed(&neighbour, MAP));
+            edges.push(edge(subject, &neighbour));
+            // Padding, so the neighbours' degrees differ: `n00` ends with one edge and the last
+            // with thirteen. The padding files are never asked about, so they are never shown.
+            for pad in 0..index {
+                edges.push(edge(
+                    &neighbour,
+                    &format!("core/src/pad{index:02}_{pad}.rs"),
+                ));
+            }
+        }
+
+        let again = to_reask(&swept(verdicts), &edges);
+        let subject = asked_again(&again, subject).expect("it disagrees with all thirteen");
+
+        assert_eq!(subject.around.heard.len(), MAX_NEIGHBOURS);
+        assert_eq!(subject.around.elided, 1);
+        assert_eq!(subject.around.heard[0].path, "core/src/n00.rs");
+        assert_eq!(subject.around.heard[0].degree, 1);
+        assert!(
+            !subject
+                .around
+                .heard
+                .iter()
+                .any(|neighbour| neighbour.path == "core/src/n12.rs"),
+            "the file with the most edges is the one the cap drops"
+        );
+    }
+
+    #[test]
+    fn a_second_answer_replaces_a_first_and_a_second_pass_that_never_landed_replaces_nothing() {
+        // The safety rule of the whole arrangement: a re-ask that failed must never leave a file
+        // WORSE off than if nobody had re-asked it. Folding the second pass's failures into the
+        // settled sweep would delete a perfectly good first answer over a network error, and it
+        // would break the one invariant that says a report is not quietly short — that the three
+        // lists still partition the files the first pass was handed.
+        let first = swept(vec![
+            placed("shell/src/project/Triagem.tsx", WORKSPACE),
+            placed("shell/src/project/Carimbos.tsx", WORKSPACE),
+        ]);
+        let second = Sweep {
+            verdicts: vec![placed("shell/src/project/Triagem.tsx", MAP)],
+            failed: vec![(
+                "shell/src/project/Carimbos.tsx".to_owned(),
+                "the CLI exited 1".to_owned(),
+            )],
+            ..Sweep::default()
+        };
+
+        let settled = settle(first, second);
+
+        assert_eq!(settled.verdicts.len(), 2);
+        assert_eq!(
+            settled.verdicts[1].proposed.as_deref(),
+            Some(MAP),
+            "the second reading of Triagem.tsx stands"
+        );
+        assert_eq!(
+            settled.verdicts[0].proposed.as_deref(),
+            Some(WORKSPACE),
+            "Carimbos.tsx's second call never landed, so its first answer is untouched"
+        );
+        assert!(
+            settled.failed.is_empty(),
+            "a file with a standing verdict must not also appear as a failure, or the three lists \
+             stop partitioning anything"
         );
     }
 
@@ -1808,7 +2711,10 @@ mod tests {
         assert_eq!(file.inheriting.len(), 25);
         assert_eq!(file.cited.len(), MAX_CITED_SECTIONS);
         assert_eq!(file.elided(), 5);
-        assert!(anchor_prompt(&file, &specs()).contains("5 more it names that are not shown here"));
+        assert!(
+            anchor_prompt(&file, &specs(), &Neighbourhood::default())
+                .contains("5 more it names that are not shown here")
+        );
     }
 
     #[test]
@@ -1878,17 +2784,27 @@ mod tests {
         };
 
         assert!(
-            ask(crate::map_intent::Extractor::Cli(&failing), &file, &specs())
-                .await
-                .is_err()
+            ask(
+                crate::map_intent::Extractor::Cli(&failing),
+                &file,
+                &specs(),
+                &Neighbourhood::default()
+            )
+            .await
+            .is_err()
         );
 
         // And the ordinary path: the prompt reaches the runner, and a reader that could edit the
         // repository is not reading it.
         let runner = fake_answering(&format!("{{\"spec\":\"{MAP}\",\"why\":\"the junction\"}}"));
-        let said = ask(crate::map_intent::Extractor::Cli(&runner), &file, &specs())
-            .await
-            .expect("the runner answered");
+        let said = ask(
+            crate::map_intent::Extractor::Cli(&runner),
+            &file,
+            &specs(),
+            &Neighbourhood::default(),
+        )
+        .await
+        .expect("the runner answered");
 
         assert_eq!(
             parse_proposal(&said).expect("a proposal").spec.as_deref(),
@@ -1982,9 +2898,14 @@ mod tests {
         let runner = fake_answering("{\"spec\":\"none\",\"why\":\"cannot tell\"}");
         let file = asked("core/src/x.rs", "// §1 alone.\n");
 
-        let _ = ask(crate::map_intent::Extractor::Cli(&runner), &file, &specs())
-            .await
-            .expect("the fake answers");
+        let _ = ask(
+            crate::map_intent::Extractor::Cli(&runner),
+            &file,
+            &specs(),
+            &Neighbourhood::default(),
+        )
+        .await
+        .expect("the fake answers");
 
         let standing = runner
             .last_append_system_prompt
@@ -2078,6 +2999,12 @@ mod tests {
         // that is the right place for it.
 
         assert_eq!(ANCHOR_PROMPT_VERSION, 1);
+
+        // And it is STILL 1 with the import signal in the tree, which is the assertion the
+        // measurement rests on: the second question is versioned separately because the first one
+        // did not move. A change that reworded the first pass and bumped only the second constant
+        // would leave a run unable to say which of the two moved its number.
+        assert_eq!(NEIGHBOUR_PROMPT_VERSION, 1);
     }
     /// A scratch tree, keyed by process the way `project_map`'s own fixtures are keyed.
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -2421,6 +3348,40 @@ mod tests {
             });
         }
 
+        gathered(running).await
+    }
+
+    /// The second round, sharded the same way and put back into the same order.
+    ///
+    /// Strided over [`to_reask`]'s output, which is already in the first pass's file order, for
+    /// [`sweep_in_lanes`]'s reason: a contiguous chunk of a path-sorted list is a contiguous folder,
+    /// and a folder's files are the ones that are large together.
+    async fn reask_in_lanes(root: &std::path::Path, again: &[Reask], specs: &[Spec]) -> Sweep {
+        let lanes = lanes();
+        let mut running = tokio::task::JoinSet::new();
+        for lane in 0..lanes {
+            let root = root.to_path_buf();
+            let specs = specs.to_vec();
+            let mine: Vec<Reask> = again.iter().skip(lane).step_by(lanes).cloned().collect();
+            running.spawn(async move {
+                let runner = brain();
+                reask(
+                    crate::map_intent::Extractor::Cli(&runner),
+                    &root,
+                    &mine,
+                    &specs,
+                )
+                .await
+            });
+        }
+        gathered(running).await
+    }
+
+    /// Join every lane and put the answers back into one order.
+    ///
+    /// Sorted by file, because the report is read as a diff and an order the scheduler chose
+    /// changes between two runs over an unchanged repository.
+    async fn gathered(mut running: tokio::task::JoinSet<Sweep>) -> Sweep {
         let mut whole = Sweep::default();
         while let Some(lane) = running.join_next().await {
             let lane = lane.expect("a lane panicked");
@@ -2474,6 +3435,8 @@ mod tests {
             .sum();
         serde_json::json!({
             "anchor_prompt_version": ANCHOR_PROMPT_VERSION,
+            "neighbour_prompt_version": NEIGHBOUR_PROMPT_VERSION,
+            "max_neighbours": MAX_NEIGHBOURS,
             "run_at": chrono::Utc::now().to_rfc3339(),
             "model": brain().model,
             "lanes": lanes(),
@@ -2519,32 +3482,45 @@ mod tests {
     /// it got wrong matters far more than how many**: a miss on `browser_policy.rs` is a model
     /// confusing two documents about one pillar, and a miss on `project_map.rs` is the IDF spike's
     /// failure arriving through a different door.
+    ///
+    /// ## Both passes are scored, and the first one is the baseline re-measured in the same run
+    ///
+    /// The first pass asks the string [`ANCHOR_PROMPT_VERSION`] has always named, of every pair,
+    /// with no neighbourhood — so its hit rate is directly comparable to the 20, 22 and 19 of 28
+    /// this gate scored before the import signal existed. The settled hit rate is the same run with
+    /// the second pass's answers in place of the ones they replaced. **Every run therefore reports
+    /// its own before and after**, taken through one sample of a sampling model rather than across
+    /// two runs of it, which is the only arrangement that can separate what the graph did from what
+    /// the sampler did.
+    ///
+    /// It also prints [`wrong_slugs`], counted apart from the hit rate on purpose. A wrong slug
+    /// manufactures a false [`crate::map_join::Anchor::Declared`] and an abstention manufactures
+    /// nothing, so a change that turned four wrong slugs into four abstentions would leave the hit
+    /// rate flat and would still be the more important half of the result. The baseline to beat is
+    /// **7 wrong slugs in 84 answers**.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "spawns the real Claude CLI once per file and spends money; run with --include-ignored"]
     async fn the_ground_truth_is_scored_before_any_sweep_is_run() {
         let root = repository_root();
         let specs = catalogue(&root);
+        let structure = crate::project_map::structure(&root).expect("the walk reads this tree");
         let files: Vec<String> = GROUND_TRUTH
             .iter()
             .map(|(file, _)| (*file).to_owned())
             .collect();
 
-        let swept = sweep_in_lanes(&root, &files, &specs).await;
+        let first = sweep_in_lanes(&root, &files, &specs).await;
+        let again = to_reask(&first, &structure.imports);
+        let second = reask_in_lanes(&root, &again, &specs).await;
+        let swept = settle(first.clone(), second.clone());
 
-        let answered: std::collections::BTreeMap<&str, &Verdict> = swept
-            .verdicts
-            .iter()
-            .map(|verdict| (verdict.file.as_str(), verdict))
-            .collect();
-        let mut hits = 0usize;
-        let mut pairs = Vec::new();
+        let (before, wrong_before, _) = scored(&first);
+        let (hits, wrong, pairs) = scored(&swept);
+
         for (file, expected) in GROUND_TRUTH {
-            let verdict = answered.get(file).copied();
+            let verdict = standing(&swept, file);
             let proposed = verdict.and_then(|verdict| verdict.proposed.as_deref());
-            let hit = proposed == Some(*expected);
-            if hit {
-                hits += 1;
-            } else {
+            if proposed != Some(*expected) {
                 println!(
                     "MISS {file}\n  expected {expected}\n  proposed {}\n  because  {}",
                     proposed.unwrap_or("(nothing)"),
@@ -2553,21 +3529,55 @@ mod tests {
                         .as_str()),
                 );
             }
-            pairs.push(serde_json::json!({
-                "file": file,
-                "expected": expected,
-                "hit": hit,
-                "verdict": verdict.map(row),
-            }));
         }
 
-        let (skipped, failed) = unasked(&swept);
+        // What the second pass actually did to each file it touched, printed rather than summed.
+        // A pass that fixed three answers and broke two is not a pass that fixed one.
+        let moved: Vec<serde_json::Value> = again
+            .iter()
+            .map(|one| {
+                let was = standing(&first, &one.file).and_then(|verdict| verdict.proposed.clone());
+                let now = standing(&swept, &one.file).and_then(|verdict| verdict.proposed.clone());
+                let truth = GROUND_TRUTH
+                    .iter()
+                    .find(|(file, _)| *file == one.file)
+                    .map(|(_, slug)| *slug);
+                println!(
+                    "REASK {} ({:?}, {} neighbours)\n  was {}\n  now {}\n  truth {}",
+                    one.file,
+                    one.reason,
+                    one.around.heard.len(),
+                    was.as_deref().unwrap_or("(none)"),
+                    now.as_deref().unwrap_or("(none)"),
+                    truth.unwrap_or("(not in the table)"),
+                );
+                serde_json::json!({
+                    "file": one.file,
+                    "reason": one.reason,
+                    "neighbours": one.around,
+                    "first": was,
+                    "settled": now,
+                    "truth": truth,
+                })
+            })
+            .collect();
+
+        let (skipped, failed) = unasked(&first);
+        let (_, failed_again) = unasked(&second);
         let report = serde_json::json!({
             "provenance": provenance(&swept, files.len()),
-            "hit_rate": {"hits": hits, "of": GROUND_TRUTH.len()},
+            "hit_rate": {"hits": hits, "of": GROUND_TRUTH.len(), "wrong_slugs": wrong},
+            "first_pass": {
+                "hits": before,
+                "of": GROUND_TRUTH.len(),
+                "wrong_slugs": wrong_before,
+                "counts": tally(&first.verdicts),
+            },
+            "reasked": moved,
             "pairs": pairs,
             "skipped": skipped,
             "failed": failed,
+            "second_pass_failed": failed_again,
         });
         std::fs::write(
             report_path(),
@@ -2575,13 +3585,55 @@ mod tests {
         )
         .expect("the report is written");
 
-        println!("ground truth: {hits}/{}", GROUND_TRUTH.len());
+        println!(
+            "ground truth: {hits}/{} settled, {before}/{} on the first pass alone; wrong slugs \
+             {wrong} settled against {wrong_before} first; {} files asked a second time",
+            GROUND_TRUTH.len(),
+            GROUND_TRUTH.len(),
+            again.len(),
+        );
         assert_eq!(
             hits,
             GROUND_TRUTH.len(),
             "anything short of the whole table stops the sweep and reports the misses BY NAME — \
              the lines above are that report"
         );
+    }
+
+    /// One file's standing verdict in a sweep, or nothing if it never got one.
+    fn standing<'a>(swept: &'a Sweep, file: &str) -> Option<&'a Verdict> {
+        swept.verdicts.iter().find(|verdict| verdict.file == file)
+    }
+
+    /// A sweep against [`GROUND_TRUTH`]: how many it got right, how many wrong slugs it produced,
+    /// and the row-per-pair the report carries.
+    ///
+    /// **Hits and wrong slugs are two numbers and never one.** A file that abstained is not a file
+    /// placed under the wrong document: the first leaves the file exactly as bare as it is today
+    /// and the second manufactures the one state this map may present as confirmed. A single
+    /// *misses* total would hide a change that halved the harm while moving the hit rate not at
+    /// all — which is the shape of result this signal was most likely to produce.
+    fn scored(swept: &Sweep) -> (usize, usize, Vec<serde_json::Value>) {
+        let mut hits = 0usize;
+        let mut wrong = 0usize;
+        let mut pairs = Vec::new();
+        for (file, expected) in GROUND_TRUTH {
+            let verdict = standing(swept, file);
+            let proposed = verdict.and_then(|verdict| verdict.proposed.as_deref());
+            let hit = proposed == Some(*expected);
+            if hit {
+                hits += 1;
+            } else if proposed.is_some() {
+                wrong += 1;
+            }
+            pairs.push(serde_json::json!({
+                "file": file,
+                "expected": expected,
+                "hit": hit,
+                "verdict": verdict.map(row),
+            }));
+        }
+        (hits, wrong, pairs)
     }
 
     /// Every `#`-headed line of every document this project has, as a decision nobody approved.
@@ -2712,22 +3764,45 @@ mod tests {
     ///
     /// The list is [`crate::project_map::citing_files`]'s and **not** `structure().modules` — see
     /// that function for the two groups a sweep over the modules alone loses in silence.
+    ///
+    /// **The sweep gets more out of the import signal than the gate does, and knowing which way
+    /// that cuts matters.** [`to_reask`] shows a file only the neighbours somebody actually asked
+    /// about; inside the 28-pair gate most of a file's neighbours are not in the list at all, while
+    /// here every module that cites anything is. So the gate measures this signal with a thinner
+    /// neighbourhood than the run it authorises — an under-estimate, which is the safe direction,
+    /// and not a promise that the sweep will do better.
+    ///
+    /// A test sibling and a Go file are in this list and in no import graph: nothing here reads what
+    /// a `.test.tsx` or a `.go` imports, so they are asked once, hear from nobody and are never
+    /// asked again. That is the honest answer rather than a gap — the signal is absent for them,
+    /// and absent evidence must not become a second sample.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "spawns the real Claude CLI once per file and spends money; run with --include-ignored"]
     async fn the_repository_is_swept_and_the_proposal_is_written_down() {
         let root = repository_root();
         let specs = catalogue(&root);
+        let structure = crate::project_map::structure(&root).expect("the walk reads this tree");
         let files = crate::project_map::citing_files(&root).expect("the walk reads this tree");
 
-        let swept = sweep_in_lanes(&root, &files, &specs).await;
+        let first = sweep_in_lanes(&root, &files, &specs).await;
+        let again = to_reask(&first, &structure.imports);
+        let second = reask_in_lanes(&root, &again, &specs).await;
+        let swept = settle(first.clone(), second.clone());
 
-        let (skipped, failed) = unasked(&swept);
+        let (skipped, failed) = unasked(&first);
+        let (_, failed_again) = unasked(&second);
         let header = provenance(&swept, files.len());
         let report = serde_json::json!({
             "provenance": header,
             "files": swept.verdicts.iter().map(row).collect::<Vec<_>>(),
+            "first_pass": {
+                "counts": tally(&first.verdicts),
+                "files": first.verdicts.iter().map(row).collect::<Vec<_>>(),
+            },
+            "reasked": again,
             "skipped": skipped,
             "failed": failed,
+            "second_pass_failed": failed_again,
         });
         std::fs::write(
             report_path(),
