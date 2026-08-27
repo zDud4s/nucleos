@@ -713,30 +713,180 @@ pub async fn resolve_repo(
 /// still matched as a whole shape, there are just more of them. A segment that is not a git command
 /// matches nothing, exactly as an unrecognised command does today.
 ///
-/// Not a shell parser, and it must not become one. Quoting is ignored, so
+/// **Quoted text and heredoc bodies are data, not commands, and this used to split inside both.**
+/// The paragraph that stood here said the opposite and defended it: *"Quoting is ignored, so
 /// `echo "a; git merge x"` yields a segment that parses as a merge and is refused. That direction is
 /// the safe one — the refusal is a sentence a person can reword, and the caller cannot approve
-/// anything with it — and it is the same trade `ask_daemon.py`'s own filter makes for the same
-/// reason.
+/// anything with it."*
+///
+/// **The second half of that sentence was never true, and 2026-08-27 is what it cost.**
+/// `hooks::session_git_decision` does not merely refuse: it **submits the operation to the queue**
+/// and *then* answers `deny` with the ticket number. So a caller could not approve anything with the
+/// refusal, and did not need to — the queue already had the request. A session writing a file with
+/// `python - <<'EOF' … EOF`, whose body happened to contain the words of a merge command as
+/// documentation for another agent, had that merge performed against the branch its shell was
+/// standing on. It was `master`, and 1016 lines of unreviewed work were published into it seconds
+/// after the heredoc was typed. Nothing was executed by the shell; the text was never a command.
+///
+/// So the scan below tracks two things and nothing else, and both are shell facts rather than
+/// heuristics:
+///
+/// - **Quotes.** A `;` inside `'…'` or `"…"` does not separate commands, so it is not a split point.
+///   Skipping quoted spans cannot open a bypass, because quoted text is not run: a caller wanting a
+///   merge out of a string still has to spell `sh -c "…"`, whose own segment is `sh` and matches no
+///   parser here today either.
+/// - **Heredoc bodies.** Everything between `<<WORD` and the terminator line is stdin for the
+///   command, not shell input, so no line of it is ever a segment. `<<-WORD` strips leading tabs
+///   from the terminator; `<<<` is a here-string and opens no body at all.
+///
+/// **Still not a shell parser, and it must not become one.** It does not expand anything, does not
+/// understand backslash escapes, and does not follow `$(…)`. What it now refuses to do is invent a
+/// command out of prose — which is a smaller claim than parsing shell, and the only one this needed.
 pub fn shell_segments(command: &str) -> Vec<&str> {
-    command
-        .split(['\n', '\r', ';', '&', '|', '(', ')'])
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| {
-            // `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and
-            // leaving them in makes `program` read `FOO=bar` and the whole segment parse as nothing.
-            let mut rest = segment;
-            while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
-                if head.contains('=') && !head.starts_with('-') {
-                    rest = tail.trim_start();
-                } else {
-                    break;
-                }
+    let mut segments = Vec::new();
+    // Carried across lines on purpose: a quote left open at a line's end is still open on the next
+    // one, which is exactly the shape a multi-line string in an embedded script has.
+    let mut single = false;
+    let mut double = false;
+    // The heredoc currently swallowing lines, if any: its terminator and whether `<<-` allows that
+    // terminator to be indented with tabs.
+    let mut swallowing: Option<(&str, bool)> = None;
+
+    for line in command.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+
+        if let Some((terminator, strip_tabs)) = swallowing {
+            let probe = if strip_tabs {
+                body.trim_start_matches('\t')
+            } else {
+                body
+            };
+            if probe == terminator {
+                swallowing = None;
             }
-            rest
-        })
-        .collect()
+            // Either way this line was the heredoc's, and a heredoc's content is never a command.
+            continue;
+        }
+
+        // Collected while scanning and armed only at the line's end: `cat <<A <<B` is legal, and
+        // both bodies follow the whole line rather than the operator that named them.
+        let mut opened: Vec<(&str, bool)> = Vec::new();
+        let mut start = 0usize;
+        let mut chars = body.char_indices().peekable();
+
+        while let Some((at, c)) = chars.next() {
+            match c {
+                '\'' if !double => single = !single,
+                '"' if !single => double = !double,
+                '<' if !single && !double => {
+                    let rest = &body[at..];
+                    // **Every `<` run is stepped over as a unit, and that is not tidiness.** Landing
+                    // on the second `<` of a `<<<` leaves `<< "some text"` ahead, which reads as a
+                    // heredoc whose terminator is `some text` — so a here-string would swallow the
+                    // rest of the script, including real commands. Caught by
+                    // `a_here_string_swallows_nothing`.
+                    let width = if rest.starts_with("<<<") {
+                        // A here-string carries its operand on the same line and opens no body.
+                        "<<<".len()
+                    } else if let Some((terminator, strip_tabs, width)) = heredoc_opened_at(rest) {
+                        opened.push((terminator, strip_tabs));
+                        // Stepping over the whole `<<WORD` spelling also keeps a quote inside the
+                        // delimiter (`<<'EOF'`) from flipping the quote state for the rest of the
+                        // line.
+                        width
+                    } else if rest.starts_with("<<") {
+                        // `<<` naming nothing. Nothing to swallow until, and stepping over both
+                        // keeps the second one from being read as a fresh opener.
+                        "<<".len()
+                    } else {
+                        // A plain `<` redirect.
+                        c.len_utf8()
+                    };
+                    while chars.peek().is_some_and(|(next, _)| *next < at + width) {
+                        chars.next();
+                    }
+                }
+                ';' | '&' | '|' | '(' | ')' if !single && !double => {
+                    push_segment(&mut segments, &body[start..at]);
+                    start = at + c.len_utf8();
+                }
+                _ => {}
+            }
+        }
+        push_segment(&mut segments, &body[start..]);
+
+        // One at a time, and the rest are dropped: a second body would need the first to have been
+        // consumed to know where it begins, and this walk does not read that far ahead. Dropping
+        // them keeps the conservative direction — an unread body is never mistaken for a command.
+        swallowing = opened.into_iter().next();
+    }
+
+    segments
+}
+
+/// One segment, trimmed and with leading environment assignments stripped, unless it is empty.
+///
+/// `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and leaving them
+/// in makes `program` read `FOO=bar` and the whole segment parse as nothing.
+fn push_segment<'a>(segments: &mut Vec<&'a str>, raw: &'a str) {
+    let mut rest = raw.trim();
+    while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+        if head.contains('=') && !head.starts_with('-') {
+            rest = tail.trim_start();
+        } else {
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        segments.push(rest);
+    }
+}
+
+/// PURE: the heredoc a `<<` at the start of `rest` opens — its terminator, whether `<<-` lets that
+/// terminator be indented with tabs, and how many bytes the whole `<<WORD` spelling occupies.
+///
+/// `None` when this is not a heredoc opener at all, which covers two cases worth naming: `<<<` is a
+/// here-string, whose operand sits on the same line and which opens no body; and a bare `<<` with
+/// nothing after it names no terminator, so there is nothing to swallow until.
+///
+/// The terminator may be quoted — `<<'EOF'` and `<<"EOF"` both mean the literal word `EOF`, and the
+/// quotes only decide whether the shell expands the body. Since nothing here expands anything, the
+/// two are the same to this function, and the width it reports includes the quotes so the caller can
+/// step over them without flipping its own quote state.
+fn heredoc_opened_at(rest: &str) -> Option<(&str, bool, usize)> {
+    let after = rest.strip_prefix("<<")?;
+    if after.starts_with('<') {
+        return None;
+    }
+    let (strip_tabs, after) = match after.strip_prefix('-') {
+        Some(after) => (true, after),
+        None => (false, after),
+    };
+    let spaces = after.len() - after.trim_start_matches([' ', '\t']).len();
+    let after = &after[spaces..];
+
+    let (terminator, taken) = match after.chars().next() {
+        Some(quote @ ('\'' | '"')) => {
+            let inside = &after[quote.len_utf8()..];
+            let end = inside.find(quote)?;
+            (&inside[..end], end + 2 * quote.len_utf8())
+        }
+        _ => {
+            let end = after
+                .find(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
+                .unwrap_or(after.len());
+            if end == 0 {
+                return None;
+            }
+            (&after[..end], end)
+        }
+    };
+
+    Some((
+        terminator,
+        strip_tabs,
+        "<<".len() + usize::from(strip_tabs) + spaces + taken,
+    ))
 }
 
 pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
@@ -3134,6 +3284,95 @@ mod tests {
                 .into_iter()
                 .find_map(|segment| merge_from_command(segment, "master"));
             assert_eq!(found, None, "{command}");
+        }
+    }
+
+    /// **The incident of 2026-08-27, pinned: a heredoc body is stdin, and stdin is not a command.**
+    ///
+    /// A session wrote a file with `python - <<'EOF' … EOF` whose body contained the words of a
+    /// merge command — as documentation, for a different agent to read. The old split saw a line of
+    /// that body as a segment, `session_git_decision` submitted it, and the queue merged 1016 lines
+    /// of unreviewed work into `master`. Nothing was ever executed by the shell.
+    ///
+    /// Each case below is a real heredoc spelling, and the assertion is the same for all of them:
+    /// no operation is found, because none was written.
+    #[test]
+    fn a_heredoc_body_is_never_a_command() {
+        let bodies_that_mention_a_merge = [
+            // The incident's own shape.
+            "python - <<'EOF'\ngit merge feature\nEOF",
+            // Unquoted delimiter.
+            "cat <<EOF > notes.md\ngit merge feature\nEOF",
+            // `<<-` lets the terminator be indented with tabs, and the body still is not a command.
+            "cat <<-EOF\n\tgit merge feature\n\tEOF",
+            // A `;` inside the body is not a separator either — the whole line is data.
+            "cat <<EOF\ntrue; git merge feature\nEOF",
+        ];
+        for command in bodies_that_mention_a_merge {
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(found, None, "a heredoc body was read as a command: {command}");
+        }
+    }
+
+    /// Swallowing the body must END at the terminator, or the fix would be a bypass: everything
+    /// after a heredoc would stop being read. The merge on the last line is real and must be found.
+    #[test]
+    fn a_command_after_a_heredoc_is_still_read() {
+        let command = "cat <<EOF > notes.md\ngit merge decoy\nEOF\ngit merge feature";
+        let found = shell_segments(command)
+            .into_iter()
+            .find_map(|segment| merge_from_command(segment, "master"));
+        assert_eq!(
+            found,
+            Some(Op::Merge {
+                source: Branch::new("feature").unwrap(),
+                target: Branch::new("master").unwrap(),
+            }),
+            "the terminator did not end the body"
+        );
+    }
+
+    /// A here-string carries its operand on the same line and opens no body, so the line after one
+    /// is an ordinary command. Reading `<<<` as a heredoc would swallow the rest of the script.
+    #[test]
+    fn a_here_string_swallows_nothing() {
+        let command = "grep x <<< \"some text\"\ngit merge feature";
+        let found = shell_segments(command)
+            .into_iter()
+            .find_map(|segment| merge_from_command(segment, "master"));
+        assert_eq!(
+            found,
+            Some(Op::Merge {
+                source: Branch::new("feature").unwrap(),
+                target: Branch::new("master").unwrap(),
+            })
+        );
+    }
+
+    /// Quoted text is data for the same reason a heredoc body is: the shell does not run it, so a
+    /// separator inside it separates nothing.
+    ///
+    /// **`sh -c "git merge feature"` is the case that shows this opens no bypass**, and it is in the
+    /// list deliberately. That spelling DOES execute a merge — and it was already invisible here
+    /// before this change, because the segment is `sh -c "…"` and `merge_from_command` matches
+    /// `[git, merge, source]` and nothing else. Skipping the quotes takes nothing away from a
+    /// detection that never existed; what it removes is the pretence of one.
+    #[test]
+    fn quoted_text_is_not_a_command() {
+        for command in [
+            "echo \"a; git merge feature\"",
+            "echo 'git merge feature'",
+            "git commit -m \"revert the git merge feature we did\"",
+            "sh -c \"git merge feature\"",
+            // A string that spans lines, which is what an embedded script looks like from out here.
+            "python -c \"\nx = 'git merge feature'\n\"",
+        ] {
+            let found = shell_segments(command)
+                .into_iter()
+                .find_map(|segment| merge_from_command(segment, "master"));
+            assert_eq!(found, None, "quoted text was read as a command: {command}");
         }
     }
 
