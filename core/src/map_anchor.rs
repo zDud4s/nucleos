@@ -3775,7 +3775,32 @@ mod tests {
     /// A test sibling and a Go file are in this list and in no import graph: nothing here reads what
     /// a `.test.tsx` or a `.go` imports, so they are asked once, hear from nobody and are never
     /// asked again. That is the honest answer rather than a gap — the signal is absent for them,
-    /// and absent evidence must not become a second sample.
+    /// and absent evidence must not become a second sample. Measured on the first sweep: **not one**
+    /// of the 76 Go files, 12 SQL migrations, two stylesheets or 17 test siblings was asked twice.
+    ///
+    /// ## What the first sweep showed that a 28-pair gate could not
+    ///
+    /// Run 2026-08-27 over 211 citing files — 209 asked, one skipped as
+    /// [`Skipped::NothingWouldInherit`], one whose CLI run never finished. **160 would be annotated
+    /// and 51 left bare**; 48 files were asked a second time and the neighbourhood changed 24 of
+    /// them. Three of those things cannot happen inside 28 files, and all three are facts about the
+    /// mechanism rather than about this checkout:
+    ///
+    /// - **[`MAX_NEIGHBOURS`] bound for the first time**, on 11 files, and on exactly the ones it
+    ///   was written for: `http.rs` at 12 of 40, `runs.rs` 12 of 24, then `hooks.rs`, `job.rs` and
+    ///   `github.rs` at 12 of 19. Every file it bound on is a router. No file with a small
+    ///   neighbourhood lost a neighbour to it, which is what the degree ordering was for.
+    /// - **Eight files retreated from a slug to `none`**, each saying in its own sentence that the
+    ///   neighbours disagreed or that two documents fit equally. That direction never fired once in
+    ///   the gate's 14 second questions. It is this design's third constraint — *a file whose
+    ///   neighbours disagree should find abstention EASIER, not harder* — working, and it is only
+    ///   visible at this scale.
+    /// - **`Triagem.tsx` was the wrong slug, and the neighbourhood corrected it.** The first pass
+    ///   put it under `2026-07-28-retrospective-attribution-design`, which is the precise vocabulary
+    ///   collision this signal exists for, and the second pass moved it while naming all three of
+    ///   its import neighbours. Across the gate's three runs the first pass never once got that file
+    ///   wrong — so **the case the whole design was built to fix is one the gate never presented**,
+    ///   and only the sweep has ever shown the signal doing it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "spawns the real Claude CLI once per file and spends money; run with --include-ignored"]
     async fn the_repository_is_swept_and_the_proposal_is_written_down() {
@@ -3791,14 +3816,20 @@ mod tests {
 
         let (skipped, failed) = unasked(&first);
         let (_, failed_again) = unasked(&second);
-        let header = provenance(&swept, files.len());
         let report = serde_json::json!({
-            "provenance": header,
-            "files": swept.verdicts.iter().map(row).collect::<Vec<_>>(),
-            "first_pass": {
-                "counts": tally(&first.verdicts),
-                "files": first.verdicts.iter().map(row).collect::<Vec<_>>(),
-            },
+            "provenance": provenance(&swept, files.len()),
+            "caveats": caveats(),
+            "summary": summary(&swept, &first, &again, skipped.len(), failed.len(), failed_again.len()),
+            "files": swept
+                .verdicts
+                .iter()
+                .map(|verdict| proposal_row(verdict, &first, &again))
+                .collect::<Vec<_>>(),
+            "abstained": bare(&swept, Outcome::Abstained),
+            "no_such_document": bare(&swept, Outcome::NoSuchDocument),
+            "unreadable": bare(&swept, Outcome::Unreadable),
+            "override_backlog": backlog(&swept),
+            "neighbour_cap_bound": capped(&again),
             "reasked": again,
             "skipped": skipped,
             "failed": failed,
@@ -3812,12 +3843,246 @@ mod tests {
 
         println!(
             "{}",
-            serde_json::to_string_pretty(&report["provenance"]).expect("the header serialises")
+            serde_json::to_string_pretty(&serde_json::json!({
+                "provenance": report["provenance"],
+                "summary": report["summary"],
+            }))
+            .expect("the header serialises")
         );
         assert_eq!(
             swept.verdicts.len() + swept.skipped.len() + swept.failed.len(),
             files.len(),
             "every file handed in has to come back in exactly one of the three lists"
         );
+    }
+
+    /// One file as the proposal carries it: the answer, and which question produced it.
+    ///
+    /// **Which pass settled a file is in every row, because the two groups do not deserve the same
+    /// confidence.** A file the first pass placed and nobody asked again was answered by a question
+    /// with three runs of a 28-pair gate behind it. A file the neighbourhood changed was answered
+    /// by a question measured on fourteen events in one afternoon. Both are proposals and neither
+    /// is proof, but a reader deciding what to look at first should be able to sort them, and a
+    /// report that folded the two together would have hidden exactly the rows worth reading
+    /// closely.
+    fn proposal_row(verdict: &Verdict, first: &Sweep, again: &[Reask]) -> serde_json::Value {
+        let mut carried = row(verdict);
+        let was = again
+            .iter()
+            .find(|one| one.file == verdict.file)
+            .and(standing(first, &verdict.file));
+        let object = carried.as_object_mut().expect("a row is an object");
+        match was {
+            None => {
+                object.insert("settled_by".into(), "first_pass".into());
+            }
+            Some(before) => {
+                let changed = before.proposed != verdict.proposed;
+                object.insert(
+                    "settled_by".into(),
+                    if changed {
+                        "neighbourhood_changed_it"
+                    } else {
+                        "neighbourhood_confirmed_it"
+                    }
+                    .into(),
+                );
+                object.insert(
+                    "first_pass_proposed".into(),
+                    serde_json::to_value(&before.proposed).expect("a slug serialises"),
+                );
+                object.insert(
+                    "first_pass_why".into(),
+                    serde_json::Value::String(before.why.clone()),
+                );
+            }
+        }
+        carried
+    }
+
+    /// The files that end up bare with one particular outcome, by name and with the sentence that
+    /// left them there.
+    ///
+    /// **By name and never only as a count.** A file that abstained stays exactly as it is today,
+    /// which is the status quo rather than a failure — but *which* files those are is this run's
+    /// own answer to how much of the repository the slice would leave untouched, and a number
+    /// cannot be argued with.
+    fn bare(swept: &Sweep, outcome: Outcome) -> Vec<serde_json::Value> {
+        swept
+            .verdicts
+            .iter()
+            .filter(|verdict| verdict.outcome == outcome)
+            .map(|verdict| {
+                serde_json::json!({
+                    "file": verdict.file,
+                    "proposed": verdict.proposed,
+                    "why": verdict.why,
+                })
+            })
+            .collect()
+    }
+
+    /// The sections somebody has to write a `§N slug` on by hand, per file, worst first.
+    ///
+    /// [`Verdict::needs_override`] and not [`Verdict::unaccounted`], for the reason that field
+    /// argues: a section no document anywhere has cannot be overridden onto anything, and telling
+    /// the applier to write one would be telling it to name a document that does not exist. The
+    /// wider list travels beside it, because the difference between the two is the difference
+    /// between work and a stale citation.
+    fn backlog(swept: &Sweep) -> Vec<serde_json::Value> {
+        let mut rows: Vec<&Verdict> = swept
+            .verdicts
+            .iter()
+            .filter(|verdict| !verdict.needs_override.is_empty())
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .needs_override
+                .len()
+                .cmp(&left.needs_override.len())
+                .then_with(|| left.file.cmp(&right.file))
+        });
+        rows.into_iter()
+            .map(|verdict| {
+                serde_json::json!({
+                    "file": verdict.file,
+                    "sections": verdict.needs_override,
+                    "count": verdict.needs_override.len(),
+                    "unaccounted": verdict.unaccounted,
+                })
+            })
+            .collect()
+    }
+
+    /// Every file where [`MAX_NEIGHBOURS`] actually bound, with what it showed and what it dropped.
+    ///
+    /// **The cap's first real exercise, and that is why it is a list rather than a number.** It
+    /// never bound once across three runs of the 28-pair gate — the largest neighbourhood there was
+    /// seven — so its degree ordering has been argued from the graph's shape and held by a unit
+    /// test, and until this sweep nothing had run it against a hub. Which files it binds on is what
+    /// says whether it binds where it was meant to.
+    fn capped(again: &[Reask]) -> Vec<serde_json::Value> {
+        again
+            .iter()
+            .filter(|one| one.around.elided > 0)
+            .map(|one| {
+                serde_json::json!({
+                    "file": one.file,
+                    "shown": one.around.heard.len(),
+                    "elided": one.around.elided,
+                    "of": one.around.heard.len() + one.around.elided,
+                })
+            })
+            .collect()
+    }
+
+    /// The block a reader can decide from without opening the per-file data.
+    ///
+    /// **Two annotating counts and one total of them, which [`AnchorCounts`] refuses and this does
+    /// not.** That type keeps `declares` and `declares_with_gaps` apart precisely so the gaps stay
+    /// visible, and that is right for a type everything reads. This is the one place a total
+    /// belongs, because the question it answers — *how many files would applying this touch* — is
+    /// the question somebody deciding is actually asking, and making them add two numbers would not
+    /// make them read the second one.
+    fn summary(
+        swept: &Sweep,
+        first: &Sweep,
+        again: &[Reask],
+        skipped: usize,
+        failed: usize,
+        failed_again: usize,
+    ) -> serde_json::Value {
+        let counts = tally(&swept.verdicts);
+        let sections: usize = swept
+            .verdicts
+            .iter()
+            .map(|verdict| verdict.needs_override.len())
+            .sum();
+        let changed = again
+            .iter()
+            .filter(|one| {
+                standing(first, &one.file).map(|before| &before.proposed)
+                    != standing(swept, &one.file).map(|now| &now.proposed)
+            })
+            .count();
+        serde_json::json!({
+            "would_annotate": counts.declares + counts.declares_with_gaps,
+            "of_which_clean": counts.declares,
+            "of_which_with_unaccounted_sections": counts.declares_with_gaps,
+            "left_bare": {
+                "total": counts.abstained
+                    + counts.no_such_document
+                    + counts.unreadable
+                    + skipped
+                    + failed,
+                "abstained": counts.abstained,
+                "no_such_document": counts.no_such_document,
+                "unreadable": counts.unreadable,
+                "never_asked": skipped,
+                "run_never_finished": failed,
+            },
+            "settled_by": {
+                "first_pass_alone": counts.files.saturating_sub(again.len()),
+                "asked_a_second_time": again.len(),
+                "of_which_the_neighbourhood_changed": changed,
+                "second_pass_never_finished": failed_again,
+            },
+            "override_backlog": {"files": counts.needing_overrides, "sections": sections},
+            "neighbour_cap": {
+                "max_neighbours": MAX_NEIGHBOURS,
+                "bound_on_files": again.iter().filter(|one| one.around.elided > 0).count(),
+            },
+            "model_calls": {"first_pass": counts.files, "second_pass": again.len()},
+        })
+    }
+
+    /// What this proposal is not, written into the proposal itself.
+    ///
+    /// **Here rather than in a commit message or a chat, because this is the file somebody opens
+    /// six months from now.** Every one of these is a live doubt about the evidence beside it, and
+    /// two hundred confident-looking slugs with the doubts kept somewhere else is precisely the
+    /// artefact this feature exists to prevent — §1's failure, produced by the thing built to cure
+    /// it.
+    fn caveats() -> serde_json::Value {
+        serde_json::json!({
+            "this_is_one_sample_and_not_the_answer":
+                "The cloud arm samples: it has no temperature control and no grammar, only a \
+                 standing instruction. Which files got a second question also depends on what the \
+                 first pass happened to answer, so the mechanism is a function of the repository \
+                 AND the first sample. A second run of this sweep would propose a different set. \
+                 Nothing here is a measurement of this repository; it is one reading of it.",
+            "the_gate_measured_a_thinner_signal_than_this_run_uses":
+                "The 28-pair gate scored 27, 27 and 28 of 28, agreeing on 26. It shows a file only \
+                 the neighbours that were themselves asked about, and inside 28 files most \
+                 neighbourhoods are nearly empty — `core/src/errands.rs` has six neighbours in this \
+                 repository and none inside the gate, and it is one of the two files the gate \
+                 missed. This sweep gives every module its real neighbourhood, so its accuracy is \
+                 PLAUSIBLY better than 26 of 28. That is an expectation and not a measurement: \
+                 nothing has scored the sweep, and nothing can without a ground truth of its own.",
+            "the_ground_truth_itself_may_be_wrong_about_map_join":
+                "In one gate run `core/src/map_join.rs` abstained through both passes, arguing that \
+                 a module ABOUT citations writes its §-marks as examples of the mechanism rather \
+                 than as references to a document. That reading is defensible, and the \
+                 ground-truth table calls the entry certain. If the table is wrong about one of \
+                 its 28 then the denominator every number here leans on is itself in question. \
+                 Only the owner can settle it.",
+            "zero_regressions_is_fourteen_events":
+                "Across three gate runs the second pass was asked 14 times, changed 8 answers, and \
+                 every one of the 8 moved to the right document with none moving the other way. \
+                 Five of the 14 were the `Alone` trigger firing on files that were right and \
+                 lonely — `github.rs` and `job.rs`, shown a neighbourhood that disagreed with a \
+                 correct answer. They held. Five events is thin evidence that showing a right \
+                 answer a hostile neighbourhood is safe, and thin evidence that survived is still \
+                 thin evidence.",
+            "the_neighbour_cap_does_real_work_here_for_the_first_time":
+                "MAX_NEIGHBOURS never bound in any gate run: the largest neighbourhood among the \
+                 28 was seven. Its degree ordering — drop the routers, keep the file with four \
+                 edges — is argued from the graph's shape and held by a unit test, and this sweep \
+                 is the first time it has run against a real hub. `neighbour_cap_bound` below is \
+                 that record.",
+            "nothing_here_has_been_applied":
+                "This file is a proposal. No source file's citations were touched by the run that \
+                 wrote it, and applying it is a separate decision with a separate review.",
+        })
     }
 }
