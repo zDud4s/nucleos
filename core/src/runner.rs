@@ -1214,6 +1214,21 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
     current
 }
 
+/// The fullest the stream ever got, rather than where it ended.
+///
+/// Written on top of `context_fill_from_line` instead of re-reading the JSON: there is one
+/// definition of "what occupies the window" — `input_tokens + cache_read_input_tokens` — and it
+/// lives there. Two copies would drift the day the CLI added a third counter, and drift silently.
+///
+/// The `None` in the call is deliberate: what is wanted is what THIS line says, not the running
+/// total, so that the larger of the two can be chosen here.
+pub(crate) fn context_peak_from_line(line: &str, current: Option<i64>) -> Option<i64> {
+    match context_fill_from_line(line, None) {
+        Some(fill) => Some(current.map_or(fill, |peak| peak.max(fill))),
+        None => current,
+    }
+}
+
 /// The environment this run's context window is expressed in, or nothing when it names none.
 ///
 /// A function rather than two lines at the spawn site for one reason: the variable's NAME is the
@@ -4923,6 +4938,37 @@ mod tests {
             crate::runner::context_fill_from_line(thinking, Some(48_733)),
             Some(48_733)
         );
+    }
+
+    /// The whole point of a second column: the last turn and the worst moment are different facts.
+    #[test]
+    fn the_peak_keeps_the_fullest_line_and_not_the_last() {
+        let subiu = r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":189000}}}"#;
+        let desceu = r#"{"type":"assistant","message":{"usage":{"input_tokens":500,"cache_read_input_tokens":39500}}}"#;
+
+        let mut pico = None;
+        pico = context_peak_from_line(subiu, pico);
+        pico = context_peak_from_line(desceu, pico);
+
+        // The last turn says 40k. The worst moment said 190k, and that is what pressure reads.
+        assert_eq!(pico, Some(190_000));
+    }
+
+    #[test]
+    fn a_line_that_says_nothing_about_usage_leaves_the_peak_alone() {
+        assert_eq!(
+            context_peak_from_line(r#"{"type":"system"}"#, Some(120_000)),
+            Some(120_000)
+        );
+        assert_eq!(
+            context_peak_from_line("not json", Some(120_000)),
+            Some(120_000)
+        );
+    }
+
+    #[test]
+    fn the_peak_of_a_stream_that_never_spoke_is_nothing() {
+        assert_eq!(context_peak_from_line("not json", None), None);
     }
 
     /// The transcript a triage run actually produces: the model's own text arrives in a `content`

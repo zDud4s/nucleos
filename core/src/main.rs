@@ -49,6 +49,7 @@ mod notify;
 mod ownership;
 mod pii_shadow;
 mod presets;
+mod pressure;
 mod priority;
 mod process_tree;
 mod project_commands;
@@ -161,6 +162,106 @@ fn seeded_library() -> Option<std::path::PathBuf> {
     Some(root)
 }
 
+/// Um numero, ou um travessao quando nao ha nenhum.
+///
+/// Nada por medir escreve-se `—` e nunca `0`: zero e uma afirmacao, e sobre uma janela que ninguem
+/// mediu e falsa. E a mesma razao por que a coluna nasceu NULL.
+fn or_dash(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Number(number) => format!("{number}"),
+        _ => "—".to_string(),
+    }
+}
+
+/// Desenha o relatorio que a rota devolveu.
+///
+/// Devolve texto em vez de o imprimir para que o desenho tenha teste: e a unica parte deste
+/// caminho que pode estar errada sem que nada estoire, e a verificacao ponta-a-ponta exigia por o
+/// daemon a correr contra a base de dados de quem manda.
+///
+/// Le o JSON como `Value` em vez de o desserializar para os tipos de `pressure`: o formato e um
+/// contrato de leitura e nao um tipo partilhado, e um cliente fino que exigisse os tipos passaria a
+/// quebrar de cada vez que se acrescentasse um campo.
+fn render_pressure(report: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+
+    let team = report["team"].as_str().unwrap_or("?");
+    if report["outcome"] == "never_ran" {
+        // A saida correcta enquanto `team_runs` estiver vazia, e a que nao se pode confundir com
+        // uma tabela de zeros.
+        return format!("equipa {team} · nunca correu");
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "equipa {team} · job {} · {} round(s)",
+        report["job"].as_str().unwrap_or("?"),
+        or_dash(&report["rounds"]),
+    );
+    let _ = writeln!(
+        out,
+        "{} itens medidos · {} sem run · {} sem passos",
+        or_dash(&report["items_measured"]),
+        or_dash(&report["items_without_run"]),
+        or_dash(&report["items_without_steps"]),
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{:<5} {:<14} {:>5} {:>5} {:>9} {:>9} {:>7} {:>9} {:>8} {:>5}  veredicto",
+        "round",
+        "agente",
+        "itens",
+        "comp",
+        "pico p50",
+        "pico p90",
+        "passos",
+        "arranque",
+        "declive",
+        "R2",
+    );
+    for rollup in report["rollups"].as_array().into_iter().flatten() {
+        let fit = &rollup["fit"];
+        let (arranque, declive, r2) = if fit["kind"] == "line" {
+            (
+                format!("{:.0}", fit["intercept"].as_f64().unwrap_or_default()),
+                format!("{:.0}", fit["slope"].as_f64().unwrap_or_default()),
+                format!("{:.2}", fit["r2"].as_f64().unwrap_or_default()),
+            )
+        } else {
+            // Menos de tres pontos, ou todos com os mesmos passos. Um arranque inventado aqui seria
+            // lido com uma confianca que nao tem.
+            ("—".to_string(), "—".to_string(), "—".to_string())
+        };
+        let verdicts: Vec<&str> = rollup["verdicts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|verdict| verdict.as_str())
+            .collect();
+        let _ = writeln!(
+            out,
+            "{:<5} {:<14} {:>5} {:>5} {:>9} {:>9} {:>7} {:>9} {:>8} {:>5}  {}",
+            or_dash(&rollup["round"]),
+            rollup["agent_name"].as_str().unwrap_or("?"),
+            or_dash(&rollup["items"]),
+            or_dash(&rollup["compacted_items"]),
+            or_dash(&rollup["peak_p50"]),
+            or_dash(&rollup["peak_p90"]),
+            or_dash(&rollup["steps_median"]),
+            arranque,
+            declive,
+            r2,
+            if verdicts.is_empty() {
+                "—".to_string()
+            } else {
+                verdicts.join(", ")
+            },
+        );
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--print-token") {
@@ -225,6 +326,75 @@ async fn main() {
                 } else {
                     eprintln!("the queue refused: {text}");
                     std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("the daemon is not reachable: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // `nucleos-core --pressao --equipa NucleOS`: quanta janela custou a cada agente da equipa.
+    //
+    // Cliente fino pelo molde do `--land` acima, e pela mesma razao: a pool esta aberta no daemon,
+    // e abrir o SQLite em paralelo a partir da CLI seria contra o desenho da casa. Aqui a CLI le o
+    // token e faz um GET.
+    //
+    // Nao ha pagina na Concha de proposito. A decisao que isto informa -- mais uma layer, mais um
+    // agente, repartir uma especialidade, ou so cortar o prompt -- toma-se entre jobs, e nao ha
+    // nada que valha a pena olhar enquanto um corre.
+    if std::env::args().any(|a| a == "--pressao") {
+        let args: Vec<String> = std::env::args().collect();
+        let value_of = |flag: &str| -> Option<String> {
+            args.iter()
+                .position(|arg| arg == flag)
+                .and_then(|at| args.get(at + 1))
+                .cloned()
+        };
+        let job = value_of("--job");
+        let equipa = value_of("--equipa");
+        // Sem adivinhar por omissao: uma resposta sobre a equipa errada e pior do que nenhuma.
+        // Codificado pelo mesmo escapador do `daemon_client`, e nao por um segundo: o argumento do
+        // dono chega de uma linha de comandos e um nome com `&` seria outro pedido.
+        let query = match (job, equipa) {
+            (Some(job), _) => format!("job={}", daemon_client::urlencoding_encode(&job)),
+            (None, Some(equipa)) => {
+                format!("team={}", daemon_client::urlencoding_encode(&equipa))
+            }
+            (None, None) => {
+                eprintln!("diga de quem: --equipa <nome> ou --job <team_run_id>");
+                std::process::exit(1);
+            }
+        };
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!("no daemon token stored yet — start the daemon once to generate one");
+                std::process::exit(1);
+            }
+        };
+        let response = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:8791/team-pressure?{query}"))
+            .bearer_auth(token)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    eprintln!("nao ha nenhuma equipa nem job com esse nome");
+                    std::process::exit(1);
+                }
+                if !status.is_success() {
+                    eprintln!("o daemon recusou: {text}");
+                    std::process::exit(1);
+                }
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(report) => println!("{}", render_pressure(&report)),
+                    Err(_) => println!("{text}"),
                 }
             }
             Err(error) => {
@@ -1138,4 +1308,99 @@ async fn main() {
     }
 
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Uma equipa que nunca correu nao se desenha como uma tabela vazia.
+    ///
+    /// Este e o caso de hoje -- `team_runs` esta a zero -- e uma tabela de zeros lia-se como
+    /// aprovacao. Nada foi aprovado: nada aconteceu.
+    #[test]
+    fn a_team_that_never_ran_is_drawn_as_that_and_not_as_an_empty_table() {
+        let drawn = render_pressure(&serde_json::json!({
+            "outcome": "never_ran",
+            "team": "NucleOS",
+        }));
+
+        assert_eq!(drawn, "equipa NucleOS · nunca correu");
+    }
+
+    /// O que nao foi medido escreve-se `—`, nunca `0`.
+    ///
+    /// Um pico ausente e um ajuste que se recusou a existir sao as duas coisas que um desenho
+    /// descuidado transforma em zeros -- e um zero aqui e uma afirmacao sobre uma janela que
+    /// ninguem mediu.
+    #[test]
+    fn what_was_not_measured_is_drawn_as_a_dash_and_never_as_a_zero() {
+        let drawn = render_pressure(&serde_json::json!({
+            "outcome": "measured",
+            "team": "NucleOS",
+            "job": "job-1",
+            "rounds": 1,
+            "items_measured": 1,
+            "items_without_run": 0,
+            "items_without_steps": 0,
+            "rollups": [{
+                "round": 1,
+                "agent_name": "Nucleo",
+                "items": 1,
+                "compacted_items": 0,
+                "peak_p50": serde_json::Value::Null,
+                "peak_p90": serde_json::Value::Null,
+                "steps_median": 3,
+                "fit": {"kind": "insufficient"},
+                "verdicts": [],
+            }],
+        }));
+
+        assert!(drawn.contains("job job-1"), "o job aparece: {drawn}");
+        let row = drawn.lines().last().expect("a linha do rollup");
+        assert!(row.contains("Nucleo"), "o agente aparece: {row}");
+        // Os dois picos, as tres colunas do ajuste que nao existe, e o veredicto que nao ha. As
+        // contagens que valem zero -- `comp`, `sem run` -- ficam a zero de proposito: essas foram
+        // medidas.
+        assert_eq!(
+            row.matches('—').count(),
+            6,
+            "cada celula por medir sai como travessao: {row}"
+        );
+    }
+
+    /// Um ajuste que existe desenha-se com o R2 ao lado.
+    ///
+    /// O R2 nao e decoracao: com uma variavel e tarefas heterogeneas isto e diagnostico
+    /// populacional, e um arranque sem ele le-se com uma confianca que nao tem.
+    #[test]
+    fn a_fit_that_exists_is_drawn_with_its_r2_beside_it() {
+        let drawn = render_pressure(&serde_json::json!({
+            "outcome": "measured",
+            "team": "NucleOS",
+            "job": "job-1",
+            "rounds": 1,
+            "items_measured": 3,
+            "items_without_run": 0,
+            "items_without_steps": 0,
+            "rollups": [{
+                "round": 1,
+                "agent_name": "Nucleo",
+                "items": 3,
+                "compacted_items": 1,
+                "peak_p50": 120_000,
+                "peak_p90": 180_000,
+                "steps_median": 4,
+                "fit": {"kind": "line", "intercept": 50_000.0, "slope": 1_400.0, "r2": 0.87},
+                "verdicts": ["split_speciality", "trim_prompt"],
+            }],
+        }));
+
+        assert!(drawn.contains("50000"), "o arranque: {drawn}");
+        assert!(drawn.contains("0.87"), "o R2: {drawn}");
+        assert!(
+            drawn.contains("split_speciality, trim_prompt"),
+            "os dois veredictos, e nao so o primeiro: {drawn}"
+        );
+    }
 }

@@ -233,6 +233,10 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::team::list_team_run_actions),
         )
         .route("/team-files/read", post(crate::team::post_read_file))
+        // `/team-pressure` e nao `/teams/pressure`: os irmaos que colhem sobre todas as equipas
+        // chamam-se `/team-runs`, `/team-files`, `/team-actions`, e sob `/teams/` o segmento
+        // estatico ficaria a sombrear o `/teams/{id}` para uma equipa que se chamasse `pressure`.
+        .route("/team-pressure", get(get_team_pressure))
         // Two callers, two methods, two scopes. A department POSTs what it would like done; only
         // the owner reads the queue of them. `auth::TEAM_ROUTES` lists the POST and not the GET, and
         // that pair is the whole of a department's authority to act.
@@ -2248,7 +2252,7 @@ fn sending_run_id_of(headers: &axum::http::HeaderMap) -> Option<i64> {
 /// * no row, or a row with no `chat_id` — `None`. The header named a run this daemon cannot
 ///   attribute to any conversation, so there is no `from_chat_id` to relay from.
 /// * a row whose `origin` is NULL — `Some((chat, None))`. The run exists and belongs to a
-///   conversation, but nothing recorded where its message came from. See 0118 for why that reads
+///   conversation, but nothing recorded where its message came from. See 0119 for why that reads
 ///   as "unknown" and never as "shell".
 ///
 /// `Origin::from_wire` is deliberately NOT used on the value read back, and this is the one reader
@@ -2347,7 +2351,7 @@ enum RelayAttempt {
     /// `UnknownSender` above, because the two are different failures wearing similar words: that
     /// one means the daemon cannot say WHICH conversation is asking, this one means it knows
     /// exactly which and cannot say where that conversation's message came from. Collapsing them
-    /// would send an operator looking for a bad run id when the answer is a row that predates 0118.
+    /// would send an operator looking for a bad run id when the answer is a row that predates 0119.
     ///
     /// Refused rather than defaulted, which is that migration's whole argument: a run whose origin
     /// nobody wrote down is not a run known to be safe, and `relay::admit`'s Telegram brake is
@@ -2397,7 +2401,7 @@ async fn relay_send_to_chat(
         //
         // `admit` is asked about the SENDER: where the message asking for this relay came from,
         // read off `runs.origin` above rather than asserted here. That read is what makes
-        // `relay::Refusal::TelegramOrigin` reachable at all — before 0118 the column did not exist,
+        // `relay::Refusal::TelegramOrigin` reachable at all — before 0119 the column did not exist,
         // this handler had nothing truer than `Origin::Shell` to pass, and the brake was live in
         // its own unit tests and dead everywhere else.
         //
@@ -2637,6 +2641,39 @@ async fn get_pii_observations(
             })
             .collect(),
     ))
+}
+
+#[derive(Deserialize)]
+struct PressureQuery {
+    /// A equipa, por nome. Resolve para o job mais recente dela.
+    team: Option<String>,
+    /// Ou um job em concreto, por `team_runs.id`. Ganha ao nome quando ambos vem.
+    job: Option<String>,
+}
+
+/// Quanta janela custou a cada agente da equipa, por round.
+///
+/// `protected` e nao publica: e telemetria da maquina de agentes, e nomeia agentes, rounds e
+/// quanto contexto cada um gastou.
+///
+/// Nenhum dos dois parametros por omissao. Adivinhar uma equipa daria uma resposta sobre a equipa
+/// errada, que e pior do que nenhuma -- e quem pergunta nao teria como notar.
+async fn get_team_pressure(
+    State(state): State<AppState>,
+    Query(query): Query<PressureQuery>,
+) -> Result<Json<crate::pressure::Report>, StatusCode> {
+    let scope = match (query.job, query.team) {
+        (Some(job), _) => crate::pressure::Scope::Job(job),
+        (None, Some(team)) => crate::pressure::Scope::Team(team),
+        (None, None) => return Err(StatusCode::BAD_REQUEST),
+    };
+    match crate::pressure::measure(&state.pool, scope).await {
+        Ok(report) => Ok(Json(report)),
+        // Errar o nome e nunca ter corrido sao coisas diferentes: esta e a primeira, e a outra sai
+        // daqui com 200 e `never_ran`.
+        Err(sqlx::Error::RowNotFound) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn get_autopilot_state(
@@ -10294,6 +10331,147 @@ mod tests {
         db.close().await;
     }
 
+    /// Seeds a team, and optionally a job of two items whose runs carry a peak each.
+    ///
+    /// Plain SQL rather than reaching into `pressure`'s own test helpers: those are private to that
+    /// module, and a route test that borrowed them would be testing the seeder as much as the route.
+    async fn seed_pressure_team(pool: &sqlx::SqlitePool, with_a_job: bool) {
+        for agent in ["director", "Nucleo"] {
+            sqlx::query(
+                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                     created_at, updated_at)
+                 VALUES (?, ?, 'a speciality', 'a prompt', 'claude', 'unrestricted',
+                         '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+            )
+            .bind(agent)
+            .bind(agent)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES ('nucleos', 'NucleOS', 'a mission', 'director', 3, 3,
+                     '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        if !with_a_job {
+            return;
+        }
+        sqlx::query(
+            "INSERT INTO team_runs (id, team_id, request, workspace, token, state,
+                                    created_at, updated_at)
+             VALUES ('job-1', 'nucleos', 'a request', 'a workspace', 'a token', 'running',
+                     '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (ordinal, peak) in [(1_i64, 100_000_i64), (2, 140_000)] {
+            let run_id: i64 = sqlx::query_scalar(
+                "INSERT INTO runs (prompt, status, mode, context_peak, tools_used, team_run_id,
+                                   created_at)
+                 VALUES ('an item', 'completed', 'worktree', ?, '[{\"name\":\"Bash\"}]', 'job-1',
+                         '2026-08-26T00:00:00Z')
+                 RETURNING id",
+            )
+            .bind(peak)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description,
+                                         state, run_id)
+                 VALUES ('job-1', ?, 1, 'Nucleo', 'do the thing', 'done', ?)",
+            )
+            .bind(ordinal)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    fn pressure_router(state: AppState) -> Router {
+        Router::new()
+            .route("/team-pressure", get(get_team_pressure))
+            .layer(Extension(Scope::Control))
+            .with_state(state)
+    }
+
+    async fn pressure_at(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn pressure_of_a_measured_team_comes_back_with_its_rollups() {
+        let state = test_state().await;
+        seed_pressure_team(&state.pool, true).await;
+
+        let (status, body) =
+            pressure_at(&pressure_router(state), "/team-pressure?team=NucleOS").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "measured");
+        assert_eq!(body["items_measured"], 2);
+        assert!(
+            !body["rollups"].as_array().unwrap().is_empty(),
+            "a measured team answers with the rollups, or the route is a wrapper around nothing"
+        );
+    }
+
+    /// The distinction the whole module exists to preserve, and the one a route can flatten.
+    ///
+    /// Not a 404, because the team is there. Not a table of zeros, because a green empty report
+    /// reads as approval and nothing was approved -- nothing happened.
+    #[tokio::test]
+    async fn a_team_that_never_ran_is_two_hundred_and_says_never_ran() {
+        let state = test_state().await;
+        seed_pressure_team(&state.pool, false).await;
+
+        let (status, body) =
+            pressure_at(&pressure_router(state), "/team-pressure?team=NucleOS").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "never_ran");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_team_is_a_not_found() {
+        let state = test_state().await;
+        seed_pressure_team(&state.pool, false).await;
+
+        // Getting the name wrong and never having run are different things, and only one of them
+        // is the asker's mistake.
+        let (status, _) = pressure_at(&pressure_router(state), "/team-pressure?team=Nowhere").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn asking_about_no_team_at_all_is_a_bad_request() {
+        let state = test_state().await;
+        seed_pressure_team(&state.pool, true).await;
+
+        // No guessing a team by default: an answer about the wrong team is worse than no answer.
+        let (status, _) = pressure_at(&pressure_router(state), "/team-pressure").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     async fn test_state() -> AppState {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -17230,7 +17408,7 @@ mod tests {
     /// `relay::Refusal::TelegramOrigin` had a unit test from the day it was written and no way to
     /// fire in production: this handler had no origin to hand `admit` and passed `Origin::Shell`,
     /// so every relay was certified as shell-sent whatever had actually asked for it. What closed
-    /// that is 0118 — the origin is on the `runs` row now — and what this test pins is the wiring
+    /// that is 0119 — the origin is on the `runs` row now — and what this test pins is the wiring
     /// between the two, which is the half a unit test on `admit` cannot reach.
     ///
     /// The sending conversation is an ordinary cloud chat; only the ORIGIN of its turn differs from
@@ -17293,7 +17471,7 @@ mod tests {
     /// A sending turn whose origin nobody recorded is refused, not assumed to be the permissive
     /// answer.
     ///
-    /// This is the case 0118 chose NULL for instead of `DEFAULT 'shell'`. Every run written before
+    /// This is the case 0119 chose NULL for instead of `DEFAULT 'shell'`. Every run written before
     /// that migration has no origin, and a default would have had them all come back claiming the
     /// shell — turning "nobody knows" into "certified safe" on precisely the rows nothing knows
     /// anything about. The row below is written by hand because there is no longer any code path

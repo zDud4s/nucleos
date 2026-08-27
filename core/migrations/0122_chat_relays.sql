@@ -36,8 +36,12 @@
 -- is a historical fact about a conversation that a later archival of that conversation must not be
 -- able to invalidate or cascade into deleting.
 --
--- **Cut as 0117, moved to 0121, and the move is the seventh time this repository has had two files
--- claim one version.** The header this replaces said, truthfully at the time, that 0116 was the
+-- **Cut as 0117, moved twice, and now 0122.** Two separate collisions rather than one told twice:
+-- the first took this file's own number, the second took a sibling's and carried this one up with
+-- it. Both are recorded, because the second is what turns the first from bad luck into a pattern.
+--
+-- **The first, at 0117 — the seventh time this repository has had two files claim one version.**
+-- The header this replaces said, truthfully at the time, that 0116 was the
 -- highest any branch had claimed. Six and a half hours later `feat/mapa-juncao` committed
 -- `0117_map_decisions.sql`, and this is the part every previous collision's header warned about and
 -- that no previous one caught in time: **`map decisions` is APPLIED, successfully, on the live
@@ -55,12 +59,23 @@
 -- different checksum and refuses to start the daemon. There is a backup in the data directory named
 -- `pre-117-rollback-2026-08-26` — somebody hit exactly this and undid it by hand.
 --
--- 0121 and not 0118, which was also free: 0118, 0119 and 0120 are this branch's own and already
--- written. Sliding all four down by one to close a hole would be rewriting three files to save one
--- number, and 0084's rule says the opposite anyway — a branch's files go to the TOP, and holes below
--- belong to whoever has not landed yet. Nothing here depends on running before them: 0118 adds a
--- column to `runs`, 0119 and 0120 build tables of their own, and none of the three touches
--- `chat_relays` or `runs.from_relay_id`.
+-- **The second, at 0118, and this file lost nothing of its own to it.** While this branch was being
+-- merged up to master, `feat/pressao-de-contexto` landed `0118_runs_context_peak.sql` against this
+-- branch's `0118_run_origin.sql`. Written first, and still the one that gives way, for the reason
+-- above: the other one is on master. Four files move together or the block grows a hole, so all
+-- four went up one and this became 0122 without anybody ever having claimed 0121.
+--
+-- What the pair of them says, plainly: a branch that stays unlanded is renumbered by every branch
+-- that lands ahead of it, and the bill is paid twice each time — once in the filenames and once in
+-- every comment that names a version. Twenty-two references across nine files, this round. The
+-- answer is not a cleverer numbering scheme. It is landing.
+--
+-- 0122 because 0119, 0120 and 0121 are this branch's own three, sitting directly above master's
+-- 0118 with nothing between them. The block is contiguous and leaves no hole for anybody else to
+-- fill, which is 0084's rule working rather than an accident: a branch's files go to the TOP, and
+-- they go together. Nothing here depends on running before them either — 0119 adds a column to
+-- `runs`, 0120 and 0121 build tables of their own, and none of the three touches `chat_relays` or
+-- `runs.from_relay_id`.
 CREATE TABLE chat_relays (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     from_chat_id        TEXT NOT NULL,

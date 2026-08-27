@@ -1367,7 +1367,7 @@ pub async fn send_relayed_or_queue(
 /// The shared body behind `send_message_with` and `send_relayed_message`.
 ///
 /// `relay_id` is written into the `INSERT INTO runs` below in the same statement that creates the
-/// row — never by an `UPDATE` once the id is known. That is the property 0121 exists for: an INSERT
+/// row — never by an `UPDATE` once the id is known. That is the property 0122 exists for: an INSERT
 /// followed by an UPDATE has a window in which a relay-born run sits with `from_relay_id IS NULL`,
 /// and `relay::chain_of` cannot tell that window apart from a turn a person actually wrote — it
 /// would stop its walk there and hand `relay::admits` a chain that reads as one hop shorter than it
@@ -1532,7 +1532,7 @@ async fn send_message_inner(
     //
     // `origin` alongside those, and written HERE rather than derived later, because there is
     // nowhere later to derive it from: it is what the client said when it sent this message, and
-    // this INSERT is the last moment anything holds that word. 0118 exists for one reader —
+    // this INSERT is the last moment anything holds that word. 0119 exists for one reader —
     // `relay::admit`, deciding whether the turn asking for a relay was a Telegram turn — and a
     // reader that has to guess is the failure that migration is fixing.
     let id = sqlx::query(
@@ -1556,7 +1556,7 @@ async fn send_message_inner(
     // After the INSERT and not inside it, because the run's id does not exist until the run does —
     // which is exactly why this pointer and `runs.from_relay_id` are not equally trusted. That one
     // is written in the same statement as the run and is what `relay::chain_of` walks; this one is
-    // a second write that can fail on its own, and 0121's header says plainly that nothing
+    // a second write that can fail on its own, and 0122's header says plainly that nothing
     // security-critical may read it.
     //
     // A warning and not a refusal, therefore. The turn is already under way; undoing it because an
@@ -1933,7 +1933,7 @@ async fn spawn_local_turn(
     // After the INSERT and not inside it, because the run's id does not exist until the run does —
     // which is exactly why this pointer and `runs.from_relay_id` are not equally trusted. That one
     // is written in the same statement as the run and is what `relay::chain_of` walks; this one is
-    // a second write that can fail on its own, and 0121's header says plainly that nothing
+    // a second write that can fail on its own, and 0122's header says plainly that nothing
     // security-critical may read it.
     //
     // A warning and not a refusal, therefore. The turn is already under way; undoing it because an
@@ -3823,7 +3823,7 @@ mod tests {
 
     /// A turn records which client sent it, on both paths that write a `runs` row.
     ///
-    /// Written down rather than only acted on, which is what 0118 changed. `Origin` was a parameter
+    /// Written down rather than only acted on, which is what 0119 changed. `Origin` was a parameter
     /// that routed a turn and was then dropped, so `runs` could say a great deal about a turn and
     /// nothing about where it came from — and `relay::admit`'s `TelegramOrigin` brake, whose whole
     /// job is to read exactly that, had no fact to read. It was reachable only by a caller willing
@@ -5549,7 +5549,7 @@ mod tests {
     /// The relay row learns which turn answered it — the mirror of `runs.from_relay_id`, written
     /// back from the other side.
     ///
-    /// 0121 declared this column and nothing ever wrote it, so `chat_relays` could say a relay had
+    /// 0122 declared this column and nothing ever wrote it, so `chat_relays` could say a relay had
     /// been admitted and never whether it landed. That is not a security gap — `chain_of` walks
     /// `runs.from_relay_id` and never this — but it is the whole of what the table was for from a
     /// person's point of view, and a column that is NULL on every row without exception is

@@ -28,11 +28,11 @@
 -- `assistant::get_session` reads to decide whether a session may still be resumed. A row that never
 -- ran would enter all three, and in the third it would silently rotate a conversation's context.
 --
--- Numbered 0120, above this branch's own 0119. The rule from `0084_runs_team_run_id.sql` stands and
+-- Numbered 0121, above this branch's own 0120. The rule from `0084_runs_team_run_id.sql` stands and
 -- is the reason to say so here: this branch's migrations move together and ALWAYS TO THE TOP when
--- they land, never into a hole master happens to have. See 0121's header for the collision that was
--- open at 0117 and how it was settled: what has already been APPLIED cannot move, whichever file was
--- written first.
+-- they land, never into a hole master happens to have. See 0122's header for the two collisions
+-- this branch has had — at 0117 and at 0118 — and how both were settled: what has already been
+-- APPLIED, or has landed on master, cannot move, whichever file was written first.
 
 -- Where this run reports, or NULL for the vast majority that report nowhere.
 --

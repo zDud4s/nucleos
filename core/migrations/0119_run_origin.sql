@@ -5,7 +5,8 @@
 -- it survives. Until now it lived for the length of one function call: `send_message` took it as a
 -- parameter, routed on it, and dropped it. Nothing downstream could ever ask again.
 --
--- 0121 (cut as 0117 — see its header) is what made that gap cost something. `relay::admit` refuses a relay sent by a Telegram
+-- 0122 (cut as 0117 — see its header) is what made that gap cost something. `relay::admit`
+-- refuses a relay sent by a Telegram
 -- turn, `relay::Refusal::TelegramOrigin` is the variant, and there was no way to reach it: the one
 -- production caller (`http::relay_send_to_chat`) had no truer answer than `Origin::Shell` to hand
 -- it, so the brake was written, tested, and unreachable — a security boundary that reads as live
@@ -23,4 +24,10 @@
 -- Only chat turns write it. A council seat, a shadow pass, an email triage — none of them was
 -- "sent by a client" at all, and inventing an origin for them would make this column mean two
 -- different things depending on `mode`.
+-- **Cut as 0118, moved to 0119**, because `feat/pressao-de-contexto` landed
+-- `0118_runs_context_peak.sql` while this branch was being merged up to master. This is the file
+-- that actually lost the number — its three siblings moved only so the block would stay contiguous
+-- above it. `0084_runs_team_run_id.sql`'s rule decides it as usual, and 0122's header carries the
+-- whole account of both collisions this branch has now had.
+
 ALTER TABLE runs ADD COLUMN origin TEXT;

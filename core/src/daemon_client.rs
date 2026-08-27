@@ -1259,7 +1259,7 @@ fn ticket_path(id: i64, wait: bool) -> String {
 /// Written out rather than pulled in: a folder name carrying `&`, `#` or `..` would otherwise
 /// arrive as a different request than the one intended — and `..` reaching the daemon's path guard
 /// as a *separate parameter* rather than part of the path is exactly how a check gets skipped.
-fn urlencoding_encode(value: &str) -> String {
+pub(crate) fn urlencoding_encode(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
