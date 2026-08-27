@@ -2650,6 +2650,41 @@ fn resume_instruction(proposal_id: i64, tool_name: &str, tool_input: Option<&str
     }
 }
 
+/// Where to resume a paused run that owns no worktree, read from what the run recorded about itself.
+///
+/// The shape is the one the worktree lookup returns — `(project_id, project_root, path)` — because
+/// everything downstream takes those three and does not care which of the two ways they were
+/// obtained. What differs is only the last: a worktree's `path` is a tree the daemon made, and this
+/// is the directory the caller named when the run was created.
+///
+/// Both halves must be present or this is not resumable: without a project there is no root to
+/// govern the resume, and without a `cwd` there is nowhere to launch it. That is the one case where
+/// the old sentence was right, so it is the one case that still says it.
+async fn recorded_tree_of(
+    state: &AppState,
+    run_id: i64,
+) -> Result<(String, String, String), ResumeError> {
+    let recorded: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT project_id, cwd FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(&state.pool)
+            .await?;
+
+    let (Some(project_id), Some(cwd)) = recorded.unwrap_or((None, None)) else {
+        return Err(ResumeError::NotResumable(
+            "the paused run owns no worktree and recorded no directory to resume in",
+        ));
+    };
+
+    let project_root = crate::inspect::project_root(&state.pool, &project_id)
+        .await?
+        .ok_or(ResumeError::NotResumable(
+            "the paused run's project has no recorded root to resume against",
+        ))?;
+
+    Ok((project_id, project_root, cwd))
+}
+
 pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
     let proposal = crate::proposals::get(&state.pool, proposal_id)
         .await?
@@ -2689,17 +2724,32 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         (None, None) => crate::worktree::Owner::Run(original_run_id),
     };
 
-    let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
+    let owned_tree = sqlx::query_as::<_, (String, String, String)>(
         "SELECT project_id, project_root, path
          FROM worktrees WHERE owner_kind = ? AND owner_id = ? AND removed_at IS NULL",
     )
     .bind(owner.kind())
     .bind(owner.id())
     .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ResumeError::NotResumable(
-        "no live worktree for the paused run",
-    ))?;
+    .await?;
+
+    // **A run that owns no worktree is not a run that cannot be resumed, and reading the two as one
+    // made a whole mode a dead end.** `mode = "real"` runs in a directory the caller named; there is
+    // no row in `worktrees` for it and there never was one to find. So this answered
+    // `NotResumable("no live worktree for the paused run")` for every paused `real` run, while the
+    // shell went on offering an Approve button — a person clicked it and got a conflict, with no
+    // other way forward than rejecting the very thing they were trying to allow.
+    //
+    // Measured 2026-08-27 on run 900376: it parked on its first command, one minute in, and could
+    // not be released by any means except refusing it.
+    //
+    // The directory the run recorded for itself is the same one it was working in, so resuming
+    // there continues exactly what was paused. `NotResumable` is still the answer when there is no
+    // directory to name — a run with neither a worktree nor a `cwd` genuinely has nowhere to go.
+    let (wt_project_id, project_root, wt_path) = match owned_tree {
+        Some(found) => found,
+        None => recorded_tree_of(state, original_run_id).await?,
+    };
 
     // Spec decision 2, arrived at the other way round: rather than letting the run perform the merge
     // once a human says yes, the yes IS the queueing. Resolved before the transaction opens, because
@@ -5701,6 +5751,104 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .await
             .unwrap();
         assert_eq!(count_after, count_before);
+    }
+
+    /// **A paused `real` run owns no worktree, and reading that as "cannot be resumed" made the
+    /// whole mode a dead end.**
+    ///
+    /// `mode = "real"` runs in a directory the caller named; nothing ever writes a `worktrees` row
+    /// for it. So the lookup that resolves where to resume answered `NotResumable` for every paused
+    /// `real` run, while the shell went on offering an Approve button that returned a conflict —
+    /// leaving refusal as the only way to release a run somebody was trying to allow.
+    ///
+    /// Measured on run 900376, which parked one minute in and could not be released any other way.
+    #[tokio::test]
+    async fn a_paused_run_without_a_worktree_resumes_in_the_directory_it_recorded() {
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', 'off', ?)",
+        )
+        .bind("C:/repos/proj")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // No `worktrees` row on purpose: that absence IS the case under test.
+        let result = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', 'C:/repos/proj', 'x', 'awaiting_approval', 'sess-real', 'real', ?)",
+        )
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let paused_run_id = result.last_insert_rowid();
+
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            paused_run_id,
+            Some("sess-real"),
+            Some("proj"),
+            "Bash",
+            "unrecognized shell commands and code execution require approval",
+            Some(r#"{"command":"pwd"}"#),
+        )
+        .await
+        .unwrap();
+
+        let resumed = resume_approved_run(&state, proposal_id).await;
+
+        assert!(
+            resumed.is_ok(),
+            "a paused run with a recorded cwd must be resumable: {resumed:?}"
+        );
+        let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
+            .bind(resumed.unwrap())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cwd.as_deref(),
+            Some("C:/repos/proj"),
+            "the resume must continue in the directory the paused run was working in"
+        );
+    }
+
+    /// The one case the old sentence was right about, kept: no worktree AND nothing recorded about
+    /// where the run was working is genuinely nowhere to resume.
+    #[tokio::test]
+    async fn a_paused_run_with_no_directory_at_all_is_still_not_resumable() {
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        let result = sqlx::query(
+            "INSERT INTO runs (prompt, status, session_id, mode, created_at)
+             VALUES ('x', 'awaiting_approval', 'sess-nowhere', 'real', ?)",
+        )
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let paused_run_id = result.last_insert_rowid();
+
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            paused_run_id,
+            Some("sess-nowhere"),
+            None,
+            "Bash",
+            "x",
+            Some(r#"{"command":"pwd"}"#),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            resume_approved_run(&state, proposal_id).await,
+            Err(ResumeError::NotResumable(_))
+        ));
     }
 
     #[tokio::test]
