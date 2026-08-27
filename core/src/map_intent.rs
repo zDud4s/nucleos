@@ -359,7 +359,15 @@ pub async fn extract(
 ) -> std::io::Result<Vec<Extracted>> {
     let answer = match asked {
         Extractor::Cli(runner) => {
-            ask_once(runner, extraction_prompt(spec_slug, source), "extraction").await?
+            // No standing instruction: this is shipped behaviour, and the one place a grammar
+            // would help it — `extraction_format` — the local arm already has.
+            ask_once(
+                runner,
+                extraction_prompt(spec_slug, source),
+                "extraction",
+                None,
+            )
+            .await?
         }
         Extractor::Loopback {
             client,
@@ -418,10 +426,20 @@ pub async fn extract(
 /// Safe because a clean run's code is the CLI process's own, which is 0 — every other arm of the
 /// runner's `match` is a named failure. `stderr` travels with it, because "the run failed" and "the
 /// run was stopped after 4 turns" are different things to find in a log.
+///
+/// **`standing` is the nearest thing this door has to a grammar, and that is the whole of why it
+/// is a parameter.** The other entrance to a model in this crate — `ollama_chat` — takes a JSON
+/// schema and gets back something shaped like one. The Claude Code CLI has no such flag, so a
+/// caller that needs an answer in a particular shape has exactly one lever: an instruction the CLI
+/// repeats on every turn. `None` keeps the run exactly as it was, which is what both of the callers
+/// that shipped before this parameter existed pass — a standing instruction is a change to what a
+/// model is told on every turn, and adding one to a shipped feature while wiring up a different
+/// one would be two changes reported as one.
 pub(crate) async fn ask_once(
     runner: &dyn crate::runner::CommandRunner,
     prompt: String,
     what: &str,
+    standing: Option<&str>,
 ) -> std::io::Result<String> {
     // Every field is spelled out because `RunRequest` deliberately has no `Default` — its own doc
     // comment says why: a flag added later must not silently inherit a value nobody chose. Copied
@@ -472,7 +490,9 @@ pub(crate) async fn ask_once(
         add_dirs: Vec::new(),
         max_budget_usd: None,
         agents: Vec::new(),
-        append_system_prompt: None,
+        // Appended and never substituted — see `RunRequest`'s own field. The caller's, because what
+        // shape an answer has to arrive in is a fact about the question and not about the run.
+        append_system_prompt: standing.map(str::to_owned),
         // Empty, and not a belt for the policy's braces: `ToolPolicy::None` already denies every
         // built-in, and naming some of them here would read as though the rest were allowed.
         denied_tools: Vec::new(),

@@ -472,7 +472,9 @@ pub async fn ask(
     let prompt = triage_prompt(evidence);
     match asked {
         crate::map_intent::Extractor::Cli(runner) => {
-            crate::map_intent::ask_once(runner, prompt, "triage").await
+            // No standing instruction, for the reason `map_intent::extract` gives beside its own
+            // `None`: this is shipped behaviour and nothing measured says it needs one.
+            crate::map_intent::ask_once(runner, prompt, "triage", None).await
         }
         crate::map_intent::Extractor::Loopback {
             client,

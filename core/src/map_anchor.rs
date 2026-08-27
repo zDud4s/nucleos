@@ -633,18 +633,43 @@ pub fn anchor_prompt(question: &Question, specs: &[Spec]) -> String {
 /// refuse, arriving well-formed and indistinguishable from a real proposal. A grammar admitting a
 /// third kind of value which [`parse_proposal`] then refuses is what keeps the failure visible.
 ///
-/// Which is also why there is no `minLength` on `why`. Forcing a sentence out of a model that had
-/// nothing to say produces a filled field and an empty thought.
+/// **`minLength` on `spec`, and deliberately none on `why`.** An empty document is not a third
+/// kind of answer — it is *I do not know* spelled as absence, and [`parse_proposal`] reads it as
+/// the abstention it is. The floor here is the other half of that same correction: the local arm is
+/// stopped from emitting the shape at all, the parse is stopped from misreading it, and the two
+/// halves cannot drift into disagreeing about what an empty string meant. It is **not** a way of
+/// forcing a slug out of a model that has none — `none` is a four-character answer that satisfies
+/// this floor, and the prompt spends a paragraph saying so.
+///
+/// `why` keeps no floor for the opposite reason: forcing a sentence out of a model that had nothing
+/// to say produces a filled field and an empty thought.
 fn anchor_format() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "spec": {"type": "string"},
+            "spec": {"type": "string", "minLength": 1},
             "why": {"type": "string"}
         },
         "required": ["spec", "why"]
     })
 }
+
+/// The standing instruction the cloud arm carries, because it is the only grammar that arm has.
+///
+/// **Not a second copy of the prompt's last paragraph, and where each one lands is the
+/// difference.** The prompt is one turn's text; this is `--append-system-prompt`, which the CLI
+/// repeats on every turn of the run, and it is the nearest thing the Claude Code CLI offers to the
+/// JSON schema [`anchor_format`] hands the local arm. See [`ask`] for the measurement that put it
+/// here: over ninety questions put to the cloud arm without it, **six answers carried no readable
+/// proposal at all** — three with no JSON object anywhere in them, three with the document left
+/// empty — while the local arm's grammar makes the first shape impossible to emit and now refuses
+/// the second.
+///
+/// **It restates `none` as well as the shape, and that is not padding.** An instruction demanding
+/// only a well-formed field makes a model that wanted to abstain reach for the nearest slug in
+/// order to fill it — the guess this entire module is arranged to refuse, arriving because the
+/// thing meant to make answers readable made the readable answer a slug.
+const ANCHOR_OUTPUT_CONTRACT: &str = "Answer with exactly one JSON object and nothing else: no      preamble, no code fence, no explanation around it. It has exactly two string fields, `spec`      and `why`. `spec` is either a document slug copied EXACTLY from the list you were given, or      the word `none` — never an empty string, never a sentence, never a slug you abbreviated.      `none` is a complete and equal answer, and if you cannot tell then `none` is the answer.";
 
 /// Ask one brain about one file, and hand back exactly what it said.
 ///
@@ -663,6 +688,26 @@ fn anchor_format() -> serde_json::Value {
 /// ceiling on this prompt is inside it by construction — see [`CITATION_RADIUS`] for the
 /// arithmetic. Unlike the extraction next door, this does not ask for four times the probed size,
 /// because unlike a 60 000-byte document it does not need it.
+///
+/// ## The two arms do not get the same guarantees, and this comment used to imply they did
+///
+/// **Corrected 2026-08-27, and the correction is the kind of thing this whole feature exists to
+/// find.** The local arm asks for `temperature: 0` and hands over [`anchor_format`] as a grammar.
+/// The Claude Code CLI has a flag for neither, so **the cloud arm samples and is constrained by
+/// words alone.** The sentence that sat on that zero — *"a sampled one would make two runs over an
+/// unchanged repository disagree about which files were safe to annotate"* — read as though it
+/// covered both arms, and it turned out to be an exact prediction of what happens on the arm it did
+/// not cover: three runs of the ground-truth gate against one unchanged checkout scored **22, 26
+/// and 21 out of 30**, agreed on only sixteen files, and twice put `Triagem.tsx` under a document
+/// that is not its own. **The product's default brain is the cloud one** (`claude-sonnet-5`), so
+/// that is the arm the property was most needed on and least true of.
+///
+/// What the cloud arm gets instead is [`ANCHOR_OUTPUT_CONTRACT`] — a standing instruction, not a
+/// grammar. It can address the shape of an answer and cannot address the sampling behind it, so
+/// **a run through this arm is a sample and not a measurement**: a hit rate taken from it has to
+/// say how many runs it took, and anything applying its proposals has to accept that a second run
+/// would propose a different set. Nothing here pretends otherwise, and no wording of this string
+/// will change it.
 pub async fn ask(
     asked: crate::map_intent::Extractor<'_>,
     question: &Question,
@@ -671,7 +716,8 @@ pub async fn ask(
     let prompt = anchor_prompt(question, specs);
     match asked {
         crate::map_intent::Extractor::Cli(runner) => {
-            crate::map_intent::ask_once(runner, prompt, "anchor").await
+            crate::map_intent::ask_once(runner, prompt, "anchor", Some(ANCHOR_OUTPUT_CONTRACT))
+                .await
         }
         crate::map_intent::Extractor::Loopback {
             client,
@@ -683,9 +729,11 @@ pub async fn ask(
                 base_url,
                 model,
                 &prompt,
-                // Zero, because the question has one right answer about one file, and a sampled one
-                // would make two runs over an unchanged repository disagree about which files were
-                // safe to annotate.
+                // Zero, because the question has one right answer about one file, and a sampled
+                // one makes two runs over an unchanged repository disagree about which files were
+                // safe to annotate. **This governs THIS arm only** — see the heading in this
+                // function's doc for what the other arm does instead, and for the three runs that
+                // measured the difference rather than assuming it away.
                 serde_json::json!({
                     "num_ctx": crate::triage::LOCAL_NUM_CTX,
                     "temperature": 0
@@ -738,6 +786,18 @@ pub enum Unreadable {
     /// The `spec` field held something that is neither a slug nor `none`, quoted so the log can say
     /// what it actually was.
     ///
+    /// **A field HOLDING an empty string is no longer one of these**, and that correction is
+    /// measured: over ninety questions put to the cloud arm, two of the six answers nobody could
+    /// read were a model spelling *I do not know* as `""`. Filed here they read as *the runner is
+    /// broken* and sent somebody to debug a runner that had worked perfectly — so
+    /// [`parse_proposal`] reads an empty document as the abstention it is.
+    ///
+    /// **A field that is ABSENT still is one**, carrying an empty string, and that is not the same
+    /// state wearing the same shape. `RawProposal::spec` is an `Option` precisely so *the key was
+    /// not there* survives as its own fact; an answer that never mentioned the document is an
+    /// answer to some other question, and reading it as *the model declined* would credit a
+    /// judgement nobody made.
+    ///
     /// Bounded when it is built rather than when it is printed, `map_triage::Unreadable`'s rule: a
     /// model can put a page in a field that was asked for one word, and clipping in `Display` alone
     /// leaves the whole page reachable through `Debug`, which is the formatter a `warn!` reaches for
@@ -749,9 +809,12 @@ impl std::fmt::Display for Unreadable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAnAnswer => write!(formatter, "the answer carried no JSON object at all"),
+            // Now built for ONE reason only: the `spec` key was absent or `null`, so nothing was
+            // answered. A key present and holding `""` no longer arrives here at all — that is a
+            // model saying it cannot tell, and [`parse_proposal`] reads it as the abstention it is.
             Self::NotASlug(said) if said.is_empty() => write!(
                 formatter,
-                "the document was left empty, which is neither a slug nor `none`"
+                "the answer carried no document field at all, so nothing was proposed"
             ),
             Self::NotASlug(said) => write!(
                 formatter,
@@ -805,9 +868,23 @@ pub fn parse_proposal(answer: &str) -> Result<Proposal, Unreadable> {
     let why = raw.why.unwrap_or_default();
     let why = crate::map_triage::clipped(why.trim(), MAX_WHY_BYTES);
 
-    let said = raw.spec.unwrap_or_default();
+    // **A field that is not there is not a field holding nothing**, and the two lines below are
+    // where that distinction is made. An absent or `null` `spec` means the answer did not contain
+    // the one thing it was asked for — a fact about the prompt or the runner — and it keeps the
+    // rejection it always had.
+    let Some(said) = raw.spec else {
+        return Err(Unreadable::NotASlug(String::new()));
+    };
     let said = said.trim();
-    if said.eq_ignore_ascii_case("none") {
+    // **A field holding an empty string IS an abstention**, and which half of the system somebody
+    // is then sent to debug is the whole of why. `""` is *I do not know* spelled as absence: the
+    // model answered, the answer parsed, and what it said was that it could not tell. Counted as
+    // [`Unreadable`] it reads as *nobody could read this*, which points at the runner — and
+    // measured over ninety questions to the cloud arm, two of six unreadables were exactly this, so
+    // a third of that pile pointed at a runner that had worked perfectly. `none` and `""` are one
+    // answer in two spellings, and the paragraph the prompt spends making abstention easy to say
+    // buys nothing if the parse then refuses one of the ways of saying it.
+    if said.is_empty() || said.eq_ignore_ascii_case("none") {
         return Ok(Proposal { spec: None, why });
     }
     if !slug_shaped(said) {
@@ -1410,11 +1487,16 @@ mod tests {
         // shape a `.unwrap_or(&specs[0])` takes, which is written by accident more often than on
         // purpose — would put a file under whichever document sorts earliest and then present it as
         // confirmed.
+        // `{"spec":""}` used to be on this list and is deliberately gone: a key present and
+        // holding nothing is a model saying it cannot tell, which
+        // `an_empty_document_is_the_abstention_it_is_and_not_an_answer_nobody_could_read` now pins
+        // as an abstention. The key being ABSENT stays here, because those are two states and only
+        // one of them is a judgement.
         for said in [
             "{\"spec\":\"I think it is the map document\",\"why\":\"\"}",
             "{\"spec\":\"mapa\",\"why\":\"a single word is an English word until proven otherwise\"}",
-            "{\"spec\":\"\",\"why\":\"\"}",
             "{\"why\":\"the field is not there at all\"}",
+            "{\"spec\":null,\"why\":\"an explicit null is the same silence\"}",
             "I could not tell which document this is.",
         ] {
             assert!(
@@ -1846,6 +1928,76 @@ mod tests {
             "a sentence forced out of a model that had nothing to say is a filled field and an \
              empty thought"
         );
+        // And `spec` DOES carry a floor, which is the other half of that same argument rather than
+        // a contradiction of it: `none` satisfies it in four characters, so nothing here forces a
+        // slug out of a model that has none. What it stops is the empty string, which is not a
+        // third answer but an abstention nobody could read as one.
+        assert_eq!(format["properties"]["spec"]["minLength"], 1);
+    }
+
+    #[test]
+    fn an_empty_document_is_the_abstention_it_is_and_not_an_answer_nobody_could_read() {
+        // Measured over ninety cloud questions: two of the six answers nobody could read were a
+        // model spelling *I do not know* as `""`. Counted as `Unreadable` they read as *the runner
+        // is broken*, and send somebody to debug a runner that had worked perfectly — a third of
+        // that pile pointing at the wrong half of the system.
+        assert_eq!(
+            parse_proposal("{\"spec\":\"\",\"why\":\"two documents fit equally\"}"),
+            Ok(Proposal {
+                spec: None,
+                why: "two documents fit equally".to_owned(),
+            })
+        );
+
+        let file = asked("core/src/x.rs", "// §1 alone.\n");
+        let verdict = adjudicate(
+            &file,
+            parse_proposal("{\"spec\":\"\",\"why\":\"cannot tell\"}"),
+            &specs(),
+        );
+        assert_eq!(verdict.outcome, Outcome::Abstained);
+        assert_ne!(verdict.outcome, Outcome::Unreadable);
+        assert!(
+            !verdict.why.starts_with(crate::map_triage::DAEMON_MARK),
+            "the model said this, so it must not be marked as a sentence a parser wrote"
+        );
+
+        // And the boundary, which is the half that keeps this from becoming a silent fallback: a
+        // key that is NOT THERE is not a key holding nothing. `RawProposal::spec` is an `Option` so
+        // that *the answer never mentioned the document* survives as its own fact, and reading that
+        // as an abstention would credit a judgement nobody made.
+        assert_eq!(
+            parse_proposal("{\"why\":\"no document field at all\"}"),
+            Err(Unreadable::NotASlug(String::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cloud_arm_carries_the_only_grammar_that_runner_has() {
+        // The correction `ask` now argues at length. The local arm gets `anchor_format()` and
+        // `temperature: 0`; the Claude Code CLI has a flag for neither, so the one lever left on
+        // that arm is a standing instruction — and it was not being pulled, while the comment
+        // beside it claimed the property for both arms. Asserted on what the runner was HANDED,
+        // which is the only place it can be observed from in here.
+        let runner = fake_answering("{\"spec\":\"none\",\"why\":\"cannot tell\"}");
+        let file = asked("core/src/x.rs", "// §1 alone.\n");
+
+        let _ = ask(crate::map_intent::Extractor::Cli(&runner), &file, &specs())
+            .await
+            .expect("the fake answers");
+
+        let standing = runner
+            .last_append_system_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a run was made");
+        assert_eq!(standing.as_deref(), Some(ANCHOR_OUTPUT_CONTRACT));
+        // It has to keep saying that abstention is free. An instruction demanding only a
+        // well-formed field makes a model that wanted to abstain reach for the nearest slug in
+        // order to fill it — the guess this module refuses, arriving because the thing meant to
+        // make answers readable made the readable answer a slug.
+        assert!(ANCHOR_OUTPUT_CONTRACT.contains("`none` is a complete and equal answer"));
     }
 
     #[test]
@@ -2055,7 +2207,7 @@ mod tests {
     // The harness: this module's caller, and the ground truth it is judged against.
     // -----------------------------------------------------------------------------------------
 
-    /// The thirty file/document pairs whose right answer was written down **before any model ran**.
+    /// The file/document pairs whose right answer was written down **before any model ran**.
     ///
     /// **This table is the whole safety argument of the slice, and its value comes entirely from
     /// when it was written.** With the veto withdrawn there is no mechanical check on whether a
@@ -2066,16 +2218,26 @@ mod tests {
     /// guessed: `voice.rs` has two candidate voice documents and `team.rs` has two team documents,
     /// so neither is here.
     ///
-    /// **All thirty are the denominator, and not the twenty-one that pass the withdrawn veto.** The
+    /// **All of them are the denominator, and not the nineteen that pass the withdrawn veto.** The
     /// last nine — from `map_join.rs` down — are the pairs arithmetic refused, and they are the
     /// more interesting half: a file a veto refused is still a file whose right answer is known,
     /// and it is precisely where the gate cost real answers.
     ///
-    /// **30/30 applies and anything less stops**, because a wrong answer here is worth roughly
+    /// **28/28 applies and anything less stops**, because a wrong answer here is worth roughly
     /// seven wrong files across the two hundred that cite anything, and a wrong slug manufactures a
     /// false [`crate::map_join::Anchor::Declared`] — the one state this map may present as
     /// confirmed. Whoever loosens that has removed the only thing standing between this module and
     /// §1's failure.
+    ///
+    /// **Twenty-eight and not the thirty this table shipped with, corrected 2026-08-27.** Two of
+    /// the thirty — `contacts.rs` and `council.rs` — contain **no `§` at all**, so [`question`]
+    /// refuses them, no header on them would govern anything, and no run could ever have scored
+    /// them. An acceptance rule of *30/30* was therefore unsatisfiable as written, and three runs
+    /// spent money discovering it. The table's own method claimed each pair had been checked
+    /// "against every `§N` the file cites", which cannot have happened for a file that cites none —
+    /// so what went wrong was a described check that was not performed, and
+    /// [`the_ground_truth_names_only_pairs_this_project_can_be_asked_about`] is that check, made
+    /// executable, for free, before any money is spent.
     const GROUND_TRUTH: &[(&str, &str)] = &[
         ("core/src/email.rs", "2026-07-28-email-pillar-design"),
         ("core/src/browser.rs", "2026-08-15-pilar-de-browser-design"),
@@ -2093,11 +2255,6 @@ mod tests {
         ("core/src/git_exec.rs", "2026-08-02-fila-vcs-design"),
         ("core/src/github.rs", "2026-08-19-modulo-de-github-design"),
         ("core/src/job.rs", "2026-07-29-autopilot-job-graph-design"),
-        (
-            "core/src/contacts.rs",
-            "2026-07-29-correspondent-contacts-design",
-        ),
-        ("core/src/council.rs", "2026-08-11-council-design"),
         (
             "core/src/errands.rs",
             "2026-08-15-assuntos-fora-de-codigo-design",
@@ -2164,24 +2321,34 @@ mod tests {
     ];
 
     #[test]
-    fn the_ground_truth_names_thirty_pairs_and_no_document_this_project_lacks() {
-        // Runs in the ordinary suite, unlike the two harness tests below, because it is the half of
-        // the ground truth that costs nothing to check. A pair naming a document this project does
-        // not have would score every run against a slug no model could ever answer, and would read
-        // as the model being wrong about a file the TABLE is wrong about — which is the one way a
-        // ground truth can quietly stop being one.
-        assert_eq!(GROUND_TRUTH.len(), 30);
+    fn the_ground_truth_names_only_pairs_this_project_can_be_asked_about() {
+        // Runs in the ordinary suite, unlike the three harness runs below, because it is the half of
+        // the ground truth that costs nothing to check — and every part of it has already been
+        // wrong once.
+        //
+        // Three properties, and the third is the one that was missing. A pair naming a document
+        // this project does not have would score every run against a slug no model could answer. A
+        // pair naming a file this checkout does not have would do the same. And a pair naming a
+        // file with nothing to inherit is a pair NO run can ever score: `question` refuses it before
+        // any model is asked, so it reads on the report as *the model got this wrong* about a file
+        // the model was never shown. Two such pairs shipped in this table, and three paid runs of
+        // the gate above are what found them. This costs nothing and finds them at the next
+        // `cargo test`.
+        assert_eq!(GROUND_TRUTH.len(), 28);
 
         let root = repository_root();
-        let slugs: BTreeSet<String> = catalogue(&root).into_iter().map(|spec| spec.slug).collect();
+        let specs = catalogue(&root);
+        let slugs: BTreeSet<&str> = specs.iter().map(|spec| spec.slug.as_str()).collect();
         for (file, slug) in GROUND_TRUTH {
             assert!(
-                root.join(file).is_file(),
-                "the ground truth names {file}, which is not in this checkout"
-            );
-            assert!(
-                slugs.contains(*slug),
+                slugs.contains(slug),
                 "the ground truth scores {file} against {slug}, which this project does not have"
+            );
+            let source = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|_| panic!("the ground truth names {file}, not in this checkout"));
+            assert!(
+                question(file, &source, &specs).is_ok(),
+                "the ground truth names {file}, which no run can score: it has nothing that would                  inherit a declaration, so it is never put to a model at all"
             );
         }
     }
@@ -2338,13 +2505,15 @@ mod tests {
         )
     }
 
-    /// Score the thirty pairs whose answer was known before any model ran.
+    /// Score the pairs whose answer was known before any model ran.
     ///
     /// **This is the gate, and it is a separate run from the sweep rather than a step inside it.**
     /// `#[ignore]` for `runner`'s reason — it needs the Claude Code CLI installed, an authenticated
     /// session, and about a dollar of somebody's money — and it is a measurement rather than a
-    /// property, so it asserts the one thing the slice turns on: thirty out of thirty, or nobody
-    /// applies anything.
+    /// property, so it asserts the one thing the slice turns on: every pair right, or nobody
+    /// applies anything. [`GROUND_TRUTH`] is the denominator and this reads its length rather than
+    /// naming a number, because a table that shrinks while an acceptance rule does not is exactly
+    /// how *30/30* came to be unsatisfiable.
     ///
     /// It prints every miss with the model's own sentence before it asserts, because **which file
     /// it got wrong matters far more than how many**: a miss on `browser_policy.rs` is a model
@@ -2410,8 +2579,8 @@ mod tests {
         assert_eq!(
             hits,
             GROUND_TRUTH.len(),
-            "anything short of thirty stops the sweep and reports the misses BY NAME — the lines \
-             above are that report"
+            "anything short of the whole table stops the sweep and reports the misses BY NAME — \
+             the lines above are that report"
         );
     }
 
