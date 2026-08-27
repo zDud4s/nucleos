@@ -287,6 +287,20 @@ struct ProposeActionParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ReportParams {
+    /// What to tell the owner, in your own words. It travels verbatim.
+    body: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct TeamNoteParams {
+    /// Which colleague, by the id on the left of their line in your department's roster.
+    to: String,
+    /// What to tell them, in your own words. It travels verbatim.
+    body: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ProposeTeammateParams {
     /// What to call them, e.g. `Contracts lawyer`.
     name: String,
@@ -340,6 +354,17 @@ struct ProjectGrepParams {
 struct ProjectIdParams {
     /// Which project. Call list_projects if you do not know it.
     project_id: String,
+}
+
+/// What the model chooses, and nothing more — see `send_to_chat`'s own doc for what it does not.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SendToChatParams {
+    /// The OTHER conversation to hand this message to. Never this one — asking for the
+    /// conversation you are already in is refused, not a way to talk to yourself.
+    chat_id: String,
+    /// What to say. Arrives at that conversation as its next turn, exactly as written here — it is
+    /// not shown to the person on this end first.
+    text: String,
 }
 
 #[tool_router]
@@ -701,6 +726,44 @@ impl NucleosTools {
     }
 
     #[tool(
+        description = "Say something to the owner, now, in the conversation this department was \
+                       pointed at when it was started. Use it for what will not keep until the \
+                       delivery: a source that turned out to be dead, work that is already done \
+                       somewhere else, a request that cannot mean what it appears to mean. It is \
+                       SHOWN and not answered — no turn starts, nobody replies, and you must not \
+                       wait for anything. You cannot choose where it goes; there is one \
+                       conversation or there is none, and if this department was not pointed at one \
+                       you will be told so and should put it in your delivery instead. Only a \
+                       director may call this: a department speaks to its owner with one voice."
+    )]
+    async fn report_to_owner(
+        &self,
+        Parameters(ReportParams { body }): Parameters<ReportParams>,
+    ) -> String {
+        json_result(self.client.report_to_owner(&body).await)
+    }
+
+    #[tool(
+        description = "Leave a message for a colleague in your department. It does NOT interrupt \
+                       them and you will get no reply in this turn: they are a separate run, and \
+                       most of the time they are not running at all. The words wait, and are put at \
+                       the top of their brief the next time the department starts them — which may \
+                       be later in this round, or the next one, or never, if the director does not \
+                       give them work again. So write it as something they can act on without you, \
+                       carry on with your own task, and say in your own answer whatever the \
+                       department needs to know regardless. Address them by the id on the left of \
+                       their line in the roster you were given; the director is on it too, and \
+                       telling the director what you found is usually worth more than telling a \
+                       specialist, because the director is who decides what the next round does."
+    )]
+    async fn send_team_note(
+        &self,
+        Parameters(TeamNoteParams { to, body }): Parameters<TeamNoteParams>,
+    ) -> String {
+        json_result(self.client.send_team_note(&to, &body).await)
+    }
+
+    #[tool(
         description = "Ask the owner for a specialist this department does not have. Only a \
                        director may call this. It does NOT hire anybody and it does NOT change \
                        this run: the person you describe joins the catalogue only if the owner \
@@ -734,6 +797,23 @@ impl NucleosTools {
                 }))
                 .await,
         )
+    }
+
+    #[tool(
+        description = "Hand a message to a DIFFERENT NucleOS conversation — not the one you are \
+                       answering in now. It will read the message as its own next turn, once it \
+                       has a turn free, exactly as you wrote it. Use this to bring another \
+                       conversation into something you are doing; do not use it to answer the \
+                       person you are already talking to, which is your ordinary reply. Refused \
+                       if the conversation named does not exist (or is archived), if handing it on \
+                       would create or close a loop between conversations, or if nobody is at the \
+                       machine right now to see it arrive."
+    )]
+    async fn send_to_chat(
+        &self,
+        Parameters(SendToChatParams { chat_id, text }): Parameters<SendToChatParams>,
+    ) -> String {
+        json_result(self.client.send_to_chat(&chat_id, &text).await)
     }
 
     #[tool(
@@ -1643,12 +1723,23 @@ pub const COUNCIL_TOOLS: &[&str] = &[
 /// because a department is not convened to answer about the machine, and `list_projects` and
 /// `list_proposals` with them: those are the state of the house, a council's subject and not a
 /// marketing department's.
-/// The seventh entry is the alçada, and it is the only `Acts` a department will ever hold.
+/// The seventh and eighth entries are the alçada, and they are the only `Acts` a department will
+/// ever hold. (Seventh AND eighth: this paragraph said "the seventh entry" and named one for as long
+/// as there was one, and `propose_teammate` arrived beside it without the sentence moving.)
 /// `propose_action` performs nothing — it records an intention the core carries out later, if a
 /// human agrees — which is what lets one name cover every action a department may ever be granted
 /// instead of one name per action. It is graded `Acts` all the same, and that grading is the
 /// point: a specialist that has read a web page or a colleague's file loses it for the rest of the
 /// turn, which is exactly the door that must close.
+/// `send_team_note` is the ninth, and it is the one entry here that is neither a read nor an ask.
+/// It writes into the department's own state — a row that another node of the SAME run will be
+/// handed — which is what makes it `WritesOwn` and not `Acts`. That grading is load-bearing rather
+/// than cosmetic: six of the eight names beside it are `ReadsUntrusted`, so as an action it would be
+/// shut by the caller's own first `web_read`, and a researching specialist would lose the ability to
+/// tell a colleague the one thing it was convened to find out. `errand_files_write` made this exact
+/// trade for this exact reason. What pays for it is at the other end — reading a note taints the
+/// receiving node, so the stranger's words travel WITH the message instead of being refused at the
+/// source, and the blast radius stays inside this list.
 pub const TEAM_TOOLS: &[&str] = &[
     "get_email",
     "get_email_queue",
@@ -1660,6 +1751,8 @@ pub const TEAM_TOOLS: &[&str] = &[
     // act on — which is better than hiding the tool from a list the two nodes share.
     "propose_teammate",
     "read_team_file",
+    "report_to_owner",
+    "send_team_note",
     "web_read",
     "web_search",
 ];
@@ -1892,6 +1985,56 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // a file the core wrote out the other, and authority to act on the day that authority exists.
     ("read_team_file", ToolEffect::ReadsUntrusted),
     ("reject_proposal", ToolEffect::Acts),
+    // `Acts`, and this one is the barrier itself rather than a label on it. Every other tool on
+    // this table is classified so that `permitted_after_untrusted` can decide whether to let it
+    // run; this is the tool `relay.rs`'s header calls "a conversation acting on another's behalf"
+    // — a stranger's words could otherwise be relayed into a DIFFERENT conversation, past every
+    // taint check that conversation's own turn will ever see, because to it the relayed message
+    // simply arrives as its next turn with no mark saying where it came from. `ReadsOwn` would
+    // reduce that to a filing detail; `Acts` is what makes `permitted_after_untrusted` refuse it
+    // for the rest of any turn that has read mail, a web page, or a teammate's answer — closing
+    // the laundering path on both the CLI and the local dispatcher, since both consult this same
+    // table. `send_to_chat` never reaching `LOCAL_TOOLS` or `TEAM_TOOLS` narrows WHO can call it;
+    // this line is what makes calling it safe for the callers who can.
+    // `WritesOwn`, and the argument for it is not the one `send_team_note` makes below — this one
+    // does reach outside the department, to a PERSON, which is exactly where `send_to_chat` earns
+    // its `Acts`.
+    //
+    // What separates them is that a department ALREADY speaks to its owner, without any barrier at
+    // all: the delivery is a document the owner opens and reads, written by a director that has been
+    // reading the folder, the web and its colleagues' answers all along. Grading this `Acts` would
+    // put a lock on a side door standing beside an open main one — and it would bite constantly
+    // rather than rarely, because the delivery node is told in its own prompt to read files with
+    // `read_team_file`, which taints it. The tool would be offered to a director and refused to it
+    // in the same breath, on nearly every run.
+    //
+    // What actually protects the owner here is not a grading but ATTRIBUTION: the words are drawn
+    // quoted, named, and marked as a department's, never as the conversation's own. A person weighing
+    // a message they can see the source of is the mechanism; a taint flag on a channel whose audience
+    // is human would be theatre.
+    //
+    // The audience is the whole of it. Nothing runs, nothing is spent, and no model reads this — a
+    // notice is deliberately absent from `recent_exchanges` and from the CLI's resumed session, so
+    // there is no context for a stranger's words to be laundered INTO. That is what makes this a
+    // report rather than a relay, and it is why `send_to_chat` one line down keeps its `Acts`.
+    ("report_to_owner", ToolEffect::WritesOwn),
+    // `WritesOwn` and NOT `Acts`, and the line below it is the reason the two differ. Both put words
+    // in front of a model that did not write them; what separates them is what that model can then
+    // do. `send_to_chat` lands in a conversation a PERSON reads, whose next turn holds the whole
+    // surface of this machine — so laundering into it is an escalation, and it is barred at the
+    // source. A team note lands on another node of the same department, holding the same eight
+    // narrow tools, whose only power is to ask. The blast radius is bounded by `TEAM_TOOLS` itself.
+    //
+    // And the cost of getting this wrong is not symmetric. `Acts` here would be shut by the caller's
+    // own first `web_read` — six of the eight tools a department holds are `ReadsUntrusted` — so the
+    // tool would fire only for a specialist that read nothing, which is nearly never. That is
+    // exactly the argument `errand_files_write` records for its own grading.
+    //
+    // What pays for it sits at the receiving end rather than here: a node handed a note is born
+    // marked `read_untrusted` (`team::launch_specialist`), so the taint travels WITH the words. The
+    // barrier is not skipped, it is moved one hop.
+    ("send_team_note", ToolEffect::WritesOwn),
+    ("send_to_chat", ToolEffect::Acts),
     ("set_kill", ToolEffect::Acts),
     // The two shadow reads. `ReadsOwn`, on the argument the project reads above set out, and the
     // honest half of that argument applies here too. A scoreboard row is the daemon's own tally of
@@ -2144,6 +2287,19 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "propose_teammate" => {
                 self.tools
                     .propose_teammate(Parameters(parsed!(ProposeTeammateParams)))
+                    .await
+            }
+            "report_to_owner" => {
+                self.tools
+                    .report_to_owner(Parameters(parsed!(ReportParams)))
+                    .await
+            }
+            // No `spend_is_permitted` guard, for `propose_action`'s reason: leaving words for a
+            // colleague starts no model and costs nothing. What governs it is the per-run ceiling,
+            // read by the daemon on the other side of this call.
+            "send_team_note" => {
+                self.tools
+                    .send_team_note(Parameters(parsed!(TeamNoteParams)))
                     .await
             }
             "web_search" => {
@@ -2935,6 +3091,14 @@ mod tests {
                 "propose_teammate",
                 "read_team_file",
                 "reject_proposal",
+                "report_to_owner",
+                // The pair a reader will want to tell apart, and they are next to each other by
+                // accident of the alphabet rather than by kinship. `send_team_note` is
+                // `WritesOwn` and reaches another node of the caller's own department;
+                // `send_to_chat` is `Acts` and reaches a conversation a person reads. The names
+                // are one letter apart and the gradings are not — see `TOOL_EFFECTS`.
+                "send_team_note",
+                "send_to_chat",
                 "set_kill",
                 "shadow_queue",
                 "shadow_scoreboard",
@@ -3330,6 +3494,44 @@ mod tests {
             registered, classified,
             "every tool this server exposes must be classified, and nothing else"
         );
+    }
+
+    /// `send_to_chat` is `Acts` — pinned on its own, not folded into
+    /// `the_mail_tools_are_what_brings_third_party_text_into_a_turn`'s table, because this one
+    /// assertion would still pass today even if the classification below it were deleted:
+    /// `tool_effect` answers `Acts` for a name it does not recognise, which is the fail-safe
+    /// default and not evidence the table was written correctly. Written anyway, because a guard's
+    /// job is to catch tomorrow's edit, not today's — a later reclassification to `ReadsOwn` for
+    /// some plausible reason ("it only files a message") is exactly the drift this exists to catch
+    /// before `permitted_after_untrusted` stops shutting it after a stranger's page.
+    #[test]
+    fn send_to_chat_is_acts() {
+        assert_eq!(tool_effect("send_to_chat"), ToolEffect::Acts);
+    }
+
+    /// `send_to_chat` reaches none of the four narrowed boxes, and each absence is a different
+    /// refusal to guess a caller's identity rather than one omission repeated four times.
+    ///
+    /// `LOCAL_TOOLS` and `TEAM_TOOLS`: neither the in-process local loop nor a department's node
+    /// can name which conversation it is speaking FOR — see this tool's own registration for why
+    /// that is a startup-singleton problem, not a policy one. `COUNCIL_TOOLS`: nothing on a
+    /// council's list acts at all (`every_council_tool_only_reads`), and a seat is not a
+    /// conversation of its own to relay from. `ERRAND_TOOLS`: an errand is a Telegram topic
+    /// anybody in the group can post to, and hands its answer to a person, never to another
+    /// conversation.
+    #[test]
+    fn send_to_chat_reaches_no_narrowed_box() {
+        for (list, name) in [
+            (LOCAL_TOOLS, "LOCAL_TOOLS"),
+            (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+            (TEAM_TOOLS, "TEAM_TOOLS"),
+            (ERRAND_TOOLS, "ERRAND_TOOLS"),
+        ] {
+            assert!(
+                !list.contains(&"send_to_chat"),
+                "send_to_chat must stay off {name}"
+            );
+        }
     }
 
     /// Nothing a council seat may call can act.

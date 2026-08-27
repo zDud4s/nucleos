@@ -992,6 +992,10 @@ async fn record_images(pool: &SqlitePool, id: i64, kept: &[String]) -> sqlx::Res
 /// Boxed because this and `send_message` call each other — a real cycle, and the compiler needs the
 /// indirection to size the future. Nothing is retried: a message that cannot be sent has been taken
 /// off the queue by `take_queued` and is gone, which is the trade that file documents.
+///
+/// A relay-born message gets a second look here that a person's own message does not — see the
+/// `Some(relay_id)` branch below for why the gap between `relay::admit` deciding and this drain
+/// spending the turn is the one place its answer can go stale.
 async fn drain_queued(state: &crate::state::AppState, chat_id: &str) {
     let taken = match crate::chats::take_queued(&state.pool, chat_id).await {
         Ok(Some(taken)) => taken,
@@ -1001,25 +1005,97 @@ async fn drain_queued(state: &crate::state::AppState, chat_id: &str) {
             return;
         }
     };
-    let (text, origin, carried) = taken;
+    // The fourth element is the relay this message travelled on, or `None` for one a person typed —
+    // see `take_queued`'s own doc. It decides which of the two doors below the resend goes back
+    // through, so a message that waited still produces a run recording where it came from.
+    let (text, origin, carried, relay_id) = taken;
     let origin = Origin::from_wire(origin.as_deref());
-    // A queue row that will not parse is sent without its pictures rather than not sent at all: the
-    // words are the part somebody is waiting on an answer to, and refusing the whole turn over an
-    // unreadable column would lose those too.
-    let images: Vec<crate::runner::Attachment> = carried
-        .as_deref()
-        .and_then(|stored| serde_json::from_str::<Vec<serde_json::Value>>(stored).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|image| {
-            Some(crate::runner::Attachment {
-                media_type: image.get("media_type")?.as_str()?.to_string(),
-                data: image.get("data")?.as_str()?.to_string(),
-            })
-        })
-        .collect();
-    if let Err(refusal) = Box::pin(send_message_with(state, chat_id, &text, &images, origin)).await
-    {
+    let sent = match relay_id {
+        // No pictures on this branch: `send_relayed_message` never takes any, for the reason its
+        // own doc gives — a relay carries `chat_relays.body`, plain text, never an attachment — so
+        // `carried` is not even parsed here.
+        Some(relay_id) => {
+            // `relay::admit` certified this hop once, at the moment `relay_send_to_chat` called
+            // it — but a message that had to queue is sent LATER, here, by a drain that can run
+            // minutes after that certificate was issued. Everything `admit` checked at that moment
+            // can have changed since: the owner it saw present can have walked away, and the
+            // destination it checked against can have been archived while the message sat
+            // waiting. `admit`'s answer has an expiry, in other words, and this is the one path
+            // where the gap between deciding and spending can be long enough for the answer to
+            // have changed — so the two time-sensitive brakes are asked again, here, right before
+            // the turn they would gate is actually spent.
+            //
+            // A message a person typed is never re-checked this way — see `relay_id => None`,
+            // below. Re-confirming "is anyone there" before delivering someone their own words, in
+            // their own conversation, would be refusing them their own conversation for the crime
+            // of having stepped away from the keyboard; the presence brake exists to gate
+            // autonomy, not to gate a person talking to themselves. A relay has no such standing —
+            // it was admitted on ANOTHER conversation's say-so, for an owner who never typed it —
+            // which is exactly the case the brake exists to catch.
+            //
+            // Budget is deliberately left uncounted here, matching `relay::admit`'s own choice not
+            // to touch it (see that function's doc comment): `budget.rs` already counts every
+            // relay-born run on its own terms, and a second, narrower opinion about spend bolted
+            // onto this drain would be a gate free to disagree with the one that already exists.
+            //
+            // A brake that catches something here drops the message rather than retrying it:
+            // `take_queued` has already deleted its row, so there is nothing left to retry — the
+            // same trade this function's own doc comment already makes for a send that fails
+            // outright, extended to a send this drain now declines to even attempt.
+            let now = chrono::Utc::now();
+            if !crate::attention::owner_is_present(&state.pool, now).await {
+                tracing::warn!(
+                    chat_id,
+                    relay_id,
+                    "a relayed message that had been waiting was dropped: the owner is no longer present"
+                );
+                return;
+            }
+            match crate::chats::brain_of(&state.pool, chat_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!(
+                        chat_id,
+                        relay_id,
+                        "a relayed message that had been waiting was dropped: its destination is gone or archived"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        chat_id,
+                        relay_id,
+                        "a relayed message that had been waiting was dropped: its destination could not be read"
+                    );
+                    return;
+                }
+            }
+            Box::pin(send_relayed_message(
+                state, chat_id, &text, origin, relay_id,
+            ))
+            .await
+        }
+        None => {
+            // A queue row that will not parse is sent without its pictures rather than not sent at
+            // all: the words are the part somebody is waiting on an answer to, and refusing the
+            // whole turn over an unreadable column would lose those too.
+            let images: Vec<crate::runner::Attachment> = carried
+                .as_deref()
+                .and_then(|stored| serde_json::from_str::<Vec<serde_json::Value>>(stored).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|image| {
+                    Some(crate::runner::Attachment {
+                        media_type: image.get("media_type")?.as_str()?.to_string(),
+                        data: image.get("data")?.as_str()?.to_string(),
+                    })
+                })
+                .collect();
+            Box::pin(send_message_with(state, chat_id, &text, &images, origin)).await
+        }
+    };
+    if let Err(refusal) = sent {
         tracing::warn!(
             %refusal,
             chat_id,
@@ -1212,12 +1288,98 @@ pub async fn send_message(
 /// Which forces the stdin path, because an argument vector holds a string and there is nowhere in
 /// it for bytes to go. `steerable` and `images` are therefore decided together, below, at the one
 /// place that can see both.
+///
+/// Never carries a relay id — this is the door every message a person (or Telegram, or the IDE)
+/// actually sent comes in through, and `send_message_inner` below is what keeps that true rather
+/// than trusting every one of ITS callers to pass `None` correctly.
 pub async fn send_message_with(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
     images: &[crate::runner::Attachment],
     origin: Origin,
+) -> Result<i64, String> {
+    send_message_inner(state, chat_id, text, images, origin, None).await
+}
+
+/// Sends a message that arrived by relay from another conversation, recording which relay bore it.
+///
+/// The one caller of `send_message_inner` allowed to pass a relay id. `relay.rs`'s header explains
+/// why that matters: `chain_of` walks `runs.from_relay_id`, and a run born from a relay that did not
+/// record so would read back as a turn a person wrote — the chain resets to zero exactly where the
+/// cycle brake needs it not to. No images: a relay carries `chat_relays.body`, plain text, never an
+/// attachment — the same reason `spawn_local_turn` never takes any either.
+pub async fn send_relayed_message(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    origin: Origin,
+    relay_id: i64,
+) -> Result<i64, String> {
+    send_message_inner(state, chat_id, text, &[], origin, Some(relay_id)).await
+}
+
+/// Sends a relayed message, or keeps it until the destination has a turn free.
+///
+/// The relay path's counterpart to `send_or_queue`, above, and built the same try-then-queue way for
+/// the same reason: asking `is_busy` first would leave a window between "the destination looked
+/// busy" and "the message was queued" in which the turn it meant to wait behind ends and the message
+/// queues behind nothing, waiting for a drain that has already run. Letting `send_relayed_message`
+/// itself refuse is what makes the two steps one decision, exactly as it is for a message a person
+/// typed.
+///
+/// Before this door existed, a relay into a busy conversation had no second chance at all:
+/// `TURN_IN_PROGRESS` reached the caller as an ordinary refusal, the words were never queued, and a
+/// relay into a conversation that happened to be mid-turn was simply lost. `relay::admit` having
+/// granted the hop is not the same fact as the destination being free to receive it *right now* —
+/// those are two different moments, and only one of them was ever handled.
+///
+/// `chats::enqueue_relayed`, not `enqueue`: the relay id has to travel with the waiting message, or
+/// `drain_queued` would have no way to tell a relay-born wait from one a person typed — and, per its
+/// own comment, that distinction is what decides whether the brakes are re-checked before the turn
+/// is spent.
+pub async fn send_relayed_or_queue(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    origin: Origin,
+    relay_id: i64,
+) -> Result<Sent, String> {
+    match send_relayed_message(state, chat_id, text, origin, relay_id).await {
+        Ok(id) => Ok(Sent::Turn(id)),
+        Err(refusal) if refusal == TURN_IN_PROGRESS => {
+            crate::chats::enqueue_relayed(
+                &state.pool,
+                chat_id,
+                text,
+                origin.as_wire(),
+                "[]",
+                relay_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok(Sent::Queued)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// The shared body behind `send_message_with` and `send_relayed_message`.
+///
+/// `relay_id` is written into the `INSERT INTO runs` below in the same statement that creates the
+/// row — never by an `UPDATE` once the id is known. That is the property 0122 exists for: an INSERT
+/// followed by an UPDATE has a window in which a relay-born run sits with `from_relay_id IS NULL`,
+/// and `relay::chain_of` cannot tell that window apart from a turn a person actually wrote — it
+/// would stop its walk there and hand `relay::admits` a chain that reads as one hop shorter than it
+/// is. A failure between the two statements would make that misreading permanent rather than a race
+/// that usually loses.
+async fn send_message_inner(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    images: &[crate::runner::Attachment],
+    origin: Origin,
+    relay_id: Option<i64>,
 ) -> Result<i64, String> {
     // Refused before the slot is taken, so a turn nobody can send costs nothing and leaves the
     // conversation answerable.
@@ -1273,7 +1435,16 @@ pub async fn send_message_with(
     if wants_local {
         match state.local_assistant.clone() {
             Some(assistant) => {
-                return spawn_local_turn(state, slot, text.to_string(), errand, assistant).await;
+                return spawn_local_turn(
+                    state,
+                    slot,
+                    text.to_string(),
+                    errand,
+                    assistant,
+                    relay_id,
+                    origin,
+                )
+                .await;
             }
             // A conversation that SAYS `local` and has no local model refuses. Falling through to
             // the cloud would be the worst possible way to find that out: on the bill, for a chat
@@ -1308,6 +1479,10 @@ pub async fn send_message_with(
         cwd.as_deref().is_some_and(|dir| {
             crate::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
         }),
+        // Whether another conversation handed this turn over. `relay_id` is the fact, already in
+        // hand, and no walk is needed to read it — which is what makes this brake one line rather
+        // than the chain-depth rule the design weighed and did not take.
+        relay_id.is_some(),
     );
     // The configured Telegram doctrine, resolved HERE and not inside the spawned task below,
     // because `origin` is what decides it and `origin` does not survive to that task: the task
@@ -1351,18 +1526,47 @@ pub async fn send_message_with(
     // that is cancelled before it produces a word still has to say who was answering it. It is a
     // literal here rather than a parameter because everything that reaches this line is on the CLI
     // path — the branch above is where the other answer is given.
+    //
+    // `from_relay_id` alongside them for the reason this function's own doc comment gives: it is
+    // `relay_id` unchanged, in the same statement, so a relay-born run can never exist without it.
+    //
+    // `origin` alongside those, and written HERE rather than derived later, because there is
+    // nowhere later to derive it from: it is what the client said when it sent this message, and
+    // this INSERT is the last moment anything holds that word. 0119 exists for one reader —
+    // `relay::admit`, deciding whether the turn asking for a relay was a Telegram turn — and a
+    // reader that has to guess is the failure that migration is fixing.
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, 'cloud', ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, from_relay_id,
+                           origin, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, 'cloud', ?, ?, ?)",
     )
     .bind(text)
     .bind(&session_id)
     .bind(chat_id)
+    .bind(relay_id)
+    .bind(origin.as_wire())
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(&state.pool)
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+
+    // The relay learns which turn answered it, now that the turn has an id to learn.
+    //
+    // After the INSERT and not inside it, because the run's id does not exist until the run does —
+    // which is exactly why this pointer and `runs.from_relay_id` are not equally trusted. That one
+    // is written in the same statement as the run and is what `relay::chain_of` walks; this one is
+    // a second write that can fail on its own, and 0122's header says plainly that nothing
+    // security-critical may read it.
+    //
+    // A warning and not a refusal, therefore. The turn is already under way; undoing it because an
+    // audit pointer would not write would be trading the thing somebody is waiting for against the
+    // record of it.
+    if let Some(relay_id) = relay_id
+        && let Err(error) = crate::relay::mark_delivered(&state.pool, relay_id, id).await
+    {
+        tracing::warn!(%error, id, relay_id, "the relayed turn started but was not stamped onto its relay");
+    }
 
     // Written after the row exists, because the turn's own id is what names the files — which is
     // what makes two people pasting the same screenshot two different files rather than a race.
@@ -1672,12 +1876,27 @@ pub(crate) async fn recent_exchanges(
 /// History is replayed rather than resumed. There is no session to resume — Ollama's chat endpoint
 /// has no session protocol — so `recent_exchanges` rebuilds the conversation from the run rows the
 /// turns already wrote, under the same barrier `get_session` applies on the other path.
+///
+/// `relay_id` reaches here too, and is written into this INSERT for the same reason
+/// `send_message_inner` writes its own: a conversation's brain is a property of the CHAT
+/// (`chats::brain_of`), not of how the message that woke it up arrived, so a relay landing in a
+/// conversation set to `Local` takes this path exactly as a person's own message would — and its
+/// run must record where it came from just as reliably.
+///
+/// `origin` reaches here for the same reason and stops at the same place: this path writes its own
+/// `runs` row, so a column wired only into `send_message_inner` would be NULL on every turn a
+/// conversation set to `Local` ever answered. It is written, never READ here — the local path does
+/// not route on it, having already been chosen by the time this is called — which is exactly what
+/// makes forgetting it easy and invisible until `relay::admit` refuses a relay it should have
+/// admitted.
 async fn spawn_local_turn(
     state: &crate::state::AppState,
     slot: ChatSlot,
     text: String,
     errand: Option<ErrandTurn>,
     assistant: std::sync::Arc<crate::local_agent::LocalAssistant>,
+    relay_id: Option<i64>,
+    origin: Origin,
 ) -> Result<i64, String> {
     // A session id even though nothing resumes it, because `budget.rs` keys spend on this column
     // and a run row that is the one kind without one is a special case every reader downstream has
@@ -1694,17 +1913,37 @@ async fn spawn_local_turn(
 
     let session_id = crate::auth::generate_uuid_v4();
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, 'local', ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, from_relay_id,
+                           origin, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, 'local', ?, ?, ?)",
     )
     .bind(&text)
     .bind(&session_id)
     .bind(&slot.chat_id)
+    .bind(relay_id)
+    .bind(origin.as_wire())
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(&state.pool)
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+
+    // The relay learns which turn answered it, now that the turn has an id to learn.
+    //
+    // After the INSERT and not inside it, because the run's id does not exist until the run does —
+    // which is exactly why this pointer and `runs.from_relay_id` are not equally trusted. That one
+    // is written in the same statement as the run and is what `relay::chain_of` walks; this one is
+    // a second write that can fail on its own, and 0122's header says plainly that nothing
+    // security-critical may read it.
+    //
+    // A warning and not a refusal, therefore. The turn is already under way; undoing it because an
+    // audit pointer would not write would be trading the thing somebody is waiting for against the
+    // record of it.
+    if let Some(relay_id) = relay_id
+        && let Err(error) = crate::relay::mark_delivered(&state.pool, relay_id, id).await
+    {
+        tracing::warn!(%error, id, relay_id, "the relayed turn started but was not stamped onto its relay");
+    }
 
     if let Some(turn) = &errand {
         mark_if_remembering(state, id, turn).await?;
@@ -1839,7 +2078,7 @@ async fn spawn_local_turn(
 
 /// What tools a conversation's turn may reach.
 ///
-/// Three conditions, and every one of them is load-bearing. Written as one pure function so the
+/// Four conditions, and every one of them is load-bearing. Written as one pure function so the
 /// rule has a single home and can be read whole; the caller supplies the filesystem answer.
 ///
 /// **A directory.** A conversation continuing a session from the IDE is rooted somewhere and is
@@ -1869,16 +2108,24 @@ async fn spawn_local_turn(
 /// sixty-nine directories and most were never NucleOS projects at all, so this is the common case
 /// and not the edge one.
 ///
-/// The three failing arms all fall to `McpOnly`, which is what every chat turn has always used: the
+/// **A turn of this conversation's own.** A relayed turn is one another conversation handed over,
+/// and it arrives carrying that conversation's `origin` — so without this the message would inherit
+/// a policy earned by somebody sitting at a keyboard somewhere else. Presence is not transferable,
+/// and the whole point of the relay's design is that trust does not travel with the words.
+///
+/// Every failing arm falls to `McpOnly`, which is what every chat turn has always used: the
 /// conversation still continues and still resumes its session, and what it loses is the ability to
 /// touch the machine.
 pub(crate) fn tool_policy_for(
     cwd: Option<&str>,
     origin: Origin,
     hook_is_wired: bool,
+    relayed: bool,
 ) -> crate::runner::ToolPolicy {
-    match (cwd, origin, hook_is_wired) {
-        (Some(_), Origin::Shell | Origin::Voice, true) => crate::runner::ToolPolicy::Unrestricted,
+    match (cwd, origin, hook_is_wired, relayed) {
+        (Some(_), Origin::Shell | Origin::Voice, true, false) => {
+            crate::runner::ToolPolicy::Unrestricted
+        }
         _ => crate::runner::ToolPolicy::McpOnly,
     }
 }
@@ -3523,6 +3770,119 @@ mod tests {
         assert_eq!(session, Some("fake-session-id".to_string()));
     }
 
+    /// A run born from a relay must record which relay bore it, in the very row that creates it —
+    /// not as a fact added afterwards. `relay::chain_of` (`relay.rs`) walks `runs.from_relay_id`
+    /// back to `chat_relays.sending_run_id` and on, stopping the first time it meets a `NULL`,
+    /// which it reads as "a person's own turn, nothing relayed yet". A relay-born run that reached
+    /// this table without that column set would be indistinguishable from one — the cycle brake
+    /// `relay::admits` enforces at write time would simply forget it ever ran, on exactly the runs
+    /// it exists to bound.
+    ///
+    /// Checked immediately after the call returns, before the spawned turn has had any chance to
+    /// run: `send_relayed_message` performs the INSERT synchronously, so this is the row the turn
+    /// was CREATED with, not a state it might reach later.
+    ///
+    /// Pinned alongside the ordinary case in the same test, not a separate one, because the two are
+    /// one property: a turn a person wrote must be as reliably `NULL` as a relayed one must be set —
+    /// either half wrong and `chain_of`'s walk reads the wrong story about where a turn came from.
+    #[tokio::test]
+    async fn a_relayed_turn_records_which_relay_it_came_from() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+
+        let relayed_id =
+            send_relayed_message(&state, "relay-destination-chat", "onward", Origin::Shell, 7)
+                .await
+                .unwrap();
+        let from_relay: Option<i64> =
+            sqlx::query_scalar("SELECT from_relay_id FROM runs WHERE id = ?")
+                .bind(relayed_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            from_relay,
+            Some(7),
+            "a run born from a relay must record which relay bore it"
+        );
+
+        let ordinary_id = send_message(&state, "a-persons-own-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        let from_relay: Option<i64> =
+            sqlx::query_scalar("SELECT from_relay_id FROM runs WHERE id = ?")
+                .bind(ordinary_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            from_relay, None,
+            "a turn a person wrote must not read back as relay-born"
+        );
+    }
+
+    /// A turn records which client sent it, on both paths that write a `runs` row.
+    ///
+    /// Written down rather than only acted on, which is what 0119 changed. `Origin` was a parameter
+    /// that routed a turn and was then dropped, so `runs` could say a great deal about a turn and
+    /// nothing about where it came from — and `relay::admit`'s `TelegramOrigin` brake, whose whole
+    /// job is to read exactly that, had no fact to read. It was reachable only by a caller willing
+    /// to state an origin it had no way to know, which is to say it was not reachable at all.
+    ///
+    /// Both paths in one test, because the column is only as good as its least careful writer: a
+    /// relay is admitted on what `runs.origin` says about the SENDING turn, and a sending turn that
+    /// happened to be answered locally would, with one path left unwired, come back NULL and be
+    /// refused — or worse, be read as some default nobody wrote.
+    #[tokio::test]
+    async fn a_turn_records_which_client_sent_it() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+
+        let from_telegram = send_message(&state, "-100200300", "olá", Origin::Telegram)
+            .await
+            .unwrap();
+        let from_shell = send_message(&state, "a-shell-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+
+        let origin_of = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>("SELECT origin FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(origin_of(from_telegram).await.as_deref(), Some("telegram"));
+        assert_eq!(origin_of(from_shell).await.as_deref(), Some("shell"));
+
+        // The local path writes its own INSERT — see `spawn_local_turn` — so the column is wired
+        // there separately or not at all, and "not at all" is a NULL that reads as a run whose
+        // origin nobody knows.
+        let local = AppState {
+            local_assistant: Some(fake_local_assistant("answered here")),
+            ..test_state().await
+        };
+        crate::chats::set_brain(&local.pool, "a-local-chat", crate::chats::Brain::Local)
+            .await
+            .unwrap();
+        let locally = send_message(&local, "a-local-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        let recorded: Option<String> = sqlx::query_scalar("SELECT origin FROM runs WHERE id = ?")
+            .bind(locally)
+            .fetch_one(&local.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded.as_deref(),
+            Some("shell"),
+            "a turn answered by the local model records its origin too"
+        );
+    }
+
     /// Every run carries a daemon-assigned session id, and an assistant turn is a run. Its first
     /// turn had nothing to resume, so it was launched with neither `--resume` nor `--session-id`:
     /// the run had an id only if the CLI's stream volunteered one. `budget.rs` deduplicates spend by
@@ -4635,8 +4995,13 @@ mod tests {
         assert_eq!(outcome, Err(KILL_ENGAGED.to_string()));
     }
 
-    /// Every combination, because the rule's whole value is that the three conditions are AND-ed:
-    /// stated as three separate tests, a change that dropped one of them would leave two green.
+    /// Every combination, because the rule's whole value is that the conditions are AND-ed: stated
+    /// as separate tests, a change that dropped one of them would leave the others green.
+    ///
+    /// The table below is the ordinary-turn half — a message somebody typed — and every row of it
+    /// passes `false` for the fourth condition. The relayed half is
+    /// `a_relayed_turn_never_gets_the_tools_however_rooted_the_conversation_is`, below, which is
+    /// where that condition is actually exercised.
     #[test]
     fn only_a_rooted_conversation_spoken_to_from_the_machine_with_a_wired_hook_gets_the_tools() {
         use crate::runner::ToolPolicy;
@@ -4695,11 +5060,59 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                tool_policy_for(cwd, origin, wired),
+                tool_policy_for(cwd, origin, wired, false),
                 expected,
                 "{why}: cwd={cwd:?} origin={origin:?} wired={wired}"
             );
         }
+    }
+
+    /// A turn another conversation handed over never gets the CLI's tools, however rooted the
+    /// conversation receiving it happens to be.
+    ///
+    /// **This was decided by accident before it was decided on purpose, and in the permissive
+    /// direction.** A relay is DELIVERED with `Origin::Shell` — correctly, because it arrives
+    /// through this daemon and not from Telegram, and because the destination routes its brain on
+    /// that value — and the same value was the one this function read to hand out a filesystem. So
+    /// a relay into a rooted conversation with a wired hook collected the whole tool surface, and
+    /// nobody chose that.
+    ///
+    /// What makes it wrong is not that the tools are dangerous in themselves; it is who asked. A
+    /// person typing into a rooted conversation is pointing this machine at that repository, right
+    /// then. A relayed turn was composed by another conversation, for an owner who never saw the
+    /// words, in a repository they did not point anything at — and `MAX_RELAY_DEPTH` allows that
+    /// three times over from one thing somebody typed.
+    ///
+    /// Delegation is not lost, it is elsewhere: a team node has its own box (`TEAM_TOOLS`), chosen
+    /// deliberately and reviewed on its own terms. Granting it here as well would be a second,
+    /// weaker path to the same power, beside the one that already exists.
+    ///
+    /// Every row of the table above, re-run with the fourth condition true: the point is that NO
+    /// combination of the other three rescues it.
+    #[test]
+    fn a_relayed_turn_never_gets_the_tools_however_rooted_the_conversation_is() {
+        for cwd in [None, Some("C:/repo")] {
+            for origin in [Origin::Shell, Origin::Telegram] {
+                for wired in [true, false] {
+                    assert_eq!(
+                        tool_policy_for(cwd, origin, wired, true),
+                        crate::runner::ToolPolicy::McpOnly,
+                        "relayed: cwd={cwd:?} origin={origin:?} wired={wired}"
+                    );
+                }
+            }
+        }
+
+        // The one row that would otherwise have been `Unrestricted`, stated on its own so the
+        // difference this test exists for is legible without reading the loop above.
+        assert_eq!(
+            tool_policy_for(Some("C:/repo"), Origin::Shell, true, false),
+            crate::runner::ToolPolicy::Unrestricted
+        );
+        assert_eq!(
+            tool_policy_for(Some("C:/repo"), Origin::Shell, true, true),
+            crate::runner::ToolPolicy::McpOnly
+        );
     }
 
     /// The conversations that exist today have no root, and this is the line that says so out loud:
@@ -4709,7 +5122,7 @@ mod tests {
         for origin in [Origin::Shell, Origin::Telegram, Origin::Voice] {
             for wired in [true, false] {
                 assert_eq!(
-                    tool_policy_for(None, origin, wired),
+                    tool_policy_for(None, origin, wired, false),
                     crate::runner::ToolPolicy::McpOnly
                 );
             }
@@ -4731,14 +5144,14 @@ mod tests {
     fn a_spoken_turn_is_trusted_exactly_as_much_as_a_typed_one() {
         for wired in [true, false] {
             assert_eq!(
-                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, wired),
-                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Shell, wired),
+                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, wired, false),
+                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Shell, wired, false),
                 "a spoken turn diverged from a typed one at wired={wired}"
             );
         }
         // And the direction is the permissive one, so this cannot pass by both being McpOnly.
         assert_eq!(
-            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, true),
+            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, true, false),
             crate::runner::ToolPolicy::Unrestricted
         );
     }
@@ -4751,7 +5164,7 @@ mod tests {
     #[test]
     fn a_message_over_the_network_is_still_kept_off_the_machine() {
         assert_eq!(
-            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Telegram, true),
+            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Telegram, true, false),
             crate::runner::ToolPolicy::McpOnly
         );
     }
@@ -4826,7 +5239,8 @@ mod tests {
             tool_policy_for(
                 Some(dir),
                 Origin::Shell,
-                crate::autopilot::classifier_hook_is_wired(root.path())
+                crate::autopilot::classifier_hook_is_wired(root.path()),
+                false
             ),
             crate::runner::ToolPolicy::McpOnly,
         );
@@ -4837,7 +5251,8 @@ mod tests {
             tool_policy_for(
                 Some(dir),
                 Origin::Shell,
-                crate::autopilot::classifier_hook_is_wired(root.path())
+                crate::autopilot::classifier_hook_is_wired(root.path()),
+                false
             ),
             crate::runner::ToolPolicy::Unrestricted,
         );
@@ -5100,6 +5515,273 @@ mod tests {
         let outcome = send_or_queue(&state, "idle-chat", "arranja isso", &[], Origin::Shell).await;
 
         assert!(matches!(outcome, Ok(Sent::Turn(_))), "{outcome:?}");
+    }
+
+    // -- relay queueing and the drain's re-check --------------------------------------------
+    //
+    // Four tests, one per behaviour `send_relayed_or_queue` and the relay branch of `drain_queued`
+    // add: a busy relay waits instead of being lost, the drain refuses a waiting relay whose owner
+    // left, refuses one whose destination was archived while it waited, and — the test that stops
+    // either refusal from leaking where it must not — a person's own queued message is unaffected
+    // by either check.
+
+    /// Writes a `chat_relays` row directly and returns its id, the way `relay::admit` would have
+    /// once it granted the hop, without paying for any of `admit`'s own brakes.
+    ///
+    /// `sending_run_id` is a dummy: nothing under test here ever calls `relay::chain_of`, which is
+    /// the only reader that cares what it points at. `relay.rs`'s own suite is what proves `admit`
+    /// grants and refuses correctly; these tests start from "a relay was already granted" and ask
+    /// what happens to the message next, so re-deriving a real chain for each one would test a fact
+    /// `relay.rs` already pins, under a different name, for nothing this module needs.
+    async fn seed_relay(pool: &SqlitePool, from_chat_id: &str, to_chat_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES (?, ?, 0, '', 1, ?) RETURNING id",
+        )
+        .bind(from_chat_id)
+        .bind(to_chat_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The relay row learns which turn answered it — the mirror of `runs.from_relay_id`, written
+    /// back from the other side.
+    ///
+    /// 0122 declared this column and nothing ever wrote it, so `chat_relays` could say a relay had
+    /// been admitted and never whether it landed. That is not a security gap — `chain_of` walks
+    /// `runs.from_relay_id` and never this — but it is the whole of what the table was for from a
+    /// person's point of view, and a column that is NULL on every row without exception is
+    /// indistinguishable from one nobody wired up.
+    ///
+    /// Both paths, for the reason the origin test above covers both: the local path writes its own
+    /// `runs` row, so a stamp wired only into `send_message_inner` would leave every relay into a
+    /// conversation set to `Local` looking undelivered for ever.
+    #[tokio::test]
+    async fn a_relay_learns_which_turn_answered_it() {
+        let state = test_state().await;
+        let relay_id = seed_relay(&state.pool, "sender-chat", "relay-destination-chat").await;
+
+        let turn_id = send_relayed_message(
+            &state,
+            "relay-destination-chat",
+            "onward",
+            Origin::Shell,
+            relay_id,
+        )
+        .await
+        .unwrap();
+        let delivered: Option<i64> =
+            sqlx::query_scalar("SELECT delivered_to_run_id FROM chat_relays WHERE id = ?")
+                .bind(relay_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            delivered,
+            Some(turn_id),
+            "the relay must name the turn that answered it"
+        );
+
+        let local = AppState {
+            local_assistant: Some(fake_local_assistant("answered here")),
+            ..test_state().await
+        };
+        crate::chats::set_brain(
+            &local.pool,
+            "a-local-destination",
+            crate::chats::Brain::Local,
+        )
+        .await
+        .unwrap();
+        let local_relay = seed_relay(&local.pool, "sender-chat", "a-local-destination").await;
+        let local_turn = send_relayed_message(
+            &local,
+            "a-local-destination",
+            "onward",
+            Origin::Shell,
+            local_relay,
+        )
+        .await
+        .unwrap();
+        let delivered: Option<i64> =
+            sqlx::query_scalar("SELECT delivered_to_run_id FROM chat_relays WHERE id = ?")
+                .bind(local_relay)
+                .fetch_one(&local.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            delivered,
+            Some(local_turn),
+            "a relay answered by the local model is stamped too"
+        );
+    }
+
+    /// The gap this task closes: before `send_relayed_or_queue` existed, a relay into a busy
+    /// conversation took `TURN_IN_PROGRESS` and was never seen again — no queue row, no second
+    /// chance, the words simply gone. This is the try-then-queue door now, and it must leave a row
+    /// that names the relay it travelled on, or the drain has nothing to re-check later.
+    #[tokio::test]
+    async fn a_relay_into_a_busy_conversation_waits_in_the_queue_with_its_relay_id() {
+        let state = test_state().await;
+        let chat_id = "relay-busy-chat";
+        let relay_id = seed_relay(&state.pool, "sender-chat", chat_id).await;
+        let _held = take_the_slot_for_testing(chat_id);
+
+        let outcome = send_relayed_or_queue(
+            &state,
+            chat_id,
+            "mensagem retransmitida",
+            Origin::Shell,
+            relay_id,
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(Sent::Queued));
+        let (text, stored_relay_id): (String, Option<i64>) =
+            sqlx::query_as("SELECT text, relay_id FROM chat_queue WHERE chat_id = ?")
+                .bind(chat_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(text, "mensagem retransmitida");
+        assert_eq!(
+            stored_relay_id,
+            Some(relay_id),
+            "the queued row must carry the relay it travelled on, or the drain has nothing to re-check"
+        );
+    }
+
+    /// `admit`'s answer to "is the owner present" was true the moment the relay was granted — that
+    /// is what let it queue instead of being refused outright. By the time the drain gets to spend
+    /// a turn on it, nobody has come back, and this re-checks rather than trusting a fact that has
+    /// had time to go stale.
+    #[tokio::test]
+    async fn the_drain_refuses_a_relay_born_turn_when_the_owner_has_gone_away() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let relay_id = seed_relay(&state.pool, "sender-chat", &chat_id).await;
+        crate::chats::enqueue_relayed(
+            &state.pool,
+            &chat_id,
+            "mensagem retransmitida",
+            "shell",
+            "[]",
+            relay_id,
+        )
+        .await
+        .unwrap();
+        // No heartbeat recorded for this test at all: `owner_is_present` fails closed to "nobody is
+        // there", the same default `relay.rs`'s own `an_absent_owner_refuses_the_relay` relies on.
+
+        drain_queued(&state, &chat_id).await;
+
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            turns, 0,
+            "no turn should have started: the owner is not present to see it land"
+        );
+        assert!(
+            crate::chats::queued(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dropped, not retried: take_queued already removed the row before this was even checked"
+        );
+    }
+
+    /// The other half of the same expiry: the owner is still present, but the destination `admit`
+    /// checked no longer exists by the time the drain would spend a turn on it — archived while the
+    /// message sat waiting, exactly the gap between deciding and spending the whole re-check exists
+    /// to close.
+    #[tokio::test]
+    async fn the_drain_refuses_a_relay_born_turn_when_the_destination_was_archived_while_it_waited()
+    {
+        let state = test_state().await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let relay_id = seed_relay(&state.pool, "sender-chat", &chat_id).await;
+        crate::chats::enqueue_relayed(
+            &state.pool,
+            &chat_id,
+            "mensagem retransmitida",
+            "shell",
+            "[]",
+            relay_id,
+        )
+        .await
+        .unwrap();
+        // Admitted once, archived since — the destination this message was queued for is gone by
+        // the time the drain would spend a turn on it.
+        crate::chats::archive(&state.pool, &chat_id).await.unwrap();
+
+        drain_queued(&state, &chat_id).await;
+
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            turns, 0,
+            "no turn should have started: the destination is archived"
+        );
+        assert!(
+            crate::chats::queued(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dropped, not retried"
+        );
+    }
+
+    /// The test that stops the fix from breaking ordinary use: the re-check is what a relay pays
+    /// for nobody being at the keyboard, and a message a person actually typed must not pay it too.
+    /// No heartbeat is recorded here either — the owner is just as away as in the relay test above
+    /// — and this queued message still becomes a turn, because its row carries no relay id for the
+    /// drain to re-check anything against.
+    #[tokio::test]
+    async fn a_persons_own_queued_message_still_drains_when_the_owner_is_away() {
+        let state = test_state().await;
+        let chat_id = "person-queued-owner-away";
+        crate::chats::enqueue(&state.pool, chat_id, "mensagem da pessoa", "shell", "[]")
+            .await
+            .unwrap();
+
+        drain_queued(&state, chat_id).await;
+
+        let turns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE chat_id = ? AND mode = 'assistant'",
+        )
+        .bind(chat_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            turns, 1,
+            "a person's own queued message must still be sent even while the owner is away"
+        );
+        assert!(
+            crate::chats::queued(&state.pool, chat_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A picture sent with a turn reaches the model INSIDE the message.

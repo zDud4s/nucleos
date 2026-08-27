@@ -33,6 +33,7 @@ import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
   Ask,
+  ChatNotice,
   ChatProject,
   ChatSummary,
   Command,
@@ -112,6 +113,9 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     context_fill: null,
     context_window: 140000,
     compacted: false,
+    relayed_from_chat_id: null,
+    relayed_from_title: null,
+    relayed_to: [],
     ...overrides,
   };
 }
@@ -163,6 +167,12 @@ function chatsFetch(
     queued?: Record<string, Array<{ id: number; text: string }>>;
     /** What each conversation is being held on, by chat id. */
     asks?: Record<string, Ask[]>;
+    /** The path each relayed turn travelled, by turn id. */
+    chains?: Record<number, Array<{ chat_id: string; title: string | null }>>;
+    /** What departments said in each conversation, by chat id. */
+    notices?: Record<string, ChatNotice[]>;
+    /** Called with the destination and body of every forward the page posts. */
+    onForward?: (toChatId: string, body: { from_turn_id: number; text: string }) => void;
     /**
      * Where each conversation runs and whether that gives it tools, by chat id.
      *
@@ -181,6 +191,17 @@ function chatsFetch(
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
+    // The path a relayed turn travelled. Answered from `opts.chains`, keyed by turn id, because a
+    // chain is a property of the turn and not of the conversation reading it.
+    const chain = /^\/assistant\/chats\/([^/]+)\/turns\/(\d+)\/chain$/.exec(path);
+    if (chain !== null) {
+      return { chain: opts.chains?.[Number(chain[2])] ?? [] };
+    }
+    const forward = /^\/assistant\/chats\/([^/]+)\/forward$/.exec(path);
+    if (forward !== null && init?.method === "POST") {
+      opts.onForward?.(decodeURIComponent(forward[1]), JSON.parse(String(init.body)));
+      return { turn_id: 99 };
+    }
     if (path === "/assistant/message" && init?.method === "POST") {
       if (opts.onMessage !== undefined) return opts.onMessage();
       return { turn_id: 999 };
@@ -326,6 +347,7 @@ function chatsFetch(
         queued: opts.queued?.[match[1]] ?? [],
         asks: opts.asks?.[match[1]] ?? [],
         more: page.length < above.length,
+        notices: opts.notices?.[match[1]] ?? [],
         turns: page,
       };
     }
@@ -437,6 +459,315 @@ describe("Chats - refusals the composer meets", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("no_local_model")).toBeDefined();
+  });
+});
+
+/* -------------------------------------------------------------- A4b: relays -- */
+
+describe("Chats - a turn another conversation handed over", () => {
+  // The whole point of the column. A relayed turn drawn under "you" tells the person reading it
+  // that they said something they did not say, in the one place they go to find out what was
+  // actually said — and there is nothing else on the row to contradict it.
+  it("names the conversation it came from instead of attributing it to you", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({
+          id: 1,
+          asked: "olha para o parser",
+          relayed_from_chat_id: "c-2",
+          relayed_from_title: "the planning conversation",
+        }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).queryByText("you")).toBeNull();
+    // A link and not a label: the conversation on the far side is a real place, and somebody
+    // reading "where did this come from" almost always wants to go and look.
+    const source = within(transcript).getByRole("link", { name: "the planning conversation" });
+    expect(source.getAttribute("href")).toBe("/chats/c-2");
+  });
+
+  // Most conversations have no title until the daemon has summarised one, and a page that printed
+  // the uuid instead would be answering a question nobody asked. The link still goes there.
+  it("still links to an unnamed conversation without printing its id", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({ id: 1, relayed_from_chat_id: "0d2b-a-uuid-9f1", relayed_from_title: null }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    const source = within(transcript).getByRole("link", { name: "an unnamed conversation" });
+    expect(source.getAttribute("href")).toBe("/chats/0d2b-a-uuid-9f1");
+    expect(within(transcript).queryByText(/0d2b-a-uuid-9f1/)).toBeNull();
+  });
+
+  // The negative, and the one that catches the likelier mistake: a note drawn above every turn
+  // reads as every message having come from somewhere else.
+  it("says nothing above a turn the person typed", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [turnRow({ id: 1, asked: "hi" })],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("you")).toBeDefined();
+    expect(within(transcript).queryByText(/handed this over/)).toBeNull();
+  });
+});
+
+describe("Chats - the conversation that sent a relay", () => {
+  // The receiving half shipped first and left this side blind: a turn that had run a tool called
+  // `send_to_chat`, with no detail — not which conversation, not the words. The conversation
+  // certain to be watched by the person who caused the relay was the one that could not say what
+  // it had done.
+  it("says where its relay went and what it said", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({
+          id: 1,
+          answer: "feito",
+          relayed_to: [{ chat_id: "c-2", title: "o planeamento", body: "olha para o parser" }],
+        }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+
+    const sent = await screen.findByRole("list", { name: "Handed to other conversations" });
+    expect(within(sent).getByRole("link", { name: "o planeamento" })).toBeDefined();
+    // The words, not just the destination: "sent something to «planning»" is the shape that makes
+    // somebody open the other conversation to find out what.
+    expect(within(sent).getByText("olha para o parser")).toBeDefined();
+  });
+
+  it("says nothing under a turn that relayed nothing", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [turnRow({ id: 1, answer: "feito" })],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    expect(screen.queryByRole("list", { name: "Handed to other conversations" })).toBeNull();
+  });
+});
+
+describe("Chats - handing a turn over yourself", () => {
+  // The gesture the model already had and the person did not. What travels is what is in the box
+  // when it is sent — pre-filled with the answer, because forwarding is rarely verbatim.
+  it("sends the edited text to the conversation you pick", async () => {
+    const forwarded: Array<[string, { from_turn_id: number; text: string }]> = [];
+    const chats = [
+      chatSummary({ chat_id: "c-1", title: "aqui" }),
+      chatSummary({ chat_id: "c-2", title: "o planeamento" }),
+    ];
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [turnRow({ id: 7, answer: "é o parser de datas" })],
+    };
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(chats, transcripts, {
+        onForward: (to, body) => forwarded.push([to, body]),
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "hand to another conversation" }));
+
+    const box = await screen.findByLabelText("What to send");
+    // Pre-filled with what the turn answered, which is what somebody almost always means to send.
+    expect((box as HTMLTextAreaElement).value).toBe("é o parser de datas");
+    fireEvent.change(box, { target: { value: "olha isto: é o parser" } });
+
+    const targets = await screen.findByRole("list", { name: "Hand it to" });
+    // The conversation you are already in is not on the list — handing a turn to itself is refused
+    // by the daemon, and offering it would be offering a button that cannot work.
+    expect(within(targets).queryByRole("button", { name: "aqui" })).toBeNull();
+    fireEvent.click(within(targets).getByRole("button", { name: "o planeamento" }));
+
+    await waitFor(() => expect(forwarded.length).toBe(1));
+    expect(forwarded[0][0]).toBe("c-2");
+    expect(forwarded[0][1]).toEqual({ from_turn_id: 7, text: "olha isto: é o parser" });
+  });
+
+  // A turn still being written has nothing to hand over. Drawing the button anyway would put an
+  // empty message one click away, and an empty relay starts a turn elsewhere about nothing.
+  it("offers nothing on a turn that has not answered", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+    };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    expect(screen.queryByRole("button", { name: "hand to another conversation" })).toBeNull();
+  });
+});
+
+describe("Chats - where a relayed turn started", () => {
+  // With three hops allowed, "B spoke to me" hides that A began it — and A is the conversation
+  // somebody actually typed into. Behind a button because it is asked occasionally and the
+  // transcript around it is re-read every second and a half.
+  it("shows the whole path only once asked for it", async () => {
+    const summary = chatSummary({ chat_id: "c-3" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-3": [
+        turnRow({ id: 5, relayed_from_chat_id: "c-2", relayed_from_title: "a segunda" }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([summary], transcripts, {
+        chains: {
+          5: [
+            { chat_id: "c-1", title: "a primeira" },
+            { chat_id: "c-2", title: "a segunda" },
+            { chat_id: "c-3", title: null },
+          ],
+        },
+      }),
+    );
+
+    await renderChats("/chats/c-3");
+    expect(screen.queryByRole("list", { name: "The path this turn travelled" })).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "where did this start?" }));
+
+    const path = await screen.findByRole("list", { name: "The path this turn travelled" });
+    expect(within(path).getByRole("link", { name: "a primeira" })).toBeDefined();
+    // The conversation being read is the end of its own path, and unnamed ones keep their place.
+    expect(within(path).getByRole("link", { name: "an unnamed conversation" })).toBeDefined();
+  });
+});
+
+describe("Chats - the sidebar tells a relay from an answer", () => {
+  // One number cannot say two things. "Your conversation answered you" and "a different
+  // conversation pulled you into its subject" are different events, and the one you did not start
+  // is the one worth a second glance.
+  it("says out loud how many were handed over", async () => {
+    const chats = [
+      chatSummary({ chat_id: "c-1", title: "aqui", waiting: 3, relayed_waiting: 1 }),
+      chatSummary({ chat_id: "c-2", title: "ali", waiting: 2, relayed_waiting: 0 }),
+    ];
+    daemon.apiFetch.mockImplementation(chatsFetch(chats, {}));
+
+    await renderChats("/chats/c-1");
+
+    const relayed = await screen.findByRole("link", { name: /1 from another conversation/ });
+    expect(relayed.getAttribute("href")).toBe("/chats/c-1");
+    // The other conversation has unread answers too, and must not be marked: the mark is about
+    // where they came from, not about there being any.
+    const ordinary = screen.getByRole("link", { name: /ali, cloud, .+, 2 unread$/ });
+    expect(ordinary).toBeDefined();
+  });
+});
+
+describe("Chats - what a department said", () => {
+  /** A report, with the fields the daemon actually sends. */
+  function notice(overrides: Partial<ChatNotice> = {}): ChatNotice {
+    return {
+      id: 1,
+      chat_id: "c-1",
+      team_run_id: "tr-1",
+      from_agent_id: "director",
+      from_run_id: 9,
+      body: "a fonte que deste está morta",
+      created_at: "2026-08-26T10:00:00Z",
+      ...overrides,
+    };
+  }
+
+  // The words and the source, both. A report drawn without a source reads as something the OWNER
+  // wrote — the exact failure the relay side already had once — and here it matters more: nothing
+  // filtered these words, because the tool that writes them is `WritesOwn` precisely so a
+  // department that read the web all afternoon can still speak.
+  it("draws the words and says which department said them", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([summary], { "c-1": [turnRow({ id: 1, answer: "feito" })] }, {
+        notices: { "c-1": [notice()] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("a fonte que deste está morta")).toBeDefined();
+    expect(within(transcript).getByRole("link", { name: "director" })).toBeDefined();
+  });
+
+  // Interleaved by the CLOCK and not by id: the two come from different tables with independent
+  // sequences, so notice 1 and turn 900 say nothing about which happened first. Asserted by DOM
+  // order, because that is the only thing a reader actually experiences.
+  it("puts a report where it happened, between the turns around it", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({ id: 1, asked: "primeira", answer: "uma", created_at: "2026-08-26T09:00:00Z" }),
+        turnRow({ id: 2, asked: "segunda", answer: "duas", created_at: "2026-08-26T11:00:00Z" }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([summary], transcripts, {
+        notices: { "c-1": [notice({ body: "no meio disto" })] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    const text = transcript.textContent ?? "";
+    expect(text.indexOf("uma")).toBeLessThan(text.indexOf("no meio disto"));
+    expect(text.indexOf("no meio disto")).toBeLessThan(text.indexOf("duas"));
+  });
+
+  // A conversation somebody opened, set a department going from, and has not typed in since. Saying
+  // "nothing has been said yet" over a screen of what a department told them is the window
+  // contradicting itself.
+  it("is not an empty conversation when only a department has spoken", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([summary], { "c-1": [] }, { notices: { "c-1": [notice()] } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText("a fonte que deste está morta")).toBeDefined();
+    expect(screen.queryByText("nothing has been said yet.")).toBeNull();
+  });
+
+  // Its own clause in the sidebar, never added to the unread count. A department speaking is not the
+  // conversation answering — nothing ran for it — and one number cannot say two things.
+  it("says out loud how many came from a department", async () => {
+    const chats = [
+      chatSummary({ chat_id: "c-1", title: "aqui", waiting: 2, notices_waiting: 1 }),
+      chatSummary({ chat_id: "c-2", title: "ali", waiting: 2, notices_waiting: 0 }),
+    ];
+    daemon.apiFetch.mockImplementation(chatsFetch(chats, {}));
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByRole("link", { name: /1 from a department/ })).toBeDefined();
+    // The count of turns is untouched by it: two unread answers are still two, not three.
+    expect(screen.getByRole("link", { name: /aqui, cloud, .+, 2 unread, 1 from a department$/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /ali, cloud, .+, 2 unread$/ })).toBeDefined();
   });
 });
 

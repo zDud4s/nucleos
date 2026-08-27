@@ -1,0 +1,33 @@
+-- Which client sent the turn, written down instead of merely stated.
+--
+-- `assistant::Origin`'s own doc says the origin is STATED by the client and never inferred, and
+-- that is still true — this column changes nothing about where the fact comes from, only how long
+-- it survives. Until now it lived for the length of one function call: `send_message` took it as a
+-- parameter, routed on it, and dropped it. Nothing downstream could ever ask again.
+--
+-- 0122 (cut as 0117 — see its header) is what made that gap cost something. `relay::admit`
+-- refuses a relay sent by a Telegram
+-- turn, `relay::Refusal::TelegramOrigin` is the variant, and there was no way to reach it: the one
+-- production caller (`http::relay_send_to_chat`) had no truer answer than `Origin::Shell` to hand
+-- it, so the brake was written, tested, and unreachable — a security boundary that reads as live
+-- and is not. The refusal is the point of this column; everything else it makes possible is
+-- incidental.
+--
+-- NULL and not `DEFAULT 'shell'`. A default would manufacture the exact fact this refuses to
+-- guess: every run written before this migration would come back claiming it was sent from the
+-- shell, and `relay_send_to_chat` would admit relays on the strength of a claim nobody made. NULL
+-- says "this run does not record where it came from", and the handler refuses a relay it cannot
+-- attribute rather than assuming the answer that happens to be permissive. The same reasoning
+-- 0061's `answered_by` gives for staying nullable: rows that predate a column keep NULL, which is
+-- honest, because nothing knows.
+--
+-- Only chat turns write it. A council seat, a shadow pass, an email triage — none of them was
+-- "sent by a client" at all, and inventing an origin for them would make this column mean two
+-- different things depending on `mode`.
+-- **Cut as 0118, moved to 0119**, because `feat/pressao-de-contexto` landed
+-- `0118_runs_context_peak.sql` while this branch was being merged up to master. This is the file
+-- that actually lost the number — its three siblings moved only so the block would stay contiguous
+-- above it. `0084_runs_team_run_id.sql`'s rule decides it as usual, and 0122's header carries the
+-- whole account of both collisions this branch has now had.
+
+ALTER TABLE runs ADD COLUMN origin TEXT;

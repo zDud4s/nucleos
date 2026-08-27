@@ -245,6 +245,16 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::team::post_team_action).get(crate::team::list_open_actions),
         )
         .route("/team-recruits", post(crate::team::post_team_recruit))
+        // POST only, and no GET twin, for the reason `/team-actions` has one and `/team-recruits`
+        // does not: a member may leave words for a colleague, and may not read the department's
+        // mail. What each node is told arrives in its prompt, chosen by the daemon, and a route that
+        // let a specialist read every note of the run would hand it the conversation it was
+        // deliberately not part of.
+        .route("/team-notes", post(crate::team::post_team_note))
+        // POST only, again, and here the absent GET matters more: a department that could READ the
+        // conversation it reports into would be reading the owner's chat. It may speak there and it
+        // may not listen.
+        .route("/team-reports", post(crate::team::post_team_report))
         // All Control, and NONE of them in `auth::TEAM_ROUTES`. A department neither arms nor fires
         // a rule, and that is not an oversight: it is what stops a chain feeding itself underneath
         // the graph the cycle check walks.
@@ -380,6 +390,27 @@ pub fn build_router(state: AppState) -> Router {
         // which is the right first answer and a useless second one: what people come back for is
         // something that was SAID, and a title is a summary written by a model.
         .route("/assistant/search", get(search_assistant))
+        // `{chat_id}` is the DESTINATION, matching every sibling route above: this acts on the
+        // conversation named in the URL, the same way `/seen` marks it read and `/title` renames
+        // it — here, the act is handing it a message. The sender is never in the URL or the body;
+        // `relay_send_to_chat` reads it off `RUN_ID_HEADER`, which only the run itself can have set
+        // (`daemon_client::send_to_chat`'s own doc says why that is trustworthy), so a caller
+        // cannot name a conversation to relay FROM any more than `POST /assistant/message` lets one
+        // name who is typing.
+        .route("/assistant/chats/{chat_id}/relay", post(relay_send_to_chat))
+        // The same hop, asked for by the person instead of by the model. A route of its own and not
+        // a flag on the one above, because the two differ in the one thing that matters: where the
+        // sending turn's identity comes from. `/relay` reads it off a header this process wrote
+        // into a run's environment; this reads it off a body, because a person at a window is not
+        // a run and has no such header to send.
+        .route("/assistant/chats/{chat_id}/forward", post(forward_to_chat))
+        // The path a relayed turn travelled, asked for rather than carried. A segment deeper than
+        // the transcript because it is about ONE turn, and off the transcript because it is read
+        // when somebody hovers — not every second and a half, which is what the transcript costs.
+        .route(
+            "/assistant/chats/{chat_id}/turns/{turn_id}/chain",
+            get(get_relay_chain),
+        )
         .route("/assistant/{turn_id}", get(get_run))
         // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
         // the two cannot shadow each other whatever a turn id looks like.
@@ -2164,6 +2195,426 @@ async fn post_assistant_message(
         }
         Err(_) => Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")),
     }
+}
+
+/// The body `POST /assistant/chats/{chat_id}/relay` takes — nothing more than what a model chose
+/// when it called `send_to_chat`. Everything else `relay::admit` needs to decide (who is asking,
+/// and from where) comes off the request's own context rather than off anything a body could say;
+/// see the route's own comment in `build_router` and `sending_run_id_of` below.
+#[derive(Deserialize)]
+struct RelayMessageRequest {
+    text: String,
+}
+
+/// The body `POST /assistant/chats/{chat_id}/forward` takes: which turn is being forwarded, and
+/// what to say.
+///
+/// `text` rather than the turn's own words re-read here, so the window can offer them for editing
+/// before they travel. What a person forwards is what they chose to forward, and a route that
+/// re-read the turn would quietly send something other than what they saw in the box.
+///
+/// `from_turn_id` is what makes this a relay rather than a plain message. `chat_relays` requires a
+/// `sending_run_id` and a turn IS a run, so forwarding one fits the table exactly — and, more to
+/// the point, `relay::chain_of` can then walk back through it, so a person's forward is bounded by
+/// the same cycle and depth rules a model's is. Sending free-standing text would have needed that
+/// column to become nullable, which in SQLite means rebuilding the table, and would have left the
+/// forwarded message outside every brake.
+#[derive(Deserialize)]
+struct ForwardRequest {
+    from_turn_id: i64,
+    text: String,
+}
+
+/// The run asking for this relay, read the one place a caller cannot simply state it: the header
+/// `daemon_client::RUN_ID_HEADER` puts on every request a run's own tool calls make, set from an
+/// environment variable that process has no tool able to read or alter — see that constant's own
+/// doc, and `DaemonClient::send_to_chat`'s. Absent or unparseable answers `None` rather than a
+/// guess: a relay with no run behind it has nothing for `relay::admit` to walk a chain from, so the
+/// request is refused rather than attributed to whichever run the caller happened to be.
+fn sending_run_id_of(headers: &axum::http::HeaderMap) -> Option<i64> {
+    headers
+        .get(crate::daemon_client::RUN_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+}
+
+/// Which conversation `run_id` is answering, and which client sent the message it is answering —
+/// the two facts `relay::admit` needs about the SENDER and takes as parameters rather than reading
+/// for itself.
+///
+/// One read for both, because they come off the same row and a second query could only race the
+/// first. `hooks::chat_of_run` makes the chat half of this read for its own purpose and stays where
+/// it is: each caller of "which chat is this run in" has so far needed it alongside something
+/// different, and a shared home would be a dependency between them that does not otherwise exist.
+///
+/// Two different absences, deliberately kept apart rather than folded into one `Option`:
+///
+/// * no row, or a row with no `chat_id` — `None`. The header named a run this daemon cannot
+///   attribute to any conversation, so there is no `from_chat_id` to relay from.
+/// * a row whose `origin` is NULL — `Some((chat, None))`. The run exists and belongs to a
+///   conversation, but nothing recorded where its message came from. See 0119 for why that reads
+///   as "unknown" and never as "shell".
+///
+/// `Origin::from_wire` is deliberately NOT used on the value read back, and this is the one reader
+/// of the column that departs from it. That function resolves an unknown spelling to `Shell` —
+/// right for a client that said nothing, since a caller stating no origin is the old shell path —
+/// but here the same leniency would answer the very question this gate exists to ask. The two
+/// spellings are matched exactly; anything else is unknown, and unknown is refused.
+async fn sending_turn_of(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+) -> Option<(String, Option<crate::assistant::Origin>)> {
+    let row: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT chat_id, origin FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let (chat_id, origin) = row?;
+    let origin = match origin.as_deref() {
+        Some("telegram") => Some(crate::assistant::Origin::Telegram),
+        Some("shell") => Some(crate::assistant::Origin::Shell),
+        _ => None,
+    };
+    Some((chat_id?, origin))
+}
+
+/// `relay::admit`'s five refusals, turned into a status and a body that names which one fired —
+/// see `Refusal`'s own doc for what each means. 409 for the four the gate actually DECIDED (the
+/// destination is gone or archived, the sender is Telegram, the chain refuses the hop, the owner is
+/// away): a caller can read the slug and know why, the same way `post_assistant_message` already
+/// answers 409 for a chat mid-turn or an errand on hold. 500 for `Unreadable` alone, because that
+/// variant is not a decision about the relay — the gate could not read enough to make one — and
+/// there is nothing about THIS relay for a caller to act on differently next time.
+fn relay_refusal_response(cause: crate::relay::Refusal) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::relay::{Refusal, Verdict};
+    match cause {
+        Refusal::NoSuchDestination { to_chat_id } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": "no_such_destination",
+                "to_chat_id": to_chat_id,
+            })),
+        ),
+        Refusal::TelegramOrigin => refusal(StatusCode::CONFLICT, "telegram_origin"),
+        Refusal::Chain(Verdict::Itself) => refusal(StatusCode::CONFLICT, "relay_to_self"),
+        Refusal::Chain(Verdict::Cycle { at }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "refusal": "relay_cycle", "at": at })),
+        ),
+        Refusal::Chain(Verdict::TooDeep) => refusal(StatusCode::CONFLICT, "relay_too_deep"),
+        // `admit` constructs `Refusal::Chain` only from a `Verdict` that is not `Ok` (see its own
+        // body: the `Ok` case falls through to the INSERT instead). Reached only if that invariant
+        // is ever broken elsewhere, and 500 is the honest answer to a refusal that cannot say what
+        // it is refusing.
+        Refusal::Chain(Verdict::Ok) => refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        Refusal::OwnerAway => refusal(StatusCode::CONFLICT, "owner_away"),
+        Refusal::Unreadable { step, error } => {
+            tracing::warn!(step, %error, "a relay could not be decided");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+/// `assistant::send_relayed_message`'s refusals, mapped the same way `post_assistant_message` above
+/// already maps `send_message_with`'s — the two share every constant because a relayed turn is
+/// refused by the same brakes an ordinary one is (a chat mid-turn, no local model, an errand on
+/// hold, the kill switch). Kept as its own small match rather than a shared function with that
+/// route's: the two bodies are one line apart today, and a shared helper here would be reaching
+/// into `post_assistant_message` for four string constants it would have imported anyway.
+fn relayed_send_refusal(msg: String) -> (StatusCode, Json<serde_json::Value>) {
+    match msg {
+        _ if msg == crate::assistant::TURN_IN_PROGRESS => {
+            refusal(StatusCode::CONFLICT, "turn_in_progress")
+        }
+        _ if msg == crate::assistant::NO_LOCAL_MODEL => {
+            refusal(StatusCode::SERVICE_UNAVAILABLE, "no_local_model")
+        }
+        _ if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
+            refusal(StatusCode::CONFLICT, "errand_not_answering")
+        }
+        _ if msg == crate::assistant::KILL_ENGAGED => refusal(StatusCode::LOCKED, "kill_switch"),
+        _ => refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+/// What `admit` and `send_relayed_or_queue` can come back with, folded into one type so the
+/// `uncancellable` block below has exactly one thing to return and the match after it is one
+/// decision per line rather than a chain of `if let`.
+enum RelayAttempt {
+    /// `sending_run_id` names no run this daemon can find a chat for — a header that parsed as a
+    /// number but not as a live run, which `relay::admit` has no way to be asked about since it
+    /// takes `from_chat_id` already resolved.
+    UnknownSender,
+    /// The sending run exists and records no origin. Its own refusal rather than folded into
+    /// `UnknownSender` above, because the two are different failures wearing similar words: that
+    /// one means the daemon cannot say WHICH conversation is asking, this one means it knows
+    /// exactly which and cannot say where that conversation's message came from. Collapsing them
+    /// would send an operator looking for a bad run id when the answer is a row that predates 0119.
+    ///
+    /// Refused rather than defaulted, which is that migration's whole argument: a run whose origin
+    /// nobody wrote down is not a run known to be safe, and `relay::admit`'s Telegram brake is
+    /// worth exactly as much as the honesty of what is handed to it.
+    UnknownOrigin,
+    Refused(crate::relay::Refusal),
+    NotSent(String),
+}
+
+/// `POST /assistant/chats/{chat_id}/relay`. Sequences `relay::admit` and, if it grants the hop,
+/// `assistant::send_relayed_or_queue` with the id it wrote — and does nothing else: every refusal
+/// either of those two can produce is already argued in `relay.rs` and `assistant.rs`, and
+/// reproducing any part of that argument here would be a second copy of a decision that belongs in
+/// one place. What this function owns is entirely transport: reading who is asking off the request,
+/// and turning what comes back into a status and a body.
+///
+/// `send_relayed_or_queue` rather than `send_relayed_message` directly: `admit` grants the HOP, not
+/// a guarantee that the destination has a turn free the instant this handler runs, and calling the
+/// plain send here would answer `turn_in_progress` for exactly the case — a busy destination — that
+/// an ordinary message already has a door for. See that function's own doc for the rest of the
+/// argument, and `assistant::drain_queued` for what happens when the wait ends.
+async fn relay_send_to_chat(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RelayMessageRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(sending_run_id) = sending_run_id_of(&headers) else {
+        return Err(refusal(StatusCode::BAD_REQUEST, "missing_run_id"));
+    };
+
+    // Uncancellable for the reason `post_assistant_message` is, above: `send_relayed_message`
+    // writes the new turn's `running` row and only then spawns the task that finishes it, and a
+    // client that disconnects mid-request must not be able to strand that row by dropping this
+    // future between the two.
+    let outcome = uncancellable(async move {
+        let Some((from_chat_id, sending_origin)) =
+            sending_turn_of(&state.pool, sending_run_id).await
+        else {
+            return Err(RelayAttempt::UnknownSender);
+        };
+        let Some(sending_origin) = sending_origin else {
+            return Err(RelayAttempt::UnknownOrigin);
+        };
+
+        // The two origins below are different facts and only look like one argument passed twice.
+        //
+        // `admit` is asked about the SENDER: where the message asking for this relay came from,
+        // read off `runs.origin` above rather than asserted here. That read is what makes
+        // `relay::Refusal::TelegramOrigin` reachable at all — before 0119 the column did not exist,
+        // this handler had nothing truer than `Origin::Shell` to pass, and the brake was live in
+        // its own unit tests and dead everywhere else.
+        //
+        // `send_relayed_or_queue` is told about the message being DELIVERED, and that one is
+        // `Origin::Shell` unconditionally. `Origin` names which client sent a message; this one was
+        // sent by another conversation through this daemon, which is the shell path by definition,
+        // and never Telegram — a Telegram sender does not get past the line above. It matters
+        // because the destination routes on it: `send_message_inner`'s `wants_local` falls back to
+        // the origin for a conversation with no brain of its own, so passing the sender's origin
+        // through would let one conversation decide which model answers in another.
+        match crate::relay::admit(
+            &state.pool,
+            &from_chat_id,
+            &chat_id,
+            sending_run_id,
+            sending_origin,
+            &body.text,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok(relay_id) => crate::assistant::send_relayed_or_queue(
+                &state,
+                &chat_id,
+                &body.text,
+                crate::assistant::Origin::Shell,
+                relay_id,
+            )
+            .await
+            .map_err(RelayAttempt::NotSent),
+            Err(cause) => Err(RelayAttempt::Refused(cause)),
+        }
+    })
+    .await
+    .map_err(|status| refusal(status, "internal"))?;
+
+    relay_outcome_response(outcome)
+}
+
+/// What either relay route answers, once the attempt has resolved.
+///
+/// Shared because the two differ only in who is asking — a run, through a header it cannot forge,
+/// or a person, through a body — and not at all in what a granted, queued, or refused hop means.
+/// Two copies of this match is two places for the queued case to be forgotten in.
+fn relay_outcome_response(
+    outcome: Result<crate::assistant::Sent, RelayAttempt>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match outcome {
+        Ok(crate::assistant::Sent::Turn(turn_id)) => {
+            Ok(Json(serde_json::json!({ "turn_id": turn_id })))
+        }
+        // Not a turn id and not a refusal: `send_relayed_or_queue` found the destination mid-turn
+        // and kept the words rather than losing them — see that function's own doc for why a relay
+        // gets the same try-then-queue door an ordinary message already has. `queued` matches the
+        // field `post_assistant_message` answers with for the identical outcome, so a caller reading
+        // either route learns the same shape.
+        Ok(crate::assistant::Sent::Queued) => Ok(Json(serde_json::json!({ "queued": true }))),
+        Err(RelayAttempt::UnknownSender) => Err(refusal(StatusCode::BAD_REQUEST, "unknown_sender")),
+        // 409 and not the 400 above it. A missing run id is a malformed request and the caller can
+        // fix it; a run whose origin was never recorded is a well-formed request this daemon
+        // declines to certify, which is the shape every other refusal here answers 409 for.
+        Err(RelayAttempt::UnknownOrigin) => Err(refusal(StatusCode::CONFLICT, "unknown_origin")),
+        Err(RelayAttempt::Refused(cause)) => Err(relay_refusal_response(cause)),
+        Err(RelayAttempt::NotSent(msg)) => Err(relayed_send_refusal(msg)),
+    }
+}
+
+/// `POST /assistant/chats/{chat_id}/forward`. A person hands a turn to another conversation.
+///
+/// `chat_id` is the DESTINATION, matching `/relay` beside it and every other
+/// `/assistant/chats/{id}/...` route on this server. The source is derived from the turn rather
+/// than stated, because a turn belongs to exactly one conversation and asking the caller to name it
+/// too would be inviting the two to disagree.
+///
+/// **The gate is the same gate, and reads the same facts.** `relay::admit` is asked about the
+/// origin of the TURN being forwarded, not about the person doing the forwarding — so forwarding a
+/// turn that arrived from Telegram is refused, exactly as a model relaying from one would be.
+/// Passing `Origin::Shell` here because a human is at the window was the alternative, and it would
+/// have been telling the gate something untrue about the turn in order to get a different answer.
+/// One rule, read one way, from one column.
+///
+/// What this does NOT do is give the person a way past the chain: `sending_run_id` is the forwarded
+/// turn, so `chain_of` walks straight through it, and a forward that would close a cycle or exceed
+/// `MAX_RELAY_DEPTH` is refused like any other hop.
+async fn forward_to_chat(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<ForwardRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Uncancellable for the reason `relay_send_to_chat` is: the send writes a `running` row and
+    // only then spawns the task that finishes it, and a window that closes mid-request must not be
+    // able to strand that row between the two.
+    let outcome = uncancellable(async move {
+        let Some((from_chat_id, sending_origin)) =
+            sending_turn_of(&state.pool, body.from_turn_id).await
+        else {
+            return Err(RelayAttempt::UnknownSender);
+        };
+        let Some(sending_origin) = sending_origin else {
+            return Err(RelayAttempt::UnknownOrigin);
+        };
+
+        match crate::relay::admit(
+            &state.pool,
+            &from_chat_id,
+            &chat_id,
+            body.from_turn_id,
+            sending_origin,
+            &body.text,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            // `Origin::Shell` on the delivery for the reason `/relay` gives: the message is
+            // arriving through this daemon, which is the shell path by definition, and the
+            // destination routes its own brain on that value.
+            Ok(relay_id) => crate::assistant::send_relayed_or_queue(
+                &state,
+                &chat_id,
+                &body.text,
+                crate::assistant::Origin::Shell,
+                relay_id,
+            )
+            .await
+            .map_err(RelayAttempt::NotSent),
+            Err(cause) => Err(RelayAttempt::Refused(cause)),
+        }
+    })
+    .await
+    .map_err(|status| refusal(status, "internal"))?;
+
+    relay_outcome_response(outcome)
+}
+
+/// One conversation on a relayed turn's path.
+#[derive(Serialize)]
+struct ChainStep {
+    chat_id: String,
+    /// Null on a conversation nobody has named. It keeps its place in the path regardless — a
+    /// chain with a hole in it is a chain that lies about its own length.
+    title: Option<String>,
+}
+
+/// `GET /assistant/chats/{chat_id}/turns/{turn_id}/chain`. Where a turn came from, all the way back.
+///
+/// The transcript already names the conversation that handed a turn over, and with
+/// `MAX_RELAY_DEPTH` at three that is a different question from "where did this start". "B spoke to
+/// me" hides that A began it, and A is the conversation somebody actually typed into.
+///
+/// `relay::chain_of` does the walk; this adds only the names. A turn nothing relayed answers a
+/// chain of one — its own conversation — which is honest rather than empty: that IS its whole path.
+///
+/// The `chat_id` in the path is checked against the turn's own, and it is not a security boundary:
+/// the control token permits every route. It catches a window bug — a stale turn id from a
+/// conversation the person has navigated away from — which would otherwise answer with somebody
+/// else's path under the title of the chat on screen.
+async fn get_relay_chain(
+    State(state): State<AppState>,
+    Path((chat_id, turn_id)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let owner: Option<Option<String>> = sqlx::query_scalar("SELECT chat_id FROM runs WHERE id = ?")
+        .bind(turn_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading which conversation a turn belongs to failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if owner.flatten().as_deref() != Some(chat_id.as_str()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // A walk that cannot complete is a 500 and not an empty chain, for the reason `chain_of`'s own
+    // doc gives: a short chain reads as a safe one, and answering a shortened path here would be
+    // the same lie in a place a person reads rather than a gate.
+    let chain = crate::relay::chain_of(&state.pool, turn_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, turn_id, "a relay chain could not be walked");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // One read for the names, not one per hop: the chain is at most `MAX_RELAY_DEPTH + 1` long, so
+    // the difference is small — but a loop of queries here would be the shape that stops being
+    // small the day somebody raises that constant.
+    let mut named = Vec::with_capacity(chain.len());
+    let mut titles = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT chat_id, title FROM chats WHERE chat_id IN (",
+    );
+    let mut separated = titles.separated(", ");
+    for step in &chain {
+        separated.push_bind(step);
+    }
+    titles.push(")");
+    let rows: Vec<(String, Option<String>)> = titles
+        .build_query_as()
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+    for step in chain {
+        // A conversation with no `chats` row at all reads as unnamed rather than dropping out. The
+        // walk found it, so it is part of the path whatever the `chats` table has to say.
+        let title = rows
+            .iter()
+            .find(|(id, _)| *id == step)
+            .and_then(|(_, title)| title.clone());
+        named.push(ChainStep {
+            chat_id: step,
+            title,
+        });
+    }
+
+    Ok(Json(serde_json::json!({ "chain": named })))
 }
 
 /// What the PII shadow pass has seen, by column and class.
@@ -5406,6 +5857,22 @@ struct AssistantTurn {
     /// to draw moved from `session_id` to here, and it says a milder and truer thing: the older
     /// exchanges were summarised at this point, not forgotten at this point.
     compacted: bool,
+    /// The conversation that handed this turn its words, or null for the ordinary case — somebody
+    /// typed them here.
+    ///
+    /// Without it the window draws a relayed turn under "you", which is the one thing it is not:
+    /// the words arrived from another conversation, and a transcript that attributes them to the
+    /// person reading it is not a cosmetic problem but a false record of who said what.
+    ///
+    /// Two columns and not one, because the pair answers two different questions and either can be
+    /// absent on its own. The id is what the conversation IS and is always there when a turn was
+    /// relayed at all; the title is what somebody called it and is null on every conversation
+    /// nobody has named — which is most of them, since a title is written by the daemon only once
+    /// a chat has been summarised. A window given only the title could not say anything about an
+    /// unnamed conversation; given only the id it would print a uuid at a person.
+    relayed_from_chat_id: Option<String>,
+    /// What that conversation is called, or null when it has no title yet. See above.
+    relayed_from_title: Option<String>,
 }
 
 /// One turn as the window receives it: the row, plus what the turn did.
@@ -5414,6 +5881,28 @@ struct AssistantTurn {
 /// all: the column holds a serialisation this daemon chose, and a client re-deriving it would be a
 /// second reader of a private shape. A column that will not parse reads as an empty list — the turn
 /// is real and its reply is worth showing, and one unreadable field is not worth losing it over.
+/// One relay a turn sent: where it went, and what it said.
+///
+/// Read off `chat_relays` rather than off the tool call the CLI reported, and the difference is not
+/// cosmetic. The relay row is what the daemon ADMITTED and wrote; a tool call is what the model
+/// asked for, and the two part company every time `relay::admit` refuses — a cycle, a chain too
+/// deep, an owner who has gone away. A sender's transcript built from the asks would show messages
+/// that never arrived, which is the one thing it must not do.
+#[derive(serde::Serialize, sqlx::FromRow)]
+struct RelaySent {
+    /// The conversation the message went to. Always present; the title beside it may not be.
+    chat_id: String,
+    /// What that conversation is called, or null when nobody has named it yet.
+    title: Option<String>,
+    /// The words that travelled, whole. The same string the destination's own turn was created
+    /// with, so the two sides of one relay cannot disagree about what was said.
+    body: String,
+    /// Which turn sent it. Not serialized — the window receives these already grouped under their
+    /// turn, and repeating the key inside every value is a second copy of the same fact.
+    #[serde(skip)]
+    sending_run_id: i64,
+}
+
 #[derive(serde::Serialize)]
 struct AssistantTurnOut {
     #[serde(flatten)]
@@ -5441,6 +5930,12 @@ struct AssistantTurnOut {
     /// chat picked up from the editor runs in a wider window than the default, and a meter drawn
     /// against the default would be wrong for exactly the conversations nearest their limit.
     context_window: i64,
+    /// The relays this turn sent, oldest first. Empty for almost every turn.
+    ///
+    /// The mirror of `relayed_from_chat_id` on the receiving side, and it exists because that side
+    /// shipped alone: the conversation certain to be watched by the person who caused a relay was
+    /// the one that could not say what it had done.
+    relayed_to: Vec<RelaySent>,
 }
 
 /// A conversation as it is read back: its turns, and whatever it was handed before the first one.
@@ -5479,6 +5974,13 @@ struct TranscriptOut {
     /// one whose first afternoon had been dropped off the top. This is what lets the window offer
     /// to go and get the rest.
     more: bool,
+    /// What departments said in this conversation, oldest first. Empty for almost every chat.
+    ///
+    /// A list of its own beside `turns` rather than folded into them, because a notice is not a
+    /// turn: nothing was asked, nothing ran, nothing was spent, and there is no answer. Giving it a
+    /// turn's shape would mean inventing a prompt nobody typed. The window interleaves the two by
+    /// `created_at`, which is the only place the two orders have to meet.
+    notices: Vec<crate::chat_notices::ChatNotice>,
 }
 
 /// Which slice of a conversation to read back.
@@ -5738,10 +6240,14 @@ async fn read_chat_project(
     // Asked of the same function the turn path asks, rather than restated here. A second copy of
     // this rule would be a second thing to keep true, and the one that answers the window is the
     // one that must agree with the one that launches the run.
+    // `false`: this answers what the person's OWN next message would get, which is the only thing
+    // the window can offer them. A relayed turn's policy is not a property of the conversation and
+    // is not previewable here — it is decided per turn, by the turn that carries a relay id.
     let tools = crate::assistant::tool_policy_for(
         Some(cwd.as_str()),
         crate::assistant::Origin::Shell,
         wired,
+        false,
     ) == crate::runner::ToolPolicy::Unrestricted;
 
     Ok(Json(ChatProjectOut {
@@ -5859,6 +6365,42 @@ async fn get_chat_files(
     }))
 }
 
+/// Every relay sent by any of `turns`, in one read.
+///
+/// An `IN` list built from the turn ids rather than a query per turn: this runs on every transcript
+/// poll, which is every second and a half while a turn is live.
+///
+/// Empty turns answer empty without touching the database — an `IN ()` is not valid SQLite, and
+/// building the statement anyway to discover that would be a round trip to learn something already
+/// known.
+async fn relays_sent_by(
+    pool: &sqlx::SqlitePool,
+    turns: &[AssistantTurn],
+) -> sqlx::Result<Vec<RelaySent>> {
+    if turns.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `QueryBuilder` rather than a formatted string, which is the shape this codebase already uses
+    // for runtime assembly (`feed.rs`, `notes.rs`). `push_bind` writes the placeholder AND binds the
+    // value in one step, so the count of `?` and the count of arguments cannot drift apart — the one
+    // mistake a hand-built `IN` list invites.
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT rel.to_chat_id AS chat_id, dst.title AS title, rel.body AS body,
+                rel.sending_run_id AS sending_run_id
+           FROM chat_relays rel
+           LEFT JOIN chats dst ON dst.chat_id = rel.to_chat_id
+          WHERE rel.sending_run_id IN (",
+    );
+    // LEFT JOIN above for the reason the transcript's own join gives: a destination nobody has
+    // named has no title and must still resolve, and one archived since still has its row.
+    let mut separated = query.separated(", ");
+    for turn in turns {
+        separated.push_bind(turn.id);
+    }
+    query.push(") ORDER BY rel.id");
+    query.build_query_as::<RelaySent>().fetch_all(pool).await
+}
+
 /// A chat's turns, oldest first.
 ///
 /// The daemon has always kept these — a turn is a run — but nothing on the row said which chat it
@@ -5882,13 +6424,24 @@ async fn get_assistant_chat(
     // One more than asked for, and it is never returned. Whether there is anything above this page
     // is a question about the row after the last one, and asking for it here answers it for the
     // price of a row rather than with a second COUNT over the same index.
+    //
+    // Two LEFT JOINs, and left rather than inner for the obvious reason and a less obvious one:
+    // almost every turn has no relay behind it, and an inner join would return only the relayed
+    // ones — but also, a relay row whose source conversation has since been ARCHIVED still has a
+    // `chats` row and still resolves, which is what keeps a transcript readable after the far side
+    // of a conversation is put away. `src.title` being null is an unnamed conversation, not a
+    // missing one; the id beside it always resolves.
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
-        "SELECT id, prompt AS asked, stdout AS answer, stderr AS error, status, cost_usd,
-                answered_by, session_id, created_at, context_fill, tools_used, thought,
-                thought_tokens, prompt_images, compacted
-           FROM runs
-          WHERE chat_id = ? AND mode = 'assistant' AND id < ?
-          ORDER BY id DESC
+        "SELECT r.id, r.prompt AS asked, r.stdout AS answer, r.stderr AS error, r.status,
+                r.cost_usd, r.answered_by, r.session_id, r.created_at, r.context_fill,
+                r.tools_used, r.thought, r.thought_tokens, r.prompt_images, r.compacted,
+                rel.from_chat_id AS relayed_from_chat_id,
+                src.title        AS relayed_from_title
+           FROM runs r
+           LEFT JOIN chat_relays rel ON rel.id = r.from_relay_id
+           LEFT JOIN chats src ON src.chat_id = rel.from_chat_id
+          WHERE r.chat_id = ? AND r.mode = 'assistant' AND r.id < ?
+          ORDER BY r.id DESC
           LIMIT ?",
     )
     .bind(&chat_id)
@@ -5903,6 +6456,16 @@ async fn get_assistant_chat(
     let more = turns.len() as i64 > ASSISTANT_TRANSCRIPT_LIMIT;
     turns.truncate(ASSISTANT_TRANSCRIPT_LIMIT as usize);
     turns.reverse();
+    // One query for the whole transcript, not one per turn. This route is polled every second and a
+    // half while a turn is live, so a per-turn read here would be a hidden multiplier on the most
+    // frequent request this daemon serves — for a list that is empty on almost every turn.
+    //
+    // Empty on a failure rather than a 500, the same trade the queue read below makes: a transcript
+    // is the point of this request, and losing the note about what a turn forwarded is a smaller
+    // loss than a conversation that will not open.
+    let sent = relays_sent_by(&state.pool, &turns)
+        .await
+        .unwrap_or_default();
     // Read through `assistant::handed_over` rather than parsed here: that function is already the
     // one reader of the column's shape, and a second one is a second thing to change the day the
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
@@ -5929,6 +6492,12 @@ async fn get_assistant_chat(
         queued,
         asks: crate::hooks::asks_for(&chat_id),
         more,
+        // Empty on a failure rather than a 500, the same trade the two reads above make: a
+        // transcript is the point of this request, and losing a department's aside is a smaller loss
+        // than a conversation that will not open.
+        notices: crate::chat_notices::for_chat(&state.pool, &chat_id)
+            .await
+            .unwrap_or_default(),
         turns: turns
             .into_iter()
             .map(|turn| {
@@ -5955,12 +6524,23 @@ async fn get_assistant_chat(
                     .as_deref()
                     .and_then(|json| serde_json::from_str(json).ok())
                     .unwrap_or_default();
+                let relayed_to = sent
+                    .iter()
+                    .filter(|relay| relay.sending_run_id == turn.id)
+                    .map(|relay| RelaySent {
+                        chat_id: relay.chat_id.clone(),
+                        title: relay.title.clone(),
+                        body: relay.body.clone(),
+                        sending_run_id: relay.sending_run_id,
+                    })
+                    .collect();
                 AssistantTurnOut {
                     turn,
                     did,
                     images,
                     thought,
                     context_window,
+                    relayed_to,
                 }
             })
             .collect(),
@@ -6338,10 +6918,13 @@ async fn list_ide_sessions(
                 // fix what is already fixed.
                 let wired =
                     crate::autopilot::classifier_hook_is_wired(std::path::Path::new(&session.cwd));
+                // `false` for the reason the route above gives: an offered session is something
+                // the person would type into themselves.
                 let policy = crate::assistant::tool_policy_for(
                     Some(session.cwd.as_str()),
                     crate::assistant::Origin::Shell,
                     wired,
+                    false,
                 );
                 OfferedSession {
                     session,
@@ -16700,6 +17283,744 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// The whole pipeline, over real HTTP: a run's own `RUN_ID_HEADER` is enough to relay into a
+    /// different conversation with nothing else said about who is asking. Owner presence is seeded
+    /// the way `relay.rs`'s own tests seed it — `attention_heartbeats` is the one row
+    /// `attention::owner_is_present` reads — because a fresh test database otherwise fails
+    /// `OwnerAway` before this route's own logic is exercised at all.
+    #[tokio::test]
+    async fn a_relay_over_http_admits_and_creates_a_turn_in_the_destination() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id = crate::assistant::send_message(
+            &state,
+            &from_chat_id,
+            "ola",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{to_chat_id}/relay"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(
+                        crate::daemon_client::RUN_ID_HEADER,
+                        sending_run_id.to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "text": "onward" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let turn_id = body["turn_id"]
+            .as_i64()
+            .expect("a granted relay answers the new turn's id");
+
+        let (from_relay_id, chat_id): (Option<i64>, String) =
+            sqlx::query_as("SELECT from_relay_id, chat_id FROM runs WHERE id = ?")
+                .bind(turn_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(
+            from_relay_id.is_some(),
+            "the destination's new turn must record which relay bore it"
+        );
+        assert_eq!(chat_id, to_chat_id);
+    }
+
+    /// One refusal, read back through the real route rather than through `relay::admit` directly —
+    /// pinning that `relay_refusal_response` is actually wired to what `build_router` serves, not
+    /// merely a function that would map it correctly if called.
+    #[tokio::test]
+    async fn a_relay_to_a_conversation_that_does_not_exist_is_a_named_409() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id = crate::assistant::send_message(
+            &state,
+            &from_chat_id,
+            "ola",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/chats/never-created/relay")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(
+                        crate::daemon_client::RUN_ID_HEADER,
+                        sending_run_id.to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "text": "onward" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["refusal"], "no_such_destination");
+    }
+
+    /// A turn that arrived from Telegram may not relay, and this is the test that makes that
+    /// sentence true rather than merely written.
+    ///
+    /// `relay::Refusal::TelegramOrigin` had a unit test from the day it was written and no way to
+    /// fire in production: this handler had no origin to hand `admit` and passed `Origin::Shell`,
+    /// so every relay was certified as shell-sent whatever had actually asked for it. What closed
+    /// that is 0119 — the origin is on the `runs` row now — and what this test pins is the wiring
+    /// between the two, which is the half a unit test on `admit` cannot reach.
+    ///
+    /// The sending conversation is an ordinary cloud chat; only the ORIGIN of its turn differs from
+    /// the granted case above. That is deliberate — it isolates the one fact under test, so a green
+    /// here cannot be explained by the destination, the chain, or presence.
+    #[tokio::test]
+    async fn a_relay_asked_for_by_a_telegram_turn_is_refused() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id = crate::assistant::send_message(
+            &state,
+            &from_chat_id,
+            "ola",
+            crate::assistant::Origin::Telegram,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{to_chat_id}/relay"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(
+                        crate::daemon_client::RUN_ID_HEADER,
+                        sending_run_id.to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "text": "onward" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["refusal"], "telegram_origin");
+        let relays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(relays, 0, "a refused relay must leave no row behind");
+    }
+
+    /// A sending turn whose origin nobody recorded is refused, not assumed to be the permissive
+    /// answer.
+    ///
+    /// This is the case 0119 chose NULL for instead of `DEFAULT 'shell'`. Every run written before
+    /// that migration has no origin, and a default would have had them all come back claiming the
+    /// shell — turning "nobody knows" into "certified safe" on precisely the rows nothing knows
+    /// anything about. The row below is written by hand because there is no longer any code path
+    /// that produces one: that is the point, and it is also why this refusal would otherwise never
+    /// be exercised.
+    #[tokio::test]
+    async fn a_relay_asked_for_by_a_turn_of_unknown_origin_is_refused() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('ola', 'running', 'assistant', ?, ?) RETURNING id",
+        )
+        .bind(&from_chat_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{to_chat_id}/relay"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(
+                        crate::daemon_client::RUN_ID_HEADER,
+                        sending_run_id.to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "text": "onward" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["refusal"], "unknown_origin");
+    }
+
+    /// A relayed turn says which conversation handed it over; an ordinary one says nothing.
+    ///
+    /// Until this, the transcript had no way to tell the two apart, so a message another
+    /// conversation sent was drawn under "you" — the person reading it had said no such thing.
+    /// That is not a missing decoration: it is the transcript recording the wrong speaker, in the
+    /// one place a person goes to find out what was actually said.
+    ///
+    /// The negative half is pinned in the same test on purpose. The join is a LEFT join across two
+    /// tables, and the failure it is easiest to ship is not "relayed turns say nothing" but "every
+    /// turn says something", where a stray row makes every ordinary message look handed over.
+    #[tokio::test]
+    async fn a_transcript_says_which_conversation_handed_a_turn_over() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &from_chat_id, Some("the other conversation"))
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id = crate::assistant::send_message(
+            &state,
+            &from_chat_id,
+            "ola",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+        // The person's own turn goes in by hand rather than through `send_message`, and the reason
+        // is the chat slot: a sent turn holds its conversation until it finishes, so sending one
+        // here and then relaying into the same conversation refuses with `turn_in_progress` before
+        // the join under test is ever reached. What this row has to be is a turn of this chat with
+        // no relay behind it, which is exactly what it is.
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('typed here by a person', 'completed', 'assistant', ?, 'shell', ?)",
+        )
+        .bind(&to_chat_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let relay_id = crate::relay::admit(
+            &state.pool,
+            &from_chat_id,
+            &to_chat_id,
+            sending_run_id,
+            crate::assistant::Origin::Shell,
+            "onward",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("every brake is clear");
+        crate::assistant::send_relayed_message(
+            &state,
+            &to_chat_id,
+            "onward",
+            crate::assistant::Origin::Shell,
+            relay_id,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{to_chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let turns = body["turns"].as_array().expect("a transcript of turns");
+        assert_eq!(turns.len(), 2);
+
+        assert_eq!(turns[0]["asked"], "typed here by a person");
+        assert_eq!(turns[0]["relayed_from_chat_id"], serde_json::Value::Null);
+        assert_eq!(turns[0]["relayed_from_title"], serde_json::Value::Null);
+
+        assert_eq!(turns[1]["asked"], "onward");
+        assert_eq!(turns[1]["relayed_from_chat_id"], from_chat_id);
+        assert_eq!(turns[1]["relayed_from_title"], "the other conversation");
+    }
+
+    /// The conversation that SENT a relay records where it went and what it said.
+    ///
+    /// The receiving half of this shipped first and left the sender blind: its transcript showed a
+    /// turn that had run a tool called `send_to_chat`, with no detail — not which conversation, not
+    /// the words. So the one conversation certain to be watched by the person who caused the relay
+    /// was the one that could not say what it had done.
+    ///
+    /// Read off `chat_relays` rather than off the tool call the CLI reported. The relay row is what
+    /// the daemon actually admitted and wrote; a tool call is what the model asked for, and the two
+    /// differ every time a relay is refused. A sender's transcript that showed the ASK would show
+    /// messages that never arrived.
+    #[tokio::test]
+    async fn the_sending_conversation_says_where_its_relay_went_and_what_it_said() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &to_chat_id, Some("a conversa que recebe"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id = crate::assistant::send_message(
+            &state,
+            &from_chat_id,
+            "manda isto para a outra",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+        crate::relay::admit(
+            &state.pool,
+            &from_chat_id,
+            &to_chat_id,
+            sending_run_id,
+            crate::assistant::Origin::Shell,
+            "as palavras que seguiram",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("every brake is clear");
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{from_chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let turns = body["turns"].as_array().expect("a transcript of turns");
+        assert_eq!(turns.len(), 1);
+
+        let sent = turns[0]["relayed_to"]
+            .as_array()
+            .expect("a turn that relayed says so");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["chat_id"], to_chat_id);
+        assert_eq!(sent[0]["title"], "a conversa que recebe");
+        assert_eq!(sent[0]["body"], "as palavras que seguiram");
+    }
+
+    /// A turn that relayed nothing says so with an empty list, and never with a stray entry.
+    ///
+    /// Its own test because the query behind it selects by `sending_run_id` across the whole table:
+    /// the failure that is easy to ship is not "senders show nothing" but "every turn shows
+    /// somebody else's relay", and a transcript that claimed every message had been forwarded is
+    /// worse than one that claimed none had.
+    #[tokio::test]
+    async fn a_turn_that_relayed_nothing_carries_an_empty_list() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        // A relay exists in the table, sent by a run that is NOT this chat's turn.
+        sqlx::query(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('somebody', 'else', 999, 'not mine', 1, ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        crate::assistant::send_message(
+            &state,
+            &chat_id,
+            "uma mensagem comum",
+            crate::assistant::Origin::Shell,
+        )
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let turns = body["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["relayed_to"].as_array().unwrap().len(), 0);
+    }
+
+    /// The whole path a relayed turn travelled, root first — not just the hop it arrived on.
+    ///
+    /// The transcript names the conversation that handed a turn over, and with `MAX_RELAY_DEPTH`
+    /// at three that is not the same question as "where did this start". "B spoke to me" hides
+    /// that A started it, and A is the conversation somebody actually typed into.
+    ///
+    /// Its own route rather than a field on the transcript, and the reason is cost: the transcript
+    /// is polled every second and a half while a turn is live, and a chain is read when a person
+    /// asks for one — by hovering — which is almost never. Putting it in the payload would pay for
+    /// every relayed turn on every poll to answer a question nobody asked.
+    #[tokio::test]
+    async fn a_relayed_turn_can_be_asked_the_whole_path_it_travelled() {
+        let state = test_state().await;
+        let a = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let b = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let c = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &a, Some("a primeira"))
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &c, Some("a terceira"))
+            .await
+            .unwrap();
+
+        // A person's turn in A, then A -> B, then B -> C. Written directly rather than sent,
+        // because sending holds each chat's slot and this test is about the walk, not the send.
+        let run_a: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('escrito por uma pessoa', 'completed', 'assistant', ?, 'shell', ?) RETURNING id",
+        )
+        .bind(&a)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let relay_ab: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES (?, ?, ?, 'para a B', 1, ?) RETURNING id",
+        )
+        .bind(&a)
+        .bind(&b)
+        .bind(run_a)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let run_b: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, from_relay_id, created_at)
+             VALUES ('para a B', 'completed', 'assistant', ?, 'shell', ?, ?) RETURNING id",
+        )
+        .bind(&b)
+        .bind(relay_ab)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let relay_bc: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES (?, ?, ?, 'para a C', 2, ?) RETURNING id",
+        )
+        .bind(&b)
+        .bind(&c)
+        .bind(run_b)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let run_c: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, from_relay_id, created_at)
+             VALUES ('para a C', 'completed', 'assistant', ?, 'shell', ?, ?) RETURNING id",
+        )
+        .bind(&c)
+        .bind(relay_bc)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{c}/turns/{run_c}/chain"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let chain = body["chain"].as_array().expect("the path, root first");
+
+        assert_eq!(chain.len(), 3, "three conversations, two hops");
+        assert_eq!(chain[0]["chat_id"], a);
+        assert_eq!(chain[0]["title"], "a primeira");
+        assert_eq!(chain[1]["chat_id"], b);
+        // Unnamed conversations keep their place in the path and answer null rather than dropping
+        // out of it — a chain with a hole in it is a chain that lies about its own length.
+        assert_eq!(chain[1]["title"], serde_json::Value::Null);
+        assert_eq!(chain[2]["chat_id"], c);
+        assert_eq!(chain[2]["title"], "a terceira");
+    }
+
+    /// A turn of a different conversation is not readable through this chat's route.
+    ///
+    /// The control token permits every route (`auth::permits`), so this narrowing is not what keeps
+    /// a stranger out — nothing here does, and nothing here claims to. What it keeps out is a
+    /// window bug: a stale turn id from a conversation the person has since navigated away from
+    /// would otherwise answer with somebody else's path, drawn under the title of the chat on
+    /// screen.
+    #[tokio::test]
+    async fn a_chain_is_only_readable_through_the_conversation_the_turn_belongs_to() {
+        let state = test_state().await;
+        let mine = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let other = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let run_elsewhere: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('noutra conversa', 'completed', 'assistant', ?, 'shell', ?) RETURNING id",
+        )
+        .bind(&other)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/assistant/chats/{mine}/turns/{run_elsewhere}/chain"
+                    ))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A person forwards a turn to another conversation, and it arrives as a relay like any other.
+    ///
+    /// The gesture the model already had and the person did not. What makes it a relay rather than
+    /// a plain message is `from_turn_id`: `chat_relays` needs a `sending_run_id`, a turn IS a run,
+    /// so a forward fits the table unchanged — and `relay::chain_of` walks straight through it, so
+    /// a person's forward is bounded by the same cycle and depth rules a model's is.
+    #[tokio::test]
+    async fn a_person_can_forward_a_turn_into_another_conversation() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let turn_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('o que foi dito', 'completed', 'assistant', ?, 'shell', ?) RETURNING id",
+        )
+        .bind(&from_chat_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{to_chat_id}/forward"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "from_turn_id": turn_id,
+                            "text": "olha o que a outra disse"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let landed = json_body(response).await["turn_id"]
+            .as_i64()
+            .expect("a granted forward answers the new turn's id");
+
+        let (chat_id, from_relay): (String, Option<i64>) =
+            sqlx::query_as("SELECT chat_id, from_relay_id FROM runs WHERE id = ?")
+                .bind(landed)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(chat_id, to_chat_id);
+        let relay_id = from_relay.expect("a forwarded turn is relay-born like any other");
+
+        // The row records the person's words and the turn they were forwarded from, which is what
+        // lets the chain be walked back through this hop at all.
+        let (body, sending_run_id): (String, i64) =
+            sqlx::query_as("SELECT body, sending_run_id FROM chat_relays WHERE id = ?")
+                .bind(relay_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(body, "olha o que a outra disse");
+        assert_eq!(sending_run_id, turn_id);
+    }
+
+    /// Forwarding a turn that arrived from Telegram is refused, exactly as a model relaying from
+    /// one would be.
+    ///
+    /// The choice this pins: `admit` is asked about the origin of the TURN, not about the person
+    /// doing the forwarding. Passing `Origin::Shell` here — true of the person, false of the turn —
+    /// would have been telling the gate something untrue in order to get a different answer out of
+    /// it, and would have left two rules where the code has one.
+    #[tokio::test]
+    async fn forwarding_a_turn_that_came_from_telegram_is_refused() {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let turn_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('veio do telegram', 'completed', 'assistant', ?, 'telegram', ?) RETURNING id",
+        )
+        .bind(&from_chat_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{to_chat_id}/forward"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "from_turn_id": turn_id, "text": "passa a palavra" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(response).await["refusal"], "telegram_origin");
     }
 
     /// What waits reaches the window, or nothing on screen says the words were kept.

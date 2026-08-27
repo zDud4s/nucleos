@@ -40,7 +40,12 @@ pub const SEAT_SKIPPED: &str = "skipped";
 /// gives: it is the same request the MCP subprocess makes, through the same handler, with the same
 /// authorisation — so a local seat and a cloud seat cannot diverge in what a tool DOES, only in
 /// which tools they are offered.
-const DAEMON_URL: &str = "http://127.0.0.1:8791";
+/// Where this daemon is reached. A function and not a `const`, because the port is no longer a
+/// compile-time fact: a second instance binds its own (`daemon_client::PORT_VAR`), and a const
+/// would send its runs to whichever daemon happens to hold the default.
+fn daemon_url() -> String {
+    crate::daemon_client::daemon_url()
+}
 
 /// The `runs.mode` every seat invocation is recorded under.
 ///
@@ -1580,7 +1585,7 @@ impl Driver {
         // which is exactly what a seat must not have. Phases 2 and 3 get an empty box — no tools is
         // no tools whichever machine answers.
         let tools = crate::mcp_tools::LocalToolBox::for_council(
-            DAEMON_URL.to_string(),
+            daemon_url(),
             self.token.clone(),
             self.state.pool.clone(),
         );

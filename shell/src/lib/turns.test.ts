@@ -29,6 +29,9 @@ function row(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     context_fill: null,
     context_window: 140000,
     compacted: false,
+    relayed_from_chat_id: null,
+    relayed_from_title: null,
+    relayed_to: [],
     ...overrides,
   };
 }
@@ -50,9 +53,57 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     contextFill: null,
     window: 140000,
     compacted: false,
+    relayedFrom: null,
+    relayedTo: [],
     ...overrides,
   };
 }
+
+describe("turnFromRow, on where a turn came from", () => {
+  // A relayed turn is not something the person reading it said. Drawn without this the transcript
+  // attributes another conversation's words to them, under their own name — the transcript getting
+  // the speaker wrong, in the one place somebody goes to find out who said what.
+  it("carries the conversation that handed a turn over", () => {
+    const relayed = turnFromRow(
+      row({
+        relayed_from_chat_id: "0d2b-…-9f1",
+        relayed_from_title: "the planning conversation",
+      }),
+    );
+
+    expect(relayed.relayedFrom).toEqual({
+      chatId: "0d2b-…-9f1",
+      title: "the planning conversation",
+    });
+  });
+
+  // Most conversations have no title: the daemon writes one only once it has summarised the chat.
+  // The id is what always resolves, so it travels beside the title rather than being replaced by
+  // it — a page given only the title could say nothing at all about an unnamed conversation.
+  it("keeps the id when the conversation has no name yet", () => {
+    const relayed = turnFromRow(
+      row({ relayed_from_chat_id: "0d2b-…-9f1", relayed_from_title: null }),
+    );
+
+    expect(relayed.relayedFrom).toEqual({ chatId: "0d2b-…-9f1", title: null });
+  });
+
+  // The ordinary case, and the one worth pinning: a stray object here would put a "handed over"
+  // note above every message the person ever typed.
+  it("reads a turn nobody relayed as one the person typed", () => {
+    expect(turnFromRow(row()).relayedFrom).toBeNull();
+  });
+
+  // A daemon older than the columns sends neither key — the same rule `did` and `images` already
+  // follow. A conversation that will not draw over one missing field is the worse answer.
+  it("reads a daemon that does not send the columns as no relay", () => {
+    const older = row();
+    delete (older as Partial<AssistantTurnRow>).relayed_from_chat_id;
+    delete (older as Partial<AssistantTurnRow>).relayed_from_title;
+
+    expect(turnFromRow(older).relayedFrom).toBeNull();
+  });
+});
 
 describe("turnFromRow, on what a turn thought", () => {
   // The size, because the words do not exist: the CLI sends every thinking block with its text

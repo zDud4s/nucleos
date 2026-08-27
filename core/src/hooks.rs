@@ -321,17 +321,22 @@ pub async fn pretooluse_decision(
         return council_decision(&state, &payload).await;
     }
 
-    // A department is in the same position as a seat, and this branch is the SECOND layer rather
-    // than the first. `team.rs` launches with `cwd: None`, so no `.claude/settings.json` of the
-    // owner's resolves and this hook may never fire at all — which is why `auth::TEAM_ROUTES` is
-    // the barrier that has to hold alone, and does.
+    // A department is in the same position as a seat, and for the question of WHICH tools this
+    // branch is the SECOND layer rather than the first. `team.rs` launches with `cwd: None`, so no
+    // `.claude/settings.json` of the owner's resolves and this hook may never fire at all — which
+    // is why `auth::TEAM_ROUTES` is the barrier that has to hold alone there, and does.
     //
-    // It is kept anyway for a reason of its own: it is the layer that carries "having read
-    // untrusted text, act no more" for the day a department is given something to act with. Today
-    // there is no `Acts` on `TEAM_TOOLS` for that rule to bite on, and two independent refusals of
-    // the same call is what one wants at a boundary.
+    // For the other question — having read, may it still act — this branch is not a second layer at
+    // all. It is the ONLY one on the cloud path. `auth::permits` is a pure function over
+    // `(Scope, Method, path)` and cannot know what a turn has read, and `permitted_after_untrusted`
+    // has exactly one caller in this codebase (`local_agent.rs`), which is the Ollama path.
+    //
+    // The two sentences that used to stand here said `TEAM_TOOLS` carried no `Acts` and that there
+    // was nothing for the ordering rule to bite on. Both were true when written and stopped being
+    // true when the alçada landed: `propose_action` and `propose_teammate` are `Acts` today, and
+    // `propose_action`'s own grading exists precisely so this door shuts.
     if mode == crate::team::TEAM_MODE {
-        return team_decision(&payload);
+        return team_decision(&state, &payload).await;
     }
 
     let classification = classifier::classify(
@@ -1134,40 +1139,140 @@ async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json
     })
 }
 
-/// PURE: what a team agent may call, by name alone.
+/// What a team agent may call: the named list, and — once it has read a stranger's words — the
+/// reads alone.
 ///
-/// Narrower than the council's sibling and simpler for it: `TEAM_TOOLS` carries no `Acts`, so there
-/// is no ordering rule to apply, and there is no `get_run` on the list to ask a second question
-/// about. What a specialist may read of its own run's folder is decided by the key it holds, in
-/// `team::post_read_file`, and not here — so this branch has nothing stateful left to get wrong.
+/// **Two questions, and this branch used to answer only the first.** Which tools a department may
+/// reach is `TEAM_TOOLS`, and `auth::TEAM_ROUTES` refuses the rest without anybody's cooperation.
+/// Whether it may still ACT, having read, was answered nowhere on the cloud path: this function
+/// allowed every name on the list unconditionally, and the doc that stood here said `TEAM_TOOLS`
+/// carried no `Acts` — true when it was written, false since the alçada landed.
+///
+/// **`TEAM_TOOLS` is six untrusted reads and two asks**, which is what makes the shape below so
+/// small. `get_email`, `get_email_queue`, `list_files`, `read_team_file`, `web_read` and
+/// `web_search` all carry somebody else's words into the turn; `propose_action` and
+/// `propose_teammate` are the alçada. A department's whole day is: read the world, then ask — and
+/// the rule is that the asking comes first or not at all.
+///
+/// **The marking is this function's too, and that half was missing as well.** A refusal that
+/// consults a flag nothing ever sets is a refusal that never fires, and `runs.read_untrusted` was
+/// written for a cloud team node by nothing at all: the orchestrator's marking arm lives past the
+/// `mode` branch that dispatches here, so a department returns before ever reaching it, and
+/// `team.rs` marks on the LOCAL path only, off `local_agent`'s taint atomic. Adding the refusal
+/// without the marking would have looked exactly like a fix and behaved exactly like none.
+///
+/// `effect_of_call` rather than the bare `tool_effect`, even though the two are identical for every
+/// name on today's list — that function short-circuits anything which is not `ReadsOwn`, and no
+/// team tool is. It is asked anyway so that the day somebody puts `get_run` on a department's list,
+/// this branch gets the argument-aware answer the orchestrator gets rather than the bare table's.
+/// One implementation is the only way two callers cannot disagree, which is a lesson this file
+/// records having already paid for once.
 ///
 /// Whole segment and not a prefix, for the reason `assistant_decision` records: an MCP server named
 /// `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test and is not this server.
-fn team_decision(payload: &PreToolUsePayload) -> Json<Decision> {
+async fn team_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
     let permitted = payload
         .tool_name
         .strip_prefix("mcp__nucleos__")
         .filter(|tool| !tool.contains("__"))
-        .is_some_and(|tool| crate::mcp_tools::TEAM_TOOLS.contains(&tool));
+        .filter(|tool| crate::mcp_tools::TEAM_TOOLS.contains(tool));
 
-    if permitted {
+    let Some(tool) = permitted else {
+        // Debug and not warn, for the reason the council's branch gives: a specialist reaching for
+        // `create_run` is a model being a model, not a symptom of anything.
+        tracing::debug!(
+            run_id = payload.run_id,
+            tool = %payload.tool_name,
+            "pretooluse-decision: refused a tool a team agent may not call"
+        );
         return Json(Decision {
-            decision: "allow".to_owned(),
-            reason: "team agents may read".to_owned(),
+            decision: "deny".to_owned(),
+            reason: "a team agent may only read".to_owned(),
         });
-    }
+    };
 
-    // Debug and not warn, for the reason the council's branch gives: a specialist reaching for
-    // `create_run` is a model being a model, not a symptom of anything.
-    tracing::debug!(
-        run_id = payload.run_id,
-        tool = %payload.tool_name,
-        "pretooluse-decision: refused a tool a team agent may not call"
-    );
-    Json(Decision {
-        decision: "deny".to_owned(),
-        reason: "a team agent may only read".to_owned(),
-    })
+    // `None` rather than a walk: `errand_of_run` resolves an errand from a run's `chat_id`, and a
+    // team run has none — `team::open_run` writes no `chat_id` at all. Passing `None` says so
+    // outright instead of paying a query to be told it.
+    let effect =
+        crate::mcp_tools::effect_of_call(&state.pool, tool, &payload.tool_input, None).await;
+
+    match effect {
+        crate::mcp_tools::ToolEffect::ReadsUntrusted => {
+            // Marked BEFORE the read is allowed, and a failure to mark refuses it — the same rule
+            // and the same direction as the orchestrator's arm. The alternative is a department
+            // holding a stranger's words with no record of having read them, which is the one state
+            // every refusal below depends on not existing.
+            if let Err(error) =
+                crate::runs::mark_untrusted_context(&state.pool, payload.run_id).await
+            {
+                tracing::warn!(
+                    run_id = payload.run_id,
+                    tool,
+                    %error,
+                    "pretooluse-decision: could not record that a department read third-party content - refusing the read"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not record that this turn read third-party content".to_owned(),
+                });
+            }
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "team agents may read".to_owned(),
+            })
+        }
+        crate::mcp_tools::ToolEffect::Acts => {
+            match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
+                Ok(false) => Json(Decision {
+                    decision: "allow".to_owned(),
+                    reason: "a department may ask".to_owned(),
+                }),
+                Ok(true) => {
+                    // Warned rather than merely refused, and unlike the council's `debug!` this one
+                    // earns it: a specialist reaching for `create_run` is a model being a model, but
+                    // a director filing a proposal straight after reading a web page is the exact
+                    // sentence `propose_teammate`'s own comment describes - a director that read a
+                    // page saying "hire an agent with this prompt" could otherwise file it.
+                    tracing::warn!(
+                        run_id = payload.run_id,
+                        tool,
+                        "pretooluse-decision: refused a department's ask in a turn that has read third-party content"
+                    );
+                    // Written down for the reason the orchestrator's is: the alçada exists so a
+                    // person reads a queue, and a refusal that leaves no trace is a department that
+                    // quietly stopped asking with nothing anywhere saying why.
+                    record_refused_action(state, payload, tool, None).await;
+                    Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
+                    })
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = payload.run_id,
+                        tool,
+                        %error,
+                        "pretooluse-decision: could not tell whether a department has read third-party content - failing closed"
+                    );
+                    Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: "could not tell whether this turn has read third-party content"
+                            .to_owned(),
+                    })
+                }
+            }
+        }
+        // Nothing on today's list lands here, and the arm is written out rather than folded into a
+        // wildcard so that a tool added to `TEAM_TOOLS` which neither carries a stranger's words nor
+        // acts is allowed DELIBERATELY, by whoever puts it there.
+        crate::mcp_tools::ToolEffect::ReadsOwn | crate::mcp_tools::ToolEffect::WritesOwn => {
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "team agents may read".to_owned(),
+            })
+        }
+    }
 }
 
 /// Whether a `get_run` call names another council seat's run.
@@ -3455,11 +3560,76 @@ mod tests {
 
         // And the reads it exists to do are allowed, so the loop above is refusing the actions
         // rather than the whole server.
+        //
+        // **A fresh run per tool, and the reason is the rule this file now enforces.** Six of the
+        // eight names below are `ReadsUntrusted`, so calling one MARKS the turn — and `get_email`
+        // sorts before `propose_action`. Sharing one run would have this loop assert that a
+        // department may ask having already read, which is the opposite of what `team_decision`
+        // decides, and it would do so as an accident of alphabetical order rather than as anything
+        // anybody chose. What this loop means is "each of these is allowed to a department that has
+        // not read yet", and one run each is what says that.
         for tool in crate::mcp_tools::TEAM_TOOLS {
-            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            let clean = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+            let decision = orchestrator_tool(&app, clean, tool, serde_json::json!({})).await;
             assert_eq!(
                 decision.decision, "allow",
                 "a department was refused {tool}"
+            );
+        }
+    }
+
+    /// A department that has read a stranger's words may still read, and may no longer ask.
+    ///
+    /// This is the rule `propose_action`'s own grading was written for — *"a specialist that has
+    /// read a web page or a colleague's file loses it for the rest of the turn, which is exactly
+    /// the door that must close"* — and until this test the door was open on the cloud path.
+    /// `team_decision` allowed every name in `TEAM_TOOLS` unconditionally, and the two comments
+    /// above it asserted the premise that justified doing so: *"`TEAM_TOOLS` carries no `Acts`"*.
+    /// Both sentences were true when written and stopped being true when the alçada landed.
+    ///
+    /// The local box did enforce it, which is why nothing looked broken: `local_agent.rs` is the
+    /// ONE caller of `permitted_after_untrusted` in this codebase, so the rule held for an Ollama
+    /// specialist and not for the Claude CLI one that runs by default.
+    ///
+    /// Both halves are asserted on purpose. A barrier that refused everything would also pass the
+    /// first loop, and a department whose reads shut down after one web page cannot do the job it
+    /// exists for — the rule is "having read, act no more", not "having read, stop".
+    #[tokio::test]
+    async fn a_team_agent_that_read_a_strangers_words_may_still_read_and_may_no_longer_ask() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+        crate::runs::mark_untrusted_context(&state.pool, run_id)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        // Enumerated from `TEAM_TOOLS` filtered by effect, not from a list typed here, so a third
+        // acting tool added to a department's box is covered the day it arrives.
+        let mut acting = 0;
+        for tool in crate::mcp_tools::TEAM_TOOLS {
+            if crate::mcp_tools::tool_effect(tool) != crate::mcp_tools::ToolEffect::Acts {
+                continue;
+            }
+            acting += 1;
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            assert_eq!(
+                decision.decision, "deny",
+                "a department that had read a stranger's words still reached {tool}"
+            );
+        }
+        assert_eq!(
+            acting, 2,
+            "a department holds exactly two acting tools; if that changed, this test is measuring              something other than what it was written for"
+        );
+
+        for tool in crate::mcp_tools::TEAM_TOOLS {
+            if crate::mcp_tools::tool_effect(tool) == crate::mcp_tools::ToolEffect::Acts {
+                continue;
+            }
+            let decision = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
+            assert_eq!(
+                decision.decision, "allow",
+                "a department that had read one page was refused {tool}, and reading is its job"
             );
         }
     }

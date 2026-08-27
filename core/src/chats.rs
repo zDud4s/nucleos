@@ -128,6 +128,24 @@ pub struct ChatSummary {
     /// watermark rather than stored, so it is right after a crash without anything having been
     /// written when the turn ended.
     pub waiting: i64,
+    /// How many of those came from ANOTHER conversation rather than from something you asked.
+    ///
+    /// A subset of `waiting`, never a separate axis: a relay still being written is not yet
+    /// something to come back to, for the same reason any other running turn is not.
+    ///
+    /// It exists because one number cannot say two things. "Your conversation answered you" and
+    /// "a different conversation pulled you into its subject" are different events, and the one you
+    /// did not start is the one worth a second glance — which is precisely the one a single count
+    /// disguised as the other.
+    pub relayed_waiting: i64,
+    /// How many departments have said something here since this conversation was last opened.
+    ///
+    /// Its own axis and NOT a subset of `waiting`, unlike `relayed_waiting` above: a notice is not a
+    /// turn at all — nothing ran and nothing was spent — so it cannot be a share of a count of
+    /// turns. The window says the two separately for the reason `relayed_waiting` exists: one
+    /// number cannot say two things, and "a department you set going has something to tell you" is
+    /// not "your conversation answered you".
+    pub notices_waiting: i64,
 }
 
 /// Sends the `extra_dirs` column out as the list it holds, rather than as the JSON that holds it.
@@ -667,6 +685,11 @@ pub async fn drop_queued(pool: &SqlitePool, chat_id: &str, id: i64) -> sqlx::Res
 /// opposite lives: a run is read on every poll and lives for ever, a queued message is read once by
 /// the drain that sends it and is deleted in the same statement. Keeping the words and losing the
 /// screenshot would be losing half of what somebody sent, without saying so.
+///
+/// Delegates to `enqueue_inner` with no relay id — every caller of THIS name is a message a person
+/// (or Telegram, or the IDE) actually typed, never a hand-off between conversations, so the row it
+/// writes must never carry one. `enqueue_relayed`, below, is the only door a relay id comes in
+/// through.
 pub async fn enqueue(
     pool: &SqlitePool,
     chat_id: &str,
@@ -674,13 +697,49 @@ pub async fn enqueue(
     origin: &str,
     images: &str,
 ) -> sqlx::Result<()> {
+    enqueue_inner(pool, chat_id, text, origin, images, None).await
+}
+
+/// Keeps a relayed message until its destination conversation has a turn free, naming the relay it
+/// travelled on so the link survives the wait.
+///
+/// A message a person typed and a message another conversation handed over queue on the very same
+/// table — the wait is the same wait either way — so this shares `enqueue_inner` with `enqueue`
+/// rather than duplicating the INSERT. What differs is only which relay, if any, the row remembers.
+pub async fn enqueue_relayed(
+    pool: &SqlitePool,
+    chat_id: &str,
+    text: &str,
+    origin: &str,
+    images: &str,
+    relay_id: i64,
+) -> sqlx::Result<()> {
+    enqueue_inner(pool, chat_id, text, origin, images, Some(relay_id)).await
+}
+
+/// The shared write behind `enqueue` and `enqueue_relayed`.
+///
+/// `relay_id` is written into the same INSERT that creates the row, not added by an UPDATE once the
+/// message is queued. A queued message already sits between two writes with nothing else guarding
+/// it — the enqueue and the eventual drain — and a second statement here would open a window in
+/// which the row exists with no relay recorded, exactly the gap 0122's header warns `runs` against.
+async fn enqueue_inner(
+    pool: &SqlitePool,
+    chat_id: &str,
+    text: &str,
+    origin: &str,
+    images: &str,
+    relay_id: Option<i64>,
+) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO chat_queue (chat_id, text, origin, images, created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO chat_queue (chat_id, text, origin, images, relay_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(chat_id)
     .bind(text)
     .bind(origin)
     .bind(images)
+    .bind(relay_id)
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await
@@ -695,14 +754,19 @@ pub async fn enqueue(
 /// order would be safer against a message lost to a crash mid-send, and that is the wrong trade:
 /// one lost message is a person retyping a sentence, one duplicated message is a turn nobody asked
 /// for acting on a conversation twice.
+///
+/// The fourth element is the relay this message travelled on, or `None` for a message a person
+/// typed. Read straight off the row rather than re-derived: `enqueue_inner` is the one place that
+/// decides whether a message carries a relay id, and a second opinion here could only ever disagree
+/// with it.
 pub async fn take_queued(
     pool: &SqlitePool,
     chat_id: &str,
-) -> sqlx::Result<Option<(String, Option<String>, Option<String>)>> {
+) -> sqlx::Result<Option<(String, Option<String>, Option<String>, Option<i64>)>> {
     sqlx::query_as(
         "DELETE FROM chat_queue
           WHERE id = (SELECT id FROM chat_queue WHERE chat_id = ? ORDER BY id LIMIT 1)
-      RETURNING text, origin, images",
+      RETURNING text, origin, images, relay_id",
     )
     .bind(chat_id)
     .fetch_optional(pool)
@@ -751,7 +815,24 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
                 (SELECT COUNT(*) FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                     AND r.status NOT IN ('running', 'pending')
-                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS waiting
+                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS waiting,
+                -- The same predicate, narrowed by the one column that says a turn was handed over
+                -- (0122). Written out rather than derived from `waiting` because SQLite has no way
+                -- to reuse a select-list alias in a sibling expression, and a subquery that
+                -- disagreed with the one above by a word would be a count nobody could reconcile.
+                (SELECT COUNT(*) FROM runs r
+                  WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
+                    AND r.status NOT IN ('running', 'pending')
+                    AND r.from_relay_id IS NOT NULL
+                    AND r.id > COALESCE(c.last_seen_turn_id, 0)) AS relayed_waiting,
+                -- A third count and NOT a subset of the first, unlike the one above it. A notice is
+                -- not a turn: nothing ran, nothing was spent, and it lives in its own table with its
+                -- own watermark. Adding it to `waiting` would make one number the sum of two things
+                -- with different meanings, and the window could no longer say which of them the
+                -- person is being called back for.
+                (SELECT COUNT(*) FROM chat_notices n
+                  WHERE n.chat_id = c.chat_id
+                    AND n.id > COALESCE(c.last_seen_notice_id, 0)) AS notices_waiting
            FROM chats c
           WHERE c.archived_at IS NULL
           ORDER BY COALESCE(last_activity, c.created_at) DESC",
@@ -842,7 +923,15 @@ pub async fn mark_seen(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
                     WHERE r.chat_id = chats.chat_id
                       AND r.mode = 'assistant'
                       AND r.status NOT IN ('running', 'pending')),
-                  last_seen_turn_id)
+                  last_seen_turn_id),
+                -- The notices own watermark, written in the same statement so there is exactly
+                -- one moment at which a conversation becomes read. There is no still-landing case
+                -- to skip here, unlike the turns above: a notice is written complete or not at all,
+                -- so every id is one somebody could have seen. COALESCE for the reason above -- a
+                -- chat with no notices must not have its watermark cleared by being opened.
+                last_seen_notice_id = COALESCE(
+                  (SELECT MAX(n.id) FROM chat_notices n WHERE n.chat_id = chats.chat_id),
+                  last_seen_notice_id)
           WHERE chat_id = ?",
     )
     .bind(chat_id)
@@ -936,6 +1025,37 @@ mod queue_tests {
         let pool = pool_with_a_queue().await;
 
         assert!(!drop_queued(&pool, "c-1", 999).await.unwrap());
+    }
+
+    /// A relayed message that has to wait — its destination conversation is busy — must come back
+    /// out of the queue still naming the relay it travelled on. Losing that link during the wait is
+    /// exactly as bad as never writing it: `relay::chain_of` would walk back to the run this message
+    /// eventually becomes, find `from_relay_id IS NULL`, and read a relayed message as a turn a
+    /// person wrote — resetting the depth the whole mechanism exists to bound.
+    ///
+    /// Pinned alongside its own negative rather than in a separate test, because the two are one
+    /// property: `enqueue` — every caller that is not a relay — must not have a message pick up a
+    /// relay id merely by passing through the same table and the same drain that a relayed one uses.
+    #[tokio::test]
+    async fn a_queued_relay_keeps_its_link_through_the_wait() {
+        let pool = pool_with_a_queue().await;
+
+        enqueue_relayed(&pool, "c-1", "onward to c-1", "shell", "[]", 7)
+            .await
+            .unwrap();
+        let (_, _, _, relayed) = take_queued(&pool, "c-1").await.unwrap().unwrap();
+        assert_eq!(
+            relayed,
+            Some(7),
+            "a relayed message must keep its relay id through the wait"
+        );
+
+        enqueue(&pool, "c-1", "hello", "shell", "[]").await.unwrap();
+        let (_, _, _, ordinary) = take_queued(&pool, "c-1").await.unwrap().unwrap();
+        assert_eq!(
+            ordinary, None,
+            "an ordinary message must not acquire a relay id by accident"
+        );
     }
 }
 
@@ -1077,6 +1197,60 @@ mod tests {
 
     async fn waiting_in(pool: &SqlitePool, chat_id: &str) -> i64 {
         get(pool, chat_id).await.unwrap().unwrap().waiting
+    }
+
+    /// A relay that landed counts twice over: as something waiting, and as something ANOTHER
+    /// conversation put there.
+    ///
+    /// The sidebar has one number, and until now a relay was indistinguishable from an answer to
+    /// something you asked. They are not the same event: one is your own conversation coming back
+    /// to you, the other is a different conversation pulling you into its subject. A single count
+    /// makes the second look like the first, which is exactly backwards — the one you did not
+    /// start is the one worth a second glance.
+    ///
+    /// A subset of `waiting` and not a separate axis: both are unseen settled turns, so a relay
+    /// still being written is not yet something to come back to, for the same reason any other
+    /// running turn is not.
+    #[tokio::test]
+    async fn a_relay_that_landed_is_counted_apart_from_an_ordinary_answer() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        let relay_id: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('outra', ?, 1, 'vem de fora', 1, ?) RETURNING id",
+        )
+        .bind(&id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        turn_in(&pool, &id, "completed").await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, from_relay_id, created_at)
+             VALUES ('vem de fora', 'completed', 'assistant', ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(relay_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let summary = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(summary.waiting, 2, "both landed and neither has been seen");
+        assert_eq!(
+            summary.relayed_waiting, 1,
+            "only one of them came from another conversation"
+        );
+
+        mark_seen(&pool, &id).await.unwrap();
+        let summary = get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(summary.waiting, 0);
+        assert_eq!(
+            summary.relayed_waiting, 0,
+            "opening the conversation clears both counts, not just the total"
+        );
     }
 
     #[tokio::test]

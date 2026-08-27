@@ -135,6 +135,48 @@ export interface AssistantTurnRow {
    * is whether the model deliberated and roughly how hard.
    */
   thought_tokens: number | null;
+  /**
+   * The conversation that handed this turn its words, or null for the ordinary
+   * case — somebody typed them here.
+   *
+   * Optional on the wire because a daemon older than the column sends neither
+   * key, the same way `did` and `images` are read defensively below.
+   */
+  relayed_from_chat_id?: string | null;
+  /** What that conversation is called, or null when nobody has named it. */
+  relayed_from_title?: string | null;
+  /**
+   * The relays this turn SENT. Empty on almost every turn.
+   *
+   * Optional on the wire for the reason the two above are: a daemon older than
+   * the column sends no such key.
+   */
+  relayed_to?: RelaySent[];
+}
+
+/**
+ * One relay a turn sent: where it went, and what it said.
+ *
+ * `body` is what the daemon actually wrote down, not what the model asked for.
+ * The two differ every time a relay is refused, and a sender's transcript built
+ * from the asks would show messages that never arrived.
+ */
+export interface RelaySent {
+  chat_id: string;
+  /** Null on a conversation nobody has named yet. */
+  title: string | null;
+  body: string;
+}
+
+/** Where a turn's words came from, when it was not the person reading them. */
+export interface RelayedFrom {
+  chatId: string;
+  /**
+   * Null on a conversation with no title yet, which is most of them until the
+   * daemon has summarised one. The id is what always resolves, which is why it
+   * travels alongside rather than being replaced by the name.
+   */
+  title: string | null;
 }
 
 /**
@@ -162,6 +204,10 @@ export interface Turn {
    * transcript a stack of exchanges with no time in it: an answer from four minutes ago
    * and one from last Tuesday looked the same, and the only way to date either was to
    * count backwards from the conversation's own position in the list.
+   *
+   * It is also what the transcript ORDERS by, which is the second reason it cannot be dropped:
+   * a department's report lives in a different table with an id sequence of its own, so ids say
+   * nothing about which of the two happened first and only the clock does.
    */
   createdAt: string;
   /** What the turn ran. See `AssistantTurnRow.did`. */
@@ -178,6 +224,25 @@ export interface Turn {
   window: number | null;
   /** See `AssistantTurnRow.compacted`. */
   compacted: boolean;
+  /**
+   * The conversation that handed this turn over, or null when the person whose
+   * transcript this is typed it themselves.
+   *
+   * Not a `Mark`. Those describe what changed BETWEEN two turns — the model, the
+   * session — and are drawn from comparing a turn with the one above it. This is
+   * a property of the turn itself: it is true of a relayed turn whether or not
+   * anything precedes it, including when it is the first thing in a
+   * conversation, which is exactly the case a between-turns rule would miss.
+   */
+  relayedFrom: RelayedFrom | null;
+  /**
+   * The relays this turn sent, oldest first.
+   *
+   * The mirror of `relayedFrom`, and it exists because that side shipped alone:
+   * the conversation certain to be watched by the person who caused a relay was
+   * the one that could not say what it had done.
+   */
+  relayedTo: RelaySent[];
 }
 
 /** Whether a turn's status means the daemon is still working it. */
@@ -234,6 +299,16 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     // because compaction is what this release added. So the absent value and the false one say the
     // same thing here, which is the only case where collapsing them is honest.
     compacted: row.compacted ?? false,
+    // Keyed off the ID and never off the title: the title is null on every conversation nobody has
+    // named, so a check on it would read most relayed turns as ordinary ones. `?? null` is the
+    // daemon-older-than-the-column case, same as `did` and `images` above.
+    relayedFrom:
+      row.relayed_from_chat_id === undefined || row.relayed_from_chat_id === null
+        ? null
+        : { chatId: row.relayed_from_chat_id, title: row.relayed_from_title ?? null },
+    // Defaulted for the reason `did` and `images` are: a daemon older than the column sends no
+    // such key, and a turn drawn without the note beats a page that refuses to draw the turn.
+    relayedTo: row.relayed_to ?? [],
   };
 }
 

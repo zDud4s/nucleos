@@ -7,16 +7,13 @@ fn the_module_map_matches_the_files_on_disk() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let map_path = manifest_dir.join("AGENTS.md");
 
-    // AGENTS.md is ignored, so its absence means this checkout does not carry the map to check.
-    //
-    // **This early return is why a stale map imitates a flake, and it cost a diagnosis.** The file
-    // exists in the main checkout and in no worktree, so the same commit is GREEN wherever the gate
-    // happens to run from a worktree and RED from the checkout — intermittent-looking, entirely
-    // deterministic, and nothing in the output says which of the two just happened. A red here is
-    // never a race: it is two modules added without a row, and the fix is to write the rows.
-    if !map_path.exists() {
-        return;
-    }
+    // No early return for an absent map any more, and its removal is the point rather than tidying.
+    // AGENTS.md used to be gitignored, so this test skipped itself wherever the file happened not
+    // to be — green in the one checkout that held it, red in every worktree, off the same commit,
+    // with nothing in the output saying which of the two had just happened. That reads as a flake
+    // and is not one; the diagnosis cost real time. The file is tracked now (see `.gitignore`), so
+    // its absence is a checkout somebody broke, and `read_to_string` below says so loudly instead
+    // of this passing quietly.
 
     let mapped_files = fs::read_to_string(&map_path)
         .expect("the module map should be readable")
@@ -68,7 +65,8 @@ fn the_module_map_matches_the_files_on_disk() {
 ///
 /// **Corrected 2026-08-22: this said it "arrives about once in a dozen full runs", and that rate
 /// was never measured.** It was inferred while hunting a red that was assumed intermittent and was
-/// not — see the note on the early return above. Twenty-two archived full runs, six of them at
+/// not — the map above used to skip itself wherever the file was absent, which is what made a
+/// deterministic red look like a race. Twenty-two archived full runs, six of them at
 /// `--test-threads=32`, have never produced this failure. The hazard is real and reads straight off
 /// `worktree_root`; how often it would bite is unknown.
 ///

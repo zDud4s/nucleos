@@ -259,6 +259,14 @@ export const keys = {
     turnTools: (turnId: number) => ["chats", "turn-tools", turnId] as const,
     /** Something that was said, across every conversation. Keyed by the query, like `files`. */
     said: (query: string) => ["chats", "said", query] as const,
+    /**
+     * The whole path one relayed turn travelled.
+     *
+     * Keyed by the turn and not by the chat: a chain is a property of the turn,
+     * and two relayed turns of one conversation came from different places.
+     */
+    relayChain: (chatId: string, turnId: number) =>
+      ["chats", "relay-chain", chatId, turnId] as const,
   },
 
   council: {

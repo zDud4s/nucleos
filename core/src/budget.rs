@@ -237,12 +237,27 @@ type RawRow = (
 /// the shape of spend this ceiling exists to bound. `council::start` reads the ceiling once, before
 /// the first seat, so what this counts is money already spent rather than money it might refuse
 /// halfway through.
+///
+/// **`OR from_relay_id IS NOT NULL`, not `'assistant'` added to the mode list.** A relay-born turn
+/// is a chat turn nobody was at the keyboard for — `relay::admit` wrote it because ANOTHER
+/// conversation asked, not because a person typed into this one — and that is precisely the gap
+/// the paragraph above leaves: `assistant` is exempt on the strength of a person waiting on it, and
+/// a relayed turn has no person waiting on it at all. Adding `'assistant'` to the mode list would
+/// count the wrong turns to close that gap: every keyboard-typed message would start counting
+/// against a ceiling built for UNATTENDED spend, and would be refused mid-conversation over money
+/// its own owner chose, right then, to spend — the opposite of what this list exists to protect.
+/// `from_relay_id IS NOT NULL` counts the right ones without touching the ones a person is
+/// answering: it is `NULL` for every turn a person or Telegram wrote, by construction of the same
+/// INSERT that also sets `mode = 'assistant'` (`assistant::send_message_inner`'s own doc), and set
+/// on nothing else this list already reaches — every mode above is already counted by name, and
+/// none of them is ever relay-born.
 async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
                 created_at, completed_at
          FROM runs
-         WHERE mode IN ('shadow', 'worktree', 'email_triage', 'council', 'team')",
+         WHERE mode IN ('shadow', 'worktree', 'email_triage', 'council', 'team')
+            OR from_relay_id IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -834,6 +849,47 @@ mod tests {
             5,
             "five autonomous modes should be counted and the attended one left out"
         );
+    }
+
+    /// The predicate this counts by is `from_relay_id IS NOT NULL`, not `mode = 'assistant'` —
+    /// see `autonomous_rows`'s own doc for why the mode alone would count the wrong turns. Both
+    /// rows below share `mode = 'assistant'`; only the relay-born one carries `from_relay_id`, and
+    /// only it may count.
+    ///
+    /// `insert_run` cannot write the relay-born row — it has no `from_relay_id` parameter, and
+    /// every other test in this file relies on that shape staying as it is — so this test writes
+    /// that one row itself, directly, rather than widening a helper twenty-odd call sites share for
+    /// a column only this test needs.
+    #[tokio::test]
+    async fn a_relay_born_run_counts_and_a_keyboard_typed_one_does_not() {
+        let pool = test_pool().await;
+        insert_run(
+            &pool,
+            "assistant",
+            Some("session-typed"),
+            Some(1.0),
+            "2026-08-22T09:00:00Z",
+            Some("2026-08-22T09:10:00Z"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, cost_usd, from_relay_id, \
+             created_at, completed_at)
+             VALUES ('p', 'completed', 'assistant', 'session-relayed', 1.0, 7, ?, ?)",
+        )
+        .bind("2026-08-22T09:00:00Z")
+        .bind("2026-08-22T09:10:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = autonomous_rows(&pool).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the relay-born assistant turn should count toward the ceiling"
+        );
+        assert_eq!(rows[0].session_id.as_deref(), Some("session-relayed"));
     }
 
     #[tokio::test]

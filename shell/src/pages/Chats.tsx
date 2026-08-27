@@ -71,7 +71,9 @@ import {
   useChatFiles,
   useChatProject,
   useDropQueued,
+  useForwardTurn,
   useLiveTurn,
+  useRelayChain,
   useLocalModel,
   usePatchChat,
   usePostChatSeen,
@@ -98,6 +100,8 @@ import {
   type ToolCall,
   type Turn,
 } from "../data/chats";
+import { type RelaySent } from "../lib/turns";
+import { type ChatNotice } from "../data/chats";
 import {
   anyTurnLive,
   marksBetween,
@@ -105,6 +109,7 @@ import {
   turnIsLive,
   unreadTotal,
   type Mark,
+  type RelayedFrom,
   type Todo,
 } from "../lib/turns";
 import {
@@ -703,6 +708,15 @@ function chatRowLabel(row: ChatSummary, live: boolean): string {
   if (row.last_activity !== null)
     parts.push(relativeText(Date.parse(row.last_activity), Date.now()));
   if (row.waiting > 0) parts.push(`${row.waiting} unread`);
+  // Said out loud rather than left to the mark beside the number, which is `aria-hidden`. Somebody
+  // listening to this list has the same reason to treat the two differently as somebody looking at
+  // it: one is their own conversation answering, the other is a different one pulling them in.
+  const relayed = row.relayed_waiting ?? 0;
+  if (relayed > 0) parts.push(`${relayed} from another conversation`);
+  // Said as its own clause and not added to the number above it, because it IS its own axis: a
+  // department speaking is not the conversation answering, and nothing ran for it.
+  const said = row.notices_waiting ?? 0;
+  if (said > 0) parts.push(`${said} from a department`);
   return parts.join(", ");
 }
 
@@ -752,8 +766,32 @@ function ChatRow({
             <RelativeTime at={row.last_activity} />
           </span>
         )}
+        {(row.notices_waiting ?? 0) > 0 && (
+          <span
+            className="chats-row-said"
+            aria-hidden="true"
+            title={`${row.notices_waiting} said by a department you set going`}
+          >
+            {row.notices_waiting}
+          </span>
+        )}
         {row.waiting > 0 && (
-          <span className="chats-row-unread" aria-hidden="true">
+          <span
+            className={
+              (row.relayed_waiting ?? 0) > 0
+                ? "chats-row-unread chats-row-unread-relayed"
+                : "chats-row-unread"
+            }
+            aria-hidden="true"
+            /* The count stays the total. A second number beside it would make a person add two
+               figures to learn one thing; the mark says "some of these came from elsewhere", and
+               the conversation itself says which. */
+            title={
+              (row.relayed_waiting ?? 0) > 0
+                ? `${row.relayed_waiting} handed over by another conversation`
+                : undefined
+            }
+          >
             {row.waiting}
           </span>
         )}
@@ -1212,6 +1250,7 @@ function ChatDetail({
         {transcript.data !== undefined && (
           <Transcript
             turns={transcript.data.turns}
+            notices={transcript.data.notices}
             precededBy={(pickedUp.data?.said ?? []).length > 0}
             chatId={chatId}
             more={transcript.data.more}
@@ -3248,6 +3287,7 @@ function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
 
 function Transcript({
   turns,
+  notices,
   precededBy,
   chatId,
   more,
@@ -3257,6 +3297,7 @@ function Transcript({
   onReuse,
 }: {
   turns: Turn[];
+  notices: ChatNotice[];
   precededBy: boolean;
   chatId: string;
   /** Whether there are turns older than the first one here. See `Transcript.more`. */
@@ -3312,8 +3353,13 @@ function Transcript({
 
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
-  if (turns.length === 0 && precededBy) return null;
-  if (turns.length === 0)
+  //
+  // A conversation holding only departmental reports is NOT empty, which is why `notices` counts
+  // here. It is the shape of a conversation somebody opened, set a department going from, and has
+  // not typed in since — and telling them nothing has been said over a screen of what a department
+  // told them would be the window contradicting itself.
+  if (turns.length === 0 && notices.length === 0 && precededBy) return null;
+  if (turns.length === 0 && notices.length === 0)
     return <p className="chats-empty">nothing has been said yet.</p>;
   return (
     /* Around the turns and not around the whole door, because this is the only subtree that draws
@@ -3338,24 +3384,103 @@ function Transcript({
         </div>
       )}
       <ul className="chats-turns" aria-label="Transcript">
-        {turns.map((turn, index) => (
-          <TurnBlock
-            key={turn.id}
-            turn={turn}
-            previous={index === 0 ? null : turns[index - 1]}
-            clearedAfter={clearedAfter}
-            chatId={chatId}
-            onReuse={onReuse}
-            /* The last one, and only the last one. A CSS animation plays when its element
-               mounts, so marking every turn would fade a forty-turn transcript in as a wall on
-               open; marking the last one means it plays once, on the turn that just arrived,
-               and the ones above it are already there. */
-            arriving={index === turns.length - 1}
-            lit={lit === turn.id}
-          />
-        ))}
+        {interleave(turns, notices).map((entry, index, all) =>
+          entry.kind === "notice" ? (
+            <DepartmentSaid key={`notice-${entry.notice.id}`} notice={entry.notice} />
+          ) : (
+            <TurnBlock
+              key={entry.turn.id}
+              turn={entry.turn}
+              previous={previousTurn(all, index)}
+              clearedAfter={clearedAfter}
+              chatId={chatId}
+              onReuse={onReuse}
+              /* The last one, and only the last one. A CSS animation plays when its element
+                 mounts, so marking every turn would fade a forty-turn transcript in as a wall on
+                 open; marking the last one means it plays once, on the turn that just arrived,
+                 and the ones above it are already there.
+
+                 Compared against the last TURN rather than against the last ENTRY, which is what
+                 the interleaving changed: a department that spoke after the final turn would
+                 otherwise take the animation off the turn that actually arrived and give it to
+                 nothing, since a notice does not draw one. */
+              arriving={entry.turn.id === turns[turns.length - 1]?.id}
+              lit={lit === entry.turn.id}
+            />
+          ),
+        )}
       </ul>
     </KeepsUp.Provider>
+  );
+}
+
+/** One thing on the transcript: a turn, or a department speaking. */
+type Entry = { kind: "turn"; turn: Turn; at: string } | { kind: "notice"; notice: ChatNotice; at: string };
+
+/**
+ * PURE: the two lists in one, oldest first.
+ *
+ * By `created_at` and not by id, because the two come from different tables with independent
+ * sequences — notice 1 and turn 900 say nothing about which happened first. Ties break toward the
+ * TURN, so a department reporting in the same second a turn landed reads as a remark on it rather
+ * than as something the turn was answering; nothing was answering it either way, and one of the two
+ * orders is less misleading.
+ *
+ * A stable sort, which `Array.prototype.sort` is required to be, so two notices written in the same
+ * second keep the order they were written in.
+ */
+function interleave(turns: Turn[], notices: ChatNotice[]): Entry[] {
+  const entries: Entry[] = [
+    ...turns.map((turn): Entry => ({ kind: "turn", turn, at: turn.createdAt })),
+    ...notices.map((notice): Entry => ({ kind: "notice", notice, at: notice.created_at })),
+  ];
+  return entries.sort((left, right) => {
+    if (left.at !== right.at) return left.at < right.at ? -1 : 1;
+    if (left.kind === right.kind) return 0;
+    return left.kind === "turn" ? -1 : 1;
+  });
+}
+
+/**
+ * PURE: the turn a turn follows, skipping whatever a department said in between.
+ *
+ * `TurnBlock` uses its predecessor to decide which marks to draw above itself — a change of brain, a
+ * restart, a rotated context — and all of those are facts about consecutive TURNS. Passing it a
+ * notice, or the turn before a notice as though nothing intervened, are both wrong; only the first
+ * is a type error, which is why this exists rather than an index arithmetic at the call site.
+ */
+function previousTurn(all: Entry[], index: number): Turn | null {
+  for (let at = index - 1; at >= 0; at -= 1) {
+    const entry = all[at];
+    if (entry.kind === "turn") return entry.turn;
+  }
+  return null;
+}
+
+/**
+ * What a department said here, drawn as a message and never as a turn.
+ *
+ * **Attributed, always, and that is the whole of what protects the reader.** The words come from an
+ * agent that may have been reading the web all afternoon, and nothing filtered them: the tool that
+ * writes one is graded `WritesOwn` precisely because a department ALREADY speaks to its owner
+ * through its delivery, unfiltered, so a barrier on this door would have stood beside an open one.
+ * What replaces the barrier is the reader being able to see whose words these are — so the source
+ * is not a tooltip and not a hover, it is on the line.
+ *
+ * No answer, no cost, no status. A notice has none of those and drawing a turn's chrome around it
+ * would be claiming a run that does not exist — the same reason `queued` is not drawn as a turn.
+ */
+function DepartmentSaid({ notice }: { notice: ChatNotice }) {
+  return (
+    <li className="chats-notice">
+      <p className="chats-notice-who">
+        <Link className="chats-notice-from" to={`/teams/runs/${notice.team_run_id}`}>
+          {notice.from_agent_id}
+        </Link>{" "}
+        said this while working
+      </p>
+      <p className="chats-notice-body">{notice.body}</p>
+    </li>
   );
 }
 
@@ -3392,7 +3517,7 @@ function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
-      <p className="chats-turn-who chats-turn-who-you">you</p>
+      <WhoAsked relayedFrom={turn.relayedFrom} chatId={chatId} turnId={turn.id} />
       <div className="chats-turn-said">
         {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
             Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
@@ -3435,6 +3560,8 @@ function TurnBlock({
           no answer recorded
         </p>
       )}
+      {!live && <RelaySentNote sent={turn.relayedTo} />}
+      {!live && <ForwardTurn chatId={chatId} turn={turn} />}
       <div className="chats-turn-foot">
         {/* Only once the turn has stopped moving. A copy control under an answer that is still
             being written would hand over half a sentence and call it the answer. */}
@@ -4176,6 +4303,196 @@ function ToolAnswer({ call, loading }: { call: ToolCall; loading: boolean }) {
 }
 
 /**
+ * Who put the words at the top of this turn there.
+ *
+ * "you" is the ordinary answer and was the only one until conversations could hand messages to each
+ * other. A relayed turn drawn under "you" is not a missing decoration — it is the transcript
+ * naming the wrong speaker, telling the person reading it that they said something they did not
+ * say, in the one place they go to find out what was actually said.
+ *
+ * The name is a link because the conversation on the far side is a real place, and the next thing
+ * somebody wants after "where did this come from" is to go and look. An unnamed conversation is
+ * described rather than identified: most chats carry no title until the daemon has summarised one,
+ * and printing a uuid at a person answers a question nobody asked — the link still goes there.
+ */
+function WhoAsked({
+  relayedFrom,
+  chatId,
+  turnId,
+}: {
+  relayedFrom: RelayedFrom | null;
+  chatId: string;
+  turnId: number;
+}) {
+  if (relayedFrom === null)
+    return <p className="chats-turn-who chats-turn-who-you">you</p>;
+  return (
+    <p className="chats-turn-who chats-turn-who-relayed">
+      <Link className="chats-turn-relayed-from" to={`/chats/${relayedFrom.chatId}`}>
+        {relayedFrom.title ?? "an unnamed conversation"}
+      </Link>{" "}
+      handed this over <RelayChain chatId={chatId} turnId={turnId} />
+    </p>
+  );
+}
+
+/**
+ * What this turn handed to another conversation.
+ *
+ * Drawn from what the daemon WROTE, not from the tool call the model made — the two part company
+ * every time a relay is refused, and a sender's transcript built from the asks would show messages
+ * that never arrived. An empty list is the ordinary case and draws nothing.
+ *
+ * The words are shown, not just the destination. "Sent something to «planning»" is the shape that
+ * makes somebody open the other conversation to find out what; the point of putting this here at
+ * all is that they should not have to.
+ */
+function RelaySentNote({ sent }: { sent: RelaySent[] }) {
+  if (sent.length === 0) return null;
+  return (
+    <ul className="chats-relay-sent" aria-label="Handed to other conversations">
+      {sent.map((relay, index) => (
+        <li key={index} className="chats-relay-sent-item">
+          <span className="chats-relay-sent-to">
+            {"handed to "}
+            <Link className="chats-turn-relayed-from" to={`/chats/${relay.chat_id}`}>
+              {relay.title ?? "an unnamed conversation"}
+            </Link>
+          </span>
+          <span className="chats-relay-sent-body">{relay.body}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The whole path a relayed turn travelled, opened on demand.
+ *
+ * Behind a button rather than always drawn, and fetched only once opened: with three hops allowed,
+ * "B spoke to me" hides that A began it — but that is a question somebody asks occasionally, and
+ * the transcript around it is re-read every second and a half.
+ *
+ * The conversation being read is the last step of its own chain, and is drawn like the rest. It is
+ * where the path ENDS, and a path drawn without its destination is one you have to hold the missing
+ * end of in your head.
+ */
+function RelayChain({ chatId, turnId }: { chatId: string; turnId: number }) {
+  const [open, setOpen] = useState(false);
+  const chain = useRelayChain(chatId, turnId, open);
+
+  return (
+    <span className="chats-relay-chain">
+      <button
+        type="button"
+        className="chats-relay-chain-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((was) => !was)}
+      >
+        {open ? "hide the path" : "where did this start?"}
+      </button>
+      {open && chain.data !== undefined && (
+        <ol className="chats-relay-chain-steps" aria-label="The path this turn travelled">
+          {chain.data.chain.map((step) => (
+            <li key={step.chat_id}>
+              <Link className="chats-turn-relayed-from" to={`/chats/${step.chat_id}`}>
+                {step.title ?? "an unnamed conversation"}
+              </Link>
+            </li>
+          ))}
+        </ol>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Hands this turn to another conversation.
+ *
+ * The gesture the model already had and the person did not: `send_to_chat` is on the model's tool
+ * list and there was no button anywhere that did the same thing.
+ *
+ * The text starts as what the turn answered and stays editable, because forwarding is rarely
+ * verbatim — the useful version is usually "look at this, and here is why". What travels is what is
+ * in the box when it is sent, never what the box was filled with.
+ *
+ * A turn with no answer offers nothing to forward. Drawing the button anyway would put an empty
+ * message one click away, and an empty relay is a turn started in another conversation about
+ * nothing.
+ */
+function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const chats = useChats();
+  const forward = useForwardTurn();
+
+  if (turn.answer === null) return null;
+
+  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId);
+
+  return (
+    <div className="chats-forward">
+      <button
+        type="button"
+        className="chats-forward-open"
+        aria-expanded={open}
+        onClick={() => {
+          setText(turn.answer ?? "");
+          setOpen((was) => !was);
+        }}
+      >
+        {open ? "cancel" : "hand to another conversation"}
+      </button>
+      {open && (
+        <div className="chats-forward-panel">
+          <label className="chats-forward-label" htmlFor={`forward-${turn.id}`}>
+            What to send
+          </label>
+          <textarea
+            id={`forward-${turn.id}`}
+            className="chats-forward-text"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+          />
+          {elsewhere.length === 0 && (
+            <p className="chats-forward-empty">there is no other conversation to hand this to.</p>
+          )}
+          <ul className="chats-forward-targets" aria-label="Hand it to">
+            {elsewhere.map((row) => (
+              <li key={row.chat_id}>
+                <button
+                  type="button"
+                  className="chats-forward-target"
+                  disabled={forward.isPending || text.trim() === ""}
+                  onClick={() => {
+                    forward.mutate(
+                      { toChatId: row.chat_id, fromTurnId: turn.id, text },
+                      { onSuccess: () => setOpen(false) },
+                    );
+                  }}
+                >
+                  {row.title ?? row.first_message ?? "New conversation"}
+                </button>
+              </li>
+            ))}
+          </ul>
+          {/* The daemon's own word for why, not a sentence this side invented: `relay_cycle`,
+              `relay_too_deep`, `owner_away`. A refusal shown as "something went wrong" is one
+              nobody can act on, and each of these has a different answer. */}
+          {forward.isError && (
+            <p className="chats-forward-refused" role="status">
+              {isApiRefusal(forward.error)
+                ? (MESSAGE_SENTENCES[forward.error.code] ?? forward.error.code)
+                : "could not hand it over"}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * The brain, restart and clear marks a transcript draws above one turn.
  *
  * The brain mark's copy is deliberately asymmetric: moving *to* the cloud is about where what you
@@ -4234,6 +4551,21 @@ const MESSAGE_SENTENCES: Record<string, string> = {
     "no local model is available on this machine, and this conversation is set to answer locally",
   errand_not_answering:
     "the errand behind this conversation is not answering right now",
+  // The relay's own refusals. Each has a different answer, which is why they are sentences here
+  // rather than one "something went wrong": a cycle is a different conversation to pick, a chain
+  // too deep is nothing you can fix from this window, and an absent owner clears by itself.
+  no_such_destination: "that conversation no longer exists, or was archived",
+  relay_to_self: "this is the conversation you are already in",
+  relay_cycle:
+    "that conversation already handed this one a message — passing it back would go in circles",
+  relay_too_deep: "this has already been handed on as far as it goes",
+  owner_away:
+    "nothing is handed over while nobody is at the machine to see it arrive",
+  telegram_origin:
+    "a turn that arrived from Telegram cannot be handed to another conversation",
+  unknown_origin:
+    "this turn does not record where it came from, so it cannot be handed on",
+  unknown_sender: "the turn being handed over could not be found",
 };
 
 /**

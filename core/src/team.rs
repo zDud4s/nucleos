@@ -94,7 +94,12 @@ const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 *
 /// director's behalf.
 const DELIVERY_FILE: &str = "entrega.md";
 
-const DAEMON_URL: &str = "http://127.0.0.1:8791";
+/// Where this daemon is reached. A function and not a `const`, because the port is no longer a
+/// compile-time fact: a second instance binds its own (`daemon_client::PORT_VAR`), and a const
+/// would send its runs to whichever daemon happens to hold the default.
+fn daemon_url() -> String {
+    crate::daemon_client::daemon_url()
+}
 
 /// PURE: whether a run in this state is still one the daemon is advancing.
 pub fn is_live(state: &str) -> bool {
@@ -492,6 +497,38 @@ pub async fn roster(pool: &sqlx::SqlitePool, team_id: &str) -> Result<Vec<String
         .fetch_all(pool)
         .await
         .map_err(TeamError::Db)
+}
+
+/// Everybody in this department that one of its members may address: the roster AND the director.
+///
+/// **`roster` alone is not this list, and the difference is not cosmetic.** `team_members` holds the
+/// specialists; the director lives in `teams.director_agent_id` and is not a row there. So a
+/// membership test against `roster` refuses the director — which would have made "tell the director
+/// what you found" impossible, and that is the single most valuable message this department will
+/// ever pass. It is exactly the sentence a specialist has to be able to send: the director is the
+/// node that decides what the next round does.
+///
+/// A function rather than two calls at each use site, because there are two use sites — the address
+/// book a specialist is shown, and the check that refuses an unknown name — and a list you can be
+/// SHOWN but not WRITE to, or write to but never see, is the same bug from either side.
+///
+/// Deduplicated because a director may also sit on its own roster; nothing forbids it, and a name
+/// printed twice reads as two people.
+pub async fn addressable(pool: &sqlx::SqlitePool, team_id: &str) -> Result<Vec<String>, TeamError> {
+    let mut all = roster(pool, team_id).await?;
+    let director: Option<String> =
+        sqlx::query_scalar("SELECT director_agent_id FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(TeamError::Db)?;
+    if let Some(director) = director
+        && !all.contains(&director)
+    {
+        all.push(director);
+    }
+    all.sort();
+    Ok(all)
 }
 
 /// The id is deliberately NOT recomputed from a new name: it is a reference, and a folder on disk
@@ -934,11 +971,23 @@ impl std::fmt::Display for StartError {
 /// the four things that cannot be discovered later without wasting money: a team with nobody in it,
 /// a director that was deleted, a local member on a machine with no local model, and a house budget
 /// that is already spent.
-pub async fn start(state: &AppState, team_id: &str, request: &str) -> Result<String, StartError> {
-    start_with(state, team_id, request, Lineage::default()).await
+pub async fn start(
+    state: &AppState,
+    team_id: &str,
+    request: &str,
+    report_to_chat_id: Option<&str>,
+) -> Result<String, StartError> {
+    start_with(
+        state,
+        team_id,
+        request,
+        Lineage::default(),
+        report_to_chat_id,
+    )
+    .await
 }
 
-/// `start`, for a caller that knows where the run came from.
+/// `start`, for a caller that knows where the run came from — and, now, where it should speak.
 ///
 /// One function and not two paths: a triggered run is an ordinary run with four columns filled in,
 /// and every refusal above applies to it unchanged. What a trigger adds — the depth, the tree
@@ -949,10 +998,30 @@ pub async fn start_with(
     team_id: &str,
     request: &str,
     lineage: Lineage,
+    report_to_chat_id: Option<&str>,
 ) -> Result<String, StartError> {
     let request = request.trim();
     if request.is_empty() {
         return Err(StartError::Invalid("the request is empty".to_owned()));
+    }
+
+    // Refused HERE and not when the department first tries to speak. A destination that does not
+    // exist is a mistake by whoever started the run, and they are present, at a keyboard, right now;
+    // discovering it two hours later means the refusal reaches a director mid-turn instead — which
+    // can do nothing about it except write the words into a delivery nobody asked for.
+    //
+    // `chats::brain_of` rather than a second `archived_at IS NULL` clause, for `relay::admit`'s
+    // reason: "still there" has exactly one definition in this codebase and this is not a second.
+    if let Some(chat_id) = report_to_chat_id {
+        let lives = crate::chats::brain_of(&state.pool, chat_id)
+            .await
+            .map_err(|error| StartError::Unavailable(error.to_string()))?
+            .is_some();
+        if !lives {
+            return Err(StartError::Invalid(format!(
+                "there is no conversation `{chat_id}` for this department to report in"
+            )));
+        }
     }
 
     let team = get(&state.pool, team_id)
@@ -1025,8 +1094,9 @@ pub async fn start_with(
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO team_runs (id, team_id, request, workspace, token, state, created_at,
-                                updated_at, trigger_id, parent_id, root_id, depth)
-         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)",
+                                updated_at, trigger_id, parent_id, root_id, depth,
+                                report_to_chat_id)
+         VALUES (?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&team.team.id)
@@ -1042,6 +1112,9 @@ pub async fn start_with(
     // is a tree ceiling read off the wrong run.
     .bind(lineage.root_id.as_deref().unwrap_or(&id))
     .bind(lineage.depth)
+    // NULL for nearly every run, which is what makes a department that reports nowhere behave
+    // exactly as it did before this column existed.
+    .bind(report_to_chat_id)
     .execute(&state.pool)
     .await
     .map_err(|error| StartError::Unavailable(error.to_string()))?;
@@ -1206,6 +1279,394 @@ pub struct ProposeActionResponse {
     pub id: i64,
     pub proposal_id: Option<i64>,
     pub outcome: String,
+}
+
+/// How many times one run may speak to its owner unbidden.
+///
+/// `MAX_ROUNDS_CEILING` director nodes plus the delivery is seven — the most nodes that could ever
+/// have something to say — and eight leaves one over. It is a belt rather than a brake: what
+/// actually bounds this is that only a DIRECTOR may report and a run has a small, fixed number of
+/// director nodes.
+pub const MAX_REPORTS_PER_RUN: i64 = 8;
+
+/// A department saying something to its owner.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReportRequest {
+    pub body: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ReportResponse {
+    pub id: i64,
+    pub outcome: String,
+}
+
+/// Why a department could not speak. Every variant is handed to the AGENT, mid-turn.
+#[derive(Debug)]
+pub enum ReportError {
+    /// Not a `Scope::TeamRun` at all.
+    NotADepartment,
+    /// The run named by the key is gone.
+    NoSuchRun,
+    /// A specialist tried. A department speaks to its owner with one voice, and the sentence says
+    /// what to do instead — the same shape `propose_teammate` uses for the same refusal.
+    NotTheDirector,
+    /// This run was not pointed at a conversation, which is the ordinary state of nearly every run
+    /// and therefore not an error to be retried. Named on its own so the sentence can say so.
+    NowhereToReport,
+    /// It was pointed at one and that conversation has since been archived. Distinct from
+    /// `NowhereToReport` because they lead somewhere different: one means this department was never
+    /// given a voice, the other that the room it was given has been closed.
+    DestinationGone(String),
+    /// Nothing to say.
+    Empty,
+    /// This run has spoken as often as it may.
+    Ceiling(i64),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ReportError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl std::fmt::Display for ReportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotADepartment => {
+                formatter.write_str("only a department reports to the owner this way")
+            }
+            Self::NoSuchRun => formatter.write_str("no such team run"),
+            Self::NotTheDirector => formatter.write_str(
+                "only the director speaks for this department — put it in your answer and let the \
+                 director pass it on",
+            ),
+            Self::NowhereToReport => formatter.write_str(
+                "this department was not pointed at a conversation when it was started, so there is \
+                 nowhere to say this; put it in your delivery instead",
+            ),
+            Self::DestinationGone(chat_id) => write!(
+                formatter,
+                "the conversation `{chat_id}` this department was told to report in has been \
+                 archived; put it in your delivery instead"
+            ),
+            Self::Empty => formatter.write_str("say something, or say nothing at all"),
+            Self::Ceiling(ceiling) => write!(
+                formatter,
+                "this department has already spoken {ceiling} times this run, which is as many as \
+                 it may; put the rest in your delivery"
+            ),
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+/// A director says something in the conversation its run was pointed at. Nothing runs.
+///
+/// **The destination is read from the run and never from the request.** `team_runs.report_to_chat_id`
+/// is written when the run is started, by the person starting it; there is no parameter here, no
+/// tool that takes one, and no route a department could use to discover what conversations exist. A
+/// department cannot choose who it talks to — it can only answer to the address it was given.
+///
+/// **Only the director**, narrowed here against `team_runs.director_run_id` exactly as
+/// `propose_teammate` is, and for the same two reasons: a department speaks to its owner with one
+/// voice, and the key names the RUN rather than the node, so this cannot be a question for
+/// `auth::permits`.
+pub async fn report(
+    state: &AppState,
+    scope: &crate::auth::Scope,
+    headers: &axum::http::HeaderMap,
+    request: &ReportRequest,
+) -> Result<ReportResponse, ReportError> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err(ReportError::NotADepartment);
+    };
+
+    let body = request.body.trim();
+    if body.is_empty() {
+        return Err(ReportError::Empty);
+    }
+
+    let destination: Option<String> =
+        sqlx::query_scalar("SELECT report_to_chat_id FROM team_runs WHERE id = ?")
+            .bind(team_run_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or(ReportError::NoSuchRun)?;
+    let Some(chat_id) = destination else {
+        return Err(ReportError::NowhereToReport);
+    };
+
+    // The director check comes AFTER the destination one on purpose. A specialist calling this in a
+    // department that reports nowhere should be told the thing it can act on — there is nowhere to
+    // say this, put it in your answer — rather than a rule about who may speak that would not have
+    // helped it even if it were the director.
+    let Some((from_agent_id, from_run_id)) =
+        agent_of_caller(&state.pool, team_run_id, headers).await?
+    else {
+        return Err(ReportError::NotTheDirector);
+    };
+    if calling_node(&state.pool, team_run_id, headers).await != Caller::Director {
+        return Err(ReportError::NotTheDirector);
+    }
+
+    // Checked again here even though `start_with` refused an absent one: a run lasts up to four
+    // hours and a conversation can be archived inside that. Reported as its own refusal rather than
+    // written into a conversation nobody will open again.
+    if crate::chats::brain_of(&state.pool, &chat_id)
+        .await?
+        .is_none()
+    {
+        return Err(ReportError::DestinationGone(chat_id));
+    }
+
+    let said: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_notices WHERE team_run_id = ?")
+        .bind(team_run_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if said >= MAX_REPORTS_PER_RUN {
+        return Err(ReportError::Ceiling(MAX_REPORTS_PER_RUN));
+    }
+
+    let id = crate::chat_notices::post(
+        &state.pool,
+        &chat_id,
+        team_run_id,
+        &from_agent_id,
+        from_run_id,
+        body,
+    )
+    .await?;
+
+    Ok(ReportResponse {
+        id,
+        // Says the part a model would otherwise assume away: it was SHOWN, not answered. A director
+        // that believes it has started a conversation waits for a reply that is never coming, and
+        // spends its remaining turns waiting.
+        outcome:
+            "shown to the owner. Nobody will answer it — it is a message on their screen, not \
+                  a question — so carry on, and put anything that matters in your delivery as well."
+                .to_owned(),
+    })
+}
+
+/// One member of a department leaving words for another.
+#[derive(Debug, serde::Deserialize)]
+pub struct TeamNoteRequest {
+    /// The colleague's `agents.id`, as printed on the left of their line in `roster_lines`.
+    pub to: String,
+    pub body: String,
+}
+
+/// What the agent is told, and it is a sentence for `ProposeActionResponse`'s reason: the reader is
+/// a model deciding what to do next, and "they may not be started again this run" leads somewhere
+/// different from "filed".
+#[derive(Debug, serde::Serialize)]
+pub struct TeamNoteResponse {
+    pub id: i64,
+    pub outcome: String,
+}
+
+/// Why a note could not be left. Every variant is handed to the AGENT, mid-turn, while it can still
+/// do something about it — which is why `NoSuchColleague` names the roster rather than saying "no".
+#[derive(Debug)]
+pub enum NoteError {
+    /// Not a `Scope::TeamRun` at all.
+    NotADepartment,
+    /// The run named by the key is gone.
+    NoSuchRun,
+    /// The daemon cannot tell which node is calling: no header, a stale id, or one belonging to
+    /// another run. Refused rather than attributed to the department at large — an unattributed note
+    /// is a second brief with no way to weigh it, which is the one thing the receiving node cannot
+    /// recover from.
+    UnknownNode,
+    /// `to` is not on this department's roster, which is listed so the model can fix it.
+    NoSuchColleague {
+        asked: String,
+        roster: Vec<String>,
+    },
+    /// `to` is the caller. Not harmful, and refused anyway: the words would arrive in the caller's
+    /// own next prompt as though a colleague had sent them, which is a turn arguing with itself.
+    Yourself,
+    /// Nothing to say. A note with no words is an entry in the queue that delivers nothing and can
+    /// never be delivered again.
+    Empty,
+    /// This run has left as many notes as it may.
+    Ceiling(i64),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for NoteError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl std::fmt::Display for NoteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotADepartment => {
+                formatter.write_str("only a member of a department leaves notes for its colleagues")
+            }
+            Self::NoSuchRun => formatter.write_str("no such team run"),
+            Self::UnknownNode => formatter.write_str(
+                "this call does not say which node of the department is making it, and a note has                  to be signed by somebody",
+            ),
+            Self::NoSuchColleague { asked, roster } => write!(
+                formatter,
+                "`{asked}` is not in this department. Its members are: {}",
+                roster.join(", ")
+            ),
+            Self::Yourself => formatter.write_str(
+                "that is you — put it in your own answer instead, which is where your own findings go",
+            ),
+            Self::Empty => formatter.write_str("say something, or say nothing at all"),
+            Self::Ceiling(ceiling) => write!(
+                formatter,
+                "this department has already left {ceiling} notes this run, which is as many as it                  may; put it in your answer instead"
+            ),
+            // The raw error, as all four siblings in this file render theirs. A friendlier sentence
+            // here would read better to a model and would be the only one of five that hides what
+            // actually happened — and the reader of a 500 is a person looking at a log, not the
+            // agent, which got its answer and moved on.
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+/// Files one member's words for another, and does nothing else: nobody is woken and no round moves.
+///
+/// **Who is speaking is read from the call and never from the body.** `Scope::TeamRun` names the
+/// run, `RUN_ID_HEADER` names the node, and `agent_of_caller` turns the two into an `agents.id`. A
+/// `from` field on the request would let a specialist sign a colleague's name to its own finding —
+/// and the receiving node, reading a quoted paragraph attributed by the daemon, has no way at all to
+/// check it.
+///
+/// **The roster is the address book and the boundary at once.** A department may write to its own
+/// members and to nobody else: there is no cross-team address, no run id to name, and no way to
+/// reach a conversation. `admits`-style chain brakes are not needed here for the reason
+/// `MAX_RELAY_DEPTH` exists at all — a chain can only grow one hop per ROUND, and rounds are already
+/// bounded by `max_rounds` and by `DRY_ROUNDS_TO_STOP`. `MAX_NOTES_PER_RUN` is the belt.
+pub async fn send_note(
+    state: &AppState,
+    scope: &crate::auth::Scope,
+    headers: &axum::http::HeaderMap,
+    request: &TeamNoteRequest,
+) -> Result<TeamNoteResponse, NoteError> {
+    let crate::auth::Scope::TeamRun(team_run_id) = scope else {
+        return Err(NoteError::NotADepartment);
+    };
+
+    let body = request.body.trim();
+    if body.is_empty() {
+        return Err(NoteError::Empty);
+    }
+
+    let team_id: String = sqlx::query_scalar("SELECT team_id FROM team_runs WHERE id = ?")
+        .bind(team_run_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(NoteError::NoSuchRun)?;
+
+    let Some((from_agent_id, from_run_id)) =
+        agent_of_caller(&state.pool, team_run_id, headers).await?
+    else {
+        return Err(NoteError::UnknownNode);
+    };
+
+    let asked = request.to.trim();
+    if asked == from_agent_id {
+        return Err(NoteError::Yourself);
+    }
+    // `addressable` and NOT `roster`, and the first draft of this used `roster` with a comment
+    // asserting the director was on it. It is not — `team_members` holds the specialists and the
+    // director lives on `teams.director_agent_id` — so that draft refused the one message this
+    // whole feature exists to carry. A test caught it; the comment would not have.
+    let roster = addressable(&state.pool, &team_id)
+        .await
+        .map_err(|error| match error {
+            TeamError::Db(error) => NoteError::Db(error),
+            _ => NoteError::NoSuchRun,
+        })?;
+    if !roster.iter().any(|member| member == asked) {
+        return Err(NoteError::NoSuchColleague {
+            asked: asked.to_owned(),
+            roster,
+        });
+    }
+
+    // Counted per RUN and not per member: what the ceiling protects against is a department talking
+    // instead of working, and that is a property of the department rather than of any one of them.
+    let left = crate::team_notes::count_for_run(&state.pool, team_run_id).await?;
+    if left >= crate::team_notes::MAX_NOTES_PER_RUN {
+        return Err(NoteError::Ceiling(crate::team_notes::MAX_NOTES_PER_RUN));
+    }
+
+    let id = crate::team_notes::leave(
+        &state.pool,
+        team_run_id,
+        &from_agent_id,
+        from_run_id,
+        asked,
+        body,
+    )
+    .await?;
+
+    Ok(TeamNoteResponse {
+        id,
+        // Said plainly, including the part a model would otherwise assume away: there is no reply
+        // coming, and there may be no delivery either. A specialist that believes it has handed the
+        // problem over stops carrying it, and the department loses the finding twice.
+        outcome: format!(
+            "left for {asked}. They will read it at the top of their brief the next time this              department starts them, which may not happen — say it in your own answer too, and do              not wait for a reply, because there is none coming."
+        ),
+    })
+}
+
+/// Which member of the department is making this call, and from which node.
+///
+/// `None` for a node the run does not recognise, which `send_note` turns into a refusal rather than
+/// into an unsigned note. The two halves come from different places on purpose: `calling_node`
+/// answers WHICH ROLE from `team_runs.director_run_id` and `team_items.run_id`, and the run id is
+/// read from the header directly because that is the row this note has to point at as its evidence.
+///
+/// Reading the header twice — here and inside `calling_node` — is deliberate over threading it
+/// through: `calling_node` is called by three other functions that want the role and not the id, and
+/// widening its return to suit one caller would put an unused half in front of all of them.
+async fn agent_of_caller(
+    pool: &sqlx::SqlitePool,
+    team_run_id: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<(String, i64)>, sqlx::Error> {
+    let Some(run_id) = headers
+        .get(crate::daemon_client::RUN_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return Ok(None);
+    };
+
+    match calling_node(pool, team_run_id, headers).await {
+        Caller::Director => Ok(sqlx::query_scalar::<_, String>(
+            "SELECT t.director_agent_id FROM teams t
+               JOIN team_runs r ON r.team_id = t.id
+              WHERE r.id = ?",
+        )
+        .bind(team_run_id)
+        .fetch_optional(pool)
+        .await?
+        .map(|agent_id| (agent_id, run_id))),
+        Caller::Specialist(ordinal) => Ok(sqlx::query_scalar::<_, String>(
+            "SELECT agent_id FROM team_items WHERE team_run_id = ? AND ordinal = ?",
+        )
+        .bind(team_run_id)
+        .bind(ordinal)
+        .fetch_optional(pool)
+        .await?
+        .map(|agent_id| (agent_id, run_id))),
+        Caller::Unknown => Ok(None),
+    }
 }
 
 /// PURE: whether this payload is a well-formed request of this kind, and its canonical form.
@@ -2236,20 +2697,34 @@ impl DirectorNode {
 
 /// The row a launch writes before anything is spawned, so the run exists for the hook to resolve a
 /// mode from and for reconciliation to find if the daemon dies here.
+///
+/// **`read_untrusted` is set in THIS statement and never in a second one**, for the reason 0122
+/// gives about `runs.from_relay_id`: a run born holding a colleague's words cannot be allowed to
+/// exist without saying so. The gap between an INSERT and a follow-up UPDATE is a window in which a
+/// node carrying a stranger's text, quoted into its own prompt, reads as a turn that has read
+/// nothing — and every refusal in `hooks::team_decision` depends on that state not existing.
+///
+/// This is the receiving half of the trade `team_notes.rs` documents. Writing a note is `WritesOwn`,
+/// so a specialist that read the web can still tell a colleague what it found; the taint travels
+/// with the words and lands here. A node that receives a note may read on and may no longer ask —
+/// which costs a department its alçada for that node, and buys the conversation.
 async fn open_run(
     state: &AppState,
     team_run_id: &str,
     prompt: &str,
+    read_untrusted: bool,
 ) -> Result<(i64, String), sqlx::Error> {
     let session_id = crate::auth::generate_uuid_v4();
     let id = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, team_run_id, created_at)
-         VALUES (?, 'running', ?, ?, ?, ?)",
+        "INSERT INTO runs (prompt, status, mode, session_id, team_run_id, read_untrusted,
+                           created_at)
+         VALUES (?, 'running', ?, ?, ?, ?, ?)",
     )
     .bind(prompt)
     .bind(TEAM_MODE)
     .bind(&session_id)
     .bind(team_run_id)
+    .bind(i64::from(read_untrusted))
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(&state.pool)
     .await?
@@ -2311,12 +2786,37 @@ async fn launch_director(
         )
         .await;
     };
-    let prompt = match node {
+    let mut prompt = match node {
         DirectorNode::Delivering => delivery_prompt(state, run, &team).await,
         _ => director_prompt(state, run, &team).await,
     };
 
-    let (run_id, session_id) = open_run(state, &run.id, &prompt).await?;
+    // The director is addressable like anybody else — `teams.director_agent_id` is an `agents.id`,
+    // and it is on the roster every specialist is shown. That is deliberate and is the highest-value
+    // message this feature will ever carry: "I found X, it is worth replanning" reaches the node that
+    // decides what the next round does, instead of waiting for a folder somebody has to read.
+    let waiting = crate::team_notes::pending(&state.pool, &run.id, &director.id)
+        .await
+        .unwrap_or_default();
+    if let Some(block) = crate::team_notes::render(&waiting) {
+        prompt.push_str(&block);
+    }
+
+    let (run_id, session_id) = open_run(state, &run.id, &prompt, !waiting.is_empty()).await?;
+
+    // AFTER the run exists, which is `notes.rs`' hard-won rule and not a detail: a node that failed
+    // to start never read the words, and a note consumed by it would be lost in silence — the one
+    // failure the owner cannot see and cannot repeat.
+    let ids: Vec<i64> = waiting.iter().map(|note| note.id).collect();
+    if let Err(error) = crate::team_notes::mark_delivered(&state.pool, &ids, run_id).await {
+        tracing::warn!(
+            team_run = %run.id,
+            run_id,
+            %error,
+            "the director was given its colleagues' notes and they were not marked delivered; they \
+             will arrive again"
+        );
+    }
 
     // The marker is written BEFORE the spawn and cleared by the ingestion, which is what makes it a
     // marker and not a derived condition — the lesson migration 0051 bought, where a derived
@@ -2358,8 +2858,30 @@ async fn launch_specialist(
         .bind(&run.team_id)
         .fetch_one(&state.pool)
         .await?;
-    let prompt = specialist_prompt(state, run, &team, item).await;
-    let (run_id, session_id) = open_run(state, &run.id, &prompt).await?;
+    let mut prompt = specialist_prompt(state, run, &team, item).await;
+
+    // Read BEFORE the run is opened and stamped AFTER, and never both in one breath. A read taken
+    // and claimed together looks identical from here right up until this launch fails — and a
+    // colleague's words would then be marked delivered to a node that never existed.
+    let waiting = crate::team_notes::pending(&state.pool, &run.id, &item.agent_id)
+        .await
+        .unwrap_or_default();
+    if let Some(block) = crate::team_notes::render(&waiting) {
+        prompt.push_str(&block);
+    }
+
+    let (run_id, session_id) = open_run(state, &run.id, &prompt, !waiting.is_empty()).await?;
+
+    let ids: Vec<i64> = waiting.iter().map(|note| note.id).collect();
+    if let Err(error) = crate::team_notes::mark_delivered(&state.pool, &ids, run_id).await {
+        tracing::warn!(
+            team_run = %run.id,
+            run_id,
+            %error,
+            "a specialist was given its colleagues' notes and they were not marked delivered; they \
+             will arrive again"
+        );
+    }
 
     sqlx::query(
         "UPDATE team_items SET state = 'running', run_id = ? WHERE team_run_id = ? AND ordinal = ?",
@@ -2405,12 +2927,8 @@ async fn spawn_agent(
             crate::runner::OllamaChat::new(crate::runner::OLLAMA_BASE_URL.to_string(), model);
         // The TEAM's box, never `LocalToolBox::new`: `LOCAL_TOOLS` carries `create_run` and
         // `create_job`, and the local path never passes through `hooks.rs` at all.
-        let tools = crate::mcp_tools::LocalToolBox::for_team(
-            DAEMON_URL.to_string(),
-            token,
-            pool.clone(),
-            run_id,
-        );
+        let tools =
+            crate::mcp_tools::LocalToolBox::for_team(daemon_url(), token, pool.clone(), run_id);
         let timeout = state.run_timeout;
         crate::runs::spawn_registered(state, run_id, async move {
             let taint = std::sync::atomic::AtomicBool::new(false);
@@ -3025,6 +3543,39 @@ async fn folder_index(state: &AppState, run: &TeamRun) -> String {
     out
 }
 
+/// The address book one specialist is shown: everybody it may write to, and not itself.
+///
+/// Separate from `roster_lines` because the two answer different questions. That one is what the
+/// DIRECTOR is shown — who it may hand work to — and a director does not hand work to itself. This
+/// one is who a specialist may TELL something, which includes the director and excludes the reader.
+///
+/// The director is marked rather than merely listed. A specialist choosing between two names should
+/// know which of them decides what the next round contains, because that is usually where a finding
+/// belongs, and a bare id says nothing about it.
+async fn colleagues_lines(state: &AppState, team_id: &str, excluding: &str) -> String {
+    let director: Option<String> =
+        sqlx::query_scalar("SELECT director_agent_id FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    let mut out = String::new();
+    for id in addressable(&state.pool, team_id).await.unwrap_or_default() {
+        if id == excluding {
+            continue;
+        }
+        if let Ok(Some(agent)) = crate::agent::get(&state.pool, &id).await {
+            let role = match director.as_deref() == Some(id.as_str()) {
+                true => " (directs this department and plans the next round)",
+                false => "",
+            };
+            out.push_str(&format!("- {}: {}{role}\n", agent.id, agent.speciality));
+        }
+    }
+    out
+}
+
 async fn roster_lines(state: &AppState, team_id: &str) -> String {
     let mut out = String::new();
     for id in roster(&state.pool, team_id).await.unwrap_or_default() {
@@ -3129,11 +3680,50 @@ async fn delivery_prompt(state: &AppState, run: &TeamRun, team: &Team) -> String
                       this department does not have and did not get them in time."
                     .to_owned(),
         },
-    )
+    ) + &undelivered_line(state, run).await
 }
 
-/// A specialist is told its own instructions, its own task, the mission and the index — and
-/// deliberately not the rest of the plan. What the others are doing is not its context.
+/// What one member of this department told another that nobody was ever given, ready to append.
+///
+/// The ordinary way for a note to end up here is not a failure: the round ended, the plan did not
+/// queue that colleague again, and the words stayed in the queue. But the delivery is the last
+/// moment anybody looks, and a queue quietly emptied by the run ending reads downstream as the whole
+/// of what the department found. `job::PlannedItems::dropped` is the precedent and the sentence is
+/// its.
+///
+/// Appended to the DELIVERY and not to every replan, because the director already gets its own mail
+/// on every node it runs — what this covers is specifically the messages addressed to somebody else
+/// that nobody will now ever read.
+async fn undelivered_line(state: &AppState, run: &TeamRun) -> String {
+    let left = crate::team_notes::undelivered(&state.pool, &run.id)
+        .await
+        .unwrap_or_default();
+    if left.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nSome of this department's members left notes for colleagues who were never started \
+         again, so nobody read them. They are below, and they are findings this department paid for. \
+         Use what is useful and leave what is not:",
+    );
+    for note in &left {
+        out.push_str(&format!(
+            "\n\n{} wrote to {}:\n\n{}",
+            note.from_agent_id, note.to_agent_id, note.body
+        ));
+    }
+    out
+}
+
+/// A specialist is told its own instructions, its own task, the mission, the roster and the index —
+/// and deliberately not the rest of the plan. What the others are DOING is not its context.
+///
+/// **The roster is, and it was the thing missing.** A specialist could not name a colleague, so
+/// there was nobody for it to address even once there was a channel: `roster_lines` prints
+/// `- <agents.id>: <speciality>`, which is exactly what `send_team_note` takes. It carries each
+/// member's speciality and not their prompt, for `director_prompt`'s reason — a specialist's
+/// instructions are its own, and putting them here would make every node pay for text that only
+/// changes what somebody else does.
 async fn specialist_prompt(
     state: &AppState,
     run: &TeamRun,
@@ -3151,11 +3741,16 @@ async fn specialist_prompt(
          You are working inside a department whose mission is: {mission}\n\
          The department was asked to: {}\n\n\
          Your task:\n{}\n\n\
+         Who else is in this department:\n{}\n\
          What is already in the department's folder:\n{}\n\
          Answer with your work itself. Do not write it to a file — your reply IS the deliverable, \
-         and it is filed for you.",
+         and it is filed for you. If you find something that changes what one of the people above \
+         should be doing, tell them with the send_team_note tool, addressing them by the id on the \
+         left. They will not answer you — they are a separate run — so say it in a way they can act \
+         on alone, and put it in your own answer as well.",
         run.request,
         item.description,
+        colleagues_lines(state, &run.team_id, &item.agent_id).await,
         folder_index(state, run).await,
     )
 }
@@ -3395,6 +3990,13 @@ pub async fn delete_team(
 #[derive(serde::Deserialize)]
 pub struct StartRequest {
     pub request: String,
+    /// Where this run may speak while it works, or nothing.
+    ///
+    /// Optional, and absent on nearly every start: a department that reports nowhere behaves exactly
+    /// as it did before this existed. Given here rather than configured on the team, so the address
+    /// belongs to THIS piece of work and is chosen by the person starting it.
+    #[serde(default)]
+    pub report_to_chat_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -3409,7 +4011,14 @@ pub async fn post_team_run(
     Path(id): Path<String>,
     Json(body): Json<StartRequest>,
 ) -> Result<(StatusCode, Json<StartResponse>), (StatusCode, String)> {
-    match start(&state, &id, &body.request).await {
+    match start(
+        &state,
+        &id,
+        &body.request,
+        body.report_to_chat_id.as_deref(),
+    )
+    .await
+    {
         Ok(id) => Ok((StatusCode::ACCEPTED, Json(StartResponse { id }))),
         Err(error @ StartError::NotFound) => Err((StatusCode::NOT_FOUND, error.to_string())),
         Err(error @ StartError::Invalid(_)) => Err((StatusCode::BAD_REQUEST, error.to_string())),
@@ -3521,6 +4130,29 @@ pub async fn delete_team_run(
         .execute(&state.pool)
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
+    // Before the run, like the items and for the same reason: `team_notes.team_run_id` is a real
+    // foreign key and `foreign_keys` is ON, so a note left behind does not become an orphan — it
+    // makes the DELETE below fail. That is what the constraint is FOR, and it is only worth having
+    // if somebody remembers the other half.
+    crate::team_notes::delete_for_run(&state.pool, &id)
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
+    // And the actions, which carried the identical reference since 0086 with nothing anywhere
+    // deleting them. Deleting a department that had used its alçada answered 500 with `FOREIGN KEY
+    // constraint failed` and named nothing — a run that never asked for anything deleted fine, which
+    // is why it went unseen. `a_department_that_asked_for_something_can_still_be_deleted` is what
+    // keeps it seen.
+    //
+    // The `proposals` rows they point at are deliberately LEFT. `team_actions.proposal_id` is a
+    // logical reference and not a constraint, and what a person was asked to approve is a fact about
+    // that person's queue — it does not stop having happened because the department that asked has
+    // been tidied away. Same reasoning as `runs.team_run_id` being nulled rather than cascaded, one
+    // statement up.
+    sqlx::query("DELETE FROM team_actions WHERE team_run_id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
     sqlx::query("DELETE FROM team_runs WHERE id = ?")
         .bind(&id)
         .execute(&state.pool)
@@ -3576,9 +4208,15 @@ pub async fn post_team_action(
 
 /// `POST /team-recruits` — a director says who it needed and did not have.
 ///
-/// The second and last route this scope gains, and the only one in the house that answers
-/// differently depending on WHICH NODE of a run is calling. That distinction comes from
-/// `team_runs.director_run_id` and not from a scope of its own — see `Caller`.
+/// The first route in the house that answers differently depending on WHICH NODE of a run is
+/// calling. That distinction comes from `team_runs.director_run_id` and not from a scope of its own
+/// — see `Caller`, and see `team::send_note`, which now asks the same question for a different
+/// reason: this one to refuse a specialist, that one to sign a note.
+///
+/// (This paragraph opened "The second and last route this scope gains" until `POST /team-notes`
+/// became the third. The count was written as a promise and did not survive one feature; what the
+/// promise was reaching for is now stated once, as a rule about what belongs in the table, in
+/// `auth::TEAM_ROUTES`.)
 ///
 /// 403 for a specialist, and the body says what to do instead: put it in your answer and let the
 /// director pass it on. A model reading only the code would retry; the sentence is what stops it.
@@ -3604,6 +4242,82 @@ pub async fn post_team_recruit(
                 }
                 RecruitError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
                 RecruitError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
+        })
+}
+
+/// `POST /team-notes` — one member of a department leaves words for another.
+///
+/// The third route this scope gains, and the first whose effect never leaves the run that made it:
+/// what it writes is read by another node holding the very same key. The two before it record a
+/// request for somebody OUTSIDE to act on; this one records a sentence for somebody inside.
+///
+/// The status codes carry the same distinction the sentences do, and 422 is doing the most work:
+/// every one of its three causes is a model that can still fix it this turn, with the roster in
+/// front of it.
+pub async fn post_team_note(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TeamNoteRequest>,
+) -> Result<Json<TeamNoteResponse>, (StatusCode, String)> {
+    send_note(&state, &scope, &headers, &request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = match &error {
+                NoteError::NotADepartment | NoteError::UnknownNode => StatusCode::FORBIDDEN,
+                NoteError::NoSuchRun => StatusCode::NOT_FOUND,
+                // 422 and not 400 for all three: the request is well-formed and it is the CONTENT
+                // that cannot stand — a name off the roster, the caller's own name, nothing at all.
+                // Each is a model that mis-typed or mis-thought, still mid-turn, and the body names
+                // the members so the retry is informed rather than blind.
+                NoteError::NoSuchColleague { .. } | NoteError::Yourself | NoteError::Empty => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                // 429 for `propose_action`'s reason, with one difference worth knowing: that ceiling
+                // is a queue that DRAINS as a person decides, and this one does not — it is spent
+                // for the life of the run. The code still says "not now, and not by retrying", which
+                // is the part that governs what the model does next.
+                NoteError::Ceiling(_) => StatusCode::TOO_MANY_REQUESTS,
+                NoteError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
+        })
+}
+
+/// `POST /team-reports` — a department says something to its owner, and nothing runs.
+///
+/// The fourth and last route of this scope, and the only one that reaches outside the department at
+/// all. It is still a SAYING rather than a DOING, which is the rule `auth::TEAM_ROUTES` keeps: no
+/// turn starts, nothing is spent, and the daemon picks the destination out of a column the
+/// department can neither read nor set.
+///
+/// 403 for a specialist, with the sentence that says what to do instead — `post_team_recruit`'s
+/// shape, because a model reading only the code would retry.
+pub async fn post_team_report(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ReportRequest>,
+) -> Result<Json<ReportResponse>, (StatusCode, String)> {
+    report(&state, &scope, &headers, &request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = match &error {
+                ReportError::NotADepartment | ReportError::NotTheDirector => StatusCode::FORBIDDEN,
+                ReportError::NoSuchRun => StatusCode::NOT_FOUND,
+                // 409 for both, and not 404: the run exists and so does the request. What is absent
+                // is a place to speak — either never given or since closed — and neither is fixed by
+                // asking again differently, which is what a 4xx about the REQUEST would suggest.
+                ReportError::NowhereToReport | ReportError::DestinationGone(_) => {
+                    StatusCode::CONFLICT
+                }
+                ReportError::Empty => StatusCode::UNPROCESSABLE_ENTITY,
+                ReportError::Ceiling(_) => StatusCode::TOO_MANY_REQUESTS,
+                ReportError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (status, error.to_string())
         })
@@ -4258,7 +4972,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        start(state, "marketing", "write the launch post")
+        start(state, "marketing", "write the launch post", None)
             .await
             .unwrap()
     }
@@ -4296,7 +5010,7 @@ mod tests {
     async fn a_department_with_no_alcada_may_ask_for_nothing() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "write the launch post")
+        let run_id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -4606,7 +5320,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let support_run = start(&state, "support", "answer the backlog")
+        let support_run = start(&state, "support", "answer the backlog", None)
             .await
             .unwrap();
         ask(&state, &support_run, "send_email", an_email())
@@ -4854,6 +5568,756 @@ mod tests {
         (director_run, specialist_run)
     }
 
+    /// A department that used its alçada can still be deleted afterwards.
+    ///
+    /// **A pre-existing bug, found by reading the schema while designing `team_notes`.**
+    /// `team_actions.team_run_id` is `TEXT NOT NULL REFERENCES team_runs(id)` (0086), `storage.rs`
+    /// runs with `foreign_keys` ON, and `delete_team_run` deletes `team_items` and `team_runs` and
+    /// nothing else — so the DELETE fails with `FOREIGN KEY constraint failed` and the owner gets a
+    /// 500 naming nothing. It bites only a run that actually asked for something, which is why it
+    /// went unnoticed: a department that never used its alçada deletes fine.
+    ///
+    /// `team_notes` was designed around this rather than repeating it: it carries the same NOT NULL
+    /// reference AND `delete_team_run` clears it, which is the whole bargain — the constraint is
+    /// what makes forgetting loud, and it is only worth having if somebody remembers.
+    ///
+    /// The proposal is left behind on purpose, exactly as `runs.team_run_id` is nulled rather than
+    /// cascaded: what a person was asked to approve is a fact about that person's queue, and it does
+    /// not stop existing because the department that asked has been tidied away.
+    #[tokio::test]
+    async fn a_department_that_asked_for_something_can_still_be_deleted() {
+        let (state, _root) = state_with_root().await;
+        let id = team_with_grant(&state, "send_email", "propose").await;
+        ask(&state, &id, "send_email", an_email())
+            .await
+            .expect("the alçada was granted");
+
+        // Only a finished run may be deleted, which is the route's own first check.
+        sqlx::query("UPDATE team_runs SET state = 'done' WHERE id = ?")
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let outcome = delete_team_run(State(state.clone()), Path(id.clone())).await;
+
+        assert!(
+            outcome.is_ok(),
+            "a department that used its alçada could not be deleted: {:?}",
+            outcome.err()
+        );
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_runs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Reporting to the owner
+    // -----------------------------------------------------------------------------------------
+
+    /// Reports as one node of a run, through the same surface the route uses.
+    async fn report_from(
+        state: &AppState,
+        team_run_id: &str,
+        run_id: i64,
+        body: &str,
+    ) -> Result<ReportResponse, ReportError> {
+        report(
+            state,
+            &crate::auth::Scope::TeamRun(team_run_id.to_owned()),
+            &as_node(run_id),
+            &ReportRequest {
+                body: body.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Starts a department pointed at a conversation, and hands back both ids.
+    async fn run_reporting_into(state: &AppState) -> (String, String) {
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let id = start_with(
+            state,
+            "marketing",
+            "write the launch post",
+            Lineage::default(),
+            Some(&chat_id),
+        )
+        .await
+        .unwrap();
+        (id, chat_id)
+    }
+
+    /// The whole of part B: a director says something, and it is in the conversation, attributed.
+    ///
+    /// Asserted on `chat_notices` and on the unread count rather than on a return value, because
+    /// what this feature promises is that a person sitting in that conversation is CALLED BACK to
+    /// it. A row nobody is told about is the same as no row.
+    #[tokio::test]
+    async fn what_a_director_says_lands_in_the_conversation_and_calls_the_owner_back() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, chat_id) = run_reporting_into(&state).await;
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        report_from(
+            &state,
+            &id,
+            director_run,
+            "a fonte que deste está morta desde Março",
+        )
+        .await
+        .expect("a director may speak in the conversation its run was pointed at");
+
+        let told = crate::chat_notices::for_chat(&state.pool, &chat_id)
+            .await
+            .unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].body, "a fonte que deste está morta desde Março");
+        assert_eq!(told[0].from_agent_id, "director");
+        assert_eq!(told[0].team_run_id, id);
+
+        assert_eq!(
+            crate::chats::get(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .expect("the conversation exists")
+                .notices_waiting,
+            1,
+            "the department spoke and nothing called the owner back to the conversation"
+        );
+
+        // And nothing ran. This is the line that separates a report from a relay: `send_to_chat`
+        // would have started a turn here, spent money, and been refused outright if the owner were
+        // away.
+        let turns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE chat_id = ? AND mode = 'assistant'",
+        )
+        .bind(&chat_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(turns, 0, "a report started a turn, which makes it a relay");
+    }
+
+    /// A specialist is refused, and told what to do instead.
+    ///
+    /// A department speaks to its owner with one voice: eight specialists reporting into a
+    /// conversation are eight interruptions about one piece of work.
+    #[tokio::test]
+    async fn a_specialist_may_not_speak_for_the_department() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, chat_id) = run_reporting_into(&state).await;
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        let refusal = report_from(&state, &id, copywriter_run, "eu acho que...")
+            .await
+            .expect_err("a specialist spoke for the whole department");
+
+        assert!(matches!(refusal, ReportError::NotTheDirector));
+        assert!(
+            refusal.to_string().contains("let the director pass it on"),
+            "the refusal did not say what to do with the finding: {refusal}"
+        );
+        assert!(
+            crate::chat_notices::for_chat(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A department nobody pointed anywhere is told so, plainly, and it is not an error.
+    ///
+    /// This is the ordinary state of nearly every run — `report_to_chat_id` is NULL unless somebody
+    /// filled it — so the sentence matters more than the code: a model that reads it should write
+    /// the words into its delivery, not retry.
+    #[tokio::test]
+    async fn a_department_pointed_nowhere_is_told_to_put_it_in_the_delivery() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        let refusal = report_from(&state, &id, director_run, "olha lá")
+            .await
+            .expect_err("a department with no destination spoke somewhere");
+
+        assert!(matches!(refusal, ReportError::NowhereToReport));
+        assert!(
+            refusal
+                .to_string()
+                .contains("put it in your delivery instead")
+        );
+    }
+
+    /// Naming a conversation that does not exist is refused when the RUN is started.
+    ///
+    /// Refused there and not two hours later: the mistake belongs to whoever started the run, and
+    /// they are at a keyboard now. A director discovering it mid-turn can do nothing about it.
+    #[tokio::test]
+    async fn a_department_cannot_be_pointed_at_a_conversation_that_is_not_there() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+
+        let refusal = start_with(
+            &state,
+            "marketing",
+            "write the launch post",
+            Lineage::default(),
+            Some("no-such-chat"),
+        )
+        .await
+        .expect_err("a department was pointed at a conversation that does not exist");
+
+        assert!(matches!(refusal, StartError::Invalid(_)));
+        assert!(refusal.to_string().contains("no-such-chat"));
+    }
+
+    /// A conversation archived while the department worked is refused mid-run, on its own line.
+    ///
+    /// Distinct from `NowhereToReport` because the two lead somewhere different: never given a
+    /// voice, versus given a room that has since been closed. A run lasts up to four hours and a
+    /// conversation can be put away inside that, so this is not a hypothetical.
+    #[tokio::test]
+    async fn a_conversation_put_away_mid_run_is_named_as_such() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, chat_id) = run_reporting_into(&state).await;
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        crate::chats::archive(&state.pool, &chat_id).await.unwrap();
+
+        let refusal = report_from(&state, &id, director_run, "tarde demais")
+            .await
+            .expect_err("a department spoke into an archived conversation");
+
+        assert!(matches!(refusal, ReportError::DestinationGone(_)));
+        assert!(refusal.to_string().contains(&chat_id));
+    }
+
+    /// A department that only talks is stopped, and told where the rest goes.
+    #[tokio::test]
+    async fn a_department_may_not_fill_a_conversation_with_its_own_voice() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let (id, _chat_id) = run_reporting_into(&state).await;
+        let (director_run, _copywriter_run) = director_and_specialist(&state, &id).await;
+
+        for _ in 0..MAX_REPORTS_PER_RUN {
+            report_from(&state, &id, director_run, "mais uma")
+                .await
+                .expect("under the ceiling");
+        }
+
+        let refusal = report_from(&state, &id, director_run, "e mais uma")
+            .await
+            .expect_err("a department spoke past its ceiling");
+        assert!(matches!(refusal, ReportError::Ceiling(_)));
+        assert!(
+            refusal
+                .to_string()
+                .contains("put the rest in your delivery")
+        );
+    }
+
+    /// A rule that fires when nobody is asking points its run at no conversation.
+    ///
+    /// The one place this could have gone wrong quietly: `team_trigger::fire` passes `None`, so a
+    /// department started by a cron rule at four in the morning has nowhere to speak and says so —
+    /// rather than inheriting an address from a conversation nobody is in.
+    #[tokio::test]
+    async fn a_triggered_run_speaks_nowhere() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start_with(
+            &state,
+            "marketing",
+            "the nightly sweep",
+            Lineage {
+                trigger_id: Some(1),
+                parent_id: None,
+                root_id: None,
+                depth: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let destination: Option<String> =
+            sqlx::query_scalar("SELECT report_to_chat_id FROM team_runs WHERE id = ?")
+                .bind(&id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(destination.is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Notes between colleagues
+    // -----------------------------------------------------------------------------------------
+
+    /// The run row as `team_tick` reads it, so the launches below see what production sees.
+    async fn load_run(state: &AppState, id: &str) -> TeamRun {
+        sqlx::query_as(
+            "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
+                    next_ordinal, dry_rounds, plan_retries, replanned, outcome, why, created_at,
+                    updated_at, finished_at, trigger_id, parent_id, root_id, depth
+               FROM team_runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Leaves a note as one node of a run, through the same surface the route uses.
+    async fn note_from(
+        state: &AppState,
+        team_run_id: &str,
+        run_id: i64,
+        to: &str,
+        body: &str,
+    ) -> Result<TeamNoteResponse, NoteError> {
+        send_note(
+            state,
+            &crate::auth::Scope::TeamRun(team_run_id.to_owned()),
+            &as_node(run_id),
+            &TeamNoteRequest {
+                to: to.to_owned(),
+                body: body.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// The whole feature in one test: a specialist tells a colleague something, and the colleague's
+    /// next brief carries it, word for word, with the sender's name on it.
+    ///
+    /// The delivery happens at `launch_specialist`, so what this asserts is the PROMPT the daemon
+    /// actually wrote to `runs.prompt` — not that a row exists. A row that nothing reads out is the
+    /// failure this feature is most likely to have and the one hardest to see.
+    #[tokio::test]
+    async fn what_one_specialist_tells_another_is_at_the_top_of_their_next_brief() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        note_from(
+            &state,
+            &id,
+            copywriter_run,
+            "researcher",
+            "o preço mudou na terça, a página antiga está errada",
+        )
+        .await
+        .expect("a colleague on the roster can be told");
+
+        // The researcher is queued and then launched, which is the seam the delivery hangs off.
+        let run = load_run(&state, &id).await;
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state)
+             VALUES (?, 2, 0, 'researcher', 'check the pricing page', 'pending')",
+        )
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let item: TeamItem = sqlx::query_as(
+            "SELECT ordinal, round, agent_id, description, state, run_id, output_path
+               FROM team_items WHERE team_run_id = ? AND ordinal = 2",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        launch_specialist(&state, &run, &item).await.unwrap();
+
+        let prompt: String = sqlx::query_scalar(
+            "SELECT prompt FROM runs WHERE team_run_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            prompt.contains("o preço mudou na terça, a página antiga está errada"),
+            "the note never reached the colleague's brief: {prompt}"
+        );
+        assert!(
+            prompt.contains("copywriter"),
+            "the note arrived unattributed, which makes it indistinguishable from the brief"
+        );
+    }
+
+    /// A node handed a colleague's words is born having read them, and may therefore no longer ask.
+    ///
+    /// **This is the governance decision of the whole feature, and it is asserted on the ROW rather
+    /// than on the tool**, because the marking is what `hooks::team_decision` reads and the tool
+    /// refusal is tested there. Writing a note is `WritesOwn` so a specialist that read the web can
+    /// still tell a colleague what it found; the taint travels WITH the words and lands here. The
+    /// cost is real and deliberate: this node has lost its alçada for this turn.
+    ///
+    /// The second half — a node with no mail is untouched — is the more important of the two. Every
+    /// department that never uses this feature has to keep the authority it has today, and a
+    /// marking applied unconditionally would take the alçada away from all of them.
+    #[tokio::test]
+    async fn a_node_handed_a_colleagues_words_is_born_having_read_them() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        let run = load_run(&state, &id).await;
+
+        // First: a colleague with no mail, launched exactly as today.
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state)
+             VALUES (?, 2, 0, 'researcher', 'check the pricing page', 'pending')",
+        )
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let item: TeamItem = sqlx::query_as(
+            "SELECT ordinal, round, agent_id, description, state, run_id, output_path
+               FROM team_items WHERE team_run_id = ? AND ordinal = 2",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        launch_specialist(&state, &run, &item).await.unwrap();
+        let clean: i64 = sqlx::query_scalar(
+            "SELECT read_untrusted FROM runs WHERE team_run_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            clean, 0,
+            "a department that leaves no notes lost its alçada anyway"
+        );
+
+        // Then: the same agent, with a colleague's words waiting.
+        note_from(
+            &state,
+            &id,
+            copywriter_run,
+            "researcher",
+            "lê isto primeiro",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state)
+             VALUES (?, 3, 1, 'researcher', 'check it again', 'pending')",
+        )
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let item: TeamItem = sqlx::query_as(
+            "SELECT ordinal, round, agent_id, description, state, run_id, output_path
+               FROM team_items WHERE team_run_id = ? AND ordinal = 3",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        launch_specialist(&state, &run, &item).await.unwrap();
+
+        let (tainted, prompt): (i64, String) = sqlx::query_as(
+            "SELECT read_untrusted, prompt FROM runs WHERE team_run_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            prompt.contains("lê isto primeiro"),
+            "the note did not travel"
+        );
+        assert_eq!(
+            tainted, 1,
+            "a node was handed a colleague's words and can still act on them"
+        );
+    }
+
+    /// The note is signed by the node that made the call, never by anything in the body.
+    ///
+    /// There is no `from` field to test the absence of — the point is that the identity comes from
+    /// `RUN_ID_HEADER`, which the local client fills from an id the calling process cannot read, let
+    /// alone alter. What this pins is that the resolution WORKS: a specialist's note is signed with
+    /// that specialist's `agents.id` and not with the department's name or nothing at all.
+    #[tokio::test]
+    async fn a_note_is_signed_by_the_node_that_made_the_call() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        note_from(&state, &id, copywriter_run, "researcher", "do especialista")
+            .await
+            .unwrap();
+        note_from(&state, &id, director_run, "researcher", "do director")
+            .await
+            .unwrap();
+
+        let signatures: Vec<(String, String)> =
+            sqlx::query_as("SELECT from_agent_id, body FROM team_notes ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            signatures,
+            vec![
+                ("copywriter".to_owned(), "do especialista".to_owned()),
+                ("director".to_owned(), "do director".to_owned()),
+            ]
+        );
+    }
+
+    /// A specialist tells the DIRECTOR something, and the director's next node reads it.
+    ///
+    /// The most valuable message this feature carries, and the one an earlier draft of `send_note`
+    /// refused: it checked `roster`, which is `team_members` and does not hold the director. This
+    /// exercises the other launch path too — `launch_director` — which nothing else here covers.
+    #[tokio::test]
+    async fn a_specialist_can_tell_the_director_and_the_director_reads_it() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        note_from(
+            &state,
+            &id,
+            copywriter_run,
+            "director",
+            "vale a pena replanear: metade do que pediste já está feito noutro sítio",
+        )
+        .await
+        .expect("the director is addressable by one of its own specialists");
+
+        // A replanning node, launched the way a finished round launches one. The marker written by
+        // `director_and_specialist` is cleared first, because `launch_director` writes its own.
+        sqlx::query(
+            "UPDATE team_runs SET director_node = 'none', director_run_id = NULL WHERE id = ?",
+        )
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let run = load_run(&state, &id).await;
+        launch_director(&state, &run, DirectorNode::Replanning)
+            .await
+            .unwrap();
+
+        let (prompt, tainted): (String, i64) = sqlx::query_as(
+            "SELECT prompt, read_untrusted FROM runs WHERE team_run_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            prompt.contains("vale a pena replanear"),
+            "the director replanned without the finding that should have changed the plan: {prompt}"
+        );
+        assert_eq!(
+            tainted, 1,
+            "the director was handed a specialist's words and can still file proposals on them"
+        );
+    }
+
+    /// A node the run does not recognise is refused rather than allowed to write anonymously.
+    ///
+    /// The safe direction and the honest one: an unattributed paragraph appended to a colleague's
+    /// brief is a second brief with no way to weigh it against the first, and the receiving node
+    /// cannot recover from that — it has only the text.
+    #[tokio::test]
+    async fn a_node_nobody_recognises_may_not_leave_an_unsigned_note() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        director_and_specialist(&state, &id).await;
+
+        let refusal = note_from(&state, &id, 999_999, "researcher", "de quem?").await;
+
+        assert!(matches!(refusal, Err(NoteError::UnknownNode)));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_notes")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "an unsigned note was filed anyway");
+    }
+
+    /// Naming somebody who is not in the department is refused, and the refusal names the roster.
+    ///
+    /// The naming is the point rather than politeness. The caller is a model, mid-turn, that has the
+    /// roster in its prompt and got a name slightly wrong; "no" sends it to guess again, and the
+    /// list lets it fix the call it already meant to make.
+    #[tokio::test]
+    async fn a_name_off_the_roster_is_refused_with_the_roster_in_the_answer() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        let refusal = note_from(&state, &id, copywriter_run, "lawyer", "olá")
+            .await
+            .expect_err("somebody outside the department was reachable");
+
+        let said = refusal.to_string();
+        assert!(
+            said.contains("lawyer"),
+            "the refusal did not say what was asked for"
+        );
+        assert!(
+            said.contains("copywriter") && said.contains("researcher") && said.contains("director"),
+            "the refusal did not name the department: {said}"
+        );
+    }
+
+    /// Writing to yourself is refused. Harmless, and refused anyway.
+    ///
+    /// The words would arrive at the top of the caller's OWN next brief, attributed to a colleague
+    /// who is the caller — a turn quoting itself back and weighing it as somebody else's finding.
+    #[tokio::test]
+    async fn a_member_may_not_leave_a_note_for_itself() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        let refusal = note_from(&state, &id, copywriter_run, "copywriter", "nota para mim").await;
+
+        assert!(matches!(refusal, Err(NoteError::Yourself)));
+    }
+
+    /// The ceiling is per RUN and counts everybody, because what it protects against is a department
+    /// talking instead of working.
+    #[tokio::test]
+    async fn a_department_that_only_talks_is_stopped_at_the_ceiling() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        // Two senders, alternating, so what is exercised is the RUN's total and not one member's.
+        for turn in 0..crate::team_notes::MAX_NOTES_PER_RUN {
+            let (from, to) = if turn % 2 == 0 {
+                (copywriter_run, "researcher")
+            } else {
+                (director_run, "copywriter")
+            };
+            note_from(&state, &id, from, to, "mais uma")
+                .await
+                .expect("under the ceiling");
+        }
+
+        let refusal = note_from(&state, &id, copywriter_run, "researcher", "e mais uma").await;
+        assert!(matches!(refusal, Err(NoteError::Ceiling(_))));
+        // And the refusal tells the model where to put it instead, which is the difference between
+        // a ceiling and a wall.
+        assert!(
+            refusal
+                .unwrap_err()
+                .to_string()
+                .contains("put it in your answer instead"),
+            "the ceiling refused without saying what to do with the finding"
+        );
+    }
+
+    /// What nobody was ever told reaches the delivery, rather than disappearing with the run.
+    #[tokio::test]
+    async fn words_nobody_read_are_handed_to_the_delivery() {
+        let (state, _root) = state_with_root().await;
+        let team = marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (_director_run, copywriter_run) = director_and_specialist(&state, &id).await;
+
+        note_from(
+            &state,
+            &id,
+            copywriter_run,
+            "researcher",
+            "a fonte de 2019 está morta",
+        )
+        .await
+        .unwrap();
+
+        let run = load_run(&state, &id).await;
+        let prompt = delivery_prompt(&state, &run, &team.team).await;
+
+        assert!(
+            prompt.contains("a fonte de 2019 está morta"),
+            "a finding the department paid for was dropped when the run ended: {prompt}"
+        );
+    }
+
+    /// A specialist is told who its colleagues are, which is what makes anybody addressable at all.
+    #[tokio::test]
+    async fn a_specialist_is_told_who_else_is_in_the_department() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let run = load_run(&state, &id).await;
+        let item = TeamItem {
+            ordinal: 1,
+            round: 0,
+            agent_id: "copywriter".to_owned(),
+            description: "draft the post".to_owned(),
+            state: "pending".to_owned(),
+            run_id: None,
+            output_path: None,
+        };
+
+        let prompt = specialist_prompt(&state, &run, "sell the thing", &item).await;
+
+        assert!(
+            prompt.contains("researcher"),
+            "no colleague was nameable: {prompt}"
+        );
+        assert!(
+            prompt.contains("send_team_note"),
+            "nothing said how to reach them"
+        );
+    }
+
     fn a_lawyer() -> RecruitRequest {
         RecruitRequest {
             name: "Contracts lawyer".to_owned(),
@@ -4875,7 +6339,7 @@ mod tests {
     async fn only_the_director_recruits_and_a_specialist_hears_why_not() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, specialist_run) = director_and_specialist(&state, &run_id).await;
@@ -4916,7 +6380,7 @@ mod tests {
     async fn hiring_writes_the_agent_and_the_roster_together() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -4972,7 +6436,7 @@ mod tests {
     async fn a_director_does_not_ask_for_the_same_person_twice() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5013,7 +6477,7 @@ mod tests {
     async fn a_department_that_asked_for_nobody_reads_the_prompt_it_always_did() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let run: TeamRun = sqlx::query_as(
@@ -5039,7 +6503,7 @@ mod tests {
     async fn a_name_already_in_the_catalogue_says_to_add_them_instead() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5070,7 +6534,7 @@ mod tests {
     async fn what_is_hired_is_what_the_owner_approved_and_not_what_was_proposed() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5141,7 +6605,7 @@ mod tests {
     async fn a_refused_recruitment_may_be_asked_for_again() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let run_id = start(&state, "marketing", "prepare the launch")
+        let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
             .unwrap();
         let (director_run, _) = director_and_specialist(&state, &run_id).await;
@@ -5236,7 +6700,7 @@ mod tests {
         .await
         .expect("a half-built team is a legitimate thing to save");
 
-        let refusal = start(&state, "empty", "do some work").await;
+        let refusal = start(&state, "empty", "do some work", None).await;
         assert!(
             matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("no members")),
             "got {refusal:?}"
@@ -5268,7 +6732,7 @@ mod tests {
         .await
         .unwrap();
 
-        let refusal = start(&state, "local", "do some work").await;
+        let refusal = start(&state, "local", "do some work", None).await;
         assert!(
             matches!(&refusal, Err(StartError::Invalid(why)) if why.contains("local model")),
             "got {refusal:?}"
@@ -5290,7 +6754,7 @@ mod tests {
             ..state
         };
 
-        let refusal = start(&state, "marketing", "write the launch post").await;
+        let refusal = start(&state, "marketing", "write the launch post", None).await;
         assert!(
             matches!(&refusal, Err(StartError::Unavailable(why)) if why.contains("files folder")),
             "got {refusal:?}"
@@ -5307,7 +6771,7 @@ mod tests {
         let (state, root) = state_with_root().await;
         marketing(&state).await;
 
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -5348,7 +6812,7 @@ mod tests {
     async fn an_ordinal_is_unique_across_the_whole_run() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -5406,11 +6870,11 @@ mod tests {
     async fn reconciliation_fails_the_items_a_dead_daemon_abandoned() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
-        let (run_id, _) = open_run(&state, &id, "work").await.unwrap();
+        let (run_id, _) = open_run(&state, &id, "work", false).await.unwrap();
         sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
             .bind(run_id)
             .execute(&state.pool)
@@ -5451,11 +6915,11 @@ mod tests {
     async fn a_director_node_that_completed_unread_is_ingested_and_not_repeated() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
-        let (run_id, _) = open_run(&state, &id, "plan it").await.unwrap();
+        let (run_id, _) = open_run(&state, &id, "plan it", false).await.unwrap();
         sqlx::query("UPDATE runs SET status = 'completed', exit_code = 0, stdout = ? WHERE id = ?")
             .bind(r#"{"items":[{"agent_id":"copywriter","description":"draft the post"}]}"#)
             .bind(run_id)
@@ -5497,7 +6961,7 @@ mod tests {
     async fn ingesting_the_same_director_node_twice_does_not_advance_the_round_twice() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         sqlx::query("UPDATE team_runs SET state = 'working', round = 0 WHERE id = ?")
@@ -5506,7 +6970,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (run_id, _) = open_run(&state, &id, "replan").await.unwrap();
+        let (run_id, _) = open_run(&state, &id, "replan", false).await.unwrap();
         sqlx::query("UPDATE runs SET status = 'completed', exit_code = 0, stdout = ? WHERE id = ?")
             .bind(r#"{"items":[{"agent_id":"copywriter","description":"another draft"}]}"#)
             .bind(run_id)
@@ -5591,7 +7055,9 @@ mod tests {
             created_at: "2026-08-26T00:00:00Z".to_owned(),
             updated_at: "2026-08-26T00:00:00Z".to_owned(),
         };
-        let (run_id, session_id) = open_run(&state, &run.id, "do the work").await.unwrap();
+        let (run_id, session_id) = open_run(&state, &run.id, "do the work", false)
+            .await
+            .unwrap();
 
         spawn_agent(
             &state,
@@ -5691,7 +7157,7 @@ mod tests {
     async fn a_failed_specialist_does_not_stop_the_run() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         sqlx::query("UPDATE team_runs SET state = 'working' WHERE id = ?")
@@ -5700,8 +7166,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (failed, _) = open_run(&state, &id, "one").await.unwrap();
-        let (ok, _) = open_run(&state, &id, "two").await.unwrap();
+        let (failed, _) = open_run(&state, &id, "one", false).await.unwrap();
+        let (ok, _) = open_run(&state, &id, "two", false).await.unwrap();
         sqlx::query("UPDATE runs SET status = 'failed' WHERE id = ?")
             .bind(failed)
             .execute(&state.pool)
@@ -5750,11 +7216,11 @@ mod tests {
     async fn the_core_files_a_specialists_answer_under_a_name_it_chose() {
         let (state, root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
-        let (run_id, _) = open_run(&state, &id, "one").await.unwrap();
+        let (run_id, _) = open_run(&state, &id, "one", false).await.unwrap();
         sqlx::query(
             "UPDATE runs SET status = 'completed', stdout = 'the launch post' WHERE id = ?",
         )
@@ -5801,7 +7267,7 @@ mod tests {
                 now - chrono::Duration::days(TEAM_WORKSPACE_RETENTION_DAYS + 1),
             ),
         ] {
-            let id = start(&state, "marketing", id_hint).await.unwrap();
+            let id = start(&state, "marketing", id_hint, None).await.unwrap();
             sqlx::query("UPDATE team_runs SET state = 'done', finished_at = ? WHERE id = ?")
                 .bind(finished.to_rfc3339())
                 .bind(&id)
@@ -5835,7 +7301,9 @@ mod tests {
     async fn the_gc_never_touches_a_live_run() {
         let (state, root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "still going").await.unwrap();
+        let id = start(&state, "marketing", "still going", None)
+            .await
+            .unwrap();
         sqlx::query("UPDATE team_runs SET finished_at = ? WHERE id = ?")
             .bind((chrono::Utc::now() - chrono::Duration::days(999)).to_rfc3339())
             .bind(&id)
@@ -5861,11 +7329,11 @@ mod tests {
     async fn cancelling_leaves_no_run_still_spending() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
-        let (run_id, _) = open_run(&state, &id, "one").await.unwrap();
+        let (run_id, _) = open_run(&state, &id, "one", false).await.unwrap();
         sqlx::query(
             "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
                                      run_id)
@@ -5908,7 +7376,7 @@ mod tests {
     async fn a_finished_run_cannot_be_cancelled_into_a_different_ending() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
         let run = fetch_run(&state, &id).await;
@@ -5929,11 +7397,11 @@ mod tests {
     async fn a_runs_spend_counts_the_directors_nodes_and_not_another_runs() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let mine = start(&state, "marketing", "mine").await.unwrap();
-        let theirs = start(&state, "marketing", "theirs").await.unwrap();
+        let mine = start(&state, "marketing", "mine", None).await.unwrap();
+        let theirs = start(&state, "marketing", "theirs", None).await.unwrap();
 
         for (team_run, cost) in [(&mine, 1.5), (&mine, 0.5), (&theirs, 10.0)] {
-            let (run_id, _) = open_run(&state, team_run, "work").await.unwrap();
+            let (run_id, _) = open_run(&state, team_run, "work", false).await.unwrap();
             sqlx::query("UPDATE runs SET status = 'completed', cost_usd = ? WHERE id = ?")
                 .bind(cost)
                 .bind(run_id)
@@ -5970,11 +7438,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
-        let (run_id, _) = open_run(&state, &id, "work").await.unwrap();
+        let (run_id, _) = open_run(&state, &id, "work", false).await.unwrap();
         sqlx::query("UPDATE runs SET status = 'completed', cost_usd = 2.0 WHERE id = ?")
             .bind(run_id)
             .execute(&state.pool)
@@ -5995,7 +7463,7 @@ mod tests {
     async fn a_run_past_its_lifetime_expires() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
@@ -6025,11 +7493,11 @@ mod tests {
     async fn a_pass_does_not_launch_a_second_director_while_one_is_in_flight() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 
-        let (in_flight, _) = open_run(&state, &id, "plan it").await.unwrap();
+        let (in_flight, _) = open_run(&state, &id, "plan it", false).await.unwrap();
         sqlx::query(
             "UPDATE team_runs SET director_node = 'planning', director_run_id = ? WHERE id = ?",
         )
@@ -6065,7 +7533,7 @@ mod tests {
     async fn a_pass_launches_the_planner_when_nothing_is_in_flight() {
         let (state, _root) = state_with_root().await;
         marketing(&state).await;
-        let id = start(&state, "marketing", "write the launch post")
+        let id = start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
 

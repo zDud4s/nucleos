@@ -384,9 +384,12 @@ pub(crate) fn run_env(
     artifacts: Option<&std::path::Path>,
 ) -> Vec<(String, String)> {
     let mut env = vec![
+        // Derived, never written out again. This is the address every tool a run calls will use to
+        // come back, and a literal here is what lets a daemon bind one port and send its own tools
+        // to another — which presents as every tool answering 404, from a route that exists.
         (
             "NUCLEOS_DAEMON_URL".to_string(),
-            "http://127.0.0.1:8791".to_string(),
+            crate::daemon_client::daemon_url(),
         ),
         ("NUCLEOS_DAEMON_TOKEN".to_string(), token.to_string()),
         ("NUCLEOS_RUN_ID".to_string(), id.to_string()),
@@ -3400,6 +3403,39 @@ pub async fn run_retention_loop(state: AppState) {
             Ok(pruned) => tracing::info!(pruned, "vcs: outputs past the retention window"),
             Err(error) => tracing::warn!(%error, "vcs: retention sweep failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod run_env_tests {
+    use super::*;
+
+    /// The address a run's tools call back on is the address this daemon actually binds.
+    ///
+    /// **Found by running it, not by a test.** This was a literal `http://127.0.0.1:8791` while the
+    /// port was one too, and stayed a literal after the port stopped being one. A second daemon on
+    /// 8890 therefore launched its CLI turns with their tools pointed at the daemon on 8791 — a
+    /// different process, on a different database, running a different build. The symptom was
+    /// `send_to_chat` answering 404: the route the model called does exist, on the daemon that
+    /// should have received the call, and did not on the one that did.
+    ///
+    /// Asserted against `daemon_client::daemon_url()` rather than a written-out string, which is
+    /// the whole point. A second copy of this address is a second thing to remember to change, and
+    /// it will be forgotten in the direction that fails silently.
+    #[test]
+    fn a_run_calls_back_on_the_port_this_daemon_binds() {
+        let env = run_env("tok", 7, None);
+        let url = env
+            .iter()
+            .find(|(key, _)| key == "NUCLEOS_DAEMON_URL")
+            .map(|(_, value)| value.as_str())
+            .expect("every run is told where to call back");
+
+        assert_eq!(url, crate::daemon_client::daemon_url());
+        assert_eq!(
+            url,
+            crate::daemon_client::url_for(crate::daemon_client::port())
+        );
     }
 }
 

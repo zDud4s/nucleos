@@ -53,6 +53,18 @@ sidecars/**/*.exe
 AGENTS.md
 CLAUDE.md
 
+# …except the one a TRACKED test reads. `core/AGENTS.md` is the module map, and
+# `core/tests/module_map.rs` fails when a module has no row in it — so the rule above put the guard
+# in git and left the thing it guards on one machine. What that produces is a test whose result
+# depends on where it was run from rather than on what the commit contains: green in the checkout
+# that happens to hold the file, red in every worktree, with nothing in the output saying which of
+# the two just happened. That test's own comment records the diagnosis it cost.
+#
+# It is also not agent working material in the sense the hard constraint means. Memory, decisions,
+# plans and specs are what an agent learned; this is what the code IS — one row per module, in the
+# repository it describes, checked by that repository's own suite.
+!core/AGENTS.md
+
 # `*.md` used to sit here and it took the project's own documentation with it. Already-tracked
 # files stayed tracked, so nothing was lost — but no new README could ever be added, which is the
 # `ask_daemon.py` trap again: editable forever, uncommittable forever. A repository about to gain
