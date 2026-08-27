@@ -219,8 +219,22 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "cargo check",
     "cargo fmt --check",
     "cargo clippy",
+    // **`cargo build` was missing, and its absence was an omission rather than a decision.** The
+    // three above compile the crate and run `build.rs` exactly as this does — `cargo test` goes
+    // further and runs the code it just built — so there is no surface here that they do not already
+    // have. `go build` sits in this same list a dozen lines below, which is the same argument in
+    // another toolchain, already accepted.
+    //
+    // Measured 2026-08-27: an autonomous run's very first step, establishing a build baseline,
+    // parked on this and waited for a human who was asleep. The command a Rust task reaches for
+    // first is not one to discover is missing at midnight.
+    "cargo build",
     "dir",
     "type",
+    // Says where you are and nothing else: it reads no file, names no path to write, and cannot
+    // fail into anything. `ls` and `dir` above are the same shape with an argument. Measured the
+    // same night as `cargo build`: a run parked on a bare `pwd`.
+    "pwd",
     // Test runners. `py` is the Windows launcher, and this daemon only builds for Windows.
     "pytest",
     "python -m pytest",
@@ -1529,6 +1543,11 @@ mod tests {
             "cargo check",
             "cargo fmt --check",
             "cargo clippy",
+            // The two an autonomous run parked on overnight on 2026-08-27, both of them the first
+            // thing anybody reaches for: a build baseline, and asking where you are.
+            "cargo build",
+            "cargo build --manifest-path core/Cargo.toml --tests",
+            "pwd",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
