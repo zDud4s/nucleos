@@ -2434,20 +2434,7 @@ async fn spawn_agent(
             }
             let completed_at = chrono::Utc::now().to_rfc3339();
             match turn {
-                // `cost_usd = 0` and not NULL: NULL is what `budget.rs` time-approximates a cost
-                // for, so leaving it unset would charge the window for electricity.
-                Ok(Ok(turn)) => {
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
-                                cost_usd = 0, completed_at = ?
-                         WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(&turn.answer)
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
-                    .await;
-                }
+                Ok(Ok(turn)) => record_local_turn(&pool, run_id, &turn, &completed_at).await,
                 Ok(Err(error)) => fail_run(&pool, run_id, &error.to_string()).await,
                 Err(_) => {
                     let _ = sqlx::query(
@@ -2622,6 +2609,44 @@ async fn spawn_agent(
             Ok(Err(error)) => fail_run(&pool, run_id, &error.to_string()).await,
         }
     });
+}
+
+/// The terminal write of a local agent's turn.
+///
+/// `cost_usd = 0` and not NULL: NULL is what `budget.rs` time-approximates a cost for, so leaving
+/// it unset would charge the window for electricity.
+///
+/// `num_turns` carries the turn's TOOL CALLS, and it is the one measurement this path can make.
+/// There is no `stream-json` here — no usage lines, so no `context_fill` and no peak, and nothing
+/// that could say whether the model summarised itself — but a count of calls is exactly the
+/// denominator `pressure::steps_of` wants, and it is a finer one than a turn count: `num_turns` is
+/// the fallback precisely because a turn with twelve tools and a turn with one count the same, and
+/// this number does not have that problem.
+///
+/// `tools_used` stays NULL on purpose. `Turn` carries a count and not the names, and a synthetic
+/// list of the right length would be read as a record of which tools ran. NULL means nobody asked;
+/// an invented list would be an answer, and a false one.
+///
+/// Separate from the branch that calls it so that it can be tested at all: the local path builds
+/// its own `OllamaChat` against `OLLAMA_BASE_URL`, so nothing can exercise the surrounding task
+/// without a live Ollama. What this function does with a turn is the part that can be wrong.
+async fn record_local_turn(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    turn: &crate::local_agent::Turn,
+    completed_at: &str,
+) {
+    let _ = sqlx::query(
+        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0,
+                num_turns = ?, completed_at = ?
+         WHERE id = ? AND status = 'running'",
+    )
+    .bind(&turn.answer)
+    .bind(turn.tool_calls as i64)
+    .bind(completed_at)
+    .bind(run_id)
+    .execute(pool)
+    .await;
 }
 
 async fn fail_run(pool: &sqlx::SqlitePool, run_id: i64, why: &str) {
@@ -5606,6 +5631,46 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("the specialist's run never reached a terminal status");
+    }
+
+    /// A local member has no stream, so it has no peak and no `compacted` -- but it does know how
+    /// many calls it made, and that is the denominator.
+    ///
+    /// Without this the pressure reading saw a local agent's items as having no steps at all, which
+    /// reads as a layer that did nothing rather than one nobody measured.
+    #[tokio::test]
+    async fn a_local_agents_tool_calls_are_the_steps_it_took() {
+        let (state, _root) = state_with_root().await;
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('work', 'running', 'team', '2026-08-26T00:00:00Z') RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        record_local_turn(
+            &state.pool,
+            run_id,
+            &crate::local_agent::Turn {
+                answer: "done".to_owned(),
+                ending: crate::local_agent::Ending::Answered,
+                tool_calls: 7,
+            },
+            "2026-08-26T01:00:00Z",
+        )
+        .await;
+
+        let (status, turns, cost): (String, Option<i64>, Option<f64>) =
+            sqlx::query_as("SELECT status, num_turns, cost_usd FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        assert_eq!(status, "completed");
+        assert_eq!(turns, Some(7), "the calls it made are the steps it took");
+        assert_eq!(cost, Some(0.0), "zero and not NULL — see the doc comment");
     }
 
     async fn fetch_run(state: &AppState, id: &str) -> TeamRun {
