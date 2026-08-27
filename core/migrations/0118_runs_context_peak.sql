@@ -1,0 +1,16 @@
+-- O ponto mais cheio a que a janela desta run chegou, em tokens.
+--
+-- Separada de `context_fill` em vez de a substituir, porque as duas respondem a perguntas
+-- diferentes e ambas tem leitor. `context_fill` e o ULTIMO turno -- `runner.rs::context_fill_from_line`
+-- e um fold que substitui -- e e o que o medidor de janela por baixo de cada turno de conversa quer
+-- desenhar: onde a conversa esta agora. Este e o maximo sobre a vida inteira da run, e e o que uma
+-- medicao de pressao precisa: onde a conversa esteve no pior momento.
+--
+-- A diferenca so aparece quando houve compactacao, e e ai que aparece inteira: uma run que subiu a
+-- 190k, compactou para 40k e acabou escreve `context_fill = 40k` e `context_peak = 190k`. Ler a
+-- pressao pelo primeiro seria concluir que o agente com menos folga de todos e o que tem mais.
+--
+-- NULL e nao `DEFAULT 0`: uma run que nunca falou nao tem pico, e zero seria uma afirmacao falsa.
+-- E o erro que `compacted` cometeu em `0116` -- `NOT NULL DEFAULT 0` fez com que "nao compactou" e
+-- "ninguem escreveu" deixassem de se distinguir, e ha 168 runs onde a diferenca importava.
+ALTER TABLE runs ADD COLUMN context_peak INTEGER;
