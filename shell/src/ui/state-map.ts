@@ -41,7 +41,8 @@ export type StateDomain =
   | "browser_refusal"
   | "team_run"
   | "team_item"
-  | "team_action";
+  | "team_action"
+  | "autopilot";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -54,6 +55,21 @@ export interface StateReading {
  * Every key below was read out of `core/src/` rather than inferred from a name.
  */
 const READINGS: Record<StateDomain, Record<string, StateReading>> = {
+  /**
+   * What a project does without being asked (`AutopilotMode`, `core/src/autopilot.rs`).
+   *
+   * The three are not a severity scale and must not read as one. `off` is a
+   * decision — nothing runs here, and that is fine; `shadow` is the project
+   * *proposing* and a person deciding, which is where every project starts and
+   * where many stay on purpose; `active` is the núcleo acting on its own. A UI
+   * that drew `off` as a fault would nag about a setting somebody chose, and one
+   * that drew `shadow` as success would hide that nothing has been promoted.
+   */
+  autopilot: {
+    off: { tone: "off", label: "off" },
+    shadow: { tone: "shadow", label: "shadow" },
+    active: { tone: "active", label: "active" },
+  },
   /**
    * Run outcomes. The four that §7 forbids merging.
    *

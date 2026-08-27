@@ -34,6 +34,18 @@ pub struct ProjectSummary {
     pub open_proposals: i64,
     pub wip_limit: Option<i64>,
     pub queue_full: bool,
+    /// The last thing this project's gate said, and when it said it.
+    ///
+    /// The LAST verdict and not a tally over a window, because the roster's question is *is this
+    /// one broken right now*. [`crate::project_readings`] already answers "how has it been going"
+    /// for the one project somebody opened, and a thirty-day count in a roster column would read
+    /// green for a project that broke this morning.
+    ///
+    /// `None` means this project has never produced one — no gate command, or no run that got far
+    /// enough to reach it. `0032_run_gate.sql` argues that case: it is not a pass and not a
+    /// failure, it is nobody having asked for a measurement.
+    pub last_gate: Option<String>,
+    pub last_gate_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -181,6 +193,40 @@ pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, 
 /// Named because the tuple carries six positional fields and is only readable at the destructure.
 type RosterRow = (String, String, Option<String>, i64, i64, Option<i64>);
 
+/// The most recent gate verdict for every project, in one query.
+///
+/// One grouped read and not one per row, for the reason `shadow_readiness` is one: the shell polls
+/// the roster every three seconds, and a call per project turns a roster of twenty-five into
+/// twenty-five round trips on every tick.
+///
+/// **This leans on a documented SQLite behaviour and says so, because it is not standard SQL.** With
+/// a bare column beside `MAX(...)` in an aggregate query, SQLite takes that column from the row
+/// that supplied the maximum — so `gate_status` here is the status of the newest run, not an
+/// arbitrary one from the group. Every other engine is free to return any row, and this query would
+/// have to be rewritten as a window function the day this stops being SQLite.
+///
+/// Rows with no verdict are excluded rather than counted as anything: a run that never reached its
+/// gate says nothing about the code, and the last run that DID reach one is still the answer.
+async fn last_gate_verdicts(
+    pool: &SqlitePool,
+) -> sqlx::Result<std::collections::HashMap<String, (String, String)>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT project_id, gate_status, MAX(completed_at)
+         FROM runs
+         WHERE project_id IS NOT NULL
+           AND gate_status IS NOT NULL
+           AND completed_at IS NOT NULL
+         GROUP BY project_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(project_id, status, at)| (project_id, (status, at)))
+        .collect())
+}
+
 pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummary>> {
     let projects: Vec<RosterRow> = sqlx::query_as(
         "SELECT state.project_id, state.mode, state.project_root,
@@ -188,7 +234,8 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                  FROM shadow_decisions
                  JOIN runs ON shadow_decisions.run_id = runs.id
                  WHERE runs.project_id = state.project_id
-                   AND shadow_decisions.human_verdict IS NULL)
+                   AND shadow_decisions.human_verdict IS NULL
+                   AND runs.mode = 'shadow')
                 +
                 (SELECT COUNT(*)
                  FROM runs
@@ -197,7 +244,12 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                 -- Same arithmetic as `wip::open_proposals`, deliberately: the flag the shell renders
                 -- and the gate the daemon enforces must not be able to disagree. Shadow decisions
                 -- count because a shadow run mints no proposal, so counting proposals alone left
-                -- the brake invisible in the mode that generates the most review work.
+                -- the brake invisible in the mode that generates the most review work. Scoped to
+                -- `runs.mode = 'shadow'`: a `worktree`-mode decision was already enforced (no
+                -- verdict left to give it) or already became a proposal the first term counts, so
+                -- an unfiltered count would either double-count or count enforced work as backlog.
+                -- Both copies of this subquery must carry the same filter, or this display number
+                -- and the number the daemon enforces (`wip::open_proposals`) would disagree.
                 (SELECT COUNT(*)
                  FROM proposals
                  WHERE proposals.project_id = state.project_id
@@ -207,7 +259,8 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                  FROM shadow_decisions
                  JOIN runs ON shadow_decisions.run_id = runs.id
                  WHERE runs.project_id = state.project_id
-                   AND shadow_decisions.human_verdict IS NULL) AS open_proposals,
+                   AND shadow_decisions.human_verdict IS NULL
+                   AND runs.mode = 'shadow') AS open_proposals,
                 state.wip_limit AS wip_limit
          FROM autopilot_state AS state
          ORDER BY state.project_id",
@@ -220,6 +273,7 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
     // read plus the per-row override already selected above.
     let readiness = crate::shadow::shadow_readiness(pool).await?;
     let global_wip_limit = crate::wip::global_wip_limit(pool).await?;
+    let gates = last_gate_verdicts(pool).await?;
 
     projects
         .into_iter()
@@ -231,6 +285,10 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                 let (classes_ready, classes_total, withheld_classes_ready) =
                     readiness.get(&project_id).copied().unwrap_or((0, 0, 0));
                 let wip_limit = wip_override.or(global_wip_limit);
+                let (last_gate, last_gate_at) = match gates.get(&project_id) {
+                    Some((status, at)) => (Some(status.clone()), Some(at.clone())),
+                    None => (None, None),
+                };
                 Ok(ProjectSummary {
                     project_id,
                     mode,
@@ -247,6 +305,8 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
                     open_proposals,
                     wip_limit,
                     queue_full: crate::wip::queue_full(open_proposals, wip_limit),
+                    last_gate,
+                    last_gate_at,
                 })
             },
         )
@@ -597,6 +657,8 @@ mod tests {
                     open_proposals: 0,
                     wip_limit: Some(3),
                     queue_full: false,
+                    last_gate: None,
+                    last_gate_at: None,
                 },
                 ProjectSummary {
                     project_id: "project-off".to_owned(),
@@ -610,6 +672,8 @@ mod tests {
                     open_proposals: 0,
                     wip_limit: Some(3),
                     queue_full: false,
+                    last_gate: None,
+                    last_gate_at: None,
                 },
                 ProjectSummary {
                     project_id: "project-shadow".to_owned(),
@@ -623,6 +687,8 @@ mod tests {
                     open_proposals: 0,
                     wip_limit: Some(3),
                     queue_full: false,
+                    last_gate: None,
+                    last_gate_at: None,
                 },
             ]
         );
@@ -659,6 +725,8 @@ mod tests {
                     open_proposals: 0,
                     wip_limit: Some(3),
                     queue_full: false,
+                    last_gate: None,
+                    last_gate_at: None,
                 },
                 ProjectSummary {
                     project_id: "project-rooted".to_owned(),
@@ -672,9 +740,95 @@ mod tests {
                     open_proposals: 0,
                     wip_limit: Some(3),
                     queue_full: false,
+                    last_gate: None,
+                    last_gate_at: None,
                 },
             ]
         );
+    }
+
+    /// The LAST verdict, and the roster's whole gate column rests on it being the last one.
+    ///
+    /// Three runs, out of chronological insert order on purpose: a query that returned "some row
+    /// from the group" would pass this half the time, and the SQLite bare-column rule this leans on
+    /// is exactly what is being pinned.
+    #[tokio::test]
+    async fn project_roster_reports_the_newest_gate_verdict_and_not_an_older_one() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'shadow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for (status, completed_at) in [
+            ("failed", "2026-08-01T09:00:00Z"),
+            ("passed", "2026-08-03T09:00:00Z"),
+            ("errored", "2026-08-02T09:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (project_id, prompt, status, created_at, mode, gate_status, completed_at)
+                 VALUES ('alpha', 'p', 'completed', '2026-08-01T08:00:00Z', 'shadow', ?, ?)",
+            )
+            .bind(status)
+            .bind(completed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let roster = project_roster(&pool).await.unwrap();
+        assert_eq!(roster[0].last_gate.as_deref(), Some("passed"));
+        assert_eq!(
+            roster[0].last_gate_at.as_deref(),
+            Some("2026-08-03T09:00:00Z")
+        );
+    }
+
+    /// A run that never reached its gate says nothing about the code, so it cannot be the answer.
+    ///
+    /// The newest run here has no verdict at all, and the roster must still report the last one that
+    /// did — otherwise a project goes blank in the column the moment anything crashes early.
+    #[tokio::test]
+    async fn project_roster_ignores_runs_that_never_reached_a_gate() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'shadow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, created_at, mode, gate_status, completed_at)
+             VALUES ('alpha', 'p', 'completed', '2026-08-01T08:00:00Z', 'shadow', 'failed', '2026-08-01T09:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, created_at, mode, completed_at)
+             VALUES ('alpha', 'p', 'failed', '2026-08-05T08:00:00Z', 'shadow', '2026-08-05T09:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            project_roster(&pool).await.unwrap()[0].last_gate.as_deref(),
+            Some("failed")
+        );
+    }
+
+    /// **No gate is not a pass.** `0032_run_gate.sql` spends its comment on this: a project with no
+    /// gate command has no definition of green, and a default verdict would invent a check.
+    #[tokio::test]
+    async fn project_roster_reports_no_verdict_for_a_project_that_has_never_run_a_gate() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'shadow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let roster = project_roster(&pool).await.unwrap();
+        assert_eq!(roster[0].last_gate, None);
+        assert_eq!(roster[0].last_gate_at, None);
     }
 
     #[tokio::test]
@@ -754,6 +908,8 @@ mod tests {
                 open_proposals: 1,
                 wip_limit: Some(3),
                 queue_full: false,
+                last_gate: None,
+                last_gate_at: None,
             }]
         );
     }
@@ -782,6 +938,8 @@ mod tests {
                 open_proposals: 0,
                 wip_limit: Some(3),
                 queue_full: false,
+                last_gate: None,
+                last_gate_at: None,
             }]
         );
     }
@@ -841,6 +999,85 @@ mod tests {
                 roster[1].queue_full
             ),
             (1, Some(3), false)
+        );
+    }
+
+    /// The roster's `open_proposals` and `wip::open_proposals` are two hand-written copies of the
+    /// same query — nothing else stops them drifting apart. Compares the two NUMBERS, not two
+    /// hardcoded literals, so a change to one copy that is not mirrored in the other fails this
+    /// test rather than silently making the shell disagree with the daemon.
+    #[tokio::test]
+    async fn o_roster_e_o_portao_contam_o_mesmo() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-a', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, run_id, project_id, reasoning, created_at)
+             VALUES ('action-approval', 'pending', 1, 'project-a', 'test', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A shadow-mode unreviewed decision: must count in both readers.
+        let shadow_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'shadow work', 'completed', 'shadow', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO shadow_decisions
+             (run_id, tool_name, decision, action_class, classifier_version, created_at)
+             VALUES (?, 'Bash', 'allow', 'read-local', 2, '2026-08-24T00:01:00Z')",
+        )
+        .bind(shadow_run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Five worktree-mode unreviewed decisions: already enforced, must count in NEITHER reader.
+        let worktree_run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('project-a', 'worktree work', 'completed', 'worktree', '2026-08-24T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        for index in 0..5 {
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, decision, action_class, classifier_version, created_at)
+                 VALUES (?, 'Bash', 'allow', 'read-local', 2, ?)",
+            )
+            .bind(worktree_run_id)
+            .bind(format!("2026-08-24T00:0{index}:00Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let roster = project_roster(&pool).await.unwrap();
+        let gate = crate::wip::open_proposals(&pool, "project-a")
+            .await
+            .unwrap();
+
+        assert_eq!(roster.len(), 1);
+        assert_eq!(
+            roster[0].open_proposals, gate,
+            "the roster's open_proposals must never disagree with the daemon's wip gate"
+        );
+        assert_eq!(
+            gate, 2,
+            "1 pending proposal + 1 shadow decision; the 5 worktree decisions must not count"
         );
     }
 

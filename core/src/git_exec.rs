@@ -67,14 +67,15 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
-/// **`git`, `add_worktree`, `repo_key`, `current_branch` and `toplevel` are the only sanctioned
-/// production entries**, and a new caller belongs behind one of them rather than here: each is a
-/// place where whatever is left of the operation's budget is computed and an already-spent one is
-/// refused *before* a child is spawned, which `output()` would otherwise do eagerly. The last three
-/// are on the list because they pass that same test rather than because they arrived later — each
-/// computes its own remaining budget and returns without spawning when there is none. A caller that
-/// reaches past the five takes its `Duration` from somewhere else and quietly loses that gate. Naming them makes the gate greppable rather than conventional. The tests below call this directly on purpose — they are
-/// testing the transport itself.
+/// **`git`, `add_worktree`, `repo_key`, `current_branch`, `toplevel` and `origin_and_head` are the
+/// only sanctioned production entries**, and a new caller belongs behind one of them rather than
+/// here: each is a place where whatever is left of the operation's budget is computed and an
+/// already-spent one is refused *before* a child is spawned, which `output()` would otherwise do
+/// eagerly. The last four are on the list because they pass that same test rather than because they
+/// arrived later — each computes its own remaining budget and returns without spawning when there
+/// is none. A caller that reaches past the six takes its `Duration` from somewhere else and quietly
+/// loses that gate. Naming them makes the gate greppable rather than conventional. The tests below
+/// call this directly on purpose — they are testing the transport itself.
 ///
 /// Output is buffered whole and truncated afterwards, unlike `gate.rs`, which streams into a
 /// `TailBuffer`. That is not an oversight: a gate runs a test suite, which can print without bound
@@ -522,6 +523,73 @@ pub async fn toplevel(
     Ok(std::path::PathBuf::from(
         canonical(Path::new(toplevel.trim())).await?,
     ))
+}
+
+/// Where a repository points and what it last did, for a folder nobody has registered yet.
+///
+/// A sixth sanctioned entry to `run_git`: it computes what is left of the budget before each spawn
+/// and returns without spawning when there is none, which is the property that list protects.
+///
+/// **Both halves are optional and neither absence is an error.** A repository with no `origin` is
+/// ordinary — a local-only project is a project — and one with no commits is a repository somebody
+/// made this morning. The caller is a wizard showing a person what is in a folder, and "there is no
+/// remote" is information rather than a failure to look.
+pub async fn origin_and_head(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> (Option<String>, Option<String>) {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return (None, None);
+    }
+    let remote = run_git(
+        path,
+        &[
+            OsStr::new("remote"),
+            OsStr::new("get-url"),
+            OsStr::new("origin"),
+        ],
+        budget,
+    )
+    .await
+    .ok()
+    .filter(|result| result.succeeded())
+    .and_then(|result| {
+        result
+            .stdout
+            .lines()
+            .next()
+            .map(|line| line.trim().to_owned())
+    })
+    .filter(|line| !line.is_empty());
+
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return (remote, None);
+    }
+    let head = run_git(
+        path,
+        &[
+            OsStr::new("log"),
+            OsStr::new("-1"),
+            OsStr::new("--date=short"),
+            OsStr::new("--format=%h %ad %s"),
+        ],
+        budget,
+    )
+    .await
+    .ok()
+    .filter(|result| result.succeeded())
+    .and_then(|result| {
+        result
+            .stdout
+            .lines()
+            .next()
+            .map(|line| line.trim().to_owned())
+    })
+    .filter(|line| !line.is_empty());
+
+    (remote, head)
 }
 
 /// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it
@@ -1481,7 +1549,39 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                 match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
                 {
                     Ok(computed) => {
-                        publish(project_root, target.as_str(), computed, deadline).await
+                        // Measured on the commit `compute_merge` left at the integration worktree's
+                        // HEAD — the tree `target` is about to become — and BEFORE `publish` moves
+                        // anything.
+                        //
+                        // `integration_worktree` and not `prepare_integration_worktree`: the first
+                        // is a pure path function, and the second would `merge --abort`, `reset
+                        // --hard` and `clean` the very checkout being measured.
+                        let measured = match gate_the_merge(
+                            project_root,
+                            &integration_worktree(project_root),
+                            crate::state::DEFAULT_GATE_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(measured) => measured,
+                            Err(outcome) => return outcome,
+                        };
+                        // A gate that RAN buys the publish a fresh git budget, and one that did not
+                        // changes nothing. The arithmetic is the reason rather than the taste:
+                        // `deadline` was fixed at `now + OPERATION_TIMEOUT` (300s) when this
+                        // operation started, and a gate may legitimately outlast it
+                        // (`DEFAULT_GATE_TIMEOUT` is 900s). Letting a measurement — which spawns no
+                        // git at all — spend the git budget would make every gated merge die at
+                        // `update-ref` saying the budget was spent, which reads as a broken queue
+                        // rather than as a slow suite. An UNGATED merge keeps the one deadline it
+                        // always had, so nothing about this loosens the budget for anybody who did
+                        // not ask to be measured.
+                        let publishing = if measured {
+                            std::time::Instant::now() + self.timeout
+                        } else {
+                            deadline
+                        };
+                        publish(project_root, target.as_str(), computed, publishing).await
                     }
                     // Computing failed, which IS how this request ended.
                     Err(outcome) => outcome,
@@ -1503,6 +1603,98 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                 rebase(project_root, branch.as_str(), onto.as_str(), deadline).await
             }
         }
+    }
+}
+
+/// Measures the computed merge before it is published, when the project asked to be.
+///
+/// **This is the answer to how a target branch catches somebody else's red.** The queue merged and
+/// nothing measured the result: a branch green on its own, merged into a target green on its own,
+/// produces a tree neither of them ever built — and the first thing to notice was the next person's
+/// build. `gate_before_publish` is a project saying it would rather wait.
+///
+/// **Where it runs is the whole design.** The commit under measurement is HEAD of the integration
+/// worktree, left detached there by `compute_merge`, and `target` has not moved. So a red gate costs
+/// a refusal and nothing else — no revert, no reset of a branch other people have already pulled, no
+/// history rewritten. The two obvious alternatives are both worse: gating the SOURCE before merging
+/// measures something other than what breaks, and merging first and undoing afterwards is a
+/// destructive act on shared history that this queue will not take on its own.
+///
+/// Returns whether a measurement actually happened, because the caller owes a publish that ran after
+/// a long gate its own git budget and owes one that did not exactly the budget it already had.
+///
+/// **Three refusals rather than one, and each is a different sentence to its reader.**
+/// - The rules file exists and will not parse: we cannot tell whether this repository wanted its
+///   merges measured, and publishing unmeasured is the failure itself. A project with NO file is
+///   untouched — `load_schedule_rules` answers `Ok(default)` for an absent one — so this only
+///   refuses a repository that has the file and broke it, which is a repository whose scheduler,
+///   triggers and run gate are already all dead for the same reason.
+/// - `gate_before_publish` with no `gate_command`: the configuration asks for a measurement and
+///   names none. Publishing anyway would make the key decorative, which is the exact failure it was
+///   added to end.
+/// - The gate could not run (`Errored`): "we could not measure" is not "it passed". `gate.rs` keeps
+///   those two apart precisely so that callers do not collapse them, and this is a caller.
+///
+/// **A consequence worth finding by reading rather than by surprise: while this key is on, a branch
+/// that CHANGES the gate script cannot land.** `run_gate` compares every script the command names
+/// against the project root's copy and refuses to measure when they differ — which is exactly right
+/// where it was written (an agent's worktree, where a run could green itself) and reads oddly here,
+/// because a branch improving `scripts/gates.sh` is not tampering with anything. It arrives as an
+/// `Errored`, so nothing is published and the reason names the file. The remedy is to land that one
+/// change with the key off; the alternative — measuring with a script the merge itself supplied —
+/// is the door that check exists to hold shut, and it is not worth opening for the convenience.
+///
+/// `Failed` and never `Escalated` for a red gate. `Escalated` means a person now owns something the
+/// queue cannot resolve; a red suite is owned by whoever wrote the branch, and it is fixed where
+/// every other red suite is fixed — in their own worktree, on their own branch.
+async fn gate_the_merge(
+    project_root: &Path,
+    integration: &Path,
+    timeout: Duration,
+) -> Result<bool, Outcome> {
+    let refuse = |reason: String| Outcome::Failed {
+        reason,
+        exit_code: None,
+        output_tail: String::new(),
+    };
+
+    let rules = match crate::config::load_schedule_rules(project_root) {
+        Ok(rules) => rules,
+        Err(error) => {
+            return Err(refuse(format!(
+                "{} could not be read, so whether this repository wants its merges measured is \
+                 unknown and nothing was published: {error}",
+                crate::config::AUTOPILOT_RULES_PATH
+            )));
+        }
+    };
+    if !rules.gate_before_publish {
+        return Ok(false);
+    }
+    let Some(command) = rules.gate_command else {
+        return Err(refuse(format!(
+            "{} asks for merges to be gated and names no gate_command, so there is nothing to \
+             measure this merge with and nothing was published",
+            crate::config::AUTOPILOT_RULES_PATH
+        )));
+    };
+
+    match crate::gate::run_gate(integration, project_root, &command, timeout).await {
+        crate::gate::GateOutcome::Passed => Ok(true),
+        crate::gate::GateOutcome::Failed { exit_code, output } => Err(Outcome::Failed {
+            // Says WHERE the failure lives, because the asker's first instinct will be that their
+            // branch is fine — and it may well be. What was measured is the junction, which is a
+            // tree neither side had ever built.
+            reason: "the merge does not pass this project's gate, so nothing was published. What \
+                     was measured is the two branches TOGETHER: each can be green on its own and \
+                     still make a tree that is not."
+                .to_owned(),
+            exit_code: Some(exit_code),
+            output_tail: output,
+        }),
+        crate::gate::GateOutcome::Errored { reason } => Err(refuse(format!(
+            "the merge could not be measured, so nothing was published: {reason}"
+        ))),
     }
 }
 
@@ -2382,6 +2574,143 @@ pub(crate) mod tests {
             ),
             other => panic!("a conflict is an Escalated, got {other:?}"),
         }
+    }
+
+    /// **A merge the project's gate refuses is not published.**
+    ///
+    /// The load-bearing assertion is the last one: `master` still stands where it stood. A version
+    /// of this that read only the `Outcome` would pass with the merge published and the row simply
+    /// lying about it — which is the failure mode of every "it was refused" claim that never looks
+    /// at the thing the refusal was supposed to prevent.
+    ///
+    /// And nothing is reverted anywhere, because nothing was ever published: the measurement happens
+    /// on the computed merge while the target has not moved.
+    #[tokio::test]
+    async fn um_merge_que_o_gate_recusa_nao_e_publicado() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-red-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            &repo,
+            "gate_before_publish: true\ngate_command: git rev-parse --verify nao-existe\n",
+        );
+        let before = sha_of(&repo, "master");
+
+        match land_ordinarily(&repo).await {
+            Outcome::Failed {
+                reason,
+                output_tail,
+                ..
+            } => {
+                assert!(reason.contains("gate"), "{reason}");
+                assert!(
+                    !output_tail.is_empty(),
+                    "the gate's own words are what make it fixable; without them the row says only \
+                     that something was refused"
+                );
+            }
+            other => panic!("a red gate must refuse the merge, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "master"),
+            before,
+            "master moved even though the gate refused it"
+        );
+    }
+
+    /// The green half. Without it the test above passes just as well for a repository where merging
+    /// never worked at all.
+    #[tokio::test]
+    async fn um_merge_que_o_gate_aceita_e_publicado() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-green-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        // `git --version` is the gate that always agrees, and it needs no shell to run.
+        write_autopilot_rules(
+            &repo,
+            "gate_before_publish: true\ngate_command: git --version\n",
+        );
+        let before = sha_of(&repo, "master");
+
+        let published = match land_ordinarily(&repo).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("a green gate must let the merge through, got {other:?}"),
+        };
+        assert_ne!(sha_of(&repo, "master"), before, "nothing was published");
+        assert_eq!(sha_of(&repo, "master"), published);
+    }
+
+    /// **The key is off by default, and that is what makes this free for every project that never
+    /// asked for it.**
+    ///
+    /// The gate configured here is one that always refuses. Without `gate_before_publish` it is
+    /// never run at all, and the merge lands exactly as it landed before this existed — which is a
+    /// stronger statement than "the default is false", because it is measured through the same door
+    /// the two tests above go through.
+    #[tokio::test]
+    async fn sem_a_chave_o_gate_nem_sequer_corre() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-off-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(&repo, "gate_command: git rev-parse --verify nao-existe\n");
+        let before = sha_of(&repo, "master");
+
+        match land_ordinarily(&repo).await {
+            Outcome::Succeeded { .. } => {}
+            other => panic!("an ungated merge must land untouched, got {other:?}"),
+        }
+        assert_ne!(sha_of(&repo, "master"), before, "nothing was published");
+    }
+
+    /// Asking for a measurement and naming nothing to measure with is refused, not ignored.
+    ///
+    /// Ignoring it is the tempting arm and the wrong one: the queue would go on publishing
+    /// unmeasured while the file says it does not, and a brake that reads as engaged and is not is
+    /// worse than no brake — it is the one nobody thinks to check.
+    #[tokio::test]
+    async fn pedir_medida_sem_gate_command_e_recusado() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-nocmd-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(&repo, "gate_before_publish: true\n");
+        let before = sha_of(&repo, "master");
+
+        match land_ordinarily(&repo).await {
+            Outcome::Failed { reason, .. } => assert!(
+                reason.contains("gate_command"),
+                "the refusal must name the key that is missing: {reason}"
+            ),
+            other => panic!("a gate asked for and not named must refuse, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
+    /// An ordinary landing of `feat/x` into `master`, through the real executor.
+    fn write_autopilot_rules(repo: &Path, contents: &str) {
+        let path = repo.join(crate::config::AUTOPILOT_RULES_PATH);
+        std::fs::create_dir_all(path.parent().expect("the rules file sits in a folder"))
+            .expect("create the rules folder");
+        std::fs::write(path, contents).expect("write the rules");
+    }
+
+    async fn land_ordinarily(repo: &Path) -> Outcome {
+        use crate::vcs::VcsExecutor;
+        GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Merge {
+                    source: "feat/x".into(),
+                    target: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
+            })
+            .await
     }
 
     /// Spec §7, first row. A conflict is not a problem this module solves — and the point of

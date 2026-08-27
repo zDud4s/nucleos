@@ -2,11 +2,9 @@ import { useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
-  REACHABILITY_TEXT,
   joinPath,
   pathSegments,
   pathUpTo,
-  readReachability,
   scheduleCapped,
   scheduleNeverFires,
   useProjectCat,
@@ -20,7 +18,7 @@ import {
   type RepoTriggerView,
   type ScheduleView,
 } from "../data/projects";
-import { useProjects, type ProjectSummary } from "../data/system";
+import { useProjects } from "../data/system";
 import {
   Badge,
   Button,
@@ -29,8 +27,6 @@ import {
   Panel,
   RefusalNote,
   RelativeTime,
-  StaleNote,
-  Teach,
 } from "../ui";
 import "./projects.css";
 
@@ -39,19 +35,52 @@ import "./projects.css";
  *
  * The page exists because two facts about a project were only readable by
  * leaving the app: what it will do on its own (`.ai/autopilot.yaml`, on disk)
- * and what its tree currently looks like. Both are shown here and neither is
- * editable — the rules file is edited in an editor, and a shell that offered to
- * write it would be a second author of a document git already owns.
+ * and what its tree currently looks like. Both are shown here, and this page
+ * edits neither.
+ *
+ * **The rule that used to justify that, and what is left of it.** The sentence
+ * was: a shell that offered to write the rules file would be a second author of
+ * a document git already owns. That is still true of every `.rs`, every
+ * `package.json`, every file in the tree below — which is the whole of what
+ * this page browses, and why nothing here is editable.
+ *
+ * It stopped being true of one file, and the exception is worth writing down so
+ * nobody restores the rule over it in six months. `.ai/autopilot.yaml` is not a
+ * document git owns: it is **gitignored, per-developer configuration** that the
+ * núcleo itself parses, with a schema, a range check and `deny_unknown_fields`.
+ * An editor that holds text to that schema before saving is not a distracted
+ * second author, it is a better-informed one — `vim` saves `gate_commmand:`
+ * happily and leaves the project silently ungated for ever. The boundary is
+ * therefore not *read vs. write* but **who is the file's legitimate author**,
+ * and it lives as data in `core/src/ownership.rs`, served by
+ * `GET /projects/{id}/ownership`. The editor for it is in the project workspace,
+ * which is where a person goes to change how a project behaves; this page is
+ * where they go to look at what is in it.
+ *
+ * The sentence still constrains the *form* even there, which is the part most
+ * easily lost: the workspace edits that file as raw text and not as a form,
+ * because a form would have to re-serialise the YAML and re-serialising deletes
+ * the comment somebody left explaining why a schedule is switched off.
  *
  * **The single write on this page is the WIP ceiling**, because it is the one of
  * these facts that lives in the database rather than in a file, and until now
  * could only be changed with `sqlite3`.
  *
- * The four views are in the route (`/projects/$projectId/$view`) so a folder
- * somebody is looking at survives a reload and can be linked to. An unknown
- * `$view` falls back to `browse` rather than 404ing: a route parameter is a
- * string, anybody can type one, and a typo in a path is not a missing page.
+ * The four views are in the route (`/projects/$projectId/inspect/$view`) so a
+ * folder somebody is looking at survives a reload and can be linked to. An
+ * unknown `$view` falls back to `browse` rather than 404ing: a route parameter
+ * is a string, anybody can type one, and a typo in a path is not a missing page.
  */
+
+/**
+ * Where this inspector lives, now that the workspace owns the shorter path.
+ *
+ * One function rather than three template literals, because the two callers
+ * below drifted apart the moment there was a prefix to forget.
+ */
+function inspectPath(projectId: string, view: ProjectView): string {
+  return `/projects/${projectId}/inspect/${view}`;
+}
 
 /** The four views, in the order the tabs read. */
 const VIEWS = ["browse", "search", "diff", "rules"] as const;
@@ -85,128 +114,53 @@ export function Projects() {
   const projectId = params.projectId ?? null;
   const view = normaliseView(params.view);
   const project = rows.find((row) => row.project_id === projectId);
-  const stale = projects.isError && projects.data !== undefined;
+
+  /*
+    This page is the inspector and nothing else. It used to draw the whole roster above itself —
+    twenty-five chips carried down the page every time somebody opened one project's file tree —
+    and that roster is now `Roster` on `/projects`, which is the page whose question it answers.
+    The route always carries an id; the guard is for a URL typed by hand.
+  */
+  if (projectId === null) {
+    return (
+      <>
+        <PageHeader title="Inspect" />
+        <p className="pj-absence" role="status">
+          This page looks inside one project. Choose one on <Link to="/projects">Projects</Link>.
+        </p>
+      </>
+    );
+  }
 
   return (
     <>
-      <PageHeader title="Projects" headline={headlineFor(rows, projects.data !== undefined)} />
+      <PageHeader title={projectId} headline="reading the folder as it is on disk right now" />
 
-      {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
-      {projects.isError && projects.data === undefined && <RosterError error={projects.error} />}
+      {/*
+        Both ways back, because they are different places: the workspace is this project seen
+        through the app's own readings, and the roster is every project. Somebody who arrived here
+        from the Código mode wants the first.
+      */}
+      <p className="pj-add">
+        <Link to="/projects/$projectId/$view" params={{ projectId, view: "codigo" }}>
+          ‹ back to {projectId}
+        </Link>
+        {" · "}
+        <Link to="/projects">all projects</Link>
+      </p>
 
-      <ProjectPicker rows={rows} answered={projects.data !== undefined} selected={projectId} view={view} />
-
-      {projectId === null && (
-        <Teach title="Choose a project">
-          <p>
-            This page is a window onto one project at a time: what it will do without being asked,
-            and what is in its folder right now. Nothing here changes a file — the only thing this
-            page writes is the ceiling on how much unreviewed work a project may be holding.
-          </p>
-        </Teach>
-      )}
-
-      {projectId !== null && (
-        <>
-          <ViewTabs projectId={projectId} view={view} />
-          {/* Keyed on the project so a folder, a query and an open file all reset
-              when the subject changes. Without the key, switching projects would
-              carry one project's path into another's tree and ask for a folder
-              that is not there. */}
-          <ProjectViews
-            key={projectId}
-            projectId={projectId}
-            projectRoot={project?.project_root ?? null}
-            view={view}
-          />
-        </>
-      )}
+      <ViewTabs projectId={projectId} view={view} />
+      {/* Keyed on the project so a folder, a query and an open file all reset
+          when the subject changes. Without the key, switching projects would
+          carry one project's path into another's tree and ask for a folder
+          that is not there. */}
+      <ProjectViews
+        key={projectId}
+        projectId={projectId}
+        projectRoot={project?.project_root ?? null}
+        view={view}
+      />
     </>
-  );
-}
-
-function headlineFor(rows: ProjectSummary[], answered: boolean): string | undefined {
-  if (!answered) return undefined;
-  if (rows.length === 0) return "the núcleo knows of no project";
-  const rooted = rows.filter((row) => row.project_root !== null).length;
-  return rooted === rows.length
-    ? `${rows.length} ${rows.length === 1 ? "project" : "projects"}, all with a folder`
-    : `${rows.length} ${rows.length === 1 ? "project" : "projects"}, ${rows.length - rooted} without a folder`;
-}
-
-function RosterError({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the roster</ErrorNote>;
-}
-
-/* ------------------------------------------------------------- the picker -- */
-
-function ProjectPicker({
-  rows,
-  answered,
-  selected,
-  view,
-}: {
-  rows: ProjectSummary[];
-  answered: boolean;
-  selected: string | null;
-  view: ProjectView;
-}) {
-  if (!answered) return <p className="pj-loading">reading the roster…</p>;
-  if (rows.length === 0) {
-    return <p className="pj-empty">no project has been registered with the núcleo.</p>;
-  }
-  return (
-    <ul className="pj-picker" aria-label="Projects">
-      {rows.map((project) => (
-        <ProjectChip
-          key={project.project_id}
-          project={project}
-          active={project.project_id === selected}
-          view={view}
-        />
-      ))}
-    </ul>
-  );
-}
-
-/**
- * One project, with its mode and whether its folder is actually there.
- *
- * The reachability is a real probe — the project's own listing of its root —
- * and not a guess from the presence of a string. A recorded root is a row in a
- * table; the folder it names is on a disk somebody may have reorganised, and
- * the difference between those two is exactly what a person hunting a broken
- * project needs to be told first.
- *
- * A project with no recorded root is not probed at all. The route would answer
- * 404 for it, and that 404 means *you have not named a folder* rather than *the
- * folder is gone* — the two must not read the same.
- */
-function ProjectChip({
-  project,
-  active,
-  view,
-}: {
-  project: ProjectSummary;
-  active: boolean;
-  view: ProjectView;
-}) {
-  const probe = useProjectLs(project.project_id, "", project.project_root !== null);
-  const reach = readReachability(project.project_root, probe);
-
-  return (
-    <li className={active ? "pj-chip pj-chip-active" : "pj-chip"}>
-      <Link className="pj-chip-link" to={`/projects/${project.project_id}/${view}`}>
-        <span className="pj-chip-name">{project.project_id}</span>
-      </Link>
-      <Badge tone={project.mode === "active" ? "active" : project.mode === "shadow" ? "shadow" : "off"}>
-        {project.mode}
-      </Badge>
-      <Badge tone={reach === "ok" ? "active" : reach === "gone" ? "danger" : reach === "failed" ? "paused" : "off"}>
-        {REACHABILITY_TEXT[reach]}
-      </Badge>
-    </li>
   );
 }
 
@@ -217,7 +171,7 @@ function ViewTabs({ projectId, view }: { projectId: string; view: ProjectView })
         <Link
           key={candidate}
           className={candidate === view ? "pj-tab pj-tab-active" : "pj-tab"}
-          to={`/projects/${projectId}/${candidate}`}
+          to={inspectPath(projectId, candidate)}
           aria-current={candidate === view ? "page" : undefined}
         >
           {VIEW_LABEL[candidate]}
@@ -571,7 +525,7 @@ function RulesPanel({ projectId }: { projectId: string }) {
       <RulesFileState rules={rules.data} />
       <SchedulesPanel schedules={rules.data.schedules} />
       <RepoTriggersPanel triggers={rules.data.repo_triggers} />
-      <GatePanel command={rules.data.gate_command} />
+      <GatePanel command={rules.data.gate_command} beforePublish={rules.data.gate_before_publish} />
       <WipPanel projectId={projectId} rules={rules.data} />
     </>
   );
@@ -738,17 +692,31 @@ function RepoTriggersPanel({ triggers }: { triggers: RepoTriggerView[] }) {
   );
 }
 
-function GatePanel({ command }: { command: string | null }) {
+function GatePanel({ command, beforePublish }: { command: string | null; beforePublish: boolean }) {
+  const configured = command !== null && command.trim() !== "";
   return (
     <Panel title="Gate" variant="dim">
-      {command === null || command.trim() === "" ? (
+      {configured ? (
+        <code className="pj-gate">{command}</code>
+      ) : (
         <p className="pj-note">
           No gate is configured, so nothing measures this project&apos;s work. That is why a job item
           can read <em>passed</em> with no gate status: there was nothing to pass.
         </p>
-      ) : (
-        <code className="pj-gate">{command}</code>
       )}
+      {/* The second moment the same command can run, and the one nothing else on this
+          page would reveal. A landing that takes twenty minutes has a reason, and the
+          reason is a key in a gitignored file — so this is where it stops being
+          invisible. The contradictory state is drawn too, because the queue refuses
+          every merge while it holds and a refusal nobody can explain is the worst of
+          the three. */}
+      <p className="pj-note">
+        {!beforePublish
+          ? "Merges do not wait for it: the queue publishes without measuring the tree the two branches make together."
+          : configured
+            ? "Merges wait for it. The queue runs it on the merged result and publishes only if it passes; nothing is reverted, because nothing is published first."
+            : "Merges are set to wait for a gate and none is configured, so the queue refuses them."}
+      </p>
     </Panel>
   );
 }

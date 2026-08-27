@@ -35,6 +35,8 @@
 /shell/node_modules/
 /shell/dist/
 /shell/src-tauri/target/
+# Output of `node scripts/preview-shots.mjs` — pictures to look at, not a baseline to diff.
+/preview-shots/
 *.db
 *.db-journal
 sidecars/**/*.exe

@@ -1,0 +1,37 @@
+-- The helpers a conversation may hand work to.
+--
+-- `--agents <json>`, a JSON object keyed by agent name. Each value carries at least a
+-- `description` — what the main model reads to decide whether to delegate — and a `prompt`, the
+-- instructions that helper runs under. Defined per CONVERSATION rather than per project, because
+-- the CLI's own answer is a file in `.claude/agents/`, and this daemon has conversations that
+-- never touch a repository and repositories shared by people who did not ask for a reviewer.
+--
+-- ── why a column and not files ──────────────────────────────────────────────────────────────────
+-- Writing `.claude/agents/*.md` into somebody's project would put the daemon's state in their
+-- working tree and their git history. The flag exists precisely so a caller can define helpers
+-- without touching the tree, and it MERGES with whatever files are there — measured against CLI
+-- 2.1.198, where `--agents` builds definitions tagged `flagSettings` and adds them to the ones
+-- discovered on disk. So a conversation's helpers extend the project's; they do not hide them.
+--
+-- ── why the daemon validates ────────────────────────────────────────────────────────────────────
+-- The CLI parses this JSON inside a try/catch and returns an EMPTY list when it throws. A typo
+-- therefore costs you every custom agent, silently, with the run continuing as if you had asked
+-- for none — no message, no exit code. That is the failure this daemon refuses to pass on, so
+-- `http.rs` checks each definition at the door and stores only what would survive.
+--
+-- ── shape ───────────────────────────────────────────────────────────────────────────────────────
+-- Stored as the object the flag takes: {"reviewer": {"description": …, "prompt": …}}. One column
+-- and not a side table, for the reason `extra_dirs` (0111) is one: read whole, written whole,
+-- never queried across rows. Parsed on the way out rather than handed on as a string, so a column
+-- that cannot be read means "no custom helpers" — a state somebody can see and fix — instead of a
+-- flag the CLI drops without saying so.
+--
+-- `model` and `effort` are accepted per helper and checked against the same catalogue the
+-- conversation's own model is. The remaining keys the CLI accepts — `tools`, `disallowedTools`,
+-- `permissionMode`, `hooks`, `mcpServers` — are deliberately NOT stored: the first two are the
+-- tool-control slice, and the last three would let a window grant a helper more than the
+-- conversation that spawned it. That is a decision for a person to make out loud, not a column to
+-- open quietly.
+--
+-- NULL is no custom helpers, which is what every conversation has had since the table was made.
+ALTER TABLE chats ADD COLUMN agents TEXT;

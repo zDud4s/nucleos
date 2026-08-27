@@ -37,9 +37,25 @@
   background: var(--bg);
 }
 
+/**
+ * The page, centred in whatever room the rail leaves it.
+ *
+ * `max-width` without `margin-inline` is a width that is never used: the page stopped growing at
+ * 78rem and then sat against the left edge, so on any window wider than that the whole app leaned
+ * left with the slack piled up on the right. With both the rail and the conversation list shut it
+ * was at its worst, because that is when there is most slack to pile.
+ *
+ * `auto` and not a calculation involving the rail. Nothing here knows how wide the rail is and
+ * nothing should: it is `auto` in `.app-shell`'s own columns, it is one width open and another
+ * shut, and it will be a third when somebody changes it. Centring inside the column the grid
+ * hands over is correct for every one of those without being told any of them.
+ */
 .app-page {
   max-width: 78rem;
-  padding: var(--space-6) var(--space-6) var(--space-8);
+  margin-inline: auto;
+  /* Less above than to the sides: the sides carry the measure, and the top is only the distance
+     from the window's edge to the first word — which needs less than the 32px it had. */
+  padding: var(--space-5) var(--space-6) var(--space-8);
 }
 
 /* ------------------------------------------------------------------- nav -- */
@@ -109,11 +125,19 @@
   justify-content: center;
 }
 
-/* The list, and the only part of the rail that scrolls. */
+/* The list, and the only part of the rail that scrolls. Faded at the cut like every
+   other scrolling column — on a short window the rail ran out mid-destination, and a
+   row sliced through its own letters reads as a broken row rather than as more list. */
 .nav-scroll {
   min-height: 0;
   overflow-y: auto;
+  /* Asking for `overflow-y` alone computes `overflow-x` to `auto`, which makes this a horizontal
+     scroll container with nothing in it to scroll — and a touchpad's sideways drift then drags the
+     whole rail and springs it back. See `html` in `base.css`. */
+  overscroll-behavior-x: none;
   padding: var(--space-3) var(--space-2);
+  mask-image: var(--scroll-fade);
+  -webkit-mask-image: var(--scroll-fade);
 }
 
 .nav-group + .nav-group {
@@ -265,6 +289,30 @@
   height: 0.45rem;
   border-radius: var(--radius-pill);
   background: var(--tone-danger-fg);
+}
+
+/* What a project is doing without being asked, in the width of a dot.
+   The three tones are already named after the three modes, so the mapping is a
+   substitution rather than a table — a fourth mode would fail visibly here
+   (no colour) instead of silently picking a wrong one. Hollow for `off`: the
+   ring says the project is known and the absent fill says nothing is running,
+   which a grey dot would leave ambiguous against a dimmed row. */
+.nav-mode {
+  flex: none;
+  width: 0.4rem;
+  height: 0.4rem;
+  margin-right: 0.1rem;
+  border-radius: var(--radius-pill);
+  background: var(--tone-active-fg);
+}
+
+.nav-mode[data-mode="shadow"] {
+  background: var(--tone-shadow-fg);
+}
+
+.nav-mode[data-mode="off"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--tone-off-fg);
 }
 
 /* ---------------------------------------------------------- nav: footer -- */

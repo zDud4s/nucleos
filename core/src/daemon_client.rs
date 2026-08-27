@@ -151,6 +151,22 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// The catalogue of departments, handed back as the daemon writes it.
+    ///
+    /// `Value` rather than a typed roster on purpose. `ProjectSummary` above is typed because
+    /// `resolve_run_request` and `job::resolve_start` DECIDE on its fields; nothing in this client
+    /// decides on a team's, so a struct here would be a second copy of `team::TeamView` that could
+    /// only drift from it. Whether the named team exists is answered by `job::start`, at the row.
+    pub async fn list_teams(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/teams")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn create_run(&self, project_id: &str, prompt: &str) -> Result<i64, String> {
         let projects = self.list_projects().await?;
         let body = resolve_run_request(&projects, project_id, prompt)?;
@@ -187,19 +203,35 @@ impl DaemonClient {
         prompt: &str,
         budget_usd: Option<f64>,
         max_rounds: Option<i64>,
+        team_id: Option<&str>,
     ) -> Result<i64, String> {
         let projects = self.list_projects().await?;
         crate::job::resolve_start(&projects, project_id)
             .map_err(|refusal| refusal.reason(project_id))?;
 
+        // Whether the team EXISTS is deliberately not checked here, unlike the project above, and
+        // the asymmetry is the same one `job::start` states at the route: the catalogue can change
+        // between a request being written and it landing, so the answer has to be read where the row
+        // is made. A courtesy check here would only be able to disagree with it.
+        //
+        // Built up rather than written as one literal because `team_id` is OMITTED when absent
+        // instead of travelling as `null`. `CreateJobRequest::team_id` is `#[serde(default)]` and
+        // reads the two the same way, so this buys exactly one thing: a job asked for with no team
+        // sends the body it sent before teams existed, byte for byte. That turns "this parameter
+        // changed nothing for callers who do not use it" from a claim into something a test holds.
+        let mut body = serde_json::json!({
+            "project_id": project_id,
+            "prompt": prompt,
+            "budget_usd": budget_usd,
+            "max_rounds": max_rounds,
+        });
+        if let Some(team_id) = team_id {
+            body["team_id"] = Value::String(team_id.to_owned());
+        }
+
         let response: Value = self
             .request(reqwest::Method::POST, "/jobs")
-            .json(&serde_json::json!({
-                "project_id": project_id,
-                "prompt": prompt,
-                "budget_usd": budget_usd,
-                "max_rounds": max_rounds,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -229,6 +261,202 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())?;
         json_or_null(response).await
+    }
+
+    // Looking at a job, and stopping one. `create_job` has been on this client since jobs existed
+    // and nothing here could ever look at what it started — so a caller with no screen could open a
+    // night's work and then had no way to ask how it went, or to end it.
+    //
+    // The middle one matters more than it reads. A job that a brake has parked writes its reason on
+    // its own row (`jobs.wait_reason`, set by `job::park`) and says it once in the feed. Without a
+    // read of that row, "waiting" and "doing nothing" are the same silence to anyone not at the app.
+
+    /// One job: its status, its wait reason if a brake parked it, and its queue.
+    pub async fn get_job(&self, id: i64) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::GET, &format!("/jobs/{id}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, &format!("reading job {id}")).await
+    }
+
+    /// The project's jobs, newest first. `live` narrows it to the ones still going.
+    ///
+    /// The project is optional because the route's is: `GET /jobs` with no `project_id` lists every
+    /// project's, which is the right answer to "what is running anywhere" — the question somebody
+    /// away from the machine actually asks.
+    pub async fn list_jobs(&self, project_id: Option<&str>, live: bool) -> Result<Value, String> {
+        // Assembled from a list rather than pushed onto a string, so that "no narrowing at all"
+        // comes out as `/jobs` and not as `/jobs?` with a dangling separator. An empty pair is a
+        // parse the route should never be asked to make: `JobsQuery::live` is an `Option<bool>`,
+        // and `live=` with nothing after it is not a bool.
+        let mut params: Vec<String> = Vec::new();
+        if live {
+            params.push("live=true".to_owned());
+        }
+        if let Some(project_id) = project_id {
+            params.push(format!("project_id={}", urlencoding_encode(project_id)));
+        }
+        let route = if params.is_empty() {
+            "/jobs".to_owned()
+        } else {
+            format!("/jobs?{}", params.join("&"))
+        };
+        let response = self
+            .request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "listing jobs").await
+    }
+
+    /// Stops a job. The item in flight finishes; nothing else starts.
+    pub async fn cancel_job(&self, id: i64) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, &format!("/jobs/{id}/cancel"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_null(response).await
+    }
+
+    // The four project reads (spec: orchestrator eyes). Each reaches the calling person's OWN
+    // checkout — never a run's worktree, so none of them takes a `run` parameter, unlike the
+    // sibling routes in `http.rs` that answer both questions. Every interpolated segment and every
+    // query value goes through `urlencoding_encode`, because a path or a query string chosen by
+    // whoever wrote the request that reaches here must travel as ONE value and never rewrite the
+    // request around it — `um_caminho_com_e_comercial_viaja_codificado` is what pins that.
+    //
+    // `project_ls` and `project_grep` answer `Value` rather than a typed shape (`inspect::Entry`,
+    // `inspect::Match`), and that is deliberate rather than lazy: a recording test-daemon answers
+    // `{}` to every route it does not otherwise handle, and a typed `Vec<_>` would fail to
+    // deserialize that shape and fail the test that relies on it, where `Value` does not care.
+
+    /// A directory listing inside the project's own checkout.
+    pub async fn project_ls(&self, project_id: &str, path: &str) -> Result<Value, String> {
+        let route = format!(
+            "/projects/{}/ls?path={}",
+            urlencoding_encode(project_id),
+            urlencoding_encode(path)
+        );
+        self.request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// One file's contents out of the project's own checkout.
+    ///
+    /// Bare text, not JSON: `get_project_cat` in `http.rs` answers `Result<String, StatusCode>`, so
+    /// the body is read with `text_or_refusal` rather than `.json()` — a `.json()` read of a
+    /// plain-text body would fail on the first file that is not valid JSON, which is nearly every
+    /// file there is. And not a bare `.text()` either: a refusal from that route is a `StatusCode`
+    /// with an EMPTY body, which `.text()` reads as `Ok(String::new())` regardless of status —
+    /// indistinguishable from an empty file, and specifically indistinguishable from the
+    /// `safe_join` refusal a path like `../../../etc/passwd` gets. Checking status first is what
+    /// turns that refusal back into an `Err`.
+    pub async fn project_cat(&self, project_id: &str, path: &str) -> Result<String, String> {
+        let route = format!(
+            "/projects/{}/cat?path={}",
+            urlencoding_encode(project_id),
+            urlencoding_encode(path)
+        );
+        let response = self
+            .request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        text_or_refusal(response, &format!("reading {path:?}")).await
+    }
+
+    /// A text search inside the project's own checkout.
+    ///
+    /// The query parameter on the wire is named `q`, matching `GrepQuery` in `http.rs` — the Rust
+    /// parameter keeps the friendlier name `query` because nothing here requires the two to match.
+    pub async fn project_grep(
+        &self,
+        project_id: &str,
+        query: &str,
+        path: &str,
+    ) -> Result<Value, String> {
+        let route = format!(
+            "/projects/{}/grep?q={}&path={}",
+            urlencoding_encode(project_id),
+            urlencoding_encode(query),
+            urlencoding_encode(path)
+        );
+        self.request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The uncommitted diff of the project's own checkout. Bare text, like `project_cat` above,
+    /// and read through `text_or_refusal` for the same reason: a refusal here is also an empty
+    /// body on a non-2xx status, and a bare `.text()` cannot tell that apart from a project with
+    /// nothing uncommitted.
+    pub async fn project_diff(&self, project_id: &str, path: &str) -> Result<String, String> {
+        let route = format!(
+            "/projects/{}/diff?path={}",
+            urlencoding_encode(project_id),
+            urlencoding_encode(path)
+        );
+        let response = self
+            .request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        text_or_refusal(response, &format!("reading the diff at {path:?}")).await
+    }
+
+    // The two shadow reads (the promotion door). `list_projects` above already answers WHETHER a
+    // project may leave shadow — `ProjectSummary` carries `classes_ready`, `classes_total`,
+    // `withheld_classes_ready` and `promotable`. These two answer WHY NOT: which action class is
+    // short of the bar, and what is sitting in the queue waiting to be judged.
+    //
+    // Both routes are already in the read table in `auth.rs` (`GET /scoreboard` and
+    // `GET /shadow-decisions`, beside the `GET /proposals` this file already calls), so nothing
+    // here widens what this token may reach. The verdict route one segment deeper —
+    // `POST /shadow-decisions/{id}/verdict` — is deliberately given no method in this file; the
+    // reason is written where the tools are, in `mcp_tools.rs`.
+    //
+    // `Value` rather than `Vec<ClassTally>` / `Vec<ShadowDecision>`, for the reason the project
+    // reads above give: the recording test-daemon answers `{}` to every route it does not otherwise
+    // handle, and a typed `Vec<_>` fails to deserialize that shape where `Value` does not care.
+
+    /// The per-class shadow scoreboard for one project: what the classifier would have decided, how
+    /// much of it a human has reviewed, and how often they agreed.
+    pub async fn shadow_scoreboard(&self, project_id: &str) -> Result<Value, String> {
+        let route = format!("/scoreboard?project_id={}", urlencoding_encode(project_id));
+        self.request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The decisions of one project still waiting on a human verdict.
+    pub async fn shadow_queue(&self, project_id: &str) -> Result<Value, String> {
+        let route = format!(
+            "/shadow-decisions?project_id={}",
+            urlencoding_encode(project_id)
+        );
+        self.request(reqwest::Method::GET, &route)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn list_proposals(&self) -> Result<Value, String> {
@@ -944,17 +1172,46 @@ async fn json_or_refusal(response: reqwest::Response, context: &str) -> Result<V
         // and `503` alone is not. Truncated because this string lands in a model's context and the
         // thing most likely to answer a request with kilobytes of body is a proxy, not the daemon.
         let detail = response.text().await.unwrap_or_default();
-        let detail = detail.trim();
-        return match detail.chars().take(REFUSAL_DETAIL_LIMIT + 1).count() {
-            0 => Err(format!("the daemon refused {context}: {status}")),
-            n if n > REFUSAL_DETAIL_LIMIT => {
-                let cut: String = detail.chars().take(REFUSAL_DETAIL_LIMIT).collect();
-                Err(format!("the daemon refused {context}: {status}: {cut}…"))
-            }
-            _ => Err(format!("the daemon refused {context}: {status}: {detail}")),
-        };
+        return Err(refusal_message(status, &detail, context));
     }
     json_or_null(response).await
+}
+
+/// Bare-text sibling of `json_or_refusal`, for the two routes that answer a plain string on
+/// success rather than JSON (`project_cat`, `project_diff`).
+///
+/// Both of those refuse the same way `get_project_ls`/`get_project_grep` do in `http.rs`: a bare
+/// `StatusCode` with an EMPTY body (`Result<String, StatusCode>`, same as the `Value` routes'
+/// `Result<Json<_>, StatusCode>`). The `Value` routes are safe from this by accident — `.json()` on
+/// an empty body fails to parse and surfaces an `Err` on its own — but `.text()` has no such
+/// accident to lean on: it happily turns an empty, refused body into `Ok(String::new())`, which
+/// reads as "the file is empty" rather than "that path was refused". Checking status before ever
+/// calling `.text()` on the success path, the same way `json_or_refusal` does, is what keeps a
+/// refusal an `Err` instead of a false-empty answer.
+async fn text_or_refusal(response: reqwest::Response, context: &str) -> Result<String, String> {
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(refusal_message(status, &detail, context));
+    }
+    response.text().await.map_err(|e| e.to_string())
+}
+
+/// The shared refusal-message formatting for `json_or_refusal` and `text_or_refusal`: the body
+/// when there is one, because the web routes put the actionable half there — "the web pillar is
+/// off: set enabled: true in .ai/web.yaml" is a sentence somebody can act on and `503` alone is
+/// not. Truncated because this string lands in a model's context and the thing most likely to
+/// answer a request with kilobytes of body is a proxy, not the daemon.
+fn refusal_message(status: reqwest::StatusCode, detail: &str, context: &str) -> String {
+    let detail = detail.trim();
+    match detail.chars().take(REFUSAL_DETAIL_LIMIT + 1).count() {
+        0 => format!("the daemon refused {context}: {status}"),
+        n if n > REFUSAL_DETAIL_LIMIT => {
+            let cut: String = detail.chars().take(REFUSAL_DETAIL_LIMIT).collect();
+            format!("the daemon refused {context}: {status}: {cut}…")
+        }
+        _ => format!("the daemon refused {context}: {status}: {detail}"),
+    }
 }
 
 /// How much of a refusal's body travels back with it, in characters.
@@ -1198,6 +1455,8 @@ mod tests {
             open_proposals: 0,
             wip_limit: Some(3),
             queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
         }
     }
 
@@ -1268,6 +1527,8 @@ mod tests {
             open_proposals: 0,
             wip_limit: Some(3),
             queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
         }];
 
         let body = resolve_run_request(&projects, "active-project", "do the work").unwrap();
@@ -1380,6 +1641,320 @@ mod tests {
         format!("http://{address}")
     }
 
+    /// **A team asked for reaches the daemon.**
+    ///
+    /// The assertion is on the BODY that travelled and not on the return value, and that is the
+    /// whole of the test. `create_job` hands back a job id either way, so a version of this that
+    /// checked the id would pass with `team_id` dropped on the floor — which is precisely the state
+    /// this change exists to end, and it is a state whose only symptom is work running sequentially
+    /// while reporting `completed`.
+    #[tokio::test]
+    async fn uma_equipa_pedida_viaja_ate_ao_corpo_do_pedido() {
+        let (url, seen) = job_recording_daemon().await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        let job_id = client
+            .create_job("live-project", "build the thing", None, None, Some("crew"))
+            .await
+            .expect("the fake daemon accepts the job");
+        assert_eq!(job_id, 7);
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no POST /jobs was sent");
+        assert_eq!(
+            body["team_id"].as_str(),
+            Some("crew"),
+            "the team never left this client: {body}"
+        );
+    }
+
+    /// And the half that says the change cost nobody anything: no team named, and the body is the
+    /// one this client sent before teams existed.
+    ///
+    /// `team_id` ABSENT rather than `null`. Both deserialize to `None` at the route, so this is not
+    /// a claim about the daemon — it is the claim that adding the parameter changed nothing for the
+    /// callers who do not use it, which is worth nothing unless something checks it.
+    ///
+    /// `.get()` and not `[]`: indexing a missing key yields `Null`, so `body["team_id"].is_null()`
+    /// would pass for both an omitted field and a `null` one — the exact confusion the test is here
+    /// to rule out.
+    #[tokio::test]
+    async fn sem_equipa_o_corpo_sai_como_sempre_saiu() {
+        let (url, seen) = job_recording_daemon().await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        client
+            .create_job("live-project", "build the thing", None, None, None)
+            .await
+            .expect("the fake daemon accepts the job");
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no POST /jobs was sent");
+        assert!(
+            body.get("team_id").is_none(),
+            "a job with no team must not mention one at all: {body}"
+        );
+        // The rest of the body, or "nothing else changed" is being asserted about a single key.
+        assert_eq!(body["project_id"].as_str(), Some("live-project"));
+        assert_eq!(body["prompt"].as_str(), Some("build the thing"));
+        assert!(body["budget_usd"].is_null());
+        assert!(body["max_rounds"].is_null());
+    }
+
+    /// A daemon that answers the two calls `create_job` makes and keeps the JSON body of the second.
+    ///
+    /// `recording_daemon` beside it records the URI, which is the right question for a read whose
+    /// argument travels in the query string and the wrong one here: `POST /jobs` always has the same
+    /// path, and everything this test is about is inside the body.
+    async fn job_recording_daemon() -> (String, std::sync::Arc<std::sync::Mutex<Option<Value>>>) {
+        let seen: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = seen.clone();
+        let roster = serde_json::to_string(&[summary_for(
+            "live-project",
+            Mode::Active,
+            Some("C:/projects/live"),
+        )])
+        .expect("a roster serializes");
+
+        let app = axum::Router::new()
+            .route(
+                "/projects",
+                axum::routing::get(move || {
+                    let roster = roster.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            roster,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/jobs",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        *recorded.lock().unwrap() = Some(body);
+                        (
+                            axum::http::StatusCode::CREATED,
+                            axum::Json(serde_json::json!({"job_id": 7})),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// A daemon that answers `{}` to everything and remembers the exact path+query of the last
+    /// request it received — so a test can inspect what actually travelled on the wire rather than
+    /// trusting that the client built what it meant to.
+    async fn recording_daemon() -> (String, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+        let seen: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = seen.clone();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let recorded = recorded.clone();
+            async move {
+                *recorded.lock().unwrap() = Some(uri.to_string());
+                (axum::http::StatusCode::OK, "{}")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// A folder name reaching a project read as a query value must stay ONE value, whatever
+    /// characters it holds — the same property `a_folder_name_cannot_rewrite_the_request_it_\
+    /// travels_in` pins for `urlencoding_encode` in isolation, checked here end-to-end so a future
+    /// `project_ls` that builds its query by hand (`format!("...?path={path}")`, skipping the
+    /// encoder that already exists in this file) is caught rather than assumed away.
+    ///
+    /// `&` is the sharp case: raw, it starts a second query parameter, so a path an attacker chose
+    /// could smuggle in a parameter the daemon reads as if the caller had sent it. `..` travels
+    /// inside the same single value — `urlencoding_encode` leaves `.` unescaped by design, so the
+    /// guard this test wants is not "no `..` reaches the daemon" but "it never reaches the daemon
+    /// as anything other than part of the one `path` value".
+    #[tokio::test]
+    async fn um_caminho_com_e_comercial_viaja_codificado() {
+        let (url, seen) = recording_daemon().await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        client
+            .project_ls("nucleos", "a&path=b/../etc")
+            .await
+            .expect("the recording daemon answers 200 to everything");
+
+        let uri = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("project_ls sent no request to the daemon at all");
+        let query = uri
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_else(|| panic!("no query string was sent at all: {uri}"));
+
+        assert_eq!(
+            query.matches("path=").count(),
+            1,
+            "the path value split into more than one query parameter: {uri}"
+        );
+        assert_eq!(
+            query.split('&').count(),
+            1,
+            "an unescaped & in the path started a second query parameter: {uri}"
+        );
+    }
+
+    /// The bug `text_or_refusal` exists to close: `get_project_cat` in `http.rs` refuses a path
+    /// like this with a bare `StatusCode` — an EMPTY body — and a plain `.text()` read does not
+    /// care about status codes at all, so it turned that refusal into `Ok(String::new())`:
+    /// indistinguishable from "the file is empty" when it is really "that path was refused". Reuses
+    /// `refusing_daemon`, the fixture the two `json_or_refusal` tests above already use for a
+    /// canned non-2xx answer, rather than touching the frozen `recording_daemon` (which only ever
+    /// answers 200).
+    #[tokio::test]
+    async fn a_project_cat_refusal_does_not_arrive_as_an_empty_file() {
+        let url = refusing_daemon(axum::http::StatusCode::BAD_REQUEST, "").await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        let refusal = client
+            .project_cat("nucleos", "../../../etc/passwd")
+            .await
+            .expect_err("a 400 with an empty body must not read as an empty file");
+
+        assert!(
+            refusal.contains("400") || refusal.contains("Bad Request"),
+            "refusal should say what happened: {refusal:?}"
+        );
+    }
+
+    /// Same bug, same fix, on `project_diff`'s side: an empty-bodied refusal must not read as an
+    /// empty (i.e. "nothing uncommitted") diff.
+    #[tokio::test]
+    async fn a_project_diff_refusal_does_not_arrive_as_an_empty_diff() {
+        let url = refusing_daemon(axum::http::StatusCode::NOT_FOUND, "").await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        let refusal = client
+            .project_diff("nucleos", "../../../etc/passwd")
+            .await
+            .expect_err("a 404 with an empty body must not read as an empty diff");
+
+        assert!(
+            refusal.contains("404") || refusal.contains("Not Found"),
+            "refusal should say what happened: {refusal:?}"
+        );
+    }
+
+    /// A project id reaching the two shadow reads is a QUERY value, not a path segment, and that is
+    /// the difference this pins. The four project reads put the id in the path, where a stray `&`
+    /// is inert; here a raw one would start a second query parameter and the daemon would read a
+    /// parameter the caller never sent. `urlencoding_encode` is already applied to both — this is
+    /// what catches the future rewrite that drops it (`format!("/scoreboard?project_id={id}")`
+    /// reads perfectly well and is wrong).
+    #[tokio::test]
+    async fn um_projeto_com_e_comercial_viaja_codificado_nas_leituras_de_shadow() {
+        for (label, call) in [("shadow_scoreboard", 0usize), ("shadow_queue", 1usize)] {
+            let (url, seen) = recording_daemon().await;
+            let client = DaemonClient::new(url, "test-token".to_string());
+            let project = "nucleos&project_id=outro";
+
+            if call == 0 {
+                client.shadow_scoreboard(project).await
+            } else {
+                client.shadow_queue(project).await
+            }
+            .expect("the recording daemon answers 200 to everything");
+
+            let uri = seen
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| panic!("{label} sent no request to the daemon at all"));
+            let query = uri
+                .split_once('?')
+                .map(|(_, query)| query)
+                .unwrap_or_else(|| panic!("{label} sent no query string at all: {uri}"));
+
+            assert_eq!(
+                query.split('&').count(),
+                1,
+                "{label}: an unescaped & in the project id started a second query parameter: {uri}"
+            );
+            assert_eq!(
+                query.matches("project_id=").count(),
+                1,
+                "{label}: the project id split into more than one query parameter: {uri}"
+            );
+        }
+    }
+
+    /// The job listing builds its own query, so the two ways it can be built wrong are checked
+    /// here: a project id that rewrites the request around itself, and a separator left dangling
+    /// when nothing narrows the list.
+    ///
+    /// `&` is the sharp case for the first. For the second, `/jobs?` with an empty pair after it is
+    /// a `live=` the route has to parse as an `Option<bool>`, which it is not — so "list
+    /// everything" has to come out as a bare path.
+    #[tokio::test]
+    async fn a_lista_de_jobs_monta_a_sua_query_sem_separador_a_solta() {
+        let (url, seen) = recording_daemon().await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        client
+            .list_jobs(Some("nucleos&live=true"), false)
+            .await
+            .expect("the recording daemon answers 200 to everything");
+        let uri = seen.lock().unwrap().clone().expect("no request was sent");
+        let query = uri
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_else(|| panic!("no query string was sent at all: {uri}"));
+        assert_eq!(
+            query.split('&').count(),
+            1,
+            "an unescaped & in the project id started a second query parameter: {uri}"
+        );
+
+        client
+            .list_jobs(None, false)
+            .await
+            .expect("the recording daemon answers 200 to everything");
+        let uri = seen.lock().unwrap().clone().expect("no request was sent");
+        assert!(
+            !uri.contains('?'),
+            "listing every job narrowed by nothing must not send a query string at all: {uri}"
+        );
+
+        client
+            .list_jobs(None, true)
+            .await
+            .expect("the recording daemon answers 200 to everything");
+        let uri = seen.lock().unwrap().clone().expect("no request was sent");
+        assert!(
+            uri.ends_with("live=true"),
+            "the live flag alone must be the whole query, with nothing after it: {uri}"
+        );
+    }
+
     #[test]
     fn shadow_project_resolves_to_shadow_mode() {
         let projects = vec![ProjectSummary {
@@ -1394,6 +1969,8 @@ mod tests {
             open_proposals: 0,
             wip_limit: Some(3),
             queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
         }];
 
         let body = resolve_run_request(&projects, "shadow-project", "inspect the work").unwrap();
@@ -1416,6 +1993,8 @@ mod tests {
             open_proposals: 0,
             wip_limit: Some(3),
             queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
         }];
 
         assert!(resolve_run_request(&projects, "off-project", "do the work").is_err());
@@ -1435,6 +2014,8 @@ mod tests {
             open_proposals: 0,
             wip_limit: Some(3),
             queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
         }];
 
         assert!(resolve_run_request(&projects, "unknown-project", "do the work").is_err());
@@ -1454,6 +2035,8 @@ mod tests {
             open_proposals: 0,
             wip_limit: Some(3),
             queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
         }];
 
         assert!(resolve_run_request(&projects, "rootless-project", "do the work").is_err());

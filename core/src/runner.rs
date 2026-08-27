@@ -98,6 +98,13 @@ pub struct RunOutcome {
     pub cache_read_tokens: Option<i64>,
     pub cache_creation_tokens: Option<i64>,
     pub num_turns: Option<i64>,
+    /// Whether the CLI summarised its own context at some point during this run.
+    ///
+    /// Beside the numbers rather than derived from them, because it cannot be derived from them: a
+    /// compacted turn's `context_fill` is simply lower than the one before it, which is
+    /// indistinguishable from a short question. The stream says it outright and this carries what
+    /// it said.
+    pub compacted: bool,
 }
 
 /// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds
@@ -189,6 +196,95 @@ pub struct RunRequest {
     pub ambient_mcp: bool,
     /// Per-run override of the runner's configured model. `None` keeps it.
     pub model: Option<String>,
+    /// How hard this run asks the model to think, or `None` for the CLI's own default.
+    ///
+    /// `low | medium | high | xhigh | max`, validated where it is CHOSEN and not here: this struct
+    /// is built by seven callers and a check in each is seven places for the list to drift. What
+    /// reaches this field has already been checked against `config::EFFORT_LEVELS`, and a value
+    /// that somehow was not is refused by the CLI at spawn — loudly, which is the safe direction.
+    ///
+    /// Honoured only by the agent CLI. `OllamaRunner` has no such notion and drops it, which is why
+    /// a local choice carries no effort levels rather than letting the window offer a dial that
+    /// turns nothing.
+    pub effort: Option<String>,
+    /// Who answers when the chosen model is overloaded or unavailable, tried in the order given.
+    ///
+    /// Beside `model` and not inside it: one says who SHOULD answer and the other who may answer
+    /// instead, and one string holding both would make "no fallback" and "no model" the same
+    /// absence. Empty is no fallback, which is what every run in this daemon has always had.
+    pub fallback_model: Vec<String>,
+    /// Directories this run's tools may reach beyond its `cwd`. Empty is the established behaviour.
+    ///
+    /// `cwd` is where the run happens; these are places it may also look. The distinction matters
+    /// because only one of them can be the working directory, and a person working across a
+    /// repository and the notes folder beside it should not have to choose which half is visible.
+    pub add_dirs: Vec<PathBuf>,
+    /// The most one invocation of the CLI may spend, or `None` for no ceiling.
+    ///
+    /// Per RUN, which in this daemon is per turn — the CLI's own flag bounds a single invocation.
+    /// It is emphatically not a conversation total: ten turns at the ceiling cost ten times it. The
+    /// column behind it is named `turn_budget_usd` for the same reason.
+    ///
+    /// A ceiling the CLI enforces, unlike `max_turns` a few fields up, which this daemon counts
+    /// itself because the CLI has no flag for it.
+    pub max_budget_usd: Option<f64>,
+    /// The helpers this run may hand work to, beyond the ones the CLI finds in `.claude/agents/`.
+    ///
+    /// Additive, not a replacement: measured against CLI 2.1.198, `--agents` builds definitions
+    /// tagged `flagSettings` and merges them with the ones discovered on disk. A conversation with
+    /// its own reviewer still has the project's.
+    ///
+    /// Empty is the established behaviour and writes no flag at all — which matters more here than
+    /// elsewhere, because the CLI parses this JSON in a try/catch and answers a throw with an EMPTY
+    /// agent list. Writing `--agents {}` would therefore not be a harmless no-op to reason about.
+    ///
+    /// Honoured only by the agent CLI, like `effort`. `OllamaRunner` has no notion of a subagent.
+    pub agents: Vec<Subagent>,
+    /// Standing instructions for this run, appended to the CLI's own system prompt.
+    ///
+    /// APPENDED and never substituted. `--system-prompt` exists too and is deliberately not
+    /// reachable from here: it replaces the CLI's own, which carries the tool descriptions and the
+    /// safety framing, and a run that lost those reads as a run whose model got worse.
+    ///
+    /// Per invocation, which in this daemon is per turn — so a conversation's instructions travel
+    /// on every one of its turns. Sending them only on the first would make them apply to the
+    /// opening message and quietly stop mattering, which is the hardest kind of wrong to notice
+    /// because the first answer is right.
+    pub append_system_prompt: Option<String>,
+    /// Built-in tools this run may not reach for, on top of whatever `tool_policy` already denies.
+    ///
+    /// Only ever takes something away. The allow-listing flag beside it does not restrict anything
+    /// — it GRANTS permission on top of what is already allowed, which `BUILTIN_TOOLS` measured —
+    /// so there is no widening version of this field to get wrong.
+    ///
+    /// Merged with the policy's own denials into ONE flag by `cli_args`. `--disallowedTools` is
+    /// variadic, so a second occurrence REPLACES the first: two flags would be a per-run preference
+    /// silently undoing a safety property.
+    pub denied_tools: Vec<String>,
+    /// What to call this run's session where the CLI shows sessions, or `None` for nameless.
+    ///
+    /// Cosmetic and nothing else: it reaches the `--resume` picker and the terminal title, and no
+    /// decision anywhere depends on it. Carried because every session this daemon has ever minted
+    /// is nameless there, so a person looking at their own machine sees a wall of timestamps where
+    /// this app's conversations are.
+    pub session_name: Option<String>,
+    /// The context window this run is given, or `None` for whatever the CLI decides on its own.
+    ///
+    /// An ENV VAR and not a flag, because the CLI has no flag for it —
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which it clamps to 100k–1M and then caps at the model's
+    /// real window. Below that window minus 13k the CLI compacts its own context and carries on in
+    /// the same session, which is how the editor has always behaved and what this daemon used to
+    /// approximate by refusing to resume and starting again.
+    ///
+    /// Verified in headless mode rather than assumed to be a REPL feature: `claude -p --resume`
+    /// with the window forced low emits `{"type":"system","subtype":"status","status":"compacting"}`
+    /// followed by a `compact_result`. Both are read back below, so a compaction is something the
+    /// transcript can show rather than something that silently happened.
+    ///
+    /// `None` on every run that is not a conversation. A one-shot errand has no second turn for a
+    /// compaction to serve, and naming a window for it would only move the point at which a single
+    /// long tool loop starts summarising itself.
+    pub context_window: Option<i64>,
     /// Which of this server's tools this run is offered, when it is offered any at all.
     ///
     /// `None` — every caller but one — keeps the wildcard: `--allowedTools mcp__nucleos__*`, the
@@ -361,7 +457,7 @@ fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option
 /// advertises it and `advertised_tools_violate` kills the run at the `init` event. The tool set can
 /// move underneath a version that never changed, which means the version number is not the signal:
 /// the stderr line naming the offending tools is.
-const BUILTIN_TOOLS: &[&str] = &[
+pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "Agent",
     "Artifact",
     "AskUserQuestion",
@@ -409,6 +505,66 @@ const BUILTIN_TOOLS: &[&str] = &[
     "Write",
 ];
 
+/// One helper a conversation may hand work to, as `--agents` takes it.
+///
+/// The field names ARE the CLI's JSON keys, which is why they are not this codebase's usual prose
+/// names: `description` is what the main model reads to decide whether to delegate — the CLI calls
+/// it `whenToUse` internally — and `prompt` is the system prompt that helper runs under. Renaming
+/// either here would mean a translation layer, and a translation layer is where a key goes missing.
+///
+/// `name` is carried IN the struct although the flag wants it as the object's key. The window edits
+/// a list of helpers and a list has an order and an index; an object has neither, and re-deriving
+/// the name from a map key at every layer is how a rename comes to lose a helper.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Subagent {
+    /// What the main model calls this helper by.
+    ///
+    /// `default` because this struct is read back out of the stored object, where the name is the
+    /// KEY and not a field — `subagents_from` puts it back. It is serialised normally, because the
+    /// window is the other reader of this type and a list of anonymous helpers is not a list
+    /// anybody can edit; `agents_json` is the one place that drops it, on its way to the flag.
+    #[serde(default)]
+    pub name: String,
+    /// What this helper is for, in the main model's words. The one field that decides whether it is
+    /// ever used at all: the CLI hands this to the parent as the reason to delegate.
+    pub description: String,
+    /// The system prompt this helper runs under.
+    pub prompt: String,
+    /// Which model answers as this helper, or `None` to inherit the conversation's.
+    ///
+    /// Absent rather than the CLI's literal `"inherit"`: absence already means it, and offering two
+    /// spellings of one state is two states to keep agreeing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard this helper is asked to think, or `None` for whatever its model does by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// The `--agents` value for a set of helpers: an object keyed by name.
+///
+/// Public because the door checks the SIZE of what it is about to store, and the size that matters
+/// is the size of this string — a helper set is one argv element, and Windows caps a whole command
+/// line at 32767 characters. Measuring the struct instead would measure the wrong thing.
+///
+/// Serialisation cannot fail for these types, so a failure answers with the empty object rather
+/// than panicking: no custom helpers is a state the run survives, and it is what a conversation
+/// that never defined any already has.
+pub fn agents_json(agents: &[Subagent]) -> String {
+    let object: serde_json::Map<String, serde_json::Value> = agents
+        .iter()
+        .filter_map(|agent| {
+            let mut body = serde_json::to_value(agent).ok()?;
+            // The name is the key here, not a field of the value. Dropped rather than left for the
+            // CLI's schema to strip: it strips unknown keys today, and a contract that holds only
+            // because the other side is forgiving is one that breaks when it stops being.
+            body.as_object_mut()?.remove("name");
+            Some((agent.name.clone(), body))
+        })
+        .collect();
+    serde_json::to_string(&object).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// The full `claude` argument vector for one run. Pure, so the flags that decide what a run can
 /// reach are asserted in tests instead of inspected on a live process.
 pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
@@ -424,6 +580,55 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
     }
     args.push("--model".to_string());
     args.push(model.to_string());
+    // Beside `--model`, and conditional like the session flags below it rather than up with
+    // `--exclude-dynamic-system-prompt-sections`: that one's comment reserves the position
+    // immediately after `--verbose`, and this must not be what pushes it out of place.
+    if let Some(effort) = &request.effort {
+        args.push("--effort".to_string());
+        args.push(effort.clone());
+    }
+    // Comma-separated, as the CLI takes it. Documented "(only works with --print)", which every run
+    // here is: `-p` is the first thing this function pushes and there is no path that omits it.
+    if !request.fallback_model.is_empty() {
+        args.push("--fallback-model".to_string());
+        args.push(request.fallback_model.join(","));
+    }
+    // `--add-dir` is variadic — it swallows every following argument until the next flag — so it is
+    // written here, among the `--flag value` pairs, and never before the prompt. On the argv path
+    // the prompt is a POSITIONAL pushed second, and a variadic flag placed above it would eat it.
+    if !request.add_dirs.is_empty() {
+        args.push("--add-dir".to_string());
+        for directory in &request.add_dirs {
+            args.push(directory.to_string_lossy().into_owned());
+        }
+    }
+    // Also print-only, and also always satisfied here. A ceiling the CLI enforces itself, which is
+    // the difference from `max_turns`: that one has no flag and is counted from the transcript.
+    if let Some(ceiling) = request.max_budget_usd {
+        args.push("--max-budget-usd".to_string());
+        args.push(format!("{ceiling}"));
+    }
+    // One argv element holding a JSON object, which is how the flag is defined — not a repeatable
+    // `--agents name=…`. Empty writes nothing rather than `{}`: the CLI answers unparseable JSON
+    // with an empty agent list and no error, so the difference between "no flag" and "a flag that
+    // parsed to nothing" is invisible from outside, and only one of them is a state anybody chose.
+    if !request.agents.is_empty() {
+        args.push("--agents".to_string());
+        args.push(agents_json(&request.agents));
+    }
+    // Appended, never substituted — see the field. Written among the flag/value pairs like the
+    // rest, and never above the prompt, for the reason `--add-dir` gives.
+    if let Some(instructions) = &request.append_system_prompt {
+        args.push("--append-system-prompt".to_string());
+        args.push(instructions.clone());
+    }
+    // Beside the session flags below in meaning, and written here in position for the same reason
+    // everything conditional is: `--exclude-dynamic-system-prompt-sections` holds the slot right
+    // after `--verbose` so the prompt cache keeps matching, and nothing may push it out of place.
+    if let Some(name) = &request.session_name {
+        args.push("--name".to_string());
+        args.push(name.clone());
+    }
     if let Some(sid) = &request.resume_session_id {
         args.push("--resume".to_string());
         args.push(sid.clone());
@@ -471,10 +676,10 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         });
     }
     match request.tool_policy {
-        // No tool denial — the classifier governs what an autopilot run may call — but the ambient
-        // MCP servers are nobody's: each one is re-described in full on every turn, and nothing in
-        // the daemon's design calls them. The `--mcp-config` block above still runs, so a run
-        // carrying `request.mcp_config` keeps its nucleos server under the strict flag.
+        // No tool denial of its own — the classifier governs what an autopilot run may call — but
+        // the ambient MCP servers are nobody's: each one is re-described in full on every turn, and
+        // nothing in the daemon's design calls them. The `--mcp-config` block above still runs, so
+        // a run carrying `request.mcp_config` keeps its nucleos server under the strict flag.
         //
         // Only this arm is opt-out-able. `McpOnly` and `None` keep their unconditional strict flag,
         // where it is a safety property rather than an economy.
@@ -483,25 +688,53 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
                 args.push("--strict-mcp-config".to_string());
             }
         }
-        ToolPolicy::McpOnly => {
-            // Drops every MCP server this user happens to have configured — the ambient surface a
-            // spawned run inherits otherwise includes file-writing connectors.
+        // Both of the arms below drop every MCP server this user happens to have configured — the
+        // ambient surface a spawned run inherits otherwise includes file-writing connectors. Under
+        // the wildcard it is redundant and passed anyway, so a future narrowing of one is not a
+        // silent widening of the other.
+        ToolPolicy::McpOnly | ToolPolicy::None => {
             args.push("--strict-mcp-config".to_string());
-            args.push("--disallowedTools".to_string());
-            args.push(BUILTIN_TOOLS.join(","));
-        }
-        // Measured against CLI 2.1.198: this yields an `init` event advertising NO tools at all —
-        // the capability is absent rather than refused, so there is nothing for a prompt injected
-        // into a mail body to talk the model into reaching for. `--strict-mcp-config` is redundant
-        // under the wildcard and passed anyway, so a future narrowing of one is not a silent
-        // widening of the other.
-        ToolPolicy::None => {
-            args.push("--strict-mcp-config".to_string());
-            args.push("--disallowedTools".to_string());
-            args.push("*".to_string());
         }
     }
+    // ONE `--disallowedTools`, holding everything anything wanted denied.
+    //
+    // The policy's denials and the run's own used to be unable to coexist, and the failure would
+    // have been silent: `--disallowedTools` is variadic, so a second occurrence REPLACES the first
+    // rather than adding to it. Written twice, a conversation asking not to run `Bash` would have
+    // taken `ToolPolicy::McpOnly` down with it and come back with the whole built-in tool set.
+    let denied = denied_tools(&request.tool_policy, &request.denied_tools);
+    if !denied.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(denied.join(","));
+    }
     args
+}
+
+/// Everything one run must be denied: what its policy denies, plus what it asked to be denied.
+///
+/// Separate from `cli_args` so the merge itself is assertable — this is the function whose being
+/// wrong would look like a safety property holding, and a test that read an argument vector could
+/// only ever check the flag that survived.
+///
+/// `ToolPolicy::None` answers with the wildcard alone. Measured against CLI 2.1.198 it yields an
+/// `init` event advertising NO tools at all — the capability is absent rather than refused, so
+/// there is nothing for a prompt injected into a mail body to talk the model into reaching for —
+/// and naming individual tools beside `*` would only add stderr lines about rules that match
+/// nothing on top of a denial that already covers them.
+fn denied_tools(policy: &ToolPolicy, asked: &[String]) -> Vec<String> {
+    if *policy == ToolPolicy::None {
+        return vec!["*".to_string()];
+    }
+    let mut denied: Vec<String> = match policy {
+        ToolPolicy::McpOnly => BUILTIN_TOOLS.iter().map(|name| name.to_string()).collect(),
+        _ => Vec::new(),
+    };
+    for name in asked {
+        if !denied.iter().any(|have| have == name) {
+            denied.push(name.clone());
+        }
+    }
+    denied
 }
 
 /// The final text of a `claude -p --output-format stream-json` run.
@@ -591,6 +824,46 @@ pub struct ToolCall {
     /// is exactly what it was.
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// What the tool answered, cut to `RESULT_LIMIT` characters, or `None` when nothing came back.
+    ///
+    /// Until this existed a turn said what it REACHED FOR and never what it found: `Bash` beside
+    /// `cargo test dates::` with no way to learn, from the conversation, whether the tests passed.
+    /// The model's paragraph underneath is a summary of this, and a summary is exactly the thing
+    /// somebody opening a tool call has decided not to take on trust.
+    ///
+    /// Cut, because a `Read` of a three-thousand-line file answers with the file. The full length
+    /// is kept beside it in `result_chars`, so the window can say what it is NOT showing rather
+    /// than present a truncation as the whole answer.
+    ///
+    /// **Not on the transcript.** `ToolCall::without_result` strips this before the turn list is
+    /// serialised, and the answers are fetched per turn on request — the transcript route is
+    /// polled at a live turn's cadence, and a hundred turns of tool output on a one-second poll
+    /// is a cost paid forever for something almost nobody has open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// How long the whole answer was, in characters. `None` when nothing came back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_chars: Option<i64>,
+    /// Whether the tool answered with an error rather than an answer.
+    ///
+    /// Its own field and not inferred from the text: "the command failed" and "the command printed
+    /// something that mentions an error" are different facts, and only the stream knows which this
+    /// was. False on every turn recorded before the field existed, which is the honest default —
+    /// nothing about those rows says a tool failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result_failed: bool,
+}
+
+impl ToolCall {
+    /// The same call with its answer removed, for the transcript. See `result`.
+    pub(crate) fn without_result(self) -> Self {
+        Self {
+            result: None,
+            result_chars: None,
+            result_failed: false,
+            ..self
+        }
+    }
 }
 
 /// One line of a plan.
@@ -638,6 +911,34 @@ fn plan_of(name: &str, input: Option<&serde_json::Value>) -> Vec<Todo> {
 
 /// The longest detail kept. A command line can be a heredoc.
 const DETAIL_LIMIT: usize = 120;
+
+/// The longest tool answer kept.
+///
+/// Two thousand characters is about thirty lines: enough for a test summary, a short diff or the
+/// head of a compiler's complaint, which is what somebody opening a tool call is looking for. A
+/// `Read` answers with a whole file and a `Grep` with every hit, and neither belongs in a row of
+/// a database that is read back in full every time a conversation is opened.
+const RESULT_LIMIT: usize = 2000;
+
+/// What a `tool_result` block actually said, flattened.
+///
+/// The CLI sends `content` two ways — a bare string, or an array of content blocks — and both are
+/// ordinary. Anything else comes back as `None` rather than as a JSON dump: a window showing the
+/// serialisation of a shape this daemon did not recognise is worse than one showing nothing.
+fn result_text(content: Option<&serde_json::Value>) -> Option<String> {
+    match content? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
 
 /// The argument of a tool call worth showing beside its name.
 ///
@@ -700,6 +1001,11 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
     let mut pondering = String::new();
     let mut doing: Option<String> = None;
     let mut did: Vec<ToolCall> = Vec::new();
+    // The `tool_use` id of each call in `did`, by the same index. Parallel rather than a field on
+    // `ToolCall`, because the id is a fact about this stream and not about the call: it is used to
+    // pair an answer with the question that asked it, and then it is finished with. A field would
+    // put it in the database and in the window, where nothing would ever read it.
+    let mut called: Vec<Option<String>> = Vec::new();
 
     for line in stream.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -776,7 +1082,16 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                         name: name.to_string(),
                         detail: block.get("input").and_then(detail_of),
                         todos: plan_of(name, block.get("input")),
+                        result: None,
+                        result_chars: None,
+                        result_failed: false,
                     });
+                    called.push(
+                        block
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .map(str::to_string),
+                    );
                     doing = Some(name.to_string());
                 }
                 // The message that just completed is the one those deltas were writing — both
@@ -789,14 +1104,40 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
             // A tool answering is the only thing that ends a tool call. Clearing this anywhere else
             // would show the model as writing while a command is still running.
             Some("user") => {
-                let returned = value
+                let mut returned = false;
+                for block in value
                     .pointer("/message/content")
                     .and_then(|c| c.as_array())
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|block| {
-                            block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        })
-                    });
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| {
+                        block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    })
+                {
+                    returned = true;
+                    // Paired by id and never by position. A turn can have two tool calls in flight
+                    // at once — the CLI runs them concurrently — and answers arrive in whatever
+                    // order the tools finish, so "the most recent call" is wrong exactly when it
+                    // matters. An answer whose id names no call this stream made is dropped: it
+                    // belongs to something that is not in this list.
+                    let Some(index) = block
+                        .get("tool_use_id")
+                        .and_then(|id| id.as_str())
+                        .and_then(|id| called.iter().position(|made| made.as_deref() == Some(id)))
+                    else {
+                        continue;
+                    };
+                    let Some(text) = result_text(block.get("content")) else {
+                        continue;
+                    };
+                    let call = &mut did[index];
+                    call.result_chars = Some(text.chars().count() as i64);
+                    call.result = Some(text.chars().take(RESULT_LIMIT).collect());
+                    call.result_failed = block
+                        .get("is_error")
+                        .and_then(|flag| flag.as_bool())
+                        .unwrap_or(false);
+                }
                 if returned {
                     doing = None;
                 }
@@ -873,6 +1214,49 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
     current
 }
 
+/// The environment this run's context window is expressed in, or nothing when it names none.
+///
+/// A function rather than two lines at the spawn site for one reason: the variable's NAME is the
+/// part that fails silently. A typo in it leaves the CLI on its own default window, the daemon
+/// still writes the number the window draws, and the only symptom is a conversation that compacts
+/// at a size nobody asked for. Spelled once, here, where a test can read it back.
+pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)> {
+    request
+        .context_window
+        .map(|window| ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string()))
+}
+
+/// Whether this line says the CLI compacted its own context.
+///
+/// The event, read off a real headless stream rather than inferred from the source:
+///
+/// ```text
+/// {"type":"system","subtype":"status","status":"compacting","session_id":...}
+/// {"type":"system","subtype":"status","status":null,"compact_result":"failed",
+///  "compact_error":"too_few_groups","session_id":...}
+/// ```
+///
+/// `status: "compacting"` is what is read, and the later `compact_result` deliberately is not. The
+/// question this answers is "was the context summarised during this turn" — which is a thing the
+/// transcript should say, because the alternative is a conversation that quietly got shorter — and
+/// a compaction that began is the honest answer to it whether or not it finished. A `failed` result
+/// means the context was left as it was; the turn still answered, and a mark that appeared and then
+/// had to be taken back would be worse than one that says "this is where it summarised".
+///
+/// Sticky once true, like `larger` above: a turn can compact and then go on for many more lines,
+/// and a flag recomputed from the last line alone would report only whatever happened to come last.
+pub(crate) fn compacted_from_line(line: &str, current: bool) -> bool {
+    if current {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return current;
+    };
+    value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+        && value.get("subtype").and_then(serde_json::Value::as_str) == Some("status")
+        && value.get("status").and_then(serde_json::Value::as_str) == Some("compacting")
+}
+
 /// Usage reported by the final `result` event of a Claude `stream-json` transcript.
 ///
 /// Missing fields stay unknown rather than becoming measured zeroes. `num_turns` belongs to the
@@ -898,6 +1282,12 @@ pub struct TurnOutcome {
     /// What THIS turn added, never what the process has spent altogether.
     pub cost_usd: Option<f64>,
     pub usage: RunUsage,
+    /// Whether the CLI summarised its context while producing THIS turn.
+    ///
+    /// Per turn and not per process, like the cost above and for the same reason: a process that
+    /// serves six turns compacts during one of them, and a flag on the process would mark all six
+    /// as the turn where the conversation got shorter.
+    pub compacted: bool,
 }
 
 /// What one line of a live process's stream means to whoever is recording turns.
@@ -921,11 +1311,21 @@ pub enum TurnEvent {
 /// in the daemon has to know that a `result` is a boundary or that the cost on it is cumulative.
 pub(crate) struct TurnSplitter {
     spent: f64,
+    /// Belongs to the turn IN FLIGHT, and is cleared when that turn ends.
+    ///
+    /// It is accumulated rather than read off the `result` line, because it is not on it: the CLI
+    /// decides to compact before it answers. Cleared at the boundary and not merely overwritten,
+    /// so a process serving six turns does not report the second one's compaction on the four
+    /// that follow it.
+    compacted: bool,
 }
 
 impl TurnSplitter {
     pub(crate) fn new() -> Self {
-        Self { spent: 0.0 }
+        Self {
+            spent: 0.0,
+            compacted: false,
+        }
     }
 
     /// The events this line produces, in the order a consumer must see them.
@@ -934,9 +1334,11 @@ impl TurnSplitter {
     /// answer, so a consumer told the turn had ended before being given that line would close every
     /// turn one line short of what it said.
     pub(crate) fn line(&mut self, line: String) -> Vec<TurnEvent> {
+        self.compacted = compacted_from_line(&line, self.compacted);
         match turn_from_result(&line, self.spent) {
-            Some((turn, total)) => {
+            Some((mut turn, total)) => {
                 self.spent = total;
+                turn.compacted = std::mem::take(&mut self.compacted);
                 vec![TurnEvent::Line(line), TurnEvent::Ended(turn)]
             }
             None => vec![TurnEvent::Line(line)],
@@ -983,6 +1385,9 @@ pub(crate) fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOu
             .map(str::to_owned),
         cost_usd: spent.map(|total| total - already_spent),
         usage: extract_usage(line),
+        // The SPLITTER's to fill: the fact is not on the `result` line this function parses, and
+        // inventing it here from nothing would be a quieter way of saying `false`.
+        compacted: false,
     };
     // A result carrying no cost at all must not reset the total: the next turn would then be
     // differenced against zero and billed for the whole conversation.
@@ -1576,6 +1981,7 @@ impl CommandRunner for OllamaRunner {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             });
         }
 
@@ -1590,6 +1996,7 @@ impl CommandRunner for OllamaRunner {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             num_turns: None,
+            compacted: false,
         })
     }
 }
@@ -1657,6 +2064,12 @@ impl CommandRunner for ClaudeCliRunner {
             std::env::var("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let mut cmd = Command::new(&claude_bin);
         cmd.args(cli_args(&request, &self.model));
+        // Before `request.env` and not after, so an explicit entry still wins. That is what a test
+        // needs to force a window the CLI would otherwise clamp away, and it costs nothing here:
+        // no caller sets both.
+        if let Some((name, value)) = window_env(&request) {
+            cmd.env(name, value);
+        }
         for (k, v) in &request.env {
             cmd.env(k, v);
         }
@@ -1780,6 +2193,7 @@ impl CommandRunner for ClaudeCliRunner {
         let mut splitter = TurnSplitter::new();
         let mut usage = RunUsage::default();
         let mut running_context_fill: Option<i64> = None;
+        let mut compacted = false;
 
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut policy_violation: Option<String> = None;
@@ -1820,6 +2234,10 @@ impl CommandRunner for ClaudeCliRunner {
             if let Ok(mut shared) = context_fill.lock() {
                 *shared = running_context_fill;
             }
+            // Read on every line and NOT only near the end: the CLI decides to compact before it
+            // answers. A run cut short here — a timeout, a turn ceiling — has still had its context
+            // summarised, and the record should say so.
+            compacted = compacted_from_line(&line, compacted);
             // After the line is accumulated and mirrored, never before: a run stopped here still has
             // to leave the transcript of the turn that stopped it, or the evidence for why it was
             // stopped is the one thing missing from the record.
@@ -1970,6 +2388,7 @@ impl CommandRunner for ClaudeCliRunner {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
+            compacted,
         })
     }
 }
@@ -2129,6 +2548,51 @@ impl CommandRunner for CodexCliRunner {
                 "codex exec cannot honour classifier_governs_tools: it has no PreToolUse hook, so nothing would replace the barrier this stands down",
             ));
         }
+        // Every per-conversation control this launch surface has no counterpart for, refused in
+        // one place and named individually so the message says which one.
+        //
+        // These arrived with 0110–0113 and each was accepted and dropped here — the outcome the
+        // block above exists to prevent. They are not one kind of thing, and refusing them together
+        // is still right, because they fail the same way: the chat row says a conversation is
+        // pinned to a model, capped at a dollar a turn, barred from `Bash` and carrying standing
+        // instructions, the window draws all four, and none of them reached the process.
+        //
+        // `denied_tools` is the sharpest of them. It passes the `ToolPolicy` guard above — a
+        // conversation can be `Unrestricted` and still have barred a tool for itself — so without
+        // this it would be a restriction somebody set, saw drawn back at them, and never had.
+        for (asked, control) in [
+            (request.effort.is_some(), "effort"),
+            (!request.fallback_model.is_empty(), "fallback_model"),
+            (!request.add_dirs.is_empty(), "add_dirs"),
+            (request.max_budget_usd.is_some(), "max_budget_usd"),
+            (!request.agents.is_empty(), "agents"),
+            (
+                request.append_system_prompt.is_some(),
+                "append_system_prompt",
+            ),
+            (!request.denied_tools.is_empty(), "denied_tools"),
+        ] {
+            if asked {
+                return Err(std::io::Error::other(format!(
+                    "codex exec cannot honour {control}: it has no counterpart for it, and dropping one would leave the chat row claiming a control the run never had"
+                )));
+            }
+        }
+        // KNOWN LIMITATION, left un-refused on purpose, beside `session_name` below:
+        // `context_window` is not honoured here, and it is the one control on this list that is
+        // safe to lose. It is exported as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which is a Claude
+        // Code environment variable that `codex exec` reads no meaning into; a run that loses it
+        // compacts on whatever schedule Codex has of its own, which is the schedule every run on
+        // this path has always had. Nothing is loosened and no record claims otherwise — the
+        // window a chat row names is drawn from the row, and the row is still true about the
+        // Claude path it was written for.
+
+        // KNOWN LIMITATION, left un-refused on purpose, beside `resume_session_id` below:
+        // `session_name` is not honoured here. It reaches the Claude CLI's `--resume` picker and
+        // nothing else — no decision anywhere depends on it, and no record claims it was applied —
+        // so a run that loses it is a run with a nameless session, which is what every run on this
+        // path has always had.
+
         // Not a safety control, and refused all the same. A caller asks for partial messages because
         // something downstream is waiting on them; a stream that silently never emits any is a
         // feature that looks broken rather than absent.
@@ -2309,6 +2773,7 @@ impl CommandRunner for CodexCliRunner {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
+            compacted: false,
         })
     }
 }
@@ -2360,6 +2825,22 @@ pub struct FakeCommandRunner {
     /// What the CLI was handed in its environment. Recorded because a run with a Bash tool can read
     /// its own environment, so which key lands here is a safety property and not a detail.
     pub last_env: std::sync::Mutex<Option<Vec<(String, String)>>>,
+    /// Which model and effort the launch was handed. Recorded because there is nowhere else to
+    /// observe them: `cli_args` proves the flags are BUILT from a request, and this proves the
+    /// request a conversation produces carries what that conversation chose. Between the two there
+    /// used to be a gap wide enough for `model: None` to sit in unnoticed for the life of the
+    /// feature.
+    pub last_model: std::sync::Mutex<Option<Option<String>>>,
+    pub last_effort: std::sync::Mutex<Option<Option<String>>>,
+    /// Recorded for the reason `last_model` is: `cli_args` proves the flags are built out of a
+    /// request, and this proves the request a conversation produces carries what it was told.
+    pub last_fallback_model: std::sync::Mutex<Option<Vec<String>>>,
+    pub last_add_dirs: std::sync::Mutex<Option<Vec<PathBuf>>>,
+    pub last_max_budget_usd: std::sync::Mutex<Option<Option<f64>>>,
+    pub last_agents: std::sync::Mutex<Option<Vec<Subagent>>>,
+    pub last_append_system_prompt: std::sync::Mutex<Option<Option<String>>>,
+    pub last_denied_tools: std::sync::Mutex<Option<Vec<String>>>,
+    pub last_session_name: std::sync::Mutex<Option<Option<String>>>,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -2498,6 +2979,16 @@ impl CommandRunner for FakeCommandRunner {
         // Before the failure injection below: what a run was handed is worth knowing even when the
         // launch is made to fail.
         *self.last_env.lock().unwrap() = Some(request.env.clone());
+        *self.last_model.lock().unwrap() = Some(request.model.clone());
+        *self.last_effort.lock().unwrap() = Some(request.effort.clone());
+        *self.last_fallback_model.lock().unwrap() = Some(request.fallback_model.clone());
+        *self.last_add_dirs.lock().unwrap() = Some(request.add_dirs.clone());
+        *self.last_max_budget_usd.lock().unwrap() = Some(request.max_budget_usd);
+        *self.last_agents.lock().unwrap() = Some(request.agents.clone());
+        *self.last_append_system_prompt.lock().unwrap() =
+            Some(request.append_system_prompt.clone());
+        *self.last_denied_tools.lock().unwrap() = Some(request.denied_tools.clone());
+        *self.last_session_name.lock().unwrap() = Some(request.session_name.clone());
         *self.last_launch.lock().unwrap() = Some(Launch {
             prompt: request.prompt.clone(),
             resume_session_id: request.resume_session_id.clone(),
@@ -2570,6 +3061,7 @@ impl CommandRunner for FakeCommandRunner {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })
         };
         if outcome.session_id.is_none() {
@@ -2648,6 +3140,377 @@ mod tests {
         assert!(args.windows(2).any(|pair| {
             pair[0] == "--session-id" && pair[1] == "123e4567-e89b-42d3-a456-426614174000"
         }));
+    }
+
+    #[test]
+    fn cli_args_names_every_fallback_in_the_order_given() {
+        let mut request = baseline_run_request();
+        request.fallback_model = vec!["opus".to_string(), "sonnet".to_string()];
+
+        let args = cli_args(&request, "fable");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--fallback-model" && pair[1] == "opus,sonnet"),
+            "the fallbacks never reached the argument vector: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cli_args_carries_every_extra_directory() {
+        let mut request = baseline_run_request();
+        request.add_dirs = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+
+        let args = cli_args(&request, "sonnet");
+
+        let at = args
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("no --add-dir");
+        assert_eq!(&args[at + 1..at + 3], ["/one", "/two"]);
+    }
+
+    /// `--add-dir` is variadic: it swallows every following argument until the next flag. On the
+    /// argv path the prompt is a POSITIONAL, so a variadic flag written above it would be handed
+    /// the person's message as a directory — the run would ask for tool access to their sentence
+    /// and never say what it was answering.
+    #[test]
+    fn the_variadic_directory_flag_never_swallows_the_prompt() {
+        let mut request = baseline_run_request();
+        request.add_dirs = vec![PathBuf::from("/one")];
+
+        let args = cli_args(&request, "sonnet");
+
+        assert_eq!(args[0], "-p");
+        assert_eq!(args[1], "test prompt", "the prompt moved: {args:?}");
+        let at = args.iter().position(|a| a == "--add-dir").unwrap();
+        assert!(at > 1, "--add-dir was written above the prompt: {args:?}");
+    }
+
+    #[test]
+    fn cli_args_carries_the_ceiling_a_turn_may_spend() {
+        let mut request = baseline_run_request();
+        request.max_budget_usd = Some(0.5);
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--max-budget-usd" && pair[1] == "0.5"),
+            "{args:?}"
+        );
+    }
+
+    /// One helper, for the tests below to vary.
+    fn a_helper(name: &str) -> Subagent {
+        Subagent {
+            name: name.to_string(),
+            description: "Reviews code".to_string(),
+            prompt: "You are a code reviewer".to_string(),
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// The flag takes ONE argv element holding a JSON object keyed by name — not a repeatable
+    /// `--agents name=…`, and not the list this daemon holds internally.
+    #[test]
+    fn the_helper_set_travels_as_one_object_keyed_by_name() {
+        let mut request = baseline_run_request();
+        request.agents = vec![a_helper("reviewer")];
+
+        let args = cli_args(&request, "sonnet");
+
+        let at = args
+            .iter()
+            .position(|arg| arg == "--agents")
+            .expect("no --agents");
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).expect("not JSON");
+        assert_eq!(sent["reviewer"]["description"], "Reviews code");
+        assert_eq!(sent["reviewer"]["prompt"], "You are a code reviewer");
+        // The name is the KEY. Sent inside the object as well it would be an unknown field, which
+        // the CLI's schema strips today — a contract that holds only because the other side is
+        // forgiving, and this asserts we do not rely on that.
+        assert!(
+            sent["reviewer"].get("name").is_none(),
+            "the name was sent twice: {}",
+            args[at + 1]
+        );
+    }
+
+    /// Absent keys, not null ones. `{"model": null}` is not what "inherit the conversation's model"
+    /// looks like to a schema that types `model` as a string.
+    #[test]
+    fn a_helper_that_named_no_model_sends_no_model_key() {
+        let mut request = baseline_run_request();
+        request.agents = vec![a_helper("reviewer")];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert!(sent["reviewer"].get("model").is_none(), "{}", args[at + 1]);
+        assert!(sent["reviewer"].get("effort").is_none(), "{}", args[at + 1]);
+    }
+
+    #[test]
+    fn a_helper_may_answer_on_its_own_model_and_effort() {
+        let mut request = baseline_run_request();
+        let mut helper = a_helper("reviewer");
+        helper.model = Some("opus".to_string());
+        helper.effort = Some("high".to_string());
+        request.agents = vec![helper];
+
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|arg| arg == "--agents").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+
+        assert_eq!(sent["reviewer"]["model"], "opus");
+        assert_eq!(sent["reviewer"]["effort"], "high");
+        // And the conversation's own model is untouched: a helper's model is not the turn's.
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == "sonnet"),
+            "{args:?}"
+        );
+    }
+
+    /// Not `--agents {}`. The CLI answers unparseable JSON with an EMPTY agent list and no error,
+    /// so from outside there is nothing to tell "a flag that parsed to nothing" from "a flag that
+    /// threw" — and only one of those is a state somebody chose. Sending no flag keeps the two
+    /// apart.
+    #[test]
+    fn a_conversation_with_no_helpers_writes_no_flag_at_all() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        assert!(
+            !args.iter().any(|arg| arg == "--agents"),
+            "an empty helper set was sent: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cli_args_appends_standing_instructions_rather_than_replacing_the_system_prompt() {
+        let mut request = baseline_run_request();
+        request.append_system_prompt = Some("Answer in Portuguese.".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--append-system-prompt"
+                    && pair[1] == "Answer in Portuguese."),
+            "{args:?}"
+        );
+        // The REPLACING flag must never appear. It drops the CLI's tool descriptions and safety
+        // framing, and a run that lost those reads as a run whose model got worse.
+        assert!(
+            !args.iter().any(|arg| arg == "--system-prompt"),
+            "the system prompt was replaced instead of appended: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cli_args_names_the_session_so_it_is_findable_outside_this_app() {
+        let mut request = baseline_run_request();
+        request.session_name = Some("o refactor do runner".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--name" && pair[1] == "o refactor do runner"),
+            "{args:?}"
+        );
+    }
+
+    /// The compaction event, as a real headless stream emits it.
+    ///
+    /// Both lines below were copied out of `claude -p --resume` run with the window forced low, not
+    /// written from the source: the point of the test is that this daemon reads what the CLI
+    /// actually sends. The `compact_result` line is deliberately NOT what is read — a compaction
+    /// that began is the honest answer to "was the context summarised here" whether or not it
+    /// finished, and a mark that appeared and then had to be taken back would be worse than one that
+    /// says where the summarising happened.
+    #[test]
+    fn a_compaction_is_read_off_the_stream_and_stays_read() {
+        let started =
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#;
+        let finished = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"too_few_groups","session_id":"s"}"#;
+
+        assert!(
+            compacted_from_line(started, false),
+            "the status line says it"
+        );
+        assert!(
+            !compacted_from_line(finished, false),
+            "the result line alone is not the event"
+        );
+        assert!(
+            compacted_from_line(finished, true),
+            "a compaction already seen is not un-seen by the lines after it"
+        );
+        assert!(
+            !compacted_from_line(r#"{"type":"assistant"}"#, false),
+            "an ordinary line says nothing about compaction"
+        );
+        assert!(
+            !compacted_from_line("not json at all", false),
+            "an unparseable line is not evidence of anything"
+        );
+    }
+
+    /// A compaction belongs to the turn it happened in, and to no other turn of the same process.
+    ///
+    /// The splitter is where this has to hold: on the multi-turn path one process answers several
+    /// times, and a flag left standing would mark every later turn as the one where the
+    /// conversation got shorter.
+    #[test]
+    fn a_compaction_marks_one_turn_and_not_the_ones_after_it() {
+        let mut splitter = TurnSplitter::new();
+        let result =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1,"session_id":"s"}"#;
+
+        splitter.line(
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#.into(),
+        );
+        let first = splitter.line(result.into());
+        let TurnEvent::Ended(first) = &first[1] else {
+            panic!("the result line ends a turn: {first:?}");
+        };
+        assert!(first.compacted, "the turn it happened in carries it");
+
+        let second = splitter.line(result.into());
+        let TurnEvent::Ended(second) = &second[1] else {
+            panic!("the result line ends a turn: {second:?}");
+        };
+        assert!(
+            !second.compacted,
+            "the next turn did not compact, and must not inherit that it did"
+        );
+    }
+
+    /// The merge that must not be two flags.
+    ///
+    /// `--disallowedTools` is variadic, so a second occurrence REPLACES the first rather than
+    /// adding to it. Written twice, a conversation asking not to run `Bash` would have taken
+    /// `ToolPolicy::McpOnly` down with it and come back holding the whole built-in tool set — a
+    /// safety property undone by a preference, silently, and looking like it still held.
+    #[test]
+    fn a_runs_own_denials_and_its_policys_travel_as_one_flag() {
+        let mut request = baseline_run_request();
+        request.tool_policy = ToolPolicy::McpOnly;
+        request.denied_tools = vec!["mcp__other__write".to_string()];
+
+        let args = cli_args(&request, "sonnet");
+
+        let flags = args
+            .iter()
+            .filter(|arg| arg.as_str() == "--disallowedTools")
+            .count();
+        assert_eq!(flags, 1, "the deny flag was written twice: {args:?}");
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        let denied: Vec<&str> = args[at + 1].split(',').collect();
+        assert!(denied.contains(&"Bash"), "the policy's denials were lost");
+        assert!(
+            denied.contains(&"mcp__other__write"),
+            "the run's own denial was lost"
+        );
+    }
+
+    /// A conversation may narrow itself even where the policy denies nothing.
+    #[test]
+    fn an_unrestricted_run_still_honours_the_tools_it_was_told_not_to_use() {
+        let mut request = baseline_run_request();
+        request.tool_policy = ToolPolicy::Unrestricted;
+        request.denied_tools = vec!["Bash".to_string(), "Edit".to_string()];
+
+        let args = cli_args(&request, "sonnet");
+
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert_eq!(args[at + 1], "Bash,Edit");
+    }
+
+    /// And the wildcard stands alone. Naming individual tools beside `*` would add stderr lines
+    /// about rules matching nothing, on top of a denial that already covers everything.
+    #[test]
+    fn the_deny_everything_policy_is_not_diluted_by_a_conversations_own_list() {
+        assert_eq!(
+            denied_tools(&ToolPolicy::None, &["Bash".to_string()]),
+            vec!["*".to_string()]
+        );
+    }
+
+    #[test]
+    fn cli_args_is_silent_about_instructions_and_denials_when_none_were_chosen() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        for flag in ["--append-system-prompt", "--name", "--disallowedTools"] {
+            assert!(
+                !args.iter().any(|arg| arg == flag),
+                "{flag} was sent: {args:?}"
+            );
+        }
+    }
+
+    /// And says nothing when nobody asked, in all three. A flag always present would replace the
+    /// CLI's own behaviour with this daemon's guess at it for every run that never expressed one.
+    #[test]
+    fn cli_args_is_silent_about_reach_and_ceiling_when_none_were_chosen() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        for flag in ["--fallback-model", "--add-dir", "--max-budget-usd"] {
+            assert!(
+                !args.iter().any(|arg| arg == flag),
+                "{flag} was sent: {args:?}"
+            );
+        }
+    }
+
+    /// The flag exists on the CLI (2.1.198, `low | medium | high | xhigh | max`) and the daemon had
+    /// no way to send it. This is the half that builds it.
+    #[test]
+    fn cli_args_carries_the_effort_when_one_was_chosen() {
+        let mut request = baseline_run_request();
+        request.effort = Some("xhigh".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--effort" && pair[1] == "xhigh"),
+            "the chosen effort never reached the argument vector: {args:?}"
+        );
+    }
+
+    /// And says nothing when nobody chose. An always-present flag would replace the CLI's own
+    /// default with this daemon's guess at it, for every run that never asked.
+    #[test]
+    fn cli_args_is_silent_about_effort_when_none_was_chosen() {
+        let args = cli_args(&baseline_run_request(), "sonnet");
+
+        assert!(
+            !args.iter().any(|arg| arg == "--effort"),
+            "an effort was sent for a run that chose none: {args:?}"
+        );
+    }
+
+    /// `--effort` must not displace `--exclude-dynamic-system-prompt-sections`, whose own comment
+    /// reserves the position immediately after `--verbose` for prompt-cache prefix matching. A flag
+    /// added carelessly is exactly how that invariant dies quietly.
+    #[test]
+    fn the_effort_flag_does_not_disturb_the_cache_prefix() {
+        let mut request = baseline_run_request();
+        request.effort = Some("max".to_string());
+
+        let args = cli_args(&request, "sonnet");
+
+        let verbose = args.iter().position(|a| a == "--verbose").unwrap();
+        assert_eq!(
+            args[verbose + 1],
+            "--exclude-dynamic-system-prompt-sections",
+            "something was inserted between --verbose and the cache flag: {args:?}"
+        );
     }
 
     #[test]
@@ -2838,6 +3701,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             ..Default::default()
         };
@@ -2916,6 +3780,15 @@ mod tests {
             classifier_governs_tools: false,
             ambient_mcp: false,
             model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -3032,6 +3905,15 @@ mod tests {
             classifier_governs_tools: false,
             ambient_mcp: false,
             model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
             messages: None,
             allowed_mcp_tools: None,
         }
@@ -3051,6 +3933,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             last_plan_only: std::sync::Mutex::new(None),
             ..Default::default()
@@ -3087,6 +3970,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 num_turns: None,
+                compacted: false,
             })),
             // The fake releases one canned event per interval. The complete run therefore lasts
             // well beyond the progress deadline while every individual quiet gap stays below it.
@@ -3324,6 +4208,206 @@ mod tests {
 
     fn said(text: &str) -> serde_json::Value {
         serde_json::json!([{"type": "text", "text": text}])
+    }
+
+    /* ------------------------------------------- what a tool answered -- */
+
+    /// One `tool_result`, as the CLI sends one.
+    fn answered(tool_use_id: &str, content: serde_json::Value, is_error: bool) -> String {
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error
+            }]}
+        })
+        .to_string()
+    }
+
+    /// A turn said what it REACHED FOR and never what it found.
+    ///
+    /// `Bash` beside `cargo test dates::`, with no way to learn from the conversation whether the
+    /// tests passed — the paragraph underneath is the model's summary of exactly that, and a
+    /// summary is what somebody opening a tool call has decided not to take on trust.
+    #[test]
+    fn a_tool_call_carries_what_the_tool_answered() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": "cargo test dates::"}
+            }])),
+            answered(
+                "toolu_1",
+                serde_json::json!("test result: ok. 3 passed"),
+                false,
+            ),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.did.len(), 1);
+        assert_eq!(
+            live.did[0].result.as_deref(),
+            Some("test result: ok. 3 passed")
+        );
+        assert_eq!(live.did[0].result_chars, Some(25));
+        assert!(!live.did[0].result_failed);
+        // And the tool has stopped running, which is the behaviour that was already here.
+        assert_eq!(live.doing, None);
+    }
+
+    /// Paired by id and never by position.
+    ///
+    /// The CLI runs tool calls concurrently, so answers arrive in whatever order the tools finish
+    /// — "the most recent call" is wrong exactly when it matters, and the failure is quiet: two
+    /// real answers, each filed under the other's question.
+    #[test]
+    fn two_tools_in_flight_get_their_own_answers_back() {
+        let stream = [
+            message(serde_json::json!([
+                {"type": "tool_use", "id": "toolu_slow", "name": "Bash",
+                 "input": {"command": "cargo test"}},
+                {"type": "tool_use", "id": "toolu_fast", "name": "Read",
+                 "input": {"file_path": "core/src/dates.rs"}}
+            ])),
+            // The second call answers first, which is the whole point of this test.
+            answered("toolu_fast", serde_json::json!("fn is_leap_year"), false),
+            answered("toolu_slow", serde_json::json!("test result: ok"), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(live.did[0].name, "Bash");
+        assert_eq!(live.did[0].result.as_deref(), Some("test result: ok"));
+        assert_eq!(live.did[1].name, "Read");
+        assert_eq!(live.did[1].result.as_deref(), Some("fn is_leap_year"));
+    }
+
+    /// A `Read` answers with the whole file, and the whole file does not go in a database row.
+    ///
+    /// The full length travels beside the cut so the window can say what it is NOT showing — a
+    /// truncation presented as the whole answer is how somebody concludes a command printed
+    /// nothing after the first thirty lines.
+    #[test]
+    fn a_long_answer_is_cut_and_says_how_long_it_really_was() {
+        let whole = "x".repeat(RESULT_LIMIT + 500);
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Read",
+                "input": {"file_path": "big.rs"}
+            }])),
+            answered("toolu_1", serde_json::json!(whole), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+
+        assert_eq!(
+            live.did[0].result.as_ref().map(|kept| kept.chars().count()),
+            Some(RESULT_LIMIT)
+        );
+        assert_eq!(live.did[0].result_chars, Some((RESULT_LIMIT + 500) as i64));
+    }
+
+    /// "The command failed" and "the command printed something that mentions an error" are
+    /// different facts, and only the stream knows which this was.
+    #[test]
+    fn a_tool_that_failed_is_recorded_as_having_failed() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": "cargo test"}
+            }])),
+            answered(
+                "toolu_1",
+                serde_json::json!("error: could not compile"),
+                true,
+            ),
+        ]
+        .join("\n");
+
+        assert!(live_from_stream(&stream).did[0].result_failed);
+    }
+
+    /// The CLI sends `content` two ways, and both are ordinary.
+    #[test]
+    fn an_answer_sent_as_blocks_reads_back_as_its_text() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Grep", "input": {"pattern": "leap"}
+            }])),
+            answered(
+                "toolu_1",
+                serde_json::json!([{"type": "text", "text": "core/src/dates.rs:12"}]),
+                false,
+            ),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            live_from_stream(&stream).did[0].result.as_deref(),
+            Some("core/src/dates.rs:12")
+        );
+    }
+
+    /// An answer whose id names no call this stream made belongs to something that is not in this
+    /// list, and is dropped rather than attached to whatever happened to be nearest.
+    #[test]
+    fn an_answer_to_a_call_this_stream_never_made_is_dropped() {
+        let stream = [
+            message(serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a.rs"}
+            }])),
+            answered("toolu_somebody_else", serde_json::json!("not ours"), false),
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+        assert_eq!(live.did[0].result, None);
+        // It still ended the wait: a tool answered, whichever one it was.
+        assert_eq!(live.doing, None);
+    }
+
+    /// A turn recorded before any of this existed still reads back.
+    ///
+    /// `tools_used` is stored JSON, and every row already in the database is a call with none of
+    /// these three fields. They default to absent, which is exactly what those turns knew.
+    #[test]
+    fn a_stored_call_from_before_the_answers_existed_still_parses() {
+        let old: ToolCall =
+            serde_json::from_str(r#"{"name":"Read","detail":"core/src/dates.rs"}"#).unwrap();
+
+        assert_eq!(old.name, "Read");
+        assert_eq!(old.result, None);
+        assert_eq!(old.result_chars, None);
+        assert!(!old.result_failed);
+    }
+
+    /// And a call with nothing to say about its answer says nothing on the wire.
+    ///
+    /// `skip_serializing_if` is what keeps the transcript the size it was: three null fields per
+    /// call, over a hundred turns, on a route polled once a second.
+    #[test]
+    fn a_call_without_an_answer_serialises_without_the_fields() {
+        let bare = ToolCall {
+            name: "Read".to_string(),
+            detail: None,
+            todos: Vec::new(),
+            result: None,
+            result_chars: None,
+            result_failed: false,
+        };
+
+        let json = serde_json::to_string(&bare).unwrap();
+
+        assert!(
+            !json.contains("result"),
+            "the empty answer was serialised: {json}"
+        );
     }
 
     #[test]
@@ -4821,11 +5905,37 @@ mod tests {
         narrowed.mcp_config = Some(std::path::PathBuf::from("C:/nucleos/mcp.json"));
         let mut streaming = baseline_run_request();
         streaming.include_partial_messages = true;
+        // The per-conversation controls of 0110–0113. Each of these is drawn back at the person in
+        // the window as a setting their conversation has, so a launch that dropped one would leave
+        // the row claiming something the run never had.
+        let mut thinking = baseline_run_request();
+        thinking.effort = Some("high".to_string());
+        let mut degrading = baseline_run_request();
+        degrading.fallback_model = vec!["opus".to_string()];
+        let mut reaching = baseline_run_request();
+        reaching.add_dirs = vec![PathBuf::from("/beside")];
+        let mut capped = baseline_run_request();
+        capped.max_budget_usd = Some(0.5);
+        let mut helped = baseline_run_request();
+        helped.agents = vec![a_helper("reviewer")];
+        let mut instructed = baseline_run_request();
+        instructed.append_system_prompt = Some("Answer in Portuguese.".to_string());
+        // The sharpest of them: it passes the `ToolPolicy` guard, because a conversation can be
+        // unrestricted and still have barred a tool for itself.
+        let mut barred = baseline_run_request();
+        barred.denied_tools = vec!["Bash".to_string()];
 
         for (field, request) in [
             ("plan_only", restrained),
             ("mcp_config", narrowed),
             ("include_partial_messages", streaming),
+            ("effort", thinking),
+            ("fallback_model", degrading),
+            ("add_dirs", reaching),
+            ("max_budget_usd", capped),
+            ("agents", helped),
+            ("append_system_prompt", instructed),
+            ("denied_tools", barred),
         ] {
             let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -4870,6 +5980,24 @@ mod tests {
         assert!(
             codex_cli_args(&resumed, "gpt-5.6-terra").is_ok(),
             "resume is degraded on this path, not refused — see the comment in `run_prompt`"
+        );
+
+        // And the other one, for the same reason. A display name reaches the Claude CLI's `--resume`
+        // picker and nothing else; no record claims it was applied, so losing it costs a nameless
+        // session, which is what every run on this path has always had.
+        let mut named = baseline_run_request();
+        named.session_name = Some("o refactor do runner".to_string());
+        let (session_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let outcome = runner
+            .run_prompt(named, session_tx, transcript)
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            !outcome.contains("session_name"),
+            "a cosmetic name is dropped on this path, not refused: {outcome}"
         );
     }
 

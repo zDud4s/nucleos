@@ -1317,6 +1317,7 @@ mod tests {
         AppState {
             token: Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner {
                 delay: Mutex::new(delay),
                 ..Default::default()
@@ -1328,6 +1329,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -2498,6 +2500,7 @@ mod tests {
         (
             AppState {
                 files_root: Some(root),
+                workflow_library: None,
                 ..state
             },
             temp,

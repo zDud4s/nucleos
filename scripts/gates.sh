@@ -91,6 +91,13 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
     # outright ("referenced project may not disable emit").
     run "shell: typecheck" shell npx tsc -b
     run "shell: test"      shell npm test
+    # The one property no test runner can check, because a Content-Security-Policy is enforced by
+    # the engine and jsdom does not enforce one. It matters here more than it would elsewhere:
+    # `tauri.conf.json` carries a permissive `devCsp` alongside the strict `csp`, so a dependency
+    # that injects a <style> works every day in `tauri dev` and is refused the first time somebody
+    # installs a build. Three of this app's surfaces were in exactly that state when this gate
+    # first ran. Builds its own bundle (~30s) rather than trusting one on disk.
+    run "shell: csp"       . node scripts/csp-gate.mjs
   fi
 
   # shell/src-tauri is deliberately excluded from the cargo workspace (see the root Cargo.toml),

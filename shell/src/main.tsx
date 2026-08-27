@@ -9,7 +9,9 @@ import "./base.css";
 import "./ui.css";
 import "./app.css";
 import { createAppQueryClient } from "./app/queryClient";
+import { lastPlace, rememberPlace } from "./app/last-place";
 import { createAppRouter } from "./router";
+import { adoptStyleNonce } from "./lib/style-nonce";
 
 /**
  * Import order is the cascade order, and it is fixed here rather than by
@@ -27,8 +29,27 @@ import { createAppRouter } from "./router";
  * handed down. Building either inside a component would throw the app's entire
  * state away on any re-render of the root.
  */
+/*
+  Before anything renders, because the first modal can open before any effect would have run. What
+  it does and why the window has a nonce to give at all is argued in `lib/style-nonce.ts`; the
+  short version is that Radix locks scrolling by injecting a <style>, and `style-src 'self'`
+  refuses one in a packaged build and nowhere else.
+*/
+adoptStyleNonce();
+
 const queryClient = createAppQueryClient();
-const router = createAppRouter();
+/**
+ * Opened where it was left, and remembered as it moves.
+ *
+ * `onResolved` and not `onBeforeLoad`: what is worth remembering is where the window ENDED UP, and
+ * a navigation that is redirected away resolves somewhere else than it started. Subscribed once,
+ * out here beside the router it belongs to, because the router lives for the life of the window and
+ * an effect inside a component would attach and detach with a re-render.
+ */
+const router = createAppRouter(lastPlace());
+router.subscribe("onResolved", ({ toLocation }) => {
+  rememberPlace(toLocation.pathname);
+});
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

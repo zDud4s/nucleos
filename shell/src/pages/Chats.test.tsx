@@ -13,6 +13,10 @@ import {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
+/* A link in an answer is handed to the OS rather than followed by the webview — see `RichLink`. */
+const opener = vi.hoisted(() => ({ openUrl: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => opener);
+
 const daemon = vi.hoisted(() => ({
   apiFetch: vi.fn(),
   apiText: vi.fn(),
@@ -36,6 +40,7 @@ import type {
   Conversation,
   IdeSession,
   Mention,
+  Transcript,
 } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
@@ -50,16 +55,36 @@ beforeEach(() => {
   daemon.probeHealth.mockReset();
   daemon.probeHealth.mockResolvedValue(true);
   daemon.apiText.mockResolvedValue("daemon running");
+  opener.openUrl.mockReset();
+  opener.openUrl.mockResolvedValue(undefined);
   localStorage.clear();
 });
 
 /* ------------------------------------------------------------ fixtures -- */
+
+/** One conversation, already pinned, for tests about the controls rather than the list. */
+function chatSummaryFetchWith(overrides: Partial<ChatSummary>) {
+  return chatsFetch([chatSummary(overrides)], { [overrides.chat_id ?? "c-1"]: [] });
+}
+
+/** What `claude --help` documents at CLI 2.1.198, weakest first. */
+const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
 function chatSummary(overrides: Partial<ChatSummary> = {}): ChatSummary {
   return {
     chat_id: "c-1",
     title: null,
     brain: "cloud",
+    model: null,
+    effort: null,
+    fallback_model: null,
+    extra_dirs: [],
+    turn_budget_usd: null,
+    agents: [],
+    system_prompt: null,
+    denied_tools: [],
+    cleared_after_run_id: null,
+    context_window: 140000,
     created_at: "2026-08-18T09:00:00Z",
     cwd: null,
     ide_session_id: null,
@@ -86,7 +111,8 @@ function turnRow(overrides: Partial<AssistantTurnRow> = {}): AssistantTurnRow {
     thought: [],
     thought_tokens: null,
     context_fill: null,
-    context_rotates_at: 140000,
+    context_window: 140000,
+    compacted: false,
     relayed_from_chat_id: null,
     relayed_from_title: null,
     relayed_to: [],
@@ -135,6 +161,8 @@ function chatsFetch(
     files?: Record<string, Mention[]>;
     /** The slash commands each conversation offers, by chat id. */
     commands?: Record<string, Command[]>;
+    /** The slash commands the front door offers, where there is no conversation to key on. */
+    frontCommands?: Command[];
     /** What is waiting to be said to each conversation, by chat id. */
     queued?: Record<string, Array<{ id: number; text: string }>>;
     /** What each conversation is being held on, by chat id. */
@@ -153,6 +181,13 @@ function chatsFetch(
      * distinction and says so.
      */
     projects?: Record<string, ChatProject>;
+    /** What each turn's tools answered, by turn id. The transcript never carries these. */
+    turnTools?: Record<number, ToolCall[]>;
+    /**
+     * How many turns one read comes back with. The daemon's own is a hundred; a test that is
+     * about paging says a smaller number rather than writing a hundred and one fixtures.
+     */
+    transcriptLimit?: number;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
@@ -176,6 +211,28 @@ function chatsFetch(
     }
     if (path === "/assistant/chats") return chats;
     if (path === "/assistant/local-model") return { available: opts.localAvailable ?? true };
+    // The daemon's own shipped default, plus the local model this machine's config names. Written
+    // out rather than derived: this fixture is what the picker is asserted against, and a fixture
+    // that computed itself from the same list the assertions use would agree with anything.
+    // Deliberately short. The daemon's real list is wider than any one CLI version's tool set on
+    // purpose; what the window has to get right is that it draws whatever it is served.
+    if (path === "/assistant/tools") {
+      return { tools: ["Bash", "Edit", "Read", "WebFetch"] };
+    }
+    if (path === "/assistant/models") {
+      return {
+        choices: [
+          { id: "opus", label: "Opus", brain: "cloud", efforts: CLAUDE_EFFORTS },
+          { id: "sonnet", label: "Sonnet", brain: "cloud", efforts: CLAUDE_EFFORTS },
+          // Deliberately shorter than the others: the picker must draw THIS model's levels and not
+          // the union, and a fixture where every model agreed could not tell the two apart.
+          { id: "fable", label: "Fable", brain: "cloud", efforts: ["low", "medium", "high"] },
+          { id: "qwen3.5:4b", label: "qwen3.5:4b", brain: "local", efforts: [] },
+        ],
+        configured: "claude-sonnet-5",
+        efforts: CLAUDE_EFFORTS,
+      };
+    }
     const live = /^\/assistant\/(\d+)\/live$/.exec(path);
     // Undefined is the daemon's 204: nothing is writing, which is not the same as writing nothing.
     if (live !== null) return (opts.live ?? {})[Number(live[1])];
@@ -198,13 +255,23 @@ function chatsFetch(
       const found =
         fixture === undefined
           ? undefined
-          : { context_estimate: null, context_rotates_at: 140000, ...fixture };
+          : { context_estimate: null, largest_window: 187000, ...fixture };
       // A transcript this machine does not have is a 404, exactly as the daemon answers.
       if (found === undefined) throw new ApiRefusal(404, "not_found", "Not Found");
       return found;
     }
     // Before the transcript match below: that pattern would not hit a path with a further
     // segment, but the order is what makes that true rather than a coincidence.
+    // The front door's own, with no chat in the path: the same shape, from `opts.frontCommands`.
+    const front = /^\/assistant\/commands\?q=(.*)$/.exec(path);
+    if (front !== null) {
+      const query = decodeURIComponent(front[1]).toLowerCase();
+      return {
+        commands: (opts.frontCommands ?? []).filter((hit) =>
+          hit.name.toLowerCase().includes(query),
+        ),
+      };
+    }
     const commands = /^\/assistant\/chats\/([^/?]+)\/commands\?q=(.*)$/.exec(path);
     if (commands !== null) {
       const offered = opts.commands?.[decodeURIComponent(commands[1])] ?? [];
@@ -238,14 +305,50 @@ function chatsFetch(
         truncated: false,
       };
     }
-    const match = /^\/assistant\/chats\/([^/]+)$/.exec(path);
+    // What one turn's tools answered. Its own route because the transcript deliberately strips
+    // them — see `ToolCall.result`.
+    const turnTools = /^\/assistant\/turns\/(\d+)\/tools$/.exec(path);
+    if (turnTools !== null) {
+      return { did: opts.turnTools?.[Number(turnTools[1])] ?? [] };
+    }
+    // Something that was said, across every conversation. Matched here rather than served from a
+    // fixture list, so a test says what is in the conversations and not what the daemon replies.
+    const said = /^\/assistant\/search\?q=(.*)$/.exec(path);
+    if (said !== null) {
+      const query = decodeURIComponent(said[1]).toLowerCase();
+      return Object.entries(transcripts).flatMap(([chatId, rows]) =>
+        rows
+          .filter(
+            (row) =>
+              row.asked.toLowerCase().includes(query) ||
+              (row.answer ?? "").toLowerCase().includes(query),
+          )
+          .map((row) => ({
+            chat_id: chatId,
+            title: chats.find((chat) => chat.chat_id === chatId)?.title ?? null,
+            turn_id: row.id,
+            side: row.asked.toLowerCase().includes(query) ? "asked" : "answered",
+            excerpt: row.asked.toLowerCase().includes(query) ? row.asked : (row.answer ?? ""),
+            created_at: row.created_at,
+          })),
+      );
+    }
+    // The `?before=` page walks backwards from a turn id. `transcripts` holds a conversation
+    // whole, so the slice is taken here — which is what makes a paging test a test of the page's
+    // own arithmetic rather than of a fixture that agrees with it.
+    const match = /^\/assistant\/chats\/([^/?]+)(?:\?before=(\d+))?$/.exec(path);
     if (match !== null) {
+      const whole = transcripts[match[1]] ?? [];
+      const limit = opts.transcriptLimit ?? whole.length;
+      const above = match[2] === undefined ? whole : whole.filter((row) => row.id < Number(match[2]));
+      const page = above.slice(-limit);
       return {
         handed: opts.handed?.[match[1]] ?? [],
         queued: opts.queued?.[match[1]] ?? [],
         asks: opts.asks?.[match[1]] ?? [],
+        more: page.length < above.length,
         notices: opts.notices?.[match[1]] ?? [],
-        turns: transcripts[match[1]] ?? [],
+        turns: page,
       };
     }
     // PATCH, DELETE, /title and /seen all answer 204 — nothing to return.
@@ -305,14 +408,14 @@ describe("Chats - a turn already in flight", () => {
     // The message was refused, not sent — the draft is exactly what was typed.
     expect(textarea.value).toBe("are you still there?");
 
-    // The brain picker is a different mutation and was never touched by the
+    // The model picker is a different mutation and was never touched by the
     // composer's failure — it still takes a click and still writes.
-    await openConversationSettings();
-    fireEvent.click(await screen.findByRole("button", { name: "Local" }));
+    await openModelMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Opus/ }));
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
         method: "PATCH",
-        body: JSON.stringify({ brain: "local" }),
+        body: JSON.stringify({ model: "opus" }),
       });
     });
   });
@@ -571,7 +674,7 @@ describe("Chats - the sidebar tells a relay from an answer", () => {
     expect(relayed.getAttribute("href")).toBe("/chats/c-1");
     // The other conversation has unread answers too, and must not be marked: the mark is about
     // where they came from, not about there being any.
-    const ordinary = screen.getByRole("link", { name: /ali, cloud, 2 unread$/ });
+    const ordinary = screen.getByRole("link", { name: /ali, cloud, .+, 2 unread$/ });
     expect(ordinary).toBeDefined();
   });
 });
@@ -663,8 +766,8 @@ describe("Chats - what a department said", () => {
 
     expect(await screen.findByRole("link", { name: /1 from a department/ })).toBeDefined();
     // The count of turns is untouched by it: two unread answers are still two, not three.
-    expect(screen.getByRole("link", { name: /aqui, cloud, 2 unread, 1 from a department$/ })).toBeDefined();
-    expect(screen.getByRole("link", { name: /ali, cloud, 2 unread$/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /aqui, cloud, .+, 2 unread, 1 from a department$/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /ali, cloud, .+, 2 unread$/ })).toBeDefined();
   });
 });
 
@@ -733,8 +836,9 @@ function afterDwell(): Promise<void> {
 /**
  * Open the conversation's `⋯` menu.
  *
- * Which model answers, plan-only and archive all moved behind it when the header was
- * reduced to one quiet line, so every test that touches one has to open it first.
+ * Archive is the only thing behind it. Which model answers and plan-only were here too
+ * and moved into the composer, where the words they govern are being written — so only
+ * archiving still has to open this.
  * Radix opens on `pointerdown`, not on `click`, which is why firing a click alone
  * leaves the menu shut and the control absent rather than merely hidden.
  */
@@ -743,6 +847,667 @@ async function openConversationSettings(): Promise<void> {
   fireEvent.pointerDown(more, { pointerType: "mouse", button: 0 });
   fireEvent.click(more);
 }
+
+/** The model menu, which lives in the composer. Same Radix `pointerdown` rule as above. */
+async function openModelMenu(): Promise<void> {
+  const trigger = await screen.findByRole("button", { name: /change the model/i });
+  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+  fireEvent.click(trigger);
+}
+
+/** The effort menu, its own control beside the model's rather than a submenu inside it. */
+async function openEffortMenu(): Promise<void> {
+  const trigger = await screen.findByRole("button", { name: /^effort:/i });
+  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+  fireEvent.click(trigger);
+}
+
+describe("Chats - a conversation that grew too long for its window", () => {
+  it("says where the conversation was summarised, rather than letting it happen quietly", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "primeiro", answer: "sim", session_id: "s-1" }),
+          // Same session either side of it — which is the whole point. The conversation did not
+          // restart; it filled up and the CLI condensed its early part in place.
+          turnRow({
+            id: 2,
+            asked: "segundo",
+            answer: "claro",
+            session_id: "s-1",
+            compacted: true,
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    expect(await screen.findByText(/summarised here/i)).toBeTruthy();
+    // And NOT the older, harsher note: nothing was forgotten and no session was traded.
+    expect(screen.queryByText(/the conversation restarted here/i)).toBeNull();
+  });
+
+  it("meters a picked-up conversation against its own window, not the default", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, context_fill: 150_000, context_window: 190_000 }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    // 150k of 190k is comfortable; against the 140k default it would read as over the line. A
+    // meter that keeps its own copy of the number is wrong for exactly the conversations nearest
+    // their limit.
+    expect(await screen.findByText("150.0k of 190.0k")).toBeTruthy();
+    expect(screen.queryByText(/earlier turns summarised soon/i)).toBeNull();
+  });
+});
+
+describe("Chats - choosing a model", () => {
+  it("offers the daemon's list rather than a list of its own", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    // Every name here came over the wire. The agent CLI cannot enumerate its own models, so a list
+    // written into the window would be an assertion going stale where nobody who can fix it looks.
+    for (const label of ["Opus", "Sonnet", "Fable", "qwen3.5:4b"]) {
+      expect(await screen.findByRole("menuitemradio", { name: new RegExp(`^${label}`) })).toBeDefined();
+    }
+  });
+
+  it("names the unpinned state instead of leaving nothing selected", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const following = await screen.findByRole("menuitemradio", { name: /whatever is configured/i });
+    expect(following.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("unpins by sending an explicit null, which is not the same as sending nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "opus" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /whatever is configured/i }));
+
+    // `undefined` would be dropped by JSON.stringify and read by the daemon as "leave it alone" —
+    // the one thing an unpin is not.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ model: null }),
+      });
+    });
+  });
+
+  it("writes the effort on its own, without touching which model answers", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openEffortMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "xhigh" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ effort: "xhigh" }),
+      });
+    });
+  });
+
+  it("offers each model its own effort levels, not the union of everyone's", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "fable" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openEffortMenu();
+
+    // Fable's list stops at `high` in the fixture. `xhigh` is on the union and on other models, and
+    // offering it here would be a level that dies at spawn.
+    expect(await screen.findByRole("menuitemradio", { name: "high" })).toBeDefined();
+    expect(screen.queryByRole("menuitemradio", { name: "xhigh" })).toBeNull();
+    expect(screen.queryByRole("menuitemradio", { name: "max" })).toBeNull();
+  });
+
+  it("closes the effort dial on a model that has none, rather than offering one that turns nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "qwen3.5:4b", brain: "local" })], {
+        "c-1": [],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Disabled and still there. Removing it would make the row jump as you switch models, and would
+    // read as a feature that is missing rather than one that does not apply to this model.
+    const dial = await screen.findByRole("button", { name: /has no effort setting/i });
+    expect((dial as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("keeps the model and the effort as two controls, not one inside the other", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatSummaryFetchWith({ chat_id: "c-1", model: "sonnet", effort: "high" }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // Two triggers, side by side. They are two decisions and a person changes them separately —
+    // most often the effort, on a model they already chose — and a dial buried one level down is
+    // one you have to remember is there.
+    expect(await screen.findByRole("button", { name: /answered by sonnet/i })).toBeDefined();
+    expect(await screen.findByRole("button", { name: /^effort: high/i })).toBeDefined();
+
+    // And opening the model menu offers models only.
+    await openModelMenu();
+    expect(screen.queryByRole("menuitemradio", { name: "xhigh" })).toBeNull();
+  });
+
+  it("carries the choice into the first message from the front door", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+
+    await renderChats("/chats");
+    await openModelMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Fable/ }));
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    // On the opening call and not as a PATCH afterwards: there is no conversation to PATCH until
+    // this returns, and correcting one a round trip later is visible — and wrong if it fails.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats", {
+        method: "POST",
+        body: JSON.stringify({ model: "fable" }),
+      });
+    });
+  });
+});
+
+describe("Chats - the front door's own slash", () => {
+  const brainstorm: Command = {
+    name: "superpowers:brainstorm",
+    description: "Turn an idea into a design",
+    hint: null,
+    source: "plugin",
+  };
+
+  it("offers commands before there is a conversation to offer them for", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/brain", selectionStart: 6 } });
+
+    // A command needs no conversation: the personal ones and the installed plugins' are the same
+    // wherever this ends up. Offering nothing here was the front door pretending the gesture did
+    // not exist, which is the first gesture anybody tries.
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+    expect(within(list).getByText("/superpowers:brainstorm")).toBeTruthy();
+  });
+
+  it("writes the chosen command into the box, with a space for its argument", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "/brain", selectionStart: 6 } });
+    fireEvent.click(await screen.findByText("/superpowers:brainstorm"));
+
+    await waitFor(() => {
+      expect(box.value).toBe("/superpowers:brainstorm ");
+    });
+  });
+
+  it("says why an @ has nothing to offer here, rather than swallowing it", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}, { frontCommands: [brainstorm] }));
+
+    await renderChats("/chats");
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "@core", selectionStart: 5 },
+    });
+
+    // An `@` names files inside the conversation's folder and there is no folder yet. A list that
+    // silently never appears is indistinguishable from a feature that is broken.
+    expect(await screen.findByText(/has no folder yet/i)).toBeDefined();
+  });
+});
+
+describe("Chats - what a conversation is told, and what it may not touch", () => {
+  async function openMenuItem(name: RegExp): Promise<void> {
+    await openConversationSettings();
+    const item = await screen.findByRole("menuitem", { name });
+    fireEvent.pointerDown(item, { pointerType: "mouse", button: 0 });
+    fireEvent.click(item);
+  }
+
+  it("appends standing instructions and never offers to replace the system prompt", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openMenuItem(/standing instructions/i);
+
+    // The copy has to say "added to", because the flag behind it appends. A dialog that read as a
+    // replacement would have people writing instructions meant to override the model's own.
+    expect(await screen.findByText(/added to what this conversation's model is already told/i))
+      .toBeDefined();
+
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "Answer in European Portuguese." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ system_prompt: "Answer in European Portuguese." }),
+      });
+    });
+  });
+
+  it("emptying the instructions clears them with a null rather than a blank", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", system_prompt: "Answer in Portuguese." })], {
+        "c-1": [],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openMenuItem(/standing instructions/i);
+    fireEvent.change(await screen.findByLabelText("Instructions"), { target: { value: "  " } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ system_prompt: null }),
+      });
+    });
+  });
+
+  it("bars a tool from a list the daemon serves, never from one typed here", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    const trigger = await screen.findByRole("menuitem", { name: /cannot use/i });
+    fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+    fireEvent.click(trigger);
+
+    // Checkboxes over served names. A typed rule that matches no tool is one line on the CLI's
+    // stderr — in this app, a restriction somebody set and nobody applied.
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: "Bash" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ denied_tools: ["Bash"] }),
+      });
+    });
+  });
+
+  it("asks for a fresh context in one click, and for a clear in two", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    fireEvent.click(await screen.findByRole("button", { name: /fresh context/i }));
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/fresh-context", {
+        method: "POST",
+      });
+    });
+
+    // The stronger one is behind the interlock: the floor only ever moves forward, so pressing it
+    // again cannot undo it.
+    fireEvent.click(screen.getByRole("button", { name: /^clear$/i }));
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/chats/c-1/clear", {
+      method: "POST",
+    });
+    const confirm = await screen.findByRole("button", { name: /the turns stay/i });
+    // The 300ms dwell: a click inside it is read as the tail of a double-click and swallowed, so
+    // the two clicks have to be apart in TIME and not only in await points.
+    await afterDwell();
+    fireEvent.click(confirm);
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/clear", { method: "POST" });
+    });
+  });
+
+  it("marks the transcript where the conversation was cleared", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cleared_after_run_id: 1 })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "antes", answer: "uma", session_id: "s-1" }),
+          turnRow({ id: 2, asked: "depois", answer: "duas", session_id: "s-2" }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    // And it says the right thing. The restart note this replaces promises the model "was read the
+    // last few exchanges back" — which is precisely what a clear makes untrue.
+    expect(await screen.findByText(/cleared here/i)).toBeDefined();
+    expect(screen.queryByText(/was read the last few exchanges back/i)).toBeNull();
+  });
+});
+
+describe("Chats - the helpers a conversation may hand work to", () => {
+  /** Opens the ⋯ and then the helper editor. The item is a menu ITEM, not a submenu. */
+  async function openHelpers(): Promise<void> {
+    await openConversationSettings();
+    const item = await screen.findByRole("menuitem", { name: /helpers/i });
+    fireEvent.pointerDown(item, { pointerType: "mouse", button: 0 });
+    fireEvent.click(item);
+  }
+
+  it("writes a helper and saves the whole set in one gesture", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "reviewer" } });
+    fireEvent.change(screen.getByLabelText("When to use it"), {
+      target: { value: "Reviews a diff for correctness" },
+    });
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "You are a code reviewer." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    // One PATCH carrying the WHOLE set — which is how the daemon stores it, and what makes "two
+    // windows saved at once" answerable with "the last one wins" instead of a merge rule.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({
+          agents: [
+            {
+              name: "reviewer",
+              description: "Reviews a diff for correctness",
+              prompt: "You are a code reviewer.",
+              model: null,
+              effort: null,
+            },
+          ],
+        }),
+      });
+    });
+  });
+
+  it("says why a helper would be refused, in place, before anything is sent", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "-x" } });
+
+    // The daemon answers a bad set with a bare 400 and no body. Without this, a dialog holding five
+    // helpers would say "no" without saying which one or why.
+    expect(await screen.findByRole("alert")).toBeDefined();
+    expect(screen.getByText(/reads as a flag/i)).toBeDefined();
+    const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+  });
+
+  it("refuses two helpers of one name rather than letting one replace the other", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [{ name: "reviewer", description: "d", prompt: "p" }],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+    // The second row's fields, which are the last of each label on the page.
+    const names = screen.getAllByLabelText("Name");
+    fireEvent.change(names[names.length - 1], { target: { value: "reviewer" } });
+
+    // Two of one name collapse into one on the way into the object the flag takes, and the person
+    // watches the other vanish without being told.
+    //
+    // BOTH rows are flagged, and that is the point: neither of them is "the duplicate". Marking
+    // only the second would say the first is fine and the newcomer is the mistake, when what is
+    // actually true is that these two cannot both exist.
+    await waitFor(() => {
+      expect(screen.getAllByText(/already has this name/i)).toHaveLength(2);
+    });
+  });
+
+  it("offers a helper only the levels its own model takes", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [{ name: "reviewer", description: "d", prompt: "p", model: "fable" }],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+
+    // Fable stops at `high` in the fixture. A menu built from the union would offer `max` and the
+    // door would refuse it — for a field the person could not see was wrong.
+    const effort = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
+    const levels = Array.from(effort.options).map((option) => option.value);
+    expect(levels).toContain("high");
+    expect(levels).not.toContain("max");
+  });
+
+  it("does not offer a local model, which the agent CLI has never heard of", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /add a helper/i }));
+
+    // A helper runs INSIDE the agent CLI. A local name there is handed to a process that cannot
+    // resolve it, and the turn dies at spawn.
+    const model = screen.getByLabelText("Model") as HTMLSelectElement;
+    const ids = Array.from(model.options).map((option) => option.value);
+    expect(ids).toContain("opus");
+    expect(ids).not.toContain("qwen3.5:4b");
+  });
+
+  it("removing every helper saves an empty set rather than saying nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [{ name: "reviewer", description: "d", prompt: "p" }],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+    fireEvent.click(await screen.findByRole("button", { name: /remove/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    // `[]` and not an omitted field: absent means "leave them alone", which is the one thing
+    // clearing is not.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ agents: [] }),
+      });
+    });
+  });
+});
+
+describe("Chats - what a conversation may reach and spend", () => {
+  /** Opens one of the submenus behind the ⋯. Same Radix `pointerdown` rule as everywhere else. */
+  async function openSetting(name: RegExp): Promise<void> {
+    await openConversationSettings();
+    const trigger = await screen.findByRole("menuitem", { name });
+    fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+    fireEvent.click(trigger);
+  }
+
+  it("says per turn and never budget, because that is what the flag bounds", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", turn_budget_usd: 0.5 })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/spends at most/i);
+
+    // The CLI's ceiling bounds one invocation and the daemon spawns one per turn. Ten turns at the
+    // ceiling cost ten times it, and a control that let somebody read it as a total would be lying
+    // about money — which is the one thing this app is built not to do.
+    expect(await screen.findByText(/per turn, not per conversation/i)).toBeDefined();
+  });
+
+  it("sets a ceiling, and clears it with an explicit null", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/spends at most/i);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /\$1\.00 a turn/ }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ turn_budget_usd: 1 }),
+      });
+    });
+  });
+
+  it("clears the ceiling with a null rather than by saying nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", turn_budget_usd: 2 })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/spends at most/i);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^no ceiling/ }));
+
+    // `undefined` would be dropped by JSON.stringify and read as "leave it alone" — the one thing
+    // clearing is not.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ turn_budget_usd: null }),
+      });
+    });
+  });
+
+  it("grants a folder the editor already knows, so no path is ever typed", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], { "c-1": [] }, {
+        ideSessions: [
+          {
+            session_id: "s-1",
+            title: "beside",
+            cwd: "C:/Projects/outro",
+            last_activity: "2026-08-23T09:00:00Z",
+            tools: true,
+          },
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/also reaches/i);
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: "C:/Projects/outro" }));
+
+    // Every path offered is one a real session ran in, so it is absolute and it exists — the two
+    // things the daemon refuses a PATCH for. A text field would invite failing a rule nobody sees.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ extra_dirs: ["C:/Projects/outro"] }),
+      });
+    });
+  });
+
+  it("does not offer the folder the conversation already runs in", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], { "c-1": [] }, {
+        ideSessions: [
+          {
+            session_id: "s-1",
+            title: "same",
+            cwd: "C:/Projects/nucleos",
+            last_activity: "2026-08-23T09:00:00Z",
+            tools: true,
+          },
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    // Its own directory is not "extra", and offering it would be a checkbox that grants nothing.
+    const trigger = await screen.findByRole("menuitem", { name: /also reaches/i });
+    expect(trigger.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("names one fallback and never the model it would fall back from", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openSetting(/falls back to/i);
+
+    // Falling back to the model that just failed is not a fallback.
+    expect(screen.queryByRole("menuitemradio", { name: /^Sonnet/ })).toBeNull();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Opus/ }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ fallback_model: ["opus"] }),
+      });
+    });
+  });
+});
 
 describe("Chats - archiving a conversation", () => {
   it("arms and then confirms in two separate waits, with copy that says the turns are kept", async () => {
@@ -790,7 +1555,6 @@ describe("Chats - planning without acting", () => {
     );
     await renderChats("/chats/c-1");
 
-    await openConversationSettings();
     const toggle = await screen.findByLabelText(/plan only/i);
     expect((toggle as HTMLInputElement).checked).toBe(false);
 
@@ -823,7 +1587,6 @@ describe("Chats - planning without acting", () => {
     );
     await renderChats("/chats/c-1");
 
-    await openConversationSettings();
     const toggle = await screen.findByLabelText(/plan only/i);
     await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true));
   });
@@ -1137,7 +1900,7 @@ describe("Chats - a conversation picked up from the editor", () => {
   // The window drew somebody's whole editor conversation and a fresh turn under it with no seam,
   // which reads as one continuous thing the model has all of. For a session past the ceiling that
   // is false: it was not resumed, and what it got was the last few exchanges in front of nothing.
-  it("says a session too large to resume was handed a tail rather than remembered", async () => {
+  it("says a session larger than any window was handed a tail rather than remembered", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([picked()], { "c-1": [turnRow({ id: 7, asked: "e agora", answer: "feito" })] }, {
         said: {
@@ -1153,7 +1916,7 @@ describe("Chats - a conversation picked up from the editor", () => {
 
     await renderChats("/chats/c-1");
 
-    expect(await screen.findByText(/too large to resume/i)).toBeTruthy();
+    expect(await screen.findByText(/larger than any window a model has/i)).toBeTruthy();
     // Shut until asked: the claim is the note, the exchanges are the audit behind it.
     expect(screen.queryByRole("list", { name: "What the model was handed" })).toBeNull();
 
@@ -1278,7 +2041,12 @@ describe("Chats - the route and the sidebar badge", () => {
     // too is in the real tree rather than only in a test's own two-route
     // stand-in — `router` here is the harness's narrowed read-only view and
     // has no `navigate` of its own.
-    fireEvent.click(await screen.findByRole("link", { name: "hello there, cloud, 2 unread" }));
+    // Matched rather than spelled out: the row's name carries when it last moved, which is a
+    // relative reading against the real clock and therefore not a constant. What this assertion
+    // is about is that the row is one link with one name — see `chatRowLabel`.
+    fireEvent.click(
+      await screen.findByRole("link", { name: /^hello there, cloud, .+, 2 unread$/ }),
+    );
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
     expect(await screen.findByRole("heading", { level: 1, name: "Chats" })).toBeDefined();
   });
@@ -1298,22 +2066,21 @@ function ideSession(overrides: Partial<IdeSession> = {}): IdeSession {
 }
 
 /**
- * Opens the editor door with these sessions on offer.
+ * Renders the page with these editor sessions on offer.
  *
- * A door of its own, and not the optional field at the bottom of the new-conversation form: a
- * person looking for the conversation they were having in the editor has no reason to press a
- * button labelled "New conversation" first, and everything behind it was invisible because of it.
+ * There is no door any more. The conversations still living in the editor are rows in the SAME
+ * list as the ones this app has opened — two lists of the same thing was two places to look for a
+ * conversation you half remember — so they are on screen as soon as the page is, and what tells
+ * them apart is the mark on the row.
  */
-async function openTheEditorDoor(sessions: IdeSession[], said: Record<string, ConversationFixture> = {}) {
+async function withEditorSessions(sessions: IdeSession[], said: Record<string, ConversationFixture> = {}) {
   daemon.apiFetch.mockImplementation(chatsFetch([], {}, { ideSessions: sessions, said }));
-  const view = await renderChats("/chats");
-  fireEvent.click(await screen.findByRole("button", { name: /from the editor/i }));
-  return view;
+  return renderChats("/chats");
 }
 
-describe("the editor's sessions, and the door to them", () => {
-  it("lists them behind a door that names what is behind it", async () => {
-    await openTheEditorDoor([ideSession()]);
+describe("the editor's sessions, in the same list as the rest", () => {
+  it("lists them beside the conversations this app opened, not behind a door", async () => {
+    await withEditorSessions([ideSession()]);
 
     expect(await screen.findByRole("button", { name: /arranja o parser de datas/i })).toBeTruthy();
   });
@@ -1322,7 +2089,7 @@ describe("the editor's sessions, and the door to them", () => {
   // CLI's store on every request precisely because it changes while somebody types, and a door that
   // asked once turned that live data back into a photograph.
   it("follows the editor's sessions instead of photographing them once", async () => {
-    const { queryClient } = await openTheEditorDoor([ideSession()]);
+    const { queryClient } = await withEditorSessions([ideSession()]);
     await screen.findByRole("button", { name: /arranja o parser de datas/i });
 
     const query = queryClient
@@ -1341,7 +2108,7 @@ describe("the editor's sessions, and the door to them", () => {
   // is live?" with a wall of identical rows.
   it("says which of them is happening right now", async () => {
     const now = Date.now();
-    await openTheEditorDoor([
+    await withEditorSessions([
       ideSession({
         session_id: "live-1",
         title: "a mexer nisto agora",
@@ -1354,37 +2121,48 @@ describe("the editor's sessions, and the door to them", () => {
       }),
     ]);
 
-    const live = await screen.findByRole("button", { name: /a mexer nisto agora/i });
-    expect(within(live).getByText(/happening now/i)).toBeTruthy();
+    // Said in the row's own name rather than spelled out beside the title: the list is a 19rem
+    // column and "happening now" next to a conversation's name squeezes the name to nothing. The
+    // eye gets a mark, everyone gets the phrase.
+    const live = await screen.findByRole("button", { name: /a mexer nisto agora, happening now/i });
+    expect(within(live).getByText("now")).toBeTruthy();
 
     // And the one nobody is in says nothing, because a mark on every row is a mark on none.
     const old = await screen.findByRole("button", { name: /isto foi na terca/i });
-    expect(within(old).queryByText(/happening now/i)).toBeNull();
+    expect(old.getAttribute("aria-label")).not.toMatch(/happening now/i);
+    expect(within(old).queryByText("now")).toBeNull();
   });
 
-  it("shows a sample and not the whole conversation, which does not fit in a picker", async () => {
-    // The picker is a 20rem column. Drawing two hundred messages into it made the panel taller than
-    // the page and spilled the preview out from under its own border.
+  it("opens in the same shape as a conversation of this app's own", async () => {
+    // The requirement, asserted directly: two rows that look identical in the list must not open
+    // two different kinds of thing. This used to open a panel — a name, a directory, six sampled
+    // lines and a button marked "Pick it up" — while the row under it opened a conversation.
     const many = Array.from({ length: 40 }, (_, at) => ({
       by_owner: at % 2 === 0,
       text: `linha ${at}`,
       aside: false,
     }));
-    await openTheEditorDoor([ideSession()], { "aaaa-1111": { cut: false, said: many } });
+    await withEditorSessions([ideSession()], { "aaaa-1111": { cut: false, said: many } });
 
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
-    const preview = await screen.findByLabelText(/what was said/i);
-    expect(within(preview).getAllByRole("listitem").length).toBeLessThanOrEqual(6);
-    // The end of it, which is where a conversation is picked up from.
-    expect(within(preview).getByText("linha 39")).toBeTruthy();
-    expect(within(preview).queryByText("linha 0")).toBeNull();
+    // The whole conversation, not a sample of its tail — and drawn by the same rules that draw it
+    // after it has been carried on.
+    const shown = await screen.findByLabelText(/said in the editor/i);
+    expect(within(shown).getAllByRole("listitem")).toHaveLength(40);
+    expect(within(shown).getByText("linha 0")).toBeTruthy();
+    expect(within(shown).getByText("linha 39")).toBeTruthy();
+
+    // And a box to type in, exactly where a conversation has one. There is no button to press
+    // first: the first thing you say is what brings it here.
+    expect(await screen.findByLabelText("Message")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /pick it up/i })).toBeNull();
   });
 
   it("shows what was said in one before it is picked up, not after", async () => {
     // The whole reason this door exists. Choosing by a cut title was choosing blind: you found out
     // which conversation it was by picking it up and reading what came back.
-    await openTheEditorDoor([ideSession()], {
+    await withEditorSessions([ideSession()], {
       "aaaa-1111": {
         cut: false,
         said: [
@@ -1403,28 +2181,28 @@ describe("the editor's sessions, and the door to them", () => {
     // The $1.72 case. A session carrying more than the daemon resumes will NOT be resumed — it
     // starts fresh with a short replay — and knowing that before pressing the button is the whole
     // point of measuring it.
-    await openTheEditorDoor([ideSession()], {
+    await withEditorSessions([ideSession()], {
       "aaaa-1111": {
         cut: false,
         said: [{ by_owner: true, text: "olá", aside: false }],
-        context_estimate: 180000,
-        context_rotates_at: 140000,
+        context_estimate: 400000,
+        largest_window: 187000,
       },
     });
 
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
-    expect(await screen.findByText(/180\.0k/)).toBeTruthy();
-    expect(screen.getByText(/starts a fresh conversation/i)).toBeTruthy();
+    expect(await screen.findByText(/400\.0k/)).toBeTruthy();
+    expect(screen.getByText(/larger than any window a model has/i)).toBeTruthy();
   });
 
   it("says a small session will be continued where it left off", async () => {
-    await openTheEditorDoor([ideSession()], {
+    await withEditorSessions([ideSession()], {
       "aaaa-1111": {
         cut: false,
         said: [{ by_owner: true, text: "olá", aside: false }],
         context_estimate: 20000,
-        context_rotates_at: 140000,
+        largest_window: 187000,
       },
     });
 
@@ -1434,17 +2212,21 @@ describe("the editor's sessions, and the door to them", () => {
     expect(screen.queryByText(/starts a fresh conversation/i)).toBeNull();
   });
 
+  // One list means one empty state. Nothing here and nothing in the editor is the same sentence
+  // now, and it points at the one door there is.
   it("says nothing was found rather than showing an empty list", async () => {
-    await openTheEditorDoor([]);
+    await withEditorSessions([]);
 
-    expect(await screen.findByText(/no conversations from the editor/i)).toBeTruthy();
+    expect(await screen.findByText(/no conversations yet/i)).toBeTruthy();
   });
 
-  it("picks one up, and the conversation it opens continues it", async () => {
-    await openTheEditorDoor([ideSession()]);
+  it("carries one on by saying something, and opens the conversation that continues it", async () => {
+    await withEditorSessions([ideSession()]);
     fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
 
-    fireEvent.click(await screen.findByRole("button", { name: /pick it up/i }));
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "e agora corre os testes" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     await waitFor(() => {
       const posted = daemon.apiFetch.mock.calls.find(
@@ -1455,20 +2237,49 @@ describe("the editor's sessions, and the door to them", () => {
         continue_session: "aaaa-1111",
       });
     });
+
+    // And the words went to the conversation that was just opened, in one gesture. Two steps —
+    // open it, then say the thing again — is what this replaced.
+    await waitFor(() => {
+      const said = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/message",
+      );
+      expect(JSON.parse(String(said?.[1]?.body))).toMatchObject({
+        chat_id: "new-1",
+        text: "e agora corre os testes",
+      });
+    });
+  });
+
+  it("bills nothing for looking at one", async () => {
+    // Opening one reads a file. That was true when this was a screen you left by pressing a
+    // button, and it has to stay true now that the screen IS the conversation — otherwise
+    // clicking down a list of editor sessions to find the right one would cost money per click.
+    await withEditorSessions([ideSession()]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /arranja o parser de datas/i }));
+    expect(await screen.findByLabelText("Message")).toBeTruthy();
+
+    const opened = daemon.apiFetch.mock.calls.filter(
+      (call) => String(call[0]) === "/assistant/chats" && call[1]?.method === "POST",
+    );
+    expect(opened).toHaveLength(0);
   });
 });
 
 /**
  * Opens the editor door with these sessions on offer, and hands back a `choose` that waits.
  *
- * The wait is load-bearing: the session list arrives from the daemon after the door is drawn, so
- * the row being clicked does not exist yet at the moment the door opens.
+ * The wait is load-bearing: the session list arrives from the daemon after the page is drawn, so
+ * the row being clicked does not exist yet at the moment it renders.
  */
 async function openThePicker(sessions: IdeSession[]) {
-  const view = await openTheEditorDoor(sessions);
+  const view = await withEditorSessions(sessions);
   const choose = async (sessionId: string) => {
     const label = sessions.find((session) => session.session_id === sessionId)?.title ?? sessionId;
-    const list = await screen.findByRole("list", { name: /conversations in the editor/i });
+    // The one list, which holds both kinds. There is no "conversations in the editor" list to look
+    // in any more — that separation is exactly what went away.
+    const list = await screen.findByRole("list", { name: /^conversations$/i });
     const row = within(list)
       .getAllByRole("button")
       .find((button) => button.textContent?.includes(label));
@@ -2187,7 +2998,7 @@ describe("what the page is not showing", () => {
     expect(screen.queryByText(/older messages are not shown/i)).toBeNull();
   });
 
-  it("says how full the context was, and warns before the daemon rotates", async () => {
+  it("says how full the context was, and warns before the CLI summarises it", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], {
         "c-1": [
@@ -2200,8 +3011,11 @@ describe("what the page is not showing", () => {
     await renderChats("/chats/c-1");
 
     expect(await screen.findByText(/132\.0k of 140\.0k/)).toBeTruthy();
-    // Said on the turn that is close to it, and not on the one that is nowhere near.
-    expect(screen.getAllByText(/a fresh context/i)).toHaveLength(1);
+    // Said on the turn that is close to it, and not on the one that is nowhere near. The warning
+    // used to say the next turn "may begin a fresh context" — which was the honest description of
+    // what happened then and would be a lie now: nothing begins again, the early exchanges are
+    // condensed and the conversation carries on.
+    expect(screen.getAllByText(/earlier turns summarised soon/i)).toHaveLength(1);
   });
 });
 
@@ -2250,22 +3064,18 @@ describe("reading a transcript back", () => {
     expect(await screen.findByText("porque **isto**")).toBeTruthy();
   });
 
-  it("scrolls to the newest turn instead of opening at the oldest", async () => {
-    // A conversation is read at its end. Opening one at the top means scrolling past an afternoon
-    // of work to reach the sentence you came back for.
-    const scrolled = vi.fn();
-    Element.prototype.scrollIntoView = scrolled;
-    daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1" })], {
-        "c-1": [turnRow({ id: 1, asked: "primeiro", answer: "um" }), turnRow({ id: 2, asked: "ultimo", answer: "dois" })],
-      }),
-    );
-
-    await renderChats("/chats/c-1");
-    await screen.findByText("ultimo");
-
-    await waitFor(() => expect(scrolled).toHaveBeenCalled());
-  });
+  /*
+   * "scrolls to the newest turn instead of opening at the oldest" was here, and it asserted that
+   * SOMETHING on the page had called `scrollIntoView`. It passed for the whole life of the defect
+   * it was written to prevent: the call was being made, at a sentinel that was not the end of the
+   * box, so a conversation opened short of its last line and one opened from the editor did not
+   * scroll at all. A test on the mechanism cannot see that; a test on the position can.
+   *
+   * Replaced by "Chats - a conversation opens at its end" at the foot of this file, which asserts
+   * where the box ends up, at both doors, and that a reader who scrolled away is left alone.
+   *
+   * (It also replaced `Element.prototype.scrollIntoView` with a mock and never put it back.)
+   */
 });
 
 /* ------------------------------------------------- a turn as it happens -- */
@@ -2420,7 +3230,7 @@ describe("stopping a turn", () => {
 /* ------------------------------------------- the quiet header and the finder -- */
 
 describe("Chats - what the header says without being asked", () => {
-  it("names the directory, the model and plan-only in one line, and nothing else", async () => {
+  it("names the directory in its line, and leaves the model and plan-only in the box", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", brain: "cloud", cwd: "C:/Projects/nucleos" })],
@@ -2438,12 +3248,21 @@ describe("Chats - what the header says without being asked", () => {
     // leave exactly one place the path can be coming from: the header line.
     fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
 
+    // The line above the transcript says where this runs, and stops there.
     expect(await screen.findByText("C:/Projects/nucleos")).toBeDefined();
-    expect(await screen.findByText("cloud")).toBeDefined();
-    expect(await screen.findByText("plan only")).toBeDefined();
 
-    // The settings themselves stay behind the menu — that is the whole point of
-    // reducing the header to a line.
+    // Which model answers, and whether it plans instead of doing, are controls in the
+    // composer — beside the words they govern rather than behind a menu at the top of the
+    // page. Asserted here, in the test that owns what the header does and does not carry,
+    // so that moving either one back up top fails this rather than passing quietly.
+    // Named, not blank: a conversation that pinned nothing still runs on something, and the
+    // trigger says which. An empty selection here would read as a broken control.
+    expect(
+      await screen.findByRole("button", { name: /answered by claude-sonnet-5/i }),
+    ).toBeDefined();
+    expect(await screen.findByLabelText(/plan only/i)).toBeDefined();
+
+    // Archiving is the one thing still behind the menu, and stays shut until asked for.
     expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
   });
 
@@ -2510,5 +3329,910 @@ describe("Chats - finding a conversation by typing", () => {
     const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
     expect(within(palette).getByText("rewrite the gate")).toBeDefined();
     expect(within(palette).getByText("bump dependencies")).toBeDefined();
+  });
+});
+
+/* ------------------------------------- reading a transcript, not just seeing it -- */
+
+describe("Chats - taking a piece of the conversation with you", () => {
+  it("copies an answer, and never claims a write the webview refused", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "why 29 February?", answer: "the year rule has three parts" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const copy = await screen.findByRole("button", { name: /copy this answer/i });
+
+    // jsdom has no clipboard, which is the same shape as a webview that refuses one. The
+    // button must say what happened rather than say "Copied" over a write that never landed.
+    fireEvent.click(copy);
+    expect(await screen.findByText("Select it instead")).toBeDefined();
+    expect(screen.queryByText("Copied")).toBeNull();
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      fireEvent.click(copy);
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith("the year rule has three parts"));
+    } finally {
+      delete (navigator as { clipboard?: unknown }).clipboard;
+    }
+  });
+
+  it("offers no copy on a turn that is still being written", async () => {
+    // Half a sentence handed over as "the answer" is the defect this prevents.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 7, status: "running", answer: null })] },
+        { live: { 7: { text: "the year rule has", doing: null } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/the year rule has/)).toBeDefined();
+    expect(screen.queryByRole("button", { name: /copy this answer/i })).toBeNull();
+  });
+
+  it("copies a code block on its own, without the prose around it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            answer:
+              "Here it is:\n\n```rust\nfn leap(y: i32) -> bool { y % 4 == 0 }\n```\n\nThat is all.",
+          }),
+        ],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      fireEvent.click(await screen.findByRole("button", { name: /copy this code/i }));
+      await waitFor(() =>
+        expect(writeText).toHaveBeenCalledWith("fn leap(y: i32) -> bool { y % 4 == 0 }"),
+      );
+      // The sentences either side of the fence are not part of the code.
+      expect(writeText.mock.calls[0][0]).not.toContain("That is all");
+    } finally {
+      delete (navigator as { clipboard?: unknown }).clipboard;
+    }
+  });
+
+  it("says when each turn was asked", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, created_at: "2026-08-18T09:00:00Z" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    // The exact time stays reachable — a relative reading alone cannot be lined up with a log.
+    const when = await screen.findByTitle(new Date("2026-08-18T09:00:00Z").toLocaleString());
+    expect(when.getAttribute("datetime")).toBe("2026-08-18T09:00:00Z");
+  });
+});
+
+describe("Chats - asking a question again", () => {
+  it("puts the question back in the box and sends nothing", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "why does the parser take 29 February 2100?" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "something else entirely" } });
+
+    fireEvent.click(await screen.findByRole("button", { name: /put this question back in the box/i }));
+
+    // It replaces what was there rather than appending — see the note on `reuse` in `Composer`.
+    await waitFor(() => expect(box.value).toBe("why does the parser take 29 February 2100?"));
+    // And nothing was said. The turn above is a billed run that already happened; this is a draft.
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/message", expect.anything());
+  });
+
+  it("puts the same question back twice", async () => {
+    // The bug a text-keyed effect would have: the second press changes nothing, because the
+    // text it is watching did not change. See the stamp on `reuse`.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "run the tests" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    const again = await screen.findByRole("button", { name: /put this question back in the box/i });
+
+    fireEvent.click(again);
+    await waitFor(() => expect(box.value).toBe("run the tests"));
+
+    fireEvent.change(box, { target: { value: "" } });
+    fireEvent.click(again);
+    await waitFor(() => expect(box.value).toBe("run the tests"));
+  });
+});
+
+describe("Chats - the list, cut into days", () => {
+  it("groups the conversations by when they last moved", async () => {
+    // NOW, and not "two hours ago". Two hours before 01:15 is yesterday, so a test written that
+    // way passes all afternoon and fails at night — which is exactly when it failed.
+    const now = Date.now();
+    const daysAgo = (days: number) => new Date(now - days * 86_400_000).toISOString();
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            // Not "just now": that is what `RelativeTime` writes for a fresh row, and a title
+            // that collides with the reading beside it makes this assertion ambiguous.
+            title: "o parser de datas",
+            last_activity: new Date(now).toISOString(),
+          }),
+          chatSummary({ chat_id: "c-2", title: "a week ago", last_activity: daysAgo(7) }),
+        ],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const today = await screen.findByRole("list", { name: "Today" });
+    expect(within(today).getByText("o parser de datas")).toBeDefined();
+
+    const earlier = await screen.findByRole("list", { name: "Earlier" });
+    expect(within(earlier).getByText("a week ago")).toBeDefined();
+
+    // No heading over a day with nothing under it.
+    expect(screen.queryByRole("list", { name: "Yesterday" })).toBeNull();
+  });
+});
+
+describe("Chats - a turn while it is running", () => {
+  it("names the tool it is in and keeps a clock on it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        {
+          "c-1": [
+            turnRow({
+              id: 7,
+              status: "running",
+              answer: null,
+              created_at: new Date(Date.now() - 84_000).toISOString(),
+            }),
+          ],
+        },
+        { live: { 7: { text: "", doing: "cargo test dates::" } } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // "thinking" is the wrong word for a wait on something that is compiling.
+    expect(await screen.findByText(/running cargo test dates::…/)).toBeDefined();
+    // Started 84 seconds ago, and the reading moves — which is what says it is alive.
+    expect(await screen.findByText("1:24")).toBeDefined();
+  });
+
+  it("stops the clock when the turn lands", async () => {
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      // Started now, so the clock reads in seconds rather than in the eight days the shared
+      // fixture's timestamp is old.
+      "c-1": [
+        turnRow({
+          id: 7,
+          status: "running",
+          answer: null,
+          created_at: new Date().toISOString(),
+        }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], transcripts, {
+        live: { 7: { text: "", doing: null } },
+      }),
+    );
+    const { queryClient } = await renderChats("/chats/c-1");
+
+    // Scoped to the transcript: the open conversation's row in the list says "thinking…" too,
+    // and a bare `findByText` would match both.
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("thinking…")).toBeDefined();
+    expect(within(transcript).getByText(/^0:0\d$/)).toBeDefined();
+
+    transcripts["c-1"] = [turnRow({ id: 7, status: "completed", answer: "done" })];
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.chats.detail("c-1") });
+    });
+
+    expect(await screen.findByText("done")).toBeDefined();
+    // The clock and the spinner go with the wait they were measuring.
+    expect(within(transcript).queryByText("thinking…")).toBeNull();
+    expect(within(transcript).queryByText(/^\d+:\d\d$/)).toBeNull();
+  });
+});
+
+/* ------------------------------------------- the rest of a long conversation -- */
+
+describe("Chats - a conversation longer than one read", () => {
+  /** Six turns, so a limit of two makes three pages. */
+  function sixTurns(): AssistantTurnRow[] {
+    return [1, 2, 3, 4, 5, 6].map((id) =>
+      turnRow({ id, asked: `question ${id}`, answer: `answer ${id}` }),
+    );
+  }
+
+  it("says the conversation goes further back, and goes and gets it", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": sixTurns() }, {
+        transcriptLimit: 2,
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    // The recent end, and nothing above it — which used to be the whole of what a page could show.
+    expect(await screen.findByText("answer 6")).toBeDefined();
+    expect(screen.queryByText("answer 4")).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Earlier turns" }));
+
+    expect(await screen.findByText("answer 4")).toBeDefined();
+    // And the newer half is still there: a page above is prepended, never swapped in.
+    expect(screen.getByText("answer 6")).toBeDefined();
+  });
+
+  it("stops offering earlier turns once the conversation begins", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": sixTurns() }, {
+        transcriptLimit: 3,
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Earlier turns" }));
+    expect(await screen.findByText("answer 1")).toBeDefined();
+
+    // The whole conversation is on the page. A button still offering more would be offering
+    // nothing — and the poll must not put it back, which is the bug `more` was shaped to avoid.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Earlier turns" })).toBeNull(),
+    );
+  });
+});
+
+describe("Chats - what a tool answered", () => {
+  it("opens one call and shows what came back, without asking for the others", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        {
+          "c-1": [
+            turnRow({
+              id: 4,
+              answer: "the three cases pass",
+              // As the transcript serves them: named, with the answers stripped.
+              did: [
+                { name: "Bash", detail: "cargo test dates::", todos: [] },
+                { name: "Read", detail: "core/src/dates.rs", todos: [] },
+              ],
+            }),
+          ],
+        },
+        {
+          turnTools: {
+            4: [
+              {
+                name: "Bash",
+                detail: "cargo test dates::",
+                todos: [],
+                result: "test result: ok. 3 passed; 0 failed",
+                result_chars: 36,
+              },
+              { name: "Read", detail: "core/src/dates.rs", todos: [], result: "fn leap()" },
+            ],
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // Nothing is fetched until something is opened: the answers are why they are not on the poll.
+    expect(await screen.findByText("cargo test dates::")).toBeDefined();
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/turns/4/tools");
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Bash cargo test dates:: — what it answered/ }),
+    );
+
+    expect(await screen.findByText("test result: ok. 3 passed; 0 failed")).toBeDefined();
+    // One open at a time — the other call's answer is not on the page.
+    expect(screen.queryByText("fn leap()")).toBeNull();
+  });
+
+  it("says what it is not showing rather than passing a cut answer off as the whole one", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 4, did: [{ name: "Read", detail: "big.rs", todos: [] }] })] },
+        {
+          turnTools: {
+            4: [
+              {
+                name: "Read",
+                detail: "big.rs",
+                todos: [],
+                result: "the first bit",
+                result_chars: 41203,
+              },
+            ],
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Read big.rs — what it answered/ }));
+
+    // The defect this prevents: somebody concludes the file ends where the excerpt does.
+    // The grouping separator is the machine's, not this test's: `toLocaleString` writes 41,203
+    // on one and a narrow no-break space on another, and both are right. Testing Library
+    // normalises the RENDERED text's whitespace and not the expected string's, so the expected
+    // one is normalised the same way here — otherwise this passes in one locale and not the next.
+    const cut = `the first 13 of ${(41203).toLocaleString()} characters`.replace(/\s+/g, " ");
+    expect(await screen.findByText(cut)).toBeDefined();
+  });
+
+  it("draws a turn whose tools nothing was recorded for", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [turnRow({ id: 4, did: [{ name: "Glob", detail: "**/*.rs", todos: [] }] })] },
+        { turnTools: { 4: [{ name: "Glob", detail: "**/*.rs", todos: [] }] } },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Glob/ }));
+
+    // Not an error, and not an empty box either: a turn from before the daemon kept these has
+    // nothing to show, and so does a tool that genuinely answered nothing.
+    expect(await screen.findByText("nothing was recorded for this one")).toBeDefined();
+  });
+});
+
+describe("Chats - finding something that was said", () => {
+  it("searches inside the conversations, not only their titles", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "the date parser" }),
+          chatSummary({ chat_id: "c-2", title: "the mail sidecar" }),
+        ],
+        {
+          "c-1": [turnRow({ id: 1, asked: "why 29 February?", answer: "the year rule" })],
+          "c-2": [
+            turnRow({ id: 2, asked: "does IMAP idle?", answer: "it uses a leap of faith" }),
+          ],
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "leap" } });
+
+    // No conversation is CALLED "leap" — this hit exists only because the word was said in one.
+    expect(await within(palette).findByText(/it uses a leap of faith/)).toBeDefined();
+    expect(within(palette).getByText("the mail sidecar")).toBeDefined();
+  });
+
+  it("takes you to the turn, not merely to the conversation", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", title: "the date parser" })],
+        {
+          "c-1": [
+            turnRow({ id: 1, asked: "why 29 February?", answer: "the year rule has three parts" }),
+            turnRow({ id: 2, asked: "and the tests?", answer: "1900, 2000 and 2024" }),
+          ],
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: /find a conversation/i });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "three parts" } });
+
+    fireEvent.click(await within(palette).findByText(/the year rule has three parts/));
+
+    // The turn is pointed AT, and not just scrolled somewhere plausible in a wall of exchanges.
+    await waitFor(() => {
+      const found = document.getElementById("turn-1");
+      expect(found?.className).toContain("chats-turn-lit");
+    });
+  });
+});
+
+/* --------------------------------------------- an answer, drawn as it was written -- */
+
+describe("Chats - the shapes an answer is written in", () => {
+  /** One settled turn whose answer is `written`. */
+  function answering(written: string) {
+    return chatsFetch([chatSummary({ chat_id: "c-1" })], {
+      "c-1": [turnRow({ id: 1, answer: written })],
+    });
+  }
+
+  it("draws a table as a table, not as rows of pipes", async () => {
+    daemon.apiFetch.mockImplementation(
+      answering(
+        [
+          "| ano  | bissexto |",
+          "| ---- | -------- |",
+          "| 1900 | nao      |",
+          "| 2000 | sim      |",
+        ].join("\n"),
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    const head = await screen.findByRole("columnheader", { name: "bissexto" });
+    expect(head).toBeDefined();
+    expect(screen.getAllByRole("row")).toHaveLength(3);
+    // And the characters it was made of are not on the page as characters.
+    expect(screen.queryByText(/\| 1900 \| nao/)).toBeNull();
+  });
+
+  it("keeps the paragraph breaks somebody typed", async () => {
+    // Every gap in every answer used to be dropped: the parser emitted the blank line and an empty
+    // paragraph is zero pixels tall, so three sections came out as one block of text.
+    daemon.apiFetch.mockImplementation(answering("primeira\n\nsegunda"));
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("primeira");
+    expect(container.querySelectorAll(".chats-rich-gap")).toHaveLength(1);
+  });
+
+  it("hangs a numbered item on the author's own number", async () => {
+    daemon.apiFetch.mockImplementation(answering("1. um\n2. dois"));
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("um");
+    const markers = [...container.querySelectorAll(".chats-rich-marker")].map(
+      (node) => node.textContent,
+    );
+    expect(markers).toEqual(["1.", "2."]);
+  });
+
+  it("keeps a nested item nested", async () => {
+    daemon.apiFetch.mockImplementation(answering("- um\n  - dentro"));
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("dentro");
+    const depths = [...container.querySelectorAll(".chats-rich-bullet")].map(
+      (node) => node.className,
+    );
+    expect(depths[0]).toContain("chats-rich-depth-0");
+    expect(depths[1]).toContain("chats-rich-depth-1");
+  });
+
+  it("hands a link to the OS, and never puts one in an href", async () => {
+    daemon.apiFetch.mockImplementation(
+      answering("ver [o calendario](https://exemplo.pt/gregoriano)"),
+    );
+    const { container } = await renderChats("/chats/c-1");
+
+    const link = await screen.findByRole("button", {
+      name: "Open https://exemplo.pt/gregoriano",
+    });
+    // Not an `<a href>`: an external URL from inside a webview is handled differently per platform
+    // and can simply be swallowed. Nothing out of a transcript is ever an address in this document.
+    expect(container.querySelector("a[href^='http']")).toBeNull();
+
+    fireEvent.click(link);
+    await waitFor(() =>
+      expect(opener.openUrl).toHaveBeenCalledWith("https://exemplo.pt/gregoriano"),
+    );
+  });
+
+  it("draws a hostile URL as text, with nothing to press", async () => {
+    // The defect this exists to prevent: a model writes a `javascript:` link and the window offers
+    // it as a control. It never becomes a link span at all — see `linkAt`.
+    daemon.apiFetch.mockImplementation(
+      answering("carrega [aqui](javascript:alert(1))"),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/javascript:alert\(1\)/)).toBeDefined();
+    expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
+    expect(opener.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("puts what you said on your own side of the exchange", async () => {
+    // Including the pictures, which used to be drawn under the `núcleo` label — a person's own
+    // screenshots, filed in the model's half.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, asked: "que cor e esta?", answer: "magenta", images: ["chats/1-0.png"] })],
+      }),
+    );
+    const { container } = await renderChats("/chats/c-1");
+
+    await screen.findByText("magenta");
+    const mine = container.querySelector(".chats-turn-said") as HTMLElement;
+    expect(within(mine).getByText("que cor e esta?")).toBeDefined();
+    expect(within(mine).getByRole("button", { name: /Open picture/ })).toBeDefined();
+  });
+});
+
+/* ------------------------------------------- a conversation opens at its end -- */
+
+/**
+ * jsdom has no layout: `scrollHeight` and `clientHeight` are 0 on every element and `scrollTop`
+ * will not hold a value that is assigned to it. Without all three there is no such thing as "the
+ * end of the box" for a test to be about, so they are lent for the length of one.
+ *
+ * On `Element.prototype` because the box under test is found by class, not by identity, and the
+ * undo is returned rather than left to `afterEach` so a test that fails still gives them back.
+ */
+function withLayout(startingHeight: number, clientHeight: number) {
+  let scrollHeight = startingHeight;
+  const names = ["scrollHeight", "clientHeight", "scrollTop"] as const;
+  const kept = names.map((name) => [
+    name,
+    Object.getOwnPropertyDescriptor(Element.prototype, name),
+  ] as const);
+  const tops = new WeakMap<Element, number>();
+
+  Object.defineProperty(Element.prototype, "scrollHeight", {
+    configurable: true,
+    get: () => scrollHeight,
+  });
+  Object.defineProperty(Element.prototype, "clientHeight", {
+    configurable: true,
+    get: () => clientHeight,
+  });
+  Object.defineProperty(Element.prototype, "scrollTop", {
+    configurable: true,
+    get(this: Element) {
+      return tops.get(this) ?? 0;
+    },
+    set(this: Element, to: number) {
+      tops.set(this, to);
+    },
+  });
+
+  const undo = () => {
+    for (const [name, was] of kept) {
+      if (was === undefined) Reflect.deleteProperty(Element.prototype, name);
+      else Object.defineProperty(Element.prototype, name, was);
+    }
+  };
+
+  /**
+   * Content arriving, in the only terms this environment has for it.
+   *
+   * Load-bearing for the live-turn tests, and the reason is worth stating: the mechanism this
+   * replaced was `scrollIntoView`, which jsdom does not implement AT ALL. A test that only checked
+   * the box had not moved would have passed against the broken code and the fixed code alike. The
+   * box has to be made to GROW, so that following it means landing somewhere it could not already
+   * have been.
+   */
+  const grewTo = (height: number) => {
+    scrollHeight = height;
+  };
+
+  return Object.assign(undo, { grewTo });
+}
+
+/** The one scrolling box on the page: the record of the conversation. */
+function theBox(container: HTMLElement) {
+  const box = container.querySelector(".chats-scroll");
+  expect(box).not.toBeNull();
+  return box as HTMLElement;
+}
+
+describe("Chats - a conversation opens at its end", () => {
+  it("opens one of this app's own at the last thing said in it", async () => {
+    const undo = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [
+            turnRow({ id: 1 }),
+            turnRow({ id: 2, asked: "e depois?", answer: "isto foi o fim" }),
+          ],
+        }),
+      );
+      const { container } = await renderChats("/chats/c-1");
+      await screen.findByText("isto foi o fim");
+
+      // The BOX, not an element inside it. What this used to aim at was the end of the transcript,
+      // and the transcript is not the last thing in the box: a question the run is waiting on, the
+      // files it changed and anything queued behind it are all drawn under it, so it landed short
+      // by however tall those happened to be.
+      await waitFor(() => expect(theBox(container).scrollTop).toBe(2000));
+    } finally {
+      undo();
+    }
+  });
+
+  it("opens one carried on from the editor at its end too", async () => {
+    // This door had no end-scroll at all. It is also the one where it matters most: an editor
+    // session opens on somebody else's whole day, and the line you came back for is the last one.
+    const undo = withLayout(2000, 500);
+    try {
+      const { container, choose } = await openThePicker([ideSession()]);
+      await choose("aaaa-1111");
+      await screen.findByPlaceholderText(/carry on where you left off/i);
+
+      await waitFor(() => expect(theBox(container).scrollTop).toBe(2000));
+    } finally {
+      undo();
+    }
+  });
+
+  it("leaves a reader who has scrolled up where they are", async () => {
+    const undo = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [turnRow({ id: 1, answer: "isto foi o fim" })],
+        }),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("isto foi o fim");
+      const box = theBox(container);
+      await waitFor(() => expect(box.scrollTop).toBe(2000));
+
+      // Reading something further up, while the transcript keeps polling underneath.
+      box.scrollTop = 0;
+      fireEvent.scroll(box);
+      await act(async () => {
+        // A real poll, and it has to be: react-query shares structure, so handing it data that is
+        // deeply equal to what it holds gives back the SAME object and nothing re-renders at all.
+        // A spread of the old transcript would have made this test pass while proving nothing.
+        queryClient.setQueryData<Transcript>(keys.chats.detail("c-1"), (old) =>
+          old === undefined
+            ? old
+            : {
+                ...old,
+                turns: [...old.turns, { ...old.turns[0], id: 99, answer: "e mais isto" }],
+              },
+        );
+      });
+      await screen.findByText("e mais isto");
+
+      expect(box.scrollTop).toBe(0);
+    } finally {
+      undo();
+    }
+  });
+
+  it("keeps up with a turn that is still writing", async () => {
+    // The words of a live turn arrive on that component's OWN poll — the list above it does not
+    // re-render — so the door's scroll effect never fires for any of them. The box has to be made
+    // to grow for this to mean anything: see `grewTo`.
+    const layout = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch(
+          [chatSummary({ chat_id: "c-1" })],
+          { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+          { live: { 1: { text: "primeiro", doing: null } } },
+        ),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("primeiro");
+      const box = theBox(container);
+      await waitFor(() => expect(box.scrollTop).toBe(2000));
+
+      // More words, and the page taller for them.
+      layout.grewTo(3000);
+      await act(async () => {
+        queryClient.setQueryData(keys.chats.live(1), {
+          text: "primeiro e depois muito mais",
+          doing: null,
+          did: [],
+          thought: [],
+          thought_tokens: null,
+        });
+      });
+      await screen.findByText("primeiro e depois muito mais");
+
+      expect(box.scrollTop).toBe(3000);
+    } finally {
+      layout();
+    }
+  });
+
+  it("does not haul a reader back down while a turn writes", async () => {
+    // Reading something further up while an answer writes was a thing the page undid once a
+    // second. This guards the direction rather than the old defect: the mechanism that caused it
+    // was `scrollIntoView`, which jsdom does not implement, so nothing here could have caught it
+    // before the fix. It catches the next person who makes the live turn scroll unconditionally.
+    const layout = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch(
+          [chatSummary({ chat_id: "c-1" })],
+          { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+          { live: { 1: { text: "primeiro", doing: null } } },
+        ),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("primeiro");
+      const box = theBox(container);
+      await waitFor(() => expect(box.scrollTop).toBe(2000));
+
+      box.scrollTop = 0;
+      fireEvent.scroll(box);
+      layout.grewTo(3000);
+      await act(async () => {
+        queryClient.setQueryData(keys.chats.live(1), {
+          text: "primeiro e depois muito mais",
+          doing: null,
+          did: [],
+          thought: [],
+          thought_tokens: null,
+        });
+      });
+      await screen.findByText("primeiro e depois muito mais");
+
+      expect(box.scrollTop).toBe(0);
+    } finally {
+      layout();
+    }
+  });
+
+  it("follows the end again once the reader comes back to it", async () => {
+    const undo = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [turnRow({ id: 1, answer: "isto foi o fim" })],
+        }),
+      );
+      const { container, queryClient } = await renderChats("/chats/c-1");
+      await screen.findByText("isto foi o fim");
+      const box = theBox(container);
+
+      box.scrollTop = 0;
+      fireEvent.scroll(box);
+      // Back down to the end. `scrollHeight - clientHeight` is where the end is.
+      box.scrollTop = 1500;
+      fireEvent.scroll(box);
+      await act(async () => {
+        // A real poll, and it has to be: react-query shares structure, so handing it data that is
+        // deeply equal to what it holds gives back the SAME object and nothing re-renders at all.
+        // A spread of the old transcript would have made this test pass while proving nothing.
+        queryClient.setQueryData<Transcript>(keys.chats.detail("c-1"), (old) =>
+          old === undefined
+            ? old
+            : {
+                ...old,
+                turns: [...old.turns, { ...old.turns[0], id: 99, answer: "e mais isto" }],
+              },
+        );
+      });
+      await screen.findByText("e mais isto");
+
+      expect(box.scrollTop).toBe(2000);
+    } finally {
+      undo();
+    }
+  });
+});
+
+/* ------------------------------------------ the conversation, at the size you want it -- */
+
+describe("Chats - how large the conversation is drawn", () => {
+  /** One settled turn is enough: what is under test is the class on the box, not the turns. */
+  async function openOne() {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, answer: "uma resposta" })],
+      }),
+    );
+    const view = await renderChats("/chats/c-1");
+    await screen.findByText("uma resposta");
+    return { ...view, box: () => theBox(view.container) };
+  }
+
+  const press = (key: string) =>
+    fireEvent.keyDown(window, { key, ctrlKey: true });
+
+  it("opens at the page's own size when nothing has been asked for", async () => {
+    // The defect this exists to catch: `Number(null)` is 0, which is a perfectly valid index into
+    // the ladder, so a window that had never been zoomed opened every conversation at the SMALLEST
+    // step and the default was unreachable until you pressed the keys.
+    const { box } = await openOne();
+
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("goes down a step on ctrl and minus, and back up on ctrl and plus", async () => {
+    const { box } = await openOne();
+
+    act(() => press("-"));
+    expect(box().className).toContain("chats-zoom-90");
+    act(() => press("-"));
+    expect(box().className).toContain("chats-zoom-80");
+    act(() => press("="));
+    expect(box().className).toContain("chats-zoom-90");
+  });
+
+  it("takes the unshifted keys, which are the ones a keyboard sends", async () => {
+    const { box } = await openOne();
+
+    act(() => press("_"));
+    expect(box().className).toContain("chats-zoom-90");
+    act(() => press("+"));
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("puts it back on ctrl and zero", async () => {
+    const { box } = await openOne();
+
+    act(() => press("-"));
+    act(() => press("-"));
+    act(() => press("0"));
+
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("stops at the ends of the ladder rather than running off them", async () => {
+    const { box } = await openOne();
+
+    for (let i = 0; i < 12; i += 1) act(() => press("-"));
+    expect(box().className).toContain("chats-zoom-67");
+    for (let i = 0; i < 20; i += 1) act(() => press("="));
+    expect(box().className).toContain("chats-zoom-200");
+  });
+
+  it("leaves the key alone unless ctrl is held", async () => {
+    // Somebody typing a dash into the box is not asking for a smaller conversation.
+    const { box } = await openOne();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "-" });
+      fireEvent.keyDown(window, { key: "-", ctrlKey: true, altKey: true });
+    });
+
+    expect(box().className).toContain("chats-zoom-100");
+  });
+
+  it("remembers the size the next time the conversation is opened", async () => {
+    const first = await openOne();
+    act(() => press("-"));
+    expect(first.box().className).toContain("chats-zoom-90");
+    first.unmount();
+
+    const again = await openOne();
+    expect(again.box().className).toContain("chats-zoom-90");
+  });
+
+  it("changes nothing outside the record of the conversation", async () => {
+    // The whole reason this is not the webview's own zoom: that one takes the rail, the page
+    // header and the box you type into with it, and a smaller conversation is what was asked for.
+    const { container, box } = await openOne();
+    act(() => press("-"));
+
+    expect(box().className).toContain("chats-zoom-90");
+    for (const sel of [".chats-detail-head", ".chats-composer-box", ".ui-page-header"]) {
+      const other = container.querySelector(sel);
+      if (other === null) continue;
+      expect(other.className).not.toContain("chats-zoom");
+    }
   });
 });

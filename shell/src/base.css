@@ -27,6 +27,20 @@ html {
      painting it here keeps a white flash out of a dark app. */
   background: var(--bg);
   -webkit-text-size-adjust: 100%;
+  /**
+   * Nothing in this app moves sideways because a hand did.
+   *
+   * A touchpad reports one gesture on two axes, and a scroll up is never purely up: the sideways
+   * component is small, constant, and involuntary. The browser answered it with an elastic drag —
+   * the page slid, then sprang back on release — which is a web convention borrowed from a
+   * back-gesture this window does not have. Reading a conversation, it means the column shifts
+   * under the line you are on for as long as you keep scrolling.
+   *
+   * `none` and not `contain`: `contain` only stops the gesture reaching an ANCESTOR, and the drag
+   * complained about was the element's own. It is the horizontal axis only — vertical overscroll
+   * is how a scroll says it has reached the end, and that is worth keeping.
+   */
+  overscroll-behavior-x: none;
   /* Reserved so that locking the page behind an overlay does not shift the
      layout sideways by the width of a scrollbar. See the scroll-lock block at
      the end of this file for why that compensation cannot come from the

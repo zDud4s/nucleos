@@ -138,11 +138,15 @@ pub struct Conversation {
     /// Roughly how many tokens continuing this session would carry, or `None` for a file that
     /// could not be read.
     ///
-    /// The ceiling that refuses to resume past `CONTEXT_ROTATION_TOKENS` reads its number off the
-    /// daemon's OWN prior runs, and a session just picked up from the editor has none — so the
-    /// first turn resumed whatever it found, however large. One did: a real pick-up carrying about
-    /// 180k of live context resumed blindly and billed $1.72 for a one-word answer, uncached,
-    /// because a resume re-sends the whole window as fresh input.
+    /// What reads it is the pick-up path, which uses it to give the conversation a window wide
+    /// enough to hold what it is inheriting — and, above the largest window any model has, to hand
+    /// it a tail instead, because there is then nothing to resume INTO.
+    ///
+    /// It was written for a narrower job: refusing the pick-up outright above 140k, after a real
+    /// one carrying about 180k of live context resumed blindly and billed $1.72 for a one-word
+    /// answer. That refusal is gone. What it was protecting against is a COLD CACHE on a large
+    /// context, and the bound that actually holds against it is the CLI's own — it never sends more
+    /// than its window and compacts to stay under it — which this number now feeds instead.
     ///
     /// Rough on purpose, and named so. Four characters to the token is wrong in both directions and
     /// wrong by tens of percent; what it has to be right about is the order of magnitude, because

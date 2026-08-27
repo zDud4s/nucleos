@@ -250,7 +250,7 @@ pub async fn run_gate(
 ///
 /// This is not a shell parser: operators such as `&&` have no special meaning. Use an explicit
 /// shell command such as `bash -c "cargo test && cargo clippy"` when shell evaluation is required.
-fn split_command(command: &str) -> Result<Vec<String>, String> {
+pub(crate) fn split_command(command: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;

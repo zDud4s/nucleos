@@ -9,6 +9,10 @@ lerna-debug.log*
 
 node_modules
 dist
+# The CSP gate's bundle. Never `dist/`: that one is embedded into the Tauri binary at compile time.
+dist-csp-gate
+# The preview's bundle, for the same reason.
+dist-preview
 dist-ssr
 *.local
 

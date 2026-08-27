@@ -3199,6 +3199,7 @@ mod tests {
         crate::state::AppState {
             token: crate::auth::Token("verification-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -3210,6 +3211,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

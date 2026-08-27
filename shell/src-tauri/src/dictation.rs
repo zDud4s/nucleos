@@ -40,6 +40,17 @@ const CLIPBOARD_SETTLE: std::time::Duration = std::time::Duration::from_millis(1
 /// this process; the device lives in the other one.
 const START_EVENT: &str = "voice://start";
 const STOP_EVENT: &str = "voice://stop";
+/// Emitted by the third chord, and carrying nothing.
+///
+/// The asymmetry with the other two is the design, not an omission. A dictation is a recording this
+/// process drives — it captured a window handle and it will paste into it — so its state lives here.
+/// A conversation is a MODE, and everything the mode does happens in the webview: the gate that hears
+/// speech, the queue that plays the answer, and the decision to stop that queue when somebody cuts in.
+/// `shell/src/lib/conversation.ts` says why that decision cannot afford to cross this boundary.
+///
+/// So this process contributes the one thing the webview cannot have — a chord that works when the
+/// window is not focused — and gets out of the way.
+const CONVERSATION_EVENT: &str = "voice://conversation-toggle";
 
 /// What the shell is doing right now, and which window it promised the text to.
 #[derive(Default)]
@@ -266,8 +277,13 @@ pub fn voice_abandon(state: State<'_, Dictation>) -> Result<(), String> {
 /// configured chords exist — `.ai/voice.yaml` is self-governing and the shell may not read it.
 /// Re-registering replaces what was there, so editing the config and reloading the tab is enough.
 #[tauri::command]
-pub fn voice_register_hotkeys(app: AppHandle, dictation: String, memo: String) -> Vec<String> {
-    register_hotkeys(&app, &dictation, &memo)
+pub fn voice_register_hotkeys(
+    app: AppHandle,
+    dictation: String,
+    memo: String,
+    conversation: String,
+) -> Vec<String> {
+    register_hotkeys(&app, &dictation, &memo, &conversation)
 }
 
 fn poisoned() -> String {
@@ -330,7 +346,12 @@ fn restore(borrowed: Option<String>, ours: &str) {
 /// A chord already taken by another application cannot be registered, and that is common — the shell
 /// must still run, with the tab able to say which one did not take. Dictation stays reachable from the
 /// tab's own buttons, so a collision costs convenience and not the feature.
-fn register_hotkeys(app: &AppHandle, dictation: &str, memo: &str) -> Vec<String> {
+fn register_hotkeys(
+    app: &AppHandle,
+    dictation: &str,
+    memo: &str,
+    conversation: &str,
+) -> Vec<String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     // Whatever was registered before is dropped first: without this, changing a chord in the config
@@ -338,7 +359,11 @@ fn register_hotkeys(app: &AppHandle, dictation: &str, memo: &str) -> Vec<String>
     let _ = app.global_shortcut().unregister_all();
 
     let mut refused = Vec::new();
-    for (chord, is_memo) in [(dictation, false), (memo, true)] {
+    for (chord, chord_kind) in [
+        (dictation, Chord::Dictation),
+        (memo, Chord::Memo),
+        (conversation, Chord::Conversation),
+    ] {
         if chord.trim().is_empty() {
             continue;
         }
@@ -347,14 +372,25 @@ fn register_hotkeys(app: &AppHandle, dictation: &str, memo: &str) -> Vec<String>
             .global_shortcut()
             .on_shortcut(chord, move |_, _, event| {
                 // Pressed only. A chord reports both press and release, and acting on both would
-                // start and immediately stop every recording.
+                // start and immediately stop every recording — and would toggle the conversation
+                // mode in and straight back out on every press.
                 if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
                     return;
                 }
                 let app = handle.clone();
-                let state = app.state::<Dictation>();
-                if let Err(error) = voice_hotkey(app.clone(), state, is_memo) {
-                    eprintln!("[voice] hotkey failed: {error}");
+                match chord_kind {
+                    Chord::Conversation => {
+                        if let Err(error) = app.emit(CONVERSATION_EVENT, ()) {
+                            eprintln!("[voice] could not toggle conversation: {error}");
+                        }
+                    }
+                    Chord::Dictation | Chord::Memo => {
+                        let state = app.state::<Dictation>();
+                        let is_memo = chord_kind == Chord::Memo;
+                        if let Err(error) = voice_hotkey(app.clone(), state, is_memo) {
+                            eprintln!("[voice] hotkey failed: {error}");
+                        }
+                    }
                 }
             });
         if registered.is_err() {
@@ -362,6 +398,19 @@ fn register_hotkeys(app: &AppHandle, dictation: &str, memo: &str) -> Vec<String>
         }
     }
     refused
+}
+
+/// Which of the three chords fired.
+///
+/// A third enum rather than a third `Kind`, because these are not three of the same thing: two of
+/// them start a recording this process owns, and the third toggles a mode it does not. Folding them
+/// into `Kind` would put a value in the type that serialises into the núcleo's `kind` parameter and
+/// is never sent there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chord {
+    Dictation,
+    Memo,
+    Conversation,
 }
 
 #[cfg(test)]

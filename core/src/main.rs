@@ -21,6 +21,7 @@ mod config;
 mod contacts;
 mod council;
 mod daemon_client;
+mod detect;
 mod email;
 mod errands;
 mod exclusion;
@@ -38,14 +39,21 @@ mod job;
 mod local_agent;
 mod logging;
 mod mailsend;
+mod map_intent;
+mod map_join;
+mod map_store;
 mod mcp_tools;
 mod mentions;
 mod notes;
 mod notify;
+mod ownership;
 mod pii_shadow;
 mod presets;
 mod priority;
 mod process_tree;
+mod project_commands;
+mod project_map;
+mod project_readings;
 mod proposals;
 mod recurrence;
 mod redact;
@@ -58,9 +66,11 @@ mod runs;
 mod scheduler;
 mod search;
 mod secrets;
+mod seed;
 mod sessions;
 mod shadow;
 mod sidecar;
+mod speak;
 mod state;
 mod storage;
 mod team;
@@ -76,6 +86,8 @@ mod web;
 mod web_client;
 mod webhook;
 mod wip;
+mod workflow_graph;
+mod workflows;
 mod worktree;
 
 use auth::Token;
@@ -114,6 +126,39 @@ fn read_secret_from_stdin(prompt: &str) -> Option<String> {
         .trim_end_matches('\r')
         .to_owned();
     if value.is_empty() { None } else { Some(value) }
+}
+
+/// The workflow library, with the built-in autopilot in it.
+///
+/// **Seeding failing does not stop the daemon**, and that is the whole of the error handling here.
+/// A library that could not be written is a canvas with one fewer workflow on it; refusing to start
+/// over it would take away email, chats, runs and the autopilot itself because a picture could not
+/// be drawn. It is said out loud and then let go — the same shape [`crate::backup`] uses for a
+/// restore that could not be applied.
+fn seeded_library() -> Option<std::path::PathBuf> {
+    let root = workflows::library_root()?;
+    match seed::seed(&root) {
+        // The ordinary case, on every start after the first, and it says nothing.
+        Ok(seed::Seeded::Unchanged) => {}
+        Ok(seed::Seeded::Written) => {
+            tracing::info!(
+                name = seed::NAME,
+                version = seed::VERSION,
+                "seeded the built-in workflow"
+            )
+        }
+        // The one case a person needs told: their disk changed under a name that means one thing.
+        Ok(seed::Seeded::Restored) => tracing::warn!(
+            name = seed::NAME,
+            version = seed::VERSION,
+            "the built-in workflow had been changed on disk and was restored; publish a new version \
+             to keep your own"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not seed the built-in workflow; the library is short one")
+        }
+    }
+    Some(root)
 }
 
 #[tokio::main]
@@ -339,6 +384,19 @@ async fn main() {
         .expect("failed to open local database");
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
+    // Beside the run sweep and for the same reason: a row saying `running` against a process that
+    // has not existed since the last restart would refuse every future click with "already
+    // running". Best-effort — a project command left unsettled is a button that will not press, not
+    // a daemon that must not start.
+    match project_commands::reconcile_orphaned_commands(&pool).await {
+        Ok(0) => {}
+        Ok(settled) => tracing::info!(
+            settled,
+            "settled project commands left running by a restart"
+        ),
+        Err(error) => tracing::warn!(%error, "could not settle project commands left running"),
+    }
+
     let interrupted = runs::reconcile_orphaned_runs(&pool)
         .await
         .expect("failed to reconcile orphaned runs on startup");
@@ -444,7 +502,7 @@ async fn main() {
         };
     tracing::info!("nucleos-core token loaded from Credential Manager");
 
-    let models_config_path = std::path::PathBuf::from(".ai/nucleos-models.yaml");
+    let models_config_path = std::path::PathBuf::from(config::MODELS_CONFIG_PATH);
     let models_config = config::load_models_config(&models_config_path).unwrap_or_else(|e| {
         tracing::warn!("failed to parse .ai/nucleos-models.yaml ({e}), using defaults");
         config::ModelsConfig::default()
@@ -518,6 +576,7 @@ async fn main() {
     let calendar_config = config::load_calendar_config(std::path::Path::new(".ai/calendar.yaml"));
     let web_config = config::load_web_config(std::path::Path::new(".ai/web.yaml"));
     let browser_config = config::load_browser_config(std::path::Path::new(".ai/browser.yaml"));
+    let telegram_config = config::load_telegram_config(std::path::Path::new(".ai/telegram.yaml"));
     // The path is named once and reused, because two facts come off it: what the file SAYS
     // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
     // `GithubRuntime::configured` — and deriving it from a second literal is how the two would come
@@ -721,6 +780,10 @@ async fn main() {
         local_triage_disabled,
         local_assistant,
         files_root,
+        // `None` when this machine has no home directory to hang a library off. Resolved here and
+        // not per request, like `files_root` above: it is a fact about the machine.
+        workflow_library: seeded_library(),
+        telegram_doctrine: telegram_config.doctrine,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,

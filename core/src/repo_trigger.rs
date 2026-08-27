@@ -570,6 +570,7 @@ mod tests {
         crate::state::AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -578,6 +579,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),

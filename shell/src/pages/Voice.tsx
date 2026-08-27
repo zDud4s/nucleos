@@ -148,18 +148,33 @@ export function Voice() {
     };
   }, []);
 
-  /** Register both hotkeys once the config that names them has answered, and again only if the chords actually change. */
+  /**
+   * Register all three hotkeys once the config that names them has answered, and again only if the
+   * chords actually change.
+   *
+   * All three in ONE call, because `register_hotkeys` unregisters everything before it registers
+   * anything — a second call naming only the conversation chord would silently drop the other two.
+   * That is also why the conversation chord is registered from this page even though the mode it
+   * toggles is driven from the chat: the registration is indivisible, and this is the page that
+   * already holds the config it comes from.
+   */
   useEffect(() => {
     const dictationHotkey = config.data?.hotkey;
     const memoHotkey = config.data?.memo_hotkey;
+    const conversationHotkey = config.data?.conversation_hotkey;
     if (dictationHotkey === undefined || memoHotkey === undefined) return;
-    const key = `${dictationHotkey} ${memoHotkey}`;
+    const conversation = conversationHotkey ?? "";
+    const key = `${dictationHotkey} ${memoHotkey} ${conversation}`;
     if (registeredHotkeysRef.current === key) return;
     registeredHotkeysRef.current = key;
-    invoke<string[]>("voice_register_hotkeys", { dictation: dictationHotkey, memo: memoHotkey })
+    invoke<string[]>("voice_register_hotkeys", {
+      dictation: dictationHotkey,
+      memo: memoHotkey,
+      conversation,
+    })
       .then((failed) => setHotkeyConflicts(failed))
       .catch(() => setHotkeyRegisterFailed(true));
-  }, [config.data?.hotkey, config.data?.memo_hotkey]);
+  }, [config.data?.hotkey, config.data?.memo_hotkey, config.data?.conversation_hotkey]);
 
   async function beginRecording(kind: "dictation" | "memo") {
     setOutcome(null);

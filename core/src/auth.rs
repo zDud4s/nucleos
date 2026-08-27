@@ -177,6 +177,59 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/cat"),
     (Method::GET, "/projects/{id}/grep"),
     (Method::GET, "/projects/{id}/diff"),
+    // The rest of the same family, added when the workspace gave them callers. Each is strictly
+    // less than one already here: `blame` is metadata about lines `cat` returns whole, `log` and
+    // `branches` are the history behind the `diff`, and `changed` is a file list plus a count. A
+    // reader that may read the files and may not learn who last touched a line is a distinction
+    // with nothing behind it.
+    //
+    // `readings` is thirty days of this project's own tallies — cost, gate, tokens, time to land —
+    // and belongs beside `/projects` for the reason `/concurrency` does: it describes the shape of
+    // the work and changes none of it.
+    //
+    // `worktree` hands back an absolute path on this machine. Listed anyway, and the argument is
+    // the same one `/runs/{id}/tail` is listed under: the holder can already read every file in
+    // that checkout through `cat?run=`, so withholding where it sits protects nothing and would
+    // make the door to an editor the one thing a reader had to be an admin to open.
+    //
+    // `ownership` is the write boundary, read. Knowing which files the app would write is not
+    // permission to write one — `POST /projects/{id}/write` is in no table at all — and a fence
+    // only a privileged caller can see is a fence nobody can argue with.
+    //
+    // `map` lists every source path in the project and the import graph between them — and, since
+    // the junction moved onto this route, the text of every approved decision read against that
+    // graph. A reader who already reaches `cat`, `grep` and `blame` can already read the contents
+    // of those same files, so a list of their names grants nothing it did not already have; and
+    // the decisions are the grant `map/decisions` is justified under in the next paragraph, on an
+    // argument that does not weaken by their being approved — either way they are sentences lifted
+    // out of a spec sitting in a folder this reader can `cat` whole. So the permission does not
+    // change and no row is added: `map` was already in this table. The sentence is corrected
+    // rather than left standing, because a comment that still read "and nothing else" is how the
+    // next reader concludes the decisions arrived on this route without anybody weighing them.
+    //
+    // `map/decisions` is the pile nobody has read yet: sentences a model lifted out of a document
+    // already sitting in that project's folder. A reader who reaches `map` and `cat` can read the
+    // spec they came from whole, so the extract of it grants nothing they did not already have.
+    // Only the GET. `POST /projects/{id}/map/extract` and `POST /projects/{id}/map/decisions/{n}`
+    // are in NO table, here or in `RUN_CREATING_ROUTES`, which leaves them to Admin and the control
+    // token by default-deny — and both belong there. Extracting spends a model, which a read-only
+    // key never bought; approving is the owner's stamp, and it is the act that puts a line in the
+    // map. Neither is a read, and neither is a thing done on the owner's behalf by a weaker key.
+    //
+    // `map/specs` is the list of filenames a reader can already see through `ls` — it names
+    // nothing `cat` could not already show. Naming them here is what lets the extraction button
+    // offer a choice instead of a text box; it spends no model and settles nothing, so it costs
+    // this key no more than `map` beside it does.
+    (Method::GET, "/projects/{id}/readings"),
+    (Method::GET, "/projects/{id}/log"),
+    (Method::GET, "/projects/{id}/branches"),
+    (Method::GET, "/projects/{id}/blame"),
+    (Method::GET, "/projects/{id}/changed"),
+    (Method::GET, "/projects/{id}/worktree"),
+    (Method::GET, "/projects/{id}/ownership"),
+    (Method::GET, "/projects/{id}/map"),
+    (Method::GET, "/projects/{id}/map/decisions"),
+    (Method::GET, "/projects/{id}/map/specs"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),
@@ -756,6 +809,7 @@ mod tests {
         AppState {
             token: Token(token.to_string()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -764,6 +818,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
             voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
@@ -2048,6 +2103,164 @@ mod tests {
         for (method, pattern) in READ_ONLY_ROUTES {
             assert!(!permits(&run, method, pattern));
         }
+    }
+
+    /// Writing a project's own rules is the owner's, and nobody else's.
+    ///
+    /// The file behind this route is `.ai/autopilot.yaml`, and it carries `gate_command` — the
+    /// command whose exit code decides what *green* means for every run in the project. A key that
+    /// could rewrite it could set the gate to `true` and pass every gate it will ever face, which
+    /// makes this the one write on the project surface where the blast radius is the whole quality
+    /// bar rather than one file.
+    ///
+    /// Asserted as membership rather than through a request, like `POST /email/send` above and for
+    /// the same reason: `permits` is default-deny, so the route is safe today by being in no table.
+    /// What that does not survive is somebody adding it to `READ_ONLY_ROUTES` beside the six reads
+    /// that share its URL prefix, which would read as tidying up. This is the test that says no.
+    #[test]
+    fn writing_a_projects_rules_is_in_no_scope_table() {
+        const WRITE_ROUTE: &str = "/projects/{id}/write";
+
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(RUN_CREATING_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(TEAM_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(EMAIL_ROUTES, &Method::POST, WRITE_ROUTE)
+                && !route_is_listed(COUNCIL_ROUTES, &Method::POST, WRITE_ROUTE),
+            "deciding what green means must stay out of every scope table"
+        );
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, "/projects/7/write"),
+                "{scope:?} must not be able to rewrite a project's gate command"
+            );
+        }
+
+        // The reads beside it stay reads. A boundary a reader cannot see is a boundary nobody can
+        // argue with, and seeing it is not permission to cross it.
+        assert!(permits(
+            &Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            &Method::GET,
+            "/projects/7/ownership"
+        ));
+    }
+
+    /// A project's commands are the owner's, to read and to run.
+    ///
+    /// The run route spawns a process of the project's own choosing, which is plainly not a read.
+    /// The **listing** is out of the table too, and that is the half worth an assertion: it is the
+    /// same class of information `GET /projects/{id}/rules` holds — what this project runs on its
+    /// own — and that route has always been Admin's. It also names which commands are marked
+    /// runnable by an agent, which is a map of the surface rather than a fact about the code.
+    ///
+    /// Membership rather than a request, like `POST /email/send` and `POST /projects/{id}/write`
+    /// above: `permits` is default-deny, so these are safe today by being nowhere. What that does
+    /// not survive is somebody filing them beside the seven `/projects/{id}/…` reads that share
+    /// their prefix, which would read as consistency.
+    #[test]
+    fn a_projects_commands_are_in_no_scope_table() {
+        for (method, pattern) in [
+            (Method::GET, "/projects/{id}/commands"),
+            (Method::POST, "/projects/{id}/commands"),
+            (Method::DELETE, "/projects/{id}/commands/{command_id}"),
+            (Method::POST, "/projects/{id}/commands/{command_id}/run"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, &method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, &method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, pattern),
+                "{method} {pattern} must stay out of every scope table"
+            );
+        }
+
+        // And the one that matters most, asked as a request: a run's key opens exactly the safety
+        // gate, so `runnable_by` is belt and braces rather than the only thing standing here.
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, "/projects/7/commands/1/run"),
+                "{scope:?} must not be able to run a project's commands"
+            );
+        }
+        assert!(permits(
+            &Scope::Control,
+            &Method::POST,
+            "/projects/7/commands/1/run"
+        ));
+    }
+
+    /// A project's workflows are the owner's, to read and to change.
+    ///
+    /// Six routes, all out of every table, and the reads are the half worth arguing for. A
+    /// workflow is the *instructions an agent is given*: which nodes run, on which model, behind
+    /// which gate. A run able to read the graph it is being executed by is a run reading the shape
+    /// of its own supervision, and one able to write it could switch the review node off. The
+    /// library listing goes with them — it names every workflow on the machine, which is a map of
+    /// the house rather than a fact about this project.
+    ///
+    /// Membership rather than a request, like the commands above: `permits` is default-deny, so
+    /// these are safe today by being nowhere. What that does not survive is somebody filing the
+    /// GETs beside the eight `/projects/{id}/…` reads that share their prefix.
+    #[test]
+    fn a_projects_workflows_are_in_no_scope_table() {
+        for (method, pattern) in [
+            (Method::GET, "/workflows/library"),
+            (Method::GET, "/projects/{id}/workflows"),
+            (Method::POST, "/projects/{id}/workflows"),
+            (Method::DELETE, "/projects/{id}/workflows/{name}"),
+            (Method::POST, "/projects/{id}/workflows/{name}/eject"),
+            (Method::POST, "/projects/{id}/workflows/{name}/update"),
+            (Method::GET, "/projects/{id}/workflows/{name}/diff"),
+            (Method::GET, "/projects/{id}/workflows/{name}/graph"),
+            (Method::POST, "/projects/{id}/workflows/{name}/nodes/{node}"),
+            (Method::POST, "/projects/{id}/workflows/adopt"),
+            // Reads a path nobody has vouched for — see `detect.rs`. Default-deny leaves it to the
+            // key of the person sitting at the machine, which is the only one that should be able
+            // to point this daemon at an arbitrary folder.
+            (Method::GET, "/projects/detect"),
+        ] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, &method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, &method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, pattern),
+                "{method} {pattern} must stay out of every scope table"
+            );
+        }
+
+        // And the one that would matter most, asked as a request: ejecting writes a whole bundle
+        // into the project's folder, which is exactly what §7.5 says may not have a door here that
+        // an agent lacks.
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, "/projects/7/workflows/harness/eject"),
+                "{scope:?} must not be able to eject a project's workflow"
+            );
+            assert!(
+                !permits(&scope, &Method::GET, "/projects/7/workflows"),
+                "{scope:?} must not be able to read which workflows a project uses"
+            );
+        }
+        assert!(permits(
+            &Scope::Control,
+            &Method::POST,
+            "/projects/7/workflows/harness/eject"
+        ));
     }
 
     /// A department's key lives for hours and crosses dozens of subprocesses, which makes it the

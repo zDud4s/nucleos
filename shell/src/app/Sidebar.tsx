@@ -1,6 +1,7 @@
 import { useState, type KeyboardEvent, type ReactNode } from "react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { NAV, SYSTEM_ITEM, type NavBadge, type NavItem } from "./nav";
+import type { AutopilotMode } from "../data/system";
 
 /**
  * Where the icon-collapse lives between sessions.
@@ -64,6 +65,58 @@ function spokenName(label: string, count: number | undefined, alert: boolean): s
   return extras.length === 0 ? undefined : `${label}, ${extras.join(", ")}`;
 }
 
+/**
+ * One project, as the rail needs it.
+ *
+ * Deliberately not `ProjectSummary`: the rail wants three fields and that type
+ * has fifteen, and taking the whole thing would tie the sidebar to the roster
+ * route's shape. What is here is what is drawn — the name, the dot, the summons.
+ */
+export interface ProjectNavEntry {
+  /** The daemon's project id, which is also the name it is known by. */
+  id: string;
+  mode: AutopilotMode;
+  /** Decisions waiting in this project. Zero draws no badge — a badge is a summons. */
+  pending: number;
+}
+
+/**
+ * Where in the path a project is, so a workspace stays lit across its modes.
+ *
+ * The rail's ordinary prefix rule compares against the item's own path, which
+ * for a project is its Estado mode. Someone reading the Workflows mode is still
+ * *in* that project, and a rail that went dark on the way between modes would
+ * say they had left it.
+ */
+function projectOf(pathname: string): string | undefined {
+  const parts = pathname.split("/").filter((part) => part !== "");
+  return parts[0] === "projects" ? parts[1] : undefined;
+}
+
+/**
+ * Whether the roster belongs on screen at all.
+ *
+ * **The rail is destinations; the roster is content, and content grows.** Every
+ * other entry in the sidebar is one of a fixed list decided at design time — one
+ * more project is one more row, for ever, and a machine watching fifteen of them
+ * pushes Work and Pillars off the bottom edge to show names that are only useful
+ * to somebody already working in one of them. The rail was the wrong home for a
+ * list whose length is not ours to choose.
+ *
+ * So the rows appear where they are the subject: on `/projects`, and inside a
+ * workspace. That keeps the one thing they were promoted for — switching
+ * projects without going back out to the list, which is what a day of work
+ * actually consists of — and gives back the space everywhere else, where a
+ * project name is a destination you reach through `All projects` like any other
+ * page.
+ *
+ * `/projects/new` counts, deliberately: the wizard is in the area, and a rail
+ * that emptied while somebody added a project would read as having lost them.
+ */
+function inProjects(pathname: string): boolean {
+  return pathname.split("/").filter((part) => part !== "")[0] === "projects";
+}
+
 export interface SidebarProps {
   /**
    * Counts for the items that carry one, by badge source.
@@ -74,6 +127,18 @@ export interface SidebarProps {
    * nobody while still taking the eye.
    */
   badges?: Partial<Record<NavBadge, number>>;
+  /**
+   * The project roster, for the one group whose items are not in the nav table.
+   *
+   * Passed in rather than fetched here, which is the same rule the badges follow
+   * and for the same reason: this component needs a router and nothing else, and
+   * that is what lets the entire rail be tested without a daemon.
+   *
+   * `undefined` — the roster has not answered — draws no rows at all. Not an
+   * empty group and not a "no projects" line: the daemon has not spoken, and a
+   * sentence about what it did not say is a claim nobody measured.
+   */
+  projects?: ProjectNavEntry[];
   /** The daemon is anything but ok; System gets a dot. */
   systemAlert?: boolean;
   /**
@@ -96,7 +161,7 @@ export interface SidebarProps {
  * at any scroll position of the item list — so the scrolling region is the
  * groups alone and the footer is its sibling, not its last child.
  */
-export function Sidebar({ badges, systemAlert, children }: SidebarProps) {
+export function Sidebar({ badges, projects, systemAlert, children }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const navigate = useNavigate();
@@ -145,9 +210,12 @@ export function Sidebar({ badges, systemAlert, children }: SidebarProps) {
     items[next].focus();
   }
 
-  function item(entry: NavItem, alert = false) {
-    const active = isActive(pathname, entry.path);
-    const count = entry.badge === undefined ? undefined : badges?.[entry.badge];
+  function item(entry: NavItem, alert = false, activeOverride?: boolean, mode?: AutopilotMode) {
+    const active = activeOverride ?? isActive(pathname, entry.path);
+    const count =
+      entry.badge === undefined
+        ? projects?.find((project) => `project:${project.id}` === entry.id)?.pending
+        : badges?.[entry.badge];
     const counted = count !== undefined && count > 0;
     const classes = ["nav-item"];
     if (active) classes.push("nav-item-active");
@@ -174,6 +242,14 @@ export function Sidebar({ badges, systemAlert, children }: SidebarProps) {
         <span className="nav-glyph" aria-hidden="true">
           {entry.glyph}
         </span>
+        {/*
+          Off, shadow and active are three different things a project can be
+          doing, and the difference governs whether anything happens here without
+          being asked. A colour rather than a word because it sits in a rail read
+          at a glance; the word is on the workspace itself, where it is read on
+          purpose.
+        */}
+        {mode === undefined ? null : <span className="nav-mode" data-mode={mode} aria-hidden="true" />}
         <span className="nav-label">{entry.label}</span>
         {counted ? (
           <span className="nav-badge" aria-hidden="true">
@@ -220,6 +296,31 @@ export function Sidebar({ badges, systemAlert, children }: SidebarProps) {
               {group.items.map((entry) => (
                 <li key={entry.id}>{item(entry)}</li>
               ))}
+              {group.roster === true && inProjects(pathname)
+                ? projects?.map((project) => (
+                    <li key={project.id}>
+                      {item(
+                        {
+                          id: `project:${project.id}`,
+                          label: project.id,
+                          // Estado is where a project opens: it is the mode that
+                          // answers the question somebody arrives with.
+                          path: `/projects/${project.id}/estado`,
+                          // Two letters off the name. Unlike the table's glyphs
+                          // these can collide, and that is accepted rather than
+                          // solved: the alternative is a generated monogram
+                          // nobody recognises, and the collapsed rail is a
+                          // shortcut for a rail you already know.
+                          glyph: project.id.slice(0, 2),
+                          badge: undefined,
+                        },
+                        false,
+                        projectOf(pathname) === project.id,
+                        project.mode,
+                      )}
+                    </li>
+                  ))
+                : null}
             </ul>
           </div>
         ))}

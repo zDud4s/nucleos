@@ -361,6 +361,29 @@ describe("StateBadge — team_action", () => {
   });
 });
 
+/**
+ * §7 rows added by the project workspace. One test per row, which is the rule
+ * the table's own header sets: a domain arrives with the slice that needs it,
+ * and it arrives with the distinctions it exists to keep.
+ */
+describe("StateBadge — autopilot mode", () => {
+  it("keeps the three modes apart, and none of them reads as a fault", () => {
+    const off = badge("autopilot", "off");
+    const shadow = badge("autopilot", "shadow");
+    const active = badge("autopilot", "active");
+
+    expect([off?.text, shadow?.text, active?.text]).toEqual(["off", "shadow", "active"]);
+    // `off` is a decision somebody made, not a broken project: drawing it in
+    // danger would nag about a setting that is working as chosen.
+    expect(off?.className).not.toContain("ui-badge-danger");
+    // `shadow` is not a lesser `active`. It is the state where the project
+    // proposes and a person decides — where every project starts, and where
+    // plenty stay on purpose — so it must not read as an incomplete `active`.
+    expect(shadow?.className).not.toBe(active?.className);
+    expect(shadow?.className).not.toContain("ui-state-unmapped");
+  });
+});
+
 describe("StateBadge — states with no reading", () => {
   it("shows an unmapped state as itself rather than guessing a tone", () => {
     const unknown = badge("run", "hibernating");

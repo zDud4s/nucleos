@@ -314,6 +314,7 @@ mod tests {
             // Recognisable on purpose: this is the value a fallback would reach for.
             token: Token("control-token".into()),
             pool,
+            telegram_doctrine: None,
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
@@ -322,6 +323,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             files_root: None,
+            workflow_library: None,
             email: Arc::new(email),
             voice: Arc::new(crate::voice::VoiceRuntime::default()),
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),

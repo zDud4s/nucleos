@@ -1,108 +1,195 @@
-import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
-import { useAgents } from "../data/agents";
+import { useState } from "react";
+import { Link } from "@tanstack/react-router";
+import { isApiRefusal } from "../data/client";
+import { NewDepartment } from "../team/Charter";
+import { RosterMatrix, headcountOf, specialistsOf } from "../team/RosterMatrix";
 import {
   GRANTABLE_ACTIONS,
-  GRANT_MODES,
-  TEAM_RUN_LIST_LIMIT,
-  TRIGGER_SOURCES,
   teamRunIsAlive,
-  useCreateTeam,
-  useCreateTrigger,
-  useDeleteTeam,
-  useDeleteTrigger,
-  useSetTriggerEnabled,
-  useStartTeamRun,
-  useTeam,
+  useOpenTeamActions,
+  useTeamRun,
   useTeams,
   useTeamRuns,
   useTeamTriggers,
-  useTriggerNext,
-  useUpdateTeam,
+  type TeamAction,
   type TeamGrant,
-  type TeamRequest,
   type TeamRun,
   type TeamTrigger,
   type TeamView,
-  type TriggerRequest,
 } from "../data/teams";
 import {
   Badge,
   Button,
-  ConfirmButton,
   ErrorNote,
+  Meter,
   PageHeader,
   Panel,
   RefusalNote,
   RelativeTime,
+  Sparkline,
   StaleNote,
   StateBadge,
   Teach,
+  usd,
 } from "../ui";
 import "./teams.css";
 
 /**
- * Teams — one component serving `/teams` and `/teams/$teamId`, the `Council`
- * pattern: the list stays on screen and the detail is added below it once a
- * department is selected, rather than replacing the list.
+ * Teams — the console. `/teams` and nothing else; `/teams/$teamId` is the bench
+ * (`team/Bench.tsx`) and is a whole page rather than a panel added below this
+ * one.
  *
- * A department is created and edited through **one** editor (`TeamEditor`),
- * because `PUT /teams/{id}` is a full replace — an edit IS a create that
- * already has an id, and the roster and the grants are resent wholesale every
- * time. Omitting either wipes it.
+ * The page this replaced served both routes at once in the `Council` pattern
+ * and stacked six panels, three forms and two copies of the same eleven-field
+ * editor — the editor opened before you could see which departments existed.
+ * The split is the whole design: this altitude answers *what is there and how
+ * is it doing*, and the bench answers *what do I do about this one*.
  *
- * A rule cannot be edited: the núcleo mounts `DELETE` on `/team-triggers/{id}`
- * and nothing else, so this page offers delete-and-write-another rather than a
- * control that would answer 405.
+ * **A strip and a table, and not a gallery of cards.** The first shape this
+ * took was one card per department, and it failed for a reason only visible on
+ * screen: a card carried a `work in flight` block only when that department had
+ * work in flight, so every section below it — occupancy, ceilings, pulse — sat
+ * at a different height in every card. Six cards side by side became six
+ * documents to read one at a time rather than one thing to scan across, which
+ * is the opposite of what a console is for. A table cannot have that defect:
+ * the columns line up because they are columns.
  *
- * The run list is the newest hundred and says so: `GET /team-runs` is a hard
- * `LIMIT 100` with no paging.
+ * So the live work, which is what made the heights unequal, is lifted out into
+ * a strip above the table — where it also belongs, because "what is running
+ * right now" is a question about the whole organisation and never about one
+ * department at a time. It appears only when something is running.
+ *
+ * **One shape per class of thing.** The cards drew a specialist's name, a
+ * per-task ceiling, a granted power, a department's state and an armed routine
+ * as five near-identical bordered pills, so no pill could be told from another
+ * without reading it. Now: a filled `Badge` is a state and nothing else; a pill
+ * outline is a person (`ui-who`, on the bench); a ceiling is plain tabular text
+ * (`ui-limit`); a power is a mark plus a word; a routine is a diamond.
+ *
+ * Three readings this page deliberately does not draw, each because the daemon
+ * does not answer it:
+ *
+ * - **Money per department.** There is none. `teams.budget_usd` is the ceiling
+ *   of ONE task (`core/src/team.rs:2078` compares it against
+ *   `spend_of(run.id)`), plus an equal one over a chain of tasks
+ *   (`spend_of_tree`, `team.rs:2138`). Nothing accumulates per department over
+ *   time, and the machine's own spend is already permanent in the sidebar.
+ * - **An exact count of what is waiting.** `GET /team-actions` answers `pending`
+ *   AND `working` (`team.rs:3570`), while the ceiling counts only `pending` with
+ *   an undecided proposal (`open_actions_of`, `team.rs:1764`). Anything counted
+ *   here is an upper bound, so the word is "waiting" and never "exactly N".
+ * - **A time axis.** `GET /team-runs` is a hard `LIMIT 100` across every
+ *   department with no paging, so every pulse says how many runs it is drawn
+ *   from and never how many days.
+ *
+ * The matrix costs nothing extra: `GET /teams` already returns every department
+ * with its roster and its grants (`list_teams`, `team.rs:445-462`).
  */
 export function Teams() {
-  const params = useParams({ strict: false }) as { teamId?: string };
-  const teamId = params.teamId ?? null;
-
   const teams = useTeams();
   const runs = useTeamRuns();
+  const triggers = useTeamTriggers();
+  const actions = useOpenTeamActions();
+  const [creating, setCreating] = useState(false);
+
   const rows = teams.data ?? [];
   const allRuns = runs.data ?? [];
+  const allTriggers = triggers.data ?? [];
+  const openActions = actions.data ?? [];
   const stale = teams.isError && teams.data !== undefined;
 
   return (
     <>
-      <PageHeader title="Teams" headline={headlineFor(rows, allRuns, teams.data !== undefined)} />
-
-      <NewTeamPanel />
+      <PageHeader
+        title="Teams"
+        headline={headlineFor(rows, allRuns, openActions, teams.data !== undefined)}
+        actions={
+          <Button intent="go" onClick={() => setCreating((open) => !open)} aria-expanded={creating}>
+            {creating ? "Close" : "New department"}
+          </Button>
+        }
+      />
 
       {stale && <StaleNote dataUpdatedAt={teams.dataUpdatedAt} />}
       {teams.isError && teams.data === undefined && <ListError error={teams.error} />}
 
-      <TeamList rows={rows} runs={allRuns} selected={teamId} />
-
-      {teamId === null && (
-        <Teach title="Choose a department">
-          <p>
-            Pick a department from the list, or create one above. A department is created and
-            edited through one editor — the roster and the grants are always resent whole, because
-            a full replace omitting either would wipe it.
-          </p>
-        </Teach>
+      {/* Closed by default, and that is the point: the old page opened an
+          eleven-field form above a list you had not read yet. */}
+      {creating && (
+        <Panel title="New department">
+          {/* The very form the Charter tab is, minus the drift guard — there is
+              nothing to have drifted from yet. One editor, one place. */}
+          <NewDepartment />
+        </Panel>
       )}
 
-      {teamId !== null && <TeamDetail key={teamId} id={teamId} allRuns={allRuns} />}
+      {rows.length === 0 ? (
+        <Teach title="No department yet">
+          <p>
+            A department is a permanent unit — Finance, Marketing, Security — not a task. It has a
+            director, a roster of specialists, what it may do on its own, and the ceilings every
+            task of its runs under. Tasks and routines belong to it and are set up inside it.
+          </p>
+        </Teach>
+      ) : (
+        <>
+          <InFlight teams={rows} runs={allRuns} />
+          <DepartmentTable
+            teams={rows}
+            runs={allRuns}
+            triggers={allTriggers}
+            actions={openActions}
+          />
+          <Panel title="Who works where">
+            <RosterMatrix teams={rows} />
+          </Panel>
+        </>
+      )}
     </>
   );
 }
 
-/** One derived sentence about the whole roster of departments. */
-function headlineFor(rows: TeamView[], runs: TeamRun[], answered: boolean): string | undefined {
+/* -------------------------------------------------------------- readings -- */
+
+/** One derived sentence about every department at once. */
+function headlineFor(
+  rows: TeamView[],
+  runs: TeamRun[],
+  actions: TeamAction[],
+  answered: boolean,
+): string | undefined {
   if (!answered) return undefined;
   if (rows.length === 0) return "no department yet";
-  const noun = rows.length === 1 ? "department" : "departments";
-  const runningIds = new Set(runs.filter((run) => teamRunIsAlive(run.state)).map((run) => run.team_id));
-  const running = rows.filter((row) => runningIds.has(row.id)).length;
-  return running === 0 ? `${rows.length} ${noun}, none running` : `${rows.length} ${noun}, ${running} running`;
+
+  const parts = [`${rows.length} ${rows.length === 1 ? "department" : "departments"}`];
+  const people = specialistsOf(rows).length;
+  parts.push(`${people} ${people === 1 ? "specialist" : "specialists"}`);
+
+  const live = runs.filter((run) => teamRunIsAlive(run.state)).length;
+  parts.push(live === 0 ? "none at work" : `${live} at work`);
+
+  // "waiting", never a count presented as the daemon's own — see the module header.
+  const known = new Set(runs.map((run) => run.team_id));
+  const waiting = actions.filter((action) => known.has(runTeam(action, runs) ?? "")).length;
+  if (waiting > 0) parts.push(`${waiting} waiting on you`);
+
+  return parts.join(" · ");
+}
+
+/**
+ * Which department an action belongs to.
+ *
+ * `GET /team-actions` carries `team_run_id` and nothing else, so the department
+ * has to come back through the run list — which is the newest hundred across
+ * every department. An action whose run has fallen off the end of that window
+ * cannot be attributed, and is counted nowhere rather than counted wrongly.
+ */
+function runTeam(action: TeamAction, runs: TeamRun[]): string | null {
+  return runs.find((run) => run.id === action.team_run_id)?.team_id ?? null;
+}
+
+function waitingFor(teamId: string, actions: TeamAction[], runs: TeamRun[]): number {
+  return actions.filter((action) => runTeam(action, runs) === teamId).length;
 }
 
 function ListError({ error }: { error: unknown }) {
@@ -110,752 +197,404 @@ function ListError({ error }: { error: unknown }) {
   return <ErrorNote>the núcleo did not answer — nothing is known about the departments</ErrorNote>;
 }
 
+/* ------------------------------------------------------------ in flight -- */
+
 /**
- * The daemon's own sentence, when it really sent one.
+ * Everything running right now, across every department.
  *
- * `client.ts` falls back to `statusText` for a refusal with an empty body, so a
- * bare status arrives carrying only the status word — four words is the floor
- * between that and a sentence the daemon wrote on purpose.
+ * Above the table and not inside it, for two reasons. The shallow one is
+ * alignment: a live task is the one block a department either has or has not,
+ * and while it lived in a card it made every card a different height. The real
+ * one is that this is a different question — "what is my organisation doing"
+ * does not decompose per department, and you want the running tasks together
+ * rather than found by reading six rows.
+ *
+ * Nothing renders when nothing runs. The headline already says "none at work",
+ * so an empty strip would be a second way of saying it and a permanent hole in
+ * the page.
  */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
-}
+function InFlight({ teams, runs }: { teams: TeamView[]; runs: TeamRun[] }) {
+  const live = runs.filter((run) => teamRunIsAlive(run.state));
+  if (live.length === 0) return null;
 
-/* --------------------------------------------------------------- new team -- */
-
-function NewTeamPanel() {
   return (
-    <Panel title="New department">
-      <TeamEditor existing={null} />
-    </Panel>
+    <section className="teams-flight" aria-label="In flight">
+      <h2 className="teams-flight-title">
+        In flight <span className="teams-flight-count">{live.length}</span>
+      </h2>
+      <ul className="teams-flight-list">
+        {live.map((run) => (
+          <li key={run.id}>
+            <LiveTask run={run} team={teams.find((row) => row.id === run.team_id) ?? null} />
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
-/* ------------------------------------------------------------------- list -- */
+/**
+ * A task that is running, and what it has cost so far.
+ *
+ * Its own component so it owns its own `useTeamRun(id)` — the row-scoped hook
+ * pattern. This is the one N+1 on the page and it is bounded by
+ * `max_live_runs`, which the daemon caps at 4, and only for tasks that are
+ * still alive. `cost_usd` exists nowhere else: the run LIST does not carry it,
+ * which is why the old page had no cost column and was right not to invent one.
+ *
+ * `team` can be null. The run list is the newest hundred across every
+ * department, so it can carry a run whose department is not in `GET /teams` —
+ * deleted while it ran, most plainly. Drawn as a task with no department rather
+ * than dropped: a running task nobody can attribute is worth seeing more, not
+ * less.
+ */
+function LiveTask({ run, team }: { run: TeamRun; team: TeamView | null }) {
+  const detail = useTeamRun(run.id);
 
-function TeamList({
-  rows,
+  return (
+    <article className="teams-task">
+      <div className="teams-task-head">
+        {team === null ? (
+          <span className="teams-task-dept teams-task-orphan">no department</span>
+        ) : (
+          <Link className="teams-task-dept" to={`/teams/${team.id}`}>
+            {team.name}
+          </Link>
+        )}
+        <Link className="teams-task-what" to={`/team-runs/${run.id}`}>
+          {run.request}
+        </Link>
+        <StateBadge domain="team_run" state={run.state} />
+      </div>
+      <p className="teams-task-when">
+        round {run.round} · started <RelativeTime at={run.created_at} />
+      </p>
+      {detail.data === undefined ? (
+        <p className="teams-loading">reading what it has spent…</p>
+      ) : (
+        // The money meter lives here and only here: this is the one place in
+        // the pillar where a spend and the ceiling it runs against both exist.
+        <Meter
+          label="spent on this task"
+          value={detail.data.cost_usd}
+          ceiling={team?.budget_usd ?? null}
+          format={usd}
+          tone="pending"
+        />
+      )}
+    </article>
+  );
+}
+
+/* ---------------------------------------------------------------- table -- */
+
+/**
+ * Every department, one per row.
+ *
+ * A real `<table>` for the reason `RosterMatrix` is one: a department is a row,
+ * the readings are columns, and a screen reader that lands in a cell is told
+ * both. Built from `div`s it would be a picture of a table.
+ *
+ * Its own horizontal scroller, so a narrow window slides the table and never
+ * the whole document.
+ */
+function DepartmentTable({
+  teams,
   runs,
-  selected,
+  triggers,
+  actions,
 }: {
-  rows: TeamView[];
+  teams: TeamView[];
   runs: TeamRun[];
-  selected: string | null;
+  triggers: TeamTrigger[];
+  actions: TeamAction[];
 }) {
   return (
-    <Panel title="Departments">
-      {rows.length === 0 && <p className="teams-empty">no department has been created yet.</p>}
-      {rows.length > 0 && (
-        <ul className="teams-list" aria-label="Departments">
-          {rows.map((team) => {
-            const live = runs.filter((run) => run.team_id === team.id && teamRunIsAlive(run.state)).length;
-            return <TeamRow key={team.id} team={team} live={live} active={team.id === selected} />;
-          })}
-        </ul>
-      )}
-    </Panel>
+    <div className="teams-table-scroller">
+      <table className="teams-table">
+        <caption className="teams-said">Every department, with what it is doing now</caption>
+        <thead>
+          <tr>
+            <th scope="col">Department</th>
+            <th scope="col">State</th>
+            <th scope="col" className="teams-col-num">
+              Staff
+            </th>
+            <th scope="col" className="teams-col-num">
+              At work
+            </th>
+            <th scope="col" className="teams-col-num">
+              Waiting
+            </th>
+            <th scope="col">On its own</th>
+            <th scope="col">Pulse</th>
+          </tr>
+        </thead>
+        <tbody>
+          {teams.map((team) => (
+            <DepartmentRow
+              key={team.id}
+              team={team}
+              runs={runs.filter((run) => run.team_id === team.id)}
+              triggers={triggers.filter((rule) => rule.team_id === team.id)}
+              waiting={waitingFor(team.id, actions, runs)}
+            />
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
-function TeamRow({ team, live, active }: { team: TeamView; live: number; active: boolean }) {
+function DepartmentRow({
+  team,
+  runs,
+  triggers,
+  waiting,
+}: {
+  team: TeamView;
+  runs: TeamRun[];
+  triggers: TeamTrigger[];
+  waiting: number;
+}) {
+  const live = runs.filter((run) => teamRunIsAlive(run.state));
+
   return (
-    <li className={active ? "teams-row teams-row-open" : "teams-row"}>
-      <Link to={`/teams/${team.id}`} aria-current={active ? "page" : undefined}>
-        <span className="teams-name">{team.name}</span>
-      </Link>
-      <p className="teams-mission">{team.mission}</p>
-      <div className="teams-meta">
-        <span>director: {team.director_agent_id}</span>
-        <span>
-          {live} run{live === 1 ? "" : "s"} live
+    <tr>
+      <th scope="row" className="teams-row-name">
+        <Link to={`/teams/${team.id}`}>{team.name}</Link>
+        {/* Drawn whether or not there is one: a remit that appeared on some rows
+            and not others would start the next line at two different heights,
+            which is the defect the cards had. */}
+        <span
+          className={team.mission === "" ? "teams-row-remit teams-row-unwritten" : "teams-row-remit"}
+        >
+          {team.mission === "" ? "no remit written" : team.mission}
         </span>
-      </div>
-      <ul className="teams-ceilings" aria-label="Ceilings">
-        <li className="teams-ceiling">rounds ≤ {team.max_rounds}</li>
-        <li className="teams-ceiling">parallel ≤ {team.max_parallel}</li>
-        {/* A `null` ceiling is not a ceiling of zero — absent is not zero. */}
-        <li className="teams-ceiling">
-          {team.budget_usd === null ? "no ceiling of its own" : `$${team.budget_usd.toFixed(2)}`}
-        </li>
-        <li className="teams-ceiling">open actions ≤ {team.max_open_actions}</li>
-        <li className="teams-ceiling">live runs ≤ {team.max_live_runs}</li>
-      </ul>
-    </li>
+      </th>
+      <td>
+        <RowState live={live.length} waiting={waiting} />
+      </td>
+      <td className="teams-col-num">
+        <Headcount team={team} />
+      </td>
+      <td className="teams-col-num">
+        <Ratio value={live.length} ceiling={team.max_live_runs} />
+      </td>
+      {/* Upper bound — see the module header. The column says "Waiting", never a
+          count the daemon would recognise. */}
+      <td className="teams-col-num">
+        <Ratio value={waiting} ceiling={team.max_open_actions} />
+      </td>
+      <td>
+        <OnItsOwn grants={team.grants} triggers={triggers} />
+      </td>
+      <td className="teams-row-pulse">
+        <Sparkline
+          values={pulseOf(runs)}
+          label={`${team.name}: ${pulseLabel(runs.length)}`}
+          labelHidden
+          width={96}
+          height={20}
+        />
+      </td>
+    </tr>
   );
-}
-
-/* ----------------------------------------------------------------- detail -- */
-
-function TeamDetail({ id, allRuns }: { id: string; allRuns: TeamRun[] }) {
-  const team = useTeam(id);
-  const triggers = useTeamTriggers();
-  const del = useDeleteTeam();
-  const navigate = useNavigate();
-  const detail = team.data;
-
-  if (detail === undefined) {
-    return (
-      <Panel title="Department">
-        {team.isError ? <TeamDetailError error={team.error} /> : <p className="teams-loading">reading the department…</p>}
-      </Panel>
-    );
-  }
-
-  const teamRuns = allRuns.filter((run) => run.team_id === id);
-  const teamTriggers = (triggers.data ?? []).filter((rule) => rule.team_id === id);
-
-  return (
-    <div className="teams-detail">
-      <Panel
-        title={detail.name}
-        aside={
-          <ConfirmButton
-            label="Delete department"
-            confirmLabel="Delete it now"
-            intent="stop"
-            disabled={del.isPending}
-            onConfirm={() => del.mutate(id, { onSuccess: () => void navigate({ to: "/teams" }) })}
-          />
-        }
-      >
-        <p className="teams-mission">{detail.mission}</p>
-        {del.isError && <DeleteTeamRefusal error={del.error} />}
-        <RosterPanel members={detail.members} />
-      </Panel>
-
-      <Panel title="Edit department" variant="dim">
-        <TeamEditor existing={detail} />
-      </Panel>
-
-      <TriggerRules teamId={id} team={detail} rules={teamTriggers} />
-      <StartRunForm teamId={id} />
-      <TeamRunList runs={teamRuns} />
-    </div>
-  );
-}
-
-function RosterPanel({ members }: { members: string[] }) {
-  return (
-    <>
-      <p className="teams-label">Roster</p>
-      {members.length === 0 ? (
-        <p className="teams-empty">no member yet — a run cannot start without a roster.</p>
-      ) : (
-        <ul className="teams-roster" aria-label="Roster">
-          {members.map((member) => (
-            <li className="teams-member" key={member}>
-              {member}
-            </li>
-          ))}
-        </ul>
-      )}
-    </>
-  );
-}
-
-function TeamDetailError({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) {
-    return (
-      <RefusalNote
-        refusal={error}
-        sentences={{ not_found: "there is no department with that id", ...daemonProse(error) }}
-      />
-    );
-  }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this department</ErrorNote>;
-}
-
-function DeleteTeamRefusal({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this department was not deleted</ErrorNote>;
-}
-
-/* ---------------------------------------------------------------- editor -- */
-
-interface TeamFormState {
-  name: string;
-  mission: string;
-  directorAgentId: string;
-  maxRounds: string;
-  maxParallel: string;
-  budgetUsd: string;
-  maxOpenActions: string;
-  maxLiveRuns: string;
-  members: string[];
-  grants: TeamGrant[];
-}
-
-function emptyTeamForm(): TeamFormState {
-  return {
-    name: "",
-    mission: "",
-    directorAgentId: "",
-    maxRounds: "3",
-    maxParallel: "2",
-    budgetUsd: "",
-    maxOpenActions: "5",
-    maxLiveRuns: "1",
-    members: [],
-    grants: [],
-  };
-}
-
-function teamFormFromView(team: TeamView): TeamFormState {
-  return {
-    name: team.name,
-    mission: team.mission,
-    directorAgentId: team.director_agent_id,
-    maxRounds: String(team.max_rounds),
-    maxParallel: String(team.max_parallel),
-    budgetUsd: team.budget_usd === null ? "" : String(team.budget_usd),
-    maxOpenActions: String(team.max_open_actions),
-    maxLiveRuns: String(team.max_live_runs),
-    members: team.members,
-    grants: team.grants,
-  };
-}
-
-/** A blank ceiling box is `null` — no ceiling — never `0`; a typed `0` is a real ceiling of zero. */
-function parseCeiling(raw: string): number | null {
-  const trimmed = raw.trim();
-  if (trimmed === "") return null;
-  const value = Number(trimmed);
-  return Number.isFinite(value) ? value : null;
-}
-
-function teamRequestFromForm(form: TeamFormState): TeamRequest {
-  return {
-    name: form.name.trim(),
-    mission: form.mission.trim(),
-    director_agent_id: form.directorAgentId,
-    max_rounds: Number(form.maxRounds),
-    max_parallel: Number(form.maxParallel),
-    budget_usd: parseCeiling(form.budgetUsd),
-    max_open_actions: Number(form.maxOpenActions),
-    max_live_runs: Number(form.maxLiveRuns),
-    members: form.members,
-    grants: form.grants,
-  };
 }
 
 /**
- * Shared by create and edit. `existing === null` is create.
+ * What this department is doing, in one word.
  *
- * Editing seeds the form **once** from the query (`form === null` guard, the
- * System `BudgetPanel` precedent): a poll tick must not overwrite a half-typed
- * edit. Never sends an `id` — the daemon slugs one from `name` and renaming
- * never changes it.
+ * Derived, because a department has no state column of its own — it is a
+ * standing unit, not a state machine. Working beats waiting: a department can
+ * be both, and the one that is spending money is the one worth the badge.
  */
-function TeamEditor({ existing }: { existing: TeamView | null }) {
-  const agents = useAgents();
-  const agentRows = agents.data ?? [];
-  const create = useCreateTeam();
-  const update = useUpdateTeam();
-  const navigate = useNavigate();
-  const [form, setForm] = useState<TeamFormState | null>(existing === null ? emptyTeamForm() : null);
+function RowState({ live, waiting }: { live: number; waiting: number }) {
+  if (live > 0) return <Badge tone="active">at work</Badge>;
+  if (waiting > 0) return <Badge tone="pending">waiting on you</Badge>;
+  return <Badge tone="off">idle</Badge>;
+}
 
-  useEffect(() => {
-    if (existing !== null && form === null) setForm(teamFormFromView(existing));
-  }, [existing, form]);
-
-  if (form === null) return <p className="teams-loading">reading the department…</p>;
-
-  const mutation = existing === null ? create : update;
-  const valid = form.name.trim() !== "" && form.mission.trim() !== "" && form.directorAgentId.trim() !== "";
-
-  function submit() {
-    if (form === null || !valid || mutation.isPending) return;
-    const body = teamRequestFromForm(form);
-    if (existing === null) {
-      create.mutate(body, {
-        onSuccess: (view) => {
-          setForm(emptyTeamForm());
-          void navigate({ to: `/teams/${view.id}` });
-        },
-      });
-    } else {
-      update.mutate({ id: existing.id, body });
-    }
-  }
-
+/**
+ * How many people, and a mark when that is nobody.
+ *
+ * Zero is not a small number here, it is a department that cannot work: the
+ * daemon will not start a task without a roster. It is marked rather than left
+ * to look like any other figure in the column.
+ */
+function Headcount({ team }: { team: TeamView }) {
+  const count = headcountOf(team);
+  if (count > 0) return <span className="teams-figure">{count}</span>;
   return (
-    <form
-      className="teams-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        submit();
-      }}
+    <span
+      className="teams-figure teams-figure-none"
+      title="nobody yet — a task cannot start without a roster"
     >
-      <label className="teams-field">
-        <span className="teams-label">Name</span>
-        <input
-          className="teams-input"
-          value={form.name}
-          onChange={(event) => setForm({ ...form, name: event.target.value })}
-        />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Mission</span>
-        <textarea
-          className="teams-textarea"
-          rows={2}
-          value={form.mission}
-          onChange={(event) => setForm({ ...form, mission: event.target.value })}
-        />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Director</span>
-        <select
-          className="teams-select"
-          value={form.directorAgentId}
-          onChange={(event) => setForm({ ...form, directorAgentId: event.target.value })}
-        >
-          <option value="">choose an agent</option>
-          {agentRows.map((agent) => (
-            <option key={agent.id} value={agent.id}>
-              {agent.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Max rounds (1-6)</span>
-        <input
-          className="teams-input"
-          type="number"
-          min={1}
-          max={6}
-          value={form.maxRounds}
-          onChange={(event) => setForm({ ...form, maxRounds: event.target.value })}
-        />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Max parallel (1-8)</span>
-        <input
-          className="teams-input"
-          type="number"
-          min={1}
-          max={8}
-          value={form.maxParallel}
-          onChange={(event) => setForm({ ...form, maxParallel: event.target.value })}
-        />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Budget ceiling (USD, blank = no ceiling)</span>
-        <input
-          className="teams-input"
-          type="text"
-          inputMode="decimal"
-          placeholder="no ceiling"
-          value={form.budgetUsd}
-          onChange={(event) => setForm({ ...form, budgetUsd: event.target.value })}
-        />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Max open actions (0-20)</span>
-        <input
-          className="teams-input"
-          type="number"
-          min={0}
-          max={20}
-          value={form.maxOpenActions}
-          onChange={(event) => setForm({ ...form, maxOpenActions: event.target.value })}
-        />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Max live runs (1-4)</span>
-        <input
-          className="teams-input"
-          type="number"
-          min={1}
-          max={4}
-          value={form.maxLiveRuns}
-          onChange={(event) => setForm({ ...form, maxLiveRuns: event.target.value })}
-        />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Members</span>
-        <select
-          className="teams-select"
-          multiple
-          aria-label="Members"
-          value={form.members}
-          onChange={(event) =>
-            setForm({ ...form, members: Array.from(event.target.selectedOptions, (option) => option.value) })
-          }
-        >
-          {agentRows.map((agent) => (
-            <option key={agent.id} value={agent.id}>
-              {agent.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <GrantsEditor grants={form.grants} onChange={(grants) => setForm({ ...form, grants })} />
-      <div className="teams-actions">
-        <Button type="submit" intent="go" disabled={!valid || mutation.isPending}>
-          {existing === null ? "Create department" : "Save changes"}
-        </Button>
-      </div>
-      <p className="teams-note">
-        This is the one editor for a department: an edit is a create that already has an id, and
-        the roster and the grants are always resent whole — omitting either wipes it.
-      </p>
-      {mutation.isError && <TeamMutationRefusal error={mutation.error} />}
-    </form>
+      0<span className="teams-said"> — nobody yet, so no task can start</span>
+    </span>
   );
 }
-
-function TeamMutationRefusal({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this department was not saved</ErrorNote>;
-}
-
-/* ------------------------------------------------------------------ grants -- */
 
 /**
- * One row per grantable action, three states: nothing / proposes / does.
+ * A reading against its ceiling, as a figure and not a bar.
  *
- * The absence of a grant row IS the denial — there is no `deny` mode. `propose`
- * reads "asks first", `allow` reads "does it".
+ * The cards drew these as meters, two per card, twelve on a screen. In a column
+ * the comparison the bar was making is already made — the figures sit under each
+ * other, tabular, and the eye does it. What a bar adds at that point is ink.
+ *
+ * At the ceiling it is marked, because `1 / 1` and `0 / 1` are one glyph apart
+ * and mean entirely different things.
  */
-function GrantsEditor({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: TeamGrant[]) => void }) {
+function Ratio({ value, ceiling }: { value: number; ceiling: number }) {
+  const full = ceiling > 0 && value >= ceiling;
   return (
-    <div className="teams-field">
-      <span className="teams-label">Grants</span>
-      <ul className="teams-grants" aria-label="Grants">
-        {GRANTABLE_ACTIONS.map((kind) => {
-          const current = grants.find((grant) => grant.kind === kind)?.mode ?? "";
-          return (
-            <li className="teams-grant" key={kind}>
-              <span className="teams-grant-name">{kind}</span>
-              <select
-                className="teams-select teams-grant-modes"
-                aria-label={`${kind} grant`}
-                value={current}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  const rest = grants.filter((grant) => grant.kind !== kind);
-                  onChange(value === "" ? rest : [...rest, { kind, mode: value }]);
-                }}
-              >
-                <option value="">nothing</option>
-                {GRANT_MODES.map((mode) => (
-                  <option key={mode} value={mode}>
-                    {mode === "propose" ? "asks first" : "does it"}
-                  </option>
-                ))}
-              </select>
-            </li>
-          );
-        })}
-      </ul>
-    </div>
+    <span className={full ? "teams-figure teams-figure-full" : "teams-figure"}>
+      {value}
+      <span className="teams-figure-of"> / {ceiling}</span>
+      {full && <span className="teams-said"> — at the ceiling</span>}
+    </span>
   );
 }
 
-/* ------------------------------------------------------------------- rules -- */
-
-function TriggerRules({ teamId, team, rules }: { teamId: string; team: TeamView; rules: TeamTrigger[] }) {
-  return (
-    <Panel title="Rules">
-      <p className="teams-note">A rule cannot be edited, only deleted and rewritten.</p>
-      {rules.length === 0 && <p className="teams-empty">no rule is armed for this department.</p>}
-      {rules.length > 0 && (
-        <ul className="teams-rules" aria-label="Rules">
-          {rules.map((rule) => (
-            <TriggerRuleRow key={rule.id} rule={rule} noCeiling={team.budget_usd === null} />
-          ))}
-        </ul>
-      )}
-      <NewTriggerForm teamId={teamId} />
-    </Panel>
-  );
-}
-
-function TriggerRuleRow({ rule, noCeiling }: { rule: TeamTrigger; noCeiling: boolean }) {
-  const setEnabled = useSetTriggerEnabled();
-  const del = useDeleteTrigger();
-  // `enabled` arrives 0 or 1 on the wire, never a real boolean.
-  const armed = rule.enabled !== 0;
+/**
+ * What happens without you: the three grantable actions, and whether a routine
+ * is armed.
+ *
+ * One column, because it is one question. The absence of a grant row IS the
+ * denial — there is no `deny` mode (`core/src/team.rs:375`) — so a kind with
+ * nothing is drawn as "asks you", not as a fourth state and not as an error.
+ *
+ * Marks and not boxes. Filled acts, half drafts and waits, hollow cannot; the
+ * shape carries it, so none of this is colour-only, and every mark has its
+ * sentence beside it for anything that does not render.
+ */
+function OnItsOwn({ grants, triggers }: { grants: TeamGrant[]; triggers: TeamTrigger[] }) {
+  const armed = triggers.filter((rule) => rule.enabled !== 0);
 
   return (
-    <li className="teams-rule">
-      <div className="teams-rule-head">
-        <span className="teams-rule-name">{rule.name}</span>
-        <span>{rule.source}</span>
-        {rule.cron !== null && <code>{rule.cron}</code>}
-        {rule.timezone !== null && <span>{rule.timezone}</span>}
-        <Badge tone={armed ? "active" : "off"}>{armed ? "armed" : "disarmed"}</Badge>
-        {armed ? (
-          // Disarming is always plain and never asks.
-          <Button onClick={() => setEnabled.mutate({ id: rule.id, enabled: false })} disabled={setEnabled.isPending}>
-            Disarm
-          </Button>
-        ) : noCeiling ? (
-          // An armed rule on a team with no ceiling is a loop that can spend
-          // without limit — the one place in this design where being wrong
-          // costs money without bound, so arming it goes through the
-          // interlock. Everything else on this row stays plain, per the
-          // standing rule that ConfirmButton is for destructive writes only.
-          <ConfirmButton
-            label="Arm with no ceiling"
-            confirmLabel="Arm it anyway"
-            intent="go"
-            disabled={setEnabled.isPending}
-            onConfirm={() => setEnabled.mutate({ id: rule.id, enabled: true })}
-          />
-        ) : (
-          <Button
-            intent="go"
-            onClick={() => setEnabled.mutate({ id: rule.id, enabled: true })}
-            disabled={setEnabled.isPending}
+    <ul className="teams-alone">
+      {GRANTABLE_ACTIONS.map((kind) => {
+        const mode = modeOf(grants, kind);
+        const said = MODE_SAID[mode];
+        return (
+          <li
+            className={`teams-alone-item teams-alone-${mode}`}
+            key={kind}
+            title={`${kind}: ${said}`}
           >
-            Arm
-          </Button>
-        )}
-        <ConfirmButton
-          label="Delete"
-          confirmLabel="Delete this rule"
-          intent="stop"
-          disabled={del.isPending}
-          onConfirm={() => del.mutate(rule.id)}
-        />
-      </div>
-      <p className="teams-rule-what">{rule.request}</p>
-      <TriggerNextLine id={rule.id} />
+            <span aria-hidden="true">{MODE_MARK[mode]}</span>
+            <span aria-hidden="true">{POWER_WORD[kind]}</span>
+            <span className="teams-said">
+              {kind}: {said}
+            </span>
+          </li>
+        );
+      })}
+      <Routines armed={armed.length} total={triggers.length} />
+    </ul>
+  );
+}
+
+/**
+ * What this department may do with one kind of action.
+ *
+ * `TeamGrant.mode` is a bare `string` on the wire, so a mode this shell has
+ * never heard of is possible and is its own answer — the same treatment
+ * `StateBadge` gives an unmapped state. It used to fall through to "asks you",
+ * which reads as a decision the daemon made rather than as a shell that is
+ * behind its núcleo.
+ */
+type Mode = "allow" | "propose" | "none" | "unmapped";
+
+function modeOf(grants: TeamGrant[], kind: string): Mode {
+  const raw = grants.find((grant) => grant.kind === kind)?.mode;
+  if (raw === undefined) return "none";
+  if (raw === "allow" || raw === "propose") return raw;
+  return "unmapped";
+}
+
+/** Filled acts, half drafts, hollow cannot, and a question mark is this shell's own gap. */
+const MODE_MARK: Record<Mode, string> = {
+  allow: "●",
+  propose: "◐",
+  none: "○",
+  unmapped: "?",
+};
+
+const MODE_SAID: Record<Mode, string> = {
+  allow: "does it",
+  propose: "asks first",
+  none: "asks you",
+  unmapped: "this shell has no reading for that mode",
+};
+
+/** The short word for each grantable kind. The full name is in the title and beside it. */
+const POWER_WORD: Record<(typeof GRANTABLE_ACTIONS)[number], string> = {
+  calendar_event: "cal",
+  file_document: "doc",
+  send_email: "mail",
+};
+
+/**
+ * Whether a clock can start work here without you.
+ *
+ * A diamond, so it is not read as a fourth power. It says how many are armed
+ * and never when the next one fires: the daemon answers that one rule at a time
+ * (`GET /team-triggers/{id}/next`), so the soonest across a department would be
+ * a query per rule per department, on a page that already carries one N+1. The
+ * bench answers it, per rule, where there is room.
+ */
+function Routines({ armed, total }: { armed: number; total: number }) {
+  if (total === 0) return null;
+  if (armed === 0) {
+    return (
+      <li
+        className="teams-alone-item teams-alone-rule"
+        title={`${total} routine${total === 1 ? "" : "s"}, none armed`}
+      >
+        <span aria-hidden="true">◇</span>
+        <span className="teams-said">
+          {total} {total === 1 ? "routine" : "routines"}, none armed
+        </span>
+      </li>
+    );
+  }
+  return (
+    <li
+      className="teams-alone-item teams-alone-rule teams-alone-armed"
+      title={`${armed} armed routine${armed === 1 ? "" : "s"}`}
+    >
+      <span aria-hidden="true">◆</span>
+      <span aria-hidden="true">{armed}</span>
+      <span className="teams-said">
+        {armed} armed {armed === 1 ? "routine" : "routines"}
+      </span>
     </li>
   );
 }
 
+/* --------------------------------------------------------------- pulse -- */
+
 /**
- * Its own component per rule, so each rule owns its own `useTriggerNext(id)`
- * query — the row-scoped hook pattern.
+ * This department's activity, one bucket per day it has a run in.
  *
- * A rule that does not fire on a clock answers 200 with
- * `"this rule does not fire on a clock"`, and a bad cron answers 200 with the
- * daemon's parse message. Neither is an error state.
+ * Days and not a fixed span, because there is no fixed span to be had: the run
+ * list is the newest hundred across EVERY department, so a department that runs
+ * often is represented by a few hours and one that runs rarely by months. The
+ * buckets are the days the window actually contains for this department, which
+ * is a shape that is true whatever the window turns out to be — and the label
+ * says how many runs it is drawn from rather than naming a period.
  */
-function TriggerNextLine({ id }: { id: number }) {
-  const next = useTriggerNext(id);
-  if (next.data === undefined) return null;
-  if (next.data.error !== null) return <p className="teams-rule-next">{next.data.error}</p>;
-  if (next.data.next !== null) {
-    return (
-      <p className="teams-rule-next">
-        next: <RelativeTime at={next.data.next} />
-      </p>
-    );
+export function pulseOf(runs: TeamRun[]): number[] {
+  const perDay = new Map<string, number>();
+  for (const run of runs) {
+    const day = run.created_at.slice(0, 10);
+    perDay.set(day, (perDay.get(day) ?? 0) + 1);
   }
-  return null;
+  return [...perDay.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, count]) => count);
 }
 
-function NewTriggerForm({ teamId }: { teamId: string }) {
-  const [name, setName] = useState("");
-  const [source, setSource] = useState<(typeof TRIGGER_SOURCES)[number]>("cron");
-  const [cron, setCron] = useState("");
-  const [timezone, setTimezone] = useState("");
-  const [fromTeam, setFromTeam] = useState("");
-  const [emailClass, setEmailClass] = useState("");
-  const [request, setRequest] = useState("");
-  const create = useCreateTrigger();
-
-  const valid = name.trim() !== "" && request.trim() !== "" && (source !== "cron" || cron.trim() !== "");
-
-  function submit() {
-    if (!valid || create.isPending) return;
-    const body: TriggerRequest = {
-      team_id: teamId,
-      name: name.trim(),
-      source,
-      cron: source === "cron" ? cron.trim() : null,
-      timezone: source === "cron" && timezone.trim() !== "" ? timezone.trim() : null,
-      from_team: source === "team_finished" && fromTeam.trim() !== "" ? fromTeam.trim() : null,
-      email_class: source === "email_triaged" && emailClass.trim() !== "" ? emailClass.trim() : null,
-      request: request.trim(),
-    };
-    create.mutate(body, {
-      onSuccess: () => {
-        setName("");
-        setCron("");
-        setTimezone("");
-        setFromTeam("");
-        setEmailClass("");
-        setRequest("");
-      },
-    });
-  }
-
-  return (
-    <form
-      className="teams-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        submit();
-      }}
-    >
-      <p className="teams-note">Creating never arms — arm the rule once it is written.</p>
-      <label className="teams-field">
-        <span className="teams-label">Name</span>
-        <input className="teams-input" value={name} onChange={(event) => setName(event.target.value)} />
-      </label>
-      <label className="teams-field">
-        <span className="teams-label">Source</span>
-        <select
-          className="teams-select"
-          value={source}
-          onChange={(event) => setSource(event.target.value as (typeof TRIGGER_SOURCES)[number])}
-        >
-          {TRIGGER_SOURCES.map((kind) => (
-            <option key={kind} value={kind}>
-              {kind}
-            </option>
-          ))}
-        </select>
-      </label>
-      {source === "cron" && (
-        <>
-          <label className="teams-field">
-            <span className="teams-label">Cron</span>
-            <input className="teams-input" value={cron} onChange={(event) => setCron(event.target.value)} />
-          </label>
-          <label className="teams-field">
-            <span className="teams-label">Timezone</span>
-            <input className="teams-input" value={timezone} onChange={(event) => setTimezone(event.target.value)} />
-          </label>
-        </>
-      )}
-      {source === "team_finished" && (
-        <label className="teams-field">
-          <span className="teams-label">From team</span>
-          <input className="teams-input" value={fromTeam} onChange={(event) => setFromTeam(event.target.value)} />
-        </label>
-      )}
-      {source === "email_triaged" && (
-        <label className="teams-field">
-          <span className="teams-label">Email class</span>
-          <input
-            className="teams-input"
-            value={emailClass}
-            onChange={(event) => setEmailClass(event.target.value)}
-          />
-        </label>
-      )}
-      <label className="teams-field">
-        <span className="teams-label">Request</span>
-        <textarea
-          className="teams-textarea"
-          rows={3}
-          value={request}
-          onChange={(event) => setRequest(event.target.value)}
-        />
-      </label>
-      <div className="teams-actions">
-        <Button type="submit" intent="go" disabled={!valid || create.isPending}>
-          Add rule
-        </Button>
-      </div>
-      {create.isError && <CreateTriggerRefusal error={create.error} />}
-    </form>
-  );
-}
-
-function CreateTriggerRefusal({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this rule was not written</ErrorNote>;
-}
-
-/* ------------------------------------------------------------------- runs -- */
-
-function StartRunForm({ teamId }: { teamId: string }) {
-  const [request, setRequest] = useState("");
-  const start = useStartTeamRun();
-
-  return (
-    <Panel title="Start a run">
-      <form
-        className="teams-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (request.trim() === "" || start.isPending) return;
-          start.mutate({ id: teamId, request: request.trim() }, { onSuccess: () => setRequest("") });
-        }}
-      >
-        <label className="teams-field">
-          <span className="teams-label">Request</span>
-          <textarea
-            className="teams-textarea"
-            rows={3}
-            value={request}
-            onChange={(event) => setRequest(event.target.value)}
-          />
-        </label>
-        <div className="teams-actions">
-          <Button type="submit" intent="go" disabled={request.trim() === "" || start.isPending}>
-            Start
-          </Button>
-        </div>
-      </form>
-      {start.isError && <StartRunRefusal error={start.error} />}
-      {start.data !== undefined && (
-        <p className="teams-note">
-          Started — <Link to={`/team-runs/${start.data.id}`}>this run</Link> has nothing in it yet; the núcleo has
-          not picked it up.
-        </p>
-      )}
-    </Panel>
-  );
-}
-
-/**
- * Why a run would not start.
- *
- * The 400s name the missing specialist, the empty roster, the deleted
- * director or the local model this machine has not got — the daemon's own
- * sentence. The 429 is the budget window and reads as a ceiling that reopens,
- * never as a failure.
- */
-function StartRunRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — no run was started</ErrorNote>;
-  if (error.status === 429) {
-    return (
-      <RefusalNote
-        refusal={error}
-        sentences={{ too_many_requests: "the budget window is exhausted for now — it reopens", ...daemonProse(error) }}
-      />
-    );
-  }
-  return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-}
-
-/**
- * The newest {@link TEAM_RUN_LIST_LIMIT} runs, filtered to one department by
- * the caller. No cost column — `cost_usd` is not in this response and an N+1
- * fetch to build one would be a lie about what the list knows.
- */
-function TeamRunList({ runs }: { runs: TeamRun[] }) {
-  return (
-    <Panel title="Runs">
-      {runs.length === 0 && <p className="teams-empty">no run yet for this department.</p>}
-      {runs.length > 0 && (
-        <ul className="teams-runs" aria-label="Runs">
-          {runs.map((run) => (
-            <li className="teams-run" key={run.id}>
-              <div className="teams-run-head">
-                <Link to={`/team-runs/${run.id}`}>{run.id}</Link>
-                <StateBadge domain="team_run" state={run.state} />
-                <RelativeTime at={run.created_at} />
-              </div>
-              <p className="teams-run-request">{run.request}</p>
-              {run.why !== null && <p className="teams-run-why">{run.why}</p>}
-            </li>
-          ))}
-        </ul>
-      )}
-      <p className="teams-cap">showing the newest hundred runs — there is no paging past the cap.</p>
-    </Panel>
-  );
+export function pulseLabel(count: number): string {
+  if (count === 0) return "no run in the window";
+  return `the ${count} ${count === 1 ? "run" : "runs"} in the window`;
 }
