@@ -3312,7 +3312,10 @@ mod tests {
             let found = shell_segments(command)
                 .into_iter()
                 .find_map(|segment| merge_from_command(segment, "master"));
-            assert_eq!(found, None, "a heredoc body was read as a command: {command}");
+            assert_eq!(
+                found, None,
+                "a heredoc body was read as a command: {command}"
+            );
         }
     }
 
