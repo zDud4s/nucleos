@@ -21615,24 +21615,30 @@ mod tests {
 
     /// **An approval that cannot resume says so, in the body, rather than answering a bare 409.**
     ///
-    /// The subject is the one that cost a whole session to diagnose: a run with no worktree. It is
-    /// not an exotic state — `mode: "real"` is the API's DEFAULT and creates no worktree at all, so
-    /// every merge approval in a run started the ordinary way lands here.
-    ///
     /// **The status is asserted AND the body is, and the body half is the whole test.** The 409 was
     /// already correct and already returned; what nobody could get at was WHICH precondition failed,
     /// since `ProposalNotPending` — "somebody already decided this" — answers with the same number
     /// and means the opposite. A test on the status alone passes against the defect.
+    ///
+    /// **The subject moved once, and the move is worth reading.** This used to stand on a run with
+    /// no worktree — `mode: "real"`'s ordinary shape — because that was believed to be the
+    /// unresumable case, and the doc here said so. It is not: such a run records the directory it
+    /// works in, and `runs::a_paused_run_without_a_worktree_resumes_in_the_directory_it_recorded`
+    /// pins that it now continues there. Leaving this fixture in place would have pinned the defect
+    /// instead of the behaviour.
+    ///
+    /// So the fixture is the case that genuinely has nowhere to go — no worktree, no project, no
+    /// recorded directory — and the assertion is untouched, because what this test is about was
+    /// never the worktree. It is that a refusal names what is missing.
     #[tokio::test]
     async fn an_approval_that_cannot_resume_says_why_instead_of_answering_a_bare_409() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let created_at = chrono::Utc::now().to_rfc3339();
-        // Deliberately NO `worktrees` row: this is `mode: "real"`'s shape, where there is nothing
-        // for the resume to take over.
+        // No `worktrees` row, no project, no `cwd`: nothing anywhere names a tree to continue in.
         let original_run_id = sqlx::query(
-            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
-             VALUES ('proj', 'C:/repos/proj', 'x', 'awaiting_approval', 'sess-a', 'real', ?)",
+            "INSERT INTO runs (prompt, status, session_id, mode, created_at)
+             VALUES ('x', 'awaiting_approval', 'sess-a', 'real', ?)",
         )
         .bind(&created_at)
         .execute(&pool)
