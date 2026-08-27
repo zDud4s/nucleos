@@ -527,6 +527,55 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
     })
 }
 
+/// Every file this map reads a `§` out of, which is deliberately **not** [`Structure::modules`].
+///
+/// Three groups, and the two a sweep over the modules alone loses in silence are the second and
+/// the third:
+///
+/// 1. **The modules** — whatever [`reader_for`] names.
+/// 2. **Their test siblings.** `Fleet.test.tsx` is [`about_a_module`], so [`structure`] never
+///    makes it a module — and folds its citations into `Fleet.tsx`'s [`Module::cites`] all the
+///    same, which is what keeps the two languages answering one question. But a declaration is
+///    read out of the file it was written in, so a header on `Fleet.tsx` governs nothing the
+///    sibling wrote: sweep the modules alone and every TypeScript module comes out
+///    half-declared, with nothing on screen saying why. That is the asymmetry `Module::cites`
+///    exists to prevent, reopened one level up. [`reader_for`] says yes to a `.test.tsx` — it is
+///    [`structure`] that subtracts them — so they arrive here for free, and this paragraph is
+///    here to say that the subtraction must not be copied.
+/// 3. **The foreign files** — [`Structure::foreign`], whose citations reach the junction exactly
+///    as a module's do. 77 Go files under `sidecars/` name a `§`, and a header is worth as much
+///    on one of those as anywhere else.
+///
+/// A `.d.ts` is in none of the three, which is the second group's argument in reverse: nothing
+/// folds its citations anywhere, so a header written on one would govern nothing.
+///
+/// **A file naming no `§` at all is left out**, by [`cites_section`]'s test rather than by a
+/// second one, so this list and [`Module::declares`] cannot drift apart about what counts as
+/// naming a section. A file that cannot be read is left out too, and reads here as naming
+/// nothing — the same answer [`structure`] gives it, where an unreadable file becomes an empty
+/// source rather than a failed walk.
+///
+/// **Paths and not sources**, so the caller reads each file when it gets to it. A list of 211
+/// file bodies held at once to save a second `read_to_string` is memory spent on a walk that
+/// happens once per sweep.
+// Not reached from `main` yet, and the two halves of that are in two different tasks: the
+// sweep that walks this list is the harness in `map_anchor`'s tests, and the applier that
+// acts on what it proposes is the next commit. Scoped to the non-test build exactly as
+// `map_anchor`'s own crate-level suppression is, so the lint stays live under `cfg(test)`,
+// where the test below exercises every branch of it. The instruction, not a description:
+// DELETE THESE TWO LINES with the change that gives this a production caller.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn citing_files(root: &Path) -> std::io::Result<Vec<String>> {
+    let mut files: Vec<String> = Vec::new();
+    collect(root, root, &mut files)?;
+    files.sort();
+    files.retain(|path| {
+        (reader_for(path).is_some() || foreign_source(path))
+            && std::fs::read_to_string(root.join(path)).is_ok_and(|source| cites_section(&source))
+    });
+    Ok(files)
+}
+
 /// Every file below `dir`, by path relative to `root`.
 fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -1282,6 +1331,61 @@ mod tests {
                 },
             ],
             "the header reached its own file's citation and not the sibling's"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_files_a_sweep_asks_about_are_not_the_modules_it_draws() {
+        // The list a disambiguating sweep has to walk is wider than `modules` in two directions,
+        // and both are easy to miss because `structure` is the obvious thing to iterate over.
+        //
+        // The fixtures below name only sections this file already cites, deliberately: a `§` in a
+        // literal here is a citation of THIS module — `citations` is not a parser — so a fixture
+        // inventing a new number would put this file into the anchor set of every document that
+        // has one, and move a junction count from a test.
+        let root = scratch("citing");
+        write(
+            &root,
+            "shell/src/fleet/Fleet.tsx",
+            "// what §5.1 asks for\n",
+        );
+        // Never a module — `about_a_module` subtracts it — and yet its citations are counted as
+        // `Fleet.tsx`'s. A declaration would have to be written in ITS text, so leaving it out of
+        // the sweep leaves the module it proves half-declared.
+        write(
+            &root,
+            "shell/src/fleet/Fleet.test.tsx",
+            "// and §7 is what the test pins\n",
+        );
+        write(
+            &root,
+            "sidecars/echo/main.go",
+            "// §9 echo — the sidecar contract\npackage main\n",
+        );
+        // Read by nobody and folded into nothing, so a header here would govern no citation at all.
+        write(&root, "shell/src/data/wire.d.ts", "// §4 is mentioned\n");
+        // Names no section, so it is a question worth nobody's money.
+        write(&root, "core/src/quiet.rs", "//! nothing is claimed here\n");
+
+        let found = structure(&root).expect("structure");
+        assert_eq!(
+            found
+                .modules
+                .iter()
+                .map(|module| module.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["core/src/quiet.rs", "shell/src/fleet/Fleet.tsx"],
+            "the drawn map is the narrower list, which is the whole reason for this function"
+        );
+
+        assert_eq!(
+            citing_files(&root).expect("citing files"),
+            vec![
+                "shell/src/fleet/Fleet.test.tsx".to_string(),
+                "shell/src/fleet/Fleet.tsx".to_string(),
+                "sidecars/echo/main.go".to_string(),
+            ]
         );
 
         let _ = fs::remove_dir_all(&root);

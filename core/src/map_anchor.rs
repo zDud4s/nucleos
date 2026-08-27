@@ -1067,6 +1067,73 @@ pub fn tally(verdicts: &[Verdict]) -> AnchorCounts {
     counts
 }
 
+/// What one pass over a project's citing files came to, with the three ways a file leaves it
+/// kept apart.
+///
+/// **Every file handed in comes back in exactly one of these three lists**, which is
+/// [`adjudicate`]'s own rule one level up: a file that vanished from a report because its run
+/// died is the under-report that looks like the map forgot something, and this whole slice is
+/// arranged around not doing that.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sweep {
+    /// One per file that was actually asked about — including the ones nobody could read an
+    /// answer for, which arrive as [`Outcome::Unreadable`].
+    pub verdicts: Vec<Verdict>,
+    /// The files that were never a question, with which of [`Skipped`]'s two reasons applied.
+    pub skipped: Vec<(String, Skipped)>,
+    /// The files whose model run never finished, with what the runner said about it.
+    ///
+    /// **Not an [`Outcome::Unreadable`], and the line between them is the one [`ask`] already
+    /// draws.** That variant means somebody answered and nobody could read it, which sends a
+    /// reader to the prompt or the model. This is a fact about the machine — a CLI that exited
+    /// non-zero, a rate limit, a network that was not there — and folding it into a verdict would
+    /// report a model as having failed to answer a question it was never asked, which is the
+    /// same collapse `map_intent::extract` refuses between an empty list and an error. Counted
+    /// and named apart, so a report short by nine files says which nine and why, and so that
+    /// re-running just those nine is a thing the report tells you how to do.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Ask one brain about every file in a list, and keep what each answer came to.
+///
+/// **Sequential on purpose, and the concurrency is the caller's.** How many model calls may be in
+/// flight at once is a spending decision about a particular machine and a particular brain — a
+/// local model wants one, a cloud CLI wants eight — and a number chosen in here would be that
+/// decision made once, for everybody, by the layer with the least idea of it. A caller that wants
+/// lanes shards the list and calls this once per shard, which is what the sweep harness below
+/// does; a route serving one button would call it once and be right to.
+///
+/// **A file that cannot be read is read as empty**, exactly as [`crate::project_map::structure`]
+/// reads one, and an empty file inherits nothing — so it comes back as
+/// [`Skipped::NothingWouldInherit`] rather than as a failure. That is the honest answer: nothing
+/// went wrong with any model, and a file this walk could not open names no section it could see.
+pub async fn sweep(
+    asked: crate::map_intent::Extractor<'_>,
+    root: &Path,
+    files: &[String],
+    specs: &[Spec],
+) -> Sweep {
+    let mut swept = Sweep::default();
+    for path in files {
+        let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+        let about = match question(path, &source, specs) {
+            Ok(about) => about,
+            Err(why) => {
+                swept.skipped.push((path.clone(), why));
+                continue;
+            }
+        };
+        match ask(asked, &about, specs).await {
+            Err(error) => swept.failed.push((path.clone(), error.to_string())),
+            Ok(answer) => {
+                swept
+                    .verdicts
+                    .push(adjudicate(&about, parse_proposal(&answer), specs));
+            }
+        }
+    }
+    swept
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1857,6 +1924,656 @@ mod tests {
         // nothing stores it: it is provenance, carried in the run's report and the sweep's commit
         // message rather than in the 209 headers themselves. See [`ANCHOR_PROMPT_VERSION`] for why
         // that is the right place for it.
+
         assert_eq!(ANCHOR_PROMPT_VERSION, 1);
+    }
+    /// A scratch tree, keyed by process the way `project_map`'s own fixtures are keyed.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("nucleos-sweep-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        root
+    }
+
+    fn write(root: &std::path::Path, relative: &str, body: &str) {
+        let full = root.join(relative);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+        std::fs::write(full, body).expect("write");
+    }
+
+    /// A scratch project holding exactly one document, named by [`FIXTURE`].
+    ///
+    /// The fictional slug and not a real one, for the reason `FIXTURE` gives: this file's own text
+    /// is walked by the map, and a fixture naming a document this project has would hand these
+    /// paragraphs' citations to it. The sections the fixtures below cite are ones this file already
+    /// cites, for the other half of the same reason — a new number here would put this module into
+    /// the anchor set of every document that has one.
+    fn one_document_project(name: &str) -> std::path::PathBuf {
+        let root = scratch(name);
+        write(
+            &root,
+            &format!(".ai/specs/{FIXTURE}.md"),
+            "# Documento de fixture\n\n## 7. Sete\n",
+        );
+        root
+    }
+
+    #[tokio::test]
+    async fn a_sweep_puts_every_file_it_was_handed_into_exactly_one_of_its_three_lists() {
+        // The under-report this slice is expected to be misread as. A file that fell out of the
+        // report because it was never a question, and a file that fell out because its run died,
+        // are indistinguishable from a file the model declined — three different facts, fixed in
+        // three different places.
+        let root = one_document_project("three-lists");
+        write(&root, "core/src/asked.rs", "//! what §7 asks for\n");
+        // Nothing would inherit: the one citation already names its own document.
+        write(
+            &root,
+            "core/src/settled.rs",
+            &format!("//! §7 {FIXTURE} — already said\n"),
+        );
+        let files = [
+            "core/src/asked.rs".to_owned(),
+            "core/src/settled.rs".to_owned(),
+            // Not on disk at all, which reads as an empty file and therefore as nothing to inherit.
+            "core/src/vanished.rs".to_owned(),
+        ];
+        let specs = catalogue(&root);
+        let runner = fake_answering(&format!(
+            "{{\"spec\":\"{FIXTURE}\",\"why\":\"the module comment names it\"}}"
+        ));
+
+        let swept = sweep(
+            crate::map_intent::Extractor::Cli(&runner),
+            &root,
+            &files,
+            &specs,
+        )
+        .await;
+
+        assert_eq!(swept.verdicts.len(), 1);
+        assert_eq!(swept.verdicts[0].file, "core/src/asked.rs");
+        assert_eq!(swept.verdicts[0].outcome, Outcome::Declares);
+        assert_eq!(
+            swept.skipped,
+            vec![
+                (
+                    "core/src/settled.rs".to_owned(),
+                    Skipped::NothingWouldInherit
+                ),
+                (
+                    "core/src/vanished.rs".to_owned(),
+                    Skipped::NothingWouldInherit
+                ),
+            ],
+            "a file this walk could not open names no section it could see, which is nobody's \
+             model failing"
+        );
+        assert!(swept.failed.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_never_happened_is_kept_apart_from_an_answer_nobody_could_read() {
+        // `map_intent::extract` refuses to collapse an empty list into an error, and this is that
+        // refusal one level up: *the CLI exited non-zero* sends a reader to the machine, and *the
+        // model put a paragraph where the slug goes* sends them to the prompt. A sweep reporting
+        // both as `Outcome::Unreadable` would say a model failed to answer a question nobody asked
+        // it.
+        let root = one_document_project("failed-run");
+        write(&root, "core/src/asked.rs", "//! what §7 asks for\n");
+        let files = ["core/src/asked.rs".to_owned()];
+        let specs = catalogue(&root);
+        // `fail_times` is a countdown, and one call is all this sweep makes.
+        let runner = crate::runner::FakeCommandRunner {
+            fail_times: std::sync::Mutex::new(1),
+            ..Default::default()
+        };
+
+        let swept = sweep(
+            crate::map_intent::Extractor::Cli(&runner),
+            &root,
+            &files,
+            &specs,
+        )
+        .await;
+
+        assert!(swept.verdicts.is_empty(), "nobody was asked anything");
+        assert!(
+            swept.skipped.is_empty(),
+            "and it was a perfectly good question"
+        );
+        assert_eq!(swept.failed.len(), 1);
+        assert_eq!(swept.failed[0].0, "core/src/asked.rs");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The harness: this module's caller, and the ground truth it is judged against.
+    // -----------------------------------------------------------------------------------------
+
+    /// The thirty file/document pairs whose right answer was written down **before any model ran**.
+    ///
+    /// **This table is the whole safety argument of the slice, and its value comes entirely from
+    /// when it was written.** With the veto withdrawn there is no mechanical check on whether a
+    /// proposal is right, so a hit rate computed from memory at the moment somebody wants it to
+    /// pass is exactly the measurement this feature exists to distrust. The answers were fixed in
+    /// advance — proposed from each module's subject, then **refuted** where possible against the
+    /// candidate document's headings — and anything that stayed ambiguous was dropped rather than
+    /// guessed: `voice.rs` has two candidate voice documents and `team.rs` has two team documents,
+    /// so neither is here.
+    ///
+    /// **All thirty are the denominator, and not the twenty-one that pass the withdrawn veto.** The
+    /// last nine — from `map_join.rs` down — are the pairs arithmetic refused, and they are the
+    /// more interesting half: a file a veto refused is still a file whose right answer is known,
+    /// and it is precisely where the gate cost real answers.
+    ///
+    /// **30/30 applies and anything less stops**, because a wrong answer here is worth roughly
+    /// seven wrong files across the two hundred that cite anything, and a wrong slug manufactures a
+    /// false [`crate::map_join::Anchor::Declared`] — the one state this map may present as
+    /// confirmed. Whoever loosens that has removed the only thing standing between this module and
+    /// §1's failure.
+    const GROUND_TRUTH: &[(&str, &str)] = &[
+        ("core/src/email.rs", "2026-07-28-email-pillar-design"),
+        ("core/src/browser.rs", "2026-08-15-pilar-de-browser-design"),
+        (
+            "core/src/browser_policy.rs",
+            "2026-08-15-pilar-de-browser-design",
+        ),
+        (
+            "core/src/browser_wheel.rs",
+            "2026-08-15-pilar-de-browser-design",
+        ),
+        ("core/src/web.rs", "2026-08-01-pilar-de-web-design"),
+        ("core/src/web_client.rs", "2026-08-01-pilar-de-web-design"),
+        ("core/src/vcs.rs", "2026-08-02-fila-vcs-design"),
+        ("core/src/git_exec.rs", "2026-08-02-fila-vcs-design"),
+        ("core/src/github.rs", "2026-08-19-modulo-de-github-design"),
+        ("core/src/job.rs", "2026-07-29-autopilot-job-graph-design"),
+        (
+            "core/src/contacts.rs",
+            "2026-07-29-correspondent-contacts-design",
+        ),
+        ("core/src/council.rs", "2026-08-11-council-design"),
+        (
+            "core/src/errands.rs",
+            "2026-08-15-assuntos-fora-de-codigo-design",
+        ),
+        (
+            "core/src/map_intent.rs",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        ("core/src/map_store.rs", "2026-08-24-mapa-do-projeto-design"),
+        ("core/src/map_stamp.rs", "2026-08-24-mapa-do-projeto-design"),
+        (
+            "shell/src/project/Triagem.tsx",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "shell/src/project/Juncao.tsx",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "shell/src/project/Carimbos.tsx",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "shell/src/project/ModeMapa.tsx",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "shell/src/canvas/map-model.ts",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        ("core/src/map_join.rs", "2026-08-24-mapa-do-projeto-design"),
+        (
+            "core/src/map_recency.rs",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "core/src/map_anchor.rs",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "core/src/map_triage.rs",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "core/src/project_map.rs",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "shell/src/data/project-map.ts",
+            "2026-08-24-mapa-do-projeto-design",
+        ),
+        (
+            "core/src/workflow_graph.rs",
+            "2026-08-24-motor-de-workflows-design",
+        ),
+        (
+            "core/src/workflows.rs",
+            "2026-08-24-motor-de-workflows-design",
+        ),
+        (
+            "shell/src/canvas/workflow-model.ts",
+            "2026-08-24-motor-de-workflows-design",
+        ),
+    ];
+
+    #[test]
+    fn the_ground_truth_names_thirty_pairs_and_no_document_this_project_lacks() {
+        // Runs in the ordinary suite, unlike the two harness tests below, because it is the half of
+        // the ground truth that costs nothing to check. A pair naming a document this project does
+        // not have would score every run against a slug no model could ever answer, and would read
+        // as the model being wrong about a file the TABLE is wrong about — which is the one way a
+        // ground truth can quietly stop being one.
+        assert_eq!(GROUND_TRUTH.len(), 30);
+
+        let root = repository_root();
+        let slugs: BTreeSet<String> = catalogue(&root).into_iter().map(|spec| spec.slug).collect();
+        for (file, slug) in GROUND_TRUTH {
+            assert!(
+                root.join(file).is_file(),
+                "the ground truth names {file}, which is not in this checkout"
+            );
+            assert!(
+                slugs.contains(*slug),
+                "the ground truth scores {file} against {slug}, which this project does not have"
+            );
+        }
+    }
+
+    /// The repository this measurement is about.
+    ///
+    /// Derived from the crate rather than from the working directory, because `cargo test` runs
+    /// with the crate as its cwd — and a harness answering about `core/` would sweep a third of the
+    /// files and report a whole number.
+    fn repository_root() -> std::path::PathBuf {
+        std::env::var("NUCLEOS_ANCHOR_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("the crate sits inside the repository")
+                    .to_path_buf()
+            })
+    }
+
+    /// A cloud brain, one per lane.
+    ///
+    /// One runner per lane rather than one shared: the struct is three strings, and a lane whose
+    /// future owns everything it borrows is a lane that can be spawned.
+    fn brain() -> crate::runner::ClaudeCliRunner {
+        crate::runner::ClaudeCliRunner {
+            model: std::env::var("NUCLEOS_ANCHOR_MODEL").unwrap_or_else(|_| "sonnet".to_owned()),
+            plan_model: None,
+            review_model: None,
+        }
+    }
+
+    /// How many model calls a run keeps in flight.
+    ///
+    /// **A spending decision, and therefore not [`sweep`]'s.** Eight is what a cloud CLI on this
+    /// machine takes without the five-hour window complaining; a local brain would want one. The
+    /// env var is what makes it somebody's choice rather than this file's.
+    fn lanes() -> usize {
+        std::env::var("NUCLEOS_ANCHOR_LANES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|lanes| *lanes > 0)
+            .unwrap_or(8)
+    }
+
+    /// Shard the list across lanes, sweep each lane, and put the answers back into one order.
+    ///
+    /// **Strided rather than chunked**, so the lane that draws `http.rs` is not also the lane that
+    /// draws every other large file beside it: the list is sorted by path, and a contiguous chunk
+    /// of it is a contiguous folder.
+    ///
+    /// Sorted by file at the end, because the report is read as a diff and an order the scheduler
+    /// chose changes between two runs over an unchanged repository.
+    async fn sweep_in_lanes(root: &std::path::Path, files: &[String], specs: &[Spec]) -> Sweep {
+        let lanes = lanes();
+        let mut running = tokio::task::JoinSet::new();
+        for lane in 0..lanes {
+            let root = root.to_path_buf();
+            let specs = specs.to_vec();
+            let mine: Vec<String> = files.iter().skip(lane).step_by(lanes).cloned().collect();
+            running.spawn(async move {
+                let runner = brain();
+                sweep(
+                    crate::map_intent::Extractor::Cli(&runner),
+                    &root,
+                    &mine,
+                    &specs,
+                )
+                .await
+            });
+        }
+
+        let mut whole = Sweep::default();
+        while let Some(lane) = running.join_next().await {
+            let lane = lane.expect("a lane panicked");
+            whole.verdicts.extend(lane.verdicts);
+            whole.skipped.extend(lane.skipped);
+            whole.failed.extend(lane.failed);
+        }
+        whole
+            .verdicts
+            .sort_by(|left, right| left.file.cmp(&right.file));
+        whole.skipped.sort_by(|left, right| left.0.cmp(&right.0));
+        whole.failed.sort_by(|left, right| left.0.cmp(&right.0));
+        whole
+    }
+
+    /// Where a run writes itself down, and it refuses to start without one.
+    ///
+    /// No default path, deliberately: a measurement that quietly wrote its report somewhere is a
+    /// measurement whose stale copy somebody reads six months later.
+    fn report_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::env::var("NUCLEOS_ANCHOR_OUT")
+                .expect("NUCLEOS_ANCHOR_OUT must name where the proposal is written"),
+        )
+    }
+
+    /// One verdict as the report carries it.
+    fn row(verdict: &Verdict) -> serde_json::Value {
+        serde_json::json!({
+            "file": verdict.file,
+            "proposed": verdict.proposed,
+            "outcome": verdict.outcome,
+            "unaccounted": verdict.unaccounted,
+            "needs_override": verdict.needs_override,
+            "why": verdict.why,
+        })
+    }
+
+    /// The header every report carries, so a header found to be wrong in six months is traceable to
+    /// the question that produced it.
+    ///
+    /// [`ANCHOR_PROMPT_VERSION`]'s own doc comment is the argument: the version is deliberately not
+    /// written into the two hundred source files, so the run's record is the only place it exists
+    /// at all. A report without it is a list of slugs nobody can attribute to a question.
+    fn provenance(swept: &Sweep, files: usize) -> serde_json::Value {
+        let counts = tally(&swept.verdicts);
+        let sections: usize = swept
+            .verdicts
+            .iter()
+            .map(|verdict| verdict.needs_override.len())
+            .sum();
+        serde_json::json!({
+            "anchor_prompt_version": ANCHOR_PROMPT_VERSION,
+            "run_at": chrono::Utc::now().to_rfc3339(),
+            "model": brain().model,
+            "lanes": lanes(),
+            "root": repository_root().to_string_lossy(),
+            "files_walked": files,
+            "counts": counts,
+            "skipped": swept.skipped.len(),
+            "failed": swept.failed.len(),
+            "override_backlog": {"files": counts.needing_overrides, "sections": sections},
+        })
+    }
+
+    /// The report's two lists of files nobody proposed anything for, shaped for JSON.
+    ///
+    /// Named apart in the file as they are named apart in [`Sweep`], because collapsing them is
+    /// exactly what that type exists to prevent.
+    fn unasked(swept: &Sweep) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        (
+            swept
+                .skipped
+                .iter()
+                .map(|(file, why)| serde_json::json!({"file": file, "why": format!("{why:?}")}))
+                .collect(),
+            swept
+                .failed
+                .iter()
+                .map(|(file, error)| serde_json::json!({"file": file, "error": error}))
+                .collect(),
+        )
+    }
+
+    /// Score the thirty pairs whose answer was known before any model ran.
+    ///
+    /// **This is the gate, and it is a separate run from the sweep rather than a step inside it.**
+    /// `#[ignore]` for `runner`'s reason — it needs the Claude Code CLI installed, an authenticated
+    /// session, and about a dollar of somebody's money — and it is a measurement rather than a
+    /// property, so it asserts the one thing the slice turns on: thirty out of thirty, or nobody
+    /// applies anything.
+    ///
+    /// It prints every miss with the model's own sentence before it asserts, because **which file
+    /// it got wrong matters far more than how many**: a miss on `browser_policy.rs` is a model
+    /// confusing two documents about one pillar, and a miss on `project_map.rs` is the IDF spike's
+    /// failure arriving through a different door.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns the real Claude CLI once per file and spends money; run with --include-ignored"]
+    async fn the_ground_truth_is_scored_before_any_sweep_is_run() {
+        let root = repository_root();
+        let specs = catalogue(&root);
+        let files: Vec<String> = GROUND_TRUTH
+            .iter()
+            .map(|(file, _)| (*file).to_owned())
+            .collect();
+
+        let swept = sweep_in_lanes(&root, &files, &specs).await;
+
+        let answered: std::collections::BTreeMap<&str, &Verdict> = swept
+            .verdicts
+            .iter()
+            .map(|verdict| (verdict.file.as_str(), verdict))
+            .collect();
+        let mut hits = 0usize;
+        let mut pairs = Vec::new();
+        for (file, expected) in GROUND_TRUTH {
+            let verdict = answered.get(file).copied();
+            let proposed = verdict.and_then(|verdict| verdict.proposed.as_deref());
+            let hit = proposed == Some(*expected);
+            if hit {
+                hits += 1;
+            } else {
+                println!(
+                    "MISS {file}\n  expected {expected}\n  proposed {}\n  because  {}",
+                    proposed.unwrap_or("(nothing)"),
+                    verdict.map_or("(this file was never asked about)", |verdict| verdict
+                        .why
+                        .as_str()),
+                );
+            }
+            pairs.push(serde_json::json!({
+                "file": file,
+                "expected": expected,
+                "hit": hit,
+                "verdict": verdict.map(row),
+            }));
+        }
+
+        let (skipped, failed) = unasked(&swept);
+        let report = serde_json::json!({
+            "provenance": provenance(&swept, files.len()),
+            "hit_rate": {"hits": hits, "of": GROUND_TRUTH.len()},
+            "pairs": pairs,
+            "skipped": skipped,
+            "failed": failed,
+        });
+        std::fs::write(
+            report_path(),
+            serde_json::to_string_pretty(&report).expect("the report serialises"),
+        )
+        .expect("the report is written");
+
+        println!("ground truth: {hits}/{}", GROUND_TRUTH.len());
+        assert_eq!(
+            hits,
+            GROUND_TRUTH.len(),
+            "anything short of thirty stops the sweep and reports the misses BY NAME — the lines \
+             above are that report"
+        );
+    }
+
+    /// Every `#`-headed line of every document this project has, as a decision nobody approved.
+    ///
+    /// **A stand-in, named as one, and deliberately the same one Task 1 of this slice measured
+    /// against.** The product's `map_decisions` table is EMPTY — §4 reserves approval to the owner,
+    /// line by line, and that is the whole point of the layer — so [`crate::map_join::join`]
+    /// against the real intention layer answers all zeros and discriminates nothing. A number
+    /// reported without naming the intention layer it was measured against is reporting nothing, so
+    /// the layer is built here in code rather than described in a report: two runs a month apart
+    /// are then comparable, which is exactly what a before-and-after is for.
+    ///
+    /// It is **not** what the product will hold, and the difference is worth stating: a real
+    /// extraction proposes a handful of decisions per document, and this proposes every heading,
+    /// which is roughly ten times as many and includes headings no owner would ever approve. What
+    /// it buys is that it is derived from the repository alone — reproducible by anybody, on any
+    /// checkout, without a database.
+    ///
+    /// `kind`, `brain` and `approved_at` are filled with the same value for every row because
+    /// [`crate::map_join::join`] reads none of them; inventing variety there would be detail the
+    /// stand-in does not have, dressed up as detail it does.
+    fn pseudo_decisions(root: &Path) -> Vec<crate::map_store::Decision> {
+        let mut decisions = Vec::new();
+        for relative in crate::map_intent::specs_in(root) {
+            let Ok(source) = std::fs::read_to_string(root.join(&relative)) else {
+                continue;
+            };
+            let slug = crate::map_intent::spec_slug(&relative);
+            // `starts_with` on the untrimmed line, and the two lines of difference are themselves
+            // a measurement. Trimming first finds two more `#` lines across these 43 documents —
+            // 1244 rather than 1242 — and both are indented, which in Markdown puts them inside a
+            // code block and makes them not headings at all. It would also quietly stop this being
+            // the SAME stand-in Task 1 took the baseline with, which is the one property a
+            // before-and-after has to have.
+            for line in source.lines().filter(|line| line.starts_with('#')) {
+                decisions.push(crate::map_store::Decision {
+                    id: decisions.len() as i64 + 1,
+                    spec_slug: slug.clone(),
+                    // The heading verbatim, because that is what an approved decision carries:
+                    // `Anchored::section` is the string the owner said yes to, and the number is an
+                    // internal step `join` takes off it.
+                    section: line.trim().to_owned(),
+                    ordinal: decisions.len() as i64 + 1,
+                    text: line.trim().to_owned(),
+                    kind: crate::map_intent::Kind::Character,
+                    brain: "stand-in".to_owned(),
+                    extracted_at: "2026-08-24T00:00:00Z".to_owned(),
+                    approved_at: Some("2026-08-24T00:00:00Z".to_owned()),
+                });
+            }
+        }
+        decisions
+    }
+
+    /// The numbers this slice is judged by, measured through the stand-in above.
+    ///
+    /// **Here rather than in `map_join`'s tests, and the reason is what it is.** `join`'s tests
+    /// assert properties of `join`; this asserts nothing at all. It is the run's record — the
+    /// before-and-after the plan asks for, taken through the shipped `structure` + `join` +
+    /// `map_recency::order` rather than through a script that would be a second answer to the same
+    /// question and would drift from the product on the first change to either.
+    ///
+    /// `#[ignore]` because it reads the whole of a particular repository and shells out to git, so
+    /// its answer is a fact about a checkout rather than about this code. It spends no money, which
+    /// is the one way it differs from the two harness runs above.
+    ///
+    /// **`StampCounts::guessed` — the plan's first scoreboard number — is not here, and cannot
+    /// be.** It counts *stamps*, `map_stamps` is as empty as `map_decisions`, and
+    /// `map_stamp::standing` answers `Never` for a decision nobody has stamped — so the honest
+    /// value today is zero, and the plan's *"every anchored stamp"* describes a state this machine
+    /// has never been in. What stands in for it under this layer is the `ambiguous` count: a
+    /// stamped `Ambiguous` decision is precisely what `Watch::Guessed` marks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "reads a whole real repository and shells out to git; run with --include-ignored"]
+    async fn the_scoreboard_is_measured_through_the_stand_in_intention_layer() {
+        let root = repository_root();
+        let decisions = pseudo_decisions(&root);
+        let slugs: Vec<String> = crate::map_intent::specs_in(&root)
+            .iter()
+            .map(|relative| crate::map_intent::spec_slug(relative))
+            .collect();
+        let structure = crate::project_map::structure(&root).expect("the walk reads this tree");
+
+        let mut junction =
+            crate::map_join::join(&decisions, &structure.modules, &structure.foreign, &slugs);
+        let walked = crate::map_recency::walk(&root).await;
+        let recency = crate::map_recency::order(&mut junction.decisions, &walked);
+
+        let moved: BTreeSet<i64> = recency
+            .ages
+            .values()
+            .filter_map(|age| match age {
+                crate::map_recency::Age::Moved { at } => Some(*at),
+                _ => None,
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "intention_layer": {
+                    "kind": "stand-in: every `#`-headed line of every document specs_in finds",
+                    "documents": slugs.len(),
+                    "pseudo_decisions": decisions.len(),
+                },
+                "counts": junction.counts,
+                "unclaimed": junction.unclaimed.len(),
+                "unmatched": junction.unmatched.len(),
+                "recency": {
+                    "window_commits": recency.window,
+                    "decisions_inside_the_window": recency
+                        .ages
+                        .values()
+                        .filter(|age| matches!(age, crate::map_recency::Age::Moved { .. }))
+                        .count(),
+                    "distinct_timestamps": moved.len(),
+                },
+            }))
+            .expect("the scoreboard serialises")
+        );
+    }
+    /// Ask about every file this map reads a `§` out of, and write the proposal down.
+    ///
+    /// **Only ever run once the gate above has passed.** Nothing here enforces that and nothing
+    /// could: the two are separate runs against a repository that changes between them, so a check
+    /// in here would be a check on a stale answer. What enforces it is that the gate is a test, and
+    /// a test that fails is a run somebody has to look at.
+    ///
+    /// The list is [`crate::project_map::citing_files`]'s and **not** `structure().modules` — see
+    /// that function for the two groups a sweep over the modules alone loses in silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns the real Claude CLI once per file and spends money; run with --include-ignored"]
+    async fn the_repository_is_swept_and_the_proposal_is_written_down() {
+        let root = repository_root();
+        let specs = catalogue(&root);
+        let files = crate::project_map::citing_files(&root).expect("the walk reads this tree");
+
+        let swept = sweep_in_lanes(&root, &files, &specs).await;
+
+        let (skipped, failed) = unasked(&swept);
+        let header = provenance(&swept, files.len());
+        let report = serde_json::json!({
+            "provenance": header,
+            "files": swept.verdicts.iter().map(row).collect::<Vec<_>>(),
+            "skipped": skipped,
+            "failed": failed,
+        });
+        std::fs::write(
+            report_path(),
+            serde_json::to_string_pretty(&report).expect("the report serialises"),
+        )
+        .expect("the report is written");
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report["provenance"]).expect("the header serialises")
+        );
+        assert_eq!(
+            swept.verdicts.len() + swept.skipped.len() + swept.failed.len(),
+            files.len(),
+            "every file handed in has to come back in exactly one of the three lists"
+        );
     }
 }
