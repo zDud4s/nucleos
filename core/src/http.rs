@@ -3606,6 +3606,10 @@ async fn post_project_map_extract(
     let local_model;
     let asked = match brain {
         crate::chats::Brain::Cloud => crate::map_intent::Extractor::Cli(state.runner.as_ref()),
+        // `read_brain` above (~3068) only ever yields `cloud` or `local` — this arm exists to
+        // satisfy exhaustiveness over the full `Brain` type, not to describe a state this route can
+        // reach today. Whoever makes the hosted route selectable HERE owns replacing it.
+        crate::chats::Brain::OpenRouter => crate::map_intent::Extractor::Cli(state.runner.as_ref()),
         crate::chats::Brain::Local => {
             // Read per request rather than cached on `AppState`, which is the argument
             // `models_config`'s own doc comment makes: a name cached at startup is one the owner
@@ -6809,7 +6813,11 @@ async fn get_assistant_live(
 /// managed to build one, and a probe here would be a second, differently-timed opinion about the
 /// same thing.
 async fn get_local_model(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "available": state.local_assistant.is_some() }))
+    // `state.local_assistant.is_some()` before the migration to the assistant factory: the field
+    // this read no longer exists, so this call site is one of the lines that migration is allowed
+    // to touch beyond the `AppState` literal.
+    let available = state.assistants.serves(crate::chats::Brain::Local).is_ok();
+    Json(serde_json::json!({ "available": available }))
 }
 
 /// The conversations the app opened, most recently active first.
@@ -7050,7 +7058,7 @@ async fn create_chat(
     // precedence `patch_chat` applies, for the same reason: a row saying `local` while naming a
     // cloud model would be sent to Ollama under a name it has never heard.
     let brain = match body.model.as_deref() {
-        Some(id) => chosen_brain(id)?,
+        Some(id) => chosen_brain(&state, id).await?,
         None => crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud")),
     };
     // Checked before the row exists, so a bad level leaves no conversation behind to explain. The
@@ -7460,43 +7468,185 @@ fn checked_budget(amount: f64) -> Result<(), StatusCode> {
     Ok(())
 }
 
-/// Which route a choice id names, or a refusal.
+/// How long the `/api/tags` menu probe waits, and no more.
 ///
-/// One function because two routes ask — opening a conversation and re-pointing one — and a second
-/// copy of this lookup is how the two come to disagree about which names are real. It re-reads the
-/// file for the reason `get_assistant_models` gives: a pinned choice travels as `--model` on the
-/// turn, so a name added to the config is one this daemon can already run.
-fn chosen_brain(id: &str) -> Result<crate::chats::Brain, StatusCode> {
-    models_config()
+/// A couple of seconds, not `runner::OLLAMA_EXCHANGE_TIMEOUT` (120s) — that timeout is sized for a
+/// COLD MODEL LOADING before it can answer a generation request, which has nothing to do with this
+/// probe. `get_assistant_models` and `chosen_brain` are called whenever a menu opens and the window
+/// may poll either, so a wedged or unreachable Ollama must cost the menu a brief pause and then
+/// today's menu — never a hung window while a person is only trying to see what is on offer.
+const OLLAMA_TAGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The one shared client every `/api/tags` probe goes through, built once rather than once per
+/// request — the same one-client-per-route argument `assistants::ConfiguredAssistants` already
+/// makes for the turn-serving routes: `reqwest::Client::new()` (or a fresh `builder()`) per request
+/// rebuilds a whole connection pool and TLS backend every time, and these two routes are called
+/// often enough (whenever a menu opens, possibly polled) for that cost to be worth avoiding.
+static OLLAMA_TAGS_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// Builds `OLLAMA_TAGS_CLIENT` the first time it is asked for, and hands back the same client every
+/// time after — never a fresh one per call, per this module's own constraint above.
+fn ollama_tags_client() -> &'static reqwest::Client {
+    OLLAMA_TAGS_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(OLLAMA_TAGS_TIMEOUT)
+            .build()
+            .expect("HTTP client for the /api/tags probe (check TLS and proxy environment)")
+    })
+}
+
+/// The menu both the picker and the door work from: the configured catalogue, merged with what
+/// this machine actually has pulled.
+///
+/// The one place `models_config()` and `installed_local_models` are read together, so
+/// `chosen_brain` and `get_assistant_models` cannot each assemble their own copy of this join and
+/// drift apart the day somebody changes one of them — a filter, a sort, a source — and not the
+/// other. Read from the file on every call rather than cached in `AppState`: a pinned choice travels
+/// as `--model` on the turn itself, so a name added to the file is one the daemon can already run,
+/// and a catalogue cached at startup would spend a whole daemon lifetime refusing it.
+///
+/// Fails closed on every kind of Ollama trouble (unreachable daemon, non-2xx, unreadable body) to
+/// `catalogue()`'s own menu rather than an error or a hang: `installed_local_models` answers an
+/// empty list on failure, `catalogue_with_installed` with an empty list IS `catalogue()`, and
+/// `OLLAMA_TAGS_CLIENT` — built once and reused, never a fresh client per call — bounds how long a
+/// wedged Ollama can hold up either caller to `OLLAMA_TAGS_TIMEOUT`.
+async fn menu() -> (
+    crate::config::ModelsConfig,
+    Vec<crate::config::AssistantChoice>,
+) {
+    let config = models_config();
+    let installed = crate::capabilities::installed_local_models(
+        ollama_tags_client(),
+        crate::runner::OLLAMA_BASE_URL,
+    )
+    .await;
+    let choices = config.catalogue_with_installed(&installed);
+    (config, choices)
+}
+
+/// Why `chosen_brain` could not hand back a route the caller may actually use.
+enum BrainRefusal {
+    /// No catalogue entry — the current `menu()`, installed models included — names this id.
+    UnknownModel,
+    /// The id names a real choice, but this machine cannot serve what it names —
+    /// `Assistants::can_serve`'s own reason, carried verbatim so a caller that wants it in a
+    /// refusal body (`patch_chat`) still has it; `create_chat` drops it and keeps its
+    /// status-only shape.
+    CannotServe(String),
+}
+
+/// `create_chat`'s shape: the reason, if any, is not part of its response today — widening that
+/// is a follow-up with no test asking for it yet, per this packet's own note.
+impl From<BrainRefusal> for StatusCode {
+    fn from(refusal: BrainRefusal) -> Self {
+        match refusal {
+            BrainRefusal::UnknownModel => StatusCode::BAD_REQUEST,
+            // Not a 500: nothing broke. This machine is simply configured such that it cannot run
+            // the model asked for — the same reasoning `NO_LOCAL_MODEL`'s own 503 already carries
+            // a few hundred lines up.
+            BrainRefusal::CannotServe(_) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+/// Which route a choice id names and can actually run, or a refusal.
+///
+/// One function because two routes ask — opening a conversation and re-pointing one — and sharing
+/// `menu()` (above) with `get_assistant_models` is how the two are kept from disagreeing about which
+/// names are real: the menu the picker is served and the menu the door validates against are the
+/// same read, not two copies that could come apart.
+///
+/// Checks the cheap, file-only `catalogue()` first, and only reaches for `menu()` — installed models
+/// included, over `OLLAMA_TAGS_CLIENT` — when the id is not there. This is safe because
+/// `catalogue_with_installed` is documented on `config.rs` to always return a SUPERSET of
+/// `catalogue()`: the merge only ever adds local entries, and none at all when
+/// `local_assistant_model` is unset. So an id found in the cheap set would have been found in the
+/// merged one too — no id changes its answer, no refusal changes — while the common cases (every
+/// cloud model, the hosted model, the already-configured local model) never touch the network at
+/// all. Do not drop this fast path or flip the order: either would put a 2s Ollama probe back in
+/// front of every chat creation and patch, cloud models included.
+///
+/// Once the id resolves to a route, `state.assistants.can_serve` is asked whether this machine can
+/// actually run it. Only `Refusal::CannotServe` is surfaced as a refusal here: the other three
+/// variants (`RouteNotConfigured`, `HostedModelNamedButNoKey`, `NotServedByThisFactory`) answer "is
+/// this ROUTE configured or reachable at all", which is `serves`'s question, asked at turn time —
+/// not this door's. `ConfiguredAssistants::can_serve` never returns any of those three for a route
+/// this catalogue actually named a choice for, but a double standing in for "nothing is configured"
+/// (`assistants::NoAssistants`) may, and treating that as a capability refusal here would refuse
+/// every cloud pick the moment `state.assistants` is not fully wired — the wrong door, not a
+/// capability gap.
+async fn chosen_brain(state: &AppState, id: &str) -> Result<crate::chats::Brain, BrainRefusal> {
+    let config = models_config();
+    let brain = if let Some(choice) = config
         .catalogue()
         .into_iter()
         .find(|choice| choice.id == id)
-        .map(|choice| crate::chats::Brain::from_wire(&choice.brain))
-        .ok_or(StatusCode::BAD_REQUEST)
+    {
+        crate::chats::Brain::from_wire(&choice.brain)
+    } else {
+        let (_, choices) = menu().await;
+        choices
+            .into_iter()
+            .find(|choice| choice.id == id)
+            .map(|choice| crate::chats::Brain::from_wire(&choice.brain))
+            .ok_or(BrainRefusal::UnknownModel)?
+    };
+
+    if let Err(crate::assistants::Refusal::CannotServe(reason)) =
+        state.assistants.can_serve(brain, id).await
+    {
+        return Err(BrainRefusal::CannotServe(reason));
+    }
+
+    Ok(brain)
 }
 
 /// Which models a conversation may be moved to, and how hard each can be asked to think.
 ///
-/// Read from the file on every request rather than from `AppState`. The runner is built once at
-/// startup and pins the DEFAULT model, but a pinned choice travels as `--model` on the turn itself —
-/// so a name added to the file is one the daemon can already run, and a catalogue cached at startup
-/// would spend a whole daemon lifetime refusing it. The cost is a small file read on a route the
-/// window calls when a menu opens.
+/// Built from the same `menu()` `chosen_brain` uses, above — installed models included, over
+/// `OLLAMA_TAGS_CLIENT` — rather than a second copy of the merge; see `menu()`'s doc comment for the
+/// fail-closed reasoning. Always pays for the installed-models read, unlike `chosen_brain`'s fast
+/// path: this route serves the WHOLE menu, so there is no cheap subset it could answer from instead.
 ///
-/// An unreadable or missing file answers with the built-in defaults rather than an error: the same
-/// posture startup takes, and a picker that fails closed leaves a person unable to change a model
-/// because of a typo in a key that has nothing to do with models.
-async fn get_assistant_models() -> Json<serde_json::Value> {
-    let config = models_config();
+/// Each choice is then marked (`config::marked_with`) with what `state.assistants.declared_for`
+/// found — grouped by route because that trait method answers for one `Brain` at a time, and this
+/// menu mixes cloud, local and hosted choices in one list. A route with no choices on the menu
+/// (the common case for the hosted route, and for local when nothing is configured) is skipped
+/// rather than asked with an empty slice, so an untouched install costs this route nothing beyond
+/// the network read `menu()` already pays for.
+async fn get_assistant_models(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let (config, choices) = menu().await;
+
+    let mut declared: std::collections::HashMap<String, crate::capabilities::Declared> =
+        std::collections::HashMap::new();
+    for brain in [
+        crate::chats::Brain::Cloud,
+        crate::chats::Brain::Local,
+        crate::chats::Brain::OpenRouter,
+    ] {
+        let ids: Vec<String> = choices
+            .iter()
+            .filter(|choice| crate::chats::Brain::from_wire(&choice.brain) == brain)
+            .map(|choice| choice.id.clone())
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        declared.extend(state.assistants.declared_for(brain, &ids).await);
+    }
+    let choices = crate::config::marked_with(choices, &declared);
+
     Json(serde_json::json!({
         // Each choice carries its OWN effort levels, which is what the picker draws: they differ
         // per model, and a menu built from the union below would offer levels that die at spawn.
-        "choices": config.catalogue(),
+        "choices": choices,
         // What an unpinned conversation runs on, so the window can NAME that state rather than
         // showing an empty selection and letting a person guess.
         "configured": config.configured_model(),
         // The union, for the one case with no model chosen yet — the front door before anybody
-        // picks. Also what the door validates against.
+        // picks. Also what the door validates against. Unaffected by the installed merge: an
+        // installed model carries no effort levels of its own, `effort_levels()` keeps calling the
+        // sync `catalogue()`, and there is nothing for the network read to add here.
         "efforts": config.effort_levels(),
     }))
 }
@@ -7711,6 +7861,48 @@ struct PatchChatRequest {
     denied_tools: Option<Option<Vec<String>>>,
 }
 
+/// `patch_chat`'s own refusal: every existing path answers with a bare status and no body, exactly
+/// as before (`Status`); the one new path — a model this machine cannot serve — carries the reason
+/// in the body (`WithDetail`), the `{"detail": ...}` shape this crate already uses elsewhere for a
+/// refusal with a reason (see the `"detail"` sites around invalid ownership claims and unreadable
+/// pins). One enum rather than widening every existing `StatusCode` return in this function to a
+/// body-carrying tuple: every one of those keeps compiling unchanged through the `From<StatusCode>`
+/// impl below, so this stays the smallest change that gets the one new path its body.
+enum PatchRefusal {
+    Status(StatusCode),
+    WithDetail(StatusCode, String),
+}
+
+impl IntoResponse for PatchRefusal {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            PatchRefusal::Status(status) => status.into_response(),
+            PatchRefusal::WithDetail(status, detail) => {
+                (status, Json(serde_json::json!({ "detail": detail }))).into_response()
+            }
+        }
+    }
+}
+
+impl From<StatusCode> for PatchRefusal {
+    fn from(status: StatusCode) -> Self {
+        PatchRefusal::Status(status)
+    }
+}
+
+impl From<BrainRefusal> for PatchRefusal {
+    fn from(refusal: BrainRefusal) -> Self {
+        match refusal {
+            BrainRefusal::UnknownModel => PatchRefusal::Status(StatusCode::BAD_REQUEST),
+            // Not a 500, for the same reason `BrainRefusal`'s own `From<StatusCode>` impl gives:
+            // nothing broke, this machine simply cannot run what was asked for.
+            BrainRefusal::CannotServe(reason) => {
+                PatchRefusal::WithDetail(StatusCode::SERVICE_UNAVAILABLE, reason)
+            }
+        }
+    }
+}
+
 /// Renames a conversation, changes which model answers it, or both.
 ///
 /// The two halves are deliberately not symmetric. A rename touches nothing but the row; a model
@@ -7722,7 +7914,7 @@ async fn patch_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
     Json(body): Json<PatchChatRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, PatchRefusal> {
     // Answered before anything is written. Without it a PATCH against a chat that was never opened
     // — or was archived — reports `204 No Content` for an UPDATE that matched no row, which is the
     // API saying "done" about something it did not do.
@@ -7731,7 +7923,7 @@ async fn patch_chat(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .is_none()
     {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     }
 
     // All three move something a turn in flight is already using, and nothing else records any of
@@ -7749,7 +7941,7 @@ async fn patch_chat(
         || body.plan_only.is_some())
         && crate::assistant::is_busy(&chat_id)
     {
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into());
     }
 
     if let Some(cwd) = body.cwd.as_deref() {
@@ -7769,7 +7961,7 @@ async fn patch_chat(
             .map(|found| found.is_dir())
             .unwrap_or(false);
         if !path.is_absolute() || !is_directory {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(StatusCode::BAD_REQUEST.into());
         }
 
         crate::chats::set_cwd(&state.pool, &chat_id, cwd)
@@ -7813,7 +8005,7 @@ async fn patch_chat(
     // name it has never heard.
     if let Some(model) = &body.model {
         let brain = match model {
-            Some(id) => Some(chosen_brain(id)?),
+            Some(id) => Some(chosen_brain(&state, id).await?),
             // Unpinning says nothing about the route. The conversation goes back to following the
             // configured model, and `brain` keeps whatever it already had — changing it here would
             // be this route inventing a decision nobody expressed.
@@ -7931,7 +8123,7 @@ async fn patch_chat(
         if let Some(level) = effort
             && !crate::config::is_effort_level(&models_config(), level)
         {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(StatusCode::BAD_REQUEST.into());
         }
         crate::chats::set_effort(&state.pool, &chat_id, effort.as_deref())
             .await
@@ -7995,10 +8187,13 @@ async fn post_chat_title(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    // `state.local_assistant.clone()` before the migration to the assistant factory: the field this
+    // read no longer exists, so this call site is one of the lines that migration is allowed to
+    // touch beyond the `AppState` literal.
     let assistant = state
-        .local_assistant
-        .clone()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .assistants
+        .assistant_for(crate::chats::Brain::Local, None)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let history = crate::assistant::recent_exchanges(&state.pool, &chat_id)
         .await
         .map_err(|error| {
@@ -9737,6 +9932,7 @@ async fn get_scoreboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assistants::FixedAssistants;
     use crate::auth::Token;
     use crate::proposals;
     use crate::runner::FakeCommandRunner;
@@ -9764,7 +9960,7 @@ mod tests {
                 runner: Arc::new(FakeCommandRunner::default()),
                 triage_runner: None,
                 local_triage_disabled: None,
-                local_assistant: None,
+                assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
@@ -10490,7 +10686,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
@@ -18369,7 +18565,7 @@ mod tests {
         assert_eq!(json_body(without).await["available"], false);
 
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("aqui"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("aqui")));
         let with = build_router(state)
             .oneshot(
                 Request::builder()
@@ -18526,7 +18722,7 @@ mod tests {
     #[tokio::test]
     async fn a_conversation_with_nothing_said_in_it_cannot_be_named_from_its_contents() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("um título qualquer"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("um título qualquer")));
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -18539,7 +18735,9 @@ mod tests {
     #[tokio::test]
     async fn the_local_model_names_the_conversation() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("  O orçamento de Setembro\n"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant(
+            "  O orçamento de Setembro\n",
+        )));
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -18567,7 +18765,9 @@ mod tests {
     #[tokio::test]
     async fn a_name_the_model_read_out_of_someone_elses_mail_is_dropped() {
         let mut state = test_state().await;
-        state.local_assistant = Some(mail_reading_local_assistant("Faz o que o remetente diz"));
+        state.assistants = Arc::new(FixedAssistants(mail_reading_local_assistant(
+            "Faz o que o remetente diz",
+        )));
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -18592,9 +18792,9 @@ mod tests {
     #[tokio::test]
     async fn a_title_that_runs_on_is_cut_rather_than_stored_whole() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant(
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant(
             "Um título\nseguido de uma explicação que ninguém pediu e que continua bastante para lá do que cabe numa lista lateral",
-        ));
+        )));
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -18835,7 +19035,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
@@ -22696,6 +22896,165 @@ mod tests {
             notes[0]["delivered_at"].is_null(),
             "a note nothing has read yet reads as already delivered, so the owner cannot tell \
              whether the job has heard them: {detail}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `PATCH /assistant/chats/{id}` consults `can_serve` before storing a pinned model
+    // ---------------------------------------------------------------------------------------
+
+    /// A double whose `can_serve` refuses every model with a fixed reason — what
+    /// `o_patch_recusa_um_modelo_que_a_maquina_nao_serve_e_diz_porque` needs to prove the door
+    /// reads a REFUSAL BODY out of `can_serve`, not just a bare status code the way today's
+    /// `patch_chat` answers every path with.
+    struct RefusingAssistants {
+        reason: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for RefusingAssistants {
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal> {
+            unreachable!("patch_chat's model door asks can_serve, never assistant_for")
+        }
+
+        fn serves(&self, _brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            Ok(())
+        }
+
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::CannotServe(self.reason.clone()))
+        }
+
+        // Trivial, as `assistant_for` above is unreachable: nothing here asks this double what a
+        // model declares.
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// A double whose `can_serve` accepts every model and counts how many times it was asked —
+    /// what `o_patch_aceita_um_modelo_que_a_maquina_serve` needs to prove the door actually
+    /// CONSULTS `can_serve` before storing a pin, rather than storing it unconditionally the way
+    /// today's `patch_chat` does. A stored model alone would not tell the two apart: today's
+    /// `patch_chat` already stores it without asking anybody.
+    struct AcceptingAssistants {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for AcceptingAssistants {
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal> {
+            unreachable!("patch_chat's model door asks can_serve, never assistant_for")
+        }
+
+        fn serves(&self, _brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            Ok(())
+        }
+
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        // Trivial, as `assistant_for` above is unreachable: nothing here asks this double what a
+        // model declares.
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// Today `patch_chat` returns a bare `StatusCode` with no body on every path. Picking a model
+    /// this machine cannot serve must instead refuse with a BODY carrying why —
+    /// `refusal(status, name)` (`:2080`) plus a `detail` field is the shape this crate already uses
+    /// elsewhere for a refusal with a reason (see the `"detail"` sites around invalid ownership
+    /// claims and unreadable pins), the same shape `post_assistant_message` returns for its own
+    /// refusals. `patch_chat` is untouched here — this test is what makes it fail until GREEN wires
+    /// the door onto `can_serve`.
+    #[tokio::test]
+    async fn o_patch_recusa_um_modelo_que_a_maquina_nao_serve_e_diz_porque() {
+        let mut state = test_state().await;
+        let reason = "a janela tem 2048 tokens mas são precisos 8192".to_string();
+        state.assistants = Arc::new(RefusingAssistants {
+            reason: reason.clone(),
+        });
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/assistant/chats/{id}"),
+            Some(serde_json::json!({"model": "sonnet"})),
+        )
+        .await;
+
+        assert_ne!(
+            status,
+            StatusCode::NO_CONTENT,
+            "a model this machine cannot serve must not be silently accepted: {body:?}"
+        );
+        assert_eq!(
+            body["detail"].as_str(),
+            Some(reason.as_str()),
+            "the refusal body must carry can_serve's own sentence, not a bare status code: {body:?}"
+        );
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            None,
+            "a refused model must not be stored"
+        );
+    }
+
+    /// The same PATCH with a double that accepts: the model is stored, AND `can_serve` was
+    /// actually asked — the second assertion is what keeps this test from passing today by
+    /// accident, since today's `patch_chat` already stores any catalogue model unconditionally,
+    /// without consulting `state.assistants` at all.
+    #[tokio::test]
+    async fn o_patch_aceita_um_modelo_que_a_maquina_serve() {
+        let mut state = test_state().await;
+        let accepting = Arc::new(AcceptingAssistants {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.assistants = accepting.clone();
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+
+        let status = patch_chat_request(state.clone(), &id, r#"{"model":"sonnet"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            Some("sonnet".to_string())
+        );
+        assert!(
+            accepting.asked.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "picking a model must ask can_serve before storing it, not store it unconditionally"
         );
     }
 }

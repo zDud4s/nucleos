@@ -774,6 +774,27 @@ impl Origin {
 /// recognised by a substring is a refusal that stops being recognised when someone edits the words.
 pub const NO_LOCAL_MODEL: &str = "this chat is set to the local model and none is configured";
 
+/// Why a turn was refused before it cost anything: the chat says `openrouter` and this daemon has
+/// no hosted model wired up to answer it.
+///
+/// `NO_LOCAL_MODEL`'s sibling and not its synonym, and the two have to stay apart because the
+/// failure they each guard is aimed at a different wallet. A chat that says `local` and finds no
+/// local model falls back to the CLI today when the choice was only inferred (`origin ==
+/// Origin::Telegram`) and refuses only when a person or an errand SAID `local` outright — because
+/// the CLI has always answered an unmarked Telegram message, so refusing there would take the bot
+/// off the air to enforce a promise nobody made. `openrouter` has no such history: nothing before
+/// this brain existed could ever have chosen it, so there is no old behaviour to preserve and no
+/// argument for falling through at all. Every turn that reaches this brain is refused, full stop,
+/// until the hosted route is actually wired — the placeholder this constant replaces the silence
+/// of (`(None, Some(crate::chats::Brain::OpenRouter)) => false` in `send_message_with`) is exactly
+/// what let that turn go to the cloud CLI instead: silently, and on the bill.
+///
+/// A named constant for the same reason `NO_LOCAL_MODEL` is one: `http.rs` will need to turn this
+/// into a status code a client can act on, and a refusal recognised by a fragment of its wording
+/// stops being recognised the day somebody improves the sentence.
+///
+pub const NO_HOSTED_MODEL: &str = "this chat is set to the hosted model and none is configured";
+
 /// What an errand adds to a turn: where it runs, what it remembers, and which box its tools come
 /// from.
 ///
@@ -1278,6 +1299,31 @@ pub async fn send_message(
     send_message_with(state, chat_id, text, &[], origin).await
 }
 
+/// The conversation's pinned model (`chats::Answering::model`), read fresh rather than cached
+/// across a turn.
+///
+/// A failure to read it must NOT refuse the turn: this returns `None` — the route's own configured
+/// default — and logs a warning instead of propagating the error. `recent_exchanges` takes the same
+/// posture when history cannot be read, and `chats::answering`'s own doc makes the same argument for
+/// a missing row answering `Default`.
+///
+/// Called from inside each of `send_message_with`'s two route branches, never above them: a cloud
+/// turn reaches neither branch, and hoisting the call above both would add this query to the
+/// busiest path — the cloud turn — to serve two branches that both return before it even starts.
+async fn pinned_model(state: &crate::state::AppState, chat_id: &str) -> Option<String> {
+    match crate::chats::answering(&state.pool, chat_id).await {
+        Ok(answering) => answering.model,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                chat_id,
+                "could not read the conversation's pinned model; falling back to the route's default"
+            );
+            None
+        }
+    }
+}
+
 /// Sends a message, with whatever pictures were attached to it.
 ///
 /// The pictures travel INSIDE the message rather than as paths for the model to go and read: they
@@ -1418,10 +1464,55 @@ async fn send_message_inner(
     let chosen = crate::chats::brain_of(&state.pool, chat_id)
         .await
         .map_err(|e| e.to_string())?;
+    // Whether this chat's brain is `openrouter`. Resolved and acted on BEFORE `wants_local` below,
+    // and unlike it, never falls through to the block that follows: `errands::Brain` names only
+    // `Cloud` and `Local`, so an errand can never ask for the hosted route, and the only way to
+    // reach it at all is a `chats` row that says so directly.
+    let wants_hosted = match (&errand, chosen) {
+        (Some(_), _) => false,
+        (None, chosen) => chosen == Some(crate::chats::Brain::OpenRouter),
+    };
+
+    // This replaces the PLACEHOLDER `(None, Some(Brain::OpenRouter)) => false` arm that used to
+    // live inside `wants_local`'s own match, and answers it the opposite way the placeholder's own
+    // comment warned about: an `openrouter` turn is never handed to the cloud CLI. It either goes
+    // to the hosted model or it is refused outright — see `NO_HOSTED_MODEL`'s doc comment for why
+    // there is no fallback here the way `wants_local` below has one: falling through would put a
+    // conversation that asked to stay off the CLI onto the bill, and the person would find out from
+    // the invoice.
+    if wants_hosted {
+        // The conversation's pinned model — see `pinned_model`'s own doc for why it is read here,
+        // inside the branch, and why a read failure falls back to `None` instead of refusing.
+        let pinned_model = pinned_model(state, chat_id).await;
+        return match state
+            .assistants
+            .assistant_for(crate::chats::Brain::OpenRouter, pinned_model.as_deref())
+        {
+            Ok(assistant) => {
+                spawn_local_turn(
+                    state,
+                    slot,
+                    text.to_string(),
+                    errand,
+                    assistant,
+                    relay_id,
+                    origin,
+                    "openrouter",
+                )
+                .await
+            }
+            Err(refusal) => Err(refusal.message(crate::chats::Brain::OpenRouter).to_string()),
+        };
+    }
+
     let wants_local = match (&errand, chosen) {
         (Some(turn), _) => turn.errand.brain == crate::errands::Brain::Local,
         (None, Some(crate::chats::Brain::Local)) => true,
         (None, Some(crate::chats::Brain::Cloud)) => false,
+        // Unreachable in practice: `wants_hosted` above already returned for every
+        // `(None, Some(OpenRouter))` case. This arm stays only to keep the match exhaustive over
+        // `Brain`'s third variant.
+        (None, Some(crate::chats::Brain::OpenRouter)) => false,
         (None, None) => origin == Origin::Telegram,
     };
     // Whether local was CHOSEN or merely inferred, which is what decides the refusal below. An
@@ -1433,8 +1524,14 @@ async fn send_message_inner(
     };
 
     if wants_local {
-        match state.local_assistant.clone() {
-            Some(assistant) => {
+        // The conversation's pinned model — same reason and posture as the hosted call site above;
+        // see `pinned_model`'s own doc.
+        let pinned_model = pinned_model(state, chat_id).await;
+        match state
+            .assistants
+            .assistant_for(crate::chats::Brain::Local, pinned_model.as_deref())
+        {
+            Ok(assistant) => {
                 return spawn_local_turn(
                     state,
                     slot,
@@ -1443,6 +1540,7 @@ async fn send_message_inner(
                     assistant,
                     relay_id,
                     origin,
+                    "local",
                 )
                 .await;
             }
@@ -1450,13 +1548,13 @@ async fn send_message_inner(
             // the cloud would be the worst possible way to find that out: on the bill, for a chat
             // that said it was staying on the machine. The refusal comes before any row is
             // inserted, so nothing was spent and nothing has to be explained away afterwards.
-            None if local_was_chosen => {
-                return Err(NO_LOCAL_MODEL.to_string());
+            Err(refusal) if local_was_chosen => {
+                return Err(refusal.message(crate::chats::Brain::Local).to_string());
             }
             // The origin path keeps its old shape on purpose: a Telegram chat with no local model
             // has always simply gone to the cloud, and has never claimed otherwise. Refusing here
             // would take the bot off the air to enforce a promise nobody made.
-            None => {}
+            Err(_) => {}
         }
     }
 
@@ -1865,17 +1963,46 @@ pub(crate) async fn recent_exchanges(
     Ok(rows)
 }
 
-/// Records and drives a turn answered by the model on this machine.
+/// Every `runs.answered_by` wire word `spawn_local_turn` below ever writes.
+///
+/// One array, read by `answered_by_a_local_agent_loop` below and by nothing else — the single place
+/// that has to grow the day a third `LocalChat` joins `runner::OllamaChat` and `openrouter::OpenRouterChat`,
+/// because `spawn_local_turn`'s own `answered_by` parameter is generalised to accept whatever wire
+/// word a caller passes it, and this is the one spot that says which words those calls actually use.
+const LOCAL_AGENT_ANSWERED_BY: &[&str] = &["local", "openrouter"];
+
+/// Whether `answered_by` names a turn `spawn_local_turn` drove, as opposed to the CLI path.
+///
+/// Exists so a reader OUTSIDE this module — `voice.rs`'s `answer_so_far` is the one today — never
+/// has to spell `"local"` or `"openrouter"` out for itself to answer a question that is really about
+/// `spawn_local_turn`'s own behaviour: every turn it drives writes `stdout` as the plain finished
+/// answer and streams nothing while running, where a CLI turn streams JSONL into both. A caller that
+/// compared `answered_by` against `"local"` alone — literally the bug this replaces — quietly mis-
+/// classified every hosted turn as a CLI one instead, which is exactly the failure a third route
+/// added here without a matching edit at every call site would repeat. Checking against
+/// `LOCAL_AGENT_ANSWERED_BY` instead of the two literals directly means a future third entry needs
+/// only ONE new line, not a search for every place someone once wrote `"local"`.
+pub(crate) fn answered_by_a_local_agent_loop(answered_by: &str) -> bool {
+    LOCAL_AGENT_ANSWERED_BY.contains(&answered_by)
+}
+
+/// Records and drives a turn answered by a `local_agent::LocalAssistant` tool-calling loop rather
+/// than the agent CLI — the local model on this machine (`answered_by == "local"`) or the hosted
+/// one reached over OpenRouter (`answered_by == "openrouter"`). One body for both: the two differ
+/// only in which `LocalChat` the assistant was built with (`runner::OllamaChat` or
+/// `openrouter::OpenRouterChat`) and in that one wire word, and a second copy of everything else
+/// here is exactly the drift this module's map exists to prevent.
 ///
 /// Deliberately NOT a variant inside `spawn_assistant_turn`. That body is almost entirely about
-/// things a local turn does not have — an MCP config written to disk, a CLI session id arriving on
-/// a channel, a resumable session, a cost in dollars, a stderr stream that explains an exit code.
+/// things this path does not have — an MCP config written to disk, a CLI session id arriving on a
+/// channel, a resumable session, a cost in dollars, a stderr stream that explains an exit code.
 /// Threading `Option`s through all of it to skip each in turn would make the CLI path harder to
 /// read in order to describe a path that shares three lines with it.
 ///
-/// History is replayed rather than resumed. There is no session to resume — Ollama's chat endpoint
-/// has no session protocol — so `recent_exchanges` rebuilds the conversation from the run rows the
-/// turns already wrote, under the same barrier `get_session` applies on the other path.
+/// History is replayed rather than resumed. There is no session to resume — neither Ollama's chat
+/// endpoint nor OpenRouter's has a session protocol — so `recent_exchanges` rebuilds the
+/// conversation from the run rows the turns already wrote, under the same barrier `get_session`
+/// applies on the other path.
 ///
 /// `relay_id` reaches here too, and is written into this INSERT for the same reason
 /// `send_message_inner` writes its own: a conversation's brain is a property of the CHAT
@@ -1889,6 +2016,11 @@ pub(crate) async fn recent_exchanges(
 /// not route on it, having already been chosen by the time this is called — which is exactly what
 /// makes forgetting it easy and invisible until `relay::admit` refuses a relay it should have
 /// admitted.
+// Eight parameters, one past the lint's ceiling, and the eighth is the reason for the allow:
+// `answered_by` is what stopped this function being local-only, so folding the list into a
+// struct to satisfy a count would bury the one fact the hosted route needs to vary. Five other
+// functions in this crate carry the same allow.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_local_turn(
     state: &crate::state::AppState,
     slot: ChatSlot,
@@ -1897,6 +2029,12 @@ async fn spawn_local_turn(
     assistant: std::sync::Arc<crate::local_agent::LocalAssistant>,
     relay_id: Option<i64>,
     origin: Origin,
+    // The `runs.answered_by` wire word for this turn: `"local"` or `"openrouter"`, matching
+    // `chats::Brain::as_str()` for the brain that chose this path. A parameter and not a constant
+    // baked into the query below, because that hardcoded `'local'` is exactly what made this
+    // function local-only in the first place — generalising the call site, per this packet's own
+    // instruction, means the one fact that differs travels in, not a second copy of the query.
+    answered_by: &'static str,
 ) -> Result<i64, String> {
     // A session id even though nothing resumes it, because `budget.rs` keys spend on this column
     // and a run row that is the one kind without one is a special case every reader downstream has
@@ -1915,11 +2053,12 @@ async fn spawn_local_turn(
     let id = sqlx::query(
         "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, from_relay_id,
                            origin, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, 'local', ?, ?, ?)",
+         VALUES (?, 'running', 'assistant', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&text)
     .bind(&session_id)
     .bind(&slot.chat_id)
+    .bind(answered_by)
     .bind(relay_id)
     .bind(origin.as_wire())
     .bind(chrono::Utc::now().to_rfc3339())
@@ -1988,8 +2127,9 @@ async fn spawn_local_turn(
         {
             tracing::error!(
                 run_id = id,
+                %answered_by,
                 %error,
-                "could not mark a local turn as having read untrusted text — dropping its answer"
+                "could not mark a turn as having read untrusted text — dropping its answer"
             );
             unmarked = true;
         }
@@ -1999,11 +2139,11 @@ async fn spawn_local_turn(
         // write would report a completed turn for one that was killed.
         let written = match outcome {
             // `timed_out`, not `failed`, matching the CLI path below. A wall-clock kill is a
-            // distinct ending there and anything filtering runs by it would simply not see a local
+            // distinct ending there and anything filtering runs by it would simply not see this
             // turn — the status is what the rest of the system reads, so it has to mean the same
             // thing whichever runner produced it.
             Err(_) => {
-                tracing::warn!(run_id = id, "local turn exceeded the wall clock");
+                tracing::warn!(run_id = id, %answered_by, "turn exceeded the wall clock");
                 sqlx::query(
                     "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ? AND status = 'running'",
                 )
@@ -2018,9 +2158,10 @@ async fn spawn_local_turn(
                     // either way, and this is the only place recording WHY it was that sentence.
                     tracing::warn!(
                         run_id = id,
+                        %answered_by,
                         ending = ?turn.ending,
                         tool_calls = turn.tool_calls,
-                        "local turn ended without an answer of its own"
+                        "turn ended without an answer of its own"
                     );
                 }
                 // The turn read mail and the row could not be made to say so, so the answer is not
@@ -2056,10 +2197,11 @@ async fn spawn_local_turn(
                     completed
                 }
             }
-            // Transport failure: Ollama stopped, or the model was pulled out from under us. The
-            // chat is told rather than handed a silence it cannot interpret.
+            // Transport failure: Ollama stopped, OpenRouter refused the request, or the model was
+            // pulled out from under us. The chat is told rather than handed a silence it cannot
+            // interpret.
             Ok(Err(error)) => {
-                tracing::warn!(run_id = id, %error, "local turn failed");
+                tracing::warn!(run_id = id, %answered_by, %error, "turn failed");
                 sqlx::query(
                     "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
@@ -2629,6 +2771,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assistants::{FixedAssistants, NoAssistants, RecordingAssistants};
     use crate::auth::Token;
     use crate::runner::FakeCommandRunner;
     use crate::state::AppState;
@@ -2658,7 +2801,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: Arc::new(NoAssistants),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
@@ -2771,7 +2914,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_read_mail_and_then_failed_is_still_marked() {
         let mut state = test_state().await;
-        state.local_assistant = Some(local_assistant_that_reads_mail_then_dies());
+        state.assistants = Arc::new(FixedAssistants(local_assistant_that_reads_mail_then_dies()));
 
         let id = send_message(
             &state,
@@ -2869,7 +3012,14 @@ mod tests {
     #[tokio::test]
     async fn a_telegram_turn_uses_the_cli_when_no_local_model_is_configured() {
         let state = test_state().await;
-        assert!(state.local_assistant.is_none());
+        // Translated from `state.local_assistant.is_none()`: the ship-dark default is now the
+        // factory refusing the local route, not a `None` singleton field — same meaning.
+        assert!(
+            state
+                .assistants
+                .assistant_for(crate::chats::Brain::Local, None)
+                .is_err()
+        );
 
         let id = send_message(&state, "tg-no-local", "hello", Origin::Telegram)
             .await
@@ -2886,7 +3036,9 @@ mod tests {
     #[tokio::test]
     async fn a_telegram_turn_is_answered_on_this_machine_when_a_model_is_configured() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("três corridas a andar"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant(
+            "três corridas a andar",
+        )));
 
         let id = send_message(&state, "tg-local", "o que está a correr?", Origin::Telegram)
             .await
@@ -2901,7 +3053,7 @@ mod tests {
     #[tokio::test]
     async fn a_shell_turn_stays_on_the_cli_even_with_a_local_model_configured() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("never asked"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("never asked")));
 
         let id = send_message(&state, "shell-with-local", "hello", Origin::Shell)
             .await
@@ -2940,7 +3092,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_turn_records_that_the_local_model_answered_it() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("aqui mesmo"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("aqui mesmo")));
 
         let id = send_message(&state, "tg-who-answered", "olá", Origin::Telegram)
             .await
@@ -2952,7 +3104,7 @@ mod tests {
     #[tokio::test]
     async fn a_chat_marked_local_is_answered_locally_even_from_the_shell() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("na máquina"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
             .await
             .unwrap();
@@ -2970,7 +3122,7 @@ mod tests {
     #[tokio::test]
     async fn a_chat_marked_cloud_is_answered_in_the_cloud_even_from_telegram() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("never asked"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("never asked")));
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -2987,12 +3139,41 @@ mod tests {
         );
     }
 
+    /// The test that kills the placeholder.
+    ///
+    /// `send_message_with` carries a match arm, `(None, Some(crate::chats::Brain::OpenRouter)) =>
+    /// false`, written as a placeholder because nothing could reach it yet — no API door and no
+    /// picker write `openrouter` onto a chat row. This test is what CAN reach it: `chats::create`
+    /// writes the row directly, exactly as `a_chat_marked_local_is_answered_locally_even_from_the_shell`
+    /// does for `Brain::Local` a few tests up. With the placeholder still in place this turn falls
+    /// through to the ordinary cloud path and SUCCEEDS — the exact hazard the placeholder's own
+    /// comment names: a hosted conversation answered by the cloud CLI, silently, and on the bill.
+    ///
+    /// Unlike `a_local_errand_with_no_local_model_refuses_instead_of_billing_the_cloud`, this is not
+    /// spelled out here as a condition on `state.hosted_assistant` being `None` — `test_state()`
+    /// just leaves it that way, the same as every field a given test does not care about. That is
+    /// already enough: `main.rs` only ever builds `Some` there when a daemon was started with BOTH a
+    /// `hosted_assistant_model` AND an OpenRouter key, and short of that every `openrouter` turn
+    /// refuses, which is `NO_HOSTED_MODEL`'s own doc comment's point. Nothing before this brain
+    /// existed could have chosen it, so there is no old promise to preserve by falling back.
+    #[tokio::test]
+    async fn a_chat_marked_openrouter_refuses_rather_than_billing_the_cloud() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+
+        let outcome = send_message(&state, &id, "olá", Origin::Shell).await;
+
+        assert_eq!(outcome, Err(NO_HOSTED_MODEL.to_string()));
+    }
+
     /// The guard on this whole change. No `chats` row anywhere is every Telegram conversation, and
     /// every conversation that predates the table — the old rule, unchanged.
     #[tokio::test]
     async fn a_conversation_with_no_row_routes_exactly_as_it_did_before() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("na máquina"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
 
         let from_telegram = send_message(&state, "-100200300", "olá", Origin::Telegram)
             .await
@@ -3056,7 +3237,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_turn_releases_the_chat_when_it_ends() {
         let mut state = test_state().await;
-        state.local_assistant = Some(fake_local_assistant("done"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("done")));
 
         let first = send_message(&state, "tg-slot", "one", Origin::Telegram)
             .await
@@ -3190,9 +3371,11 @@ mod tests {
 
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let mut state = test_state().await;
-        state.local_assistant = Some(Arc::new(crate::local_agent::LocalAssistant::new(
-            Box::new(Recorder(seen.clone())),
-            Box::new(NoTools),
+        state.assistants = Arc::new(FixedAssistants(Arc::new(
+            crate::local_agent::LocalAssistant::new(
+                Box::new(Recorder(seen.clone())),
+                Box::new(NoTools),
+            ),
         )));
 
         let first = send_message(&state, "tg-memory", "primeira", Origin::Telegram)
@@ -3862,7 +4045,7 @@ mod tests {
         // there separately or not at all, and "not at all" is a NULL that reads as a run whose
         // origin nobody knows.
         let local = AppState {
-            local_assistant: Some(fake_local_assistant("answered here")),
+            assistants: Arc::new(FixedAssistants(fake_local_assistant("answered here"))),
             ..test_state().await
         };
         crate::chats::set_brain(&local.pool, "a-local-chat", crate::chats::Brain::Local)
@@ -4182,7 +4365,7 @@ mod tests {
     #[tokio::test]
     async fn a_topic_with_no_errand_still_routes_by_origin() {
         let (mut state, _dir, _runner) = errand_state().await;
-        state.local_assistant = Some(fake_local_assistant("na máquina"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
 
         let id = send_message(&state, "-100200300:5", "olá", Origin::Telegram)
             .await
@@ -4194,7 +4377,7 @@ mod tests {
     #[tokio::test]
     async fn an_errand_set_to_the_cloud_goes_to_the_cloud_even_from_telegram() {
         let (mut state, _dir, _runner) = errand_state().await;
-        state.local_assistant = Some(fake_local_assistant("never asked"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("never asked")));
         let errand = open_errand(&state, "carros", "-100200300:6").await;
         crate::errands::set_brain(&state.pool, errand.id, crate::errands::Brain::Cloud)
             .await
@@ -4212,7 +4395,7 @@ mod tests {
     #[tokio::test]
     async fn an_errand_set_to_local_is_answered_here_even_from_the_shell() {
         let (mut state, _dir, _runner) = errand_state().await;
-        state.local_assistant = Some(fake_local_assistant("na máquina"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
         open_errand(&state, "carros", "shell-errand").await;
 
         let id = send_message(&state, "shell-errand", "procura", Origin::Shell)
@@ -4227,7 +4410,7 @@ mod tests {
     #[tokio::test]
     async fn an_errand_outranks_a_chats_row_for_the_same_key() {
         let (mut state, _dir, _runner) = errand_state().await;
-        state.local_assistant = Some(fake_local_assistant("na máquina"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -4284,7 +4467,14 @@ mod tests {
     #[tokio::test]
     async fn a_local_errand_with_no_local_model_refuses_instead_of_billing_the_cloud() {
         let (state, _dir, _runner) = errand_state().await;
-        assert!(state.local_assistant.is_none());
+        // Translated from `state.local_assistant.is_none()`: the ship-dark default is now the
+        // factory refusing the local route, not a `None` singleton field — same meaning.
+        assert!(
+            state
+                .assistants
+                .assistant_for(crate::chats::Brain::Local, None)
+                .is_err()
+        );
         open_errand(&state, "carros", "-1:9").await;
 
         let outcome = send_message(&state, "-1:9", "procura", Origin::Telegram).await;
@@ -4377,6 +4567,93 @@ mod tests {
             runner.last_effort.lock().unwrap().clone(),
             Some(Some("xhigh".to_string())),
             "the conversation's effort never reached the launch"
+        );
+    }
+
+    /// RED: a local turn must ask the assistant factory for the model the CONVERSATION pinned
+    /// (`chats.model`, read by `chats::answering`), not the route's own default. Fails today because
+    /// the local call site in `send_message_with` deliberately passes `None` for the pin — GREEN's
+    /// whole job is to replace that `None` with a read of `chats::answering`.
+    #[tokio::test]
+    async fn um_turno_local_pede_a_fabrica_o_modelo_que_a_conversa_fixou() {
+        let mut state = test_state().await;
+        let recording = Arc::new(RecordingAssistants::new(fake_local_assistant("na máquina")));
+        state.assistants = recording.clone();
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &id, Some("qwen3:8b"))
+            .await
+            .unwrap();
+
+        send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        let calls = recording.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![(crate::chats::Brain::Local, Some("qwen3:8b".to_string()))],
+            "the factory must be asked for the model this conversation pinned, not None"
+        );
+    }
+
+    /// RED: the hosted route's own half of the same bug. Fails today for the same reason as
+    /// `um_turno_local_pede_a_fabrica_o_modelo_que_a_conversa_fixou` — the hosted call site also
+    /// passes `None` for the pin.
+    #[tokio::test]
+    async fn um_turno_alojado_pede_a_fabrica_o_modelo_que_a_conversa_fixou() {
+        let mut state = test_state().await;
+        let recording = Arc::new(RecordingAssistants::new(fake_local_assistant("no ar")));
+        state.assistants = recording.clone();
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &id, Some("anthropic/claude-sonnet-4.5"))
+            .await
+            .unwrap();
+
+        send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        let calls = recording.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![(
+                crate::chats::Brain::OpenRouter,
+                Some("anthropic/claude-sonnet-4.5".to_string())
+            )],
+            "the factory must be asked for the model this conversation pinned, not None"
+        );
+    }
+
+    /// A GUARD, not a driver — this one PASSES today and must keep passing after GREEN. A chat with
+    /// no pinned model must still reach the factory with `None`, so that GREEN's read of
+    /// `chats::answering` cannot accidentally turn "no pin" into an empty string or a refusal: the
+    /// route's own configured default has to keep answering an unpinned conversation exactly as it
+    /// does today.
+    #[tokio::test]
+    async fn um_turno_sem_modelo_fixado_pede_a_fabrica_o_omissao_da_rota() {
+        let mut state = test_state().await;
+        let recording = Arc::new(RecordingAssistants::new(fake_local_assistant(
+            "sem fixação",
+        )));
+        state.assistants = recording.clone();
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+
+        send_message(&state, &id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        let calls = recording.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![(crate::chats::Brain::Local, None)],
+            "an unpinned conversation must still reach the factory, asking for the route's own \
+             configured default"
         );
     }
 
@@ -4808,7 +5085,7 @@ mod tests {
     async fn the_notebook_reaches_a_local_turn() {
         let (mut state, dir, _runner) = errand_state().await;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        state.local_assistant = Some(capturing_local_assistant(seen.clone()));
+        state.assistants = Arc::new(FixedAssistants(capturing_local_assistant(seen.clone())));
         let errand = open_errand(&state, "carros", "-1:31").await;
         crate::errands::append_notebook(dir.path(), &errand, 1, "já vi 12 anúncios").unwrap();
 
@@ -4887,7 +5164,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_turns_answer_lands_in_the_notebook() {
         let (mut state, dir, _runner) = errand_state().await;
-        state.local_assistant = Some(fake_local_assistant("encontrei três"));
+        state.assistants = Arc::new(FixedAssistants(fake_local_assistant("encontrei três")));
         let errand = open_errand(&state, "carros", "-1:16").await;
 
         let id = send_message(&state, "-1:16", "procura", Origin::Telegram)
@@ -5585,7 +5862,7 @@ mod tests {
         );
 
         let local = AppState {
-            local_assistant: Some(fake_local_assistant("answered here")),
+            assistants: Arc::new(FixedAssistants(fake_local_assistant("answered here"))),
             ..test_state().await
         };
         crate::chats::set_brain(

@@ -231,6 +231,19 @@ pub const LOCAL_BATCH_MAX: usize = 5;
 /// growth until Ollama truncates mail that the verdict is supposed to cover.
 pub const LOCAL_NUM_CTX: usize = 8192;
 
+/// What local triage requires from a model, read by `capabilities::missing_capabilities` instead of
+/// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window: local
+/// triage checks nothing else today, and `capabilities`' own guard test
+/// (`nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela`) fails if this ever claims more without
+/// that being a deliberate change.
+pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
+    crate::capabilities::Requirement {
+        context_tokens: LOCAL_NUM_CTX,
+        tools: false,
+        vision: false,
+        structured_output: false,
+    };
+
 /// Infrastructure failures at which a row is triaged ALONE. Below it, rows ride together; at it,
 /// the row is isolated so "there is a breakage" (everything rises together, and one good pass
 /// clears them all) separates from "there is a message that kills the run" (only it keeps rising).
@@ -3203,7 +3216,7 @@ mod tests {
             runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
-            local_assistant: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),

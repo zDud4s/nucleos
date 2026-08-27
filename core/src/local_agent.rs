@@ -37,6 +37,19 @@ pub const MAX_TOOL_ROUNDS: usize = 8;
 /// raising this trades a turn that gives up for a turn that quietly forgets its first lookup.
 pub const TURN_NUM_CTX: usize = 16_384;
 
+/// What a local assistant turn requires from a model, read by `capabilities::missing_capabilities`
+/// instead of a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window:
+/// a local turn checks nothing else today, and `capabilities`' own guard test
+/// (`nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela`) fails if this ever claims more without
+/// that being a deliberate change.
+pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
+    crate::capabilities::Requirement {
+        context_tokens: TURN_NUM_CTX,
+        tools: false,
+        vision: false,
+        structured_output: false,
+    };
+
 /// What a local turn is told it is.
 ///
 /// Explicit in a way a CLI agent's prompt need not be. A hosted agent arrives knowing it is an
