@@ -795,7 +795,7 @@ const CONTEXT_FILL_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::
 /// The run body is left by more paths than it returns from: the wall clock drops its future and
 /// `finalize_termination` aborts it, and neither runs a statement placed after the await. A guard is
 /// the only cleanup that fires on all of them — the same reason `Registration` is one.
-struct AbortOnDrop(tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -817,7 +817,7 @@ impl Drop for AbortOnDrop {
 ///
 /// Compare-and-set on `status = 'running'` because this task is not the only writer: a tick that
 /// lands after the terminal UPDATE must not put a stale number back onto a finished run.
-fn mirror_context_fill(
+pub(crate) fn mirror_context_fill(
     pool: &sqlx::SqlitePool,
     id: i64,
     context_fill: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
@@ -862,8 +862,31 @@ fn mirror_context_fill(
     )
 }
 
+/// The fullest this stream ever got.
+///
+/// Named rather than folded at each call site because there are four of them now — two terminal
+/// writes here and two in `team.rs` — and four copies of a fold is four places to forget that the
+/// peak is not the last line.
+pub(crate) fn peak_of(stream: &str) -> Option<i64> {
+    stream.lines().fold(None, |peak, line| {
+        crate::runner::context_peak_from_line(line, peak)
+    })
+}
+
+/// The tool calls this stream made, as the JSON `runs.tools_used` stores.
+///
+/// An empty list is stored as `[]`, which says "used no tools". NULL stays reserved for "nobody
+/// asked" — the distinction `compacted` lost by being `NOT NULL DEFAULT 0`.
+pub(crate) fn tools_of(stream: &str) -> String {
+    serde_json::to_string(&crate::runner::live_from_stream(stream).did)
+        .unwrap_or_else(|_| "[]".to_string())
+}
+
 /// Reduces the mirrored stream as a fallback for runners that do not publish context separately.
-fn observed_context_fill(mirror: &std::sync::Mutex<Option<i64>>, transcript: &str) -> Option<i64> {
+pub(crate) fn observed_context_fill(
+    mirror: &std::sync::Mutex<Option<i64>>,
+    transcript: &str,
+) -> Option<i64> {
     let current = mirror.lock().map(|fill| *fill).unwrap_or(None);
     transcript.lines().fold(current, |fill, line| {
         crate::runner::context_fill_from_line(line, fill)
@@ -1471,15 +1494,11 @@ fn spawn_run(
                     // An empty list is stored as `[]`, which says "used no tools". NULL stays
                     // reserved for "nobody asked" — the distinction `compacted` lost by being
                     // `NOT NULL DEFAULT 0`.
-                    let tools_used =
-                        serde_json::to_string(&crate::runner::live_from_stream(&o.stdout).did)
-                            .unwrap_or_else(|_| "[]".to_string());
+                    let tools_used = tools_of(&o.stdout);
                     // The peak comes off the whole stream, at full fidelity. The periodic mirror
                     // writes a peak too, sampled every 500ms; this write comes after it and is the
                     // more exact of the two.
-                    let context_peak = o.stdout.lines().fold(None, |peak, line| {
-                        crate::runner::context_peak_from_line(line, peak)
-                    });
+                    let context_peak = peak_of(&o.stdout);
                     append_run_events(&pool, id, &o.stdout).await;
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
@@ -1711,12 +1730,8 @@ fn spawn_run(
                     // this is the run most worth reading afterwards. There is no outcome here, so
                     // `seen` is the whole record — and `compacted` cannot be known from it, which is
                     // why only these two are written.
-                    let context_peak = seen.lines().fold(None, |peak, line| {
-                        crate::runner::context_peak_from_line(line, peak)
-                    });
-                    let tools_used =
-                        serde_json::to_string(&crate::runner::live_from_stream(&seen).did)
-                            .unwrap_or_else(|_| "[]".to_string());
+                    let context_peak = peak_of(&seen);
+                    let tools_used = tools_of(&seen);
                     append_run_events(&pool, id, &seen).await;
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let timed_out = sqlx::query(

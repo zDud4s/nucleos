@@ -2524,20 +2524,43 @@ async fn spawn_agent(
     crate::runs::spawn_registered(state, run_id, async move {
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        // How much window this agent is holding, mirrored into the row while it runs.
+        //
+        // This path is a launcher of its own -- it does not go through `runs::spawn_run` -- and
+        // for a long time that meant a team item, the ONE kind of run the pressure reading is
+        // about, recorded none of the four things it reads. `run_prompt_with_context_fill` and the
+        // mirror are what `runs.rs` does, and the reason is the same: a cancel aborts this task
+        // and writes only a status, so an in-memory number would be dropped with the run most
+        // worth inspecting.
+        let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let _live_context_fill =
+            crate::runs::mirror_context_fill(&pool, run_id, std::sync::Arc::clone(&context_fill));
         let outcome = tokio::time::timeout(
             timeout,
-            runner.run_prompt(request, session_tx, transcript.clone()),
+            runner.run_prompt_with_context_fill(
+                request,
+                session_tx,
+                transcript.clone(),
+                std::sync::Arc::clone(&context_fill),
+            ),
         )
         .await;
         let completed_at = chrono::Utc::now().to_rfc3339();
         match outcome {
             Err(_) => {
                 let partial = transcript.lock().unwrap().clone();
+                // No outcome on this branch, so `compacted` cannot be known -- but the partial
+                // transcript is the whole record of a run that went too far, which is the case the
+                // reading exists to see.
                 let _ = sqlx::query(
-                    "UPDATE runs SET status = 'timed_out', stdout = ?, completed_at = ?
+                    "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?,
+                            context_peak = ?, tools_used = ?, completed_at = ?
                      WHERE id = ? AND status = 'running'",
                 )
                 .bind(&partial)
+                .bind(crate::runs::observed_context_fill(&context_fill, &partial))
+                .bind(crate::runs::peak_of(&partial))
+                .bind(crate::runs::tools_of(&partial))
                 .bind(&completed_at)
                 .bind(run_id)
                 .execute(&pool)
@@ -2547,7 +2570,8 @@ async fn spawn_agent(
                 let _ = sqlx::query(
                     "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = ?,
                             input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
-                            num_turns = ?, completed_at = ?
+                            num_turns = ?, context_fill = ?, context_peak = ?, compacted = ?,
+                            tools_used = ?, completed_at = ?
                      WHERE id = ? AND status = 'running'",
                 )
                 .bind(&outcome.stdout)
@@ -2556,21 +2580,40 @@ async fn spawn_agent(
                 .bind(outcome.output_tokens)
                 .bind(outcome.cache_read_tokens)
                 .bind(outcome.num_turns)
+                .bind(crate::runs::observed_context_fill(
+                    &context_fill,
+                    &outcome.stdout,
+                ))
+                .bind(crate::runs::peak_of(&outcome.stdout))
+                .bind(outcome.compacted)
+                .bind(crate::runs::tools_of(&outcome.stdout))
                 .bind(&completed_at)
                 .bind(run_id)
                 .execute(&pool)
                 .await;
             }
             Ok(Ok(outcome)) => {
+                // An agent that started, spoke, and exited non-zero has a stream like any other,
+                // and `num_turns` is written here too: the denominator was missing on every
+                // non-`completed` path, which is exactly where the fullest runs are.
                 let _ = sqlx::query(
                     "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
-                            cost_usd = ?, completed_at = ?
+                            cost_usd = ?, num_turns = ?, context_fill = ?, context_peak = ?,
+                            compacted = ?, tools_used = ?, completed_at = ?
                      WHERE id = ? AND status = 'running'",
                 )
                 .bind(outcome.exit_code)
                 .bind(&outcome.stdout)
                 .bind(&outcome.stderr)
                 .bind(outcome.cost_usd)
+                .bind(outcome.num_turns)
+                .bind(crate::runs::observed_context_fill(
+                    &context_fill,
+                    &outcome.stdout,
+                ))
+                .bind(crate::runs::peak_of(&outcome.stdout))
+                .bind(outcome.compacted)
+                .bind(crate::runs::tools_of(&outcome.stdout))
                 .bind(&completed_at)
                 .bind(run_id)
                 .execute(&pool)
@@ -5470,6 +5513,99 @@ mod tests {
             twice.next_ordinal, once.next_ordinal,
             "the items were queued twice"
         );
+    }
+
+    /// A team item is the ONE kind of run the pressure reading is about, and this path is its own
+    /// launcher -- it never touches `runs::spawn_run`. Until this test, every column that reading
+    /// depends on came back NULL for exactly the runs it was built to measure.
+    #[tokio::test]
+    async fn a_specialists_run_records_the_window_it_cost_and_whether_it_compacted() {
+        let (mut state, _root) = state_with_root().await;
+        // Climbs to 190k, compacts, ends at 40k -- two tool calls along the way.
+        state.runner = std::sync::Arc::new(crate::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+                exit_code: 0,
+                stdout: [
+                    r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":189000},"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+                    r#"{"type":"assistant","message":{"usage":{"input_tokens":500,"cache_read_input_tokens":39500},"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.rs"}}]}}"#,
+                ]
+                .join("\n"),
+                stderr: String::new(),
+                session_id: Some("team-pressure-session".into()),
+                cost_usd: Some(0.03),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: Some(2),
+                compacted: true,
+            })),
+            ..Default::default()
+        });
+        marketing(&state).await;
+        sqlx::query(
+            "INSERT INTO team_runs (id, team_id, request, workspace, token, state,
+                                    created_at, updated_at)
+             VALUES ('tr-pressure', 'marketing', 'write it', 'ws', 'a-secret', 'working',
+                     '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let run = fetch_run(&state, "tr-pressure").await;
+        let agent = crate::agent::Agent {
+            id: "copywriter".to_owned(),
+            name: "copywriter".to_owned(),
+            speciality: "writes".to_owned(),
+            prompt: "write".to_owned(),
+            engine: "claude".to_owned(),
+            model: None,
+            // Not `mcp_only`: this test is about what the terminal write records, and the MCP
+            // branch would put a config file in the machine's temp directory to prove nothing.
+            tool_policy: "unrestricted".to_owned(),
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            updated_at: "2026-08-26T00:00:00Z".to_owned(),
+        };
+        let (run_id, session_id) = open_run(&state, &run.id, "do the work").await.unwrap();
+
+        spawn_agent(
+            &state,
+            &run,
+            &agent,
+            run_id,
+            session_id,
+            "do the work".into(),
+        )
+        .await;
+
+        for _ in 0..80 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                let measured: (Option<String>, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+                    "SELECT tools_used, context_peak, context_fill, compacted
+                     FROM runs WHERE id = ?",
+                )
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+                let (tools, peak, fill, compacted) = measured;
+
+                let tools: Vec<serde_json::Value> =
+                    serde_json::from_str(&tools.expect("tools_used written")).unwrap();
+                assert_eq!(tools.len(), 2, "the two calls the stream made");
+                assert_eq!(peak, Some(190_000), "the peak");
+                assert_eq!(fill, Some(40_000), "where it ended, after compacting");
+                assert_eq!(compacted, 1, "it compacted, and the column has to say so");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the specialist's run never reached a terminal status");
     }
 
     async fn fetch_run(state: &AppState, id: &str) -> TeamRun {
