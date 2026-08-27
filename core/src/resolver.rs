@@ -483,6 +483,45 @@ pub(crate) async fn landing_is_a_resolution(
     }
 }
 
+/// The escalated request a resolution's landing answers, if `branch` is one.
+///
+/// The same lookup `landing_is_a_resolution` makes, minus the boolean collapse — `land.rs` needs
+/// the ROW, to link `vcs_requests.resolved_by` at the moment the resolution is admitted, so the
+/// session still waiting on the original ticket follows the link instead of reading a terminal
+/// `escalated` and stopping (design decision #5).
+///
+/// `None` on anything that keeps `landing_is_a_resolution` from answering `true` for the same
+/// branch — a branch this daemon never opened, one whose run never escalated anything, or a
+/// database read that failed. Fails toward NOT linking rather than guessing: a resolution admitted
+/// without a link still lands and still tells `/wait` the truth eventually, once its own row goes
+/// terminal and the caller polls it directly; a wrong link would point a person at the wrong row.
+pub(crate) async fn escalated_request_id(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    branch: &str,
+) -> Option<i64> {
+    let run = crate::worktree::run_behind_branch(branch)?;
+    let found: sqlx::Result<Option<i64>> = sqlx::query_scalar(
+        "SELECT id FROM vcs_requests WHERE project_id = ? AND resolution_run_id = ?",
+    )
+    .bind(project_id)
+    .bind(run)
+    .fetch_optional(pool)
+    .await;
+    match found {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                branch,
+                %error,
+                "could not look up the escalation a resolution answers; landing it unlinked"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

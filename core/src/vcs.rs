@@ -1662,26 +1662,49 @@ pub const TERMINAL_STATUSES: [&str; 7] = [
 /// Reads before it ever sleeps, and every subsequent iteration does the same: the terminal check
 /// runs on freshly read data, not on whatever the previous iteration saw, so a row that finishes
 /// between two polls is reported the moment the next read sees it rather than after the deadline.
+///
+/// **A terminal `escalated` row carrying `resolved_by` is not the end of the wait — it is
+/// followed.** Design decision #5: the row a conflict resolution's landing wrote is a NEW request,
+/// admitted after this one already went terminal, and a caller polling only the id it was handed
+/// would read `escalated` and stop — told its merge failed while the daemon is, in fact, still
+/// carrying it. So a terminal row that names a successor is not returned; the successor is read
+/// instead, on the same loop and against the same deadline. The chain can be more than one link
+/// long — a resolution that itself conflicts escalates as its own row, which a later resolution
+/// then answers — and this follows it however far it goes, because each link is written by the
+/// same admission this loop already trusts. The `Ticket` this returns keeps the id the caller
+/// asked about, whichever row's status, sha and reason it took to answer it.
 pub async fn wait_for(
     pool: &sqlx::SqlitePool,
     id: i64,
     deadline: std::time::Duration,
 ) -> sqlx::Result<Ticket> {
     let started = std::time::Instant::now();
+    let mut current = id;
     loop {
-        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT status, result_sha, failure_reason FROM vcs_requests WHERE id = ?",
+        let row: Option<(String, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT status, result_sha, failure_reason, resolved_by FROM vcs_requests WHERE id = ?",
         )
-        .bind(id)
+        .bind(current)
         .fetch_optional(pool)
         .await?;
 
-        let Some((status, result_sha, failure_reason)) = row else {
+        let Some((status, result_sha, failure_reason, resolved_by)) = row else {
             return Err(sqlx::Error::RowNotFound);
         };
 
-        let terminal = TERMINAL_STATUSES.contains(&status.as_str());
-        if terminal || started.elapsed() >= deadline {
+        if TERMINAL_STATUSES.contains(&status.as_str()) {
+            if let Some(next) = resolved_by {
+                current = next;
+                continue;
+            }
+            return Ok(Ticket {
+                id,
+                status,
+                result_sha,
+                failure_reason,
+            });
+        }
+        if started.elapsed() >= deadline {
             return Ok(Ticket {
                 id,
                 status,
@@ -1986,6 +2009,84 @@ pub trait VcsExecutor: Send + Sync {
     async fn execute(&self, request: &ClaimedRequest) -> Outcome;
 }
 
+/// How many times a merge's target may move while it is being computed before the row gives up and
+/// says so, rather than retrying against something that keeps rewriting the target out from under
+/// it. Design decision #4: once is the ordinary race with whatever else touches the branch; three
+/// in a row is somebody writing to it directly, outside the queue, and the row's failure reason
+/// says that rather than "resubmit" — there being nobody left to resubmit it.
+const MOVED_TARGET_RETRY_CEILING: i64 = 3;
+
+/// Whether `outcome` is `publish`'s answer to a target that moved between computing a merge and
+/// writing it — `git_exec::publish_by_update_ref` and `publish_by_fast_forward` both phrase it
+/// identically, so matching the phrase is matching the case rather than duplicating a constant
+/// across the two modules that would have to agree on it.
+fn outcome_is_a_moved_target(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Failed { reason, .. } if reason.contains("moved while the merge was being computed")
+    )
+}
+
+/// What `requeue_after_moved_target` did.
+enum MovedTargetRetry {
+    /// Back to `queued`, slot dropped. Nothing to finish — the row is not terminal.
+    Requeued,
+    /// `attempts` reached the ceiling. This is the `Failed` to finish with instead of the one
+    /// `publish` produced, because "resubmit" is not the true cause any more; this is.
+    CeilingReached(Outcome),
+    /// The row was not `running` any more — a restart's `reconcile_interrupted` already took it.
+    /// The caller falls through to `finish`'s own handling of exactly that race.
+    RowGone,
+}
+
+/// Applies design decision #4 to one claimed request whose target moved while its merge was being
+/// computed: increments `attempts`, and either sends it back to `queued` or, at the ceiling,
+/// returns the `Outcome` to finish with instead.
+///
+/// Two statements rather than one `UPDATE ... RETURNING` with a `CASE` in every column, because the
+/// ceiling's `Outcome::Failed` needs a `String` built in Rust — `format!`, not SQL — and a single
+/// statement would have to decide the row's fate without knowing yet what that message says. Both
+/// statements are scoped to `status = 'running'`, matching `finish`, so a row a restart already
+/// reconciled is left exactly as the reconcile left it rather than overwritten by a late worker.
+async fn requeue_after_moved_target(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+) -> sqlx::Result<MovedTargetRetry> {
+    let attempts: Option<i64> = sqlx::query_scalar(
+        "UPDATE vcs_requests SET attempts = attempts + 1 WHERE id = ? AND status = 'running' \
+         RETURNING attempts",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(attempts) = attempts else {
+        return Ok(MovedTargetRetry::RowGone);
+    };
+
+    if attempts >= MOVED_TARGET_RETRY_CEILING {
+        return Ok(MovedTargetRetry::CeilingReached(Outcome::Failed {
+            reason: format!(
+                "the target moved while this merge was being computed, {attempts} times in a \
+                 row — something is writing to it directly, outside the queue, so this landing is \
+                 giving up rather than retrying forever"
+            ),
+            exit_code: None,
+            output_tail: String::new(),
+        }));
+    }
+
+    let requeued = sqlx::query(
+        "UPDATE vcs_requests SET status = 'queued', started_at = NULL WHERE id = ? AND status = 'running'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if requeued.rows_affected() != 1 {
+        return Ok(MovedTargetRetry::RowGone);
+    }
+    Ok(MovedTargetRetry::Requeued)
+}
+
 /// Claims, executes and finalizes exactly one request for one repository, and says whether it found
 /// anything to do — so a caller can drain until this returns `false` and only then wait.
 ///
@@ -2073,6 +2174,40 @@ pub async fn drain_once(
     };
     let id = claimed.id;
     let outcome = executor.execute(&claimed).await;
+
+    // Design decision #4. `publish` answers "the target moved while this merge was being
+    // computed" with a `Failed` nobody resubmits — the row just sits there having said "resubmit"
+    // to an asker who, by the whole point of this pillar, is not watching for it. A merge is a
+    // `git_exec::run_git` invocation the queue itself can redo for the cost of one more claim, so
+    // it does: the SAME row goes back to `queued` and drops the slot, up to a ceiling, rather than
+    // ending on a message nobody reads. Scoped to `Op::Merge` — every other operation's "moved"
+    // is a different failure with a different remedy, and none of the rest publishes by
+    // compare-and-swap against a target this queue does not own the way it owns a merge's.
+    let outcome = if matches!(claimed.op, Op::Merge { .. }) && outcome_is_a_moved_target(&outcome)
+    {
+        match requeue_after_moved_target(pool, id).await {
+            Ok(MovedTargetRetry::Requeued) => return true,
+            Ok(MovedTargetRetry::CeilingReached(replacement)) => replacement,
+            // The row is no longer `running` — a restart's `reconcile_interrupted` already took it,
+            // the same race `finish`'s own `RowNotFound` arm below is written to catch. Falling
+            // through with the original outcome lets that arm log it exactly as it would have
+            // without this branch existing at all.
+            Ok(MovedTargetRetry::RowGone) => outcome,
+            Err(error) => {
+                tracing::warn!(
+                    vcs_request_id = id,
+                    repo_key = %repo_key,
+                    %error,
+                    "vcs: could not requeue a merge whose target moved; recording the original \
+                     failure instead"
+                );
+                outcome
+            }
+        }
+    } else {
+        outcome
+    };
+
     // Cloned rather than moved so the failure paths below can still name it. `finish` consumes the
     // outcome, and a refused write would otherwise drop the only copy of a sha that git really
     // produced — leaving a commit the daemon caused recorded nowhere in the system at all.
@@ -5459,6 +5594,89 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(summaries, vec![format!("vcs request {id} blocked")]);
+    }
+
+    /// Design decision #4, and the land design's third test: the target moving once while a merge
+    /// is being computed is ordinary contention, not a reason to hand the row back to an asker who
+    /// is not watching for it. The SAME row goes back to `queued`, `attempts` becomes 1, and it
+    /// lands on the retry — proving the ticket a caller is holding survives the requeue rather than
+    /// silently becoming a different row.
+    #[tokio::test]
+    async fn a_target_that_moved_once_is_requeued_under_the_same_ticket_and_lands_on_retry() {
+        let pool = test_pool().await;
+        let id = submit(
+            &pool,
+            &ResolvedRepo::synthetic("alpha", "C:/repo", "alpha"),
+            &merge_op(),
+            Origin::Human,
+        )
+        .await
+        .unwrap();
+
+        let moved = FakeVcsExecutor::failing_with(
+            "master moved while the merge was being computed, so it was not published; resubmit",
+        );
+        assert!(drain_once(&pool, "alpha", &moved).await);
+        assert_eq!(
+            status_of(&pool, id).await,
+            "queued",
+            "a moved target is retried by the queue itself, not handed back terminal"
+        );
+        let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+
+        let lands = FakeVcsExecutor::succeeding_with("cafe");
+        assert!(drain_once(&pool, "alpha", &lands).await);
+
+        let ticket = wait_for(&pool, id, Duration::ZERO).await.unwrap();
+        assert_eq!(ticket.id, id, "the same ticket the caller was already holding");
+        assert_eq!(ticket.status, "succeeded");
+        assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
+    }
+
+    /// The land design's fourth test: the target moving three times in a row is not contention any
+    /// more — it is something writing to it directly, outside the queue — and the row says so
+    /// rather than retrying forever. `attempts` stops at the ceiling, `status` is terminal, and the
+    /// reason names the real cause instead of the generic "resubmit" nobody was going to act on.
+    #[tokio::test]
+    async fn a_target_that_keeps_moving_gives_up_at_the_ceiling_and_names_the_real_cause() {
+        let pool = test_pool().await;
+        let id = submit(
+            &pool,
+            &ResolvedRepo::synthetic("alpha", "C:/repo", "alpha"),
+            &merge_op(),
+            Origin::Human,
+        )
+        .await
+        .unwrap();
+
+        for attempt in 1..=3 {
+            let moved = FakeVcsExecutor::failing_with(
+                "master moved while the merge was being computed, so it was not published; resubmit",
+            );
+            assert!(drain_once(&pool, "alpha", &moved).await, "attempt {attempt}");
+        }
+
+        assert_eq!(status_of(&pool, id).await, "failed");
+        let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 3, "the ceiling stops counting once it is reached");
+        let reason = failure_reason_of(&pool, id).await;
+        assert!(
+            reason.contains("3 times in a row"),
+            "the row has to say WHY it gave up, not just that it did: {reason}"
+        );
+        assert!(
+            !reason.contains("resubmit"),
+            "the generic message is what this replaces — nobody was resubmitting it: {reason}"
+        );
     }
 
     /// A branch name that could be read as an option must not exist, let alone reach argv.

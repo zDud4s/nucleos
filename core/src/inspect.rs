@@ -494,9 +494,16 @@ pub struct BranchRow {
 pub struct Branches {
     /// The branch checked out at the project root.
     ///
-    /// **That is the daemon's own definition of where work lands**, not a guess and not `master` by
-    /// convention: `land_worktree` computes a merge's target by reading exactly this. Measuring
-    /// against anything else would draw distances to a place nothing merges into.
+    /// **A heuristic for this panel, and no longer `land.rs`'s own answer.** Before
+    /// `core/src/land.rs` existed this WAS where a landing's target came from, and the two were the
+    /// same read; the design at `.ai/specs/2026-08-27-dono-da-arvore-principal-design.md` killed
+    /// that read precisely because a checkout parked on the wrong branch silently redirected every
+    /// landing. `land::integration_branch` now answers from `autopilot_state.integration_branch`,
+    /// declared once per project rather than read off a worktree. This function is synchronous and
+    /// has no `project_id` to look one up with, so it keeps the old read for the panel alone — a
+    /// project whose main checkout is parked away from its declared branch will see this measure
+    /// against the wrong thing until this is threaded through to the real answer, which is follow-up
+    /// work and not scene-setting for anything this struct's own callers rely on today.
     pub integration: Option<String>,
     pub branches: Vec<BranchRow>,
     /// Branches past the ceiling, which were not measured. Zero is the ordinary case.

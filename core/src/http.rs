@@ -5237,9 +5237,11 @@ struct LandBody {
 /// publishing and the row records `failed` with git's own output. A request that can no longer land
 /// says so and stops, which is the behaviour wanted rather than a new mechanism.
 ///
-/// The target is the branch the project's MAIN worktree has open, not a configured name. It is the
-/// branch the project is standing on, which is what "land it" means to whoever asks, and it is read
-/// rather than assumed so a project that works on something other than `master` needs no setting.
+/// The target is `land::integration_branch` — declared once per project and never read off any
+/// worktree's HEAD. This handler no longer decides that, or anything else about what the landing
+/// means: it resolves *who is asking* (a `cwd`, turned into a worktree root, a branch and a
+/// repository) and hands the rest to `land.rs`. Design decision #8 — the ~60 lines this used to
+/// carry moved to the module that now owns them.
 async fn land_worktree(
     State(state): State<AppState>,
     Json(body): Json<LandBody>,
@@ -5273,44 +5275,25 @@ async fn land_worktree(
             )
         })?;
 
-    let target = crate::git_exec::current_branch(std::path::Path::new(repo.root()), deadline)
-        .await
-        .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
-    // Standing on the integration branch itself. Refused rather than admitted as a no-op, because
-    // the request means "take my work" and there is no separate work to take — and `Merge` with one
-    // branch named twice is a shape the executor should never be handed.
-    if source.trim() == target.trim() {
-        return Err(refuse(
-            StatusCode::CONFLICT,
-            format!("this worktree is already on {target}, which is where work lands"),
-        ));
-    }
-
-    let op = crate::vcs::Op::Merge {
-        source: crate::vcs::Branch::new(source.trim())
-            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
-        target: crate::vcs::Branch::new(target.trim())
-            .map_err(|reason| refuse(StatusCode::UNPROCESSABLE_ENTITY, reason))?,
-    };
-    // **A landing that came out of a conflict resolution is marked as it is admitted**, and the mark
-    // is what makes the queue verify it before publishing — a two-parent tip, no conflict markers.
-    // Asked here rather than at execution time because the answer is only reliable now: it is read
-    // from the worktree the asker is standing in, which exists precisely because they are standing
-    // in it.
-    let from_resolution =
-        crate::resolver::landing_is_a_resolution(&state.pool, repo.project_id(), source.trim())
-            .await;
-    let admitted = if from_resolution {
-        crate::vcs::submit_resolution(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
-    } else {
-        crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await
-    };
-    let id = admitted.map_err(|error| {
-        tracing::warn!(%error, "land: admitting the request failed");
-        refuse(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the request could not be admitted".to_owned(),
-        )
+    let id = crate::land::submit(
+        &state.pool,
+        &repo,
+        std::path::Path::new(repo.root()),
+        source.trim(),
+        deadline,
+    )
+    .await
+    .map_err(|refusal| {
+        let code = match &refusal {
+            crate::land::LandRefusal::AlreadyOnTarget(_)
+            | crate::land::LandRefusal::NothingToLand(_) => StatusCode::CONFLICT,
+            crate::land::LandRefusal::Refused(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            crate::land::LandRefusal::NotAdmitted(error) => {
+                tracing::warn!(%error, "land: admitting the request failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
+        refuse(code, refusal.message().to_owned())
     })?;
 
     vcs_ticket(&state, id, std::time::Duration::ZERO)
@@ -10124,21 +10107,25 @@ mod tests {
         db.close().await;
     }
 
-    /// **The target is read, never assumed.** A constant `master` would be wrong for any project
-    /// working on something else, and wrong silently — it would queue a merge into a branch nobody
-    /// asked about. So the test builds a repository whose integration branch is deliberately NOT
-    /// called master, and the landed request has to name it.
+    /// **The target is declared, never read off a worktree's HEAD.** A constant `master` would be
+    /// wrong for any project working on something else, and reading the main checkout's HEAD is
+    /// the exact defect design decision #2 exists to kill — a checkout parked on the wrong branch
+    /// used to redirect every landing there. So the test declares an integration branch that is
+    /// deliberately NOT called master, and the landed request has to name it regardless of what the
+    /// main checkout happens to have open.
     ///
     /// It also pins the direction, which is the whole point of this route existing: a session could
     /// already ask for merges INTO its own branch, and this is the only way it can ask for the
     /// reverse.
     #[tokio::test]
-    async fn landing_a_worktree_queues_its_branch_into_the_branch_the_project_is_on() {
+    async fn landing_a_worktree_queues_its_branch_into_the_declared_integration_branch() {
         let (state, _db) = file_test_state().await;
         let container = crate::git_exec::tests::space_free_tempdir("http-land-");
         let repo = container.path().join("repo");
         crate::git_exec::tests::initialize_repo(&repo);
-        // Not `master`, on purpose — see the doc comment.
+        // Not `master`, on purpose — see the doc comment. The main checkout is left standing HERE
+        // for the whole test, never on the declared branch, which is what proves the target came
+        // from the column and not from this checkout's HEAD.
         assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
         assert!(git_in(&repo, &["branch", "feature"]));
         let worktree = container.path().join("wt");
@@ -10152,9 +10139,14 @@ mod tests {
                 "feature"
             ]
         ));
+        // `feature` has to carry a real commit `trunk` does not, or decision #3's ancestor check
+        // refuses the landing before this test reaches anything it means to assert.
+        std::fs::write(worktree.join("feature.txt"), "from the branch\n").unwrap();
+        assert!(git_in(&worktree, &["add", "-A"]));
+        assert!(git_in(&worktree, &["commit", "-m", "feature"]));
         sqlx::query(
-            "INSERT INTO autopilot_state (project_id, mode, project_root)
-             VALUES ('alpha', 'active', ?)",
+            "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
+             VALUES ('alpha', 'active', ?, 'trunk')",
         )
         .bind(repo.to_string_lossy().into_owned())
         .execute(&state.pool)
@@ -10184,7 +10176,7 @@ mod tests {
         );
         assert_eq!(
             op["target"], "trunk",
-            "the target is the branch the project's main checkout is on, not a constant"
+            "the target is the project's declared integration branch, not a constant"
         );
 
         // Standing on the integration branch, there is no separate work to take. Refused rather

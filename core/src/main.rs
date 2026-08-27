@@ -38,6 +38,7 @@ mod hooks;
 mod http;
 mod inspect;
 mod job;
+mod land;
 mod local_agent;
 mod logging;
 mod mailsend;
