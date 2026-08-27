@@ -121,6 +121,12 @@ pub fn build_router(state: AppState) -> Router {
         // `map/decisions` on their argument exactly: sentences lifted out of a document already
         // sitting in a folder this reader can `cat` whole.
         .route("/projects/{id}/map/silenced", get(get_project_map_silenced))
+        // §14's guard, and the only route in this pillar that reads git's HISTORY rather than its
+        // present. A GET, in `READ_ONLY_ROUTES`, and reached from ONE place — a row of §5.1's
+        // *declarado, sem código* — because the question it answers only means anything there. It
+        // costs a walk of the history per call, which is why it is not folded into `map`: every
+        // decision in that pile would pay for it and almost none of them would be asked.
+        .route("/projects/{id}/map/orphan", get(get_project_map_orphan))
         // The owner's verdict on one decision (§5.2). In no table in `auth.rs` for the sharpest
         // reason of the three POSTs here: §6 takes the green away from the model on purpose, and
         // §6.1 says handing that authority back through any other door turns the map into false
@@ -133,6 +139,12 @@ pub fn build_router(state: AppState) -> Router {
         // is already in the map — §9.2's *acrescenta uma linha, nunca substitui* — and it carries a
         // verdict and a note that have to travel in a body regardless.
         .route("/projects/{id}/map/stamps", post(post_project_map_stamp))
+        // §14's other half: which files a decision's code IS, written down so that deleting
+        // the `§` comment stops erasing the association. In NO table in `auth.rs`, beside
+        // `stamps` and for a sharper version of its argument — a record is what the whole map
+        // anchors to, so a key that could write one could point every decision at whatever it
+        // liked and the map would report it as the owner's own choice.
+        .route("/projects/{id}/map/anchors", post(post_project_map_anchors))
         // The model's second entrance (§6), and in no table in `auth.rs` for `extract`'s reason
         // doubled: it spends a model per decision. No id anywhere on it, and that is §10 rather
         // than an omission — the triager's scope is everything nobody has stamped, and a caller
@@ -2437,6 +2449,41 @@ async fn resolve_run_worktree(
     }
 }
 
+/// Which documents this project has, from the table first and the folder second.
+///
+/// **The union, and the order of the two words is the whole argument.** `map_intent::specs_in`
+/// answers *what is in `.ai/specs` right now*; `map_store::slugs` answers *what this project has
+/// ever extracted decisions from*. Only the second is durable — spec files are gitignored working
+/// material that gets archived, renamed and reorganised, and the slug is the FILENAME, so a rename
+/// silently retires every slug the approved rows still carry.
+///
+/// What the list is for is [`crate::map_join::evidence`]'s one refusal: a citation whose candidate
+/// names a DIFFERENT document of this project is evidence against, and is skipped rather than
+/// counted. A list that lost a slug therefore does not fail loudly — it quietly stops being able to
+/// tell two documents apart, every anchor degrades to ambiguous, and nothing on screen says why.
+/// That is the silent wrong answer this feature exists to refuse, arriving through a file rename.
+///
+/// **The folder still contributes**, because a spec sitting there with no decisions yet is a real
+/// document of this project and a citation naming it must still be refused for the others. Union
+/// never loses a slug; either source alone does.
+///
+/// Sorted and deduplicated so two reads of an unchanged project cannot produce two different lists,
+/// which `map_join::join`'s determinism rests on.
+async fn document_slugs(
+    state: &AppState,
+    id: &str,
+    on_disk: Vec<String>,
+) -> Result<Vec<String>, StatusCode> {
+    let mut all: std::collections::BTreeSet<String> = on_disk.into_iter().collect();
+    all.extend(crate::map_store::slugs(&state.pool, id).await.map_err(
+        |error| {
+            tracing::warn!(%error, project_id = %id, "reading this project's document slugs failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+    )?);
+    Ok(all.into_iter().collect())
+}
+
 async fn resolve_project_root(state: &AppState, id: &str) -> Result<PathBuf, StatusCode> {
     match inspect::project_root(&state.pool, id).await {
         Ok(Some(root)) => Ok(PathBuf::from(root)),
@@ -3277,9 +3324,17 @@ async fn anchor_digests(
     std::collections::BTreeMap<i64, crate::map_stamp::Anchors>,
     crate::map_stamp::Anchors,
 ) {
+    // `watched` and not `modules`, which is the whole of §14's cure reaching the expiry rule: a
+    // stamp has to keep watching the files somebody wrote down even after the comment that first
+    // named them is gone. Watching `modules` alone would mean a deleted comment silently shrinks
+    // the set a green expires against — the green stops watching the very file it was given over.
+    let per_decision_watched: std::collections::BTreeMap<i64, Vec<String>> = decisions
+        .iter()
+        .map(|anchored| (anchored.decision_id, anchored.watched()))
+        .collect();
     let mut union: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for anchored in decisions {
-        union.extend(anchored.modules.iter().map(String::as_str));
+    for paths in per_decision_watched.values() {
+        union.extend(paths.iter().map(String::as_str));
     }
     let union: Vec<String> = union.into_iter().map(str::to_owned).collect();
     let anchors = crate::map_stamp::digest(root, &union).await;
@@ -3296,13 +3351,16 @@ async fn anchor_digests(
         // `digest` itself never asks git for an empty list — so a project with no repository leaves
         // these on `Watch::NoAnchor`, which is the fact the owner can act on, rather than on
         // `Watch::NoRepository`, which would be true about the folder and useless about the decision.
-        let current = if anchored.modules.is_empty() {
+        let watched = per_decision_watched
+            .get(&anchored.decision_id)
+            .expect("every decision was given a watched set just above");
+        let current = if watched.is_empty() {
             crate::map_stamp::Anchors::Computed(String::new())
         } else {
             match (&anchors, &tracked) {
                 (crate::map_stamp::Anchors::Computed(_), Some(tracked)) => {
                     crate::map_stamp::Anchors::Computed(crate::map_stamp::canonical(
-                        anchored.modules.iter().filter_map(|path| {
+                        watched.iter().filter_map(|path| {
                             tracked
                                 .get(path.as_str())
                                 .map(|blob| (path.as_str(), blob.as_str()))
@@ -3395,11 +3453,25 @@ async fn project_junction(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    let spec_slugs = document_slugs(state, id, spec_slugs).await?;
+
+    // The recorded anchor sets, which are the only part of this junction with a memory. Read here
+    // rather than merged into the payload afterwards, because `join` needs them: a file somebody
+    // wrote down as a decision's code is CLAIMED, and deciding that after the fact would mean a
+    // second place that knows what §5.1's two piles mean.
+    let records = crate::map_store::anchors(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the recorded anchors failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
     let junction = crate::map_join::join(
         &decisions,
         &structure.modules,
         &structure.foreign,
         &spec_slugs,
+        &records,
     );
     Ok((structure, junction))
 }
@@ -3712,6 +3784,70 @@ async fn get_project_map_silenced(
         })
 }
 
+/// What `GET …/map/orphan` is asked about: one section of one document.
+#[derive(Deserialize)]
+struct MapOrphanQuery {
+    /// The document, as `map/specs` spells it and as a decision row carries it.
+    slug: String,
+    /// The heading the decision was copied from, **verbatim** — `## 4.1 Três tipos de decisão`.
+    ///
+    /// The heading and not the number, so that [`crate::map_join::section_number`] stays the one
+    /// place that knows how one becomes the other. A client that sent the number would be a second
+    /// implementation of that rule, and the day the two disagreed the guard would be searching the
+    /// history for a section the junction never anchored anything to.
+    section: String,
+}
+
+/// Whether a decision with no code was never built, or lost the comment that anchored it (§14).
+///
+/// **Three refusals, and each is a different sentence.** `422` for a heading carrying no number:
+/// that is [`crate::map_join::Anchor::Unnumbered`], where no search ever ran, and answering
+/// *nothing ever named it* about a question nobody could ask would be the silent wrong answer this
+/// whole feature refuses. `404` for a slug this project has no document for — the same answer
+/// `map/extract` gives it, and for its reason. Everything else is a `200` carrying one of
+/// [`crate::map_orphan::Orphan`]'s six states, including the two that mean *I could not look*: a
+/// git that would not answer is a finding and not a fault of this daemon.
+///
+/// **There is deliberately NO refusal for a document that is not on disk**, and the first version
+/// of this route had one. It answered `404` when the slug was missing from `map_intent::specs_in`,
+/// which made the guard the only part of this map that stops working when a spec file is archived
+/// or renamed — `GET /map` keeps showing those decisions, because their text was copied into the
+/// table at extraction and the folder was never where they lived. Worse, the slug IS the filename,
+/// so renaming a spec would have killed the guard for every decision of that document while the
+/// rows carrying the old slug sat on screen looking answerable. See [`document_slugs`]: the list of
+/// this project's documents comes from the table first, so a slug an approved decision carries is a
+/// document this project has, whatever happened to the file.
+async fn get_project_map_orphan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<MapOrphanQuery>,
+) -> Result<Json<crate::map_orphan::Orphan>, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    let Some(section) = crate::map_join::section_number(&query.section) else {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    };
+
+    // On `spawn_blocking` for `map/extract`'s reason: this reads a directory, and the daemon is
+    // also answering a three-second poll. Slugs and not paths, exactly as `project_junction` does
+    // it, because the slug is what a citation's candidate is checked against.
+    let listing = root.clone();
+    let on_disk: Vec<String> = tokio::task::spawn_blocking(move || {
+        crate::map_intent::specs_in(&listing)
+            .iter()
+            .map(|path| crate::map_intent::spec_slug(path))
+            .collect()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let slugs = document_slugs(&state, &id, on_disk).await?;
+
+    Ok(Json(
+        crate::map_orphan::orphan(&root, &section, &query.slug, &slugs).await,
+    ))
+}
+
 #[derive(Deserialize)]
 struct MapDecisionBody {
     /// `true` approves the line and lets it into the map; `false` retires it, which is what stops
@@ -3840,12 +3976,24 @@ async fn post_project_map_stamp(
 
     let root = resolve_read_root(&state, &id, None).await?;
     let (_, junction) = project_junction(&state, &id, root.clone()).await?;
-    let anchors = junction
+    let anchored = junction
         .decisions
         .iter()
         .find(|anchored| anchored.decision_id == body.decision_id)
-        .map(|anchored| anchored.modules.clone())
         .ok_or(StatusCode::NOT_FOUND)?;
+    // `watched` and not `modules`: once a set has been written down, that is what the green expires
+    // against. See `anchor_digests`, which makes the same substitution for the same reason.
+    let anchors = anchored.watched();
+    // **A stamp never overwrites a set the OWNER pointed at**, and that is the one rule this
+    // side effect has. What a stamp can record is whatever the `§` comments happened to say at this
+    // instant — which, while §8 is unfixed, is a set of guesses about which document a bare `§`
+    // meant. Writing that over a choice somebody made deliberately would demote the choice to the
+    // guess, silently, at the moment they were being most careful. So an owner record stands, and
+    // the stamp adds nothing.
+    let already_chosen = matches!(
+        anchored.record.as_ref().map(|record| record.source),
+        Some(crate::map_store::AnchorSource::Owner)
+    );
 
     // `Anchored::modules` and never `foreign` beside it. `Anchor::Declared` spends a paragraph on
     // why: watching an anchor means being able to read it, and promising an expiry over a Go file
@@ -3883,7 +4031,31 @@ async fn post_project_map_stamp(
     )
     .await
     {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(true) => {
+            // After the stamp and never instead of it: the verdict is what the caller asked for,
+            // and a record written for a stamp that then failed to land would be a memory of an
+            // act that did not happen. A record that fails to write is logged and swallowed for the
+            // mirror-image reason — the owner's verdict IS recorded, and answering `500` would tell
+            // them their stamp did not land when it did.
+            if !already_chosen
+                && let Err(error) = crate::map_store::record_anchor(
+                    &state.pool,
+                    &id,
+                    body.decision_id,
+                    &anchors,
+                    crate::map_store::AnchorSource::Stamp,
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    project_id = %id,
+                    decision = body.decision_id,
+                    "the stamp landed and its anchor set could not be written down"
+                );
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
         // Reachable despite the lookup above: the line could have been retired between the two, and
         // the store is the authority on that rather than the reading this handler took a moment ago.
         Ok(false) => Err(StatusCode::NOT_FOUND),
@@ -4029,6 +4201,98 @@ struct TriageReport {
 /// this machine has no model for — never a quiet fall back to the cloud, which would break the two
 /// promises that word carries at once — and `500` for the daemon's own failure to read or write its
 /// tables.
+/// Which files one decision's code is, as the owner says it.
+#[derive(Deserialize)]
+struct MapAnchorBody {
+    decision_id: i64,
+    /// Repository-relative, forward slashes. **An empty list is legal and is an assertion**,
+    /// not a no-op: *these files were this decision's and now none are* is what somebody says
+    /// about code they genuinely removed, and it is a different fact from never having written
+    /// anything down.
+    paths: Vec<String>,
+}
+
+/// Write down which files one decision's code is (§14).
+///
+/// **The one act in this map that gives an anchor a memory.** Everything else here is
+/// recomputed from the working tree on every read: delete the `§7.1` from a file and the
+/// association is gone, and the decision lands in §5.1's *declarado, sem código* looking exactly
+/// like one nobody ever implemented. This is what makes that a named alarm instead of a silent
+/// disappearance.
+///
+/// **Every path is resolved inside the project before anything is written**, through the same
+/// [`crate::inspect::resolved_within`] `cat` and `grep` use — so an absolute path, a `..`, and a
+/// junction pointing out of the tree are all refused by the function that already knows how,
+/// rather than by a second rule written here. A path that does not exist is refused too, and
+/// that is not tidiness: an anchor naming a file the project does not have would sit in
+/// [`crate::map_stamp::Lapse::Moved`]'s `gone` for ever, nagging about a file that was never
+/// there.
+///
+/// **Deliberately not restricted to files the map can READ.** [`crate::project_map::scanned`]
+/// decides whose `§` this reader parses; it has no standing over which files somebody’s code
+/// lives in. A Go sidecar, a migration, a stylesheet — the owner is entitled to say a
+/// decision's code is there, and `map_stamp::digest` watches any tracked path perfectly well.
+/// Refusing them would make this route unusable for exactly the languages §11 already admits
+/// the map cannot read.
+///
+/// `204` when a row was written, `404` when the decision is not this project’s, not approved,
+/// or retired — [`crate::map_store::decide`]'s three-reasons-one-answer, for its reason.
+async fn post_project_map_anchors(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapAnchorBody>,
+) -> Result<StatusCode, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    let asked = body.paths.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        let mut kept: Vec<String> = Vec::with_capacity(asked.len());
+        for path in &asked {
+            // Backslashes normalised before anything looks at the string, because the map
+            // spells every path with forward slashes (`project_map::collect` does the same
+            // `replace`) and a record written the other way would never match an anchor again.
+            let cleaned = path.trim().replace('\\', "/");
+            if cleaned.is_empty() {
+                return None;
+            }
+            let resolved = crate::inspect::resolved_within(&root, &cleaned).ok()?;
+            // A directory is not a decision’s code, and recording one would put a path in the
+            // digest that `git ls-files` never answers for — a permanent `gone`.
+            if !resolved.is_file() {
+                return None;
+            }
+            kept.push(cleaned);
+        }
+        Some(kept)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    match crate::map_store::record_anchor(
+        &state.pool,
+        &id,
+        body.decision_id,
+        &checked,
+        crate::map_store::AnchorSource::Owner,
+    )
+    .await
+    {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                decision = body.decision_id,
+                files = checked.len(),
+                "writing down a decision's anchor files failed"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn post_project_map_triage(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -13273,6 +13537,184 @@ mod tests {
         );
     }
 
+    /// Write down a decision's files, as the window does.
+    async fn post_anchors(state: AppState, project: &str, body: serde_json::Value) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/anchors"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A project whose repository holds one module naming §1, and one approved decision about it.
+    async fn project_with_one_anchored_decision(
+        state: &AppState,
+        id: &str,
+    ) -> (tempfile::TempDir, i64) {
+        let dir = project_with_repo(state, id, "gate_command: x\n").await;
+        let module = dir.path().join("core").join("src").join("a.rs");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "//! This module implements §1.\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "the citation arrives"]);
+        let decision = seed_approved(state, id, "## 1. Alfa", 1, "A decisão.").await;
+        (dir, decision)
+    }
+
+    /// §14 end to end: the comment goes and the association does not.
+    ///
+    /// **The whole point of `map_anchors`, asserted through the two routes that make it real.** The
+    /// before half matters as much as the after: without it the test would pass against a map that
+    /// never anchored the decision at all.
+    #[tokio::test]
+    async fn a_recorded_anchor_survives_the_comment_being_deleted() {
+        let state = test_state().await;
+        let (dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+
+        let before = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(before["junction"]["decisions"][0]["anchor"], "ambiguous");
+        assert_eq!(
+            before["junction"]["decisions"][0]["modules"][0],
+            "core/src/a.rs"
+        );
+
+        assert_eq!(
+            post_anchors(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "paths": ["core/src/a.rs"] }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        // The rewrite that drops the comment — a model inside a plan nobody read to the end.
+        std::fs::write(
+            dir.path().join("core").join("src").join("a.rs"),
+            "//! This module implements nothing at all.\n",
+        )
+        .unwrap();
+
+        let after = get_json(&state, "/projects/alpha/map").await;
+        let row = &after["junction"]["decisions"][0];
+        // Still `silent`, and that is TRUE: no comment names it. What changed is that the row is no
+        // longer empty, so it cannot be read as *nobody ever implemented this*.
+        assert_eq!(row["anchor"], "silent");
+        assert_eq!(row["modules"].as_array().unwrap().len(), 0);
+        assert_eq!(row["record"]["paths"][0], "core/src/a.rs");
+        assert_eq!(row["record"]["source"], "owner");
+    }
+
+    /// Stamping writes the set down, so a green keeps watching the files it was given over.
+    #[tokio::test]
+    async fn stamping_writes_down_which_files_the_decision_s_code_was() {
+        let state = test_state().await;
+        let (_dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "verdict": "settled" }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let held = crate::map_store::anchors(&state.pool, "alpha")
+            .await
+            .unwrap();
+        let record = held.get(&decision).expect("the stamp wrote a record");
+        assert_eq!(record.paths, ["core/src/a.rs"]);
+        assert_eq!(record.source, crate::map_store::AnchorSource::Stamp);
+    }
+
+    /// **A stamp never overwrites a set the owner pointed at**, and this is the rule that keeps a
+    /// choice from being demoted to a guess.
+    ///
+    /// What a stamp can record is whatever the `§` comments happened to say at that instant, which
+    /// while §8 is unfixed is a guess about which document a bare `§` meant. Writing that over a
+    /// deliberate choice would do it silently, at the moment the owner was being most careful.
+    #[tokio::test]
+    async fn a_stamp_never_overwrites_a_set_the_owner_pointed_at() {
+        let state = test_state().await;
+        let (dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+        // A second file, deliberately NOT the one the comment names.
+        let other = dir.path().join("core").join("src").join("b.rs");
+        std::fs::write(&other, "//! Nothing at all.\n").unwrap();
+
+        assert_eq!(
+            post_anchors(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "paths": ["core/src/b.rs"] }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "verdict": "settled" }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let held = crate::map_store::anchors(&state.pool, "alpha")
+            .await
+            .unwrap();
+        let record = held.get(&decision).expect("the record is still there");
+        assert_eq!(record.paths, ["core/src/b.rs"], "the choice stands");
+        assert_eq!(record.source, crate::map_store::AnchorSource::Owner);
+    }
+
+    /// A path that leaves the project is refused before anything is written.
+    ///
+    /// Through `inspect::resolved_within`, the same function `cat` and `grep` use, so the rule has
+    /// one home. A path that simply is not there is refused too: an anchor naming a file the
+    /// project does not have would sit in `Lapse::Moved`'s `gone` for ever.
+    #[tokio::test]
+    async fn a_path_that_leaves_the_project_is_not_written_down() {
+        let state = test_state().await;
+        let (_dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+
+        for path in [
+            "../outside.rs",
+            "/etc/passwd",
+            "core/src/never-existed.rs",
+            "core/src",
+        ] {
+            assert_eq!(
+                post_anchors(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({ "decision_id": decision, "paths": [path] }),
+                )
+                .await,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path} should be refused"
+            );
+        }
+
+        assert!(
+            crate::map_store::anchors(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "and nothing was written for any of them"
+        );
+    }
+
     fn git_in_project(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
@@ -13297,6 +13739,153 @@ mod tests {
         git_in_project(dir.path(), &["config", "user.name", "test"]);
         git_in_project(dir.path(), &["config", "core.autocrlf", "false"]);
         dir
+    }
+
+    /// A registered git project holding one spec, one module that named §7.1, and the commit that
+    /// took the comment away.
+    async fn project_that_lost_a_citation(state: &AppState, id: &str) -> tempfile::TempDir {
+        let dir = project_with_repo(state, id, "gate_command: x\n").await;
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".ai").join("specs")).unwrap();
+        std::fs::write(
+            root.join(".ai").join("specs").join("a-spec-design.md"),
+            "## 7.1 Uma decisão\n\nO texto da decisão.\n",
+        )
+        .unwrap();
+        let module = root.join("core").join("src").join("a.rs");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+
+        std::fs::write(&module, "//! This module implements §7.1.\n").unwrap();
+        git_in_project(&root, &["add", "-A"]);
+        git_in_project(&root, &["commit", "-q", "-m", "the citation arrives"]);
+
+        std::fs::write(&module, "//! This module implements nothing at all.\n").unwrap();
+        git_in_project(&root, &["add", "-A"]);
+        git_in_project(
+            &root,
+            &["commit", "-q", "-m", "refactor: rewrite the header"],
+        );
+        dir
+    }
+
+    async fn orphan_status(state: &AppState, uri: &str) -> StatusCode {
+        build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// §14's guard, end to end: the sentence the panel puts in front of somebody looking at a row
+    /// of *declarado, sem código*.
+    ///
+    /// The point of running it through the route rather than through `map_orphan` alone is the two
+    /// things only the route does: it turns a heading into a section number through
+    /// `map_join::section_number`, and it hands the guard the project's real spec slugs, which is
+    /// what keeps the answer about ONE document.
+    #[tokio::test]
+    async fn the_orphan_guard_says_which_commit_took_the_citation_away() {
+        let state = test_state().await;
+        let _dir = project_that_lost_a_citation(&state, "alpha").await;
+
+        let answer = get_json(
+            &state,
+            "/projects/alpha/map/orphan?slug=a-spec-design&section=%23%23%207.1",
+        )
+        .await;
+
+        assert_eq!(answer["state"], "lost", "{answer:?}");
+        assert_eq!(answer["losses"][0]["path"], "core/src/a.rs");
+        assert_eq!(
+            answer["losses"][0]["subject"],
+            "refactor: rewrite the header"
+        );
+        assert_eq!(answer["losses"][0]["renamed_to"], serde_json::Value::Null);
+        // §8 is unfixed in this fixture as it is in the repository: the citation named a section
+        // and no document, so the guard reports the same ambiguity the junction reports.
+        assert_eq!(answer["losses"][0]["declared"], false);
+    }
+
+    /// A heading carrying no number is refused, and is not answered *nothing ever named it*.
+    ///
+    /// That is `map_join::Anchor::Unnumbered` reaching the route: an approved decision copied from
+    /// `## Contrato` anchors nothing because nothing could be looked for, and a `200` here saying
+    /// the section was never named would be the report of a search that never ran — over a decision
+    /// that may well be implemented.
+    #[tokio::test]
+    async fn a_heading_with_no_number_is_refused_rather_than_answered() {
+        let state = test_state().await;
+        let _dir = project_that_lost_a_citation(&state, "alpha").await;
+
+        assert_eq!(
+            orphan_status(
+                &state,
+                "/projects/alpha/map/orphan?slug=a-spec-design&section=%23%23%20Contrato"
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// **Archiving or renaming a spec file must not take the guard with it**, and the first version
+    /// of this route let it.
+    ///
+    /// A slug is a filename without its extension, these filenames carry dates, and the folder they
+    /// sit in is gitignored working material that gets reorganised. Every approved decision keeps
+    /// the slug it was extracted under for ever. So a route that answered `404` for a slug missing
+    /// from `map_intent::specs_in` would refuse to answer about rows `GET /map` was still happily
+    /// drawing — the guard being the one part of this map that stops working because a file moved.
+    ///
+    /// The fixture deletes the document outright, which is the harsher half of the same case.
+    #[tokio::test]
+    async fn a_document_that_left_the_folder_is_still_a_document_this_project_has() {
+        let state = test_state().await;
+        let dir = project_that_lost_a_citation(&state, "alpha").await;
+        // A row carrying the slug, which is what makes the table the durable register.
+        seed_approved(&state, "alpha", "## 7.1 Uma decisão", 1, "A decisão.").await;
+        std::fs::remove_file(
+            dir.path()
+                .join(".ai")
+                .join("specs")
+                .join("a-spec-design.md"),
+        )
+        .unwrap();
+
+        // Answered, not refused — and answered with the finding, which is what says the slug still
+        // reached `map_orphan` rather than merely getting past a guard.
+        let answer = get_json(
+            &state,
+            "/projects/alpha/map/orphan?slug=design&section=%23%23%207.1",
+        )
+        .await;
+        assert_eq!(answer["state"], "lost", "{answer:?}");
+    }
+
+    /// A project nobody registered is still a `404`, and that one is `resolve_read_root`'s.
+    ///
+    /// Kept as its own test because it is a different refusal from the one above and the two used
+    /// to be one assertion: *this project does not exist* is about the daemon's own registry, where
+    /// *this document is not in that folder* was about somebody's filesystem — and only the first
+    /// is a fact this route is entitled to have an opinion about.
+    #[tokio::test]
+    async fn a_project_nobody_registered_is_not_searched_for() {
+        let state = test_state().await;
+        let _dir = project_that_lost_a_citation(&state, "alpha").await;
+
+        assert_eq!(
+            orphan_status(
+                &state,
+                "/projects/nowhere/map/orphan?slug=a-spec-design&section=%23%23%207.1"
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// The owner's verdict on one decision, as the window sends it: the status and nothing else.

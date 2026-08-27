@@ -1155,6 +1155,7 @@ mod tests {
             kind: Kind::Character,
             anchor,
             modules: modules.iter().map(|path| (*path).to_owned()).collect(),
+            record: None,
             foreign: foreign.iter().map(|path| (*path).to_owned()).collect(),
         }
     }

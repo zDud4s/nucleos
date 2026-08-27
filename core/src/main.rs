@@ -41,6 +41,7 @@ mod mailsend;
 mod map_anchor;
 mod map_intent;
 mod map_join;
+mod map_orphan;
 mod map_recency;
 mod map_stamp;
 mod map_store;

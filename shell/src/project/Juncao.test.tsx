@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { screen, within } from "@testing-library/react";
 
-// The harness pulls the app's router and client in with it. Nothing on this surface fetches
-// anything — it is handed a `Junction` and draws it — so this line is for the import graph and
-// not for the component: there is no request here for a test to answer.
+// The harness pulls the app's router and client in with it. This surface fetches nothing when it
+// opens — it is handed a `Junction` and draws it — and the one request it can make, §14's guard on
+// a row of *declared, with no code*, only leaves on a press. So this line is for the import graph
+// and not for the component: no test here answers a request, and `Orfa.test.tsx` is where the one
+// that does lives.
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import type { Anchor, Anchored, Junction } from "../data/project-map";
@@ -27,6 +29,9 @@ function anchored(overrides: Partial<Anchored> = {}): Anchored {
     anchor: "silent",
     modules: [],
     foreign: [],
+    // Nobody has written down which files this decision's code is, which is every
+    // decision on day one and the state each of these fixtures is about.
+    record: null,
     ...overrides,
   };
 }
@@ -61,7 +66,7 @@ function junction(overrides: Partial<Omit<Junction, "counts">> = {}): Junction {
 }
 
 function open(overrides: Partial<Omit<Junction, "counts">> = {}) {
-  return renderWithQuery(<Juncao junction={junction(overrides)} />);
+  return renderWithQuery(<Juncao junction={junction(overrides)} projectId="alpha" />);
 }
 
 describe("the nodes that do not match", () => {
@@ -242,15 +247,78 @@ describe("the nodes that do not match", () => {
   });
 
   /**
-   * **The absence is the assertion, twice over.**
+   * §14: a decision whose code somebody wrote down does not sit in *declared, with no code*.
    *
-   * No verdict word, because a verdict is the owner's alone and the surface that carries one is a
-   * later slice; a panel that implied one would be manufacturing the confidence this whole mode
-   * exists to take apart. And no control at all, because this is a reading surface — the one
-   * place in this mode with buttons answers a single line at a time, deliberately, and a second
-   * place to press would be a second way to accept without reading.
+   * **The two rows are identical to the júnction — both `silent`, both with no modules — and
+   * they are not the same fact.** One is work still to do. The other is an anchor a rewrite
+   * deleted, and the files are known. Drawing them alike is exactly the confusion this feature
+   * exists to end, so the test asserts the SEPARATION rather than the presence: the recorded
+   * row must be out of the first pile as well as in the second.
    */
-  it("implies no verdict and offers no control", () => {
+  it("keeps a decision whose comment was deleted out of the code-less pile", () => {
+    open({
+      decisions: [
+        anchored({ decision_id: 20 }),
+        anchored({
+          decision_id: 21,
+          record: {
+            paths: ["core/src/remembered.rs"],
+            source: "owner",
+            recorded_at: "2026-08-27T10:00:00+00:00",
+          },
+        }),
+      ],
+    });
+
+    const codeless = screen.getByRole("list", { name: /decisions nothing names/i });
+    expect(within(codeless).queryByText(/core\/src\/remembered\.rs/)).toBeNull();
+    expect(within(codeless).queryAllByRole("listitem")).toHaveLength(1);
+
+    const lost = screen.getByRole("list", { name: /decisions whose comment is gone/i });
+    expect(within(lost).getByText(/core\/src\/remembered\.rs/)).toBeTruthy();
+    expect(screen.getByText(/no comment naming them any more/i)).toBeTruthy();
+  });
+
+  /**
+   * An EMPTY record stays in the code-less pile, and that is not an oversight.
+   *
+   * *Somebody wrote down that none are* is a stronger version of *nothing names this*, not a
+   * different claim — there is no file to go and look at, so a pile whose whole purpose is to
+   * hand over a file would be the wrong home for it.
+   */
+  it("leaves a decision somebody said has no code where it was", () => {
+    open({
+      decisions: [
+        anchored({
+          decision_id: 22,
+          record: { paths: [], source: "owner", recorded_at: "2026-08-27T10:00:00+00:00" },
+        }),
+      ],
+    });
+
+    expect(screen.queryByRole("list", { name: /decisions whose comment is gone/i })).toBeNull();
+    const codeless = screen.getByRole("list", { name: /decisions nothing names/i });
+    expect(within(codeless).queryAllByRole("listitem")).toHaveLength(1);
+  });
+  /**
+   * **The absence is still the assertion, and it is now one absence rather than two.**
+   *
+   * No verdict word: a verdict is the owner's alone, the surface that carries one is its own panel,
+   * and a line here that implied one would be manufacturing the confidence this mode exists to take
+   * apart. That half is unchanged.
+   *
+   * **The other half used to be `queryAllByRole("button")` with a length of zero, and §14 ended it.**
+   * The argument behind that number was about ACCEPTING — *a second place to press would be a second
+   * way to accept without reading* — and it survives whole: nothing here accepts anything and nothing
+   * here writes. What §14 adds is a button that asks git *was this ever named?*, on the rows of
+   * *declared, with no code* and on no others, and it is the opposite of a way to accept without
+   * reading. So the assertion becomes the shape it was always about: exactly one control per silent
+   * row, no control anywhere else, and no verdict word on the panel.
+   *
+   * Written as a count tied to the silent rows rather than as *some buttons exist*, because the
+   * failure to catch is a later slice quietly hanging a second control off the ambiguous piles.
+   */
+  it("implies no verdict, and its only control asks rather than accepts", () => {
     open({
       decisions: [
         anchored({ decision_id: 9 }),
@@ -264,7 +332,16 @@ describe("the nodes that do not match", () => {
     });
 
     expect(document.body.textContent ?? "").not.toMatch(/stamp|carimb/i);
-    expect(screen.queryAllByRole("button")).toHaveLength(0);
+    // One silent row in the fixture, one button, and it is §14's question.
+    const controls = screen.queryAllByRole("button");
+    expect(controls).toHaveLength(1);
+    expect(controls[0].textContent ?? "").toMatch(/was this ever named/i);
+    // And it hangs off the silent pile, never off the row whose heading carried no number — where
+    // no search could run at all.
+    const unnumbered = screen.getByRole("list", {
+      name: /decisions whose heading carried no number/i,
+    });
+    expect(within(unnumbered).queryAllByRole("button")).toHaveLength(0);
   });
 
   /**

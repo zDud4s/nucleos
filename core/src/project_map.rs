@@ -264,6 +264,18 @@ fn foreign_source(path: &str) -> bool {
     FOREIGN.iter().any(|extension| path.ends_with(extension))
 }
 
+/// Whether this map reads a § out of this path at all.
+///
+/// **One predicate for the two callers that have to agree, and they are a walk apart.**
+/// [`citing_files`] applies it to the working tree; [`crate::map_orphan`] applies it to paths git
+/// prints out of the history, where no file exists to read. Spelling the rule twice would let the
+/// guard report a loss in a file the structure layer never looked at — a claim about a language
+/// this map does not scan, arriving under the one word (`Lost`) that is supposed to mean
+/// something definite.
+pub fn scanned(path: &str) -> bool {
+    reader_for(path).is_some() || foreign_source(path)
+}
+
 /// A file of the project, and what is known about it without asking any model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Module {
@@ -570,7 +582,7 @@ pub fn citing_files(root: &Path) -> std::io::Result<Vec<String>> {
     collect(root, root, &mut files)?;
     files.sort();
     files.retain(|path| {
-        (reader_for(path).is_some() || foreign_source(path))
+        scanned(path)
             && std::fs::read_to_string(root.join(path)).is_ok_and(|source| cites_section(&source))
     });
     Ok(files)

@@ -1704,6 +1704,19 @@ pub fn settle(first: Sweep, second: Sweep) -> Sweep {
 }
 #[cfg(test)]
 mod tests {
+    use crate::map_store::AnchorRecord;
+    use std::collections::BTreeMap;
+
+    /// A project where nobody has written down which files any decision's code is.
+    ///
+    /// Every test in this module predates `map_anchors` and every one of them is about what the
+    /// COMMENTS say, which is the half of the junction that never had a memory. Naming the empty
+    /// map instead of inlining it is what keeps that readable: the argument each of these tests
+    /// makes is *given no record*, and a bare `&BTreeMap::new()` in twenty-seven call sites says
+    /// that to nobody.
+    fn unrecorded() -> BTreeMap<i64, AnchorRecord> {
+        BTreeMap::new()
+    }
     use super::*;
 
     /// Two real documents of this repository, because the one rejection left in this module is a
@@ -1851,8 +1864,8 @@ mod tests {
 ",
         )];
 
-        let after = join(&elsewhere, &declaring, &[], &slugs);
-        let before = join(&elsewhere, &bare, &[], &slugs);
+        let after = join(&elsewhere, &declaring, &[], &slugs, &unrecorded());
+        let before = join(&elsewhere, &bare, &[], &slugs, &unrecorded());
 
         assert_eq!(
             after.counts.declared, 0,
@@ -1887,10 +1900,20 @@ mod tests {
 ",
         )];
 
-        assert_eq!(join(&shared, &danger, &[], &slugs).counts.declared, 1);
-        assert_eq!(join(&shared, &honest, &[], &slugs).counts.declared, 0);
         assert_eq!(
-            join(&shared, &honest, &[], &slugs).decisions[0].anchor,
+            join(&shared, &danger, &[], &slugs, &unrecorded())
+                .counts
+                .declared,
+            1
+        );
+        assert_eq!(
+            join(&shared, &honest, &[], &slugs, &unrecorded())
+                .counts
+                .declared,
+            0
+        );
+        assert_eq!(
+            join(&shared, &honest, &[], &slugs, &unrecorded()).decisions[0].anchor,
             Anchor::Ambiguous
         );
 
@@ -3717,8 +3740,13 @@ mod tests {
             .collect();
         let structure = crate::project_map::structure(&root).expect("the walk reads this tree");
 
-        let mut junction =
-            crate::map_join::join(&decisions, &structure.modules, &structure.foreign, &slugs);
+        let mut junction = crate::map_join::join(
+            &decisions,
+            &structure.modules,
+            &structure.foreign,
+            &slugs,
+            &unrecorded(),
+        );
         let walked = crate::map_recency::walk(&root).await;
         let recency = crate::map_recency::order(&mut junction.decisions, &walked);
 

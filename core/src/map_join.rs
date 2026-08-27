@@ -49,10 +49,10 @@
 //! the wrong document — which is why nothing here decides anything.
 
 use crate::map_intent::Kind;
-use crate::map_store::Decision;
+use crate::map_store::{AnchorRecord, Decision};
 use crate::project_map::{Foreign, Module};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One `§` reference found in a source file.
 ///
@@ -413,6 +413,17 @@ pub enum Anchor {
     /// there is no ambiguity left to resolve. Decision 3 of the spec says the value is in the
     /// nodes that do not match — so the answers this map is certain about are exactly the ones it
     /// exists to give.
+    ///
+    /// **Qualified 2026-08-27: sound about what the comments say, and not about what the code
+    /// does.** The paragraph above is an argument about attribution and it survives intact — no
+    /// document claims a section nobody names. What it does not license is the sentence a reader
+    /// hears, *this was never built*. Every anchor in this map rests on a `§N` written in a
+    /// comment, and a comment deleted makes *nothing claims this* true of the file and false of the
+    /// product — §1's failure arriving through the one state that was described as immune to it.
+    /// [`crate::map_orphan`] is the answer and deliberately not a repair: it goes to git and says
+    /// which file carried this citation and in which commit it stopped, and leaves the judgement
+    /// where §5 leaves every other one. Until somebody asks it, this variant means *no file names
+    /// this section today* and nothing more.
     Silent,
     /// The heading the decision was copied from carries no number, so nothing could be looked
     /// for. **Not a claim about the code.**
@@ -450,6 +461,26 @@ pub struct Anchored {
     /// [`Anchor::Unnumbered`] — in the first case because nothing was found, in the second because
     /// nothing was sought.
     pub modules: Vec<String>,
+    /// What somebody wrote down as this decision's files, whatever the comments say today.
+    ///
+    /// **This is the only anchor in the map with a memory, and that is the whole reason it exists.**
+    /// [`Anchored::modules`] and [`Anchored::foreign`] are recomputed from the working tree on every
+    /// read: delete the `§7.1` from a file and the association is simply gone, and the decision
+    /// lands in §5.1's *declarado, sem código* indistinguishable from one nobody ever implemented.
+    /// A record survives that, and turns a silent disappearance into a named alarm — *these files
+    /// were this decision's, and nothing says so any more*.
+    ///
+    /// **`None` and an empty [`AnchorRecord::paths`] are different facts and neither is the other.**
+    /// `None` is *nobody has written anything down*, which on day one is every decision. An empty
+    /// list is *somebody wrote down that none are*, which is an assertion about code that was
+    /// genuinely removed. A caller that read the two alike would turn a deliberate withdrawal into
+    /// an oversight.
+    ///
+    /// **Carried whole rather than flattened to a path list**, because [`crate::map_store::AnchorSource`]
+    /// travels with it: a set a stamp recorded is whatever the comments happened to say at that
+    /// moment, and a set the owner pointed at is a choice. A payload that dropped the difference
+    /// would let the first be read as the second.
+    pub record: Option<AnchorRecord>,
     /// Files naming it in a language this map cannot read — the Go sidecars, mostly.
     ///
     /// **Separate from [`Anchored::modules`] and never merged into it.** *We know something is
@@ -459,6 +490,38 @@ pub struct Anchored {
     /// also what keeps `Silent` honest — 77 Go files here name a `§`, and reading *declared, with
     /// no code* off the module list alone would report a whole language as absent.
     pub foreign: Vec<String>,
+}
+
+impl Anchored {
+    /// The files this decision's code IS, for everything that watches code move.
+    ///
+    /// **The union of what a record says and what the comments say, and neither alone.**
+    ///
+    /// Not the record alone, because [`crate::map_stamp::Lapse::Moved`]'s `added` list is a
+    /// question — *did you ever look at this?* — and it is §1's failure verbatim: a module that
+    /// started claiming a decision after somebody stamped it is exactly the thing nobody would have
+    /// gone looking for. Taking the record as closed would delete that question.
+    ///
+    /// Not the comments alone, because that is the rot this whole record exists against: a comment
+    /// deleted would silently shrink the set a green expires against, and the stamp would stop
+    /// watching the very file it was given over.
+    ///
+    /// **Deliberately does not include [`Anchored::foreign`].** [`Anchor::Declared`] and
+    /// `anchor_digests` both spend a paragraph on it: watching an anchor means being able to read
+    /// it, and promising an expiry over a Go file this map cannot parse is a promise the read side
+    /// cannot keep. A record naming one is a different matter — the owner said so, and it goes in,
+    /// because a record is a claim about files and not about what this reader can parse.
+    ///
+    /// Sorted and deduplicated, because two readings of an unchanged project must produce the same
+    /// digest and the same recency, and a `BTreeSet` is what makes that a property rather than a
+    /// promise.
+    pub fn watched(&self) -> Vec<String> {
+        let mut all: BTreeSet<&str> = self.modules.iter().map(String::as_str).collect();
+        if let Some(record) = self.record.as_ref() {
+            all.extend(record.paths.iter().map(String::as_str));
+        }
+        all.into_iter().map(str::to_owned).collect()
+    }
 }
 
 /// The junction: the intention layer read against the structure layer.
@@ -570,8 +633,13 @@ pub(crate) fn names_document(candidate: &str, spec_slug: &str) -> bool {
 /// Ordered so that the strongest wins when a file says several things at once, which is common:
 /// `shell/src/pages/Fleet.tsx` names §9.2 twice, and the day slice 6 lands a module will routinely
 /// carry the same section bare in one place and with its slug in another.
+/// **`pub(crate)` for the same reason [`names_document`] is**, and the caller is
+/// [`crate::map_orphan`]: it asks this question of a blob out of git's history, where this
+/// module asks it of a file on disk. A second spelling there would let the past and the
+/// present disagree about what counts as naming a section — which is precisely the divergence
+/// the guard exists to refuse, reopened inside the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Evidence {
+pub(crate) enum Evidence {
     /// This file says nothing about that section. Not the same as saying nothing at all.
     Nothing,
     /// It names the section without saying which document, or names it after a word that is no
@@ -609,7 +677,12 @@ enum Evidence {
 /// The decision then reads [`Anchor::Silent`] rather than [`Anchor::Ambiguous`], which is an
 /// under-report and the direction this module errs in on purpose — but it will look like the map
 /// forgot something, so it is written down here before it happens.
-fn evidence(cites: &[Citation], section: &str, spec_slug: &str, spec_slugs: &[String]) -> Evidence {
+pub(crate) fn evidence(
+    cites: &[Citation],
+    section: &str,
+    spec_slug: &str,
+    spec_slugs: &[String],
+) -> Evidence {
     let mut found = Evidence::Nothing;
     for cite in cites.iter().filter(|cite| cite.section == section) {
         let says = match &cite.named {
@@ -670,6 +743,7 @@ pub fn join(
     modules: &[Module],
     foreign: &[Foreign],
     spec_slugs: &[String],
+    records: &BTreeMap<i64, AnchorRecord>,
 ) -> Junction {
     let mut order: Vec<&Decision> = decisions.iter().collect();
     order.sort_by(|left, right| {
@@ -723,6 +797,20 @@ pub fn join(
             }
         };
 
+        // A file somebody wrote down as this decision's is claimed, whether or not it says so
+        // itself. Without this line a recorded file that carries no `§` would sit in §5.1's *code
+        // nobody asked for* — a pile whose whole meaning is *nothing claims this* — while a row in
+        // the table claimed it. That is the map contradicting itself, and it is also the shape that
+        // would make recording an anchor add noise instead of removing it.
+        let record = records.get(&decision.id).cloned();
+        if let Some(record) = record.as_ref() {
+            for path in &record.paths {
+                if let Some(module) = modules.iter().find(|module| &module.path == path) {
+                    matched.insert(module.path.as_str());
+                }
+            }
+        }
+
         anchored.push(Anchored {
             decision_id: decision.id,
             ordinal: decision.ordinal,
@@ -732,6 +820,7 @@ pub fn join(
             kind: decision.kind,
             anchor,
             modules: named_by,
+            record,
             foreign: abroad,
         });
     }
@@ -739,9 +828,17 @@ pub fn join(
     let mut unclaimed: Vec<String> = Vec::new();
     let mut unmatched: Vec<String> = Vec::new();
     for module in modules {
+        // `matched` now also holds every file a record names, which is what keeps a recorded file
+        // out of BOTH piles rather than only out of `unmatched`. A file with no `§` at all that
+        // somebody has written down as a decision's code is claimed — by a row in a table instead
+        // of by a comment, which is the entire point — and reporting it as *code nobody asked for*
+        // would be the map disagreeing with its own record.
+        if matched.contains(module.path.as_str()) {
+            continue;
+        }
         if module.cites.is_empty() {
             unclaimed.push(module.path.clone());
-        } else if !matched.contains(module.path.as_str()) {
+        } else {
             unmatched.push(module.path.clone());
         }
     }
@@ -779,6 +876,7 @@ fn tally(anchored: &[Anchored], anchor: &Anchor) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map_store::AnchorSource;
     use crate::project_map::Reader;
 
     /// The single citation in `source`, or a failure naming what was found instead.
@@ -889,12 +987,161 @@ mod tests {
         }
     }
 
+    /// One decision's files, written down.
+    fn recorded(id: i64, paths: &[&str], source: AnchorSource) -> BTreeMap<i64, AnchorRecord> {
+        BTreeMap::from([(
+            id,
+            AnchorRecord {
+                paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                source,
+                recorded_at: "2026-08-27T10:00:00+00:00".to_owned(),
+            },
+        )])
+    }
+
+    /// A project where nobody has written down which files any decision's code is.
+    ///
+    /// Every test in this module predates `map_anchors` and every one of them is about what the
+    /// COMMENTS say, which is the half of the junction that never had a memory. Naming the empty
+    /// map instead of inlining it is what keeps that readable: the argument each of these tests
+    /// makes is *given no record*, and a bare `&BTreeMap::new()` in twenty-seven call sites says
+    /// that to nobody.
+    fn unrecorded() -> BTreeMap<i64, AnchorRecord> {
+        BTreeMap::new()
+    }
+
     /// The one decision of a junction built from one decision.
     fn single(junction: &Junction) -> &Anchored {
         assert_eq!(junction.decisions.len(), 1, "{:?}", junction.decisions);
         &junction.decisions[0]
     }
 
+    /// **§14, and the whole reason `map_anchors` exists.** A decision whose `§` comment somebody
+    /// deleted keeps the files that were written down for it.
+    ///
+    /// The anchor itself still reads [`Anchor::Silent`], and that is deliberate rather than an
+    /// omission: `Anchor` is a statement about what the COMMENTS say, and nothing says this any
+    /// more — which is true, and is exactly the fact the owner needs. What must not happen is the
+    /// row arriving with nothing on it, indistinguishable from a decision nobody ever implemented.
+    #[test]
+    fn a_deleted_comment_does_not_erase_a_record() {
+        let decisions = vec![decided(1, SLUGS[1], "## 7.1 Uma decisão", 1)];
+        // Not one module names §7.1 any more.
+        let modules = vec![module_at("core/src/a.rs", &[("9", None)])];
+
+        let junction = join(
+            &decisions,
+            &modules,
+            &[],
+            &slugs(),
+            &recorded(1, &["core/src/a.rs"], AnchorSource::Owner),
+        );
+
+        let row = single(&junction);
+        assert_eq!(
+            row.anchor,
+            Anchor::Silent,
+            "no comment names it, and that is true"
+        );
+        assert!(row.modules.is_empty());
+        let record = row
+            .record
+            .as_ref()
+            .expect("the record survives the comment");
+        assert_eq!(record.paths, ["core/src/a.rs"]);
+        assert_eq!(record.source, AnchorSource::Owner);
+    }
+
+    /// A file somebody wrote down is claimed, and leaves §5.1's *code nobody asked for*.
+    ///
+    /// **This is what makes recording an anchor REMOVE noise instead of adding it.** `unclaimed` is
+    /// the pile whose whole meaning is *nothing claims this module*; a file a row in a table claims
+    /// belongs in neither pile, and leaving it there would be the map contradicting its own record.
+    #[test]
+    fn a_recorded_file_is_not_code_nobody_asked_for() {
+        let decisions = vec![decided(1, SLUGS[1], "## 7.1 Uma decisão", 1)];
+        // A module that cites nothing at all — the plainest member of `unclaimed`.
+        let modules = vec![module_at("core/src/silent.rs", &[])];
+
+        let before = join(&decisions, &modules, &[], &slugs(), &unrecorded());
+        assert_eq!(before.unclaimed, ["core/src/silent.rs"]);
+        assert_eq!(before.counts.unclaimed, 1);
+
+        let after = join(
+            &decisions,
+            &modules,
+            &[],
+            &slugs(),
+            &recorded(1, &["core/src/silent.rs"], AnchorSource::Owner),
+        );
+        assert!(after.unclaimed.is_empty(), "{:?}", after.unclaimed);
+        assert_eq!(after.counts.unclaimed, 0);
+        assert!(
+            after.unmatched.is_empty(),
+            "and it is not moved to the other pile either"
+        );
+    }
+
+    /// [`Anchored::watched`] is the union, and neither half alone.
+    ///
+    /// The record alone would delete `Lapse::Moved`'s `added` question — *did you ever look at
+    /// this?* — which is §1's failure verbatim. The comments alone are the rot the record exists
+    /// against. Both, sorted, and `foreign` in neither: watching an anchor means being able to read
+    /// it, and this map cannot parse a Go file.
+    #[test]
+    fn what_is_watched_is_the_record_and_the_comments_together() {
+        let decisions = vec![decided(1, SLUGS[1], "## 7.1 Uma decisão", 1)];
+        let modules = vec![module_at("core/src/newcomer.rs", &[("7.1", None)])];
+
+        let junction = join(
+            &decisions,
+            &modules,
+            &[foreign_at("sidecars/echo/main.go", &[("7.1", None)])],
+            &slugs(),
+            &recorded(1, &["core/src/written-down.rs"], AnchorSource::Stamp),
+        );
+
+        let row = single(&junction);
+        assert_eq!(
+            row.watched(),
+            ["core/src/newcomer.rs", "core/src/written-down.rs"]
+        );
+        assert_eq!(
+            row.foreign,
+            ["sidecars/echo/main.go"],
+            "read, and not watched"
+        );
+    }
+
+    /// An empty record is an assertion and leaves nothing watched.
+    ///
+    /// *These files were this decision's and now none are*, said out loud, is different from never
+    /// having written anything down — and it has to survive all the way to [`Anchored::watched`],
+    /// or a decision the owner deliberately unanchored would keep expiring against files they had
+    /// just said were not its code.
+    #[test]
+    fn an_empty_record_leaves_nothing_watched_and_is_still_a_record() {
+        let decisions = vec![decided(1, SLUGS[1], "## 7.1 Uma decisão", 1)];
+
+        let junction = join(
+            &decisions,
+            &[],
+            &[],
+            &slugs(),
+            &recorded(1, &[], AnchorSource::Owner),
+        );
+
+        let row = single(&junction);
+        assert!(row.watched().is_empty());
+        assert!(
+            row.record
+                .as_ref()
+                .is_some_and(|record| record.paths.is_empty()),
+            "an empty record is present, not absent"
+        );
+    }
+
+    /// The one decision of a junction built from one decision.
     #[test]
     fn a_bare_section_number_is_the_whole_citation() {
         let citation = only("//! §7 — and nothing else is claimed");
@@ -1257,7 +1504,7 @@ mod tests {
         let decisions = [decided(1, SLUGS[0], "## 4.1 Três tipos de decisão", 1)];
         let modules = [module_at("core/src/runs.rs", &[("7", None)])];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(single(&junction).anchor, Anchor::Silent);
         assert!(single(&junction).modules.is_empty());
@@ -1275,7 +1522,7 @@ mod tests {
         let decisions = [decided(1, SLUGS[0], "## 6.4 Vocabulário de nó", 4)];
         let foreign = [foreign_at("sidecars/telegram/main.go", &[("6.4", None)])];
 
-        let junction = join(&decisions, &[], &foreign, &slugs());
+        let junction = join(&decisions, &[], &foreign, &slugs(), &unrecorded());
 
         assert_eq!(single(&junction).anchor, Anchor::Ambiguous);
         assert!(
@@ -1293,7 +1540,7 @@ mod tests {
         let decisions = [decided(1, SLUGS[1], "## 7. O carimbo", 7)];
         let modules = [module_at("core/src/runs.rs", &[("7", None)])];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(single(&junction).anchor, Anchor::Ambiguous);
         assert_ne!(single(&junction).anchor, Anchor::Declared);
@@ -1312,7 +1559,7 @@ mod tests {
             &[("6.4", Some("workspace-de-projeto"))],
         )];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(single(&junction).anchor, Anchor::Declared);
         assert_eq!(single(&junction).modules, ["core/src/workflow_graph.rs"]);
@@ -1335,7 +1582,7 @@ mod tests {
             ),
         )];
 
-        let junction = join(&decisions, &declared, &[], &spec_slugs);
+        let junction = join(&decisions, &declared, &[], &spec_slugs, &unrecorded());
 
         assert_eq!(single(&junction).anchor, Anchor::Declared);
         assert_eq!(single(&junction).modules, ["core/src/workflow_graph.rs"]);
@@ -1348,7 +1595,7 @@ mod tests {
             "core/src/workflow_graph.rs",
             "/// four kinds, decided by whoever runs the node — §6.4.\n",
         )];
-        let before = join(&decisions, &bare, &[], &spec_slugs);
+        let before = join(&decisions, &bare, &[], &spec_slugs, &unrecorded());
         assert_eq!(before.counts.declared, 0);
         assert_eq!(single(&before).anchor, Anchor::Ambiguous);
     }
@@ -1376,7 +1623,7 @@ mod tests {
             "/// §6.4, and nothing else\n",
         )];
 
-        let junction = join(&decisions, &declared, &[], &slugs());
+        let junction = join(&decisions, &declared, &[], &slugs(), &unrecorded());
 
         assert_eq!(
             single(&junction).anchor,
@@ -1386,7 +1633,7 @@ mod tests {
         assert_eq!(junction.counts.declared, 0);
         assert_eq!(
             junction.counts,
-            join(&decisions, &bare, &[], &slugs()).counts,
+            join(&decisions, &bare, &[], &slugs(), &unrecorded()).counts,
             "changes nothing means changes nothing, not merely does not confirm"
         );
     }
@@ -1426,7 +1673,7 @@ mod tests {
             .map(|(path, source)| module_reading(path, source))
             .collect();
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(
             junction.counts,
@@ -1460,7 +1707,7 @@ mod tests {
         let decisions = [decided(1, SLUGS[1], "## Contrato", 9)];
         let modules = [module_at("core/src/http.rs", &[("9.1", None)])];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(single(&junction).anchor, Anchor::Unnumbered);
         assert_ne!(single(&junction).anchor, Anchor::Silent);
@@ -1478,7 +1725,7 @@ mod tests {
         // arrived inside a thousand-line plan nobody read.
         let modules = [module_at("shell/src/ui/Meter.tsx", &[])];
 
-        let junction = join(&[], &modules, &[], &slugs());
+        let junction = join(&[], &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(junction.unclaimed, ["shell/src/ui/Meter.tsx"]);
         assert!(junction.unmatched.is_empty());
@@ -1501,7 +1748,7 @@ mod tests {
             tested: true,
         };
 
-        let junction = join(&[], &[module], &[], &slugs());
+        let junction = join(&[], &[module], &[], &slugs(), &unrecorded());
 
         assert!(junction.unclaimed.is_empty());
         assert_eq!(junction.unmatched, ["shell/src/pages/Fleet.tsx"]);
@@ -1515,7 +1762,7 @@ mod tests {
         let decisions = [decided(1, SLUGS[0], "## 4.1 Três tipos", 1)];
         let modules = [module_at("core/src/gate.rs", &[("12", None)])];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert!(junction.unclaimed.is_empty());
         assert_eq!(junction.unmatched, ["core/src/gate.rs"]);
@@ -1540,7 +1787,7 @@ mod tests {
             &[("8.4", Some("approval-pause"))],
         )];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(
             single(&junction).anchor,
@@ -1598,7 +1845,7 @@ mod tests {
             &[("9.2", Some("risk")), ("9.2", Some("spike"))],
         )];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(single(&junction).modules, ["shell/src/pages/Fleet.tsx"]);
         assert_eq!(single(&junction).anchor, Anchor::Ambiguous);
@@ -1616,7 +1863,7 @@ mod tests {
         ];
         let modules = [module_at("core/src/map_store.rs", &[("9.2", None)])];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(junction.decisions.len(), 2);
         assert_eq!(junction.decisions[0].modules, ["core/src/map_store.rs"]);
@@ -1637,7 +1884,7 @@ mod tests {
             &[("6.4", Some("mapa-do-projeto"))],
         )];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         assert_eq!(single(&junction).anchor, Anchor::Silent);
         assert!(single(&junction).modules.is_empty());
@@ -1646,7 +1893,7 @@ mod tests {
         // The contrast that makes the rule worth having: a candidate that is no document at all
         // does not disqualify its citation, it just leaves it bare.
         let prose = [module_at("core/src/x.rs", &[("6.4", Some("rule"))])];
-        let bare = join(&decisions, &prose, &[], &slugs());
+        let bare = join(&decisions, &prose, &[], &slugs(), &unrecorded());
         assert_eq!(single(&bare).anchor, Anchor::Ambiguous);
     }
 
@@ -1671,7 +1918,7 @@ mod tests {
             module_at("core/src/aa.rs", &[("99", None)]),
         ];
 
-        let junction = join(&decisions, &modules, &[], &slugs());
+        let junction = join(&decisions, &modules, &[], &slugs(), &unrecorded());
 
         let order: Vec<i64> = junction.decisions.iter().map(|d| d.decision_id).collect();
         assert_eq!(order, [2, 1, 3], "spec_slug, then ordinal");
@@ -1700,7 +1947,7 @@ mod tests {
             decided(8, SLUGS[0], "## 7. O carimbo", 1),
             decided(5, SLUGS[0], "## 7. O carimbo", 1),
         ];
-        let broken: Vec<i64> = join(&tied, &[], &[], &slugs())
+        let broken: Vec<i64> = join(&tied, &[], &[], &slugs(), &unrecorded())
             .decisions
             .iter()
             .map(|anchored| anchored.decision_id)
@@ -1733,7 +1980,7 @@ mod tests {
         ];
         let foreign = [foreign_at("sidecars/echo/main.go", &[("9.3", None)])];
 
-        let junction = join(&decisions, &modules, &foreign, &slugs());
+        let junction = join(&decisions, &modules, &foreign, &slugs(), &unrecorded());
         let counts = &junction.counts;
 
         assert_eq!(counts.decisions, decisions.len());

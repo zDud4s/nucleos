@@ -162,6 +162,20 @@ export interface Anchored {
    * with no code* off the module list alone would report a whole language as absent.
    */
   foreign: string[];
+  /**
+   * What somebody wrote down as this decision's files, or `null` when nobody has.
+   *
+   * **The only anchor on this map with a memory.** {@link Anchored.modules} is recomputed from
+   * the working tree on every read, so deleting the `§7.1` from a file erases the association
+   * and drops the decision into *declared, with no code* looking exactly like one nobody ever
+   * implemented. A record survives that.
+   *
+   * **`null` and an empty `paths` are different facts.** `null` is *nobody has written anything
+   * down*, which on day one is every decision. An empty list is *somebody wrote down that none
+   * are* — an assertion about code genuinely removed. Drawing them alike would turn a
+   * deliberate withdrawal into an oversight.
+   */
+  record: AnchorRecord | null;
 }
 
 /**
@@ -873,6 +887,142 @@ export function useSilencedPile(projectId: string | null) {
     queryFn: () =>
       apiFetch<SilencedPile>(`/projects/${encodeURIComponent(projectId ?? "")}/map/silenced`),
     enabled: projectId !== null && projectId !== "",
+  });
+}
+
+/** One file that carried a `§` reference and stopped carrying it. */
+export interface Loss {
+  /** The path as it was **before** that commit — the file somebody remembers. */
+  path: string;
+  /** The whole object id, never abbreviated: it is meant to be pasted into `git show`. */
+  commit: string;
+  /** The committer date, in Unix seconds. */
+  at: number;
+  subject: string;
+  /** Where the file went, when that commit renamed it. `null` when it did not. */
+  renamed_to: string | null;
+  /** Whether the citation that left named **this** decision's document. `false` while §8 is unfixed. */
+  declared: boolean;
+}
+
+/**
+ * Whether a decision with no code was never built, or lost the comment that anchored it (§14).
+ *
+ * **Six states and not a boolean with a list beside it**, because three of them are refusals and
+ * each refuses differently. `not_in_window` is the one worth naming twice: *I did not find it* and
+ * *I did not search all of it* are different sentences, and a surface that drew them alike would
+ * be asserting *this was never built* about a history nobody read to the end.
+ */
+export type Orphan =
+  | { state: "never_named" }
+  | { state: "still_named"; paths: string[] }
+  | { state: "lost"; losses: Loss[] }
+  | { state: "not_in_window"; window: number }
+  | { state: "unreadable" }
+  | { state: "no_repository" };
+
+/** What {@link useOrphanCheck} asks about: one section of one document. */
+export interface OrphanQuestion {
+  /** The document, as a decision row carries it. */
+  slug: string;
+  /**
+   * The heading **verbatim**, and never the number read off it.
+   *
+   * `map_join::section_number` is the one place that knows how one becomes the other. A client
+   * that sent the number would be a second implementation of that rule, and the day the two
+   * disagreed the guard would be searching the history for a section the junction never anchored
+   * anything to.
+   */
+  section: string;
+}
+
+/**
+ * Ask git whether a decision with no code ever had a comment naming it (§14).
+ *
+ * **A mutation for a GET, and that is §14.3 rather than a misuse.** *"A pedido, por decisão, e
+ * nunca em fundo"*: the question only means anything at the instant somebody is looking at one row
+ * of *declared, with no code*, and a `useQuery` would fire on render for every row on the panel —
+ * a walk of the repository's history per line, none of it asked for. This never runs until
+ * somebody presses.
+ *
+ * **One hook instance per row**, so each line holds its own answer. A single shared mutation would
+ * hold one result and paint it under whichever row was pressed last.
+ *
+ * Writes nothing and invalidates nothing: §12 makes every part of this map a read, and this one
+ * reads git rather than the daemon's tables.
+ *
+ * The refusals: `422` for a heading carrying no number — which is `unnumbered`, where no search
+ * could run — and `404` for a document this project does not have. Neither is retried, for
+ * `useTriage`'s reason: a question the daemon has refused does not become a different question by
+ * being asked again.
+ */
+export function useOrphanCheck(projectId: string) {
+  return useMutation({
+    mutationFn: ({ slug, section }: OrphanQuestion) =>
+      apiFetch<Orphan>(
+        `/projects/${encodeURIComponent(projectId)}/map/orphan` +
+          `?slug=${encodeURIComponent(slug)}&section=${encodeURIComponent(section)}`,
+      ),
+    retry: false,
+  });
+}
+
+/**
+ * How a decision's anchor set came to be written down.
+ *
+ * **Two, and they are not the same claim.** A stamp records whatever the `§` comments produced
+ * at the moment a verdict was given — guesses, while §8 leaves every bare `§` unattributed.
+ * `owner` is a choice about which files a decision's code is. A surface that drew them alike
+ * would let a guess be read back as a decision.
+ */
+export type AnchorSource = "stamp" | "owner";
+
+/** Which files one decision's code is, as somebody wrote them down. */
+export interface AnchorRecord {
+  /** Sorted, repository-relative, forward slashes. Empty means *none are*, said deliberately. */
+  paths: string[];
+  source: AnchorSource;
+  recorded_at: string;
+}
+
+/** What {@link useRecordAnchor} sends: one decision, and the files its code is. */
+export interface AnchorInput {
+  decision_id: number;
+  /**
+   * Repository-relative paths. **An empty list is legal and is an assertion**, not a cancel: it
+   * says the code this decision had is gone, which is a different fact from never having said
+   * anything.
+   */
+  paths: string[];
+}
+
+/**
+ * Write down which files one decision's code is (§14).
+ *
+ * **The one act on this map that gives an anchor a memory.** Everything else is derived from `§`
+ * comments and recomputed on every read, so a model that rewrites a module inside a plan nobody
+ * read to the end deletes the association silently. This is what turns that into a named alarm.
+ *
+ * Invalidates the map, and only the map: the record changes which files a decision is anchored
+ * to, which changes its piles, its recency and what its stamp expires against — all of which
+ * arrive on that one answer. §6.2's pile is untouched, so it is deliberately not invalidated
+ * here.
+ *
+ * `422` for a path that leaves the project or is not there; `404` for a decision that is not
+ * this project's, not approved, or retired. Not retried, for {@link useTriage}'s reason.
+ */
+export function useRecordAnchor(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ decision_id, paths }: AnchorInput) =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/map/anchors`, {
+        method: "POST",
+        body: JSON.stringify({ decision_id, paths }),
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.projects.map(projectId) });
+    },
   });
 }
 

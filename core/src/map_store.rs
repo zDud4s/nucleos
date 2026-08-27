@@ -17,7 +17,7 @@ use crate::chats::Brain;
 use crate::map_intent::{Extracted, Kind};
 use crate::map_stamp::Verdict;
 use crate::map_triage::Judgement;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A decision as it sits in the table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -245,6 +245,37 @@ pub async fn approved(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result
     Ok(rows.into_iter().filter_map(from_row).collect())
 }
 
+/// Every document this project has decided anything about, whatever is on disk today.
+///
+/// **The filesystem is not the register of which documents a project has, and treating it as one is
+/// what makes this feature rot.** `map_intent::specs_in` answers *which files are in `.ai/specs`
+/// right now* — a question about a folder the owner archives, renames and reorganises, and whose
+/// contents are gitignored working material by standing policy. A decision row, by contrast, copied
+/// its slug, its heading and its text at extraction and keeps them for as long as the row exists.
+/// So the durable answer to *which documents does this project have* is here, in the table, and the
+/// folder is a second source that can only ever add to it.
+///
+/// Concretely, the failure this replaces: `spec_slug` is a filename without its extension and these
+/// filenames carry dates. Rename `2026-08-24-mapa-do-projeto-design.md` and every approved decision
+/// keeps the old slug for ever, while a slug list read off the disk holds only the new one — so
+/// `map_join::evidence` stops being able to tell one document from another, every anchor degrades,
+/// and nothing on screen says why. Read from here, the rename costs nothing.
+///
+/// **Every row and not only the approved ones**, because the question is which documents exist and
+/// not which decisions stand. A rejected line is still evidence that this project extracted from
+/// that document, and `evidence` uses the list only to refuse a citation that names a document
+/// other than the one being asked about — a use that wants the widest true list.
+pub async fn slugs(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT spec_slug FROM map_decisions WHERE project_id = ? ORDER BY spec_slug",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(slug,)| slug).collect())
+}
+
 /// The owner's answer to one line, and whether it landed on anything.
 ///
 /// Approving stamps `approved_at`; rejecting stamps `retired_at`, which is what stops the line
@@ -452,6 +483,174 @@ pub async fn stamps(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result<V
     .await?;
 
     Ok(rows.into_iter().filter_map(stamp_from_row).collect())
+}
+
+/// How a decision's anchor set came to be written down.
+///
+/// **Two, and they are not the same claim.** A stamp records whatever the `§` comments produced at
+/// the moment the owner gave a verdict — which, while §8 is unfixed, is a set of guesses about
+/// which document a bare `§` meant. The owner pointing at files is a choice. Storing them alike
+/// would let a guess be read back as a decision, and that collapse is the disease this whole
+/// feature treats.
+///
+/// Two wire forms read as two, exactly as [`crate::map_stamp::Verdict`] insists: [`Self::as_str`]
+/// is the STORAGE form and what `map_anchors.source`'s `CHECK` admits; the derived `Serialize` is
+/// the JSON form the window speaks. They spell alike today by accident of English and not by
+/// guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorSource {
+    /// Recorded as a side effect of a verdict, from what the comments said at that moment.
+    Stamp,
+    /// Pointed at deliberately. The only one of the two that is a choice about which files a
+    /// decision's code is.
+    Owner,
+}
+
+impl AnchorSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stamp => "stamp",
+            Self::Owner => "owner",
+        }
+    }
+
+    /// The two, and nothing else.
+    ///
+    /// `Option` and not a fallback, following [`crate::map_stamp::Verdict::from_wire`] rather than
+    /// [`crate::chats::Brain::from_wire`]. Defaulting to `Owner` would invent a deliberate choice
+    /// nobody made; defaulting to `Stamp` would quietly demote one somebody did. A record that
+    /// cannot be read is therefore no record, which lands the decision back among the ones whose
+    /// anchor is only what the comments say — visible, and the one answer that claims nothing.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "stamp" => Some(Self::Stamp),
+            "owner" => Some(Self::Owner),
+            _ => None,
+        }
+    }
+}
+
+/// Which files are one decision's, as somebody wrote them down.
+///
+/// **The whole point is that this survives the `§` comment being deleted.** Every other anchor in
+/// this map is recomputed from the working tree on every read and has no memory; this one is the
+/// memory. A comment that disappears afterwards stops being a silent fall into *declarado, sem
+/// código* and becomes a named alarm: these files were this decision's, and nothing says so any
+/// more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnchorRecord {
+    /// Sorted, deduplicated, forward slashes — the spelling `project_map::structure` produces.
+    ///
+    /// **Empty is legal and is not the same as absent.** *These files were this decision's and now
+    /// none are* is an assertion the owner can make about code that was genuinely removed; no
+    /// record at all is the absence of any assertion. A caller that read the two alike would turn
+    /// a deliberate withdrawal into an oversight.
+    pub paths: Vec<String>,
+    pub source: AnchorSource,
+    pub recorded_at: String,
+}
+
+/// The columns every read of `map_anchors` selects, named once for [`DecisionRow`]'s reason: three
+/// of the four fields are `String` and a `SELECT` that swapped `source` for `recorded_at` would
+/// still typecheck.
+type AnchorRow = (i64, String, String, String);
+
+/// Write down which files are one decision's.
+///
+/// **Canonicalised here and not by the caller**, because the only reader that matters is a set
+/// difference and two records of the same set must compare equal. Sorted and deduplicated, so a
+/// caller handing the paths in the order a UI listed them cannot produce a record that looks
+/// different from one that says exactly the same thing.
+///
+/// The guard is [`stamp`]'s verbatim — the decision must belong to this project and be approved and
+/// not retired — and it lives in the `WHERE` rather than in a handler, which is the argument
+/// [`decide`] makes about checks a second caller forgets. `false` means no row matched, and the
+/// three reasons it can mean that are deliberately one answer for [`decide`]'s reason.
+pub async fn record_anchor(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    decision_id: i64,
+    paths: &[String],
+    source: AnchorSource,
+) -> sqlx::Result<bool> {
+    let canonical: std::collections::BTreeSet<&str> = paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !path.is_empty())
+        .collect();
+    let written = canonical.into_iter().collect::<Vec<_>>().join("\n");
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let result = sqlx::query(
+        "INSERT INTO map_anchors (decision_id, paths, source, recorded_at)
+         SELECT id, ?, ?, ? FROM map_decisions
+          WHERE id = ? AND project_id = ? AND approved_at IS NOT NULL AND retired_at IS NULL",
+    )
+    .bind(&written)
+    .bind(source.as_str())
+    .bind(&now)
+    .bind(decision_id)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// The current anchor record for each of one project's approved decisions.
+///
+/// One row per decision at most, and decisions nobody has recorded anything for are simply absent —
+/// [`stamps`]' shape and for its reason: the absence is countable rather than something a reader has
+/// to interpret. On day one that is every decision, which is the honest starting point.
+///
+/// **The subquery picks a row id and not a maximum timestamp**, which is [`stamps`]' argument
+/// verbatim: `recorded_at` is a clock rather than a counter, two records written in the same second
+/// tie, and a set that changed between two reads with nothing having happened is the portrait this
+/// map refuses to be.
+///
+/// The JOIN is load-bearing exactly as [`stamps`]' is — `map_anchors` carries no `project_id` and
+/// reaches one only through its decision.
+pub async fn anchors(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<std::collections::BTreeMap<i64, AnchorRecord>> {
+    let rows = sqlx::query_as::<_, AnchorRow>(
+        "SELECT a.decision_id, a.paths, a.source, a.recorded_at
+           FROM map_anchors a
+           JOIN map_decisions d ON d.id = a.decision_id
+          WHERE d.project_id = ?
+            AND d.approved_at IS NOT NULL
+            AND d.retired_at IS NULL
+            AND a.id = (SELECT latest.id
+                          FROM map_anchors latest
+                         WHERE latest.decision_id = a.decision_id
+                         ORDER BY latest.recorded_at DESC, latest.id DESC
+                         LIMIT 1)
+          ORDER BY a.decision_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(decision_id, paths, source, recorded_at)| {
+            // A source nobody can read is no record, which is what `AnchorSource::from_wire` argues
+            // for. The row stays in the table — it is history — and this read declines to present
+            // it as an anchor rather than guessing which of the two claims it was making.
+            let source = AnchorSource::from_wire(&source)?;
+            Some((
+                decision_id,
+                AnchorRecord {
+                    // `''` is an empty set and not one empty path, which `str::split` would give.
+                    paths: paths.lines().map(str::to_owned).collect(),
+                    source,
+                    recorded_at,
+                },
+            ))
+        })
+        .collect())
 }
 
 /// One triage judgement, as it sits in the table.
@@ -908,6 +1107,170 @@ mod tests {
                 kind: Kind::Character,
             },
         ]
+    }
+
+    /// A record comes back canonical, whatever order it was handed in.
+    ///
+    /// Sorted and deduplicated by the writer and not by the caller, because the only reader that
+    /// matters is a set difference: two records of the same set must compare equal, or a stamp
+    /// would lapse over a list that was reordered by a UI.
+    #[tokio::test]
+    async fn a_record_comes_back_canonical_whatever_order_it_arrived_in() {
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        assert!(
+            record_anchor(
+                &pool,
+                "alpha",
+                id,
+                &[
+                    "core/src/b.rs".to_owned(),
+                    "core/src/a.rs".to_owned(),
+                    "core/src/b.rs".to_owned(),
+                ],
+                AnchorSource::Owner,
+            )
+            .await
+            .unwrap()
+        );
+
+        let held = anchors(&pool, "alpha").await.unwrap();
+        let record = held.get(&id).expect("the decision has a record");
+        assert_eq!(record.paths, ["core/src/a.rs", "core/src/b.rs"]);
+        assert_eq!(record.source, AnchorSource::Owner);
+    }
+
+    /// Append-only, and the last row is the answer (§9.2).
+    ///
+    /// Asserted through the reader rather than by counting rows, because the property that matters
+    /// is which set the map anchors to — and the earlier rows staying in the table is what somebody
+    /// reads when they are trying to work out whether a comment went on purpose.
+    #[tokio::test]
+    async fn the_latest_record_is_the_one_the_map_anchors_to() {
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        record_anchor(
+            &pool,
+            "alpha",
+            id,
+            &["core/src/a.rs".to_owned()],
+            AnchorSource::Stamp,
+        )
+        .await
+        .unwrap();
+        record_anchor(
+            &pool,
+            "alpha",
+            id,
+            &["core/src/b.rs".to_owned()],
+            AnchorSource::Owner,
+        )
+        .await
+        .unwrap();
+
+        let held = anchors(&pool, "alpha").await.unwrap();
+        assert_eq!(held[&id].paths, ["core/src/b.rs"]);
+        assert_eq!(held[&id].source, AnchorSource::Owner);
+
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM map_anchors WHERE decision_id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.0, 2,
+            "the first record is history, not something to overwrite"
+        );
+    }
+
+    /// **An empty record is an assertion and never an absence**, and the two must not read alike.
+    ///
+    /// *These files were this decision's and now none are* is what somebody says about code they
+    /// genuinely removed. *Nobody has written anything down* is the day-one state of every decision
+    /// in the project. A reader that collapsed them would turn a deliberate withdrawal into an
+    /// oversight, which is the silent wrong answer this whole feature refuses.
+    #[tokio::test]
+    async fn an_empty_record_is_an_assertion_and_not_an_absence() {
+        let pool = test_pool().await;
+        let id = an_approved_decision(&pool, "alpha").await;
+
+        assert!(!anchors(&pool, "alpha").await.unwrap().contains_key(&id));
+
+        record_anchor(&pool, "alpha", id, &[], AnchorSource::Owner)
+            .await
+            .unwrap();
+
+        let held = anchors(&pool, "alpha").await.unwrap();
+        let record = held.get(&id).expect("an empty record is still a record");
+        assert!(record.paths.is_empty());
+    }
+
+    /// One project cannot write down anchors for another's decision.
+    ///
+    /// The guard is in the `WHERE` and not in the handler, which is [`decide`]'s argument about
+    /// checks a second caller forgets — and this is the test that keeps it there.
+    #[tokio::test]
+    async fn a_neighbours_decision_is_not_ours_to_anchor() {
+        let pool = test_pool().await;
+        let mine = an_approved_decision(&pool, "alpha").await;
+
+        assert!(
+            !record_anchor(
+                &pool,
+                "beta",
+                mine,
+                &["core/src/a.rs".to_owned()],
+                AnchorSource::Owner
+            )
+            .await
+            .unwrap()
+        );
+        assert!(anchors(&pool, "alpha").await.unwrap().is_empty());
+    }
+
+    /// A decision nobody approved cannot be anchored either.
+    ///
+    /// [`stamp`]'s filter verbatim, and repeated for its reason: a line still sitting in the pile
+    /// waiting to be answered is not in the map, and anchoring it would put a file on a map that
+    /// does not have the decision it belongs to.
+    #[tokio::test]
+    async fn a_line_nobody_has_answered_yet_cannot_be_anchored() {
+        let pool = test_pool().await;
+        record(&pool, "alpha", "design", Brain::Local, &two_decisions())
+            .await
+            .unwrap();
+        let waiting = pending(&pool, "alpha").await.unwrap()[0].id;
+
+        assert!(
+            !record_anchor(
+                &pool,
+                "alpha",
+                waiting,
+                &["core/src/a.rs".to_owned()],
+                AnchorSource::Owner,
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    /// The two, and nothing else.
+    ///
+    /// **A unit test and not a round trip through the table, because the `CHECK` makes the round
+    /// trip unreachable** — `source` admits exactly `'stamp'` and `'owner'`, and `PRAGMA
+    /// writable_schema` does not turn a constraint off. The branch in [`anchors`] that drops such a
+    /// row is therefore defensive rather than exercised, and it stays: a restored backup, a
+    /// hand-edited database and a later migration are all ways a third word arrives, and the
+    /// alternative to dropping the row is guessing which of the two claims it was making.
+    #[test]
+    fn a_source_nobody_can_read_is_not_guessed_at() {
+        assert_eq!(AnchorSource::from_wire("stamp"), Some(AnchorSource::Stamp));
+        assert_eq!(AnchorSource::from_wire("owner"), Some(AnchorSource::Owner));
+        assert_eq!(AnchorSource::from_wire("Owner"), None);
+        assert_eq!(AnchorSource::from_wire(""), None);
+        assert_eq!(AnchorSource::from_wire("whatever"), None);
     }
 
     /// One of `two_decisions`, approved — the only state a stamp is allowed to land on.

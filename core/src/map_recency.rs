@@ -479,12 +479,17 @@ fn parse(text: &str) -> BTreeMap<String, i64> {
 /// portrait decision 1 refuses. The order fallen back to is `map_store::approved`'s —
 /// `spec_slug, ordinal, id` — because that is the order the decisions arrive in.
 pub fn order(decisions: &mut [Anchored], walk: &Walk) -> Recency {
+    // `watched` and not `modules`, which is §14's record reaching this sort. Without it a decision
+    // whose comment was deleted but whose files somebody had written down would read as
+    // [`Age::Unanchored`] — *nothing to move* — about a decision with real, named, moving code.
+    // That is a silent wrong answer, and it is the exact shape this ordering is presented as a fact
+    // about git in order not to be.
     let ages: BTreeMap<i64, Age> = decisions
         .iter()
         .map(|anchored| {
             (
                 anchored.decision_id,
-                walk.age(&anchored.modules, &anchored.foreign),
+                walk.age(&anchored.watched(), &anchored.foreign),
             )
         })
         .collect();
@@ -624,6 +629,9 @@ mod tests {
                 Anchor::Ambiguous
             },
             modules: modules.iter().map(|path| (*path).to_owned()).collect(),
+            // Nothing written down: every test in this module is about what the COMMENTS say,
+            // which is the half of an anchor that has no memory.
+            record: None,
             foreign: Vec::new(),
         }
     }
@@ -639,6 +647,18 @@ mod tests {
         Anchored {
             anchor: Anchor::Ambiguous,
             foreign: foreign.iter().map(|path| (*path).to_owned()).collect(),
+            ..decision(id, &[])
+        }
+    }
+
+    /// A decision no comment names, whose files somebody wrote down instead (§14).
+    fn anchored_by_record(id: i64, paths: &[&str]) -> Anchored {
+        Anchored {
+            record: Some(crate::map_store::AnchorRecord {
+                paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                source: crate::map_store::AnchorSource::Owner,
+                recorded_at: "2026-08-27T10:00:00+00:00".to_owned(),
+            }),
             ..decision(id, &[])
         }
     }
@@ -663,6 +683,29 @@ mod tests {
         write(root, "core/src/quick.rs", "//! §1 often\n");
         commit_at(root, "quick", RECENT);
         repo
+    }
+
+    /// §14 reaching the sort: a decision anchored only by a record is not told nothing moved.
+    ///
+    /// **This is the failure that made `watched` necessary here rather than only in the digest.**
+    /// Reading `modules` alone, a decision whose `§` comment somebody deleted comes back
+    /// [`Age::Unanchored`] — whose sentence is *there is nothing to move* — about a decision with
+    /// real, named, moving code sitting in the record. §5.1 puts that pile in front of somebody
+    /// precisely so it gets looked at, and filling it with rows that are anchored is the silently
+    /// wrong answer this ordering is presented as a fact about git in order not to be.
+    #[tokio::test]
+    async fn a_decision_anchored_only_by_a_record_is_not_told_nothing_moved() {
+        let repo = three_files("nucleos-recency-recorded-");
+        let walk = walk(repo.path()).await;
+
+        let mut decisions = vec![anchored_by_record(1, &["core/src/quick.rs"])];
+        let recency = order(&mut decisions, &walk);
+
+        assert_eq!(
+            recency.ages[&1],
+            Age::Moved { at: RECENT },
+            "the record names a file, and that file moved"
+        );
     }
 
     #[tokio::test]

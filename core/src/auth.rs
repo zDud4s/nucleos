@@ -245,6 +245,13 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // `cat` can already read whole — plus the reason the triager gave and the name of the brain
     // that gave it. Neither of those two is a fact about anything outside this project.
     //
+    // `map/orphan` says which file carried a `§` and in which commit it stopped, for one section
+    // of one document. Every fact in that answer — a path, a commit id, a committer date, a commit
+    // subject — is one `log` and `blame` beside it already hand over, out of the same repository,
+    // and the section it is asked about is a heading from a spec `map/decisions` already grants.
+    // It reads history where the routes above read the present, and that is a different git call
+    // rather than a different grant.
+    //
     // Listed rather than left implied, because §6.2 requires the pile to be *"sempre acessível"*
     // and a route that answered `403` to a key holding `map` would be a filter on that
     // accessibility wearing the shape of a permission. The `POST …/map/triage` beside it stays in
@@ -262,6 +269,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/map/decisions"),
     (Method::GET, "/projects/{id}/map/specs"),
     (Method::GET, "/projects/{id}/map/silenced"),
+    (Method::GET, "/projects/{id}/map/orphan"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),

@@ -127,7 +127,7 @@ function Derived({ projectId }: { projectId: string }) {
             : ""}
         </p>
       </div>
-      <Juncao junction={junction} />
+      <Juncao junction={junction} projectId={projectId} />
       {/*
         Drawn here rather than as a panel of its own for the reason the junction is: the standings,
         the header and `git_would_not_answer` come back on this same answer, flattened. A query of
