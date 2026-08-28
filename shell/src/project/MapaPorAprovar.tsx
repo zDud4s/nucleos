@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { isApiRefusal } from "../data/client";
 import { useDecideMapLine, useMapDecisions, type MapDecision } from "../data/project-map";
 

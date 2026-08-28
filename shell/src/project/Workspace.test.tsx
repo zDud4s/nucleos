@@ -433,8 +433,46 @@ describe("the project workspace", () => {
               unmatched: 0,
             },
           },
+          // The verdict half, which arrives on this same answer. Left out, every count the stamp
+          // panel reads would be `undefined` and the mode would go down with it — which is what
+          // `junction` did one slice ago, on this exact mock.
+          standings: {},
+          stamps: {
+            settled: 0,
+            partial: 0,
+            never: 0,
+            lapsed: 0,
+            withdrawn: 0,
+            guessed: 0,
+            no_anchor: 0,
+            untracked: 0,
+            no_repository: 0,
+            unwatched: 0,
+            decisions: 0,
+          },
+          // The triager's axis, which arrives on this same answer too. §5.3's `K` and `J` are read
+          // off `triage_counts` and not off `stamps` since slice 5 — a mock that stopped at the
+          // stamps would leave the header printing `undefined`, which is what `junction` and then
+          // `standings` each did in turn on this exact mock.
+          triage: {},
+          triage_counts: {
+            flagged: 0,
+            silenced: 0,
+            untriaged: 0,
+            unseen: 0,
+            waiting: 0,
+            unchecked: 0,
+          },
+          git_would_not_answer: false,
+          recency: { window: 200, ages: {} },
+          // `null` is *the triager has never run here*, which the panel now reads rather than
+          // infers from two empty piles — an inference that called a project triaged this morning
+          // un-triaged the moment its answers went stale.
+          last_triaged_at: null,
         };
       }
+      // The pile is capped by the daemon, so it answers a page and the size it was cut from.
+      if (path.endsWith("/map/silenced")) return { rows: [], total: 0 };
       return daemonFetch(state)(path, init);
     });
     daemon.apiText.mockImplementation(daemonText(state));

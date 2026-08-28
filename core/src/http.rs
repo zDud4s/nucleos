@@ -114,6 +114,42 @@ pub fn build_router(state: AppState) -> Router {
             "/projects/{id}/map/decisions/{decision}",
             post(post_project_map_decision),
         )
+        // §6.2's pile, on a door of its own rather than a query parameter on `map`. *"Sempre
+        // acessível"* is the requirement, and a pile you reach only by knowing which parameter to
+        // add is not — §13 names the triager silencing what it should have shown a real residual
+        // risk, and this route IS the mitigation. A GET, and in `READ_ONLY_ROUTES` beside `map` and
+        // `map/decisions` on their argument exactly: sentences lifted out of a document already
+        // sitting in a folder this reader can `cat` whole.
+        .route("/projects/{id}/map/silenced", get(get_project_map_silenced))
+        // §14's guard, and the only route in this pillar that reads git's HISTORY rather than its
+        // present. A GET, in `READ_ONLY_ROUTES`, and reached from ONE place — a row of §5.1's
+        // *declarado, sem código* — because the question it answers only means anything there. It
+        // costs a walk of the history per call, which is why it is not folded into `map`: every
+        // decision in that pile would pay for it and almost none of them would be asked.
+        .route("/projects/{id}/map/orphan", get(get_project_map_orphan))
+        // The owner's verdict on one decision (§5.2). In no table in `auth.rs` for the sharpest
+        // reason of the three POSTs here: §6 takes the green away from the model on purpose, and
+        // §6.1 says handing that authority back through any other door turns the map into false
+        // confidence with the authority of a traffic light. A read-only key writing one would be
+        // that door.
+        //
+        // The id is in the body and not in the path, unlike `decisions/{decision}` above. The two
+        // are different acts: that one answers a line that is in front of the owner right now and is
+        // addressed by where it sits in the pile, while a stamp is a new row about a decision that
+        // is already in the map — §9.2's *acrescenta uma linha, nunca substitui* — and it carries a
+        // verdict and a note that have to travel in a body regardless.
+        .route("/projects/{id}/map/stamps", post(post_project_map_stamp))
+        // §14's other half: which files a decision's code IS, written down so that deleting
+        // the `§` comment stops erasing the association. In NO table in `auth.rs`, beside
+        // `stamps` and for a sharper version of its argument — a record is what the whole map
+        // anchors to, so a key that could write one could point every decision at whatever it
+        // liked and the map would report it as the owner's own choice.
+        .route("/projects/{id}/map/anchors", post(post_project_map_anchors))
+        // The model's second entrance (§6), and in no table in `auth.rs` for `extract`'s reason
+        // doubled: it spends a model per decision. No id anywhere on it, and that is §10 rather
+        // than an omission — the triager's scope is everything nobody has stamped, and a caller
+        // that could name the decisions could name the ones whose answer it liked.
+        .route("/projects/{id}/map/triage", post(post_project_map_triage))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
@@ -2901,6 +2937,41 @@ async fn resolve_run_worktree(
     }
 }
 
+/// Which documents this project has, from the table first and the folder second.
+///
+/// **The union, and the order of the two words is the whole argument.** `map_intent::specs_in`
+/// answers *what is in `.ai/specs` right now*; `map_store::slugs` answers *what this project has
+/// ever extracted decisions from*. Only the second is durable — spec files are gitignored working
+/// material that gets archived, renamed and reorganised, and the slug is the FILENAME, so a rename
+/// silently retires every slug the approved rows still carry.
+///
+/// What the list is for is [`crate::map_join::evidence`]'s one refusal: a citation whose candidate
+/// names a DIFFERENT document of this project is evidence against, and is skipped rather than
+/// counted. A list that lost a slug therefore does not fail loudly — it quietly stops being able to
+/// tell two documents apart, every anchor degrades to ambiguous, and nothing on screen says why.
+/// That is the silent wrong answer this feature exists to refuse, arriving through a file rename.
+///
+/// **The folder still contributes**, because a spec sitting there with no decisions yet is a real
+/// document of this project and a citation naming it must still be refused for the others. Union
+/// never loses a slug; either source alone does.
+///
+/// Sorted and deduplicated so two reads of an unchanged project cannot produce two different lists,
+/// which `map_join::join`'s determinism rests on.
+async fn document_slugs(
+    state: &AppState,
+    id: &str,
+    on_disk: Vec<String>,
+) -> Result<Vec<String>, StatusCode> {
+    let mut all: std::collections::BTreeSet<String> = on_disk.into_iter().collect();
+    all.extend(crate::map_store::slugs(&state.pool, id).await.map_err(
+        |error| {
+            tracing::warn!(%error, project_id = %id, "reading this project's document slugs failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+    )?);
+    Ok(all.into_iter().collect())
+}
+
 async fn resolve_project_root(state: &AppState, id: &str) -> Result<PathBuf, StatusCode> {
     match inspect::project_root(&state.pool, id).await {
         Ok(Some(root)) => Ok(PathBuf::from(root)),
@@ -3421,16 +3492,121 @@ struct MapAnswer {
     #[serde(flatten)]
     structure: crate::project_map::Structure,
     junction: crate::map_join::Junction,
+    /// Where each decision stands, by `decision_id`.
+    ///
+    /// **A map and never a parallel array.** Two arrays that must stay index-aligned is a bug
+    /// waiting for the first re-sort, and the re-sort duly arrived: `junction.decisions` leaves
+    /// [`crate::map_join::join`] in `spec_slug, ordinal, id` and leaves this handler in §10's
+    /// recency order. Keyed by id, the client survived that; keyed by position it would now be
+    /// drawing one decision's verdict against another's text, and nothing on the screen would look
+    /// wrong.
+    standings: std::collections::BTreeMap<i64, crate::map_stamp::Standing>,
+    /// §5.3's header, tallied from exactly the standings above.
+    stamps: crate::map_stamp::StampCounts,
+    /// What the triager said about each decision, by `decision_id` — and only where that is still
+    /// an answer about this map.
+    ///
+    /// **Two filters stand between [`crate::map_store::judgements`] and this field, and both are
+    /// required for §5.3's numbers to add up.** [`crate::map_triage::reconcile`] argues them in
+    /// full; the short of it is that a judgement about a decision somebody has since stamped
+    /// describes a decision that has left triage's scope (§10), and a judgement whose
+    /// `inputs_digest` no longer matches describes code that has since moved. Counting either
+    /// reports something that is not true now — the first as a decision tallied in `settled` **and**
+    /// in `flagged`, the second as a model's opinion of a file it never saw.
+    ///
+    /// **A map and never a parallel array**, for [`MapAnswer::standings`]'s reason: this list gets
+    /// re-sorted into §10's order after the join.
+    ///
+    /// **The staleness test is three-valued, and the third value is why a judgement is kept rather
+    /// than dropped when git will not answer.** A judgement whose digest cannot be COMPUTED — the
+    /// decision's anchors came back [`crate::map_stamp::Anchors::Failed`] — is neither current nor
+    /// expired, so it arrives here [`crate::map_triage::Held::checked`] `false` and counts in
+    /// whichever pile it was already in. Dropping it was the first shape of this field and it was
+    /// wrong at the scale of the whole project: every stored judgement is written against a
+    /// `Computed(...)` reading, so one git hiccup made all of them stale at once and the map
+    /// reported a three-hundred-row backlog as *nunca vista* — a fact about this daemon presented
+    /// as a fact about the project. A flag we could not re-verify is still a flag; a flag we
+    /// discarded becomes a claim that nobody ever looked. [`MapAnswer::git_would_not_answer`] is on
+    /// the same answer and says why the flags are unchecked.
+    ///
+    /// A judgement that WAS tested and failed is genuinely dropped, and the decision reads
+    /// untriaged, which is what it is: §10 sends the triager back over it.
+    triage: std::collections::BTreeMap<i64, crate::map_triage::Held>,
+    /// §5.3's `J à tua espera` and `K nunca vistas`, tallied in the same pass that built `triage`.
+    ///
+    /// **Beside [`MapAnswer::stamps`] rather than inside it**, which is
+    /// [`crate::map_triage::TriageCounts`]'s own argument: `stamps` is the denominator these numbers
+    /// are checked against, and one function producing both sides of `flagged + silenced + untriaged
+    /// == never` could not be checked by anything.
+    triage_counts: crate::map_triage::TriageCounts,
+    /// **One fact about this whole reading, and never a fact about any single decision.**
+    ///
+    /// `map_stamp::digest` is all-or-nothing on purpose — one record it cannot parse takes the
+    /// entire call to a failure, because dropping an anchor would read as `gone`, a file that never
+    /// went anywhere. Correct for one anchor set; combined with this route calling it **once** for
+    /// the union of every decision's anchors, it means a git that will not answer takes every
+    /// settled stamp in the project to [`crate::map_stamp::Lapse::Unreadable`] at the same instant.
+    ///
+    /// That blast radius is accepted — the alternative is up to 350 process spawns on a route the
+    /// window calls every time the map opens — and this flag is the price of accepting it. The
+    /// owner meets one sentence saying git would not answer, rather than a screen of identical rows
+    /// saying it 350 times, which is a wall of noise nobody reads to the bottom of and is how the
+    /// one real lapse underneath it goes unseen.
+    ///
+    /// **Named for git refusing, and it was renamed from `anchors_unreadable` to make one thing
+    /// impossible: printing *try again* at somebody with nothing to retry.** This flag is
+    /// [`crate::map_stamp::Anchors::Failed`] and nothing else. A project with no git repository at
+    /// all — §11's ordinary case — leaves it `false`, because there is nothing wrong there and no
+    /// retry that could help; what that project gets instead is
+    /// [`crate::map_stamp::Watch::NoRepository`] on each of its greens, which is a permanent fact
+    /// and reads as one. The older name covered both, and the sentence a shell would have written
+    /// under it was false for exactly the project that could do least about it.
+    ///
+    /// A decision with no anchor paths is untouched by this either way: git was never asked about
+    /// it, so its digest is `""` however git is faring, and it stays
+    /// [`crate::map_stamp::Watch::NoAnchor`] rather than flapping every time this goes up.
+    git_would_not_answer: bool,
+    /// §10's ordering — what `junction.decisions` is sorted by, and how far that sort can see.
+    ///
+    /// **Beside the list rather than folded into it, because the order is only half the answer.**
+    /// A list carries the sequence and nothing about which part of it is a fact: on this repository
+    /// 83 of the 112 anchor files fall inside the window and every decision behind the other 29
+    /// ties, so a panel drawing this without [`crate::map_recency::Recency::window`] would present
+    /// a mostly arbitrary tail with the same confidence as the head. §10 offers this ordering as
+    /// *um facto do git*, and the honest way to keep that true is to say how far the git looked.
+    recency: crate::map_recency::Recency,
+    /// When this project's triager last answered anything, or `null` if it never has.
+    ///
+    /// **The one thing `triage` and `triage_counts` cannot say, and a panel was reduced to guessing
+    /// it.** Both of those describe what is true NOW: a run that flagged everything and whose
+    /// answers have all since gone stale leaves `triage` empty and §6.2's pile empty, which is
+    /// indistinguishable from a project nobody has ever pressed the button on. Those two are not the
+    /// same fact — the first says the triager's work expired, the second says none was ever done —
+    /// and the panel wrote *as far as this map can see, it has never run* because that was the
+    /// strongest true sentence available to it. A hedge is what an honest surface produces when the
+    /// daemon declines a question it could answer.
+    ///
+    /// **Deliberately unfiltered by staleness and by standing.** See
+    /// [`crate::map_store::last_triaged`]: filtering either way would make `null` mean *nothing it
+    /// said still stands*, which is a different sentence and one the numbers already carry.
+    last_triaged_at: Option<String>,
 }
 
 /// The project's whole graph: modules, imports, and what the approved decisions do or do not
 /// anchor to.
 ///
-/// Derived on every request and never stored — decision 1 of the spec. It goes to disk, so it
-/// runs on `spawn_blocking` the way `blame` and `grep` already do: walking a thousand-file
-/// tree on the async executor blocks the whole daemon for a good few milliseconds, and this
-/// daemon is also answering a three-second poll. `specs_in` walks directories too and rides the
-/// same hop, since the thread already has the root in hand.
+/// Derived on every request and never stored — decision 1 of the spec. The walk and the join are
+/// [`project_junction`], which the stamp route shares; the digest, the standings and §5.3's header
+/// are this route's own.
+///
+/// **Three axes arrive beside one another and none is merged into the others.** §5 refuses to
+/// flatten them — *"achatá-las numa só punha o triador e o dono a falar pela mesma boca"* — so
+/// `junction` still says only what can be known without anybody looking, `standings` says what the
+/// owner said and whether it is still true, and `triage` says what a model thought was worth their
+/// eyes. A client is free to draw them together; it is not free to be handed one number that has
+/// already decided how they combine. That is why `triage` is a map of verdicts and not a colour,
+/// and why §6.1 spends a paragraph on the one combination that may never be drawn: *silenciado* is
+/// a claim about the triager, and a green is the owner's.
 ///
 /// **What this now answers that it did not: which decisions nothing implements.** The structure
 /// alone cannot say it — it has never heard of a decision — and the pile alone cannot say it
@@ -3450,13 +3626,287 @@ struct MapAnswer {
 /// one that goes stale — the argument [`crate::map_store::decide`] makes about checks that live in
 /// handlers, and the failure `from_row` next door already had once.
 ///
-/// A missing folder is a 404 and a failed query is a 500, which is not one distinction made twice:
-/// the first is something the owner did to their own machine, the second is this daemon failing.
+/// A missing folder is a 404 and a failed query is a 500 — see [`project_junction`], which is where
+/// both now happen.
 async fn get_project_map(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<MapAnswer>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
+    let (structure, mut junction) = project_junction(&state, &id, root.clone()).await?;
+
+    // One `git ls-files` for the union of every decision's anchor paths, sliced per decision
+    // afterwards, and the same reading `POST /map/triage` shows the model. See [`anchor_digests`]
+    // for why it is one call and one function.
+    let (readings, anchors) = anchor_digests(&root, &junction.decisions).await;
+
+    // §10's order, and the SAME call `POST /map/triage` makes before its sweep. Two orderings would
+    // be two answers to one sentence of the spec, and the one deciding which twenty decisions get a
+    // model call spent on them would be the one nobody ever looked at.
+    let walked = crate::map_recency::walk(&root).await;
+    let recency = crate::map_recency::order(&mut junction.decisions, &walked);
+
+    let stamped = crate::map_store::stamps(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "project map stamps failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let latest: std::collections::BTreeMap<i64, &crate::map_store::Stamp> = stamped
+        .iter()
+        .map(|stamp| (stamp.decision_id, stamp))
+        .collect();
+
+    // Read beside the judgements and never derived from them, because it answers the question they
+    // cannot: `answered` is what still describes this map, and a run whose every answer has since
+    // gone stale comes back from it empty — identical to a project nobody ever pressed the button
+    // on. One `MAX` over the table tells those two apart, and it is the difference between a panel
+    // saying *it has never run here* and a panel hedging.
+    let last_triaged_at = crate::map_store::last_triaged(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the last triage run failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // The whole pile, stale rows and all, and the staleness decided below where the reading of the
+    // repository is. `map_store::judgements` cannot decide it — see `Judged`, which argues why the
+    // comparison belongs to whoever holds that reading, and what a store that filtered would have
+    // cost §6.2's pile.
+    let answered = crate::map_store::judgements(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the triage pile failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let mut stored: std::collections::BTreeMap<i64, crate::map_store::Judged> = answered
+        .into_iter()
+        .map(|judged| (judged.decision_id, judged))
+        .collect();
+
+    // One clock for the whole answer rather than one per decision. Two amber stamps on either side
+    // of `NOTE_LIFETIME` must be judged against the same instant, or the header can report a total
+    // that was never true at any single moment.
+    let now = chrono::Utc::now();
+    let mut standings = std::collections::BTreeMap::new();
+    // The judgements that survived the staleness test, in the order the decisions come in.
+    // `map_triage::reconcile` applies the other filter — the one about standing — and tallies what
+    // is left in the same pass that builds the map this answer ships.
+    let mut current = Vec::new();
+    for anchored in &junction.decisions {
+        let anchors = anchor_reading(&readings, anchored.decision_id);
+        standings.insert(
+            anchored.decision_id,
+            crate::map_stamp::standing(
+                latest.get(&anchored.decision_id).copied(),
+                crate::map_stamp::Anchoring {
+                    current: anchors,
+                    named: anchored.modules.len(),
+                    // `Declared` and not merely *something names this section*. §8 is unfixed, so
+                    // this is `false` for every decision in this repository today, and that is the
+                    // measurement rather than a defect — see `Watch::Guessed`.
+                    declared: anchored.anchor == crate::map_join::Anchor::Declared,
+                },
+                now,
+            ),
+        );
+
+        // The digest is computed only for decisions that actually have a judgement, which is what
+        // keeps this loop's cost proportional to the pile rather than to the map: on day one there
+        // are ~350 decisions and no judgements at all, and a hash per decision would be 350 of them
+        // to compare against nothing. The evidence is the SAME `Evidence` `POST /map/triage`
+        // builds — one derivation, or a judgement could read current on one route and stale on the
+        // other with nothing having happened.
+        if let Some(judged) = stored.remove(&anchored.decision_id) {
+            // **Three answers and not two.** With `Anchors::Failed` there is no digest to compare
+            // against — `inputs_digest` would hash the `git-failed` tag, which every stored
+            // judgement mismatches by construction — so asking `is_current` here would not be a
+            // staleness test at all, it would be a guaranteed *no* dressed as one. The judgement is
+            // kept and marked instead, exactly as `POST /map/triage` skips such a decision rather
+            // than triaging it under a digest that dies when git recovers.
+            if matches!(anchors, crate::map_stamp::Anchors::Failed) {
+                current.push(crate::map_triage::Held {
+                    checked: false,
+                    judged,
+                });
+                continue;
+            }
+            let digest = crate::map_triage::inputs_digest(crate::map_triage::Evidence {
+                decision: anchored,
+                anchors,
+            });
+            if crate::map_triage::is_current(&judged.inputs_digest, &digest) {
+                current.push(crate::map_triage::Held {
+                    checked: true,
+                    judged,
+                });
+            }
+        }
+    }
+
+    let stamps = crate::map_stamp::counts(&standings.values().cloned().collect::<Vec<_>>());
+    // The map the panel draws and the two numbers above it, out of one pass over one reading. Two
+    // calls — one to filter, one to tally — would be two chances to ship one set and count another,
+    // and the screen would look entirely correct while doing it.
+    let crate::map_triage::Reconciled {
+        judgements: triage,
+        counts: triage_counts,
+    } = crate::map_triage::reconcile(&standings, &stamps, current);
+    // The two header lines on that screen come from different places — this one from
+    // `standings.len()`, the other from the join — and they can only agree if the loop above put
+    // exactly one standing against every approved decision. A test asserts it too, because a
+    // `debug_assert` says nothing in the build the owner runs.
+    debug_assert_eq!(
+        stamps.decisions, junction.counts.decisions,
+        "one standing per approved decision, or the header disagrees with itself"
+    );
+
+    Ok(Json(MapAnswer {
+        structure,
+        junction,
+        standings,
+        stamps,
+        triage,
+        triage_counts,
+        git_would_not_answer: anchors == crate::map_stamp::Anchors::Failed,
+        recency,
+        last_triaged_at,
+    }))
+}
+
+/// Every decision's anchor code as it stands now, from ONE `git ls-files` for the union of their
+/// paths.
+///
+/// **One function and not a second walk, for the reason [`project_junction`] is one.** `GET /map`
+/// asks this to say where a decision stands and `POST /map/triage` asks it to say what the triager
+/// was shown and whether its last answer is still about that. Two derivations would be two answers
+/// to one question, free to disagree — and the disagreement would surface as a judgement about
+/// files the map does not think are anchors, or as a stamp expired against a set nobody stamped it
+/// over.
+///
+/// **The union call, sliced per decision afterwards** — and the obvious later refactor is the
+/// per-decision loop, so both reasons it is not written that way are here rather than left to be
+/// rediscovered.
+///
+/// The first is cost. This repository has ~350 approved decisions and the map is read every time
+/// the window opens, so a call each would be ~350 process spawns on a route somebody is waiting
+/// on. The second is the ceiling: the union of this repository's paths measures 732 entries and
+/// **24 224 characters of argv — 75 % of the 32 767 Windows allows** — so the chunking
+/// `map_stamp::digest` already does is load-bearing here rather than decorative, and a project a
+/// third larger than this one goes over it.
+///
+/// The union must produce exactly what the per-decision loop would have, or it is an optimisation
+/// that changes answers. Two rules keep that true: the slice below is **by path**, never by the
+/// order git happened to answer in, and a decision with no anchor paths gets `Some("")` without
+/// consulting the call at all — which is what `digest` itself does with an empty list, and is why
+/// a git failure leaves those decisions on `Watch::NoAnchor` instead of flapping to *unreadable*.
+///
+/// Answers the per-decision reading **and** the union call's own result. The second is not
+/// derivable from the first: a project where every decision names no file has a map full of
+/// `Computed("")` whatever git did, and *git would not answer* is a fact about the repository that
+/// only the union call holds.
+async fn anchor_digests(
+    root: &std::path::Path,
+    decisions: &[crate::map_join::Anchored],
+) -> (
+    std::collections::BTreeMap<i64, crate::map_stamp::Anchors>,
+    crate::map_stamp::Anchors,
+) {
+    // `watched` and not `modules`, which is the whole of §14's cure reaching the expiry rule: a
+    // stamp has to keep watching the files somebody wrote down even after the comment that first
+    // named them is gone. Watching `modules` alone would mean a deleted comment silently shrinks
+    // the set a green expires against — the green stops watching the very file it was given over.
+    let per_decision_watched: std::collections::BTreeMap<i64, Vec<String>> = decisions
+        .iter()
+        .map(|anchored| (anchored.decision_id, anchored.watched()))
+        .collect();
+    let mut union: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for paths in per_decision_watched.values() {
+        union.extend(paths.iter().map(String::as_str));
+    }
+    let union: Vec<String> = union.into_iter().map(str::to_owned).collect();
+    let anchors = crate::map_stamp::digest(root, &union).await;
+    // Parsed once and not once per decision: 350 decisions against a 52 KB digest is 350 walks of
+    // the same text for an answer that cannot change between them.
+    let tracked = match &anchors {
+        crate::map_stamp::Anchors::Computed(text) => Some(crate::map_stamp::parse(text)),
+        _ => None,
+    };
+
+    let mut per_decision = std::collections::BTreeMap::new();
+    for anchored in decisions {
+        // A decision with no anchor paths is `Computed("")` whatever became of the git call, because
+        // `digest` itself never asks git for an empty list — so a project with no repository leaves
+        // these on `Watch::NoAnchor`, which is the fact the owner can act on, rather than on
+        // `Watch::NoRepository`, which would be true about the folder and useless about the decision.
+        let watched = per_decision_watched
+            .get(&anchored.decision_id)
+            .expect("every decision was given a watched set just above");
+        let current = if watched.is_empty() {
+            crate::map_stamp::Anchors::Computed(String::new())
+        } else {
+            match (&anchors, &tracked) {
+                (crate::map_stamp::Anchors::Computed(_), Some(tracked)) => {
+                    crate::map_stamp::Anchors::Computed(crate::map_stamp::canonical(
+                        watched.iter().filter_map(|path| {
+                            tracked
+                                .get(path.as_str())
+                                .map(|blob| (path.as_str(), blob.as_str()))
+                        }),
+                    ))
+                }
+                (crate::map_stamp::Anchors::NoRepository, _) => {
+                    crate::map_stamp::Anchors::NoRepository
+                }
+                _ => crate::map_stamp::Anchors::Failed,
+            }
+        };
+        per_decision.insert(anchored.decision_id, current);
+    }
+    (per_decision, anchors)
+}
+
+/// The anchor reading of one decision, or the value that claims nothing if it somehow has none.
+///
+/// Unreachable by construction — [`anchor_digests`] puts exactly one entry against every decision
+/// of the slice it was handed, and both callers hand it `junction.decisions` — and written anyway,
+/// because the alternative to a fallback here is a panic in a handler and the alternative to both
+/// is dropping the decision, which would take it silently out of a header §5.3 requires to add up.
+///
+/// [`crate::map_stamp::Anchors::Failed`] is the one value that is safe to be wrong with. It means
+/// *this daemon could not read the anchors*, which is exactly true if this were ever reached: a
+/// stamp reads as unreadable rather than as green, and a judgement made against it goes stale the
+/// moment git answers again. Both err towards asking, which is the direction §1 can afford.
+fn anchor_reading(
+    readings: &std::collections::BTreeMap<i64, crate::map_stamp::Anchors>,
+    decision_id: i64,
+) -> &crate::map_stamp::Anchors {
+    const UNREADABLE: crate::map_stamp::Anchors = crate::map_stamp::Anchors::Failed;
+    readings.get(&decision_id).unwrap_or(&UNREADABLE)
+}
+
+/// The structure layer and the approved decisions read against it, for the two routes that need
+/// both.
+///
+/// **One function and not two copies, because a decision's anchor set is what a stamp is anchored
+/// TO.** `GET /map` computes it to say where a decision stands; `POST /map/stamps` computes it to
+/// know what it is putting a verdict on. If the two ever derived it differently, a stamp would be
+/// written against one anchor set and expired against another — a green that lapses the instant it
+/// is given, with a diff nobody can explain, which is the false-alarm failure that costs exactly
+/// the trust §7 is trying to buy.
+///
+/// It goes to disk, so it runs on `spawn_blocking` the way `blame` and `grep` already do: walking a
+/// thousand-file tree on the async executor blocks the whole daemon for a good few milliseconds,
+/// and this daemon is also answering a three-second poll. `specs_in` walks directories too and
+/// rides the same hop, since the thread already has the root in hand.
+///
+/// A missing folder is a 404 and a failed query is a 500, which is not one distinction made twice:
+/// the first is something the owner did to their own machine, the second is this daemon failing.
+async fn project_junction(
+    state: &AppState,
+    id: &str,
+    root: PathBuf,
+) -> Result<(crate::project_map::Structure, crate::map_join::Junction), StatusCode> {
     let walked = tokio::task::spawn_blocking(move || {
         let structure = crate::project_map::structure(&root)?;
         // Slugs and not paths, for the reason `get_project_map_specs` gives below: a decision row
@@ -3484,10 +3934,23 @@ async fn get_project_map(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let decisions = crate::map_store::approved(&state.pool, &id)
+    let decisions = crate::map_store::approved(&state.pool, id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "project map decisions failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let spec_slugs = document_slugs(state, id, spec_slugs).await?;
+
+    // The recorded anchor sets, which are the only part of this junction with a memory. Read here
+    // rather than merged into the payload afterwards, because `join` needs them: a file somebody
+    // wrote down as a decision's code is CLAIMED, and deciding that after the fact would mean a
+    // second place that knows what §5.1's two piles mean.
+    let records = crate::map_store::anchors(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the recorded anchors failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -3496,11 +3959,9 @@ async fn get_project_map(
         &structure.modules,
         &structure.foreign,
         &spec_slugs,
+        &records,
     );
-    Ok(Json(MapAnswer {
-        structure,
-        junction,
-    }))
+    Ok((structure, junction))
 }
 
 /// Which specs this project has, named the way the owner reads them.
@@ -3545,6 +4006,39 @@ struct MapExtractBody {
     spec_slug: String,
     brain: String,
 }
+
+/// How many decisions one press of the triage button may put in front of a model.
+///
+/// **A ceiling on a wait, and it is expected to be hit rather than approached.** One model call per
+/// decision: this repository's ~350 approved decisions, none of them stamped, is 350 runs of the
+/// agent CLI, and the shell asks this synchronously the way `map/extract` does. Twenty is what
+/// somebody watches a spinner through — minutes with a cloud brain — and it is deliberately not
+/// sized to drain a backlog in one press, because nothing that drains a 350-row backlog in one
+/// press finishes inside a request.
+///
+/// **Sized knowing the staleness rate rather than guessing it.** Counted on this repository on
+/// 2026-08-26: 109 files under `core/src` and `shell/src` name a `§`, and **17 of them were touched
+/// in the last 20 commits** — 26 in the last 50. An anchor set is several files, so a decision's
+/// chance of going stale is HIGHER than that per-file sixth, and `map_triage::inputs_digest` covers
+/// the anchor blobs precisely so it does. This repository will therefore rarely be in the "nothing
+/// stale" state, and the cap will sit saturated rather than draining once.
+///
+/// **The silent cap is the disease, so [`TriageReport::left_over`] is not optional.** A run that
+/// stopped at twenty of two hundred and said only "done" reads as *covered everything*, which is
+/// §1's thousand-line plan reproduced by the feature built to cure it. The number has to reach the
+/// screen, not merely the log.
+///
+/// **It drains rather than starves, and that is a property of the skip and not of this number.**
+/// What stops the first twenty being the only twenty ever looked at is that a judgement still
+/// current costs no call, so the next press starts where the last one stopped.
+///
+/// **Which twenty is [`crate::map_recency`]'s answer and not this constant's**, and the two were
+/// separated late: the sweep used to run in `map_store::approved`'s order — `spec_slug, ordinal,
+/// id` — which meant a saturated cap paid for the first twenty decisions alphabetically by
+/// document, every press, for ever. §10 says the order is by recency of the anchor code's last
+/// change, and until that landed this comment recorded the gap rather than pretending the order had
+/// been chosen. It changes which twenty go first; it does not change whether the rest are reached.
+const MAX_TRIAGE_BATCH: usize = 20;
 
 /// Which brain the caller named, and nothing else.
 ///
@@ -3703,6 +4197,149 @@ async fn get_project_map_decisions(
         })
 }
 
+/// §6.2's pile: everything this project's triager has silenced, and why.
+///
+/// **Its own door and never a filter on the map, because §6.2 says *sempre acessível*.** A pile you
+/// reach only by knowing which query parameter to add is not always accessible, and §13 rates *o
+/// triador silencia o que devia mostrar* a **real** residual risk whose only mitigation is that
+/// this stays visible. A mitigation with a secret entrance is not one.
+///
+/// **Filtered by NEITHER standing, staleness nor retirement — the exact opposite of what `GET /map`
+/// does with the same table, and all three departures are deliberate.** That route answers *what is
+/// true now*: a judgement about a decision the owner has since stamped, or about code that has
+/// since moved, is not an answer to its question, and a retired decision is not in its map at all
+/// — see [`crate::map_triage::reconcile`], which is where §5.3's numbers would otherwise stop
+/// reconciling. This route answers *what the triager did*, and each of the three filters would
+/// delete part of that record:
+///
+/// - **stamped** — the stamp is the evidence the silence was premature, so the silencing is worth
+///   MORE afterwards, not less;
+/// - **stale** — a silence whose reason was written about code that has since moved is exactly the
+///   one somebody should reread;
+/// - **retired** — auditing the triager does not care whether the decision survived, and a
+///   silencing that vanished because the owner later said no is a bug report deleted by its own
+///   subject. It is reported instead, as `retired` on the row.
+///
+/// Somebody will one day read this as an inconsistency and repair it: the repair breaks §6.2 in one
+/// direction or §5.3 in the other, and
+/// `the_silenced_pile_still_shows_a_silencing_of_a_decision_that_was_later_stamped` and
+/// `a_silencing_survives_the_decision_being_retired` are the tests that stop it.
+///
+/// **Every silencing ever written and not the latest judgement per decision**, which is
+/// [`crate::map_store::silencings`] rather than `judgements` and is what §6.2 literally asks for:
+/// *"a razão de **cada** silenciamento"*. A decision silenced last week and flagged today has a
+/// silencing in the table, and until this route read the history it had none in the pile —
+/// `map_triage` was made append-only for precisely that row and nothing was reading it.
+///
+/// Asks nothing of the disk: `resolve_project_root` reads the row and never the folder, so a
+/// project whose folder has moved still has its pile — which is *sempre acessível* meaning what it
+/// says. An id nobody registered is a 404 rather than an empty list, for the reason
+/// [`get_project_map_decisions`] gives: *nothing was silenced* and *there is no such project* are
+/// different answers and only one of them is true.
+///
+/// The order is the store's — newest first, ties broken by insertion order — and the argument for
+/// it is [`crate::map_store::silencings`]'s. Sorted in SQL and not here, because with the whole
+/// history in the pile the tie-break has to be `id` and a handler cannot see one.
+///
+/// **Capped at [`crate::map_store::SILENCED_PAGE`], with the uncapped total on the answer.** *Sempre
+/// acessível* is not *all at once*, and this table only grows: append-only by design, by up to
+/// `MAX_TRIAGE_BATCH` rows per press of the button the feature exists to encourage, on a route the
+/// window performs every time the map opens. The write side was bounded from the first commit and
+/// this side was bounded by nothing. What makes the cap admissible rather than a quiet truncation is
+/// that the reader is handed the number it was cut from — the same bargain
+/// [`TriageReport::left_over`] strikes one route over, and the same one every capped pile in the
+/// window keeps.
+///
+/// **It answers [`crate::map_store::Silencing`] rows and nothing wrapped around them, and the
+/// wrapper's removal is a correction rather than a tidy-up.** A `SilencedRow` here added
+/// `machine_written`, which could not be `true` on this route: the one producer of a daemon-written
+/// reason is [`crate::map_triage::unreadable_flag`], which may only ever reach
+/// [`crate::map_triage::Judgement::Flagged`], while [`crate::map_store::silencings`] selects the
+/// silenced. So the payload where the answer is provably always `false` carried the field and
+/// `GET /map`'s `triage` — the only place a `nucleos:` sentence can appear at all — carried nothing,
+/// which made a client re-spell [`crate::map_triage::DAEMON_MARK`] in its own language to keep §6.2's
+/// attribution. It now lives on [`crate::map_store::Judged`], computed at the only place a row of
+/// that table becomes a value. A field that can never be true is worse than an absent one: it is a
+/// promise somebody eventually relies on, and this one would have been relied on for the wrong pile.
+async fn get_project_map_silenced(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::map_store::SilencedPile>, StatusCode> {
+    resolve_project_root(&state, &id).await?;
+
+    crate::map_store::silencings(&state.pool, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the silenced pile failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// What `GET …/map/orphan` is asked about: one section of one document.
+#[derive(Deserialize)]
+struct MapOrphanQuery {
+    /// The document, as `map/specs` spells it and as a decision row carries it.
+    slug: String,
+    /// The heading the decision was copied from, **verbatim** — `## 4.1 Três tipos de decisão`.
+    ///
+    /// The heading and not the number, so that [`crate::map_join::section_number`] stays the one
+    /// place that knows how one becomes the other. A client that sent the number would be a second
+    /// implementation of that rule, and the day the two disagreed the guard would be searching the
+    /// history for a section the junction never anchored anything to.
+    section: String,
+}
+
+/// Whether a decision with no code was never built, or lost the comment that anchored it (§14).
+///
+/// **Three refusals, and each is a different sentence.** `422` for a heading carrying no number:
+/// that is [`crate::map_join::Anchor::Unnumbered`], where no search ever ran, and answering
+/// *nothing ever named it* about a question nobody could ask would be the silent wrong answer this
+/// whole feature refuses. `404` for a slug this project has no document for — the same answer
+/// `map/extract` gives it, and for its reason. Everything else is a `200` carrying one of
+/// [`crate::map_orphan::Orphan`]'s six states, including the two that mean *I could not look*: a
+/// git that would not answer is a finding and not a fault of this daemon.
+///
+/// **There is deliberately NO refusal for a document that is not on disk**, and the first version
+/// of this route had one. It answered `404` when the slug was missing from `map_intent::specs_in`,
+/// which made the guard the only part of this map that stops working when a spec file is archived
+/// or renamed — `GET /map` keeps showing those decisions, because their text was copied into the
+/// table at extraction and the folder was never where they lived. Worse, the slug IS the filename,
+/// so renaming a spec would have killed the guard for every decision of that document while the
+/// rows carrying the old slug sat on screen looking answerable. See [`document_slugs`]: the list of
+/// this project's documents comes from the table first, so a slug an approved decision carries is a
+/// document this project has, whatever happened to the file.
+async fn get_project_map_orphan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<MapOrphanQuery>,
+) -> Result<Json<crate::map_orphan::Orphan>, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    let Some(section) = crate::map_join::section_number(&query.section) else {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    };
+
+    // On `spawn_blocking` for `map/extract`'s reason: this reads a directory, and the daemon is
+    // also answering a three-second poll. Slugs and not paths, exactly as `project_junction` does
+    // it, because the slug is what a citation's candidate is checked against.
+    let listing = root.clone();
+    let on_disk: Vec<String> = tokio::task::spawn_blocking(move || {
+        crate::map_intent::specs_in(&listing)
+            .iter()
+            .map(|path| crate::map_intent::spec_slug(path))
+            .collect()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let slugs = document_slugs(&state, &id, on_disk).await?;
+
+    Ok(Json(
+        crate::map_orphan::orphan(&root, &section, &query.slug, &slugs).await,
+    ))
+}
+
 #[derive(Deserialize)]
 struct MapDecisionBody {
     /// `true` approves the line and lets it into the map; `false` retires it, which is what stops
@@ -3741,6 +4378,628 @@ async fn post_project_map_decision(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+#[derive(Deserialize)]
+struct MapStampBody {
+    decision_id: i64,
+    /// The owner's verdict, parsed by serde and by nothing this handler wrote.
+    ///
+    /// Typed rather than taken as a `String` and read afterwards, which is where `read_brain` next
+    /// door had to end up and why the two differ. `Brain::from_wire` reads anything unfamiliar as
+    /// `Cloud`, so that route needed a stricter reader of its own; [`crate::map_stamp::Verdict`]'s
+    /// derived `Deserialize` is already exact — §5.2 has three and `0118`'s CHECK admits three — so
+    /// a fourth is refused before this function runs at all. That is the earliest place it can be
+    /// refused, and the only one where nothing has yet had a chance to guess what was meant.
+    verdict: crate::map_stamp::Verdict,
+    /// Obligatory on amber and optional on the other two (§7).
+    ///
+    /// `serde(default)` so a client that has nothing to say may omit the field rather than having
+    /// to spell `null`. The default is `None` and never an empty string, because *said nothing* and
+    /// *said the empty string* are different, and `0118` stores the first as NULL.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// The owner's verdict on one decision, and the moment they gave it (§5.2, §7).
+///
+/// **The daemon computes the digest and the body has no field for one.** A client that could supply
+/// it is a client that could mint a green anchored to a digest nothing will ever move — a stamp that
+/// never expires, which is §1's false confidence with a signature on it. The anchor set comes from
+/// [`project_junction`], the same reading `GET /map` expires the stamp against, so the two cannot
+/// disagree about what this verdict was given over.
+///
+/// Four answers, and each is a different thing to tell whoever asked:
+///
+/// - `204` when a row was written. Nothing to say back; §9.2 makes the current state the last row,
+///   and the map is where it is read.
+/// - `404` when nothing was written — a decision belonging to another project, an id that names
+///   nothing, or a line nobody approved. All three mean *that decision is not yours to stamp now*,
+///   none is a fault of this daemon, and telling them apart would tell a caller which ids exist in
+///   projects it cannot see. §4 is why the third is in that list at all: approval is the gate, and a
+///   verdict on an unapproved line would put the owner's word on something they never let in.
+/// - `400` for an amber with nothing in its note. `0118`'s CHECK is the backstop and would surface
+///   as a 500, which reads as this daemon having broken; a malformed request is the client's fault
+///   and has to read as one. §5.2 makes the note the whole of amber — *falta migrar as páginas de
+///   pilar* is worth more than the colour is — so an empty one is not a lesser amber, it is not one.
+/// - `503` for a `settled` when git is there and **would not answer**. **Not `500`**: that is
+///   transient, and the honest thing to tell the owner is *try again*, whereas a 500 reads as a
+///   fault here and puts a warning in a log for an ordinary Tuesday. §7.1 makes *está como quero*
+///   the only verdict the code moving can falsify, so it is the only one that may not be recorded
+///   without knowing what it is anchored to; the other two take a NULL digest without complaint,
+///   because neither has an expiry the code can reach. **A project with no git repository is not
+///   this case** and gets a `204` — see the `NoRepository` arm below, and [`crate::map_stamp::Anchors`]
+///   for what telling the two apart cost when they were one value.
+///
+/// **The tree walk on this path is deliberate, and it is the second one this click pays for.** The
+/// shell will do `GET /map`, then this, then invalidate and `GET /map` again — three walks of a
+/// thousand-file tree per stamp. It is not an oversight and it must not be optimised away by
+/// computing the anchor set from anything cheaper: the write has to derive it **exactly** as the
+/// read expires it, or a stamp is anchored to one set and compared against another and lapses the
+/// instant it is given, with a diff nobody can explain. That is the false-alarm failure that costs
+/// precisely the trust §7 is buying. In particular, an optimistic update in the shell may show the
+/// verdict immediately and may **not** invent the `Standing` that goes with it — `Watch` is decided
+/// by a git call and by the join, and a client guessing `Watched` would put a certain word on screen
+/// over an anchor set nobody has read yet.
+///
+/// **The decision is looked up here, and that is not the handler check [`crate::map_store::decide`]
+/// argues against.** `map_store::stamp` still puts `project_id`, `approved_at` and `retired_at` in
+/// its own `WHERE`, and that INSERT is what actually refuses the write — this lookup cannot replace
+/// it and does not try. It is forced: without finding the decision there is no anchor set to compute
+/// a digest from. Short-circuiting on it also fixes an ordering that would otherwise be wrong, and
+/// the wrongness is quiet: a settled verdict on a decision that does not exist, in a folder that is
+/// not a repository, would answer `503` — *git is unreadable, try again* — about a request that will
+/// never succeed however healthy git becomes.
+async fn post_project_map_stamp(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapStampBody>,
+) -> Result<StatusCode, StatusCode> {
+    // Trimmed with `str::trim` against a CHECK that strips space, tab, CR and LF. Stricter, and
+    // deliberately in that direction: a note of one non-breaking space is one the table would take
+    // and one that says nothing, and the failure that matters is being LOOSER than the CHECK, which
+    // turns a client's mistake into a 500 about this daemon.
+    let note = body.note.as_deref();
+    if body.verdict == crate::map_stamp::Verdict::Partial
+        && !note.is_some_and(|note| !note.trim().is_empty())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let root = resolve_read_root(&state, &id, None).await?;
+    let (_, junction) = project_junction(&state, &id, root.clone()).await?;
+    let anchored = junction
+        .decisions
+        .iter()
+        .find(|anchored| anchored.decision_id == body.decision_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // `watched` and not `modules`: once a set has been written down, that is what the green expires
+    // against. See `anchor_digests`, which makes the same substitution for the same reason.
+    let anchors = anchored.watched();
+    // **A stamp never overwrites a set the OWNER pointed at**, and that is the one rule this
+    // side effect has. What a stamp can record is whatever the `§` comments happened to say at this
+    // instant — which, while §8 is unfixed, is a set of guesses about which document a bare `§`
+    // meant. Writing that over a choice somebody made deliberately would demote the choice to the
+    // guess, silently, at the moment they were being most careful. So an owner record stands, and
+    // the stamp adds nothing.
+    let already_chosen = matches!(
+        anchored.record.as_ref().map(|record| record.source),
+        Some(crate::map_store::AnchorSource::Owner)
+    );
+
+    // `Anchored::modules` and never `foreign` beside it. `Anchor::Declared` spends a paragraph on
+    // why: watching an anchor means being able to read it, and promising an expiry over a Go file
+    // this map cannot parse is a promise the read side cannot keep.
+    let digest = match crate::map_stamp::digest(&root, &anchors).await {
+        crate::map_stamp::Anchors::Computed(text) => Some(text),
+        // §11: a project added from outside may have no git repository at all, and that is not a
+        // fault of anything. The stamp is **allowed**, and `''` is not a lie here — with no
+        // repository there is genuinely nothing that could ever move, which is the same claim `''`
+        // makes for a decision no module names. Refusing instead would make this feature useless on
+        // exactly the projects §11 says must still get an honest answer, and refusing it with a
+        // `503` would tell their owner to try again at something that cannot succeed.
+        // `Watch::NoRepository` is what carries the reason back out, so the green is visible as one
+        // that will never come and ask rather than passing for one that will.
+        crate::map_stamp::Anchors::NoRepository => Some(String::new()),
+        crate::map_stamp::Anchors::Failed => None,
+    };
+    if digest.is_none() && body.verdict == crate::map_stamp::Verdict::Settled {
+        tracing::warn!(
+            project_id = %id,
+            decision = body.decision_id,
+            anchors = anchors.len(),
+            "a green was asked for and git would not say what its anchors are, so it was refused"
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    match crate::map_store::stamp(
+        &state.pool,
+        &id,
+        body.decision_id,
+        body.verdict,
+        digest.as_deref(),
+        note,
+    )
+    .await
+    {
+        Ok(true) => {
+            // After the stamp and never instead of it: the verdict is what the caller asked for,
+            // and a record written for a stamp that then failed to land would be a memory of an
+            // act that did not happen. A record that fails to write is logged and swallowed for the
+            // mirror-image reason — the owner's verdict IS recorded, and answering `500` would tell
+            // them their stamp did not land when it did.
+            if !already_chosen
+                && let Err(error) = crate::map_store::record_anchor(
+                    &state.pool,
+                    &id,
+                    body.decision_id,
+                    &anchors,
+                    crate::map_store::AnchorSource::Stamp,
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    project_id = %id,
+                    decision = body.decision_id,
+                    "the stamp landed and its anchor set could not be written down"
+                );
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
+        // Reachable despite the lookup above: the line could have been retired between the two, and
+        // the store is the authority on that rather than the reading this handler took a moment ago.
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                decision = body.decision_id,
+                verdict = body.verdict.as_str(),
+                "stamping a decision failed"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MapTriageBody {
+    /// Which brain answers, exactly as `POST /map/extract` takes it. No spec slug and no decision
+    /// id beside it: §10 gives the triager one scope — everything nobody has stamped — and a route
+    /// that let a caller name the decisions would let it name the ones whose answer it liked.
+    brain: String,
+}
+
+/// What one triage run did, and — the half that is easy to leave out — what it did not.
+///
+/// **Counts and never a bare `204`.** *"Corri o triador e não aconteceu nada"* and *"corri o triador
+/// e estava tudo em dia"* are different facts about a project, and a route that reported only
+/// success would make the second look like the first. Every field below is a thing that would
+/// otherwise have happened invisibly.
+///
+/// **The seven after [`Self::in_scope`] are exhaustive and disjoint, and a test asserts they add
+/// up.** §5.3 makes that the house rule for anything a person reads as a total — *as categorias são
+/// exaustivas e disjuntas, e um teste verifica que somam ao total em vez de um comentário o
+/// prometer* — and this is a report, which is exactly where a reader stops checking.
+///
+/// **Every one of them is a count and none is a flag**, which is the correction this type needed
+/// most. [`Self::unreadable_anchors`] was a `git_would_not_answer: bool` for one commit, and a
+/// boolean can say that a run was narrower than it looks without ever saying by how much — which
+/// leaves the owner reading `judged: 3` off a project of three hundred with no way to learn that
+/// the other two hundred and ninety-seven were skipped.
+#[derive(Debug, Default, Serialize)]
+struct TriageReport {
+    /// Decisions in [`crate::map_stamp::Standing::Never`], which is the whole of what the triager
+    /// is allowed to look at (§10). Everything below is a bucket of this number.
+    in_scope: usize,
+    /// Judged already, against inputs that have not moved since. Cost nothing and asked nothing.
+    already_current: usize,
+    /// Answered and written this run. The only field that grew the table.
+    judged: usize,
+    /// The model answered, the answer was not a judgement, and **a `flagged` row was written
+    /// saying so**. Rows written this way, not rows withheld — the field changed meaning when the
+    /// starvation was fixed, and the sentence is spelled out because the old one read the other way
+    /// round.
+    ///
+    /// Counted apart from [`Self::unanswered`] because the two send whoever is debugging to
+    /// different places: this one to the prompt, that one to the machine. See
+    /// [`crate::map_triage::unreadable_flag`] for why the row exists at all and what it costs.
+    unreadable: usize,
+    /// Nobody answered: the run itself failed. A brain that is down fails on every decision and a
+    /// brain that is confused fails on one, so folding this into [`Self::unreadable`] would report
+    /// an unreachable machine as a broken prompt and send somebody to rewrite a question that was
+    /// never asked.
+    unanswered: usize,
+    /// The decision stopped being one this project's map holds between the reading and the write.
+    ///
+    /// Expected to be zero, and counted rather than dropped because the six have to add up:
+    /// approval cannot be taken back today — `decide` only touches rows nobody has answered and
+    /// `record` supersedes only what is still pending — so nothing can retire an approved decision
+    /// mid-run. A number here means that changed, which is worth finding out from a report rather
+    /// than from a header that stopped reconciling.
+    vanished: usize,
+    /// Stale, and the cap stopped the run before reaching them. **The field this report exists
+    /// for.** See [`MAX_TRIAGE_BATCH`].
+    left_over: usize,
+    /// In scope, and **skipped because git would not say what their anchor code is**.
+    ///
+    /// **Skipped and not triaged, which dissolves a storm rather than reporting one.** An earlier
+    /// version of this route triaged them anyway and put a boolean on the report. The trouble is
+    /// not the answer — the model reads none of its evidence from git, so an answer given during an
+    /// outage is as good as any other — it is the digest: `map_triage::inputs_digest` keeps all four
+    /// states of [`crate::map_stamp::Anchors`] apart on purpose, which is what `0118` was amended to
+    /// require, so a judgement recorded under `git-failed` dies the moment git recovers. Every row
+    /// written during an outage would have to be bought again.
+    ///
+    /// Skipping removes the source instead of the symptom. No judgement is ever written carrying a
+    /// `git-failed` digest, so there is nothing to invalidate on recovery; the judgements already
+    /// stored read stale for the length of the outage and are skipped rather than re-run, so nothing
+    /// is spent; and when git answers again they match their `Computed(...)` digest and are current,
+    /// untouched.
+    ///
+    /// It is the posture slice 4 already took with `Lapse::Unreadable`: *I could not look* is
+    /// neither *unchanged* nor *changed*, and acting on either guess is the error.
+    ///
+    /// **Not the same as §11's project with no repository**, which is
+    /// [`crate::map_stamp::Anchors::NoRepository`] and is triaged normally — with no repository
+    /// there is genuinely nothing that could ever move, which is a permanent fact and an honest
+    /// digest. Nor does it touch a decision no module names: that is `Computed("")`, reached without
+    /// git being asked at all.
+    unreadable_anchors: usize,
+}
+
+/// Ask a model which of the decisions nobody has stamped deserve their owner's eyes (§6, §10).
+///
+/// **Only [`crate::map_stamp::Standing::Never`], and that is §10's table rather than a shortcut.**
+/// A decision whose anchor code moved — *"se estava carimbada, caducou (§7.1); se nunca foi vista,
+/// o triador decide se vale o teu olhar."* A stamped decision already carries the owner's answer and
+/// a lapsed one already reaches them through §5.3's `J`, so running a model over either is the model
+/// second-guessing a human: the one authority §6 takes away from it, recovered through a sweep.
+///
+/// **And only rows whose judgement is stale or absent.** `map_triage::is_current` against a digest
+/// computed now, so a second press over a repository nothing has happened to writes nothing and
+/// spends nothing. That is not an optimisation: without it the bill grows with how often somebody
+/// presses a button rather than with what changed, and a feature whose cost is unrelated to its
+/// value is one people stop pressing.
+///
+/// **The anchor material is [`project_junction`] and [`anchor_digests`], the same two `GET /map`
+/// reads.** Deriving it a second way here would be two answers to one question, and the disagreement
+/// would arrive as a triage answer about files the map does not consider anchors — visibly
+/// approximate is this feature's bargain, and two mechanisms quietly disagreeing is not that.
+///
+/// **A failure on one decision never abandons the rest.** A run that gave up at the first
+/// unparseable answer would be useless on precisely the repositories worth running it on: three
+/// hundred decisions is three hundred chances for a model to answer something odd. Each failure is
+/// counted, logged with what was actually said, and the sweep carries on. That is also why the
+/// route does not answer `502` the way `map/extract` does when the model fails — by then rows have
+/// been written, and a status code that discarded the report would hide work actually done.
+///
+/// **And a decision git would not answer for is skipped rather than triaged**, which is the one
+/// rule here that is about money rather than about correctness. See
+/// [`TriageReport::unreadable_anchors`].
+///
+/// **The way out of a flag is a stamp, and §5.2 already has the right one — so no panel built on
+/// this route may grow a dismiss button.** A flag stays in §5.3's `J` until its inputs move, which
+/// looks like a nag with no answer until you notice that the answer is *a meio, e eu sei*, whose
+/// stated purpose is *"converte um não sabia num sabia, que é metade da cura"*. The owner who reads
+/// a flag and decides it is noise says so in that note. Dismissing without saying anything is
+/// precisely the *não sabia* this map exists to convert, and a fourth verdict for it would be §5.2
+/// widened to make the map quieter — which is the one direction it must never be widened in.
+///
+/// `200` with the report, and the four refusals are the ones `map/extract` already makes: `422` for
+/// a brain nobody can read, `404` for a project or a folder that is not there, `503` for a `local`
+/// this machine has no model for — never a quiet fall back to the cloud, which would break the two
+/// promises that word carries at once — and `500` for the daemon's own failure to read or write its
+/// tables.
+/// Which files one decision's code is, as the owner says it.
+#[derive(Deserialize)]
+struct MapAnchorBody {
+    decision_id: i64,
+    /// Repository-relative, forward slashes. **An empty list is legal and is an assertion**,
+    /// not a no-op: *these files were this decision's and now none are* is what somebody says
+    /// about code they genuinely removed, and it is a different fact from never having written
+    /// anything down.
+    paths: Vec<String>,
+}
+
+/// Write down which files one decision's code is (§14).
+///
+/// **The one act in this map that gives an anchor a memory.** Everything else here is
+/// recomputed from the working tree on every read: delete the `§7.1` from a file and the
+/// association is gone, and the decision lands in §5.1's *declarado, sem código* looking exactly
+/// like one nobody ever implemented. This is what makes that a named alarm instead of a silent
+/// disappearance.
+///
+/// **Every path is resolved inside the project before anything is written**, through the same
+/// [`crate::inspect::resolved_within`] `cat` and `grep` use — so an absolute path, a `..`, and a
+/// junction pointing out of the tree are all refused by the function that already knows how,
+/// rather than by a second rule written here. A path that does not exist is refused too, and
+/// that is not tidiness: an anchor naming a file the project does not have would sit in
+/// [`crate::map_stamp::Lapse::Moved`]'s `gone` for ever, nagging about a file that was never
+/// there.
+///
+/// **Deliberately not restricted to files the map can READ.** [`crate::project_map::scanned`]
+/// decides whose `§` this reader parses; it has no standing over which files somebody’s code
+/// lives in. A Go sidecar, a migration, a stylesheet — the owner is entitled to say a
+/// decision's code is there, and `map_stamp::digest` watches any tracked path perfectly well.
+/// Refusing them would make this route unusable for exactly the languages §11 already admits
+/// the map cannot read.
+///
+/// `204` when a row was written, `404` when the decision is not this project’s, not approved,
+/// or retired — [`crate::map_store::decide`]'s three-reasons-one-answer, for its reason.
+async fn post_project_map_anchors(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapAnchorBody>,
+) -> Result<StatusCode, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    let asked = body.paths.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        let mut kept: Vec<String> = Vec::with_capacity(asked.len());
+        for path in &asked {
+            // Backslashes normalised before anything looks at the string, because the map
+            // spells every path with forward slashes (`project_map::collect` does the same
+            // `replace`) and a record written the other way would never match an anchor again.
+            let cleaned = path.trim().replace('\\', "/");
+            if cleaned.is_empty() {
+                return None;
+            }
+            let resolved = crate::inspect::resolved_within(&root, &cleaned).ok()?;
+            // A directory is not a decision’s code, and recording one would put a path in the
+            // digest that `git ls-files` never answers for — a permanent `gone`.
+            if !resolved.is_file() {
+                return None;
+            }
+            kept.push(cleaned);
+        }
+        Some(kept)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    match crate::map_store::record_anchor(
+        &state.pool,
+        &id,
+        body.decision_id,
+        &checked,
+        crate::map_store::AnchorSource::Owner,
+    )
+    .await
+    {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                decision = body.decision_id,
+                files = checked.len(),
+                "writing down a decision's anchor files failed"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn post_project_map_triage(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapTriageBody>,
+) -> Result<Json<TriageReport>, StatusCode> {
+    let brain = read_brain(&body.brain).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let root = resolve_read_root(&state, &id, None).await?;
+    let (_, mut junction) = project_junction(&state, &id, root.clone()).await?;
+    let (readings, _) = anchor_digests(&root, &junction.decisions).await;
+
+    // **§10's order, and on this route it is a spending decision rather than a display one.** The
+    // sweep below caps at [`MAX_TRIAGE_BATCH`] and spends one model call per decision, so the order
+    // it walks in decides which twenty of a three-hundred-row backlog get money spent on them —
+    // every press, for as long as the cap stays saturated, which `MAX_TRIAGE_BATCH`'s own
+    // measurement says is the state this repository lives in. `map_store::approved`'s order is
+    // `spec_slug, ordinal, id`, so what that bought was the first twenty decisions alphabetically by
+    // document. The answer is discarded here and kept by `GET /map`: what this route needs is the
+    // order, and what the panel needs is the order plus the window it is a fact about.
+    let walked = crate::map_recency::walk(&root).await;
+    let _ = crate::map_recency::order(&mut junction.decisions, &walked);
+
+    let stamped = crate::map_store::stamps(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "project map stamps failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let latest: std::collections::BTreeMap<i64, &crate::map_store::Stamp> = stamped
+        .iter()
+        .map(|stamp| (stamp.decision_id, stamp))
+        .collect();
+    // Read once, before any call. A judgement written by this very run cannot make one of its own
+    // decisions "already current" — every decision is visited once — and reading per decision would
+    // be one query per model call for an answer that cannot change under us.
+    let answered = crate::map_store::judgements(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading the triage pile failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let known: std::collections::BTreeMap<i64, &crate::map_store::Judged> = answered
+        .iter()
+        .map(|judged| (judged.decision_id, judged))
+        .collect();
+
+    // Bound out here because `Extractor::Loopback` borrows it and the borrow has to outlive the
+    // `match` that creates it, exactly as `map/extract` has it.
+    let local_model;
+    let (asked, model) = match brain {
+        crate::chats::Brain::Cloud => (
+            crate::map_intent::Extractor::Cli(state.runner.as_ref()),
+            // The brain and not a model name, and the limit is worth stating rather than hiding
+            // behind a plausible string. §6.2 asks for *o modelo que o produziu*; the CLI chooses
+            // its own model per run and `CommandRunner::model_for_stage` answers `None` for an
+            // unnamed stage, so the honest thing this daemon knows is which brain was asked.
+            // `map_decisions.brain` records exactly the same word about the other half of the
+            // feature, so the two piles are attributable alike.
+            brain.as_str().to_owned(),
+        ),
+        crate::chats::Brain::Local => {
+            // Read per request rather than cached on `AppState`, for `map/extract`'s reason: a name
+            // cached at startup is one the owner cannot change without restarting the daemon.
+            let Some(model) = models_config().local_triage_model else {
+                tracing::warn!(
+                    project_id = %id,
+                    "the local brain was asked to triage and this machine has no local model \
+                     configured"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            local_model = model;
+            (
+                crate::map_intent::Extractor::Loopback {
+                    client: &state.web.http,
+                    base_url: crate::runner::OLLAMA_BASE_URL,
+                    model: &local_model,
+                },
+                // Here the model IS known, which is why the column takes a string rather than a
+                // brain: the pile is more useful naming what answered than naming the choice.
+                local_model.clone(),
+            )
+        }
+    };
+
+    // One clock for the whole run, as `GET /map` uses one for the whole answer: two amber stamps on
+    // either side of `NOTE_LIFETIME` must be judged against the same instant, or a decision could
+    // leave `Never` halfway through a sweep and be both in scope and not.
+    let now = chrono::Utc::now();
+    let mut report = TriageReport::default();
+    let mut attempted = 0usize;
+
+    // In §10's order, sorted above: *"dentro do que chega, a ordem é por recência de alteração do
+    // código âncora, não por importância."* What that changes here is which decisions the cap
+    // reaches, not whether the rest are ever reached — a judgement still current costs no call, so
+    // the next press starts where this one stopped, which is the drain `MAX_TRIAGE_BATCH` describes.
+    for anchored in &junction.decisions {
+        let current = anchor_reading(&readings, anchored.decision_id);
+        let standing = crate::map_stamp::standing(
+            latest.get(&anchored.decision_id).copied(),
+            crate::map_stamp::Anchoring {
+                current,
+                named: anchored.modules.len(),
+                declared: anchored.anchor == crate::map_join::Anchor::Declared,
+            },
+            now,
+        );
+        if !matches!(standing, crate::map_stamp::Standing::Never) {
+            continue;
+        }
+        report.in_scope += 1;
+
+        // Before the staleness test and not after it, and the order is the point. During an outage
+        // `is_current` says stale about every judgement in the project — they were stored against
+        // `Computed(...)` and the reading now is `git-failed` — so a check that came second would
+        // report three hundred decisions as freshly in need of a model when the only thing that
+        // happened is that git hiccuped. Counted here, the number says what it is: the run was this
+        // much narrower than it looks.
+        if matches!(current, crate::map_stamp::Anchors::Failed) {
+            report.unreadable_anchors += 1;
+            continue;
+        }
+
+        let evidence = crate::map_triage::Evidence {
+            decision: anchored,
+            anchors: current,
+        };
+        let digest = crate::map_triage::inputs_digest(evidence);
+        if known
+            .get(&anchored.decision_id)
+            .is_some_and(|judged| crate::map_triage::is_current(&judged.inputs_digest, &digest))
+        {
+            report.already_current += 1;
+            continue;
+        }
+
+        // The cap counts ATTEMPTS and not rows, so a batch of answers nobody could read still ends
+        // the run — otherwise a model returning prose would be asked three hundred times, and the
+        // ceiling would protect the table instead of the owner's afternoon.
+        if attempted >= MAX_TRIAGE_BATCH {
+            report.left_over += 1;
+            continue;
+        }
+        attempted += 1;
+
+        let said = match crate::map_triage::ask(asked, evidence).await {
+            Ok(said) => said,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    project_id = %id,
+                    decision = anchored.decision_id,
+                    brain = %brain.as_str(),
+                    "a triage run failed, so nobody looked at this decision"
+                );
+                report.unanswered += 1;
+                continue;
+            }
+        };
+        // **An answer nobody could read becomes a `flagged` row that says so, and does not become
+        // nothing.** Writing no row leaves the decision *not looked at*, which is honest and which
+        // starves the queue: with no record that it was attempted it consumes a slot of
+        // [`MAX_TRIAGE_BATCH`] on every future run, so twenty decisions that reliably confuse the
+        // model mean nothing behind them is ever triaged again — a map that has stopped working
+        // while going on reporting honestly that it has. See [`crate::map_triage::unreadable_flag`],
+        // which argues why `flagged` is the one verdict a machine may reach for and what the trade
+        // costs.
+        let (answer, readable) = match crate::map_triage::parse_answer(&said) {
+            Ok(answer) => (answer, true),
+            Err(why) => {
+                // What the model actually said travels into the log AND into the row, because
+                // §6.2's argument applies hardest to the answers that were not judgements: a bug is
+                // only fixable if it is visible.
+                tracing::warn!(
+                    project_id = %id,
+                    decision = anchored.decision_id,
+                    brain = %brain.as_str(),
+                    "the triager answered something that is not a judgement: {why}"
+                );
+                (crate::map_triage::unreadable_flag(&why, &said), false)
+            }
+        };
+
+        let wrote = crate::map_store::triage(
+            &state.pool,
+            &id,
+            anchored.decision_id,
+            answer.judgement,
+            &answer.reason,
+            &model,
+            &digest,
+        )
+        .await
+        .map_err(|error| {
+            // The table refusing the row itself — a blank reason, a blank model, a blank digest —
+            // is a bug in this handler and not a fact about the decision, so it is not counted and
+            // swept past. `parse_answer` already refuses everything `0119` would, so reaching here
+            // means the two disagree, and that is worth stopping for.
+            tracing::warn!(
+                %error,
+                project_id = %id,
+                decision = anchored.decision_id,
+                "recording a judgement failed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if !wrote {
+            report.vanished += 1;
+        } else if readable {
+            report.judged += 1;
+        } else {
+            report.unreadable += 1;
+        }
+    }
+
+    Ok(Json(report))
 }
 
 /// Who last touched each line of a file, in the project or in one run's worktree.
@@ -13235,6 +14494,871 @@ mod tests {
         );
     }
 
+    /// Write down a decision's files, as the window does.
+    async fn post_anchors(state: AppState, project: &str, body: serde_json::Value) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/anchors"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A project whose repository holds one module naming §1, and one approved decision about it.
+    async fn project_with_one_anchored_decision(
+        state: &AppState,
+        id: &str,
+    ) -> (tempfile::TempDir, i64) {
+        let dir = project_with_repo(state, id, "gate_command: x\n").await;
+        let module = dir.path().join("core").join("src").join("a.rs");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "//! This module implements §1.\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "the citation arrives"]);
+        let decision = seed_approved(state, id, "## 1. Alfa", 1, "A decisão.").await;
+        (dir, decision)
+    }
+
+    /// §14 end to end: the comment goes and the association does not.
+    ///
+    /// **The whole point of `map_anchors`, asserted through the two routes that make it real.** The
+    /// before half matters as much as the after: without it the test would pass against a map that
+    /// never anchored the decision at all.
+    #[tokio::test]
+    async fn a_recorded_anchor_survives_the_comment_being_deleted() {
+        let state = test_state().await;
+        let (dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+
+        let before = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(before["junction"]["decisions"][0]["anchor"], "ambiguous");
+        assert_eq!(
+            before["junction"]["decisions"][0]["modules"][0],
+            "core/src/a.rs"
+        );
+
+        assert_eq!(
+            post_anchors(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "paths": ["core/src/a.rs"] }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        // The rewrite that drops the comment — a model inside a plan nobody read to the end.
+        std::fs::write(
+            dir.path().join("core").join("src").join("a.rs"),
+            "//! This module implements nothing at all.\n",
+        )
+        .unwrap();
+
+        let after = get_json(&state, "/projects/alpha/map").await;
+        let row = &after["junction"]["decisions"][0];
+        // Still `silent`, and that is TRUE: no comment names it. What changed is that the row is no
+        // longer empty, so it cannot be read as *nobody ever implemented this*.
+        assert_eq!(row["anchor"], "silent");
+        assert_eq!(row["modules"].as_array().unwrap().len(), 0);
+        assert_eq!(row["record"]["paths"][0], "core/src/a.rs");
+        assert_eq!(row["record"]["source"], "owner");
+    }
+
+    /// Stamping writes the set down, so a green keeps watching the files it was given over.
+    #[tokio::test]
+    async fn stamping_writes_down_which_files_the_decision_s_code_was() {
+        let state = test_state().await;
+        let (_dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "verdict": "settled" }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let held = crate::map_store::anchors(&state.pool, "alpha")
+            .await
+            .unwrap();
+        let record = held.get(&decision).expect("the stamp wrote a record");
+        assert_eq!(record.paths, ["core/src/a.rs"]);
+        assert_eq!(record.source, crate::map_store::AnchorSource::Stamp);
+    }
+
+    /// **A stamp never overwrites a set the owner pointed at**, and this is the rule that keeps a
+    /// choice from being demoted to a guess.
+    ///
+    /// What a stamp can record is whatever the `§` comments happened to say at that instant, which
+    /// while §8 is unfixed is a guess about which document a bare `§` meant. Writing that over a
+    /// deliberate choice would do it silently, at the moment the owner was being most careful.
+    #[tokio::test]
+    async fn a_stamp_never_overwrites_a_set_the_owner_pointed_at() {
+        let state = test_state().await;
+        let (dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+        // A second file, deliberately NOT the one the comment names.
+        let other = dir.path().join("core").join("src").join("b.rs");
+        std::fs::write(&other, "//! Nothing at all.\n").unwrap();
+
+        assert_eq!(
+            post_anchors(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "paths": ["core/src/b.rs"] }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({ "decision_id": decision, "verdict": "settled" }),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let held = crate::map_store::anchors(&state.pool, "alpha")
+            .await
+            .unwrap();
+        let record = held.get(&decision).expect("the record is still there");
+        assert_eq!(record.paths, ["core/src/b.rs"], "the choice stands");
+        assert_eq!(record.source, crate::map_store::AnchorSource::Owner);
+    }
+
+    /// A path that leaves the project is refused before anything is written.
+    ///
+    /// Through `inspect::resolved_within`, the same function `cat` and `grep` use, so the rule has
+    /// one home. A path that simply is not there is refused too: an anchor naming a file the
+    /// project does not have would sit in `Lapse::Moved`'s `gone` for ever.
+    #[tokio::test]
+    async fn a_path_that_leaves_the_project_is_not_written_down() {
+        let state = test_state().await;
+        let (_dir, decision) = project_with_one_anchored_decision(&state, "alpha").await;
+
+        for path in [
+            "../outside.rs",
+            "/etc/passwd",
+            "core/src/never-existed.rs",
+            "core/src",
+        ] {
+            assert_eq!(
+                post_anchors(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({ "decision_id": decision, "paths": [path] }),
+                )
+                .await,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path} should be refused"
+            );
+        }
+
+        assert!(
+            crate::map_store::anchors(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "and nothing was written for any of them"
+        );
+    }
+
+    fn git_in_project(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A registered project whose folder is also a git repository.
+    ///
+    /// Needed by every test that wants a real anchor digest, because `map_stamp::digest` asks git
+    /// and a folder that is not a repository is exactly the input that makes it answer `None`.
+    /// `core.autocrlf false` for the reason `map_stamp`'s own fixture gives: it is `true` from the
+    /// system config on a default Windows install, and a blob hash of bytes git rewrote on the way
+    /// into the index is not the hash of the bytes the test wrote.
+    async fn project_with_repo(state: &AppState, id: &str, yaml: &str) -> tempfile::TempDir {
+        let dir = project_with_rules(state, id, yaml).await;
+        git_in_project(dir.path(), &["init", "-q"]);
+        git_in_project(dir.path(), &["config", "user.email", "test@x"]);
+        git_in_project(dir.path(), &["config", "user.name", "test"]);
+        git_in_project(dir.path(), &["config", "core.autocrlf", "false"]);
+        dir
+    }
+
+    /// A registered git project holding one spec, one module that named §7.1, and the commit that
+    /// took the comment away.
+    async fn project_that_lost_a_citation(state: &AppState, id: &str) -> tempfile::TempDir {
+        let dir = project_with_repo(state, id, "gate_command: x\n").await;
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".ai").join("specs")).unwrap();
+        std::fs::write(
+            root.join(".ai").join("specs").join("a-spec-design.md"),
+            "## 7.1 Uma decisão\n\nO texto da decisão.\n",
+        )
+        .unwrap();
+        let module = root.join("core").join("src").join("a.rs");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+
+        std::fs::write(&module, "//! This module implements §7.1.\n").unwrap();
+        git_in_project(&root, &["add", "-A"]);
+        git_in_project(&root, &["commit", "-q", "-m", "the citation arrives"]);
+
+        std::fs::write(&module, "//! This module implements nothing at all.\n").unwrap();
+        git_in_project(&root, &["add", "-A"]);
+        git_in_project(
+            &root,
+            &["commit", "-q", "-m", "refactor: rewrite the header"],
+        );
+        dir
+    }
+
+    async fn orphan_status(state: &AppState, uri: &str) -> StatusCode {
+        build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// §14's guard, end to end: the sentence the panel puts in front of somebody looking at a row
+    /// of *declarado, sem código*.
+    ///
+    /// The point of running it through the route rather than through `map_orphan` alone is the two
+    /// things only the route does: it turns a heading into a section number through
+    /// `map_join::section_number`, and it hands the guard the project's real spec slugs, which is
+    /// what keeps the answer about ONE document.
+    #[tokio::test]
+    async fn the_orphan_guard_says_which_commit_took_the_citation_away() {
+        let state = test_state().await;
+        let _dir = project_that_lost_a_citation(&state, "alpha").await;
+
+        let answer = get_json(
+            &state,
+            "/projects/alpha/map/orphan?slug=a-spec-design&section=%23%23%207.1",
+        )
+        .await;
+
+        assert_eq!(answer["state"], "lost", "{answer:?}");
+        assert_eq!(answer["losses"][0]["path"], "core/src/a.rs");
+        assert_eq!(
+            answer["losses"][0]["subject"],
+            "refactor: rewrite the header"
+        );
+        assert_eq!(answer["losses"][0]["renamed_to"], serde_json::Value::Null);
+        // §8 is unfixed in this fixture as it is in the repository: the citation named a section
+        // and no document, so the guard reports the same ambiguity the junction reports.
+        assert_eq!(answer["losses"][0]["declared"], false);
+    }
+
+    /// A heading carrying no number is refused, and is not answered *nothing ever named it*.
+    ///
+    /// That is `map_join::Anchor::Unnumbered` reaching the route: an approved decision copied from
+    /// `## Contrato` anchors nothing because nothing could be looked for, and a `200` here saying
+    /// the section was never named would be the report of a search that never ran — over a decision
+    /// that may well be implemented.
+    #[tokio::test]
+    async fn a_heading_with_no_number_is_refused_rather_than_answered() {
+        let state = test_state().await;
+        let _dir = project_that_lost_a_citation(&state, "alpha").await;
+
+        assert_eq!(
+            orphan_status(
+                &state,
+                "/projects/alpha/map/orphan?slug=a-spec-design&section=%23%23%20Contrato"
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// **Archiving or renaming a spec file must not take the guard with it**, and the first version
+    /// of this route let it.
+    ///
+    /// A slug is a filename without its extension, these filenames carry dates, and the folder they
+    /// sit in is gitignored working material that gets reorganised. Every approved decision keeps
+    /// the slug it was extracted under for ever. So a route that answered `404` for a slug missing
+    /// from `map_intent::specs_in` would refuse to answer about rows `GET /map` was still happily
+    /// drawing — the guard being the one part of this map that stops working because a file moved.
+    ///
+    /// The fixture deletes the document outright, which is the harsher half of the same case.
+    #[tokio::test]
+    async fn a_document_that_left_the_folder_is_still_a_document_this_project_has() {
+        let state = test_state().await;
+        let dir = project_that_lost_a_citation(&state, "alpha").await;
+        // A row carrying the slug, which is what makes the table the durable register.
+        seed_approved(&state, "alpha", "## 7.1 Uma decisão", 1, "A decisão.").await;
+        std::fs::remove_file(
+            dir.path()
+                .join(".ai")
+                .join("specs")
+                .join("a-spec-design.md"),
+        )
+        .unwrap();
+
+        // Answered, not refused — and answered with the finding, which is what says the slug still
+        // reached `map_orphan` rather than merely getting past a guard.
+        let answer = get_json(
+            &state,
+            "/projects/alpha/map/orphan?slug=design&section=%23%23%207.1",
+        )
+        .await;
+        assert_eq!(answer["state"], "lost", "{answer:?}");
+    }
+
+    /// A project nobody registered is still a `404`, and that one is `resolve_read_root`'s.
+    ///
+    /// Kept as its own test because it is a different refusal from the one above and the two used
+    /// to be one assertion: *this project does not exist* is about the daemon's own registry, where
+    /// *this document is not in that folder* was about somebody's filesystem — and only the first
+    /// is a fact this route is entitled to have an opinion about.
+    #[tokio::test]
+    async fn a_project_nobody_registered_is_not_searched_for() {
+        let state = test_state().await;
+        let _dir = project_that_lost_a_citation(&state, "alpha").await;
+
+        assert_eq!(
+            orphan_status(
+                &state,
+                "/projects/nowhere/map/orphan?slug=a-spec-design&section=%23%23%207.1"
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The owner's verdict on one decision, as the window sends it: the status and nothing else.
+    ///
+    /// The body goes in whole rather than as typed arguments, because two of the tests below are
+    /// about bodies this route must refuse — an unknown verdict, and an amber with nothing in its
+    /// note — and a helper that could only build valid ones could not ask for them.
+    async fn post_stamp(state: AppState, project: &str, body: serde_json::Value) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/stamps"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn every_approved_decision_gets_a_standing_and_an_unstamped_one_is_never() {
+        // §5.3's `K nunca vistas`, which on day one is every row. The absence of a stamp has to
+        // arrive as a standing the client can count, not as a missing key it has to interpret: a
+        // decision that is simply not in the map is indistinguishable from one the daemon forgot,
+        // and `StampCounts::decisions` is `standings.len()`, so a decision with no standing would
+        // quietly shrink the header's own denominator.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        let one = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let two = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(map["standings"][one.to_string()]["state"], "never");
+        assert_eq!(map["standings"][two.to_string()]["state"], "never");
+        assert_eq!(map["standings"].as_object().unwrap().len(), 2);
+        assert_eq!(map["stamps"]["never"], 2);
+        assert_eq!(map["stamps"]["decisions"], 2);
+        assert_eq!(map["stamps"]["settled"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_stamp_written_through_the_route_comes_back_on_the_map() {
+        // Through the door the routes use, which is the convention `the_map_carries_the_junction`
+        // next door already follows: a fixture that wrote the row itself would go on passing on
+        // the day the writing path stopped producing it.
+        let state = test_state().await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let standing = &map["standings"][id.to_string()];
+        assert_eq!(standing["state"], "settled");
+        // **`guessed` and not `watched`, and the difference is the point.** A module names the
+        // section and git tracks it, so this green really does expire when the file moves — but
+        // `core/src/a.rs` writes `§1` and never says of which document, which is the same
+        // `Anchor::Ambiguous` the junction test next door asserts. It will expire; it may expire
+        // because a file that happens to write `§1` about something else changed. `watched` would
+        // say the map knows what it is watching, and here it does not.
+        assert_eq!(standing["watch"], "guessed");
+        assert_eq!(
+            map["junction"]["decisions"][0]["anchor"], "ambiguous",
+            "the standing's certainty has to follow the join's, not a second opinion"
+        );
+        assert!(standing["stamped_at"].is_string());
+        assert_eq!(map["stamps"]["settled"], 1);
+        assert_eq!(map["stamps"]["guessed"], 1);
+        assert_eq!(map["stamps"]["no_anchor"], 0);
+        assert_eq!(map["stamps"]["untracked"], 0);
+        assert_eq!(
+            map["stamps"]["unwatched"], 0,
+            "a guess still expires, so it is not one of the greens that never will"
+        );
+        assert_eq!(
+            map["git_would_not_answer"], false,
+            "git answered, so there is nothing for the window to say about this reading"
+        );
+
+        // The digest is the DAEMON's and the body never carried one — a client that could supply
+        // it is a client that could mint a green which never expires. Asserted by looking at what
+        // was stored: it names the anchor file, which no part of the request did.
+        let stored = crate::map_store::stamps(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let digest = stored[0]
+            .code_digest
+            .as_deref()
+            .expect("a settled stamp cannot be written without one");
+        assert!(
+            crate::map_stamp::parse(digest).contains_key("core/src/a.rs"),
+            "{digest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_header_numbers_reconcile_with_the_decisions_on_the_map() {
+        // Two header lines on the same screen disagreeing, with nobody noticing, is the disease
+        // reproduced inside the cure — and a header is exactly where a reader stops checking. The
+        // two counts come from different places on purpose: `junction.counts.decisions` from the
+        // join, `stamps.decisions` from `standings.len()`, so they can only agree if this handler
+        // produced exactly one standing per approved decision.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let settled = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let partial = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        let withdrawn = seed_approved(&state, "alpha", "## 3. Gama", 3, "Gama.").await;
+        seed_approved(&state, "alpha", "## 4. Delta", 4, "Delta.").await;
+
+        for body in [
+            serde_json::json!({"decision_id": settled, "verdict": "settled", "note": null}),
+            serde_json::json!({"decision_id": partial, "verdict": "partial",
+                               "note": "falta migrar as páginas de pilar"}),
+            serde_json::json!({"decision_id": withdrawn, "verdict": "withdrawn", "note": null}),
+        ] {
+            assert_eq!(
+                post_stamp(state.clone(), "alpha", body.clone()).await,
+                StatusCode::NO_CONTENT,
+                "{body}"
+            );
+        }
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let stamps = &map["stamps"];
+
+        assert_eq!(stamps["decisions"], map["junction"]["counts"]["decisions"]);
+        assert_eq!(stamps["decisions"], 4);
+        assert_eq!(map["standings"].as_object().unwrap().len(), 4);
+        let five = ["settled", "partial", "never", "lapsed", "withdrawn"]
+            .iter()
+            .map(|which| stamps[which].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(
+            five, 4,
+            "the five standings must cover every decision: {stamps}"
+        );
+        assert_eq!(stamps["settled"], 1);
+        assert_eq!(stamps["partial"], 1);
+        assert_eq!(stamps["withdrawn"], 1);
+        assert_eq!(stamps["never"], 1);
+    }
+
+    #[tokio::test]
+    async fn an_amber_stamp_without_a_note_is_refused_by_the_route_with_400_and_not_500() {
+        // §5.2 makes the note the whole of amber: *falta migrar as páginas de pilar* is worth more
+        // than the colour. `0118`'s CHECK refuses the row and would surface as a 500, which reads
+        // as this daemon having broken — and a malformed request is the client's fault and has to
+        // read as one.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        for note in [serde_json::Value::Null, serde_json::json!("   \t\n")] {
+            assert_eq!(
+                post_stamp(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({"decision_id": id, "verdict": "partial", "note": note}),
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "note {note}"
+            );
+        }
+
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused amber leaves no row behind"
+        );
+    }
+
+    /// A `503` for the one case that is actually transient: git is there and will not answer.
+    ///
+    /// **This test used to name a project with no repository, and it was asserting a lie.** For that
+    /// project the refusal was permanent and the word `503` says *try again* — so the suite was
+    /// green over a daemon telling somebody to retry something that could never succeed. The
+    /// fixture is now a real repository whose index is corrupt, which is a state that genuinely does
+    /// come back; `a_project_with_no_repository_can_still_be_stamped_and_says_nothing_will_ever_expire`
+    /// covers the other half.
+    #[tokio::test]
+    async fn a_settled_stamp_is_refused_with_503_when_git_will_not_answer() {
+        // `503` and not `500`: nothing in this daemon is broken, so the honest thing to say is *try
+        // again*. Storing the green anyway would be the one row this whole feature exists to
+        // prevent — a *está como quero* with nothing to expire it — and `0118`'s CHECK is the
+        // backstop that would have turned it into a 500 instead.
+        let state = test_state().await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+        std::fs::write(dir.path().join(".git/index"), "not an index").unwrap();
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no green was minted over code nobody could read"
+        );
+
+        // The other two verdicts are unmoved by it: neither expires by the code, so neither needs
+        // to know what the code is. §7 still wants the digest when it can be had, and NULL when it
+        // cannot — which is exactly what `0118` lets them store.
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "withdrawn", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        // And the reading says the same thing once, for the whole map, rather than per decision.
+        let map = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(map["git_would_not_answer"], true);
+    }
+
+    #[tokio::test]
+    async fn a_project_with_no_repository_can_still_be_stamped_and_says_nothing_will_ever_expire() {
+        // §11: a project added from outside has no specs and may have no repository. Refusing here
+        // would make the whole feature useless on exactly the projects that spec says must still get
+        // an honest answer — and refusing with a `503` would tell their owner to try again at
+        // something that will never work, which is what this route did before the two failures were
+        // told apart.
+        //
+        // `''` is not a lie for this project: with no repository there is genuinely nothing that
+        // could ever move. What must not happen is that green passing for one that will come back
+        // and ask, and `Watch::NoRepository` is what stops it.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        let anchored = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let nameless = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        for id in [anchored, nameless] {
+            assert_eq!(
+                post_stamp(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(
+            map["standings"][anchored.to_string()]["watch"],
+            "no_repository",
+            "modules name it, and there is no repository to say anything about them"
+        );
+        // The decision no module names is `no_anchor` even here, and that is not a detail: git was
+        // never asked about it, so the answer the owner can act on is §8's, not §11's. A route that
+        // painted the whole project `no_repository` would bury the one thing slice 6 will fix.
+        assert_eq!(map["standings"][nameless.to_string()]["watch"], "no_anchor");
+        assert_eq!(map["stamps"]["no_repository"], 1);
+        assert_eq!(map["stamps"]["no_anchor"], 1);
+        assert_eq!(map["stamps"]["unwatched"], 2);
+        assert_eq!(
+            map["git_would_not_answer"], false,
+            "nothing here failed, so there is nothing to tell this owner to retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn stamping_a_decision_of_another_project_is_404_and_writes_nothing() {
+        // The id is a global integer, so the project in the path is the only thing between one
+        // owner's verdict and another owner's decision.
+        let state = test_state().await;
+        let _a = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _b = project_with_rules(&state, "beta", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "beta",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty(),
+            "alpha's decision is unstamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn stamping_a_decision_nobody_approved_is_404() {
+        // §4: approval is the gate, and nothing reaches the map without it. A verdict on an
+        // unapproved line would put the owner's own word on something they never let in — and the
+        // line is still in the pile, where a wrong stamp would be invisible.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_two_pending(&state, "alpha").await;
+        let id = crate::map_store::pending(&state.pool, "alpha")
+            .await
+            .unwrap()[0]
+            .id;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // And an id that names nothing at all, which is the same answer for the same reason.
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": 9_999, "verdict": "withdrawn", "note": null}),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_verdict_is_refused_at_the_edge() {
+        // §5.2 has three and `0118`'s CHECK admits three. A fourth is refused by serde before this
+        // handler runs at all, which is the earliest place it can be refused and the only one where
+        // no code has yet had a chance to guess what was meant — and guessing is what this map
+        // refuses: `Settled` would invent a green nobody gave, and either of the others would put
+        // words in the owner's mouth.
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        for body in [
+            serde_json::json!({"decision_id": id, "verdict": "maybe", "note": null}),
+            serde_json::json!({"decision_id": id, "verdict": "Settled", "note": null}),
+            serde_json::json!({"decision_id": id, "note": null}),
+        ] {
+            assert_eq!(
+                post_stamp(state.clone(), "alpha", body.clone()).await,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+        }
+        assert!(
+            crate::map_store::stamps(&state.pool, "alpha")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_whose_modules_are_all_untracked_is_untracked_and_not_no_anchor() {
+        // The live case a boolean could not express, measured in this very repository: of ten real
+        // anchor paths, eight got blobs and two did not — `AGENTS.md` and `CLAUDE.md`, which this
+        // repository gitignores. Both greens have nothing to watch and the two are fixed by
+        // different edits: slice 6 puts slugs on citations, and a `.gitignore` line is a
+        // `.gitignore` line. One number meaning both is one the owner cannot act on.
+        let state = test_state().await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "core/src/a.rs\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+
+        let ignored = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let nameless = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        for id in [ignored, nameless] {
+            assert_eq!(
+                post_stamp(
+                    state.clone(),
+                    "alpha",
+                    serde_json::json!({"decision_id": id, "verdict": "settled", "note": null}),
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        // The one whose module git will not report: modules name it, so this is not §8 unfixed.
+        assert_eq!(
+            map["junction"]["decisions"][0]["modules"],
+            serde_json::json!(["core/src/a.rs"]),
+            "the decision really is anchored, which is what makes the empty digest mean something"
+        );
+        assert_eq!(map["standings"][ignored.to_string()]["watch"], "untracked");
+        // And the one no readable module names at all, which is the other silence.
+        assert_eq!(map["standings"][nameless.to_string()]["watch"], "no_anchor");
+        assert_eq!(map["stamps"]["untracked"], 1);
+        assert_eq!(map["stamps"]["no_anchor"], 1);
+        assert_eq!(map["stamps"]["settled"], 2);
+        assert_eq!(map["stamps"]["unwatched"], 2);
+        assert_eq!(
+            map["git_would_not_answer"], false,
+            "git answered perfectly well; it simply had nothing to say about that path"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_digest_is_reported_once_and_not_per_decision() {
+        // `map_stamp::digest` is all-or-nothing by design, and the map calls it once for the union
+        // of every decision's anchors — so a git that will not answer takes every settled stamp in
+        // the project to `Lapse::Unreadable` at the same instant. That is accepted: the alternative
+        // is one process spawn per decision, which is ~350 of them on a read the window makes every
+        // time it opens. What is not accepted is the owner meeting it as a screenful of identical
+        // rows, so the whole reading carries ONE flag saying git would not answer, and the window
+        // has one sentence to print instead of a wall of noise.
+        let state = test_state().await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        std::fs::write(dir.path().join("core/src/c.rs"), "//! §2\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+        let one = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let two = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        // Written straight to the store rather than through the route, because the state under test
+        // is the one that arrives LATER: stamped while git was answering, read once it is not. The
+        // digests are hand-made so the read has something real to fail to compare against.
+        for (id, path) in [(one, "core/src/a.rs"), (two, "core/src/c.rs")] {
+            let digest =
+                crate::map_stamp::canonical([(path, "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567")]);
+            assert!(
+                crate::map_store::stamp(
+                    &state.pool,
+                    "alpha",
+                    id,
+                    crate::map_stamp::Verdict::Settled,
+                    Some(&digest),
+                    None,
+                )
+                .await
+                .unwrap()
+            );
+        }
+
+        // Git is here and will not answer: the repository is intact enough for `rev-parse` and its
+        // index is not readable at all. A folder with no repository would be a different answer —
+        // permanent, nothing to retry — and is the test two above.
+        std::fs::write(dir.path().join(".git/index"), "not an index").unwrap();
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(
+            map["git_would_not_answer"], true,
+            "one flag for the whole reading: {map}"
+        );
+        assert!(
+            map["git_would_not_answer"].is_boolean(),
+            "one sentence and not a list that grows with the decisions"
+        );
+        for id in [one, two] {
+            let standing = &map["standings"][id.to_string()];
+            assert_eq!(standing["state"], "lapsed");
+            assert_eq!(
+                standing["why"]["kind"], "unreadable",
+                "not `moved`: nothing moved, and nagging about a diff nobody can show is the false \
+                 alarm that costs the trust this feature is built to earn"
+            );
+        }
+        assert_eq!(map["stamps"]["lapsed"], 2);
+    }
+
     /// What a model answers when it has read a spec: the shape `parse_extraction` takes.
     ///
     /// Portuguese because the documents are, and the prompt tells the model to answer in the
@@ -13395,6 +15519,1398 @@ mod tests {
                 .is_empty(),
             "nothing was recorded, so nothing was run"
         );
+    }
+
+    /// A runner that answers a triage question, keyed on what the prompt is asking about.
+    ///
+    /// **Keyed on the prompt and not on a queue of answers per call**, which is the same argument
+    /// `FakeCommandRunner::writes` makes and it matters more here: the whole point of these tests is
+    /// which decision got which answer, and a queue taken one entry per call would be asserting
+    /// about the order this handler happens to iterate in rather than about the answers. The marker
+    /// is the decision's text, which is the one thing that identifies a decision from inside a
+    /// prompt.
+    ///
+    /// `FakeCommandRunner` cannot do this: its `canned` outcome is cloned for every call, so every
+    /// decision gets the same answer — which cannot express "one of them came back unreadable and
+    /// the rest were fine", and that is the failure isolation this slice has to prove.
+    #[derive(Default)]
+    struct TriagingRunner {
+        /// `(marker, answer)` — a prompt containing the marker gets that answer, first match wins.
+        answers: Vec<(String, String)>,
+        /// What a prompt matching no marker gets. A well-formed judgement, so a test that means to
+        /// assert about one awkward decision is not also asserting about the others by accident.
+        otherwise: String,
+        /// Every prompt this was handed, in order. The call count is its length, and asserting on
+        /// that is the only way to prove a judgement that was already current cost nothing — "no
+        /// row changed" is also true of a run that asked and was told the same thing again.
+        asked: std::sync::Mutex<Vec<String>>,
+        /// Runs that fail at the launch, keyed the same way. An `Err` and not a non-zero exit,
+        /// because *nobody answered* is the fact this expresses and both arms of it are one answer
+        /// to the caller.
+        refuses: Vec<String>,
+    }
+
+    impl TriagingRunner {
+        fn calls(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runner::CommandRunner for TriagingRunner {
+        async fn run_prompt(
+            &self,
+            request: crate::runner::RunRequest,
+            _session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+            _transcript: Arc<std::sync::Mutex<String>>,
+        ) -> std::io::Result<crate::runner::RunOutcome> {
+            self.asked.lock().unwrap().push(request.prompt.clone());
+            if self
+                .refuses
+                .iter()
+                .any(|marker| request.prompt.contains(marker.as_str()))
+            {
+                return Err(std::io::Error::other(
+                    "this machine could not launch the CLI",
+                ));
+            }
+            let said = self
+                .answers
+                .iter()
+                .find(|(marker, _)| request.prompt.contains(marker.as_str()))
+                .map(|(_, said)| said.clone())
+                .unwrap_or_else(|| self.otherwise.clone());
+            Ok(crate::runner::RunOutcome {
+                exit_code: 0,
+                // The `result` envelope the CLI actually answers in, for `extracting_runner`'s
+                // reason: a fixture that handed back bare JSON would exercise the plain-text path
+                // and prove nothing about the one this route uses.
+                stdout: serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": said,
+                })
+                .to_string(),
+                stderr: String::new(),
+                session_id: Some("fake-session-id".into()),
+                cost_usd: Some(0.0),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+            })
+        }
+    }
+
+    /// One judgement as a model would answer it.
+    fn judgement(verdict: &str, reason: &str) -> String {
+        serde_json::json!({"verdict": verdict, "reason": reason}).to_string()
+    }
+
+    /// A triager that silences everything it is shown, with a reason.
+    fn silencing_runner() -> Arc<TriagingRunner> {
+        Arc::new(TriagingRunner {
+            otherwise: judgement("silenced", "Nada estranho à vista."),
+            ..Default::default()
+        })
+    }
+
+    async fn post_triage(
+        state: AppState,
+        project: &str,
+        brain: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/triage"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"brain": brain}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The seven buckets a decision in scope can end a run in, asserted to cover it exactly once.
+    ///
+    /// §5.3 makes this the house rule for anything the owner reads as a total — *as categorias são
+    /// exaustivas e disjuntas, e um teste verifica que somam ao total em vez de um comentário o
+    /// prometer* — and a run report is exactly where a reader stops checking. Called from every
+    /// test below rather than living in one of its own, because the arithmetic has to hold in the
+    /// awkward cases and not only in the clean one.
+    fn reconciles(report: &serde_json::Value) {
+        let of = |field: &str| {
+            report[field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{field} is a number: {report}"))
+        };
+        assert_eq!(
+            of("already_current")
+                + of("judged")
+                + of("unreadable")
+                + of("unanswered")
+                + of("vanished")
+                + of("left_over")
+                + of("unreadable_anchors"),
+            of("in_scope"),
+            "every decision in scope ends in exactly one bucket: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_triager_never_looks_at_a_decision_somebody_stamped() {
+        // §10's table gives the triager one scope and names it: a decision whose anchor code moved
+        // — *se estava carimbada, caducou (§7.1); se nunca foi vista, o triador decide se vale o
+        // teu olhar.* A stamped decision already carries the owner's answer and a lapsed one
+        // already reaches them, so running a model over either is the model second-guessing a
+        // human, which is the one authority §6 takes away from it.
+        let mut state = test_state().await;
+        let runner = silencing_runner();
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let stamped = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa carimbada.").await;
+        let never = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta por ver.").await;
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": stamped, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let (status, report) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["in_scope"], 1, "{report}");
+        assert_eq!(report["judged"], 1, "{report}");
+        reconciles(&report);
+        // The count is the claim; the calls are the proof. A handler that triaged both and dropped
+        // one answer would report the same numbers and would have spent the money anyway.
+        assert_eq!(
+            runner.calls(),
+            1,
+            "one model call, for the unstamped decision"
+        );
+        let judged = crate::map_store::judgements(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].decision_id, never);
+    }
+
+    #[tokio::test]
+    async fn a_judgement_that_is_still_current_costs_no_model_call() {
+        // `is_current` is what stands between this feature and a bill that grows with the number of
+        // times somebody presses a button rather than with what changed. Asserted on the CALL COUNT
+        // and not on the rows: a run that asked again and stored the identical answer leaves the
+        // table looking exactly like a run that skipped it, and only one of the two is free.
+        let mut state = test_state().await;
+        let runner = silencing_runner();
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        let (_, first) = post_triage(state.clone(), "alpha", "cloud").await;
+        assert_eq!(first["judged"], 2, "{first}");
+        assert_eq!(runner.calls(), 2);
+
+        let (status, again) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["in_scope"], 2, "{again}");
+        assert_eq!(again["already_current"], 2, "{again}");
+        assert_eq!(again["judged"], 0, "{again}");
+        reconciles(&again);
+        assert_eq!(
+            runner.calls(),
+            2,
+            "the second run asked nothing, because nothing it looked at had moved"
+        );
+        // Append-only, so a second row would be visible as one. There is none: the run wrote
+        // nothing at all.
+        let judged = crate::map_store::judgements(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(judged.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_parse_failure_on_one_decision_does_not_abandon_the_rest() {
+        // One confused answer costing the whole batch would make the triager useless on exactly the
+        // repositories that need it — the ones with three hundred decisions, where the chance that
+        // all three hundred answers parse is not one. The failed decision stays *not looked at*,
+        // which is what it is, and the count is how anybody finds out.
+        let mut state = test_state().await;
+        let runner = Arc::new(TriagingRunner {
+            answers: vec![(
+                "Beta confusa.".to_owned(),
+                "Everything here looks correct to me, so no action is needed.".to_owned(),
+            )],
+            otherwise: judgement("flagged", "Nada no repo nomeia esta secção."),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let first = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa boa.").await;
+        let muddled = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta confusa.").await;
+        let third = seed_approved(&state, "alpha", "## 3. Gama", 3, "Gama boa.").await;
+
+        let (status, report) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["in_scope"], 3, "{report}");
+        assert_eq!(report["judged"], 2, "{report}");
+        assert_eq!(report["unreadable"], 1, "{report}");
+        reconciles(&report);
+        assert_eq!(
+            runner.calls(),
+            3,
+            "the confused answer did not stop the sweep at the decision after it"
+        );
+        let judged = crate::map_store::judgements(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(
+            judged.iter().map(|row| row.decision_id).collect::<Vec<_>>(),
+            vec![first, muddled, third],
+            "all three have a row: the two the model answered, and the one it did not, whose row \
+             says a machine wrote it"
+        );
+        let confused = judged
+            .iter()
+            .find(|row| row.decision_id == muddled)
+            .expect("the decision nobody could read an answer for still has a row");
+        assert_eq!(
+            confused.judgement,
+            crate::map_triage::Judgement::Flagged,
+            "never `silenced` — a failure may ask for the owner's eyes and may never clear a \
+             decision out of his queue"
+        );
+        assert!(
+            confused.reason.starts_with("nucleos:"),
+            "the reason says a machine wrote it, or §6.2's pile presents it as the model's \
+             opinion: {}",
+            confused.reason
+        );
+        assert!(
+            confused.reason.contains("Everything here looks correct"),
+            "and it quotes what actually came back, because a bug is only fixable if it is \
+             visible (§6.2): {}",
+            confused.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_nobody_answered_is_not_reported_as_a_run_that_found_nothing() {
+        // The other half of the test above, and the reason the two failures are counted apart. A
+        // brain that is down fails on every decision; a brain that is confused fails on one. Told
+        // as one number, the first reads as "the prompt is broken" and sends somebody to rewrite a
+        // prompt that was never asked.
+        let mut state = test_state().await;
+        let runner = Arc::new(TriagingRunner {
+            refuses: vec!["Alfa.".to_owned()],
+            otherwise: judgement("silenced", "Nada estranho."),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        let (status, report) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["unanswered"], 1, "{report}");
+        assert_eq!(report["unreadable"], 0, "{report}");
+        assert_eq!(report["judged"], 1, "{report}");
+        reconciles(&report);
+    }
+
+    #[tokio::test]
+    async fn the_batch_cap_is_reported_and_not_silently_applied() {
+        // **A silent cap is the disease this whole feature exists to cure**, arriving through the
+        // cure. A run that stopped at twenty of two hundred and answered `204` reads as "covered
+        // everything", which is §1's thousand-line plan wearing a smaller shape. So the leftover is
+        // counted, returned, and the number asserted is the cap's own — a test that only asked for
+        // `left_over > 0` would stay green if somebody raised the ceiling to a thousand and turned
+        // the button into a twenty-minute wait.
+        let mut state = test_state().await;
+        let runner = silencing_runner();
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let over = MAX_TRIAGE_BATCH + 2;
+        for ordinal in 1..=over {
+            seed_approved(
+                &state,
+                "alpha",
+                &format!("## {ordinal}. Secção"),
+                ordinal as i64,
+                &format!("Decisão número {ordinal}."),
+            )
+            .await;
+        }
+
+        let (status, report) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["in_scope"], over, "{report}");
+        assert_eq!(report["judged"], MAX_TRIAGE_BATCH, "{report}");
+        assert_eq!(report["left_over"], 2, "{report}");
+        reconciles(&report);
+        assert_eq!(
+            runner.calls(),
+            MAX_TRIAGE_BATCH,
+            "the cap is on model calls and not merely on rows written"
+        );
+
+        // And it drains rather than starving: the second press skips what the first judged and
+        // reaches the two that were left. A cap that always swept the same first twenty would leave
+        // decision twenty-one unlooked-at for ever — honestly reported, and for ever.
+        let (_, second) = post_triage(state.clone(), "alpha", "cloud").await;
+        assert_eq!(second["already_current"], MAX_TRIAGE_BATCH, "{second}");
+        assert_eq!(second["judged"], 2, "{second}");
+        assert_eq!(second["left_over"], 0, "{second}");
+        reconciles(&second);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_nothing_stale_is_distinguishable_from_a_run_that_did_nothing() {
+        // *"Corri o triador e não aconteceu nada"* and *"corri o triador e estava tudo em dia"* are
+        // different facts, and a route that answered `204` to both would make the second look like
+        // the first. They differ in `in_scope`, which is the number that says whether there was
+        // anything to do at all.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _empty = project_with_rules(&state, "vazio", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let (_, current) = post_triage(state.clone(), "alpha", "cloud").await;
+        let (_, nothing) = post_triage(state.clone(), "vazio", "cloud").await;
+
+        assert_eq!(current["judged"], 0, "{current}");
+        assert_eq!(nothing["judged"], 0, "{nothing}");
+        assert_ne!(
+            current, nothing,
+            "two runs that both wrote nothing, for reasons that are not the same"
+        );
+        assert_eq!(current["in_scope"], 1, "{current}");
+        assert_eq!(current["already_current"], 1, "{current}");
+        assert_eq!(nothing["in_scope"], 0, "{nothing}");
+        assert_eq!(nothing["already_current"], 0, "{nothing}");
+        reconciles(&current);
+        reconciles(&nothing);
+    }
+
+    #[tokio::test]
+    async fn the_triager_cannot_write_a_verdict_the_table_would_refuse() {
+        // §6's forbidden column for the triager is *Aprovar*, and it is written in four places on
+        // purpose. This is two of them, belt and braces: the route drops an `approved` on the floor
+        // and counts it, and the table would refuse the word even if a later caller reached past
+        // every one of them.
+        let mut state = test_state().await;
+        let runner = Arc::new(TriagingRunner {
+            otherwise: judgement("approved", "This matches the code exactly."),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        let (status, report) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["unreadable"], 1, "{report}");
+        assert_eq!(report["judged"], 0, "{report}");
+        reconciles(&report);
+        // **The assertion this test is really about.** `approved` is the one word §6 forbids the
+        // triager, and what it must never become is `silenced` — that would clear the decision out
+        // of the owner's queue on the strength of a word nobody could read. It becomes a flag whose
+        // reason says a machine wrote it, which asks for his eyes and claims nothing.
+        let judged = crate::map_store::judgements(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].judgement, crate::map_triage::Judgement::Flagged);
+        assert!(
+            judged[0].reason.starts_with("nucleos:"),
+            "{}",
+            judged[0].reason
+        );
+        assert!(
+            judged[0].reason.contains("approved"),
+            "the word it actually used is quoted, or nobody can tell this failure from any other: \
+             {}",
+            judged[0].reason
+        );
+
+        // The braces: `0119`'s CHECK, reached past the enum that cannot say the word at all.
+        let refused = sqlx::query(
+            "INSERT INTO map_triage (decision_id, verdict, reason, model, computed_at, inputs_digest)
+             VALUES (?, 'approved', 'looks right', 'cloud', '2026-08-26T00:00:00Z', 'sha256:abc')",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await;
+        assert!(
+            refused.is_err(),
+            "the table is the copy of §6's rule a caller cannot forget"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_project_s_triage_never_touches_another_project_s_decisions() {
+        // `map_triage` carries no `project_id` — it reaches one only through its decision — so the
+        // isolation lives in the JOIN and in the `INSERT ... SELECT`, and neither is visible from a
+        // test that only ever has one project.
+        let mut state = test_state().await;
+        let runner = silencing_runner();
+        state.runner = runner.clone();
+        let _alpha = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _beta = project_with_rules(&state, "beta", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "A decisão do alpha.").await;
+        let theirs = seed_approved(&state, "beta", "## 1. Alfa", 1, "A decisão do beta.").await;
+
+        let (status, report) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["in_scope"], 1, "{report}");
+        assert_eq!(
+            runner.calls(),
+            1,
+            "the other project's decision was not asked about"
+        );
+        assert!(
+            crate::map_store::judgements(&state.pool, "beta")
+                .await
+                .unwrap()
+                .is_empty(),
+            "decision {theirs} belongs to beta and this run was alpha's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_triage_brain_nobody_can_read_is_refused_and_asking_local_with_no_model_is_503() {
+        // Both inherited from `map/extract` deliberately. `Brain::from_wire` reads anything
+        // unfamiliar as `Cloud`, which is right for a conversation and wrong for the one choice the
+        // owner explicitly made — quietly making it in the direction that spends money and sends
+        // the decision off the machine is the worst default to inherit. The 503 is the same promise
+        // from the other side: `local` is what somebody picks when it must not leave the machine.
+        let mut state = test_state().await;
+        let runner = silencing_runner();
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        assert_eq!(
+            post_triage(state.clone(), "alpha", "whatever").await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            post_triage(state.clone(), "alpha", "local").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            runner.calls(),
+            0,
+            "neither refusal fell back to the brain that was not asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_whose_anchors_git_would_not_answer_for_is_skipped_and_counted() {
+        // **The storm this dissolves, reproduced in one test.** The model reads none of its evidence
+        // from git — the decision, the anchor state and the two file lists all come off the tree —
+        // so an answer given during an outage would be perfectly good. The digest is what suffers:
+        // `inputs_digest` keeps the four `Anchors` states apart on purpose (`0118` was amended to
+        // require it), so a judgement recorded under `git-failed` dies the moment git recovers, and
+        // meanwhile every judgement already stored reads stale and would be bought again.
+        //
+        // Skipping removes the source rather than the symptom, and the three presses below are the
+        // proof: one before, one during, one after, with the model asked exactly once.
+        let mut state = test_state().await;
+        let runner = silencing_runner();
+        state.runner = runner.clone();
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "//! §1\n").unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        let (_, healthy) = post_triage(state.clone(), "alpha", "cloud").await;
+        assert_eq!(healthy["judged"], 1, "{healthy}");
+        assert_eq!(runner.calls(), 1);
+
+        std::fs::write(dir.path().join(".git/index"), "not an index").unwrap();
+        let (status, broken) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(status, StatusCode::OK, "{broken}");
+        assert_eq!(broken["in_scope"], 1, "{broken}");
+        assert_eq!(
+            broken["unreadable_anchors"], 1,
+            "in scope and skipped, and the report says by how much rather than merely that it \
+             happened: {broken}"
+        );
+        assert_eq!(broken["judged"], 0, "{broken}");
+        assert_eq!(
+            broken["already_current"], 0,
+            "not counted as current either — `is_current` genuinely says stale during an outage, \
+             and calling that *current* would be the other wrong answer: {broken}"
+        );
+        reconciles(&broken);
+        assert_eq!(
+            runner.calls(),
+            1,
+            "nothing was asked, so the outage cost nothing"
+        );
+
+        // git comes back and the judgement made before it broke is untouched and current. Nothing
+        // was written under `git-failed`, so there is nothing to invalidate.
+        std::fs::remove_file(dir.path().join(".git/index")).unwrap();
+        git_in_project(dir.path(), &["reset", "-q"]);
+        let (_, mended) = post_triage(state.clone(), "alpha", "cloud").await;
+        assert_eq!(
+            mended["already_current"], 1,
+            "the answer survived the outage, which is the whole point of skipping: {mended}"
+        );
+        assert_eq!(mended["unreadable_anchors"], 0, "{mended}");
+        reconciles(&mended);
+        assert_eq!(runner.calls(), 1, "and still only ever one model call");
+
+        // §11's project with no repository is NOT this case and is triaged normally — the digest
+        // there is honest and permanent, so refusing or skipping would make the feature useless on
+        // exactly the projects that spec says must still get an answer.
+        let _outside = project_with_rules(&state, "fora", "gate_command: x\n").await;
+        seed_approved(&state, "fora", "## 1. Alfa", 1, "Sem repositório.").await;
+        let (_, outside) = post_triage(state.clone(), "fora", "cloud").await;
+        assert_eq!(outside["unreadable_anchors"], 0, "{outside}");
+        assert_eq!(outside["judged"], 1, "{outside}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_nobody_could_read_stops_costing_a_slot_on_every_future_run() {
+        // **The starvation this fixes, and it is the failure that would have killed the feature
+        // quietly.** With no row, a decision the model reliably confuses is stale again next run and
+        // takes a slot of `MAX_TRIAGE_BATCH` for ever. Twenty of them early in the sweep and nothing
+        // behind them is ever triaged again — a map that has stopped working while going on
+        // reporting, accurately, that it has.
+        //
+        // The row carries an `inputs_digest` like any other, so the decision reads current and the
+        // slot is released. What it costs is named in `map_triage::unreadable_flag` and is asserted
+        // at the end here: the flag is pinned until the inputs move.
+        let mut state = test_state().await;
+        let runner = Arc::new(TriagingRunner {
+            otherwise: "I am not going to answer that in JSON.".to_owned(),
+            ..Default::default()
+        });
+        state.runner = runner.clone();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        let (_, first) = post_triage(state.clone(), "alpha", "cloud").await;
+        assert_eq!(first["unreadable"], 1, "{first}");
+        assert_eq!(first["judged"], 0, "{first}");
+        reconciles(&first);
+        assert_eq!(runner.calls(), 1);
+
+        let (_, again) = post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(
+            again["already_current"], 1,
+            "the attempt is on the record, so the decision is not asked about again: {again}"
+        );
+        assert_eq!(again["unreadable"], 0, "{again}");
+        reconciles(&again);
+        assert_eq!(
+            runner.calls(),
+            1,
+            "the slot is released — this is the whole of the fix, and a run that asked again would \
+             be the starvation back"
+        );
+
+        // The cost, asserted rather than only argued: the flag stands until the inputs move. A
+        // decision whose text nobody has touched keeps a verdict a machine wrote about one bad
+        // answer — a visible wrong flag, which is the right way round against an invisible dead
+        // queue.
+        let judged = crate::map_store::judgements(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].judgement, crate::map_triage::Judgement::Flagged);
+        assert!(!judged[0].inputs_digest.is_empty());
+    }
+
+    /// A module of this project that names one section and nothing else.
+    ///
+    /// Writing one AFTER a triage run is how these tests move a decision's `inputs_digest`: the
+    /// anchor set grows, so the evidence the model was shown is no longer the evidence that stands,
+    /// which is `map_triage::inputs_digest`'s whole subject. Cheaper and more honest than editing
+    /// the decision's text, because a decision whose words changed is a different question, while
+    /// this is the same question over code that moved — §10's first trigger, in a fixture.
+    fn anchor_file(dir: &tempfile::TempDir, name: &str, section: u32) {
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(
+            dir.path().join("core/src").join(name),
+            format!("//! §{section}\n"),
+        )
+        .unwrap();
+    }
+
+    /// §5.3's header, read off the map and asserted to reconcile.
+    ///
+    /// **Called from every test below rather than living in one of its own**, exactly as
+    /// [`reconciles`] is for the run report, and for the reason §5.3 gives: *as categorias são
+    /// exaustivas e disjuntas, e um teste verifica que somam ao total em vez de um comentário o
+    /// prometer*. The arithmetic has to hold over the awkward populations and not only the clean
+    /// one, which is why this is a helper and not a test.
+    fn header_reconciles(map: &serde_json::Value) {
+        let of = |group: &str, field: &str| {
+            map[group][field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{group}.{field} is a number: {map}"))
+        };
+        let flagged = of("triage_counts", "flagged");
+        let silenced = of("triage_counts", "silenced");
+        let never = of("stamps", "never");
+
+        assert_eq!(
+            flagged + silenced + of("triage_counts", "untriaged"),
+            never,
+            "every never-stamped decision is flagged, silenced or untriaged, exactly once: {map}"
+        );
+        assert_eq!(
+            of("triage_counts", "waiting"),
+            of("stamps", "lapsed") + flagged,
+            "§5.3's `J` is the lapsed stamps plus what the triager assinalou: {map}"
+        );
+        // **`K = never − flagged`, and a silence is never subtracted.** §5.1 says a silenced
+        // decision is one *ninguém olhou*, so it is still debt; the only pile that leaves `K` is
+        // the flagged, and it leaves because it has arrived in `J`.
+        assert_eq!(
+            of("triage_counts", "unseen"),
+            silenced + of("triage_counts", "untriaged"),
+            "`K` is exactly its two parts: {map}"
+        );
+        assert_eq!(
+            of("triage_counts", "unseen"),
+            never - flagged,
+            "§5.3's `K` is `never − flagged`: {map}"
+        );
+        assert_eq!(
+            map["triage"].as_object().expect("triage is a map").len() as u64,
+            flagged + silenced,
+            "the rows the panel draws are exactly the judgements these numbers counted: {map}"
+        );
+        assert!(
+            of("triage_counts", "unchecked") <= flagged + silenced,
+            "unchecked is a subset of the two piles and never a fourth one: {map}"
+        );
+    }
+
+    /// The silenced pile as the window asks for it — the rows, with the uncapped total checked.
+    ///
+    /// The total is asserted here rather than in each caller because it is a property of every read
+    /// of this route and not of any one test: the answer is capped, and a reader that could see only
+    /// `rows.len()` would read a truncated pile as the whole of it. Every test below writes fewer
+    /// rows than `SILENCED_PAGE`, so the two must agree — the cap itself is exercised where it can
+    /// be saturated cheaply, in `map_store`.
+    async fn get_silenced(state: &AppState, project: &str) -> Vec<serde_json::Value> {
+        let pile = get_json(state, &format!("/projects/{project}/map/silenced")).await;
+        let rows = pile["rows"].as_array().expect("the pile is a list").clone();
+        assert_eq!(
+            pile["total"].as_u64(),
+            Some(rows.len() as u64),
+            "nothing here writes past the cap, so the total is the length: {pile}"
+        );
+        rows
+    }
+
+    #[tokio::test]
+    async fn every_approved_decision_gets_a_triage_entry_or_none_and_never_a_stale_one() {
+        // **Keyed by decision id, and the absence is the third state.** A decision the triager has
+        // not looked at is simply not in the map — a placeholder would be something a reader has to
+        // interpret rather than something they can count, and §5.3 requires these to add up. What
+        // may never be in the map is a judgement that is no longer about this code: a stale answer
+        // presented as current is an approximate answer wearing an exact one's clothes, which is
+        // the one trade this feature never makes.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let first = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let second = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+
+        // Before anybody presses the button: no entries at all, and `K` is every decision.
+        let untouched = get_json(&state, "/projects/alpha/map").await;
+        assert!(
+            untouched["triage"]
+                .as_object()
+                .expect("triage is a map even when it is empty")
+                .is_empty(),
+            "{untouched}"
+        );
+        assert_eq!(untouched["triage_counts"]["unseen"], 2, "{untouched}");
+        header_reconciles(&untouched);
+
+        post_triage(state.clone(), "alpha", "cloud").await;
+        let judged = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(judged["triage"][first.to_string()]["judgement"], "silenced");
+        assert_eq!(
+            judged["triage"][second.to_string()]["judgement"],
+            "silenced"
+        );
+        assert_eq!(judged["triage_counts"]["silenced"], 2, "{judged}");
+        assert_eq!(judged["triage_counts"]["untriaged"], 0, "{judged}");
+        // **And `K` has not moved**, because a silence is *ninguém olhou* — see
+        // `a_silence_does_not_pay_off_a_debt_nobody_looked_at`, which is this rule on its own.
+        assert_eq!(judged["triage_counts"]["unseen"], 2, "{judged}");
+        // Checked, because git answered — the flag `a_judgement_git_could_not_re_check…` is about.
+        assert_eq!(judged["triage"][first.to_string()]["checked"], true);
+        assert_eq!(judged["triage_counts"]["unchecked"], 0, "{judged}");
+        header_reconciles(&judged);
+
+        // Now the code behind the FIRST decision moves. Its judgement was written about an anchor
+        // set that no longer exists, so it stops being an answer about this map — and the decision
+        // goes back to being one nobody has looked at, which is what it is.
+        anchor_file(&dir, "alfa.rs", 1);
+        let moved = get_json(&state, "/projects/alpha/map").await;
+
+        assert!(
+            moved["triage"][first.to_string()].is_null(),
+            "a judgement about code that has since moved is not an answer about the code as it \
+             stands: {moved}"
+        );
+        assert_eq!(moved["triage"][second.to_string()]["judgement"], "silenced");
+        assert_eq!(moved["triage_counts"]["silenced"], 1, "{moved}");
+        assert_eq!(
+            moved["triage_counts"]["untriaged"], 1,
+            "the decision whose anchors moved is one nobody has a current answer about: {moved}"
+        );
+        assert_eq!(moved["triage_counts"]["unseen"], 2, "{moved}");
+        header_reconciles(&moved);
+    }
+
+    #[tokio::test]
+    async fn a_judgement_about_a_decision_somebody_stamped_is_not_counted() {
+        // **The first of the two filters §5.3's arithmetic needs, and the one that would go
+        // unnoticed.** Nothing deletes a judgement when a decision is later stamped and nothing
+        // should — §6.2 keeps the silenced pile *sempre acessível*, with no exception for decisions
+        // that moved on — so `judgements()` goes on returning a `Flagged` row for a decision the
+        // owner settled this morning. Counted naively, that decision appears in `settled` AND in
+        // `flagged`: two header lines on one screen disagreeing, which is the disease reproduced
+        // inside the cure.
+        let mut state = test_state().await;
+        state.runner = Arc::new(TriagingRunner {
+            answers: vec![(
+                "Alfa.".to_owned(),
+                judgement("flagged", "Isto merece o teu olhar."),
+            )],
+            otherwise: judgement("silenced", "Nada estranho."),
+            ..Default::default()
+        });
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let stamped = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let never = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": stamped, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(map["stamps"]["settled"], 1, "{map}");
+        assert_eq!(map["stamps"]["never"], 1, "{map}");
+        assert_eq!(
+            map["triage_counts"]["flagged"], 0,
+            "the flag was about a decision that now carries the owner's own answer: {map}"
+        );
+        assert!(
+            map["triage"][stamped.to_string()].is_null(),
+            "and it is off the wire as well as out of the count, or the panel draws *à espera* on \
+             a green: {map}"
+        );
+        assert_eq!(map["triage"][never.to_string()]["judgement"], "silenced");
+        header_reconciles(&map);
+
+        // The row is still in the table. Nothing here deleted it, and §6.2 is why.
+        let rows = crate::map_store::judgements(&state.pool, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "the judgement was filtered, never deleted");
+    }
+
+    #[tokio::test]
+    async fn a_judgement_whose_inputs_moved_is_not_counted_either() {
+        // **The second filter.** A judgement whose `inputs_digest` no longer matches is a model's
+        // opinion of a file it never saw. Counting it is worse than counting nothing: `K nunca
+        // vistas` is debt and is supposed to be uncomfortable (§5.3), and a stale silence quietly
+        // pays it off with an answer nobody gave.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let current = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(current["triage_counts"]["silenced"], 2, "{current}");
+        assert_eq!(current["triage_counts"]["untriaged"], 0, "{current}");
+
+        // A module appears naming §2. Nothing about decision 1 has changed, which is what makes
+        // this an assertion about staleness rather than about a route that forgot everything.
+        anchor_file(&dir, "beta.rs", 2);
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(map["triage_counts"]["silenced"], 1, "{map}");
+        assert_eq!(
+            map["triage_counts"]["untriaged"], 1,
+            "the decision whose anchors moved has no current answer, which is where §10 sends the \
+             triager back over it: {map}"
+        );
+        // **Tested and failed, so genuinely dropped** — and NOT held as unchecked. That third value
+        // exists only for a digest that could not be computed at all, and reaching for it here
+        // would freeze every stale judgement as permanently current.
+        assert_eq!(map["triage_counts"]["unchecked"], 0, "{map}");
+        header_reconciles(&map);
+
+        // And the pile is untouched by any of this — §6.2's door does not filter on staleness, so
+        // the silence whose reason was written about code that has since moved is exactly the one
+        // still worth reading.
+        assert_eq!(get_silenced(&state, "alpha").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_header_numbers_reconcile_over_a_mixed_population() {
+        // **The property test, over the awkward population and never a clean one.** §5.3's `J =
+        // lapsed + flagged` and `K = never − flagged − silenced` hold trivially on a project where
+        // every judgement is fresh and nothing is stamped, and that project does not exist a week
+        // after the button is first pressed. This one has all five shapes in it at once: a decision
+        // flagged and then stamped, one silenced whose anchors then moved, one nobody has triaged,
+        // one flagged and still current, and one whose green has lapsed.
+        //
+        // A real repository, because `Standing::Lapsed` cannot be produced without one — a folder
+        // that is not a repository answers `Anchors::NoRepository`, which is a settled green with
+        // nothing to watch and not a lapse.
+        let mut state = test_state().await;
+        state.runner = Arc::new(TriagingRunner {
+            answers: vec![
+                (
+                    "Alfa.".to_owned(),
+                    judgement("flagged", "Merece o teu olhar."),
+                ),
+                (
+                    "Delta.".to_owned(),
+                    judgement("flagged", "Isto não bate certo."),
+                ),
+            ],
+            otherwise: judgement("silenced", "Nada estranho."),
+            ..Default::default()
+        });
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        anchor_file(&dir, "epsilon.rs", 5);
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+
+        let stamped = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let stale = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        let waiting = seed_approved(&state, "alpha", "## 4. Delta", 4, "Delta.").await;
+        let lapsing = seed_approved(&state, "alpha", "## 5. Epsilon", 5, "Epsilon.").await;
+
+        // Green over §5 while its anchor still holds, so the lapse below is a real expiry and not a
+        // stamp that was never watching anything.
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": lapsing, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        // Approved AFTER the run, so it is genuinely one nobody has looked at rather than one the
+        // fixture pretended not to look at. This is what §5.3's `K` is made of on day one, and a
+        // population without it would leave `unseen` asserted against zero.
+        let untouched = seed_approved(&state, "alpha", "## 3. Gama", 3, "Gama.").await;
+
+        // Now break each one in its own way. `Gama` is touched by none of it.
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": stamped, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        anchor_file(&dir, "beta.rs", 2);
+        std::fs::write(
+            dir.path().join("core/src/epsilon.rs"),
+            "//! §5\npub fn moved() {}\n",
+        )
+        .unwrap();
+        git_in_project(dir.path(), &["add", "-A"]);
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        // **The reconciliation, which is the whole of this test.**
+        header_reconciles(&map);
+
+        assert_eq!(map["stamps"]["decisions"], 5, "{map}");
+        assert_eq!(map["stamps"]["settled"], 1, "{map}");
+        assert_eq!(map["stamps"]["lapsed"], 1, "{map}");
+        assert_eq!(map["stamps"]["never"], 3, "{map}");
+        // Only `Delta` survives both filters: `Alfa`'s flag is about a decision that has been
+        // stamped, and `Beta`'s silence is about an anchor set that has moved.
+        assert_eq!(map["triage_counts"]["flagged"], 1, "{map}");
+        assert_eq!(map["triage_counts"]["silenced"], 0, "{map}");
+        assert_eq!(map["triage_counts"]["untriaged"], 2, "{map}");
+        assert_eq!(map["triage_counts"]["unseen"], 2, "{map}");
+        // §5.3's `J`: the lapsed green plus the one live flag. The two reach the owner for opposite
+        // reasons and are one number, because the header promises *how many things want you today*.
+        assert_eq!(map["triage_counts"]["waiting"], 2, "{map}");
+
+        assert_eq!(map["triage"][waiting.to_string()]["judgement"], "flagged");
+        for gone in [stamped, stale, untouched, lapsing] {
+            assert!(
+                map["triage"][gone.to_string()].is_null(),
+                "decision {gone} carries a triage verdict it is not in scope for: {map}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_silenced_pile_still_shows_a_silencing_of_a_decision_that_was_later_stamped() {
+        // **This route filters on NEITHER standing nor staleness, and that is the exact opposite of
+        // what `GET /map` does with the same rows.** The map answers *what is true now*; this pile
+        // answers *what the triager did*. A silencing that was wrong is exactly as worth reading
+        // after the decision was stamped as before — if anything it is worth more, because the
+        // stamp is the evidence the silence was premature, and §6.2's whole argument is *um bug só
+        // é corrigível se for visível*.
+        //
+        // Somebody will read the two filters as an inconsistency and repair it. This test is what
+        // stops them: the repair breaks §6.2 in one direction or §5.3 in the other.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let stamped = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let never = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+        assert_eq!(
+            post_stamp(
+                state.clone(),
+                "alpha",
+                serde_json::json!({"decision_id": stamped, "verdict": "settled", "note": null}),
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let pile = get_silenced(&state, "alpha").await;
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(
+            pile.iter()
+                .map(|row| row["decision_id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([stamped, never]),
+            "the pile is what the triager did, and the owner stamping something afterwards did not \
+             un-silence it: {pile:?}"
+        );
+        // And the same decision is absent from the map's own triage map at the same instant, which
+        // is the pair this test exists to pin. Neither is a bug in the other.
+        assert!(map["triage"][stamped.to_string()].is_null(), "{map}");
+        assert_eq!(map["triage_counts"]["silenced"], 1, "{map}");
+        header_reconciles(&map);
+    }
+
+    #[tokio::test]
+    async fn silencing_the_whole_backlog_does_not_shrink_the_debt_nobody_looked_at() {
+        // **§5.3's `K` through the route, and the number that would have made this feature a
+        // liar.** *Silenciado* is *"sem sinal de problema. **Ninguém olhou.** Não é verde"* (§5.1),
+        // so a silenced decision is still one the owner has given no verdict on — and `K` *"é
+        // dívida, e é suposto incomodar"*. A formula that subtracted the silenced would let one
+        // press of a button turn a three-hundred-row backlog into `0 nunca vistas`: §1's false
+        // confidence, manufactured by the cure's own arithmetic, on the one line built to be
+        // uncomfortable.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        for ordinal in 1..=3 {
+            seed_approved(
+                &state,
+                "alpha",
+                &format!("## {ordinal}. Secção"),
+                ordinal,
+                &format!("Decisão {ordinal}."),
+            )
+            .await;
+        }
+
+        let before = get_json(&state, "/projects/alpha/map").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+        let after = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(before["triage_counts"]["unseen"], 3, "{before}");
+        assert_eq!(after["triage_counts"]["silenced"], 3, "{after}");
+        assert_eq!(
+            after["triage_counts"]["unseen"], 3,
+            "the triager silenced everything and the debt did not move by one: {after}"
+        );
+        // **What a silence DOES buy, which is the other half of the rule.** Nothing entered `J`.
+        // That is the triager's whole job: deciding what deserves the owner's eyes, never deciding
+        // what has already been seen.
+        assert_eq!(after["triage_counts"]["waiting"], 0, "{after}");
+        header_reconciles(&after);
+    }
+
+    #[tokio::test]
+    async fn a_judgement_git_could_not_re_check_is_kept_and_marked_rather_than_dropped() {
+        // **The collapse this prevents is the size of the whole project.** Every judgement is
+        // stored against a `Computed(...)` reading, so the moment git will not answer, every one of
+        // them mismatches a `git-failed` digest — and a two-valued staleness test drops all of
+        // them, emptying `triage` and reporting a whole backlog as *nunca vista*. That is a fact
+        // about this daemon presented as a fact about the project, which is exactly the collapse
+        // `map_stamp::Lapse::Unreadable` exists one table over to prevent.
+        //
+        // A flag we could not re-verify is still a flag; a flag we discarded becomes a claim that
+        // nobody ever looked.
+        let mut state = test_state().await;
+        state.runner = Arc::new(TriagingRunner {
+            otherwise: judgement("flagged", "Isto merece o teu olhar."),
+            ..Default::default()
+        });
+        let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
+        anchor_file(&dir, "alfa.rs", 1);
+        git_in_project(dir.path(), &["add", "-A"]);
+        git_in_project(dir.path(), &["commit", "-q", "-m", "seed"]);
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let healthy = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(
+            healthy["triage"][id.to_string()]["checked"],
+            true,
+            "{healthy}"
+        );
+        assert_eq!(healthy["triage_counts"]["flagged"], 1, "{healthy}");
+
+        // git breaks, exactly as `a_decision_whose_anchors_git_would_not_answer_for_is_skipped…`
+        // breaks it.
+        std::fs::write(dir.path().join(".git/index"), "not an index").unwrap();
+        let broken = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(broken["git_would_not_answer"], true, "{broken}");
+        assert_eq!(
+            broken["triage_counts"]["flagged"], 1,
+            "the flag is still a flag — the header may not move because git hiccuped: {broken}"
+        );
+        assert_eq!(broken["triage_counts"]["untriaged"], 0, "{broken}");
+        // **Marked on the row and counted apart**, so nothing can present it as verified against
+        // the code as it stands. The count alone would leave a panel guessing which row it was.
+        assert_eq!(
+            broken["triage"][id.to_string()]["checked"],
+            false,
+            "{broken}"
+        );
+        assert_eq!(broken["triage_counts"]["unchecked"], 1, "{broken}");
+        assert_eq!(
+            broken["triage"][id.to_string()]["reason"],
+            "Isto merece o teu olhar.",
+            "and the row is whole, not a stub: {broken}"
+        );
+        header_reconciles(&broken);
+
+        // git comes back and the judgement is checked again, untouched. Nothing was rewritten and
+        // nothing was lost — which is what makes keeping it cheaper than dropping it.
+        std::fs::remove_file(dir.path().join(".git/index")).unwrap();
+        git_in_project(dir.path(), &["reset", "-q"]);
+        let mended = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(
+            mended["triage"][id.to_string()]["checked"],
+            true,
+            "{mended}"
+        );
+        assert_eq!(mended["triage_counts"]["unchecked"], 0, "{mended}");
+        header_reconciles(&mended);
+    }
+
+    #[tokio::test]
+    async fn the_silenced_pile_shows_every_silencing_and_not_only_the_latest_judgement() {
+        // §6.2 asks for *"a razão de **cada** silenciamento"*. A pile built on
+        // `map_store::judgements` answers with one row per decision, so a decision silenced twice
+        // and then flagged had two silencings in the table and none in the pile — `map_triage` was
+        // made append-only for exactly those rows and nothing was reading them.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        // Its anchor code moves, so the judgement goes stale and a second press asks again.
+        anchor_file(&dir, "alfa.rs", 1);
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        // Then the triager changes its mind, which is the row a latest-only pile loses.
+        state.runner = Arc::new(TriagingRunner {
+            otherwise: judgement("flagged", "Afinal isto merece o teu olhar."),
+            ..Default::default()
+        });
+        anchor_file(&dir, "alfa-outra.rs", 1);
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let pile = get_silenced(&state, "alpha").await;
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(
+            pile.len(),
+            2,
+            "both silencings survive the flag that overturned them: {pile:?}"
+        );
+        assert!(pile.iter().all(|row| row["decision_id"] == id), "{pile:?}");
+        // The map, at the same instant, says the current answer is a flag. The pair is the point:
+        // one route answers *what is true now* and the other *what the triager did*.
+        assert_eq!(map["triage"][id.to_string()]["judgement"], "flagged");
+        assert_eq!(map["triage_counts"]["silenced"], 0, "{map}");
+        header_reconciles(&map);
+    }
+
+    #[tokio::test]
+    async fn a_silencing_survives_the_decision_being_retired() {
+        // **The third filter this route does not apply.** `judgements`'s JOIN drops a retired
+        // decision, so a silencing of one the owner later said no to — or that a re-extraction
+        // superseded — vanished without trace. Auditing what the triager did does not care whether
+        // the decision survived; §6.2's *sempre acessível* has no exception for it, and deleting
+        // the bug report by way of its own subject is the one repair §13's mitigation cannot take.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let id = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        sqlx::query("UPDATE map_decisions SET retired_at = ? WHERE id = ?")
+            .bind("2026-08-26T12:00:00+00:00")
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let pile = get_silenced(&state, "alpha").await;
+        let map = get_json(&state, "/projects/alpha/map").await;
+
+        assert_eq!(pile.len(), 1, "{pile:?}");
+        assert_eq!(pile[0]["decision_id"], id);
+        // **Reported rather than hidden**, so the pile says the decision is gone while still
+        // showing what was said about it.
+        assert_eq!(pile[0]["retired"], true, "{:?}", pile[0]);
+        assert_eq!(pile[0]["text"], "Alfa.");
+        // And the map has neither the decision nor its judgement — the asymmetry from the other
+        // side. A retired decision is not in the map, so it has no standing to be counted against.
+        assert_eq!(map["stamps"]["decisions"], 0, "{map}");
+        assert!(map["triage"].as_object().unwrap().is_empty(), "{map}");
+        header_reconciles(&map);
+    }
+
+    #[tokio::test]
+    async fn the_silenced_pile_carries_the_reason_and_the_model_that_produced_it() {
+        // §6.2, word for word: *"com a razão de cada silenciamento e o modelo que o produziu"*. §13
+        // rates *o triador silencia o que devia mostrar* a real residual risk whose ONLY mitigation
+        // is this, so a pile that would not say why, or who, is the mitigation missing.
+        let mut state = test_state().await;
+        state.runner = Arc::new(TriagingRunner {
+            answers: vec![(
+                "Beta.".to_owned(),
+                judgement("flagged", "Nada no repo nomeia esta secção."),
+            )],
+            otherwise: judgement("silenced", "Vi o módulo e bate certo com a decisão."),
+            ..Default::default()
+        });
+        let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let silenced = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let pile = get_silenced(&state, "alpha").await;
+
+        assert_eq!(pile.len(), 1, "a flag is not a silencing: {pile:?}");
+        let row = &pile[0];
+        assert_eq!(row["decision_id"], silenced);
+        assert_eq!(row["reason"], "Vi o módulo e bate certo com a decisão.");
+        assert_eq!(row["model"], "cloud");
+        assert!(
+            row["computed_at"]
+                .as_str()
+                .is_some_and(|when| !when.is_empty()),
+            "{row}"
+        );
+        // **The decision's own words travel with it**, or this is a list of ids and the owner has
+        // to do the cross-reference §1 says they cannot.
+        assert_eq!(row["text"], "Alfa.");
+        assert_eq!(row["section"], "## 1. Alfa");
+        assert_eq!(row["spec_slug"], "design");
+        assert_eq!(row["retired"], false, "{row}");
+        // **`machine_written` is deliberately NOT here, and its absence is the correction.** It sat
+        // on this row for one slice and could not be `true` on it: `unreadable_flag` may only ever
+        // reach `flagged` and this route selects the silenced. So the payload where the answer was
+        // provably always `false` carried the field while `GET /map`'s `triage` — the one place a
+        // `nucleos:` sentence can appear — carried nothing, and a client duly re-spelled
+        // `DAEMON_MARK` in its own language. Asserted as absent rather than left untested, because
+        // a field that cannot be true is a promise somebody eventually relies on.
+        assert!(
+            row.get("machine_written").is_none(),
+            "the mark belongs to the pile that can carry it: {row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flag_this_daemon_wrote_itself_says_so_and_is_never_the_model_s_opinion() {
+        // **This is the pile where a machine-written sentence actually appears**, which is why the
+        // field moved here. `unreadable_flag` records an answer nobody could parse as a flag rather
+        // than dropping it — a confused model costs a look instead of disappearing — and `model`
+        // names the brain that ANSWERED, which stays true of an answer nobody could read. A client
+        // handed `reason` under `model` and nothing else shows a machine's failure note as a
+        // model's opinion about the code, which is §6.2's attribution inverted.
+        let mut state = test_state().await;
+        state.runner = Arc::new(TriagingRunner {
+            answers: vec![("Alfa.".to_owned(), "isto não é um veredicto".to_owned())],
+            otherwise: judgement("flagged", "Isto contradiz o que o módulo faz."),
+            ..Default::default()
+        });
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "gate_command: x
+",
+        )
+        .await;
+        let unreadable = seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+        let answered = seed_approved(&state, "alpha", "## 2. Beta", 2, "Beta.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let triage = map["triage"].as_object().expect("triage is a map");
+
+        let written = &triage[&unreadable.to_string()];
+        assert_eq!(
+            written["judgement"], "flagged",
+            "an answer nobody could read costs a look and never a silence: {map}"
+        );
+        assert_eq!(
+            written["machine_written"], true,
+            "the daemon wrote that sentence, and the payload has to say so: {map}"
+        );
+        assert_eq!(
+            written["model"], "cloud",
+            "while `model` still names the brain that was asked, which is what makes the flag              ambiguous without the field beside it: {map}"
+        );
+
+        assert_eq!(
+            triage[&answered.to_string()]["machine_written"],
+            false,
+            "and a model's own sentence is the model's: {map}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_nobody_triaged_says_so_and_one_that_was_carries_the_hour() {
+        // **`triage` and `triage_counts` both describe what is true NOW, and neither can say whether
+        // a run ever happened.** A run that flagged everything and whose answers have since gone
+        // stale empties both — identical, on the wire, to a project nobody ever pressed the button
+        // on. Those are different facts and only one of them is *nobody has looked at this with a
+        // model yet*, so the panel was left hedging over the gap.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "gate_command: x
+",
+        )
+        .await;
+        seed_approved(&state, "alpha", "## 1. Alfa", 1, "Alfa.").await;
+
+        let before = get_json(&state, "/projects/alpha/map").await;
+        assert!(
+            before["last_triaged_at"].is_null(),
+            "never run is a real answer, and null is it: {before}"
+        );
+
+        post_triage(state.clone(), "alpha", "cloud").await;
+
+        let after = get_json(&state, "/projects/alpha/map").await;
+        assert!(
+            after["last_triaged_at"]
+                .as_str()
+                .is_some_and(|when| !when.is_empty()),
+            "{after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_project_s_silenced_pile_is_not_another_s() {
+        // `map_triage` carries no `project_id` — it reaches one only through its decision — so this
+        // isolation lives entirely in a JOIN, and a JOIN is invisible to a test with one project in
+        // it. §6.2 makes the pile readable by anybody holding a read-only key, which is exactly the
+        // key that must not be able to read a neighbour's.
+        let mut state = test_state().await;
+        state.runner = silencing_runner();
+        let _alpha = project_with_rules(&state, "alpha", "gate_command: x\n").await;
+        let _beta = project_with_rules(&state, "beta", "gate_command: x\n").await;
+        let mine = seed_approved(&state, "alpha", "## 1. Alfa", 1, "A decisão do alpha.").await;
+        let theirs = seed_approved(&state, "beta", "## 1. Alfa", 1, "A decisão do beta.").await;
+        post_triage(state.clone(), "alpha", "cloud").await;
+        post_triage(state.clone(), "beta", "cloud").await;
+
+        let ours = get_silenced(&state, "alpha").await;
+        let others = get_silenced(&state, "beta").await;
+
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0]["decision_id"], mine);
+        assert_eq!(ours[0]["text"], "A decisão do alpha.");
+        assert_eq!(others.len(), 1, "{others:?}");
+        assert_eq!(others[0]["decision_id"], theirs);
+
+        // And a project nobody registered is a 404 rather than an empty pile: *nothing was
+        // silenced* and *there is no such project* are different answers.
+        let missing = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/nowhere/map/silenced")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     /// Two unapproved lines in a project's pile, put there the way the extract route puts them.

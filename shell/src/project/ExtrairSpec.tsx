@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map";

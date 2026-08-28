@@ -1,4 +1,6 @@
+// §spec mapa-do-projeto
 import type { Anchored, Junction } from "../data/project-map";
+import { Orfa } from "./Orfa";
 
 /**
  * The junction: the nodes that do not match.
@@ -15,14 +17,19 @@ import type { Anchored, Junction } from "../data/project-map";
  * the mismatches lead, and no ambiguous line is ever drawn as a confirmation — a map that is
  * confidently wrong is the disease this feature treats, with better pixels.
  *
- * **Pure and presentational, fed by the query `ModeMapa` already holds.** It issues no request,
- * so it cannot fail on its own and has no loading state to draw. Reading the map a second time
- * here would put two answers to one question on one screen, free to disagree.
+ * **Presentational, fed by the query `ModeMapa` already holds.** It reads the map once and never
+ * again — reading it a second time here would put two answers to one question on one screen, free
+ * to disagree.
  *
- * **No control, and the absence is deliberate.** This is a reading surface. The one place in this
- * mode that has buttons answers a single line at a time, on purpose, and a second place to press
- * would be a second way to accept without reading. Nothing here implies a verdict either: a
- * verdict is the owner's alone, and the surface that carries one is a later slice.
+ * **One control, and it is the only one, qualified 2026-08-27.** This paragraph used to say there
+ * were none: *"a second place to press would be a second way to accept without reading"*. That
+ * argument is about VERDICTS and it survives whole — nothing here accepts anything, nothing here
+ * writes, and a verdict is still the owner's alone on a surface of its own. What §14 adds is a
+ * button that asks git a question, on the rows of *declared, with no code* and on no others, and
+ * it is the opposite of a way to accept without reading: it exists because the pile it sits in is
+ * built entirely out of `§` comments, and a comment a rewrite deleted lands a decision there
+ * looking exactly like one nobody ever implemented. See {@link Orfa}. It is asked per row and
+ * never on render, so this surface still issues no request of its own when it opens.
  *
  * **No percentage, no single score, no bar** (§12). A collapsed number is exactly the collapse §5
  * forbids, and it is also the shape that manufactures the false confidence in §1: one figure that
@@ -31,6 +38,14 @@ import type { Anchored, Junction } from "../data/project-map";
 
 export interface JuncaoProps {
   junction: Junction;
+  /**
+   * Whose history §14's guard asks about.
+   *
+   * Threaded down rather than read from a route here, the way `Carimbos` takes it: this component
+   * is handed everything it draws, and a second source for the project id would be a second
+   * answer to which project is on screen.
+   */
+  projectId: string;
 }
 
 /**
@@ -51,10 +66,27 @@ function plural(count: number, one: string, many: string): string {
   return count === 1 ? one : many;
 }
 
-export function Juncao({ junction }: JuncaoProps) {
+export function Juncao({ junction, projectId }: JuncaoProps) {
   const { decisions, unclaimed, counts } = junction;
 
-  const silent = decisions.filter((row) => row.anchor === "silent");
+  /*
+    The silent pile, split by whether anybody ever wrote down what this decision’s code is.
+
+    `anchor === "silent"` means NO COMMENT names the section, which is a true statement about
+    the working tree and says nothing about whether the code exists. Until §14 those were one
+    pile, and a decision whose `§` comment a rewrite deleted sat in it looking exactly like one
+    nobody ever implemented — §1’s failure happening to the instrument built against §1.
+
+    A record with files in it makes the two tellable apart, so they are told apart. A record
+    with NO files stays in the first pile deliberately: *somebody wrote down that none are* is
+    a stronger version of the same claim, not a different one.
+  */
+  const silent = decisions.filter(
+    (row) => row.anchor === "silent" && (row.record?.paths.length ?? 0) === 0,
+  );
+  const lostTheComment = decisions.filter(
+    (row) => row.anchor === "silent" && (row.record?.paths.length ?? 0) > 0,
+  );
   const unnumbered = decisions.filter((row) => row.anchor === "unnumbered");
   /*
     The two uncertainties `ambiguous` carries, told apart the only way they can be — by `modules`
@@ -75,7 +107,8 @@ export function Juncao({ junction }: JuncaoProps) {
         What does not match
       </h2>
 
-      {counts.decisions === 0 ? <NoIntention /> : <Silent rows={silent} />}
+      {counts.decisions === 0 ? <NoIntention /> : <Silent rows={silent} projectId={projectId} />}
+      {lostTheComment.length > 0 ? <LostTheComment rows={lostTheComment} /> : null}
       {unnumbered.length > 0 ? <Unnumbered rows={unnumbered} /> : null}
 
       <Unclaimed paths={unclaimed} />
@@ -131,7 +164,7 @@ function NoIntention() {
  * first as the second is the false confidence this mode exists to cure. It is also written so it
  * cannot be read as a pass: nothing here has compared a line of code to what a decision says.
  */
-function Silent({ rows }: { rows: Anchored[] }) {
+function Silent({ rows, projectId }: { rows: Anchored[]; projectId: string }) {
   if (rows.length === 0) {
     return (
       <p className="max-w-prose text-sm text-text-muted">
@@ -160,7 +193,52 @@ function Silent({ rows }: { rows: Anchored[] }) {
       </p>
       <ul aria-label="Decisions nothing names" className="flex flex-col gap-2">
         {shown.map((row) => (
-          <Line key={row.decision_id} row={row} />
+          <Line key={row.decision_id} row={row}>
+            <Orfa projectId={projectId} row={row} />
+          </Line>
+        ))}
+      </ul>
+      {hidden > 0 ? <Hidden count={hidden} /> : null}
+    </div>
+  );
+}
+
+/**
+ * Decisions whose code somebody wrote down, and whose `§` comment is gone (§14).
+ *
+ * **This pile is the entire point of `map_anchors`, and before it existed these rows were
+ * invisible — not wrong, invisible.** They sat in *declared, with no code*, which is what the
+ * junction honestly derives when no comment names a section, and which a reader cannot tell
+ * from a decision nobody ever implemented. The difference is not cosmetic: one of those two is
+ * work still to do, and the other is an anchor a rewrite quietly deleted.
+ *
+ * **Kept out of the pile above rather than folded into it**, for the reason `Unnumbered` gives
+ * about its own rows: *nothing claims this* is a report, and here something does claim it — a
+ * row in a table, written by somebody, which no rewrite of the code can erase.
+ *
+ * It says nothing about whether the deletion was deliberate. It cannot: the parser reads
+ * `§7.1` in *this implements §7.1* and in *as §7.1 explains* exactly alike. What it hands over
+ * is a file to go and look at, which is what §5 gives every judgement on this map to one person
+ * for.
+ */
+function LostTheComment({ rows }: { rows: Anchored[] }) {
+  const { shown, hidden } = capped(rows);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="max-w-prose text-sm text-text">
+        {rows.length} {plural(rows.length, "decision", "decisions")} {plural(rows.length, "has", "have")} files
+        written down and no comment naming them any more.
+      </p>
+      <p className="max-w-prose text-xs text-text-muted">
+        The `§` that anchored each of these is gone from the code. The files are still here
+        because somebody wrote them down, which is the only reason these rows are not sitting
+        above looking like decisions nobody ever implemented. Whether the comment went on
+        purpose is for you to say — nothing here read a line of code.
+      </p>
+      <ul aria-label="Decisions whose comment is gone" className="flex flex-col gap-2">
+        {shown.map((row) => (
+          <Line key={row.decision_id} row={row} paths={row.record?.paths ?? []} />
         ))}
       </ul>
       {hidden > 0 ? <Hidden count={hidden} /> : null}
@@ -332,9 +410,13 @@ function Plausible({
 /**
  * What this panel cannot see, said rather than left to be assumed.
  *
- * §5.1 names four derived states and two of them mean *the triager looked*. There is no triager
- * (§6), so a panel drawing four states would be inventing two — and a surface that looks complete
- * while a layer is missing is the same false confidence with better pixels.
+ * §5.1 names four derived states and two of them mean *the triager looked*. Since slice 5 there is
+ * a triager, and the sentence had to change rather than survive: it used to say there was none, and
+ * a panel telling the owner a layer is missing while it sits on the same screen is the false
+ * confidence inverted — the map lying about itself in the direction of pessimism, which costs the
+ * same trust. What stays true is that a panel drawing four states would be answering the triager's
+ * question and the junction's with one voice, which is exactly what §5 forbids, so this panel still
+ * draws two and points at the one that owns the other two.
  *
  * The second paragraph is read off the payload rather than asserted, so it stays true for any
  * project: `declared` is the only state that means certain, and it needs a citation naming its
@@ -347,9 +429,9 @@ function Missing({ declared, decisions }: { declared: number; decisions: number 
         What this panel cannot see
       </h3>
       <p className="max-w-prose text-xs text-text-muted">
-        §5.1 names four derived states and this panel can draw two of them. The other two — waiting
-        on you, and silenced — both mean a triager looked at a node and formed an opinion about it,
-        and there is no triager yet. So nothing here says whether anybody looked.
+        §5.1 names four derived states and this panel draws two of them. The other two — waiting on
+        you, and silenced — both mean a triager looked at a node and formed an opinion about it, and
+        they belong to the triage panel below. Nothing on this panel says whether anybody looked.
       </p>
       {decisions === 0 ? null : declared === 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
@@ -379,7 +461,22 @@ function Missing({ declared, decisions }: { declared: number; decisions: number 
  * of that document* is how the owner refers to a decision after approving it. Never a summary:
  * summarising twelve lines would be the thousand-line plan again, only shorter.
  */
-function Line({ row, paths = [] }: { row: Anchored; paths?: string[] }) {
+function Line({
+  row,
+  paths = [],
+  children,
+}: {
+  row: Anchored;
+  paths?: string[];
+  /**
+   * Whatever the pile this row belongs to hangs off it, and today only one pile does.
+   *
+   * A slot rather than a flag, so this component stays what it is — a row that draws a decision —
+   * and does not grow a branch per pile. `Unnumbered` deliberately passes nothing: its rows carry
+   * no section number, so §14's question cannot be put about them at all.
+   */
+  children?: React.ReactNode;
+}) {
   const named = capped(paths, 4);
 
   return (
@@ -396,6 +493,7 @@ function Line({ row, paths = [] }: { row: Anchored; paths?: string[] }) {
           {named.hidden > 0 ? ` · and ${named.hidden} more not shown` : ""}
         </p>
       ) : null}
+      {children}
     </li>
   );
 }

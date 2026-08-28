@@ -1,10 +1,46 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The package this test is *running in*, checked against the one it was *compiled in*.
+///
+/// **`env!("CARGO_MANIFEST_DIR")` is baked at compile time, and with a shared target directory that
+/// makes it a claim about a different checkout.** `CARGO_HOME/config.toml` on this machine points
+/// every crate at `C:/Projects/.cargo-target`, so a `module_map-<hash>.exe` compiled inside a
+/// worktree is reused by the main checkout whenever the hashes line up. That binary looks for
+/// `AGENTS.md` under the *worktree's* `core/`, does not find it — no worktree has one — takes the
+/// early return below, and reports PASS having checked nothing.
+///
+/// **Measured 2026-08-26, and it had already happened.** The shared `deps/` held two binaries at
+/// once: `module_map-fbe301874ed541e2.exe` with `C:\Projects\nucleos\core` baked in, and
+/// `module_map-71f5cbac06dd4edb.exe` with `C:\Projects\nucleos-conversas\core`. Which one cargo
+/// runs is invisible from the output, so the gate was a coin flip that always looked green — and
+/// `map_stamp.rs` landed with no row in the map while this test said everything was fine.
+///
+/// That is the exact shape of the false confidence the project-map feature exists to cure, sitting
+/// inside this repository's own gate. So the mismatch is an ASSERTION and not a fallback: a test
+/// that quietly reads another checkout's files is worse than one that refuses to run.
+///
+/// Cargo sets the working directory of an integration test to the package root, so
+/// `current_dir` is the honest answer to *which checkout am I looking at*.
+fn package_root() -> PathBuf {
+    let built_in = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let running_in = std::env::current_dir().expect("the working directory should be readable");
+    assert_eq!(
+        built_in,
+        running_in.as_path(),
+        "this test binary was compiled in {} and is running in {} — a shared target directory has \
+         handed this checkout a binary built somewhere else, so every path below would name the \
+         other checkout's files. Touch this file to force a rebuild.",
+        built_in.display(),
+        running_in.display(),
+    );
+    running_in
+}
 
 #[test]
 fn the_module_map_matches_the_files_on_disk() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = package_root();
     let map_path = manifest_dir.join("AGENTS.md");
 
     // No early return for an absent map any more, and its removal is the point rather than tidying.
@@ -14,6 +50,12 @@ fn the_module_map_matches_the_files_on_disk() {
     // and is not one; the diagnosis cost real time. The file is tracked now (see `.gitignore`), so
     // its absence is a checkout somebody broke, and `read_to_string` below says so loudly instead
     // of this passing quietly.
+    //
+    // The guarded skip this replaces (a worktree's `.git` is a FILE, so only a worktree could take
+    // the return) was the right answer while the map was ignored, and became unreachable the moment
+    // it was tracked. `package_root` above is the half of that change that is still load-bearing,
+    // and it is a different guard against a different lie: not "which checkout may skip" but "which
+    // checkout is this binary even looking at".
 
     let mapped_files = fs::read_to_string(&map_path)
         .expect("the module map should be readable")
@@ -80,7 +122,11 @@ fn the_module_map_matches_the_files_on_disk() {
 /// module and the thing being forbidden is calling it directly.
 #[test]
 fn nothing_sets_the_worktree_root_without_restoring_it() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // `package_root` and not `env!`, for the reason it documents: `src/` exists in every worktree,
+    // so this test would not have gone red on a binary built elsewhere — it would have read the
+    // other checkout's modules and reported on those. Quieter than the map check's failure and the
+    // same defect.
+    let src = package_root().join("src");
     let mut offenders = Vec::new();
 
     for entry in fs::read_dir(&src).expect("the source directory should be readable") {

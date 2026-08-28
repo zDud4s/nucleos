@@ -210,16 +210,54 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // `map/decisions` is the pile nobody has read yet: sentences a model lifted out of a document
     // already sitting in that project's folder. A reader who reaches `map` and `cat` can read the
     // spec they came from whole, so the extract of it grants nothing they did not already have.
-    // Only the GET. `POST /projects/{id}/map/extract` and `POST /projects/{id}/map/decisions/{n}`
-    // are in NO table, here or in `RUN_CREATING_ROUTES`, which leaves them to Admin and the control
-    // token by default-deny — and both belong there. Extracting spends a model, which a read-only
-    // key never bought; approving is the owner's stamp, and it is the act that puts a line in the
-    // map. Neither is a read, and neither is a thing done on the owner's behalf by a weaker key.
+    // Only the GET. `POST /projects/{id}/map/extract`, `POST /projects/{id}/map/decisions/{n}`,
+    // `POST /projects/{id}/map/stamps` and `POST /projects/{id}/map/triage` are in NO table, here
+    // or in `RUN_CREATING_ROUTES`, which leaves them to Admin and the control token by
+    // default-deny — and all four belong there. Extracting spends a model, which a read-only key
+    // never bought; approving is what puts a line in the map. Neither is a read, and neither is a
+    // thing done on the owner's behalf by a weaker key.
+    //
+    // The fourth is the extraction's argument doubled and is listed rather than left implied,
+    // because an enumeration that stopped at three is how the next reader concludes the triage
+    // route was weighed and allowed: it spends a model PER DECISION, so a read-only key that could
+    // reach it could spend a whole backlog's worth of somebody else's money in one request. It
+    // takes no id at all, which makes the exposure the entire project rather than one line.
+    //
+    // The third has the sharpest claim of the four, and it is worth writing down because the
+    // absence of a row is the entire enforcement and an absence explains nothing to whoever reads
+    // this next. A stamp is the owner's VERDICT — *está como quero* — and §6 of the map spec takes
+    // that one act away from the model on purpose: the model may compress a spec and may say a node
+    // deserves a look, and may never put anything green. §6.1 gives the reason in one sentence:
+    // returning that authority "pela porta da renderização" turns the map back into false confidence,
+    // now carrying the authority of a traffic light. A read-only key writing one would be that same
+    // door with a different handle — an automated caller minting the owner's answer, on the one
+    // question this whole feature exists because only they can answer. Every other write here is a
+    // thing the owner could have done themselves in a moment; this one is the moment.
     //
     // `map/specs` is the list of filenames a reader can already see through `ls` — it names
     // nothing `cat` could not already show. Naming them here is what lets the extraction button
     // offer a choice instead of a text box; it spends no model and settles nothing, so it costs
     // this key no more than `map` beside it does.
+    //
+    // `map/silenced` is the same grant a third time and needs no new argument: §6.2's pile is the
+    // decisions a model saw nothing worth the owner's time in, each one a sentence lifted out of a
+    // spec sitting in that project's folder — which a reader holding `map`, `map/decisions` and
+    // `cat` can already read whole — plus the reason the triager gave and the name of the brain
+    // that gave it. Neither of those two is a fact about anything outside this project.
+    //
+    // `map/orphan` says which file carried a `§` and in which commit it stopped, for one section
+    // of one document. Every fact in that answer — a path, a commit id, a committer date, a commit
+    // subject — is one `log` and `blame` beside it already hand over, out of the same repository,
+    // and the section it is asked about is a heading from a spec `map/decisions` already grants.
+    // It reads history where the routes above read the present, and that is a different git call
+    // rather than a different grant.
+    //
+    // Listed rather than left implied, because §6.2 requires the pile to be *"sempre acessível"*
+    // and a route that answered `403` to a key holding `map` would be a filter on that
+    // accessibility wearing the shape of a permission. The `POST …/map/triage` beside it stays in
+    // NO table for the reason given four paragraphs up, and the pair is worth reading together:
+    // this is the pile a run left behind, and that one is what spends a model per decision to
+    // fill it.
     (Method::GET, "/projects/{id}/readings"),
     (Method::GET, "/projects/{id}/log"),
     (Method::GET, "/projects/{id}/branches"),
@@ -230,6 +268,8 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/map"),
     (Method::GET, "/projects/{id}/map/decisions"),
     (Method::GET, "/projects/{id}/map/specs"),
+    (Method::GET, "/projects/{id}/map/silenced"),
+    (Method::GET, "/projects/{id}/map/orphan"),
     (Method::GET, "/feed"),
     (Method::GET, "/runs"),
     (Method::GET, "/presets"),

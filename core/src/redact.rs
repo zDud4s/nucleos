@@ -1041,7 +1041,30 @@ A fatura de julho segue em anexo.\n\n\
 
     #[test]
     fn no_tracing_call_interpolates_mail_content() {
-        let source_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        // `env!("CARGO_MANIFEST_DIR")` is baked at COMPILE time, and every crate on this machine
+        // shares one target directory (`CARGO_HOME/config.toml` sets `target-dir`). So a binary
+        // compiled inside a worktree gets reused by the main checkout, and this scan would read
+        // *that* checkout's `src/` — silently passing while a violation sat here unread. Not
+        // hypothetical: `tests/module_map.rs` was found doing exactly this on 2026-08-26, with two
+        // binaries in `deps/` at once baked from different checkouts, and it had been reporting
+        // PASS while checking nothing.
+        //
+        // An assertion rather than a fallback, for the reason that gate now gives: a test quietly
+        // reading another checkout's files is worse than one that refuses to run. Cargo sets the
+        // working directory to the package root, so `current_dir` is the honest answer to *which
+        // checkout am I scanning*.
+        let built_in = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let running_in = std::env::current_dir().expect("the working directory must be readable");
+        assert_eq!(
+            built_in,
+            running_in.as_path(),
+            "this test binary was compiled in {} and is running in {} — a shared target directory \
+             handed this checkout a binary built somewhere else, so this scan would read the other \
+             checkout's sources. Touch this file to force a rebuild.",
+            built_in.display(),
+            running_in.display(),
+        );
+        let source_dir = running_in.join("src");
         let forbidden = ["body_excerpt", "body_text", "subject"];
 
         for entry in fs::read_dir(source_dir).expect("core source directory must be readable") {
