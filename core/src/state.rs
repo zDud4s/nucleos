@@ -53,6 +53,29 @@ pub const AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER: u32 = 12;
 /// unchanged at 600 seconds.
 pub const DEFAULT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How much longer an autonomous run may stay silent than an interactive one.
+///
+/// The sibling of [`AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER`], and it exists for the mirror image of that
+/// constant's reason. The wall clock catches a run that never finishes; this deadline catches one
+/// that has stopped getting anywhere. Set below the length of a single legitimate step, it stops
+/// catching stuck runs and starts catching busy ones.
+///
+/// **Measured, 2026-08-28.** `cargo check --manifest-path core/Cargo.toml --tests` on this
+/// workspace takes 2m42s from a warm target directory, and a full `cargo test` link is longer
+/// still. One such call is ONE tool call, which streams nothing while it runs — so a worktree run
+/// that compiles, the ordinary thing a worktree run does, is silent for longer than the 300-second
+/// deadline allows and is killed for working. Two autonomous attempts died this way overnight,
+/// and the prompt written to work around it ("commit before compiling, always") is a workaround
+/// for this number rather than advice about git.
+///
+/// 15 minutes is a bound, not a measurement: it is a little over five times the measured compile
+/// and still finite, which is the property that matters. An interactive run keeps the short one —
+/// somebody is watching it, and five minutes of silence in front of a person is already too long.
+///
+/// Derived as a multiplier rather than given its own `Duration` for `run_timeout_for_mode`'s
+/// reason: a test that shortens the deadline must still get a short one.
+pub const AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER: u32 = 3;
+
 /// Production default for how long a repository verification gate may run.
 ///
 /// A gate is a subprocess over a repository the daemon does not control, so its deadline answers a
