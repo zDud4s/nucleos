@@ -4388,7 +4388,7 @@ struct MapStampBody {
     /// Typed rather than taken as a `String` and read afterwards, which is where `read_brain` next
     /// door had to end up and why the two differ. `Brain::from_wire` reads anything unfamiliar as
     /// `Cloud`, so that route needed a stricter reader of its own; [`crate::map_stamp::Verdict`]'s
-    /// derived `Deserialize` is already exact — §5.2 has three and `0118`'s CHECK admits three — so
+    /// derived `Deserialize` is already exact — §5.2 has three and `0124`'s CHECK admits three — so
     /// a fourth is refused before this function runs at all. That is the earliest place it can be
     /// refused, and the only one where nothing has yet had a chance to guess what was meant.
     verdict: crate::map_stamp::Verdict,
@@ -4396,7 +4396,7 @@ struct MapStampBody {
     ///
     /// `serde(default)` so a client that has nothing to say may omit the field rather than having
     /// to spell `null`. The default is `None` and never an empty string, because *said nothing* and
-    /// *said the empty string* are different, and `0118` stores the first as NULL.
+    /// *said the empty string* are different, and `0124` stores the first as NULL.
     #[serde(default)]
     note: Option<String>,
 }
@@ -4418,7 +4418,7 @@ struct MapStampBody {
 ///   none is a fault of this daemon, and telling them apart would tell a caller which ids exist in
 ///   projects it cannot see. §4 is why the third is in that list at all: approval is the gate, and a
 ///   verdict on an unapproved line would put the owner's word on something they never let in.
-/// - `400` for an amber with nothing in its note. `0118`'s CHECK is the backstop and would surface
+/// - `400` for an amber with nothing in its note. `0124`'s CHECK is the backstop and would surface
 ///   as a 500, which reads as this daemon having broken; a malformed request is the client's fault
 ///   and has to read as one. §5.2 makes the note the whole of amber — *falta migrar as páginas de
 ///   pilar* is worth more than the colour is — so an empty one is not a lesser amber, it is not one.
@@ -4629,7 +4629,7 @@ struct TriageReport {
     /// version of this route triaged them anyway and put a boolean on the report. The trouble is
     /// not the answer — the model reads none of its evidence from git, so an answer given during an
     /// outage is as good as any other — it is the digest: `map_triage::inputs_digest` keeps all four
-    /// states of [`crate::map_stamp::Anchors`] apart on purpose, which is what `0118` was amended to
+    /// states of [`crate::map_stamp::Anchors`] apart on purpose, which is what `0124` was amended to
     /// require, so a judgement recorded under `git-failed` dies the moment git recovers. Every row
     /// written during an outage would have to be bought again.
     ///
@@ -5000,7 +5000,7 @@ async fn post_project_map_triage(
         .map_err(|error| {
             // The table refusing the row itself — a blank reason, a blank model, a blank digest —
             // is a bug in this handler and not a fact about the decision, so it is not counted and
-            // swept past. `parse_answer` already refuses everything `0119` would, so reaching here
+            // swept past. `parse_answer` already refuses everything `0125` would, so reaching here
             // means the two disagree, and that is worth stopping for.
             tracing::warn!(
                 %error,
@@ -15028,7 +15028,7 @@ mod tests {
     #[tokio::test]
     async fn an_amber_stamp_without_a_note_is_refused_by_the_route_with_400_and_not_500() {
         // §5.2 makes the note the whole of amber: *falta migrar as páginas de pilar* is worth more
-        // than the colour. `0118`'s CHECK refuses the row and would surface as a 500, which reads
+        // than the colour. `0124`'s CHECK refuses the row and would surface as a 500, which reads
         // as this daemon having broken — and a malformed request is the client's fault and has to
         // read as one.
         let state = test_state().await;
@@ -15069,7 +15069,7 @@ mod tests {
     async fn a_settled_stamp_is_refused_with_503_when_git_will_not_answer() {
         // `503` and not `500`: nothing in this daemon is broken, so the honest thing to say is *try
         // again*. Storing the green anyway would be the one row this whole feature exists to
-        // prevent — a *está como quero* with nothing to expire it — and `0118`'s CHECK is the
+        // prevent — a *está como quero* with nothing to expire it — and `0124`'s CHECK is the
         // backstop that would have turned it into a 500 instead.
         let state = test_state().await;
         let dir = project_with_repo(&state, "alpha", "gate_command: x\n").await;
@@ -15099,7 +15099,7 @@ mod tests {
 
         // The other two verdicts are unmoved by it: neither expires by the code, so neither needs
         // to know what the code is. §7 still wants the digest when it can be had, and NULL when it
-        // cannot — which is exactly what `0118` lets them store.
+        // cannot — which is exactly what `0124` lets them store.
         assert_eq!(
             post_stamp(
                 state.clone(),
@@ -15234,7 +15234,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_verdict_is_refused_at_the_edge() {
-        // §5.2 has three and `0118`'s CHECK admits three. A fourth is refused by serde before this
+        // §5.2 has three and `0124`'s CHECK admits three. A fourth is refused by serde before this
         // handler runs at all, which is the earliest place it can be refused and the only one where
         // no code has yet had a chance to guess what was meant — and guessing is what this map
         // refuses: `Settled` would invent a green nobody gave, and either of the others would put
@@ -15981,7 +15981,7 @@ mod tests {
             judged[0].reason
         );
 
-        // The braces: `0119`'s CHECK, reached past the enum that cannot say the word at all.
+        // The braces: `0125`'s CHECK, reached past the enum that cannot say the word at all.
         let refused = sqlx::query(
             "INSERT INTO map_triage (decision_id, verdict, reason, model, computed_at, inputs_digest)
              VALUES (?, 'approved', 'looks right', 'cloud', '2026-08-26T00:00:00Z', 'sha256:abc')",
@@ -16059,7 +16059,7 @@ mod tests {
         // **The storm this dissolves, reproduced in one test.** The model reads none of its evidence
         // from git — the decision, the anchor state and the two file lists all come off the tree —
         // so an answer given during an outage would be perfectly good. The digest is what suffers:
-        // `inputs_digest` keeps the four `Anchors` states apart on purpose (`0118` was amended to
+        // `inputs_digest` keeps the four `Anchors` states apart on purpose (`0124` was amended to
         // require it), so a judgement recorded under `git-failed` dies the moment git recovers, and
         // meanwhile every judgement already stored reads stale and would be bought again.
         //

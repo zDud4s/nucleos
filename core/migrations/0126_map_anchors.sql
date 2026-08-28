@@ -1,3 +1,10 @@
+-- Numbered 0126 and not 0120: master took 0120 for `team_notes`. See `0124_map_stamps.sql`'s header.
+--
+-- This one had never been applied anywhere when it moved, which is why it is the cheapest of the
+-- three and worth saying so: the live database stopped at 0119. The other two had been applied, and
+-- paying for that took two UPDATEs against `_sqlx_migrations` -- the checksum is of the file's
+-- CONTENTS, which a rename does not touch.
+--
 -- Which files are one decision's, remembered rather than re-derived.
 --
 -- **This table exists because the map had exactly two inputs and both of them rot.** The specs are
@@ -47,7 +54,7 @@
 -- takes its anchors with it: an anchor for a decision nobody can name is a row no reader can ever
 -- reach, and it would keep a file looking spoken-for by nothing.
 --
--- Numbering: `0120` is the next free number ON THIS BRANCH. Master has moved past it independently
+-- Numbering: `0126` is the next free number ON THIS BRANCH. Master has moved past it independently
 -- and this file will have to move up at merge, exactly as `project_commands` and this branch's
 -- other migrations already have. Renumbering is the merge's job and not something to pre-empt here,
 -- where the number would then be wrong for everybody working on this branch.

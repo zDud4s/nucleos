@@ -338,7 +338,7 @@ pub struct Stamp {
     /// nothing here to watch*, which is a fact about the decision or about its project, is
     /// permanent, and is what makes a stamp that can never expire. `Some(text)` is the digest. An
     /// `unwrap_or_default()` anywhere downstream turns the first into the second and mints a green
-    /// that never comes back to ask; `0118`'s CHECK stops `settled` reaching the table as `None` at
+    /// that never comes back to ask; `0124`'s CHECK stops `settled` reaching the table as `None` at
     /// all, and this type is what keeps the other two apart afterwards.
     ///
     /// **A project with no git repository writes `Some("")` and not `None`**, and the reason is
@@ -350,12 +350,12 @@ pub struct Stamp {
     /// now, and a copy in this column would be a second place for it to be wrong — and the one that
     /// goes stale, because a project can gain a repository and this row cannot notice.
     ///
-    /// **`0118`'s header briefly listed *no repository* among the things NULL means, which A6 made
+    /// **`0124`'s header briefly listed *no repository* among the things NULL means, which A6 made
     /// wrong; it says `''` now.** Editing an applied migration is normally forbidden — `sqlx::migrate!`
     /// checksums the file byte for byte and one that has already run panics with
     /// `Migrate(VersionMismatch)`, the trap `.gitattributes` and `0115`'s header both describe, and
     /// which this feature has already sprung twice on the numbering alone. It was safe here only
-    /// because `0118` had **never been applied**: checked against
+    /// because `0124` had **never been applied**: checked against
     /// `%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db` on 2026-08-26, whose `_sqlx_migrations`
     /// stopped at `117 map decisions`. `0117` is applied and must never be touched. **Check before
     /// editing any migration; do not infer from this one that it is allowed.**
@@ -425,7 +425,7 @@ type StampRow = (i64, String, String, Option<String>, Option<String>);
 /// The single place a row becomes a [`Stamp`].
 ///
 /// `None` for a verdict this module cannot read, which drops the stamp and so leaves the decision
-/// among the ones nobody has looked at. Unreachable while the `CHECK` in `0118` stands — it admits
+/// among the ones nobody has looked at. Unreachable while the `CHECK` in `0124` stands — it admits
 /// exactly the three [`Verdict::from_wire`] accepts — and written anyway, because the alternative to
 /// dropping is defaulting, and every default here is a sentence put in the owner's mouth. Visible
 /// debt is the honest failure; a green nobody gave is the one this map exists to prevent.
@@ -676,7 +676,7 @@ pub async fn anchors(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Judged {
     pub decision_id: i64,
-    /// Flagged or silenced, and never a third thing. See [`Judgement`], and `0119`'s CHECK, which is
+    /// Flagged or silenced, and never a third thing. See [`Judgement`], and `0125`'s CHECK, which is
     /// the copy of that rule a caller cannot go round.
     pub judgement: Judgement,
     /// Why, in the triager's own words. Never empty — the table refuses it — because §6.2 makes the
@@ -735,7 +735,7 @@ pub struct Judged {
 /// weakest: `record` takes a `Brain` and writes `Brain::as_str()`, while this takes whatever the
 /// caller has. The reason is that §6.2 asks for *o modelo*, which is not always the same thing as
 /// the brain — a brain resolves to a model name, and the pile is more useful naming the one that
-/// actually answered. `0119` refuses both columns blank, which is the floor the type would have
+/// actually answered. `0125` refuses both columns blank, which is the floor the type would have
 /// given for free and is why the looser signature costs nothing that matters.
 ///
 /// `false` means no row was written, and it covers the four things [`stamp`] lists, which are one
@@ -778,7 +778,7 @@ type JudgedRow = (i64, String, String, String, String, String);
 /// The single place a row becomes a [`Judged`].
 ///
 /// `None` for a verdict this module cannot read, which drops the judgement and so leaves the
-/// decision *not looked at*. Unreachable while `0119`'s CHECK stands — it admits exactly the two
+/// decision *not looked at*. Unreachable while `0125`'s CHECK stands — it admits exactly the two
 /// [`Judgement::from_wire`] accepts — and written anyway, because the alternative to dropping is
 /// defaulting, and both defaults are worse than the absence: silencing a row nobody could read would
 /// clear a decision out of the owner's queue on the strength of a parse failure, and flagging it
@@ -865,7 +865,7 @@ pub struct Silencing {
     pub spec_slug: String,
     pub section: String,
     pub text: String,
-    /// Why the triager silenced it, in its own words. Never empty — `0119` refuses it.
+    /// Why the triager silenced it, in its own words. Never empty — `0125` refuses it.
     pub reason: String,
     /// Which brain or model answered. §6.2 names it: the repair for a triager that silences too
     /// much is to stop using that triager, and that is not a decision anybody can take about a pile
@@ -983,7 +983,7 @@ pub struct SilencedPile {
 /// reader that quietly displayed it would be the place that defect went unnoticed.
 ///
 /// **The verdict is compared against [`Judgement::Silenced`]'s own storage form** rather than the
-/// literal `'silenced'`, so the word has one owner. `0119`'s CHECK admits exactly two values and
+/// literal `'silenced'`, so the word has one owner. `0125`'s CHECK admits exactly two values and
 /// `Judgement::as_str` writes them; a third spelling here would be a filter that silently matched
 /// nothing the day either changed.
 ///
@@ -1706,7 +1706,7 @@ mod tests {
         let id = an_approved_decision(&pool, "alpha").await;
 
         // A tab is whitespace too, and bare `trim` in SQLite strips spaces and nothing else, so
-        // the CHECK in `0118` names the characters it must actually see through.
+        // the CHECK in `0124` names the characters it must actually see through.
         for note in [None, Some(""), Some("   "), Some("\t"), Some("\n \r")] {
             assert!(
                 stamp(&pool, "alpha", id, Verdict::Partial, None, note)
@@ -2068,7 +2068,7 @@ mod tests {
         // which costs the same trust the silent green costs, from the other side.
         //
         // A tab is whitespace too, and bare `trim` in SQLite strips spaces and nothing else, so
-        // `0119` names the characters it must actually see through. The same hole `0118`'s note
+        // `0125` names the characters it must actually see through. The same hole `0124`'s note
         // CHECK already argues, owed here twice over.
         let pool = test_pool().await;
         let id = an_approved_decision(&pool, "alpha").await;
@@ -2100,7 +2100,7 @@ mod tests {
         // decided by comparing the stored digest against the one computed now; a hash is never
         // empty, so a stored `''` can only have come from a caller that failed to compute one —
         // and if a reader ever computes `''` the same way, the two compare EQUAL and a judgement
-        // about a decision that has since changed is presented as current. That is `0118`'s
+        // about a decision that has since changed is presented as current. That is `0124`'s
         // collapse of *could not compute* into *nothing to watch*, reappearing one table over and
         // one slice later, and it is refused here for the reason it is refused there.
         let pool = test_pool().await;

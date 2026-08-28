@@ -277,7 +277,7 @@ pub enum Lapse {
     /// depends on cannot be made, and the alternative — reading it as a settled green with nothing
     /// to watch — would silently promote a stamp that used to expire into one that never will, over
     /// code that may well have moved since. The third is a settled stamp holding **no** digest, a
-    /// row `0118`'s `CHECK (verdict <> 'settled' OR code_digest IS NOT NULL)` refuses at the table;
+    /// row `0124`'s `CHECK (verdict <> 'settled' OR code_digest IS NOT NULL)` refuses at the table;
     /// it is answered here anyway because the tempting alternative is that CHECK's own defect moved
     /// from write to read — a transient *git was unreadable* silently promoted to a permanent
     /// *there is nothing to watch*. The fourth is an amber whose `stamped_at` will not parse, so its
@@ -425,7 +425,7 @@ pub struct Anchoring<'a> {
 ///
 /// [`Anchors::Computed`] holding the empty string is a fourth thing again and is not a failure at
 /// all: **computed, and there is no anchor to watch.** That one is a fact about the decision, and
-/// keeping it apart from the two above is what `0118`'s `code_digest` column spends its longest
+/// keeping it apart from the two above is what `0124`'s `code_digest` column spends its longest
 /// comment on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Anchors {
@@ -450,7 +450,7 @@ pub enum Anchors {
 /// `Lapse::Moved { gone }` at once, and the panel would report that all of them disappeared when
 /// nothing whatsoever happened. That lapse storm costs exactly what the silent green costs, from the
 /// other side — a reader nagged about nothing stops reading, and the one real lapse then arrives on
-/// a screen nobody looks at. `0118`'s header spends a paragraph keeping those states apart at write
+/// a screen nobody looks at. `0124`'s header spends a paragraph keeping those states apart at write
 /// time; this is where that has to survive the read.
 ///
 /// `now` is a parameter and this function never reads a clock, which is what lets §7.1's three rules
@@ -502,7 +502,7 @@ pub fn standing(stamp: Option<&Stamp>, anchoring: Anchoring<'_>, now: DateTime<U
             },
         },
         Verdict::Partial => {
-            // The note is required by `0118` and defaulted here anyway, and the DIRECTION of the
+            // The note is required by `0124` and defaulted here anyway, and the DIRECTION of the
             // default is the argument. An amber with no note is a row that CHECK refuses, so this is
             // unreachable while the table stands; if one ever arrives, showing amber with nothing to
             // say is visibly incomplete, whereas the other candidate — dropping it to
@@ -896,7 +896,7 @@ fn ls_files_entry(record: &str) -> Option<(u8, &str, &str)> {
 /// read — a daemon insisting it was having a bad moment about a fact that was never going to change.
 ///
 /// An `unwrap_or_default()` anywhere between here and the column collapses a failure into
-/// `Computed("")` and mints exactly the silent green §1 describes. `0118`'s `CHECK (verdict <>
+/// `Computed("")` and mints exactly the silent green §1 describes. `0124`'s `CHECK (verdict <>
 /// 'settled' OR code_digest IS NOT NULL)` refuses the collapse at the table and [`standing`] refuses
 /// it on the way back out; this is the third side of the same argument, on the way in. The `warn!`
 /// on every failure is the other half — a transient failure nobody can see in a log is one nobody
@@ -1484,7 +1484,7 @@ mod tests {
         );
 
         // The same answer when the stamp is the unreadable half. A settled row with no digest is
-        // one `0118`'s CHECK refuses, and the reason it is answered here anyway is that the
+        // one `0124`'s CHECK refuses, and the reason it is answered here anyway is that the
         // tempting alternative — a green with nothing to watch — is D2's defect moved to read time:
         // a transient *git was unreadable* promoted to a permanent *there is nothing to watch*.
         let undigested = stamp_of(Verdict::Settled, None, None);

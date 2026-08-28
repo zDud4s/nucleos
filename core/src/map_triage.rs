@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// `Settled`: turning something green is the owner's act and the owner's alone (§5.2), and a variant
 /// here would hand back the authority §6 took away — with the compiler's blessing, which is worse
 /// than a handler doing it, because nobody reviews an enum arm twice. The prohibition is written in
-/// four places on purpose and this is only one of them: `0119`'s `CHECK (verdict IN ('flagged',
+/// four places on purpose and this is only one of them: `0125`'s `CHECK (verdict IN ('flagged',
 /// 'silenced'))` is the one that survives a caller who never reaches for this type at all.
 ///
 /// **Neither value is a statement about the code**, and that is the sentence a reader is most likely
@@ -135,7 +135,7 @@ impl Judgement {
 /// crowd out the question. The blobs still belong in the digest, because §10's first trigger is *o
 /// código âncora de uma decisão mexeu-se*: the judgement is about whether the code behind those
 /// paths deserves the owner's eyes, and that code moving is precisely the event the answer must not
-/// outlive. `0119`'s header argues the same inclusion from *the model looked at it*, which this
+/// outlive. `0125`'s header argues the same inclusion from *the model looked at it*, which this
 /// module makes untrue; the conclusion survives its reason being corrected, and the cost of the
 /// stricter rule is stated at [`inputs_digest`].
 #[derive(Debug, Clone, Copy)]
@@ -160,7 +160,7 @@ const MAX_LISTED_PATHS: usize = 40;
 /// How long a reason may be before it is cut.
 ///
 /// **Cut, and not kept whole — the choice this slice had to make either way, so here is the
-/// argument.** The column would take an essay: `0119` constrains `reason` to be non-blank and to
+/// argument.** The column would take an essay: `0125` constrains `reason` to be non-blank and to
 /// nothing else, on purpose. What cannot take one is §6.2's pile, which is the mitigation §13 names
 /// and is read as one line per decision across a backlog §10 expects to be in the hundreds. A model
 /// that answers the question asked — *one sentence saying what you saw* — is never near a thousand
@@ -272,7 +272,7 @@ fn anchor_says(anchor: &crate::map_join::Anchor) -> &'static str {
 /// In the prompt and deliberately not in [`inputs_digest`]. §10's second trigger is a *tipo B que
 /// deixou de bater* — a countable claim the code stopped matching — so the kind is part of what the
 /// triager is looking for and belongs beside the question. It is out of the digest by the rule
-/// `0119`'s header sets for that hash: it covers everything whose CHANGE would make the answer
+/// `0125`'s header sets for that hash: it covers everything whose CHANGE would make the answer
 /// wrong, and a decision's kind is fixed when the line is extracted and never updated afterwards,
 /// so a digest covering it could not move.
 fn kind_says(kind: crate::map_intent::Kind) -> &'static str {
@@ -601,7 +601,7 @@ struct RawAnswer {
 /// The honest outcome is the third one: no row, and the decision stays *nunca vista*, which is what
 /// it is. That is also the answer `map_store::judged_from_row` and both `from_wire`s already give.
 ///
-/// **A blank reason is refused here and not left to the table.** `0119`'s CHECK would reject it, so
+/// **A blank reason is refused here and not left to the table.** `0125`'s CHECK would reject it, so
 /// a parse that produced one would be assembling a request designed to fail — and the failure would
 /// reach the route as an sqlite error about a decision, which is the least readable place for *the
 /// model said nothing* to turn up. Rust's `trim` strips every Unicode space, which is strictly more
@@ -793,7 +793,7 @@ fn anchor_tag(anchor: &crate::map_join::Anchor) -> &'static str {
 /// this function exists to avoid.** An `unwrap_or_default()` on the way in makes *git would not
 /// answer* — transient, a fact about this daemon — hash identically to *computed, and there is
 /// nothing to watch* — permanent, a fact about the decision. A judgement made in the minute git was
-/// broken would then stay current for ever over anchors it never saw, which is the collapse `0118`
+/// broken would then stay current for ever over anchors it never saw, which is the collapse `0124`
 /// was amended to prevent, reappearing one table over. A tag before the payload keeps the four
 /// apart; `the_four_anchor_states_hash_to_four_different_digests` asserts all six pairs.
 ///
@@ -808,7 +808,7 @@ fn anchor_tag(anchor: &crate::map_join::Anchor) -> &'static str {
 /// this repository re-opens a sixth of its own anchors, so the cap will sit saturated rather than
 /// draining a backlog once.
 ///
-/// `sha256:` in front for the reason `workflows::digest_of` puts it there: `0119` refuses to
+/// `sha256:` in front for the reason `workflows::digest_of` puts it there: `0125` refuses to
 /// constrain the column to an alphabet or a length, precisely so tomorrow's hash can land in it, and
 /// a stored value that names the function that produced it is the only way anybody tells the two
 /// apart afterwards. The hex itself comes from `workflows::hash_of`, which is this codebase's one
@@ -866,7 +866,7 @@ fn digest_against(evidence: Evidence<'_>, prompt_version: u32) -> String {
 /// written about code that has since moved.
 ///
 /// **A blank on either side is never current**, and that is the one direction this function is not
-/// allowed to fail in. `0119` refuses a blank `inputs_digest` at the table for the same reason it
+/// allowed to fail in. `0125` refuses a blank `inputs_digest` at the table for the same reason it
 /// gives in its own header — an empty hash compares EQUAL to the next empty one, and so presents a
 /// stale judgement as current. The CHECK guards the write; this guards the read, and the read is
 /// what decides whether a model is asked again. Unreachable while both hold, and written anyway,
@@ -1221,7 +1221,7 @@ mod tests {
 
     #[test]
     fn an_empty_reason_is_a_parse_failure_even_when_the_verdict_parses() {
-        // `0119` refuses a blank reason at the table, so a parse that produced one would be
+        // `0125` refuses a blank reason at the table, so a parse that produced one would be
         // assembling a request designed to fail — and the failure would arrive at the route as a
         // database error about a decision, which is the least readable place for it. Refused here,
         // where what happened is still known: a verdict with nothing to read behind it.
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn a_reason_that_is_only_whitespace_is_the_same_failure() {
-        // `0119`'s CHECK strips space, tab, CR and LF — not space alone, which is all a bare `trim`
+        // `0125`'s CHECK strips space, tab, CR and LF — not space alone, which is all a bare `trim`
         // does in SQLite — precisely so a reason of one tab cannot satisfy a constraint whose whole
         // purpose is that the text says something. This side has to strip at least as much, or a
         // row that got through here would be refused there, and the route would report a database
@@ -1450,7 +1450,7 @@ mod tests {
         // answer*, which is transient and a fact about this daemon, and *computed, and there is
         // nothing to watch*, which is permanent and a fact about the decision. Collapsed, a
         // judgement made in the minute git was broken stays "current" for ever over anchors it
-        // never saw — the exact failure `0118` was amended to prevent, reappearing one table over.
+        // never saw — the exact failure `0124` was amended to prevent, reappearing one table over.
         //
         // All six pairs, and not just the one that is easy to think of.
         let decision = decision(Anchor::Ambiguous, &["core/src/map_triage.rs"], &[]);
@@ -1605,7 +1605,7 @@ mod tests {
 
     #[test]
     fn a_blank_digest_on_either_side_is_never_read_as_current() {
-        // `0119` refuses a blank `inputs_digest` at the table for exactly this reason: an empty hash
+        // `0125` refuses a blank `inputs_digest` at the table for exactly this reason: an empty hash
         // compares EQUAL to the next empty one and so presents a stale judgement as current. The
         // CHECK guards the write; this guards the read, and the read is what decides whether a model
         // is asked again. Unreachable while both hold — and the direction this function is never

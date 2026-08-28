@@ -1,3 +1,10 @@
+-- Numbered 0125 and not 0119: master took 0119 for `run_origin`. See `0124_map_stamps.sql`'s header
+-- for the rule and the measurement -- these three moved as one block, which is the point of the rule.
+--
+-- Reordering these three past master's 0121-0123 is safe on inspection rather than by hope: all
+-- three CREATE tables of their own and none ALTERs `chats` or `runs`, so nothing here can change
+-- what `0123_brain_openrouter.sql`'s table rebuild sees.
+--
 -- What the triager thought of one decision, why, and what it was looking at when it thought it.
 --
 -- The model enters this feature twice and is a compressor both times (§6). Before, it turns a
@@ -37,10 +44,10 @@
 --
 -- **The `trim` is given the whitespace it must actually strip.** Bare `trim(reason)` in SQLite
 -- removes spaces and nothing else, so a reason of one tab would satisfy a constraint whose entire
--- purpose is that the text says something. `0118`'s note CHECK already argues this; it is owed here
+-- purpose is that the text says something. `0124`'s note CHECK already argues this; it is owed here
 -- three times over.
 --
--- **`inputs_digest` is a scalar hash, and that is the OPPOSITE of what `0118` chose one file back.**
+-- **`inputs_digest` is a scalar hash, and that is the OPPOSITE of what `0124` chose one file back.**
 -- The obvious inference — *slice 4 kept its digest as readable text, so this one should too* — is
 -- wrong, and the reason the two differ is the reason each exists. `map_stamps.code_digest` is text
 -- because §7 requires a lapsed decision to show **what moved**: paths added, changed and gone, which
@@ -57,7 +64,7 @@
 -- prova mecânica ao lado"* and the proof is therefore part of what it looked at; and the `Anchor`
 -- variant, because *declared* and *guessed* are different evidence about the same paths.
 --
--- **The three states of the anchor digest have to survive being hashed.** `0118` spends its longest
+-- **The three states of the anchor digest have to survive being hashed.** `0124` spends its longest
 -- comment keeping *nobody could compute one* — transient, a fact about this daemon — apart from
 -- *computed, and there is nothing to watch* — permanent, a fact about the decision. An
 -- `unwrap_or_default()` on the way into this hash collapses them again one table over, and the row
@@ -84,7 +91,7 @@
 -- that it did so is the only way anybody finds it. A unique constraint would let a later silence
 -- erase the flag that preceded it, which is precisely the sequence somebody wants to read.
 --
--- **A foreign key without `ON DELETE CASCADE`, which is what `0118` settled on and this follows.**
+-- **A foreign key without `ON DELETE CASCADE`, which is what `0124` settled on and this follows.**
 -- `job_notes.job_id` (0072) and `errand_events.errand_id` (0074) name their parent the same way,
 -- `storage.rs` opens every pool with `foreign_keys(true)`, and a child row that reaches its project
 -- only through its parent has more reason than most to be sure the parent is there. No cascade:
@@ -94,16 +101,16 @@
 --
 -- 0119, and the number is not negotiable downward. Checked on 2026-08-26 against
 -- `%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db`, whose `_sqlx_migrations` is applied through
--- **117**: `0118` is this feature's own and has never run, and `0119` is free. `sqlx::migrate!`
+-- **117**: `0124` is this feature's own and has never run, and `0125` is free. `sqlx::migrate!`
 -- checksums every file byte for byte and an applied one that changed panics the daemon at startup
 -- with `Migrate(VersionMismatch)` — the trap `0115`'s header describes, `0117`'s describes again,
 -- and which has now caught this one feature twice on numbering alone. **Never edit `0117` or
 -- anything below it, and check before editing any migration rather than inferring from the fact
--- that `0118` was amended after it was written.**
+-- that `0124` was amended after it was written.**
 CREATE TABLE map_triage (
   id            INTEGER PRIMARY KEY,
 
-  -- Which decision was judged. **This table has no `project_id`**, on purpose and for `0118`'s
+  -- Which decision was judged. **This table has no `project_id`**, on purpose and for `0124`'s
   -- reason: a decision already belongs to exactly one project, and a second copy of that fact is a
   -- second place for it to be wrong. Every read must therefore JOIN `map_decisions` to discover
   -- whose judgement it is, and that JOIN is the only thing standing between two owners' piles.

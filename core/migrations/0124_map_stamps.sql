@@ -1,3 +1,19 @@
+-- Numbered 0124 and not 0118: master took 0118 for `runs_context_peak` while this branch was out.
+-- Two migrations cannot share a version -- sqlx refuses the whole SET, so the symptom is every test
+-- that opens a database failing at once, not the one test that reads a stamp. Measured on
+-- 2026-08-28: 1607 of 3170 tests failed on `UNIQUE constraint failed: _sqlx_migrations.version`,
+-- with `fmt` and `clippy` both green, because nothing about this is a compile error.
+--
+-- 0084's rule, as `0122_chat_relays.sql` states it: a branch's files go to the TOP and they go
+-- together, and the one that gives way is the branch rather than master. This branch's three moved
+-- as a block to 0124-0126, contiguous above master's 0123, leaving no hole. `0117_map_decisions.sql`
+-- deliberately did NOT move with them: it collides with nothing, and it is already applied in the
+-- live database, where renaming it would turn it into an applied version missing from the source --
+-- the one thing sqlx does refuse.
+--
+-- The bill for this move: 51 references across seven files, exactly as `0122`'s header warned. Its
+-- conclusion holds. The answer is not a cleverer numbering scheme; it is landing.
+--
 -- The owner's verdict on one decision, and the moment they gave it.
 --
 -- This is the half of the map no derivation can produce. Structure says what the code does and the
