@@ -51,10 +51,38 @@ export function declaredCoverage(
   return {
     citing: citingModules.length + foreign.length,
     saying:
-      citingModules.filter((module) => module.spec !== null).length +
-      foreign.filter((file) => file.spec !== null).length,
+      citingModules.filter((module) => declaredIn(module) !== null).length +
+      foreign.filter((file) => declaredIn(file) !== null).length,
   };
 }
+
+/**
+ * The document a file declares, from a payload that may not carry the field at all.
+ *
+ * **A núcleo older than `Module::spec` sends no `spec`, and `apiFetch<T>` is a cast** — the same
+ * property `ForeignFile` records having been silently absent from this file for a whole slice. A
+ * cast cannot notice a missing field, so `module.spec` is then `undefined` rather than `null`, and
+ * every `=== null` in this module answers *no, it declared something* about a file that declared
+ * nothing. The visible result is one box named `undefined` holding the entire project: a confident
+ * wrong answer, which is the failure this map exists to refuse, reached through a version skew
+ * nobody would think to look for.
+ *
+ * One place, so the two readers below cannot drift apart on it.
+ */
+function declaredIn(file: { spec?: string | null }): string | null {
+  return file.spec ?? null;
+}
+
+/**
+ * How tall a folder's column is allowed to get before it spills into the next one.
+ *
+ * **A column as tall as its folder is unreadable at the size this is drawn.** Unbounded, the
+ * núcleo is one column of about 150 files, and one document's files are little better —
+ * `pilar-de-browser` puts 53 into `sidecars` alone. `fitView` then scales the picture to about a
+ * fifth and the labels go with it. Wrapping keeps the folder grouping, which is the only thing
+ * this layout was ever saying, and bounds the height so the words survive.
+ */
+export const ROWS_PER_COLUMN = 12;
 
 export function topFolder(path: string): string {
   const cut = path.indexOf("/");
@@ -128,20 +156,53 @@ export interface MapModel {
  * An edge whose ends are not both in the list is dropped. The núcleo does not return those,
  * but trusting blindly is how a canvas dies on `undefined` instead of drawing what it can.
  */
+/**
+ * The modules one document's box stands for.
+ *
+ * **The same membership rule {@link buildDocuments} counts with, written once.** A file naming no
+ * section and declaring nothing is §5.1's *code nobody asked for* and belongs to no box, so
+ * opening the undeclared pile must not show it either — two rules would let a box open onto a
+ * different set from the one its own number counted, which is a surface disagreeing with itself.
+ */
+export function filesOf(modules: MapModule[], slug: string | null): MapModule[] {
+  return modules.filter((module) => {
+    const spec = declaredIn(module);
+    if (spec === null && module.cites.length === 0) return false;
+    return spec === slug;
+  });
+}
+
 export function buildMap(modules: MapModule[], imports: MapImport[]): MapModel {
   const known = new Set(modules.map((module) => module.path));
-  const filled: Record<string, number> = {};
-  const folders: string[] = [];
 
-  const nodes: MapFlowNode[] = modules.map((module) => {
+  // Two passes, because where a folder's second column starts depends on how many the folders
+  // before it needed. One pass could only know that by placing everything twice anyway.
+  const size: Record<string, number> = {};
+  const folders: string[] = [];
+  for (const module of modules) {
     const folder = topFolder(module.path);
     if (!folders.includes(folder)) folders.push(folder);
+    size[folder] = (size[folder] ?? 0) + 1;
+  }
+  const startsAt: Record<string, number> = {};
+  let column = 0;
+  for (const folder of folders) {
+    startsAt[folder] = column;
+    column += Math.ceil(size[folder] / ROWS_PER_COLUMN);
+  }
+
+  const filled: Record<string, number> = {};
+  const nodes: MapFlowNode[] = modules.map((module) => {
+    const folder = topFolder(module.path);
     const row = filled[folder] ?? 0;
     filled[folder] = row + 1;
     return {
       id: module.path,
       type: "mapNode" as const,
-      position: { x: folders.indexOf(folder) * COLUMN, y: row * ROW },
+      position: {
+        x: (startsAt[folder] + Math.floor(row / ROWS_PER_COLUMN)) * COLUMN,
+        y: (row % ROWS_PER_COLUMN) * ROW,
+      },
       data: { module },
     };
   });
@@ -240,12 +301,13 @@ export function buildDocuments(
     // A module naming no section and declaring nothing is `§5.1`'s *code nobody asked for*, and it
     // is not §8 debt: there is nothing in it to disambiguate. Putting it in the undeclared pile
     // would make that pile grow with files that were never the question.
-    if (module.spec === null && module.cites.length === 0) continue;
-    documentOf.set(module.path, module.spec);
-    bump(module.spec, module.cites.length > 0);
+    const spec = declaredIn(module);
+    if (spec === null && module.cites.length === 0) continue;
+    documentOf.set(module.path, spec);
+    bump(spec, module.cites.length > 0);
   }
   // Foreign files are only ever sent when they cite something, so each one counts.
-  for (const file of foreign) bump(file.spec, true);
+  for (const file of foreign) bump(declaredIn(file), true);
 
   const nodes: DocumentFlowNode[] = [...tally.entries()]
     .sort((a, b) => b[1].files - a[1].files || String(a[0]).localeCompare(String(b[0])))

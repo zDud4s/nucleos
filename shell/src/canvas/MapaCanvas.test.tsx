@@ -1,6 +1,6 @@
 // §spec mapa-do-projeto
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 
 /**
  * jsdom has no layout and no CSS transforms, and xyflow constructs a `DOMMatrixReadOnly` on mount.
@@ -75,5 +75,69 @@ describe("MapaCanvas", () => {
       />,
     );
     expect(screen.getByText(/no documents to draw/)).toBeTruthy();
+  });
+});
+
+describe("MapaCanvas, opened", () => {
+  const open = (label: string) => {
+    // xyflow puts its click handler on the node wrapper, not on the box we drew inside it.
+    const box = screen.getByLabelText(label);
+    const node = box.closest(".react-flow__node");
+    expect(node).toBeTruthy();
+    fireEvent.click(node as Element);
+  };
+
+  it("opens a document onto the files that declared it, and comes back", () => {
+    render(
+      <MapaCanvas
+        modules={[
+          mod("core/src/map_join.rs", "mapa-do-projeto"),
+          mod("core/src/map_store.rs", "mapa-do-projeto"),
+          mod("core/src/browser.rs", "pilar-de-browser"),
+        ]}
+        foreign={[]}
+        imports={[{ from: "core/src/map_join.rs", to: "core/src/map_store.rs" }]}
+      />,
+    );
+
+    open("mapa-do-projeto, 2 files");
+    expect(screen.getByLabelText("core/src/map_join.rs, 1 citation")).toBeTruthy();
+    // The other document's file is not in here. A level that showed everything would be the
+    // level above it, with worse labels.
+    expect(screen.queryByLabelText("core/src/browser.rs, 1 citation")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /all documents/ }));
+    expect(screen.getByLabelText("pilar-de-browser, 1 file")).toBeTruthy();
+  });
+
+  it("opens the undeclared pile too, which is why `null` is not the closed state", () => {
+    // A bare `string | null` would make *the undeclared pile* and *nothing is open* one value.
+    // The pile is the §8 debt and the second-largest box in this project — the one box somebody
+    // most needs to open, and the one a collapsed state would make unopenable.
+    render(
+      <MapaCanvas
+        modules={[mod("core/src/http.rs", null), mod("core/src/a.rs", "mapa-do-projeto")]}
+        foreign={[]}
+        imports={[]}
+      />,
+    );
+
+    open("1 file naming a section under no document");
+    expect(screen.getByLabelText("core/src/http.rs, 1 citation")).toBeTruthy();
+    expect(screen.getByText("no document")).toBeTruthy();
+  });
+
+  it("says what the level below leaves out, as the level above does", () => {
+    render(
+      <MapaCanvas
+        modules={[mod("core/src/browser.rs", "pilar-de-browser")]}
+        foreign={[go("sidecars/browser/fence/csp.go", "pilar-de-browser")]}
+        imports={[]}
+      />,
+    );
+    open("pilar-de-browser, 2 files");
+    // The Go file counted toward the box and cannot be drawn inside it, so the count says so
+    // rather than the picture quietly being one file short of its own label.
+    expect(screen.getByText(/1 more in a language it cannot read, drawn nowhere/)).toBeTruthy();
   });
 });

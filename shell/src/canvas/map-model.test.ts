@@ -4,6 +4,9 @@ import {
   buildMap,
   COLUMN,
   declaredCoverage,
+  filesOf,
+  ROW,
+  ROWS_PER_COLUMN,
   moduleTone,
   topFolder,
   UNDECLARED,
@@ -89,6 +92,20 @@ describe("buildMap", () => {
     const built = buildMap([mod("core/src/a.rs"), mod("core/src/b.rs")], []);
     const [first, second] = built.nodes;
     expect(first.position).not.toEqual(second.position);
+  });
+
+
+  it("spills a folder into a second column instead of growing without bound", () => {
+    // Unbounded, the núcleo is one column of about 150 files and one document's files are little
+    // better — `pilar-de-browser` puts 53 into `sidecars`. `fitView` then scales the whole picture
+    // to about a fifth, and the labels go with it. The folder grouping survives the wrap; the
+    // height does not survive its absence.
+    const many = Array.from({ length: ROWS_PER_COLUMN + 1 }, (_, i) => mod(`core/src/${i}.rs`));
+    const built = buildMap([...many, mod("shell/src/b.tsx")], []);
+    expect(built.nodes[ROWS_PER_COLUMN - 1].position).toEqual({ x: 0, y: (ROWS_PER_COLUMN - 1) * ROW });
+    expect(built.nodes[ROWS_PER_COLUMN].position).toEqual({ x: COLUMN, y: 0 });
+    // And the next folder starts after the columns `core` actually needed, not after one.
+    expect(built.nodes[ROWS_PER_COLUMN + 1].position.x).toBe(2 * COLUMN);
   });
 
   it("puts two folders in two columns, which is the whole reason to group at all", () => {
@@ -235,6 +252,19 @@ describe("buildDocuments", () => {
     expect(weight("pilar-de-browser->mapa-do-projeto")).toBe(1);
   });
 
+
+  it("survives a núcleo that predates the field and sends no spec at all", () => {
+    // `apiFetch<T>` is a cast and a cast cannot notice a missing field, so an older daemon leaves
+    // `spec` as `undefined` rather than `null`. Read with `=== null` that says *it declared
+    // something*, and the picture becomes one box named `undefined` holding the whole project —
+    // a confident wrong answer arrived at through a version skew.
+    const old = { path: "core/src/a.rs", reader: "rust", declares: true, cites, tested: false };
+    const built = buildDocuments([old as unknown as MapModule], [], []);
+    expect(built.nodes).toHaveLength(1);
+    expect(built.nodes[0].data.slug).toBe(UNDECLARED);
+    expect(declaredCoverage([old as unknown as MapModule], [])).toEqual({ citing: 1, saying: 0 });
+  });
+
   it("drops an import whose end is a file it never saw", () => {
     const built = buildDocuments(
       [said("core/src/a.rs", "mapa-do-projeto")],
@@ -242,5 +272,25 @@ describe("buildDocuments", () => {
       [link("core/src/a.rs", "core/src/gone.rs")],
     );
     expect(built.edges).toHaveLength(0);
+  });
+});
+
+describe("filesOf", () => {
+  const cites = [{ section: "7", named: null }];
+
+  it("opens onto exactly the set the box counted", () => {
+    // Two membership rules would let a box open onto a different set from the one its own number
+    // came from — a surface disagreeing with itself, on the screen built to stop exactly that.
+    const modules = [
+      mod("core/src/a.rs", { cites, spec: "mapa-do-projeto" }),
+      mod("core/src/b.rs", { cites }),
+      mod("core/src/quiet.rs"),
+    ];
+    const counted = buildDocuments(modules, [], []);
+    for (const node of counted.nodes) {
+      expect(filesOf(modules, node.data.slug)).toHaveLength(node.data.files);
+    }
+    // And the file nobody asked for is in neither box, not even the undeclared one.
+    expect(filesOf(modules, UNDECLARED).map((m) => m.path)).toEqual(["core/src/b.rs"]);
   });
 });
