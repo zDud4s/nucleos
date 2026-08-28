@@ -158,3 +158,127 @@ export function buildMap(modules: MapModule[], imports: MapImport[]): MapModel {
 
   return { nodes, edges };
 }
+
+/**
+ * Horizontal gap between document nodes, and the grid is five wide.
+ *
+ * **Sized against `fitView` and not by eye.** Twenty-one boxes at 300 apart are 1500 wide, which
+ * a 420px-tall canvas fits by scaling to about 0.6 — and at 0.6 a 10px label is 6px. The numbers
+ * here keep the whole grid near 1:1 in the space it is given, so the picture is readable without
+ * anybody reaching for the zoom. Layout only: see {@link buildDocuments} on what position means,
+ * which is nothing.
+ */
+export const DOC_COLUMN = 210;
+/** Vertical gap between document nodes. Sized with {@link DOC_COLUMN}. */
+export const DOC_ROW = 118;
+
+/** The pile of files that name a section and say no document. */
+export const UNDECLARED = null;
+
+export interface DocumentNodeData extends Record<string, unknown> {
+  /** The document, or `null` for the pile that declares none. */
+  slug: string | null;
+  /** Files carrying this header — modules and foreign files together. */
+  files: number;
+  /** Of those, how many name at least one section. */
+  citing: number;
+}
+
+export type DocumentFlowNode = Node<DocumentNodeData, "documentNode">;
+
+export interface DocumentEdgeData extends Record<string, unknown> {
+  /** How many imports cross from one document's files into the other's. */
+  weight: number;
+}
+
+export type DocumentFlowEdge = Edge<DocumentEdgeData, "documentEdge">;
+
+export interface DocumentModel {
+  nodes: DocumentFlowNode[];
+  edges: DocumentFlowEdge[];
+}
+
+/**
+ * The map one level above the file: **a node is a document, and its files are the ones that said
+ * so.**
+ *
+ * **The boundary is declared and not invented, which is the whole reason this exists.** Grouping
+ * by folder — what {@link buildMap} does — was measured against this repository and fails in both
+ * directions: `core/src` is a single directory holding 94 files, so the whole núcleo collapses into
+ * one node; and `shell/src/project/` holds 30 files of which 14 belong to one document and 16 to
+ * others, so the folder puts `WorkflowGraph.tsx` inside the map. A hand-written list of subsystems
+ * fixes neither and rots on the day somebody adds a file. The `§spec` header is a fact the owner
+ * writes, so this grouping is derived, durable, and the same mechanism the rest of the feature
+ * already turns on.
+ *
+ * **The undeclared pile is a node and not an omission.** It is exactly the §8 debt — files naming
+ * a section without saying which document — and it shrinks as headers are written. Hiding it
+ * would draw a project as more organised than it is, which is the failure this whole map is
+ * against; drawing it as a document would claim somebody decided it.
+ *
+ * **Foreign files count toward a document's size and contribute no edges**, because nothing here
+ * knows what a Go file imports. Leaving them out of the count would report the sidecars as
+ * belonging to nothing when 68 of them declare; drawing an edge for them would invent one.
+ *
+ * **Position carries no meaning and the drawing must not imply otherwise.** Nodes are ordered by
+ * size and laid on a grid so the picture is stable between reads; nothing about *where* a document
+ * sits says anything about it. What is true here is the sizes and the edges.
+ */
+export function buildDocuments(
+  modules: MapModule[],
+  foreign: ForeignFile[],
+  imports: MapImport[],
+): DocumentModel {
+  const tally = new Map<string | null, { files: number; citing: number }>();
+  const bump = (slug: string | null, citing: boolean) => {
+    const row = tally.get(slug) ?? { files: 0, citing: 0 };
+    tally.set(slug, { files: row.files + 1, citing: row.citing + (citing ? 1 : 0) });
+  };
+
+  const documentOf = new Map<string, string | null>();
+  for (const module of modules) {
+    // A module naming no section and declaring nothing is `§5.1`'s *code nobody asked for*, and it
+    // is not §8 debt: there is nothing in it to disambiguate. Putting it in the undeclared pile
+    // would make that pile grow with files that were never the question.
+    if (module.spec === null && module.cites.length === 0) continue;
+    documentOf.set(module.path, module.spec);
+    bump(module.spec, module.cites.length > 0);
+  }
+  // Foreign files are only ever sent when they cite something, so each one counts.
+  for (const file of foreign) bump(file.spec, true);
+
+  const nodes: DocumentFlowNode[] = [...tally.entries()]
+    .sort((a, b) => b[1].files - a[1].files || String(a[0]).localeCompare(String(b[0])))
+    .map(([slug, row], index) => ({
+      id: slug ?? "",
+      type: "documentNode" as const,
+      position: {
+        x: (index % 5) * DOC_COLUMN,
+        y: Math.floor(index / 5) * DOC_ROW,
+      },
+      data: { slug, files: row.files, citing: row.citing },
+    }));
+
+  const crossings = new Map<string, { from: string | null; to: string | null; weight: number }>();
+  for (const line of imports) {
+    if (!documentOf.has(line.from) || !documentOf.has(line.to)) continue;
+    const from = documentOf.get(line.from) ?? null;
+    const to = documentOf.get(line.to) ?? null;
+    // An import inside one document is not a crossing. Drawing it as a self-loop would put a
+    // number on the picture that says nothing about how the documents relate.
+    if (from === to) continue;
+    const id = `${from ?? ""}->${to ?? ""}`;
+    const seen = crossings.get(id);
+    crossings.set(id, { from, to, weight: (seen?.weight ?? 0) + 1 });
+  }
+
+  const edges: DocumentFlowEdge[] = [...crossings.entries()].map(([id, crossing]) => ({
+    id,
+    source: crossing.from ?? "",
+    target: crossing.to ?? "",
+    type: "documentEdge" as const,
+    data: { weight: crossing.weight },
+  }));
+
+  return { nodes, edges };
+}

@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { buildMap, COLUMN, declaredCoverage, moduleTone, topFolder } from "./map-model";
+import {
+  buildDocuments,
+  buildMap,
+  COLUMN,
+  declaredCoverage,
+  moduleTone,
+  topFolder,
+  UNDECLARED,
+} from "./map-model";
 import type { ForeignFile, MapModule } from "../data/project-map";
 import type { BadgeTone } from "../ui/Badge";
 
@@ -141,5 +149,98 @@ describe("declaredCoverage", () => {
     // §11's project without specs. `0 of 0` is not a failure to report and must not be drawn as
     // one: nothing here is undeclared, there is simply nothing to declare.
     expect(declaredCoverage([mod("core/src/a.rs")], [])).toEqual({ citing: 0, saying: 0 });
+  });
+});
+
+describe("buildDocuments", () => {
+  const cites = [{ section: "7", named: null }];
+  const said = (path: string, spec: string) => mod(path, { cites, spec });
+  const link = (from: string, to: string) => ({ from, to });
+
+  it("groups by the document a file declares and not by the folder it sits in", () => {
+    // Both halves of the measurement that produced this function. `core/src` is ONE directory
+    // holding the whole núcleo, so a folder puts every file in one node; `shell/src/project/`
+    // holds files of several documents, so a folder puts `WorkflowGraph.tsx` inside the map.
+    const built = buildDocuments(
+      [
+        said("core/src/map_join.rs", "mapa-do-projeto"),
+        said("core/src/browser.rs", "pilar-de-browser"),
+        said("shell/src/project/Juncao.tsx", "mapa-do-projeto"),
+        said("shell/src/project/WorkflowGraph.tsx", "motor-de-workflows"),
+      ],
+      [],
+      [],
+    );
+    const size = (slug: string) =>
+      built.nodes.find((node) => node.data.slug === slug)?.data.files;
+    expect(built.nodes).toHaveLength(3);
+    expect(size("mapa-do-projeto")).toBe(2);
+    expect(size("pilar-de-browser")).toBe(1);
+    expect(size("motor-de-workflows")).toBe(1);
+  });
+
+  it("draws the undeclared pile as a node, because it is the debt and not an omission", () => {
+    // Hiding it would draw a project as more organised than it is — the failure this whole map
+    // is against. Drawing it as a document would claim somebody decided it, so it is `null`.
+    const built = buildDocuments(
+      [said("core/src/a.rs", "mapa-do-projeto"), mod("core/src/b.rs", { cites })],
+      [],
+      [],
+    );
+    const pile = built.nodes.find((node) => node.data.slug === UNDECLARED);
+    expect(pile?.data.files).toBe(1);
+  });
+
+  it("leaves out a file that names no section, which is not §8 debt", () => {
+    // §5.1's *code nobody asked for* has nothing in it to disambiguate. Counting it as
+    // undeclared would grow the pile with files that were never the question, and the pile is
+    // read as a worklist.
+    const built = buildDocuments([mod("core/src/quiet.rs")], [], []);
+    expect(built.nodes).toHaveLength(0);
+  });
+
+  it("counts a Go file's header and never invents an edge for it", () => {
+    // 68 of this repository's declaring files are Go. Leaving them out would report the sidecars
+    // as belonging to nothing; nothing here knows what a Go file imports, so it draws no edge.
+    const built = buildDocuments(
+      [said("core/src/browser.rs", "pilar-de-browser")],
+      [{ path: "sidecars/browser/fence/csp.go", cites, spec: "pilar-de-browser" }],
+      [],
+    );
+    expect(built.nodes[0].data.files).toBe(2);
+    expect(built.edges).toHaveLength(0);
+  });
+
+  it("counts crossings and never an import inside one document", () => {
+    // A self-loop would put a number on the picture that says nothing about how the documents
+    // relate. Two documents importing each other are two edges, because a mutual pair is a real
+    // fact about this repository and merging them would hide it.
+    const built = buildDocuments(
+      [
+        said("core/src/a.rs", "mapa-do-projeto"),
+        said("core/src/b.rs", "mapa-do-projeto"),
+        said("core/src/c.rs", "pilar-de-browser"),
+      ],
+      [],
+      [
+        link("core/src/a.rs", "core/src/b.rs"),
+        link("core/src/a.rs", "core/src/c.rs"),
+        link("core/src/b.rs", "core/src/c.rs"),
+        link("core/src/c.rs", "core/src/a.rs"),
+      ],
+    );
+    expect(built.edges).toHaveLength(2);
+    const weight = (id: string) => built.edges.find((edge) => edge.id === id)?.data?.weight;
+    expect(weight("mapa-do-projeto->pilar-de-browser")).toBe(2);
+    expect(weight("pilar-de-browser->mapa-do-projeto")).toBe(1);
+  });
+
+  it("drops an import whose end is a file it never saw", () => {
+    const built = buildDocuments(
+      [said("core/src/a.rs", "mapa-do-projeto")],
+      [],
+      [link("core/src/a.rs", "core/src/gone.rs")],
+    );
+    expect(built.edges).toHaveLength(0);
   });
 });
