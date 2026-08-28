@@ -514,6 +514,42 @@ pub async fn pretooluse_decision(
         count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
     }
 
+    // **An unrecognized tool is refused, not parked, and the two are not the same verdict.**
+    //
+    // Parking exists to put a decision in front of a person: writes outside the workspace, changes
+    // to the files that ARE the policy, a git operation with consequences. Those keep parking, and
+    // must — the whole design is that nobody but the owner authorises them.
+    //
+    // `unrecognized` is not that. Its own message says so: a tool nobody has reasoned about is a
+    // capability nobody has bounded, which is a gap in this file rather than a question about the
+    // work. Parked, it stopped an autonomous run dead and minted a proposal saying, in effect,
+    // "somebody please decide about WebSearch" — a question no owner asleep at 4am was going to
+    // answer, and one that has the same answer every time. Measured 2026-08-27: two overnight
+    // attempts died exactly here, hours of work each, having asked for a tool once.
+    //
+    // Refused, the run is told no and carries on with the tools it has, which is what a person
+    // would have replied. **Deliberately not counted by `count_denial_and_stop_a_prober`**: that
+    // counter is the guard against searching a grammar for a destructive command that gets through,
+    // and reaching for an absent tool is not that search. `runner::DEFAULT_MAX_TURNS` is what bounds
+    // a run that will not take no for an answer.
+    //
+    // Scoped to the unattended modes by the one definition of that word (`runs::runs_unattended`),
+    // and not applied more widely, because the premise is literally "nobody is awake". A `real`-mode
+    // run has its owner at the window, and for them the pause is exactly right: they can approve it
+    // in ten seconds.
+    if classification.decision.decision == "pending_approval"
+        && classification.action_class == "unrecognized"
+        && crate::runs::runs_unattended(&mode)
+    {
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!(
+                "{} is not available to an autonomous run. Nobody is awake to approve it, so this                  is a refusal and not a pause: do not retry it, and do the work with the tools you                  have.",
+                payload.tool_name
+            ),
+        });
+    }
+
     if classification.decision.decision == "pending_approval" {
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
@@ -3073,6 +3109,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kinds, vec!["action-approval"]);
+    }
+
+    /// The 2026-08-27 decision, and the failure that produced it. Two overnight runs asked for a
+    /// tool this file has never reasoned about, were parked, and spent the night holding a
+    /// concurrency slot while a proposal nobody could answer sat in the queue. Hours of work each.
+    ///
+    /// The run has to still be running afterwards — that is the entire property — so the status is
+    /// asserted as well as the verdict.
+    #[tokio::test]
+    async fn an_unattended_run_is_refused_an_unrecognized_tool_instead_of_being_parked() {
+        let state = test_state().await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\work\repo"),
+            Some("sess-x"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "WebSearch",
+                "tool_input": {"query": "anything"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(
+            decision.reason.contains("WebSearch"),
+            "the refusal must name the tool so the model knows what to stop reaching for: {}",
+            decision.reason
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "running",
+            "the run must carry on with the tools it has"
+        );
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            proposals, 0,
+            "nobody is awake to answer a proposal about a tool name"
+        );
+    }
+
+    /// The narrowing, asserted. Only `unrecognized` became a refusal; an action a person genuinely
+    /// has to decide about still parks and still asks. Without this test the change above reads as
+    /// "autonomous runs stopped asking", which is the opposite of what was decided.
+    #[tokio::test]
+    async fn an_unattended_run_still_parks_for_an_action_a_person_must_decide() {
+        let state = test_state().await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\work\repo"),
+            Some("sess-y"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+    }
+
+    /// The other half of the same decision: a subagent is no longer an unrecognized tool, so it is
+    /// neither parked nor refused. `classifier.rs` holds the reasoning; this asserts the hook agrees,
+    /// because the classifier being right about `Agent` buys nothing if the run still stops here.
+    #[tokio::test]
+    async fn an_unattended_run_may_start_a_subagent() {
+        let state = test_state().await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\work\repo"),
+            Some("sess-z"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Agent",
+                "tool_input": {"prompt": "read the spec and report"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "allow");
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
     }
 
     /// The node of a job that owns no item: the plan, which runs before the queue exists.

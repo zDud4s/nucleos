@@ -27,16 +27,54 @@ pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 /// them was stuck, and each one spent money the daemon then had to write off. A worktree run does
 /// setup, edits, a build and a gate; 10 minutes does not buy that.
 ///
-/// 30 minutes is a bound, not a measurement — nobody has yet run one to completion to find out
-/// what it needs. It is three times the observed floor and still finite, which is the property
-/// that matters: an autonomous run must not be able to run all day.
-pub const AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER: u32 = 3;
+/// **Measured, 2026-08-27 — which is the measurement the sentence that stood here said nobody had
+/// taken.** An overnight run implementing one design document started at 17:42:09 and was killed at
+/// 18:12:09: thirty minutes to the second, so this deadline and not the progress one. It was not
+/// stuck. It had committed a finished piece of work minutes earlier, its context was still filling,
+/// and it died mid-task. That is exactly the failure the paragraph above names — a backstop set
+/// below the length of an ordinary task stops being a backstop — arriving at the multiplier this
+/// time instead of at the base timeout.
+///
+/// So 12, which is two hours, and it is a second bound rather than a removal. One data point says
+/// thirty minutes is too short; it does not say what is enough, and answering "no ceiling" to a
+/// deadline that fired once would give away the property that matters: an autonomous run must not
+/// be able to run all day.
+///
+/// **What still catches a run that has genuinely hung is [`DEFAULT_PROGRESS_TIMEOUT`], and that is
+/// why raising this costs less than it looks.** The two deadlines were split so this one could
+/// afford to be generous: five minutes of silence kills a wedged run whatever this says. A higher
+/// ceiling exposes only the run that keeps streaming events and never finishes, and that one is
+/// bounded by money rather than by hanging — about $3 an hour on the run measured above.
+pub const AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER: u32 = 12;
 
 /// Production default for how long a run may stay silent between streamed events.
 ///
 /// This measures silence, not total run duration. The independent `DEFAULT_RUN_TIMEOUT` remains
 /// unchanged at 600 seconds.
 pub const DEFAULT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How much longer an autonomous run may stay silent than an interactive one.
+///
+/// The sibling of [`AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER`], and it exists for the mirror image of that
+/// constant's reason. The wall clock catches a run that never finishes; this deadline catches one
+/// that has stopped getting anywhere. Set below the length of a single legitimate step, it stops
+/// catching stuck runs and starts catching busy ones.
+///
+/// **Measured, 2026-08-28.** `cargo check --manifest-path core/Cargo.toml --tests` on this
+/// workspace takes 2m42s from a warm target directory, and a full `cargo test` link is longer
+/// still. One such call is ONE tool call, which streams nothing while it runs — so a worktree run
+/// that compiles, the ordinary thing a worktree run does, is silent for longer than the 300-second
+/// deadline allows and is killed for working. Two autonomous attempts died this way overnight,
+/// and the prompt written to work around it ("commit before compiling, always") is a workaround
+/// for this number rather than advice about git.
+///
+/// 15 minutes is a bound, not a measurement: it is a little over five times the measured compile
+/// and still finite, which is the property that matters. An interactive run keeps the short one —
+/// somebody is watching it, and five minutes of silence in front of a person is already too long.
+///
+/// Derived as a multiplier rather than given its own `Duration` for `run_timeout_for_mode`'s
+/// reason: a test that shortens the deadline must still get a short one.
+pub const AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER: u32 = 3;
 
 /// Production default for how long a repository verification gate may run.
 ///

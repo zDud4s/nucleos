@@ -618,6 +618,24 @@ fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Dur
     }
 }
 
+/// PURE: the silence a run in `mode` is allowed, given the interactive default `base`.
+///
+/// The same shape as `run_timeout_for_mode` and the same modes, because the two deadlines fail
+/// unattended runs for the same reason: both were sized for work somebody is watching. A single
+/// tool call that compiles this workspace streams nothing for minutes (see
+/// `state::AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER`), so the deadline meant to catch a stuck run
+/// was killing runs that were merely building.
+///
+/// `email_triage` stays on the short one for its own reason, unchanged: it classifies one message
+/// against a local model, and a triage run silent for five minutes is stuck rather than busy.
+fn progress_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
+    if runs_unattended(mode) {
+        base * crate::state::AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER
+    } else {
+        base
+    }
+}
+
 /// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
 /// aborted, including aborted before its first poll, when the task drops its captured state without
 /// running a line of the body.
@@ -955,11 +973,41 @@ Check what actually remains before doing anything. The tree is the truth; the no
     )
 }
 
+/// The line a resume note puts above the task it is continuing.
+///
+/// A literal rather than a format, because it is read back as well as written: `task_to_carry`
+/// splits on it to recover the task from a note, which is what keeps a run that is resumed twice
+/// from being handed a note wrapped in a note.
+const RESUMED_TASK_HEADER: &str = "--- THE TASK THIS RUN IS CONTINUING ---";
+
+/// PURE: the task inside `prompt`, whether `prompt` is a task or a resume note carrying one.
+///
+/// Idempotent by construction, and that is the whole point. `runs` records no link from a resume
+/// row back to the run it resumed — the connection lives in `proposals` and `action_grants`, which
+/// nothing walking a task's history reads — so a resumed run's prompt is, as far as every later
+/// reader is concerned, the task it was given. Left alone, a run approved twice would be told its
+/// task was a note about an approval of a note about an approval.
+///
+/// Measured on 2026-08-27: run 900383 was resumed, ran out of context, and its successor was
+/// launched with `proposal #7 authorizes Agent...` as its entire brief. It had no idea what it was
+/// supposed to be building, and the 1016 lines its predecessor had written survived only because a
+/// person committed them by hand.
+fn task_to_carry(prompt: &str) -> &str {
+    match prompt.split_once(RESUMED_TASK_HEADER) {
+        Some((_, task)) => task.trim_start(),
+        None => prompt,
+    }
+}
+
 /// The task the chain started from, walking back through `successor_run_id`.
 ///
 /// **Not the predecessor's prompt**, which since the change above is itself a handoff note: reading
 /// that would nest one note inside another and push the real task one level further away on every
 /// hop, until a third successor was reading mostly framing.
+///
+/// **And not a resume note either**, which `task_to_carry` is what strips: an approval breaks the
+/// `successor_run_id` chain — a resume is a new row nothing points at — so the walk below stops at
+/// the resume rather than at the task, and what it stops on is a sentence about a proposal.
 ///
 /// Bounded rather than trusting the links: `successor_run_id` is an ordinary column and a cycle in
 /// it would hang a run's completion path, which is not a place to discover one.
@@ -977,10 +1025,11 @@ async fn original_task(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<Str
             _ => break,
         }
     }
-    sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+    let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
         .bind(id)
         .fetch_one(pool)
-        .await
+        .await?;
+    Ok(task_to_carry(&prompt).to_owned())
 }
 
 struct HandoffSuccessor {
@@ -992,6 +1041,10 @@ struct HandoffSuccessor {
     /// The job this successor belongs to, carried over from its predecessor. `Some` means the
     /// successor needs the handoff directory in its environment, like every other node of that job.
     job_id: Option<i64>,
+    /// Whether a person asked to be able to speak to this work, carried over from its predecessor.
+    /// Read back from the row that was just written rather than passed alongside it, so the flag
+    /// the launch uses and the flag `post_run_message` reads are the same fact and not two.
+    steerable: bool,
 }
 
 /// Applies the durable handoff policy to a prepared successor.
@@ -1112,13 +1165,14 @@ async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
 ) -> sqlx::Result<Option<HandoffSuccessor>> {
-    let (context_fill, existing_successor, job_id, transcript): (
+    let (context_fill, existing_successor, job_id, transcript, steerable): (
         Option<i64>,
         Option<i64>,
         Option<i64>,
         Option<String>,
+        i64,
     ) = sqlx::query_as(
-        "SELECT context_fill, successor_run_id, job_id, stdout FROM runs WHERE id = ?",
+        "SELECT context_fill, successor_run_id, job_id, stdout, steerable FROM runs WHERE id = ?",
     )
     .bind(run_id)
     .fetch_one(pool)
@@ -1149,12 +1203,21 @@ async fn prepare_handoff_successor(
     // it out is not a no-op: the successor of a node working in its item's own tree would arrive
     // with no item, resolve to the job's tree instead, and relaunch the agent somewhere its work
     // is not.
+    //
+    // `steerable` is carried for a reason of its own, taken deliberately on 2026-08-28 after an
+    // overnight run could not be corrected: the owner watched it walk into a mistake, typed the
+    // correction, and got a 409 back from a successor whose row said nobody may speak to it. The
+    // flag says a person asked to keep the volante on this work, and the work is what continues
+    // across a handoff — so the successor keeps it, and `spawn_handoff_if_needed` launches
+    // listening. Row and launch move together: a launch that listened while its row refused would
+    // hold stdin open with no way to close it, which is the failure the old comment here feared.
     let inserted = sqlx::query(
         "INSERT INTO runs (
              project_id, cwd, prompt, status, mode, session_id, read_untrusted, created_at,
-             job_id, stage, item_id
+             job_id, stage, item_id, steerable
          )
-         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage, item_id
+         SELECT project_id, cwd, ?, 'running', mode, ?, read_untrusted, ?, job_id, stage, item_id,
+                steerable
          FROM runs WHERE id = ?",
     )
     .bind(&prompt)
@@ -1230,6 +1293,7 @@ async fn prepare_handoff_successor(
         session_id,
         prompt,
         job_id,
+        steerable: steerable != 0,
     }))
 }
 
@@ -1262,6 +1326,7 @@ async fn spawn_handoff_if_needed(
     max_attempts: u32,
     tool_policy: crate::runner::ToolPolicy,
     run_timeout: std::time::Duration,
+    progress_timeout: std::time::Duration,
     classifier_governs_tools: bool,
     model: Option<String>,
 ) {
@@ -1312,16 +1377,19 @@ async fn spawn_handoff_if_needed(
         max_attempts,
         tool_policy,
         run_env(&daemon_token, successor.id, node_artifacts.as_deref()),
-        // A successor is not steerable, whatever its predecessor was. `prepare_handoff_successor`
-        // writes its row with the column's default, so a listening successor would contradict its
-        // own record: `post_run_message` reads the row, refuses, and nothing would ever close the
-        // stdin the launch had opened — a run that can only end on a deadline. Continuing a steered
-        // conversation across a handoff means giving the successor row the flag too, which is a
-        // decision to take deliberately rather than inherit.
-        false,
+        // Inherited, and this is the decision the paragraph that used to sit here asked for: a
+        // handoff continues one task, and being able to speak to that task is a property of the
+        // task rather than of the process currently doing it. `prepare_handoff_successor` now
+        // copies the column, so the row and this launch agree — which is what the old comment
+        // required before the flag could be carried at all.
+        successor.steerable,
         // Inherited, not re-derived: a successor continues one task, and a handoff that reset the
         // clock would let a run outlive its deadline by handing itself on.
         run_timeout,
+        // Inherited for the same reason. The silence deadline is per-mode, the successor's mode is
+        // its predecessor's, and re-deriving it here would need a `mode` this function does not
+        // have — the same reason `spawn_run` is handed it rather than reading `state`.
+        progress_timeout,
         // Inherited for the same reason, and it is the same tree: re-deriving would let a handoff
         // quietly change what the work is allowed to do halfway through it.
         classifier_governs_tools,
@@ -1352,6 +1420,10 @@ fn spawn_run(
     env: Vec<(String, String)>,
     steerable: bool,
     run_timeout: std::time::Duration,
+    // Decided by the caller for `run_timeout`'s reason: the mode is what sets it, and the mode is
+    // not a fact this function has. Passed beside the wall clock rather than read from `state`
+    // here, so the two deadlines can never be derived from different beliefs about the run.
+    progress_timeout: std::time::Duration,
     classifier_governs_tools: bool,
     // Which model answers this run, or `None` for the runner's own. Decided by the caller, because
     // only it knows the stage — `spawn_run` must not learn to read job nodes.
@@ -1359,7 +1431,6 @@ fn spawn_run(
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
-    let progress_timeout = state.progress_timeout;
     let handoff_state = state.clone();
     let run_messages = state.run_messages.clone();
     let run_tails = state.run_tails.clone();
@@ -1643,6 +1714,7 @@ fn spawn_run(
                             max_attempts,
                             tool_policy,
                             run_timeout,
+                            progress_timeout,
                             classifier_governs_tools,
                             model.clone(),
                         ))
@@ -1789,6 +1861,7 @@ fn spawn_run(
                             max_attempts,
                             tool_policy,
                             run_timeout,
+                            progress_timeout,
                             classifier_governs_tools,
                             model.clone(),
                         ))
@@ -2504,6 +2577,7 @@ async fn create_run_with(
         run_env(&daemon_token, id, node_artifacts.as_deref()),
         steerable,
         run_timeout_for_mode(state.run_timeout, mode),
+        progress_timeout_for_mode(state.progress_timeout, mode),
         governed_by_classifier,
         // A job node's stage is what may be routed elsewhere; every other run names no stage and so
         // stays on the runner's own model.
@@ -2650,6 +2724,41 @@ fn resume_instruction(proposal_id: i64, tool_name: &str, tool_input: Option<&str
     }
 }
 
+/// Where to resume a paused run that owns no worktree, read from what the run recorded about itself.
+///
+/// The shape is the one the worktree lookup returns — `(project_id, project_root, path)` — because
+/// everything downstream takes those three and does not care which of the two ways they were
+/// obtained. What differs is only the last: a worktree's `path` is a tree the daemon made, and this
+/// is the directory the caller named when the run was created.
+///
+/// Both halves must be present or this is not resumable: without a project there is no root to
+/// govern the resume, and without a `cwd` there is nowhere to launch it. That is the one case where
+/// the old sentence was right, so it is the one case that still says it.
+async fn recorded_tree_of(
+    state: &AppState,
+    run_id: i64,
+) -> Result<(String, String, String), ResumeError> {
+    let recorded: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT project_id, cwd FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(&state.pool)
+            .await?;
+
+    let (Some(project_id), Some(cwd)) = recorded.unwrap_or((None, None)) else {
+        return Err(ResumeError::NotResumable(
+            "the paused run owns no worktree and recorded no directory to resume in",
+        ));
+    };
+
+    let project_root = crate::inspect::project_root(&state.pool, &project_id)
+        .await?
+        .ok_or(ResumeError::NotResumable(
+            "the paused run's project has no recorded root to resume against",
+        ))?;
+
+    Ok((project_id, project_root, cwd))
+}
+
 pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i64, ResumeError> {
     let proposal = crate::proposals::get(&state.pool, proposal_id)
         .await?
@@ -2674,12 +2783,25 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // this node started. Looking it up by run would answer "no live worktree" for every paused job
     // node, so approving one returned `NotResumable` and the shell offered a button that could not
     // work. Which owner to ask for is decided by the paused run's own `job_id`.
-    let (job_id, stage, item_id): (Option<i64>, Option<String>, Option<i64>) =
-        sqlx::query_as("SELECT job_id, stage, item_id FROM runs WHERE id = ?")
+    //
+    // `steerable` rides along for a different reason, and it is the one an owner felt: a paused run
+    // that is approved back to life is the same work, so the permission to speak to that work
+    // survives the pause. Without it the answer to a mid-course correction was a 409 from a run the
+    // owner had just personally authorised to continue.
+    let (job_id, stage, item_id, steerable): (Option<i64>, Option<String>, Option<i64>, i64) =
+        sqlx::query_as("SELECT job_id, stage, item_id, steerable FROM runs WHERE id = ?")
             .bind(original_run_id)
             .fetch_optional(&state.pool)
             .await?
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, 0));
+    // Read here, outside the transaction opened below, because `original_task` walks the run table
+    // with its own connection and doing that while holding SQLite's write lock is a deadlock
+    // waiting for a busy night. A resume that cannot recover the task is not a reason to refuse the
+    // approval — the note still names the action and the session still has the history — so a
+    // failure falls back to an empty task and the note simply omits the section.
+    let carried_task = original_task(&state.pool, original_run_id)
+        .await
+        .unwrap_or_default();
     // Item before job, and both are set at once — a node of an item IS a node of its job. The
     // innermost tree wins, because it is the one the work is in: answering with the job's would
     // resume the agent in the integration checkout with its edits somewhere else entirely.
@@ -2689,17 +2811,32 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         (None, None) => crate::worktree::Owner::Run(original_run_id),
     };
 
-    let (wt_project_id, project_root, wt_path) = sqlx::query_as::<_, (String, String, String)>(
+    let owned_tree = sqlx::query_as::<_, (String, String, String)>(
         "SELECT project_id, project_root, path
          FROM worktrees WHERE owner_kind = ? AND owner_id = ? AND removed_at IS NULL",
     )
     .bind(owner.kind())
     .bind(owner.id())
     .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ResumeError::NotResumable(
-        "no live worktree for the paused run",
-    ))?;
+    .await?;
+
+    // **A run that owns no worktree is not a run that cannot be resumed, and reading the two as one
+    // made a whole mode a dead end.** `mode = "real"` runs in a directory the caller named; there is
+    // no row in `worktrees` for it and there never was one to find. So this answered
+    // `NotResumable("no live worktree for the paused run")` for every paused `real` run, while the
+    // shell went on offering an Approve button — a person clicked it and got a conflict, with no
+    // other way forward than rejecting the very thing they were trying to allow.
+    //
+    // Measured 2026-08-27 on run 900376: it parked on its first command, one minute in, and could
+    // not be released by any means except refusing it.
+    //
+    // The directory the run recorded for itself is the same one it was working in, so resuming
+    // there continues exactly what was paused. `NotResumable` is still the answer when there is no
+    // directory to name — a run with neither a worktree nor a `cwd` genuinely has nowhere to go.
+    let (wt_project_id, project_root, wt_path) = match owned_tree {
+        Some(found) => found,
+        None => recorded_tree_of(state, original_run_id).await?,
+    };
 
     // Spec decision 2, arrived at the other way round: rather than letting the run perform the merge
     // once a human says yes, the yes IS the queueing. Resolved before the transaction opens, because
@@ -2777,7 +2914,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // `kind()` rather than by the word "merge", which is what it said while merge was the only thing
     // the queue could do: a run told its *merge* was queued after asking for a push would read that
     // as the daemon having misunderstood it, and go looking for what it had misfiled.
-    let prompt = match (queued_request_id, &queueable) {
+    let note = match (queued_request_id, &queueable) {
         (Some(request_id), Some((_, op))) => {
             let kind = op.kind();
             format!(
@@ -2792,6 +2929,23 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         _ => resume_instruction(proposal_id, &tool_name, proposal.tool_input.as_deref()),
     };
 
+    // The note is what CHANGED; the task is what the run is still for, and the row has to carry
+    // both. It resumes the same CLI session, so in the ordinary case the history is right there and
+    // the note alone reads fine — but the row's prompt is the only thing that survives the session,
+    // and a handoff out of this run reads exactly that. Told only the note, a successor inherits an
+    // instruction about a proposal as its entire brief (see `task_to_carry`).
+    //
+    // Appended under a header rather than merged into the sentence, so `task_to_carry` can take it
+    // back out on the next resume instead of nesting.
+    let prompt = if carried_task.trim().is_empty() {
+        note
+    } else {
+        format!("{note}
+
+{RESUMED_TASK_HEADER}
+{carried_task}")
+    };
+
     // The resume carries the node's identity forward. Without it the new run belongs to no job, so
     // the chain that has to finalise it cannot see it: the item stays `running` forever and the job
     // sits there until the four-hour ceiling retires it, with the approved work already done.
@@ -2801,8 +2955,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // resolves to the job's tree instead. One approval looks correct; two do not.
     let result = sqlx::query(
         "INSERT INTO runs
-           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage, item_id)
-         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?)",
+           (project_id, cwd, prompt, status, mode, session_id, created_at, job_id, stage, item_id,
+            steerable)
+         VALUES (?, ?, ?, 'running', 'worktree', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&wt_project_id)
     .bind(&wt_path)
@@ -2812,6 +2967,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     .bind(job_id)
     .bind(stage.as_deref())
     .bind(item_id)
+    .bind(steerable)
     .execute(&mut *tx)
     .await?;
     let resume_id = result.last_insert_rowid();
@@ -2975,13 +3131,15 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
                 .map(|_| std::path::PathBuf::from(&wt_path).join(crate::worktree::ARTIFACTS_DIR))
                 .as_deref(),
         ),
-        // Not steerable, for the reason the handoff successor is not: the resume row carries the
-        // column's default, and a process listening on a stdin its own row denies could never be
-        // told the conversation is over.
-        false,
+        // Inherited from the run being resumed, like the handoff successor's. The row above carries
+        // the same value, so the launch listens exactly when `post_run_message` will admit a turn.
+        steerable != 0,
         // A resume is a worktree run, so it gets the worktree clock — the same one the run it
         // continues was given.
         run_timeout_for_mode(state.run_timeout, "worktree"),
+        // And the worktree silence deadline, for the same reason: a resume goes straight back into
+        // the work its predecessor was doing, which on this workspace means compiling.
+        progress_timeout_for_mode(state.progress_timeout, "worktree"),
         // Asked again against the worktree being resumed rather than inherited, because it is a
         // fresh launch into a tree that has since been worked in: the run it continues may have
         // rewritten the very settings file this reads. Re-checking is the conservative direction —
@@ -5494,6 +5652,77 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// single thing `project_slots` exists to prevent.
     ///
     /// Handed over rather than claimed, for the reason spelled out at the resume: a claim is per
+    /// The volante survives the handoff, and the row and the launch agree about it.
+    ///
+    /// Both halves are asserted because either alone is a bug. A row that says `steerable` with a
+    /// launch that never opened stdin refuses every turn; a launch that listens with a row that
+    /// says no holds stdin open with nothing able to close it, and the run can then only end on a
+    /// deadline. The old code chose the safe half — neither — and the cost was an owner watching a
+    /// run walk into a mistake with no way to say so.
+    #[tokio::test]
+    async fn a_successor_keeps_the_permission_to_be_steered() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, steerable, context_fill, created_at)
+             VALUES (43201, 'project-s', 'the task', 'running', 'real', 1, ?, '2026-08-28T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let successor = prepare_handoff_successor(&pool, 43201)
+            .await
+            .unwrap()
+            .expect("the run was over the threshold and had no successor yet");
+
+        assert!(
+            successor.steerable,
+            "the launch would not open a stdin the row admits turns on"
+        );
+        let recorded: i64 = sqlx::query_scalar("SELECT steerable FROM runs WHERE id = ?")
+            .bind(successor.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded, 1,
+            "post_run_message reads the row, so the row is what decides whether a turn is admitted"
+        );
+    }
+
+    /// And a run nobody asked to steer stays unsteerable across the same hop. The inheritance is a
+    /// copy, not a promotion.
+    #[tokio::test]
+    async fn a_successor_of_an_unsteerable_run_is_not_promoted() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+             VALUES (43202, 'project-s', 'the task', 'running', 'worktree', ?, '2026-08-28T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let successor = prepare_handoff_successor(&pool, 43202)
+            .await
+            .unwrap()
+            .expect("the run was over the threshold and had no successor yet");
+
+        assert!(!successor.steerable);
+    }
+
     /// owner, so the successor would ask for a SECOND slot while the predecessor still held the
     /// first, and a project at its ceiling would refuse to continue work it had already admitted.
     /// A handover cannot fail on a full project, because it does not change how many are held.
@@ -5701,6 +5930,104 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .await
             .unwrap();
         assert_eq!(count_after, count_before);
+    }
+
+    /// **A paused `real` run owns no worktree, and reading that as "cannot be resumed" made the
+    /// whole mode a dead end.**
+    ///
+    /// `mode = "real"` runs in a directory the caller named; nothing ever writes a `worktrees` row
+    /// for it. So the lookup that resolves where to resume answered `NotResumable` for every paused
+    /// `real` run, while the shell went on offering an Approve button that returned a conflict —
+    /// leaving refusal as the only way to release a run somebody was trying to allow.
+    ///
+    /// Measured on run 900376, which parked one minute in and could not be released any other way.
+    #[tokio::test]
+    async fn a_paused_run_without_a_worktree_resumes_in_the_directory_it_recorded() {
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', 'off', ?)",
+        )
+        .bind("C:/repos/proj")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // No `worktrees` row on purpose: that absence IS the case under test.
+        let result = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at)
+             VALUES ('proj', 'C:/repos/proj', 'x', 'awaiting_approval', 'sess-real', 'real', ?)",
+        )
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let paused_run_id = result.last_insert_rowid();
+
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            paused_run_id,
+            Some("sess-real"),
+            Some("proj"),
+            "Bash",
+            "unrecognized shell commands and code execution require approval",
+            Some(r#"{"command":"pwd"}"#),
+        )
+        .await
+        .unwrap();
+
+        let resumed = resume_approved_run(&state, proposal_id).await;
+
+        assert!(
+            resumed.is_ok(),
+            "a paused run with a recorded cwd must be resumable: {resumed:?}"
+        );
+        let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
+            .bind(resumed.unwrap())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cwd.as_deref(),
+            Some("C:/repos/proj"),
+            "the resume must continue in the directory the paused run was working in"
+        );
+    }
+
+    /// The one case the old sentence was right about, kept: no worktree AND nothing recorded about
+    /// where the run was working is genuinely nowhere to resume.
+    #[tokio::test]
+    async fn a_paused_run_with_no_directory_at_all_is_still_not_resumable() {
+        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        let result = sqlx::query(
+            "INSERT INTO runs (prompt, status, session_id, mode, created_at)
+             VALUES ('x', 'awaiting_approval', 'sess-nowhere', 'real', ?)",
+        )
+        .bind(&created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let paused_run_id = result.last_insert_rowid();
+
+        let proposal_id = proposals::create_action_approval(
+            &state.pool,
+            paused_run_id,
+            Some("sess-nowhere"),
+            None,
+            "Bash",
+            "x",
+            Some(r#"{"command":"pwd"}"#),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            resume_approved_run(&state, proposal_id).await,
+            Err(ResumeError::NotResumable(_))
+        ));
     }
 
     #[tokio::test]
@@ -6067,6 +6394,36 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         panic!("run did not reach completed status in time");
     }
 
+    /// PURE. The task survives a resume, and survives being resumed again.
+    ///
+    /// The second half is the one that matters: without idempotence, a run approved three times
+    /// would be launched with a note about a note about a note, and the task pushed a page further
+    /// down each time — the same nesting `original_task` already guards against for handoffs.
+    #[test]
+    fn a_task_carried_through_a_resume_comes_back_out_whole() {
+        let task = "Finish the land module, test-first, against the seven tests in §5.";
+        assert_eq!(task_to_carry(task), task, "a plain task is its own task");
+
+        let once = format!("proposal #7 authorizes Agent.
+
+{RESUMED_TASK_HEADER}
+{task}");
+        assert_eq!(task_to_carry(&once), task);
+
+        let twice = format!(
+            "proposal #9 authorizes Bash.
+
+{RESUMED_TASK_HEADER}
+{}",
+            task_to_carry(&once)
+        );
+        assert_eq!(
+            task_to_carry(&twice),
+            task,
+            "a second approval must not wrap the note again"
+        );
+    }
+
     /// The note is the whole bridge, so it carries both halves and says which is which.
     #[test]
     fn a_handoff_note_carries_the_task_and_the_predecessors_own_words() {
@@ -6139,6 +6496,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             GateConfig::NotConfigured,
             1,
             crate::runner::ToolPolicy::None,
+            Duration::from_secs(30),
             Duration::from_secs(30),
             false,
             None,
@@ -8007,6 +8365,49 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 "{mode} keeps the interactive clock"
             );
         }
+    }
+
+    /// PURE, and the sibling of the test above. The silence deadline was the one actually killing
+    /// autonomous runs: a worktree run compiles, one compile is one tool call, and a tool call
+    /// streams nothing while it runs. The wall clock was raised twice before anyone noticed that
+    /// the deaths were arriving at the 300-second mark and not the 600-second one.
+    ///
+    /// `email_triage` is again the case worth stating, and for the same reason as above rather
+    /// than a new one: it is autonomous and must still be caught quickly.
+    #[test]
+    fn only_the_long_running_autonomous_modes_get_the_longer_silence() {
+        let base = Duration::from_secs(300);
+
+        for mode in ["shadow", "worktree"] {
+            assert_eq!(
+                progress_timeout_for_mode(base, mode),
+                base * crate::state::AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER,
+                "{mode} spends single tool calls compiling, and streams nothing while it does"
+            );
+        }
+
+        for mode in ["real", "plan", crate::email::TRIAGE_MODE] {
+            assert_eq!(
+                progress_timeout_for_mode(base, mode),
+                base,
+                "{mode} keeps the interactive silence deadline"
+            );
+        }
+    }
+
+    /// The two deadlines must stay ordered: a silence deadline longer than the wall clock could
+    /// never fire, which would silently delete the guard rather than relax it. Asserted against
+    /// the production constants, so raising one without the other fails here rather than in the
+    /// field at three in the morning.
+    #[test]
+    fn the_silence_deadline_stays_inside_the_wall_clock_for_an_autonomous_run() {
+        let wall = run_timeout_for_mode(crate::state::DEFAULT_RUN_TIMEOUT, "worktree");
+        let silence = progress_timeout_for_mode(crate::state::DEFAULT_PROGRESS_TIMEOUT, "worktree");
+        assert!(
+            silence < wall,
+            "an autonomous run may be silent for {silence:?} but only live for {wall:?} — the \
+             silence deadline can never fire, so nothing catches a stuck run"
+        );
     }
 
     /// The wall clock is per mode, and this is the test that notices if it stops being — the pure
