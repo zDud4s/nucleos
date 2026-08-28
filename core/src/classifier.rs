@@ -22,6 +22,26 @@ pub const CLASSIFIER_VERSION: u32 = 10;
 /// `TodoWrite` writes the agent's task list, which lives in the session and not in the project.
 const READ_LOCAL_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill", "TodoWrite"];
 const WRITE_TOOLS: &[&str] = &["Edit", "Write"];
+
+/// Tools that start a subagent. Both spellings, because the CLI has used each.
+///
+/// **Allowed, and the reason is a claim about the hook rather than about the tool.** A subagent is
+/// not a capability of its own: it cannot read, write or run anything except by calling tools, and
+/// every tool call it makes arrives back at `pretooluse_decision` under its parent run's id and is
+/// classified here exactly as the parent's own would be. Delegating therefore widens who is doing
+/// the work and not what the work may do.
+///
+/// **If that stops being true, this list is the hole.** A CLI that ran subagent tool calls without
+/// firing `PreToolUse` would turn one allowed `Agent` call into an ungoverned session. That is the
+/// thing to check when this file is next revisited, and it is why the entry is named and commented
+/// rather than folded into `READ_LOCAL_TOOLS` — a subagent plainly does not "only read", and
+/// `only_reads` must keep answering no for it so the read-untrusted barrier still holds.
+///
+/// Decided 2026-08-27 by the owner, against the alternative of leaving them unrecognized. Two
+/// overnight runs died having asked for one: an unrecognized tool parked the run for an approval
+/// nobody was awake to give, so the cost of the refusal was the whole night's work rather than one
+/// declined delegation.
+const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
 const SELF_GOVERNING_FILES: &[&str] = &[
     ".ai/autopilot.yaml",
     // Holds `stt_command`, a string the daemon spawns on a hotkey press. That is the same shape as
@@ -391,6 +411,16 @@ pub fn classify(
             "allow",
             "read-local",
             "local reads and ordinary file writes are allowed",
+        );
+    }
+
+    // Its own class rather than `read-local`, so the scoreboard can show how much of a run's work
+    // was delegated, and so nobody reads "allow/read-local" on a line that started a session.
+    if SUBAGENT_TOOLS.contains(&tool_name) {
+        return classification(
+            "allow",
+            "subagent",
+            "starting a subagent is allowed; its own tool calls are classified the same way",
         );
     }
 
@@ -2116,11 +2146,34 @@ mod tests {
     /// about is a capability nobody has bounded.
     #[test]
     fn a_tool_this_file_has_not_reasoned_about_still_asks() {
-        for tool_name in ["WebFetch", "WebSearch", "Task", "NotebookEdit"] {
+        for tool_name in ["WebFetch", "WebSearch", "NotebookEdit"] {
             assert_classification(
                 classify(tool_name, &json!({}), None),
                 "pending_approval",
                 "unrecognized",
+            );
+        }
+    }
+
+    /// The owner's decision of 2026-08-27, written as a test so it cannot be undone by accident.
+    /// `Task` used to sit in the list above, which is what parked two overnight runs.
+    #[test]
+    fn starting_a_subagent_is_allowed_under_its_own_class() {
+        for tool_name in ["Agent", "Task"] {
+            assert_classification(classify(tool_name, &json!({}), None), "allow", "subagent");
+        }
+    }
+
+    /// The other half of that decision, and the half that keeps it safe. A subagent is allowed
+    /// because its own tool calls come back through this file — not because it changes nothing. If
+    /// it ever answered `only_reads`, a turn holding a stranger's words could delegate its way past
+    /// the read-untrusted barrier, which is the one thing that barrier exists to stop.
+    #[test]
+    fn a_subagent_is_not_a_read_however_it_is_classified() {
+        for tool_name in ["Agent", "Task"] {
+            assert!(
+                !only_reads(tool_name),
+                "{tool_name} starts a session that can write; the barrier must not wave it through"
             );
         }
     }
