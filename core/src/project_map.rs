@@ -1036,7 +1036,7 @@ import type { GraphNode } from "../data/workflow-graph";
         write(
             &root,
             "sidecars/echo/main.go",
-            "// §9 echo — the sidecar contract\npackage main\n",
+            "// §9 pilar-de-web — the sidecar contract\npackage main\n",
         );
 
         let found = structure(&root).expect("structure");
@@ -1056,7 +1056,11 @@ import type { GraphNode } from "../data/workflow-graph";
             found.foreign[0].cites,
             vec![Citation {
                 section: "9".to_string(),
-                named: Some("echo".to_string()),
+                // A real slug and not the word `echo`: since 2026-08-28 a one-word tail is
+                // prose and never becomes a citation's document (see
+                // [`crate::map_join::citations`]). This test is about a Go file's citations
+                // being COLLECTED, which needs a tail that survives to be worth asserting.
+                named: Some("pilar-de-web".to_string()),
             }]
         );
 
@@ -1375,7 +1379,7 @@ mod tests {
         write(
             &root,
             "sidecars/echo/main.go",
-            "// §9 echo — the sidecar contract\npackage main\n",
+            "// §9 pilar-de-web — the sidecar contract\npackage main\n",
         );
         // Read by nobody and folded into nothing, so a header here would govern no citation at all.
         write(&root, "shell/src/data/wire.d.ts", "// §4 is mentioned\n");
