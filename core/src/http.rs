@@ -4844,6 +4844,26 @@ async fn post_project_map_triage(
             // feature, so the two piles are attributable alike.
             brain.as_str().to_owned(),
         ),
+        // Unreachable today, and refused rather than given a placeholder. `read_brain` (~4050)
+        // yields only `cloud` or `local`, so a hosted brain never gets this far — the 422 below is
+        // the same answer it already receives one layer up, written here rather than invented.
+        //
+        // **Deliberately not the shape its sibling at ~4106 uses.** That route's arm falls back to
+        // the CLI extractor, which is harmless there because the answer is returned and forgotten.
+        // This one WRITES what answered into the triage pile, and a row recorded against the wrong
+        // brain is exactly the silent lie `Brain::OpenRouter` was split out of `Local` to prevent.
+        // A pile is read months later by somebody asking where their words went.
+        //
+        // Whoever makes the hosted route selectable here owns replacing this with a real extractor,
+        // and will find no extractor to reach for: `map_intent::Extractor` has `Cli` and `Loopback`
+        // and nothing hosted. That is the work, not this arm.
+        crate::chats::Brain::OpenRouter => {
+            tracing::warn!(
+                project_id = %id,
+                "the hosted brain was asked to triage, which this route has no extractor for"
+            );
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
         crate::chats::Brain::Local => {
             // Read per request rather than cached on `AppState`, for `map/extract`'s reason: a name
             // cached at startup is one the owner cannot change without restarting the daemon.
