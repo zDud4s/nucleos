@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! The intention layer of a project's map: what a spec decided, one line at a time.
 //!
 //! **Pure, and that is what makes the hard part testable.** The prompt and the parse are where the

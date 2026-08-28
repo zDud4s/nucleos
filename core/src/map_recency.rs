@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! §10's ordering: what arrives first is what moved last.
 //!
 //! > *"Dentro do que chega, a ordem é por **recência de alteração do código âncora**, não por

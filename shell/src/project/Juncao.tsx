@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import type { Anchored, Junction } from "../data/project-map";
 import { Orfa } from "./Orfa";
 

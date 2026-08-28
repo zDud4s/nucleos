@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! Whether a decision has no code, or lost the comment that said it had.
 //!
 //! §5.1's *declarado, sem código* pile is the product of this map, and every row in it rests on the
@@ -1172,10 +1174,11 @@ mod tests {
     ///
     /// The rule is `map_join::evidence`'s own — a candidate that names a DIFFERENT document of this
     /// project is evidence against and the citation is skipped, never downgraded — and it is the
-    /// same call rather than a second opinion about the same question. Today no citation in this
-    /// repository declares anything, so this branch is inert; the day §8 lands it is the difference
-    /// between a guard that answers about one document and one that answers about all of them at
-    /// once.
+    /// same call rather than a second opinion about the same question. Until 2026-08-28 nothing in
+    /// this repository declared anything and this branch was inert. The map's own modules now carry
+    /// a `§spec` header, so it is live for them and still inert everywhere else — which is the
+    /// difference between a guard that answers about one document and one that answers about all of
+    /// them at once, arriving one group of files at a time.
     #[tokio::test]
     async fn a_citation_under_another_document_is_not_this_decision_s_loss() {
         let repo = repository("nucleos-orphan-other-doc-");

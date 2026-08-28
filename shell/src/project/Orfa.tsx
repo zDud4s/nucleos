@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { isApiRefusal } from "../data/client";
 import type { Anchored, Loss, Orphan } from "../data/project-map";
 import { useOrphanCheck, useRecordAnchor } from "../data/project-map";

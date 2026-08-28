@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { useState, type ReactNode } from "react";
 import { isApiRefusal } from "../data/client";
 import {

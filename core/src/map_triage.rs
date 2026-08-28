@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! What the triager is allowed to answer.
 //!
 //! The model enters this feature twice and is a compressor both times (§6). Before, it turns a

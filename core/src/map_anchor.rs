@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! Which document a file's bare `§` numbers name: the question put to a model about one file, the
 //! parse of what it answers, and the two facts the arithmetic can honestly add to it.
 //!
@@ -2631,18 +2633,26 @@ mod tests {
     }
 
     #[test]
-    fn this_module_declares_nothing_about_itself() {
+    fn this_module_declares_the_map_spec_and_no_fixture_has_added_a_second() {
         // `map_join::declaration` is deliberately not a parser, so a complete `§spec` line written
         // out as a plain literal anywhere in this file — in a fixture, in a comment explaining the
-        // convention — would put THIS module under that document the moment the map walks this
-        // repository, and every bare citation in the prose above with it. The fixtures interpolate
-        // for exactly that reason, and this is what says they still do.
+        // convention — would put THIS module under that document, and every bare citation in the
+        // prose above with it. The fixtures interpolate for exactly that reason, and this is what
+        // says they still do.
+        //
+        // **Rewritten 2026-08-28, when this file gained a header of its own.** Until then nothing
+        // in this repository declared anything, so `Absent` was the whole guard: any declaration
+        // at all was a leak. The header is now a real declaration and the guard has to get sharper
+        // rather than disappear — `Named` is what exactly one produces, so a fixture spelling a
+        // second one out makes this `Repeated` and the assertion still fails. What is no longer
+        // checked, and cannot be from inside this file, is that the header names the right
+        // document; `map_join::names_document` is where that question belongs.
         let me = include_str!("map_anchor.rs");
 
         assert_eq!(
             crate::map_join::declaration(me),
-            crate::map_join::Declaration::Absent,
-            "a fixture in this file has spelled a declaration out, and is now declaring this module"
+            crate::map_join::Declaration::Named("mapa-do-projeto".to_owned()),
+            "a fixture in this file has spelled a declaration out, so this module declares twice              and only the first of the two is a header"
         );
 
         // The second defence, independent of the first: the slug the fixtures name is not a
@@ -3276,7 +3286,7 @@ mod tests {
         // the ground truth that costs nothing to check — and every part of it has already been
         // wrong once.
         //
-        // Three properties, and the third is the one that was missing. A pair naming a document
+        // Four properties now, and the fourth arrived with the headers. A pair naming a document
         // this project does not have would score every run against a slug no model could answer. A
         // pair naming a file this checkout does not have would do the same. And a pair naming a
         // file with nothing to inherit is a pair NO run can ever score: `question` refuses it before
@@ -3284,6 +3294,11 @@ mod tests {
         // the model was never shown. Two such pairs shipped in this table, and three paid runs of
         // the gate above are what found them. This costs nothing and finds them at the next
         // `cargo test`.
+        //
+        // The fourth is the reverse direction, and it did not exist while nothing declared: a file
+        // whose header was written BY HAND has to name the document this table already said it
+        // does. That is the only independent check such a header ever gets, and this table is
+        // older than every one of them.
         assert_eq!(GROUND_TRUTH.len(), 28);
 
         let root = repository_root();
@@ -3296,10 +3311,28 @@ mod tests {
             );
             let source = std::fs::read_to_string(root.join(file))
                 .unwrap_or_else(|_| panic!("the ground truth names {file}, not in this checkout"));
-            assert!(
-                question(file, &source, &specs).is_ok(),
-                "the ground truth names {file}, which no run can score: it has nothing that would                  inherit a declaration, so it is never put to a model at all"
-            );
+            match question(file, &source, &specs) {
+                Ok(_) => {}
+                // **A file the owner decided by hand is not a defect in this table, and from
+                // 2026-08-28 several of these are.** `question` refuses a file that already
+                // declares, so such a pair can never be scored by a run — but the reason is that
+                // the answer is settled, not that the pair was written wrong. Dropping it from the
+                // table would be the one move §8 forbids: shrinking the reference to whatever
+                // currently passes is the hit rate computed at the moment somebody wants it to pass.
+                //
+                // So it stays, and it is checked HARDER than a scorable pair. The header has to
+                // agree with a slug written down before any of this ran, which is the only
+                // independent check a hand-written header ever gets.
+                Err(Skipped::AlreadyDeclares(declared)) => assert!(
+                    crate::map_join::names_document(&declared, slug),
+                    "{file} declares {declared}, and the ground truth written before any run says \
+                     it is {slug} — one of the two is wrong and the table is the older of them"
+                ),
+                Err(Skipped::NothingWouldInherit) => panic!(
+                    "the ground truth names {file}, which no run can score: it has nothing that \
+                     would inherit a declaration, so it is never put to a model at all"
+                ),
+            }
         }
     }
 

@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! The structure layer of a project's map: what modules exist, and what they import.
 //!
 //! **Pure, and that is what makes it callable from anywhere.** It takes a path and returns

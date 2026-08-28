@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! What a stamp means.
 //!
 //! The verdict is the owner's, and it is the one thing in this map that no amount of reading the

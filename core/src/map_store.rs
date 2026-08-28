@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! Where the intention layer's rows live.
 //!
 //! Separate from `map_intent.rs` for the same reason that module knows no SQL: the prompt and the

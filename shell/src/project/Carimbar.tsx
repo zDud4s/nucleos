@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useCarimbar, type Anchored } from "../data/project-map";

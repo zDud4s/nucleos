@@ -1,3 +1,5 @@
+//! §spec mapa-do-projeto
+//!
 //! The junction between what a spec decided and what the code implements, both halves of it.
 //!
 //! The lexical half reads `§` references out of a source file. The joining half — [`join`] —
@@ -22,11 +24,25 @@
 //! document for the whole file (the **default** — see [`declaration`]). Which of the two a given
 //! citation used is [`citations`]'s business and nobody else's.
 //!
-//! **The reader landed on a repository where not one file declares anything, and that ordering is
-//! the safety property.** Every count this module produces was measured before and after it and
-//! did not move, so the commit that writes the headers is a diff of headers alone and its effect
-//! is measurable in isolation. Until it lands, every positive join here is still a guess about
-//! which document a bare `§` meant.
+//! **The reader landed on a repository where not one file declared anything, and that ordering
+//! was the safety property.** Every count this module produces was measured before and after the
+//! reader landed and did not move, so the commits that write the headers are diffs of headers
+//! alone and their effect is measurable in isolation.
+//!
+//! **The first of those landed 2026-08-28 and covers the map’s own files only** — the
+//! twenty-four modules and components that implement this feature declare `§spec
+//! mapa-do-projeto`. Measured against twenty approved decisions of the map’s own spec, on this
+//! repository: **2 declared / 16 ambiguous before, 17 declared / 1 ambiguous after.** Everywhere
+//! else a bare `§` is still a guess.
+//!
+//! **It raises the anchor and does NOT shrink the file lists, and that half is worth knowing
+//! before somebody expects it.** A decision’s [`Anchored::modules`] holds every file whose
+//! citation this decision COULD be about, and a bare `§5.2` in `attention.rs` still could be. It
+//! stops being a candidate only once `attention.rs` declares ITS document, because [`evidence`]
+//! then skips it as another document’s citation. So the noise in a row is the size of what has
+//! not declared yet — after the headers above, the one decision left ambiguous is ambiguous
+//! because of a single undeclared file in `shell/src/team/`, which is the whole mechanism in one
+//! row. [`crate::map_anchor`] is what proposes the rest.
 //!
 //! **[`Citation::named`] is a candidate, never a verdict.** The word after a section number has
 //! the same shape whether it is a slug or an English word, and nothing lexical tells them apart:
@@ -36,8 +52,10 @@
 //! 308 of them carry a candidate — every one an English word. The only hyphenated candidate in
 //! shipping code is `§8.4 approval-pause` in `runs.rs`, and `approval-pause` is a phrase, not a
 //! document; the others the scan reports sit inside test fixtures in `project_map.rs` that quote
-//! the form §8 prescribes. **Zero real slug citations exist here** — §8 is unfixed until the
-//! edit that puts a slug on all of them lands. Checking a candidate against the project's actual
+//! the form §8 prescribes. **Zero real slug citations exist here** — §8's OVERRIDE half is
+//! still unfixed, and the scan above predates the headers: re-run today it would report the map's
+//! own files carrying `mapa-do-projeto` on every bare citation, inherited from a [`declaration`]
+//! rather than typed after a number. Checking a candidate against the project's actual
 //! spec slugs is [`names_document`]'s job, below, and refusing to guess at this layer is what
 //! keeps that rejection worth anything.
 //!
@@ -878,6 +896,118 @@ mod tests {
     use super::*;
     use crate::map_store::AnchorSource;
     use crate::project_map::Reader;
+
+    /// Dogfood: the whole junction, against a real database and a real repository.
+    ///
+    /// `#[ignore]` for the reason `map_anchor`'s repository scan is ignored: it reads one
+    /// particular checkout and one particular database, and an ordinary `cargo test` has neither.
+    /// It exists because every other test in this module builds its own fixtures, and a feature
+    /// whose entire purpose is to tell somebody the truth about a real project ought to be
+    /// pointed at one at least once before anybody believes it.
+    ///
+    /// It asserts almost nothing on purpose. What the junction SAYS about a repository is not a
+    /// property of this code, it is a property of that repository -- so this prints, and the
+    /// reading is a person's. The one thing it does assert is the invariant `Counts` already
+    /// promises, because that one is about the code and is exactly where a header stops being
+    /// checked.
+    ///
+    /// Point `NUCLEOS_MAP_DOGFOOD_DB` at a COPY. This only reads, and a test that opens somebody's
+    /// live database is one edit away from not.
+    #[tokio::test]
+    #[ignore]
+    async fn the_junction_answers_about_a_real_repository() {
+        let (Ok(db), Ok(root), Ok(project)) = (
+            std::env::var("NUCLEOS_MAP_DOGFOOD_DB"),
+            std::env::var("NUCLEOS_MAP_DOGFOOD_ROOT"),
+            std::env::var("NUCLEOS_MAP_DOGFOOD_PROJECT"),
+        ) else {
+            panic!("set NUCLEOS_MAP_DOGFOOD_DB, _ROOT and _PROJECT");
+        };
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .create_if_missing(false)
+                    .read_only(true),
+            )
+            .await
+            .expect("the dogfood database opens");
+
+        let tree = std::path::PathBuf::from(&root);
+        let structure = crate::project_map::structure(&tree).expect("the tree walks");
+        let on_disk: Vec<String> = crate::map_intent::specs_in(&tree)
+            .iter()
+            .map(|path| crate::map_intent::spec_slug(path))
+            .collect();
+
+        let decisions = crate::map_store::approved(&pool, &project).await.unwrap();
+        let mut slugs = crate::map_store::slugs(&pool, &project).await.unwrap();
+        slugs.extend(on_disk);
+        slugs.sort();
+        slugs.dedup();
+        let records = crate::map_store::anchors(&pool, &project).await.unwrap();
+
+        let junction = join(
+            &decisions,
+            &structure.modules,
+            &structure.foreign,
+            &slugs,
+            &records,
+        );
+
+        println!("--- {} ---", project);
+        println!(
+            "modules {}, foreign {}, documents {}, approved decisions {}",
+            structure.modules.len(),
+            structure.foreign.len(),
+            slugs.len(),
+            junction.counts.decisions
+        );
+        println!("{:?}", junction.counts);
+        for row in &junction.decisions {
+            println!(
+                "  [{:?}] {} | {} | files: {}",
+                row.anchor,
+                row.ordinal,
+                row.section,
+                if row.modules.is_empty() {
+                    "-".to_owned()
+                } else {
+                    row.modules.join(", ")
+                }
+            );
+            if let Some(record) = row.record.as_ref() {
+                println!(
+                    "        recorded ({:?}): {}",
+                    record.source,
+                    record.paths.join(", ")
+                );
+            }
+        }
+        println!(
+            "unclaimed {} (code nobody asked for)",
+            junction.unclaimed.len()
+        );
+        for path in junction.unclaimed.iter().take(10) {
+            println!("  {}", path);
+        }
+        println!(
+            "unmatched {} (cites a section no approved decision names)",
+            junction.unmatched.len()
+        );
+        for path in junction.unmatched.iter().take(10) {
+            println!("  {}", path);
+        }
+
+        let counts = &junction.counts;
+        assert_eq!(
+            counts.declared + counts.ambiguous + counts.silent + counts.unnumbered,
+            counts.decisions,
+            "the header has to reconcile on real data too"
+        );
+    }
 
     /// The single citation in `source`, or a failure naming what was found instead.
     fn only(source: &str) -> Citation {

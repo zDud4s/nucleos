@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { type ReactNode } from "react";
 import {
   type Anchored,

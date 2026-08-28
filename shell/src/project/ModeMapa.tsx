@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { useProjectMap } from "../data/project-map";
 import { buildMap } from "../canvas/map-model";
 import { Carimbos } from "./Carimbos";
