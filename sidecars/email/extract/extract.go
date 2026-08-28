@@ -1,3 +1,5 @@
+// §spec email-pillar
+
 // Package extract turns a raw RFC 5322 message into the envelope the núcleo stores.
 //
 // Pure on purpose: every rule that decides what the núcleo sees is exercised from bytes, with no

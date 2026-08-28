@@ -1,3 +1,5 @@
+// §spec email-pillar
+
 // Package config reads the sidecar's entire configuration from the environment.
 //
 // Everything arrives from the núcleo (spec §3.4): this process holds no config file of its own and

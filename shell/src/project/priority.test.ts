@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import { describe, expect, it } from "vitest";
 import { CONCERN_ORDER, leadingConcern, type ProjectConcerns } from "./priority";
 

@@ -1,3 +1,4 @@
+// §spec novo-frontend
 import { PageHeader, Teach } from "../ui";
 import { sliceOf, type NavItem } from "../app/nav";
 

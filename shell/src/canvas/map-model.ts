@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 import type { Edge, Node } from "@xyflow/react";
 import type { MapImport, MapModule } from "../data/project-map";
 

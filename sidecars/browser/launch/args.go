@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package launch owns the Chromium on disk: where it lives, how it is fetched, how it is started,
 // and how its absence is reported.
 //

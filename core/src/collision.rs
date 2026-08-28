@@ -1,3 +1,5 @@
+//! §spec trabalho-noturno-e-jobs-paralelos
+//!
 //! Two live worktrees of one project touching the same files.
 //!
 //! It lives apart from `concurrency.rs` because it answers a different question. That one says *how

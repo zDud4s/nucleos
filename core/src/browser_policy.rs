@@ -1,3 +1,5 @@
+//! §spec pilar-de-browser
+//!
 //! Which profile a browsing session runs in, and whether it may run at all.
 //!
 //! Pure: no I/O, no database, no Chrome. The same split `trust.rs` has from the modules that call

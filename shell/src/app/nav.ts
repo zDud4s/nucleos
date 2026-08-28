@@ -1,3 +1,4 @@
+// §spec novo-frontend
 /**
  * The navigation, as data.
  *

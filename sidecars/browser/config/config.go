@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package config reads the sidecar's entire configuration from the environment.
 //
 // Like the web and email sidecars this process holds no config file of its own and stores nothing on

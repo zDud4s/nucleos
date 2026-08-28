@@ -1,3 +1,4 @@
+// §spec workspace-de-projeto
 import { useEffect, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {

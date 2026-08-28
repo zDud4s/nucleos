@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package browser is the contract for driving a real browser, and nothing else.
 //
 // It contains no CDP, no Chrome, and no process management. That is the point: the spike of

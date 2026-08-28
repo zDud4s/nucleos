@@ -1,3 +1,5 @@
+//! §spec pilar-de-web
+
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};

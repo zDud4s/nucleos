@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package chrome implements browser.Driver over CDP.
 //
 // # The fence is a constructor, not a flag

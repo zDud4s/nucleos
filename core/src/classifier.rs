@@ -1,3 +1,5 @@
+//! §spec pilar-de-browser
+
 use serde_json::Value;
 use std::path::Path;
 

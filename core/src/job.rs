@@ -1,3 +1,5 @@
+//! §spec autopilot-job-graph
+//!
 //! The job state machine: a sequence of runs over one shared worktree.
 //!
 //! A run is one `claude -p` subprocess and therefore one context window, which caps how large a

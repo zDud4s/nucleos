@@ -1,3 +1,5 @@
+//! §spec pilar-de-voz
+//!
 //! The núcleo↔TTS boundary: where text becomes audio, and where a third-party program is given a
 //! chance to misbehave.
 //!

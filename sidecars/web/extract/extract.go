@@ -1,3 +1,5 @@
+// §spec pilar-de-web
+
 // Package extract turns a fetched HTML page into the Markdown the núcleo stores and the model reads.
 //
 // Extraction happens here, in the sidecar, rather than in the núcleo, for the same reason the fetch

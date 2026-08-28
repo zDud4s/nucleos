@@ -1,3 +1,5 @@
+//! §spec agenticos-foundation-and-autopilot
+
 use std::fmt;
 use std::path::Path;
 

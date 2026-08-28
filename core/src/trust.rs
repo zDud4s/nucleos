@@ -1,3 +1,5 @@
+//! §spec pilar-de-web
+//!
 //! Whether a page's text may reach a privileged agent as written, or must be summarised first.
 //!
 //! Pure: no I/O, no database, no knowledge of run state. The same split `classifier.rs` and

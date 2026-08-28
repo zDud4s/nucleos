@@ -1,3 +1,5 @@
+// §spec email-pillar
+
 package pipe
 
 import (

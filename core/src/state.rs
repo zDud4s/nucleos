@@ -1,3 +1,5 @@
+//! §spec email-pillar
+
 use crate::auth::Token;
 use crate::runner::CommandRunner;
 use sqlx::SqlitePool;

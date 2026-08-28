@@ -1,3 +1,4 @@
+// §spec pilar-de-web
 import { useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";

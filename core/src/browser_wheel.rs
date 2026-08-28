@@ -1,3 +1,5 @@
+//! §spec pilar-de-browser
+//!
 //! Spec §4.4: the wheel changes hands, and the list of trusted hosts grows.
 //!
 //! Four moments, and they are separate because the guarantees between them are different:

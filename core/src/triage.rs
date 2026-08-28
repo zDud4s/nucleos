@@ -1,3 +1,5 @@
+//! §spec email-pillar
+//!
 //! The email pillar's run machinery (spec §5): the sandbox a triage run executes in, and the
 //! startup verification that proves its hook barrier is really in force.
 //!

@@ -1,3 +1,5 @@
+//! §spec motor-de-workflows
+//!
 //! The workflow library, the pin a project keeps, and how far the two have drifted apart.
 //!
 //! A workflow is not a file. §6.1 of the design counts five pieces — the graph, the node bodies,

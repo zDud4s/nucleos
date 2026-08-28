@@ -1,3 +1,5 @@
+// §spec pilar-de-web
+
 // Package serve is this sidecar's only inbound surface.
 //
 // It binds to loopback, requires the daemon's token, and writes nothing anywhere. The núcleo asks
