@@ -389,6 +389,36 @@ function chatsFetchWithHostedChoice(
 }
 
 /**
+ * `chatsFetch`'s `/assistant/models`, with one choice the daemon has marked as unable to work
+ * tools.
+ *
+ * A wrapper for the same reason `chatsFetchWithHostedChoice` above is one: a dozen tests in this
+ * file assert an EXACT model menu, and folding a fifth choice into the shared fixture would make
+ * every one of them about this mark.
+ */
+function chatsFetchWithToollessChoice(
+  chats: ChatSummary[],
+  transcripts: Record<string, AssistantTurnRow[]>,
+  opts: Parameters<typeof chatsFetch>[2] = {},
+): (path: string, init?: RequestInit) => Promise<unknown> {
+  const base = chatsFetch(chats, transcripts, opts);
+  const toolless: ModelChoice = {
+    id: "gemma3:1b",
+    label: "gemma3:1b",
+    brain: "local",
+    efforts: [],
+    tools: false,
+  };
+  return async (path, init) => {
+    if (path === "/assistant/models") {
+      const models = (await base(path, init)) as AssistantModels;
+      return { ...models, choices: [...models.choices, toolless] };
+    }
+    return base(path, init);
+  };
+}
+
+/**
  * The page inside a two-route router, exactly like `Projects.test.tsx`'s
  * `renderProjects`: `renderApp` mounts the gate, the rail and its own live
  * queries around every assertion, which this machine cannot pay for more than
@@ -1064,6 +1094,33 @@ describe("Chats - choosing a model", () => {
         body: JSON.stringify({ model: "fable" }),
       });
     });
+  });
+});
+
+describe("Chats - a model that cannot work tools", () => {
+  it("says so in the menu, beside where the words go, before anything is picked", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithToollessChoice([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const toolless = await screen.findByRole("menuitemradio", {
+      name: /^gemma3:1b/,
+    });
+    // Said BEFORE the pick. Afterwards it is a turn that answers without doing any of what it
+    // was asked to do, which reads as the model being bad rather than as the wrong model.
+    expect(within(toolless).getByText(/cannot use tools/i)).toBeDefined();
+    // And the route mark it already carried survives the composition: they are two separate
+    // facts about one choice, and a line that dropped either would still pass a test asserting
+    // only the other.
+    expect(within(toolless).getByText(/on this machine/i)).toBeDefined();
+
+    // A choice nobody has probed carries no mark at all. `tools` absent is "nobody asked", and
+    // reading that as "cannot" would put a warning on almost every model on the menu.
+    const unprobed = await screen.findByRole("menuitemradio", { name: /^Sonnet/ });
+    expect(within(unprobed).queryByText(/cannot use tools/i)).toBeNull();
   });
 });
 

@@ -2177,6 +2177,21 @@ async fn post_assistant_message(
         Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => {
             Err(refusal(StatusCode::SERVICE_UNAVAILABLE, "no_local_model"))
         }
+        // The hosted route's twin of the arm above, 503 for the same reason and with a slug of
+        // its own: both say "this machine cannot answer that", and what to DO about each is
+        // different — one is fixed by installing a model, this one by naming one in the config.
+        Err(msg) if msg == crate::assistant::NO_HOSTED_MODEL => {
+            Err(refusal(StatusCode::SERVICE_UNAVAILABLE, "no_hosted_model"))
+        }
+        // Half-configured rather than unconfigured: a hosted model IS named, and the key needed
+        // to reach it is not stored. `assistants::Refusal` keeps these two apart deliberately —
+        // telling somebody "no model configured" when the model is configured points them at
+        // the wrong half of the setup — and folding them together here would undo that at the
+        // one place a person actually reads it.
+        Err(msg) if msg == crate::assistants::HOSTED_KEY_MISSING => Err(refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_openrouter_key",
+        )),
         // Also not a 500, and for the same reason: the topic has an errand somebody paused or
         // closed. That is a state this request conflicts with, which is what 409 already means here
         // for a chat that is mid-turn — and it is what lets the sidecar answer "that topic is on
@@ -2319,7 +2334,8 @@ fn relay_refusal_response(cause: crate::relay::Refusal) -> (StatusCode, Json<ser
 
 /// `assistant::send_relayed_message`'s refusals, mapped the same way `post_assistant_message` above
 /// already maps `send_message_with`'s — the two share every constant because a relayed turn is
-/// refused by the same brakes an ordinary one is (a chat mid-turn, no local model, an errand on
+/// refused by the same brakes an ordinary one is (a chat mid-turn, neither route configured, an
+/// OpenRouter key missing, an errand on
 /// hold, the kill switch). Kept as its own small match rather than a shared function with that
 /// route's: the two bodies are one line apart today, and a shared helper here would be reaching
 /// into `post_assistant_message` for four string constants it would have imported anyway.
@@ -2330,6 +2346,12 @@ fn relayed_send_refusal(msg: String) -> (StatusCode, Json<serde_json::Value>) {
         }
         _ if msg == crate::assistant::NO_LOCAL_MODEL => {
             refusal(StatusCode::SERVICE_UNAVAILABLE, "no_local_model")
+        }
+        _ if msg == crate::assistant::NO_HOSTED_MODEL => {
+            refusal(StatusCode::SERVICE_UNAVAILABLE, "no_hosted_model")
+        }
+        _ if msg == crate::assistants::HOSTED_KEY_MISSING => {
+            refusal(StatusCode::SERVICE_UNAVAILABLE, "no_openrouter_key")
         }
         _ if msg.starts_with(crate::assistant::ERRAND_NOT_ANSWERING) => {
             refusal(StatusCode::CONFLICT, "errand_not_answering")
@@ -7053,7 +7075,7 @@ const IDE_SESSIONS_SHOWN: usize = 40;
 async fn create_chat(
     State(state): State<AppState>,
     Json(body): Json<CreateChatRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ChatRefusal> {
     // A named model decides the route, and outranks any `brain` sent beside it — the same
     // precedence `patch_chat` applies, for the same reason: a row saying `local` while naming a
     // cloud model would be sent to Ollama under a name it has never heard.
@@ -7066,7 +7088,7 @@ async fn create_chat(
     if let Some(level) = body.effort.as_deref()
         && !crate::config::is_effort_level(&models_config(), level)
     {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     checked_fallback(&body.fallback_model)?;
     checked_dirs(&body.extra_dirs).await?;
@@ -7529,24 +7551,10 @@ enum BrainRefusal {
     /// No catalogue entry — the current `menu()`, installed models included — names this id.
     UnknownModel,
     /// The id names a real choice, but this machine cannot serve what it names —
-    /// `Assistants::can_serve`'s own reason, carried verbatim so a caller that wants it in a
-    /// refusal body (`patch_chat`) still has it; `create_chat` drops it and keeps its
-    /// status-only shape.
+    /// `Assistants::can_serve`'s own reason, carried verbatim into the refusal body of both
+    /// doors that ask — opening a conversation and re-pointing one — so somebody who picked a
+    /// model this machine cannot run is told which one and why, not handed a bare 503.
     CannotServe(String),
-}
-
-/// `create_chat`'s shape: the reason, if any, is not part of its response today — widening that
-/// is a follow-up with no test asking for it yet, per this packet's own note.
-impl From<BrainRefusal> for StatusCode {
-    fn from(refusal: BrainRefusal) -> Self {
-        match refusal {
-            BrainRefusal::UnknownModel => StatusCode::BAD_REQUEST,
-            // Not a 500: nothing broke. This machine is simply configured such that it cannot run
-            // the model asked for — the same reasoning `NO_LOCAL_MODEL`'s own 503 already carries
-            // a few hundred lines up.
-            BrainRefusal::CannotServe(_) => StatusCode::SERVICE_UNAVAILABLE,
-        }
-    }
 }
 
 /// Which route a choice id names and can actually run, or a refusal.
@@ -7861,43 +7869,48 @@ struct PatchChatRequest {
     denied_tools: Option<Option<Vec<String>>>,
 }
 
-/// `patch_chat`'s own refusal: every existing path answers with a bare status and no body, exactly
-/// as before (`Status`); the one new path — a model this machine cannot serve — carries the reason
-/// in the body (`WithDetail`), the `{"detail": ...}` shape this crate already uses elsewhere for a
+/// What the two doors onto a conversation refuse with. Every path that had no body keeps none
+/// (`Status`); the one path that has something to say — a model this machine cannot serve — carries
+/// the reason in the body (`WithDetail`), the `{"detail": ...}` shape this crate already uses for a
 /// refusal with a reason (see the `"detail"` sites around invalid ownership claims and unreadable
 /// pins). One enum rather than widening every existing `StatusCode` return in this function to a
 /// body-carrying tuple: every one of those keeps compiling unchanged through the `From<StatusCode>`
-/// impl below, so this stays the smallest change that gets the one new path its body.
-enum PatchRefusal {
+/// impl below, so this stays the smallest change that gets that one path its body.
+///
+/// `create_chat` answered a bare 503 here for one release, because the packet that added the
+/// check had no test asking for the body and would not widen a response without one. Opening a
+/// conversation on a model the machine cannot run is the FIRST place somebody meets this
+/// refusal, though, so it is the last place a bare status is any use.
+enum ChatRefusal {
     Status(StatusCode),
     WithDetail(StatusCode, String),
 }
 
-impl IntoResponse for PatchRefusal {
+impl IntoResponse for ChatRefusal {
     fn into_response(self) -> axum::response::Response {
         match self {
-            PatchRefusal::Status(status) => status.into_response(),
-            PatchRefusal::WithDetail(status, detail) => {
+            ChatRefusal::Status(status) => status.into_response(),
+            ChatRefusal::WithDetail(status, detail) => {
                 (status, Json(serde_json::json!({ "detail": detail }))).into_response()
             }
         }
     }
 }
 
-impl From<StatusCode> for PatchRefusal {
+impl From<StatusCode> for ChatRefusal {
     fn from(status: StatusCode) -> Self {
-        PatchRefusal::Status(status)
+        ChatRefusal::Status(status)
     }
 }
 
-impl From<BrainRefusal> for PatchRefusal {
+impl From<BrainRefusal> for ChatRefusal {
     fn from(refusal: BrainRefusal) -> Self {
         match refusal {
-            BrainRefusal::UnknownModel => PatchRefusal::Status(StatusCode::BAD_REQUEST),
+            BrainRefusal::UnknownModel => ChatRefusal::Status(StatusCode::BAD_REQUEST),
             // Not a 500, for the same reason `BrainRefusal`'s own `From<StatusCode>` impl gives:
             // nothing broke, this machine simply cannot run what was asked for.
             BrainRefusal::CannotServe(reason) => {
-                PatchRefusal::WithDetail(StatusCode::SERVICE_UNAVAILABLE, reason)
+                ChatRefusal::WithDetail(StatusCode::SERVICE_UNAVAILABLE, reason)
             }
         }
     }
@@ -7914,7 +7927,7 @@ async fn patch_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
     Json(body): Json<PatchChatRequest>,
-) -> Result<StatusCode, PatchRefusal> {
+) -> Result<StatusCode, ChatRefusal> {
     // Answered before anything is written. Without it a PATCH against a chat that was never opened
     // — or was archived — reports `204 No Content` for an UPDATE that matched no row, which is the
     // API saying "done" about something it did not do.
@@ -18550,6 +18563,87 @@ mod tests {
         assert_eq!(body["refusal"], "no_local_model");
     }
 
+    /// The hosted twin of the test above, and a separate test rather than a second assertion in
+    /// it: the two refusals have separate slugs because they are separate jobs to do about them,
+    /// and a single test asserting a 503 would pass with both collapsed into one answer.
+    #[tokio::test]
+    async fn a_message_to_a_hosted_chat_with_no_hosted_model_is_not_reported_as_a_broken_daemon() {
+        let state = test_state().await; // no hosted model either
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({ "chat_id": id, "text": "olá" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["refusal"], "no_hosted_model");
+    }
+
+    /// A hosted route half-way through setup: a model IS named and no key is stored. The one
+    /// refusal `assistants::NoAssistants` cannot produce, which is why this double exists.
+    struct KeylessAssistants;
+
+    #[async_trait::async_trait]
+    impl crate::assistants::Assistants for KeylessAssistants {
+        fn assistant_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: Option<&str>,
+        ) -> Result<Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::HostedModelNamedButNoKey)
+        }
+
+        fn serves(&self, _brain: crate::chats::Brain) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::HostedModelNamedButNoKey)
+        }
+
+        async fn can_serve(
+            &self,
+            _brain: crate::chats::Brain,
+            _model: &str,
+        ) -> Result<(), crate::assistants::Refusal> {
+            Err(crate::assistants::Refusal::HostedModelNamedButNoKey)
+        }
+
+        // Nothing here asks this double what a model declares.
+        async fn declared_for(
+            &self,
+            _brain: crate::chats::Brain,
+            _models: &[String],
+        ) -> std::collections::HashMap<String, crate::capabilities::Declared> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// Half-configured has to be its own answer. A 500 says the daemon broke; `no_hosted_model`
+    /// says go and name a model, which is the one part already done. Either sends whoever reads
+    /// it to the wrong setting, and the second is worse for looking right.
+    #[tokio::test]
+    async fn a_hosted_chat_whose_key_is_missing_says_that_and_not_that_no_model_is_named() {
+        let mut state = test_state().await;
+        state.assistants = Arc::new(KeylessAssistants);
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/message",
+            Some(serde_json::json!({ "chat_id": id, "text": "olá" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["refusal"], "no_openrouter_key", "body: {body:?}");
+    }
+
     #[tokio::test]
     async fn the_daemon_says_whether_a_local_model_can_answer_at_all() {
         let without = build_router(test_state().await)
@@ -23027,6 +23121,34 @@ mod tests {
             crate::chats::model_of(&state.pool, &id).await.unwrap().0,
             None,
             "a refused model must not be stored"
+        );
+    }
+
+    /// The same refusal at the OTHER door, which is the one a person meets first. Opening a
+    /// conversation on a model this machine cannot run answered a bare 503 while re-pointing an
+    /// existing one at the very same model explained itself — the asymmetry was a packet
+    /// boundary, never a decision, and it left the harder-to-diagnose case as the quieter one.
+    #[tokio::test]
+    async fn abrir_uma_conversa_num_modelo_que_a_maquina_nao_serve_tambem_diz_porque() {
+        let mut state = test_state().await;
+        let reason = "a janela tem 2048 tokens mas são precisos 8192".to_string();
+        state.assistants = Arc::new(RefusingAssistants {
+            reason: reason.clone(),
+        });
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/chats",
+            Some(serde_json::json!({ "model": "sonnet" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["detail"].as_str(),
+            Some(reason.as_str()),
+            "opening a chat must carry can_serve's own sentence too: {body:?}"
         );
     }
 

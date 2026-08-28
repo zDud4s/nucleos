@@ -24,6 +24,16 @@
 //! `http.rs` (`get_local_model`, `post_chat_title`) and `scheduler.rs` (an errand's own-criterion
 //! check). This module sits on every chat turn, not beside it.
 
+/// The sentence `Refusal::HostedModelNamedButNoKey` renders as.
+///
+/// A named constant for the reason `assistant::NO_LOCAL_MODEL` and `assistant::NO_HOSTED_MODEL`
+/// are named ones: `http.rs` turns each into a status and a slug a caller can act on, and a
+/// refusal recognised by a fragment of its wording stops being recognised the day somebody
+/// improves the sentence. It lives HERE and not beside those two because the fact it reports is
+/// the factory's — `assistant.rs` never reads a key.
+pub const HOSTED_KEY_MISSING: &str =
+    "an OpenRouter key is required before the hosted assistant can answer";
+
 /// Why a route could not produce an assistant for a turn.
 ///
 /// `RouteNotConfigured` renders as the exact sentence `http.rs` already compares with `==`
@@ -87,9 +97,7 @@ impl Refusal {
                 }
             }
             .to_string(),
-            Refusal::HostedModelNamedButNoKey => {
-                "an OpenRouter key is required before the hosted assistant can answer".to_string()
-            }
+            Refusal::HostedModelNamedButNoKey => HOSTED_KEY_MISSING.to_string(),
             Refusal::NotServedByThisFactory => {
                 "this route answers through the agent CLI, not this factory".to_string()
             }
@@ -454,7 +462,7 @@ impl Assistants for ConfiguredAssistants {
             }
         });
 
-        join_all_concurrently(probes).await.into_iter().collect()
+        crate::join::all(probes).await.into_iter().collect()
     }
 }
 
@@ -522,49 +530,6 @@ impl ConfiguredAssistants {
             }
         }
     }
-}
-
-/// Awaits a set of futures CONCURRENTLY and returns their results, in no particular order — what
-/// `declared_for` needs so a menu open on N unseen models costs one round trip's time, not N.
-///
-/// Hand-written because this crate does not depend on `futures`, and this is the one thing needed
-/// from it — the same shape `council.rs`'s own `futures_join_all` (`council.rs:1717` at last
-/// reading) already carries, body for body. That IS a second copy of the thing this task's own
-/// module doc names as the problem it exists to stop; it stays a second copy rather than a
-/// hoisted, shared one because `council.rs`'s copy is a private `async fn` in a do-not-touch file
-/// for this packet — deleting it, or adding a `pub(crate)` a shared copy elsewhere could import,
-/// both require editing `council.rs`, which this packet's own boundary forbids. Widening the
-/// boundary to fix a duplication a controller flagged after the fact is not this packet's call to
-/// make; recorded as a follow-up for whichever later change is already touching both files.
-async fn join_all_concurrently<F: std::future::Future>(
-    futures: impl IntoIterator<Item = F>,
-) -> Vec<F::Output> {
-    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
-    let mut results: Vec<Option<F::Output>> = (0..pending.len()).map(|_| None).collect();
-    let mut remaining = pending.len();
-
-    std::future::poll_fn(|context| {
-        for (index, future) in pending.iter_mut().enumerate() {
-            if results[index].is_some() {
-                continue;
-            }
-            if let std::task::Poll::Ready(output) = future.as_mut().poll(context) {
-                results[index] = Some(output);
-                remaining -= 1;
-            }
-        }
-        if remaining == 0 {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-
-    results
-        .into_iter()
-        .map(|result| result.expect("every future resolved before the join returned"))
-        .collect()
 }
 
 /// Hands back one fixed `LocalAssistant` for every request, whatever the route or model asked for.

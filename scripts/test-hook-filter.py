@@ -22,6 +22,7 @@ Run:  python scripts/test-hook-filter.py
 import importlib.util
 import os
 import sys
+import tempfile
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HOOK = os.path.join(ROOT, ".claude", "hooks", "ask_daemon.py")
@@ -78,6 +79,61 @@ CASES = [
 ]
 
 
+def target_dir_cases(tmp):
+    """Where the daemon binary might be, and in what order.
+
+    The hole this covers is not in the filter: it is in `control_token`, which used to look only in
+    `<main_root>/target`. On a machine whose worktrees share one build tree OUTSIDE the repository
+    there is no `target/` at all, so the lookup found nothing and every merge, push, tag and fetch
+    from every agent session was refused — reported as a token that could not be read, which sends
+    whoever reads it to the credential manager instead of to the build directory.
+    """
+    config = os.path.join(tmp, "config.toml")
+    # `newline=""` so `os.linesep` reaches the file as itself. In text mode Python translates a
+    # line ending on the way out, so writing one that is already a line ending produces a doubled
+    # one, and tomllib will not parse the file it lands in.
+    with open(config, "w", encoding="utf-8", newline="") as handle:
+        # The comment on the first line is the case, not decoration: the real config this mirrors
+        # documents the setting with a line a regex would match before it reached the setting.
+        handle.write(
+            '# $env:CARGO_TARGET_DIR = "C:/Projects/.decoy"'
+            + os.linesep
+            + "[build]"
+            + os.linesep
+            + 'target-dir = "C:/Projects/.cargo-target"'
+            + os.linesep
+        )
+    root = os.path.join(tmp, "repo")
+    default = os.path.join(root, "target")
+
+    return [
+        (
+            "a configured target-dir is looked in, and <root>/target still is",
+            hook.cargo_target_dirs(root, environ={}, configs=[config]),
+            ["C:/Projects/.cargo-target", default],
+        ),
+        (
+            "CARGO_TARGET_DIR comes first, as it does for cargo itself",
+            hook.cargo_target_dirs(
+                root,
+                environ={"CARGO_TARGET_DIR": "C:/Projects/.cargo-target-test"},
+                configs=[config],
+            ),
+            ["C:/Projects/.cargo-target-test", "C:/Projects/.cargo-target", default],
+        ),
+        (
+            "a machine that configures nothing behaves exactly as it did before",
+            hook.cargo_target_dirs(root, environ={}, configs=[os.path.join(tmp, "absent.toml")]),
+            [default],
+        ),
+        (
+            "the documentation in the config is not read as the setting",
+            [hook.configured_target_dir(config)],
+            ["C:/Projects/.cargo-target"],
+        ),
+    ]
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -93,6 +149,14 @@ def main() -> int:
             print(f"FAIL {shown!r}: expected {expected!r}, got {actual!r}")
 
     total = len(CASES)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, got, want in target_dir_cases(tmp):
+            total += 1
+            if got != want:
+                failures += 1
+                print(f"FAIL {label}: expected {want!r}, got {got!r}")
+
     print(f"{total - failures}/{total} as expected")
     return 1 if failures else 0
 
