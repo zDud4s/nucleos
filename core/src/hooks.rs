@@ -520,9 +520,14 @@ pub async fn pretooluse_decision(
     // to the files that ARE the policy, a git operation with consequences. Those keep parking, and
     // must — the whole design is that nobody but the owner authorises them.
     //
-    // `unrecognized` is not that. Its own message says so: a tool nobody has reasoned about is a
-    // capability nobody has bounded, which is a gap in this file rather than a question about the
-    // work. Parked, it stopped an autonomous run dead and minted a proposal saying, in effect,
+    // `unrecognized-tool` is not that, and the hyphen is load-bearing. Until 2026-08-28 both this
+    // and the shell path's unrecognized COMMANDS shared one label, and keying on it here refused
+    // `git branch -D`, `cargo fix` and `gh run list` -- real decisions -- while meaning to refuse
+    // only tool names. Two job-node tests caught it, and the classifier now names the two apart.
+    //
+    // A tool nobody has reasoned about is a capability nobody has bounded, which is a gap in
+    // `classifier.rs` rather than a question about the work. Parked, it stopped an autonomous run
+    // dead and minted a proposal saying, in effect,
     // "somebody please decide about WebSearch" — a question no owner asleep at 4am was going to
     // answer, and one that has the same answer every time. Measured 2026-08-27: two overnight
     // attempts died exactly here, hours of work each, having asked for a tool once.
@@ -538,7 +543,7 @@ pub async fn pretooluse_decision(
     // run has its owner at the window, and for them the pause is exactly right: they can approve it
     // in ten seconds.
     if classification.decision.decision == "pending_approval"
-        && classification.action_class == "unrecognized"
+        && classification.action_class == "unrecognized-tool"
         && crate::runs::runs_unattended(&mode)
     {
         return Json(Decision {
@@ -3200,6 +3205,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "awaiting_approval");
+    }
+
+    /// The narrowing's sharper edge, and the one two job-node tests found first. An unrecognized
+    /// COMMAND is not an unrecognized TOOL: `git branch -D`, `cargo fix`, `gh run list` and a bare
+    /// shell loop all classify `pending_approval`, and every one of them is an action a person has
+    /// to decide about. Refusing those would have quietly narrowed what the owner governs, which is
+    /// the opposite of what was asked for.
+    #[tokio::test]
+    async fn an_unattended_run_still_parks_for_a_command_nobody_has_reasoned_about() {
+        let state = test_state().await;
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-w"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "git branch -D feature"}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "awaiting_approval",
+            "deleting a branch is a decision, and the owner is the one who takes it"
+        );
     }
 
     /// The other half of the same decision: a subagent is no longer an unrecognized tool, so it is

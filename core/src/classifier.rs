@@ -424,10 +424,20 @@ pub fn classify(
         );
     }
 
+    // **Its own class, and not the `unrecognized` the shell path uses.** The two were one label for
+    // a long time and they are not one thing: an unrecognized COMMAND is `git branch -D`, `cargo
+    // fix`, `gh run list` -- an action somebody has to decide about. An unrecognized TOOL is a name
+    // this file has never reasoned about, which is a gap in this file rather than a question about
+    // the work, and has the same answer every time it is asked.
+    //
+    // Splitting them is what lets `hooks.rs` refuse the second to an unattended run without
+    // touching the first. Sharing the label made that impossible to express, and the two tests that
+    // caught the attempt (`a_jobs_replan_node_gives_up_instead_of_parking_the_job` and its review
+    // twin) are the ones to keep in mind: they park a job node on a `for` loop, which is a COMMAND.
     if !matches!(tool_name, "Bash" | "PowerShell") {
         return classification(
             "pending_approval",
-            "unrecognized",
+            "unrecognized-tool",
             "unrecognized tool actions require approval",
         );
     }
@@ -2150,7 +2160,7 @@ mod tests {
             assert_classification(
                 classify(tool_name, &json!({}), None),
                 "pending_approval",
-                "unrecognized",
+                "unrecognized-tool",
             );
         }
     }
