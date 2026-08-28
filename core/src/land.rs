@@ -22,6 +22,11 @@ use std::time::Instant;
 
 use crate::vcs::{Branch, Op, Origin, ResolvedRepo};
 
+/// Decision #7's feed kind: a conflict resolution the agent could not produce, or that admission
+/// otherwise refused. Named so it reads as this module's own line among `vcs_request_finished` and
+/// the rest, rather than blending into them.
+const RESOLUTION_FAILED_KIND: &str = "land_resolution_failed";
+
 /// Why a landing could not be submitted.
 ///
 /// Four arms rather than one string because `http.rs` answers them with different status codes: a
@@ -197,12 +202,38 @@ pub async fn submit(
     let from_resolution =
         crate::resolver::landing_is_a_resolution(pool, repo.project_id(), source.as_str()).await;
 
-    let id = if from_resolution {
+    let submission = if from_resolution {
         crate::vcs::submit_resolution(pool, repo, &op, Origin::Shell).await
     } else {
         crate::vcs::submit(pool, repo, &op, Origin::Shell).await
-    }
-    .map_err(|error| LandRefusal::NotAdmitted(format!("the request could not be admitted: {error}")))?;
+    };
+
+    let id = match submission {
+        Ok(id) => id,
+        Err(error) => {
+            // Decision #7: a resolver agent's own session is not a person watching for the answer
+            // the way an ordinary landing's caller is, so a resolution that the agent could not get
+            // admitted has to say so on its own — through the feed's waiting room, since an
+            // unresolved landing is stuck work, not governance, and does not earn an immediate
+            // ping. An ordinary landing's admission failure is unchanged: its caller is a live
+            // session that already sees the refusal in its own response.
+            if from_resolution {
+                let summary = format!(
+                    "{}'s conflict resolution on {} could not be admitted: {error}",
+                    repo.project_id(),
+                    source.as_str()
+                );
+                if let Err(notify_error) =
+                    crate::notify::deliver_or_defer(pool, RESOLUTION_FAILED_KIND, &summary).await
+                {
+                    tracing::warn!(%notify_error, "land: could not notify about a failed resolution");
+                }
+            }
+            return Err(LandRefusal::NotAdmitted(format!(
+                "the request could not be admitted: {error}"
+            )));
+        }
+    };
 
     if from_resolution
         && let Some(escalated_id) =
@@ -369,7 +400,7 @@ mod tests {
     async fn a_source_already_landed_is_refused_with_no_row_in_the_queue() {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
-        let (_container, repo) = repo_parked_off_target("nucleos-land-ancestor-", "master");
+        let (_container, repo) = repo_parked_off_target("nucleos-land-ancestor-", "chore/other");
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
         assert!(git_in(&repo, &["merge", "--no-ff", "-m", "already landed", "feat/x"]));
         seed_project(&pool, "alpha", &repo, Some("master")).await;
@@ -420,7 +451,7 @@ mod tests {
     async fn a_red_gate_fails_the_landing_and_starts_no_agent() {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
-        let (_container, repo) = repo_parked_off_target("nucleos-land-gate-", "master");
+        let (_container, repo) = repo_parked_off_target("nucleos-land-gate-", "chore/other");
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
         let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
@@ -555,5 +586,43 @@ mod tests {
             "the wait follows resolved_by past the escalation to the resolution that answered it"
         );
         assert!(ticket.result_sha.is_some());
+    }
+
+    /// Decision #7: a resolver agent's own session is nobody watching for the answer, so a
+    /// resolution that cannot be admitted has to say so through the feed itself. `vcs_requests` is
+    /// dropped on purpose — the cheapest way to force `submit_resolution` to fail deterministically
+    /// without standing up a real conflict — and it also makes `landing_is_a_resolution`'s own read
+    /// error, which that function documents as failing TOWARD treating the branch as a resolution;
+    /// this is what puts this landing on the path decision #7 covers rather than an ordinary one.
+    #[tokio::test]
+    async fn a_resolution_that_cannot_be_admitted_notifies_through_the_feed() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-notify-", "chore/other");
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "nucleos/run-77", "feat/x"]));
+        assert!(git_in(&repo, &["checkout", "-q", "chore/other"]));
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        sqlx::query("DROP TABLE vcs_requests")
+            .execute(&pool)
+            .await
+            .expect("break admission so the resolution cannot be admitted");
+
+        let refusal = submit(&pool, &repo_id, &repo, "nucleos/run-77", deadline())
+            .await
+            .expect_err("admission is broken on purpose — the resolution cannot land");
+
+        assert!(
+            matches!(refusal, LandRefusal::NotAdmitted(_)),
+            "got {refusal:?}"
+        );
+
+        let summary: String = sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
+            .bind(RESOLUTION_FAILED_KIND)
+            .fetch_one(&pool)
+            .await
+            .expect("a resolution that could not be admitted has to say so on the feed");
+        assert!(summary.contains("nucleos/run-77"), "{summary}");
     }
 }
