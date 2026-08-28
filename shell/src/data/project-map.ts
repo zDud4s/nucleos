@@ -58,6 +58,20 @@ export interface MapModule {
    * survives and throwing the other away. Group by `.section` before counting or displaying.
    */
   cites: Citation[];
+  /**
+   * The document this file declares with a `§spec` header, or `null`.
+   *
+   * **This is what decides whether a confirmation means anything.** A bare `§7` names a section
+   * of *some* document; the header says which, and without it the junction can only guess. So a
+   * surface reporting how firmly decisions are tied to code has to be able to say how much of the
+   * project has declared, or its greens are of unknown worth.
+   *
+   * **Read from this file's own source and never from its sibling test**, unlike {@link
+   * MapModule.cites} above, which folds the two. A citation is a claim about a decision and
+   * belongs to the module whichever of the pair writes it; a declaration is a claim about *this
+   * file*. The sweep that writes headers writes one into the test file for itself.
+   */
+  spec: string | null;
   tested: boolean;
 }
 
@@ -86,6 +100,14 @@ export interface MapImport {
 export interface ForeignFile {
   path: string;
   cites: Citation[];
+  /**
+   * The document this file declares, exactly as {@link MapModule.spec} carries it.
+   *
+   * Foreign files declare too — 68 of this repository's Go files do — because the header is found
+   * by a substring search that needs no per-language parser. Leaving it off here would make the
+   * sidecars read as undeclared on a screen that is counting exactly that.
+   */
+  spec: string | null;
 }
 
 /**

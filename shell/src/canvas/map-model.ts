@@ -1,6 +1,6 @@
 // §spec mapa-do-projeto
 import type { Edge, Node } from "@xyflow/react";
-import type { MapImport, MapModule } from "../data/project-map";
+import type { ForeignFile, MapImport, MapModule } from "../data/project-map";
 
 /**
  * Where a project's modules sit, and what xyflow is handed.
@@ -21,6 +21,41 @@ export interface Point {
 }
 
 /** The top folder of a path, which is how this repo already divides: core, shell, sidecars. */
+/** How much of a project has said which document its `§` numbers belong to. */
+export interface DeclaredCoverage {
+  /** Files naming at least one section — the only files the question applies to. */
+  citing: number;
+  /** Of those, the ones carrying a `§spec` header. */
+  saying: number;
+}
+
+/**
+ * The §8 progress of one project, counted over the files the question is about.
+ *
+ * **The denominator is files that cite a section, and not every file.** A module with no `§`
+ * anywhere has nothing to disambiguate, so counting it as undeclared would report a debt that
+ * does not exist and would make the number fall every time somebody adds an unrelated file.
+ *
+ * **Foreign files are counted with modules here, and that is deliberate even though nothing else
+ * on this screen counts them together.** The question is *how much of this project has declared*,
+ * which is about files rather than about what this reader can follow — and the Go sidecars are
+ * where a large share of the headers are. Counting only modules would report a project as far less
+ * declared than it is, which is the one direction this number must not err in: it exists to say
+ * how much the map's confirmations are worth.
+ */
+export function declaredCoverage(
+  modules: MapModule[],
+  foreign: ForeignFile[],
+): DeclaredCoverage {
+  const citingModules = modules.filter((module) => module.cites.length > 0);
+  return {
+    citing: citingModules.length + foreign.length,
+    saying:
+      citingModules.filter((module) => module.spec !== null).length +
+      foreign.filter((file) => file.spec !== null).length,
+  };
+}
+
 export function topFolder(path: string): string {
   const cut = path.indexOf("/");
   return cut === -1 ? "" : path.slice(0, cut);

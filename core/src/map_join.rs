@@ -150,12 +150,7 @@ pub struct Citation {
 /// must keep reporting rather than quietly upgrading to the file's document.
 pub fn citations(source: &str) -> BTreeSet<Citation> {
     // Read once, before the scan, and not per citation: the answer is a property of the file.
-    let declared = match declaration(source) {
-        Declaration::Absent => None,
-        Declaration::Named(slug) => Some(slug),
-        // First occurrence wins — see [`Declaration::Repeated`] for why the rule is positional.
-        Declaration::Repeated(slugs) => slugs.into_iter().next(),
-    };
+    let declared = declared_document(source);
 
     let mut found = BTreeSet::new();
     for (index, _) in source.match_indices('§') {
@@ -176,6 +171,22 @@ pub fn citations(source: &str) -> BTreeSet<Citation> {
         });
     }
     found
+}
+
+/// The document a file declares, or `None` when it declares none.
+///
+/// **One answer to *which document is this file's*, and both callers borrow it.** [`citations`]
+/// needs it to fill every bare citation's [`Citation::named`]; [`crate::project_map::Module::spec`]
+/// needs it to report the same fact to whoever is looking at the map. Written twice, the two would
+/// be free to disagree about a file with two headers — and about that file the disagreement is
+/// silent, which is the shape of divergence this module refuses everywhere else.
+pub(crate) fn declared_document(source: &str) -> Option<String> {
+    match declaration(source) {
+        Declaration::Absent => None,
+        Declaration::Named(slug) => Some(slug),
+        // First occurrence wins — see [`Declaration::Repeated`] for why the rule is positional.
+        Declaration::Repeated(slugs) => slugs.into_iter().next(),
+    }
 }
 
 /// The marker a file writes to say which document its bare `§` numbers belong to.
@@ -1122,6 +1133,8 @@ mod tests {
             reader: Reader::Rust,
             declares: !cites.is_empty(),
             cites: cited(cites),
+            // Built from a list of citations and not from a source, so there is no header to read.
+            spec: None,
             tested: false,
         }
     }
@@ -1139,6 +1152,7 @@ mod tests {
             reader: Reader::Rust,
             declares: crate::project_map::cites_section(source),
             cites: citations(source).into_iter().collect(),
+            spec: declared_document(source),
             tested: false,
         }
     }
@@ -1147,6 +1161,7 @@ mod tests {
         Foreign {
             path: path.to_owned(),
             cites: cited(cites),
+            spec: None,
         }
     }
 
@@ -1942,6 +1957,7 @@ mod tests {
             reader: Reader::Typescript,
             declares: false,
             cites: cited(&[("9.2", None)]),
+            spec: None,
             tested: true,
         };
 

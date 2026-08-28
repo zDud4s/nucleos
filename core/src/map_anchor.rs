@@ -1843,6 +1843,7 @@ mod tests {
             reader: Reader::Rust,
             declares: crate::project_map::cites_section(source),
             cites: citations(source).into_iter().collect(),
+            spec: crate::map_join::declared_document(source),
             tested: false,
         };
 
