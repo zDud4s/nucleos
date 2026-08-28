@@ -2940,10 +2940,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     let prompt = if carried_task.trim().is_empty() {
         note
     } else {
-        format!("{note}
-
-{RESUMED_TASK_HEADER}
-{carried_task}")
+        format!("{note}\n\n{RESUMED_TASK_HEADER}\n{carried_task}")
     };
 
     // The resume carries the node's identity forward. Without it the new run belongs to no job, so
@@ -6404,17 +6401,11 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let task = "Finish the land module, test-first, against the seven tests in §5.";
         assert_eq!(task_to_carry(task), task, "a plain task is its own task");
 
-        let once = format!("proposal #7 authorizes Agent.
-
-{RESUMED_TASK_HEADER}
-{task}");
+        let once = format!("proposal #7 authorizes Agent.\n\n{RESUMED_TASK_HEADER}\n{task}");
         assert_eq!(task_to_carry(&once), task);
 
         let twice = format!(
-            "proposal #9 authorizes Bash.
-
-{RESUMED_TASK_HEADER}
-{}",
+            "proposal #9 authorizes Bash.\n\n{RESUMED_TASK_HEADER}\n{}",
             task_to_carry(&once)
         );
         assert_eq!(

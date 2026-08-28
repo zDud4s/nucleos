@@ -3124,7 +3124,7 @@ mod tests {
             &state,
             "worktree",
             Some("proj"),
-            Some("C:\work\repo"),
+            Some("C:\\work\\repo"),
             Some("sess-x"),
         )
         .await;
@@ -3177,7 +3177,7 @@ mod tests {
             &state,
             "worktree",
             Some("proj"),
-            Some("C:\work\repo"),
+            Some("C:\\work\\repo"),
             Some("sess-y"),
         )
         .await;
@@ -3212,7 +3212,7 @@ mod tests {
             &state,
             "worktree",
             Some("proj"),
-            Some("C:\work\repo"),
+            Some("C:\\work\\repo"),
             Some("sess-z"),
         )
         .await;
