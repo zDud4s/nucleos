@@ -1,3 +1,5 @@
+//! §spec fila-vcs
+//!
 //! Running git for the queue: argv, a deadline, and what it printed.
 //!
 //! Separate from `vcs.rs` because this is process transport and that is a queue —

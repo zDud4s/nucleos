@@ -1,3 +1,5 @@
+//! §spec pilar-de-web
+//!
 //! The web pillar's domain: the cache, the FTS5 index, retention, and the `web_pages` SQL.
 //!
 //! This is the only module that touches `web_pages`, following the `runs.rs` pattern — `storage.rs`

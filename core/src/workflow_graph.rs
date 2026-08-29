@@ -1,3 +1,5 @@
+//! §spec motor-de-workflows
+//!
 //! What a workflow's graph is, and what this project changed about it.
 //!
 //! **A module of its own, and that is the point.** [`crate::workflows`] states, at length, that it

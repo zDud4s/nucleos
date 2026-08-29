@@ -1,3 +1,4 @@
+// §spec mapa-do-projeto
 /**
  * Query keys, built in one place.
  *

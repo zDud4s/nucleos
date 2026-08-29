@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package fence is spec §6.2 as code: in agent mode the browser emits GET and HEAD over HTTP(S),
 // and nothing else leaves the machine.
 //

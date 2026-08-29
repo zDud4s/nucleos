@@ -1,3 +1,5 @@
+//! §spec pilar-de-web
+//!
 //! Typed HTTP client for the web sidecar's loopback API.
 //!
 //! It exists for the same reason `daemon_client.rs` does: transport belongs in a module of its own.

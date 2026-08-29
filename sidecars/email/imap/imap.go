@@ -1,3 +1,5 @@
+// §spec email-pillar
+
 // Package imap is the read-only mailbox reader.
 //
 // THE INVARIANT (spec §3.1): this package never modifies the mailbox. No STORE, no MOVE, no COPY,

@@ -1,3 +1,5 @@
+//! §spec escrita-com-concessao-por-origem
+//!
 //! Who is the legitimate author of a file in a project.
 //!
 //! "The shell never writes" answers the `.rs` case and fails the `.yaml` case, which is the one

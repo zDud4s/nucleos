@@ -1,3 +1,5 @@
+//! §spec pilar-de-browser
+//!
 //! The browser pillar's domain: profiles, the site lists, and the sessions opened in them.
 //!
 //! The only module that touches `browser_profiles`, `browser_sites` and `browser_sessions`. It owns

@@ -1,3 +1,4 @@
+// §spec motor-de-workflows
 import { useState } from "react";
 import { WorkflowCanvas } from "../canvas/WorkflowCanvas";
 import { inSequence, nodeMeaning, nodeTone } from "../canvas/workflow-model";

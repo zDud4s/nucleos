@@ -117,9 +117,10 @@ pub struct Citation {
 /// to whoever opens it, and cheaper than the parser that would avoid it.
 ///
 /// Dedup is by the whole citation and not by section alone, so a file writing `§7` in one place
-/// and `§7 rule` in another yields two rows. Collapsing them would mean picking which tail
-/// survives and throwing a candidate away; two rows the join resolves separately throw nothing
-/// away.
+/// and `§7 workspace-de-projeto` in another yields two rows. Collapsing them would mean picking
+/// which tail survives and throwing a claim away; two rows the join resolves separately throw
+/// nothing away. A tail that could name no document does not make a second row, because it was
+/// never a second claim — see the paragraph below.
 ///
 /// **A file's [`declaration`] is the default and a citation's own tail is the override.** A `§7`
 /// in a file that declared a document comes back naming that document, exactly as if the slug had
@@ -128,14 +129,28 @@ pub struct Citation {
 /// citations do — and everything downstream ([`names_document`], [`evidence`], [`Anchor`]) then
 /// works unchanged, which is the point. Threading a default through [`crate::project_map::Module`]
 /// instead would be a second answer to the one question this function already answers.
+///
+/// **A tail that cannot name any document is prose, and the declaration stands.** This is the
+/// correction of 2026-08-28, and it was found by running the junction over this repository rather
+/// than by reading the code. `shell/src/team/Charter.tsx` declares `alcada-por-equipa` and writes
+/// `§2.2 of the design` in a sentence; `of` was taken as that citation's document, matched no
+/// slug, and the file's own header was discarded — so the map reported the decision
+/// [`Anchor::Ambiguous`], the header defeated by the next word of an English sentence. It was not
+/// one file: **770 of the 795 tails in this tree have no hyphen**, across 141 files and 182
+/// distinct words — `of`, `and`, `already`, `authorises` — against 25 tails that carry a real
+/// slug.
+///
+/// The rule that separates them consults no dictionary and judges no plausibility, which is the
+/// objection [`candidate`] answers and this must answer too: [`could_name_a_document`] asks only
+/// whether the tail has two segments, because [`names_document`] refuses a shorter run before it
+/// looks at any slug. Handing the join a one-segment tail is not giving it a decision — it is
+/// giving it one whose answer was fixed here, at the price of the header. So the override applies
+/// when the tail *could* be a slug, and `§8.4 approval-pauze` — hyphenated, and a document of
+/// nothing — still overrides and still lands ambiguous, which is the misspelling case this module
+/// must keep reporting rather than quietly upgrading to the file's document.
 pub fn citations(source: &str) -> BTreeSet<Citation> {
     // Read once, before the scan, and not per citation: the answer is a property of the file.
-    let declared = match declaration(source) {
-        Declaration::Absent => None,
-        Declaration::Named(slug) => Some(slug),
-        // First occurrence wins — see [`Declaration::Repeated`] for why the rule is positional.
-        Declaration::Repeated(slugs) => slugs.into_iter().next(),
-    };
+    let declared = declared_document(source);
 
     let mut found = BTreeSet::new();
     for (index, _) in source.match_indices('§') {
@@ -150,10 +165,28 @@ pub fn citations(source: &str) -> BTreeSet<Citation> {
         };
         found.insert(Citation {
             section,
-            named: candidate(&rest[taken..]).or_else(|| declared.clone()),
+            named: candidate(&rest[taken..])
+                .filter(|tail| could_name_a_document(tail))
+                .or_else(|| declared.clone()),
         });
     }
     found
+}
+
+/// The document a file declares, or `None` when it declares none.
+///
+/// **One answer to *which document is this file's*, and both callers borrow it.** [`citations`]
+/// needs it to fill every bare citation's [`Citation::named`]; [`crate::project_map::Module::spec`]
+/// needs it to report the same fact to whoever is looking at the map. Written twice, the two would
+/// be free to disagree about a file with two headers — and about that file the disagreement is
+/// silent, which is the shape of divergence this module refuses everywhere else.
+pub(crate) fn declared_document(source: &str) -> Option<String> {
+    match declaration(source) {
+        Declaration::Absent => None,
+        Declaration::Named(slug) => Some(slug),
+        // First occurrence wins — see [`Declaration::Repeated`] for why the rule is positional.
+        Declaration::Repeated(slugs) => slugs.into_iter().next(),
+    }
 }
 
 /// The marker a file writes to say which document its bare `§` numbers belong to.
@@ -331,6 +364,17 @@ fn candidate(rest: &str) -> Option<String> {
         return None;
     }
     Some(word)
+}
+
+/// Whether a candidate could name any document at all, which is a question about its shape and
+/// not about its meaning.
+///
+/// **One segment can never name a document of any project**, because [`names_document`] matches a
+/// contiguous run of at least two hyphen-separated segments and refuses a shorter run before it
+/// looks at a single slug. That makes this the same rule stated once instead of twice, which is
+/// why the guard lives here and both callers borrow it rather than each carrying a `< 2`.
+fn could_name_a_document(candidate: &str) -> bool {
+    candidate.split('-').count() >= 2
 }
 
 /// The section number a spec heading carries, or `None` when it carries none.
@@ -637,10 +681,10 @@ pub struct Counts {
 /// there would be a second, quietly different answer to *is this a document of this project*
 /// governing the only state the map may present as confirmed.
 pub(crate) fn names_document(candidate: &str, spec_slug: &str) -> bool {
-    let wanted: Vec<&str> = candidate.split('-').collect();
-    if wanted.len() < 2 {
+    if !could_name_a_document(candidate) {
         return false;
     }
+    let wanted: Vec<&str> = candidate.split('-').collect();
     let slug: Vec<&str> = spec_slug.split('-').collect();
     slug.windows(wanted.len())
         .any(|run| run == wanted.as_slice())
@@ -1089,6 +1133,8 @@ mod tests {
             reader: Reader::Rust,
             declares: !cites.is_empty(),
             cites: cited(cites),
+            // Built from a list of citations and not from a source, so there is no header to read.
+            spec: None,
             tested: false,
         }
     }
@@ -1106,6 +1152,7 @@ mod tests {
             reader: Reader::Rust,
             declares: crate::project_map::cites_section(source),
             cites: citations(source).into_iter().collect(),
+            spec: declared_document(source),
             tested: false,
         }
     }
@@ -1114,6 +1161,7 @@ mod tests {
         Foreign {
             path: path.to_owned(),
             cites: cited(cites),
+            spec: None,
         }
     }
 
@@ -1349,12 +1397,17 @@ mod tests {
         assert_eq!(citation.section, "6.4");
         assert_eq!(citation.named, Some("workspace-de-projeto".to_string()));
 
-        // Identical is the whole citation and not the section alone. `§7` bare and `§7 rule`
-        // are two rows on purpose: collapsing them means picking which tail survives, and the
-        // one thrown away might have been the slug. The join resolves each row separately, so
-        // keeping both costs a row and loses nothing.
-        let mixed = "// §7, and later §7 rule";
+        // Identical is the whole citation and not the section alone. `§7` bare and
+        // `§7 outro-documento` are two rows on purpose: collapsing them means picking which tail
+        // survives, and the one thrown away might have been the slug. The join resolves each row
+        // separately, so keeping both costs a row and loses nothing.
+        let mixed = "// §7, and later §7 outro-documento";
         assert_eq!(citations(mixed).len(), 2);
+
+        // `§7 rule` is NOT a second row, and that is the 2026-08-28 correction rather than a
+        // collapse: one word was never a claim about a document, so the two mentions are the
+        // same citation of the same section and always were.
+        assert_eq!(citations("// §7, and later §7 rule").len(), 1);
     }
 
     #[test]
@@ -1376,18 +1429,47 @@ mod tests {
         assert_eq!(only("// §7 The rule").named, None);
         assert_eq!(only("// §7  two spaces").named, None);
         assert_eq!(only("// §7's tail").named, None);
-        assert_eq!(only("// §7 rule.").named, Some("rule".to_string()));
+        // The tail is hyphenated so that this test stays about where the run STOPS. A
+        // one-segment tail is prose and never reaches the citation — that is the test below.
+        assert_eq!(
+            only("// §7 uma-regra.").named,
+            Some("uma-regra".to_string())
+        );
     }
 
     #[test]
-    fn an_english_word_is_still_a_candidate_here_because_this_module_cannot_know() {
-        // `§4.4 rule` occurs twelve times in this repository and `rule` is not a document. This
-        // module answers `Some("rule")` anyway, and that is not a defect to be fixed here: the
-        // join rejects the candidate when it matches no spec slug, and it can only do that
-        // because this layer hands it every candidate rather than the ones it liked the look of.
-        // Whoever tightens this parser to "sound like a slug" moves the guess to the layer that
-        // has no document list to check it against.
-        assert_eq!(only("/// §4.4 rule").named, Some("rule".to_string()));
+    fn a_one_word_tail_is_prose_and_never_becomes_the_citation_s_document() {
+        // **This test used to assert the opposite**, under the argument that only the join has
+        // the document list and so every candidate should be handed over rather than filtered on
+        // a guess. The argument is right about vocabulary and wrong about arithmetic: a
+        // one-segment tail is refused by `names_document` before any slug is consulted, so
+        // passing it on is not deferring a decision, it is passing one already made — and its
+        // effect was to throw away the file's own declaration. Measured over this tree, 770 of
+        // the 795 tails are one word. See the note on `citations`.
+        assert_eq!(only("/// §4.4 rule").named, None);
+        // `candidate` itself is unchanged and still judges no vocabulary: the tail below is no
+        // document of anything, has two segments, and is carried through exactly as before, so
+        // the join goes on reporting a misspelled override rather than curing it.
+        assert_eq!(
+            only(&format!("/// §4.4 {NO_SUCH_DOCUMENT}")).named,
+            Some(NO_SUCH_DOCUMENT.to_string())
+        );
+    }
+
+    #[test]
+    fn a_prose_tail_does_not_defeat_the_file_s_declaration() {
+        // The case that found this, reduced: `shell/src/team/Charter.tsx` declares its document
+        // on line 1 and then writes `§2.2 of the design` in a sentence. `of` was read as that
+        // citation's document, matched nothing, and the header was discarded — leaving the map
+        // to call the decision ambiguous because of an English preposition.
+        let source = format!("// §spec {FIXTURE}\n// the two kinds §2.2 of the design\n");
+        assert_eq!(only(&source).named, Some(FIXTURE.to_string()));
+
+        // And the half that must NOT change: a tail shaped like a slug still overrides the
+        // header, whether or not it names a real document. Otherwise the override of §8 would
+        // only work in files that had not declared, which is the opposite of the intent.
+        let overridden = format!("// §spec {FIXTURE}\n// §2.2 {NO_SUCH_DOCUMENT}\n");
+        assert_eq!(only(&overridden).named, Some(NO_SUCH_DOCUMENT.to_string()));
     }
 
     #[test]
@@ -1875,6 +1957,7 @@ mod tests {
             reader: Reader::Typescript,
             declares: false,
             cites: cited(&[("9.2", None)]),
+            spec: None,
             tested: true,
         };
 

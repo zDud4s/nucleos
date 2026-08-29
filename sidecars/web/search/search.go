@@ -1,3 +1,5 @@
+// §spec pilar-de-web
+
 // Package search turns a query into a list of destinations, without fetching any of them.
 //
 // The whole pillar is built on this separation (spec §3.2): a search returns {title, url, snippet}

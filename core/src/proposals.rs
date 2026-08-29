@@ -1,3 +1,5 @@
+//! §spec pilar-de-browser
+
 use serde::Serialize;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 

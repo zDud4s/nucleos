@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package pool keeps one browser per profile, and routes each session to the right one.
 //
 // It exists because the two halves of this sidecar disagree about what a "session" is. The núcleo

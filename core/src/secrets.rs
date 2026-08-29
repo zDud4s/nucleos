@@ -1,3 +1,5 @@
+//! §spec modulo-de-github
+
 use keyring::Entry;
 
 const SERVICE_NAME: &str = "nucleos";

@@ -1,3 +1,5 @@
+//! §spec pilar-de-voz
+//!
 //! The voice pillar's domain: what a transcript means, and what happens to it.
 //!
 //! Owns the `voice_captures` table's SQL and the `/voice/*` handlers, and nothing else. Audio capture,

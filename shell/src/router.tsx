@@ -1,3 +1,4 @@
+// §spec novo-frontend
 import type { ReactNode } from "react";
 import {
   createMemoryHistory,

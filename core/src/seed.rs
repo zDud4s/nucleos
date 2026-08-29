@@ -1,3 +1,5 @@
+//! §spec motor-de-workflows
+//!
 //! The autopilot's own bundle, written to the library so it can be read back like any other.
 //!
 //! # Why the built-in workflow lives on disk and not in the code

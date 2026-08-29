@@ -1,3 +1,5 @@
+//! §spec modulo-de-github
+//!
 //! The GitHub pillar: total capability, autonomy by list.
 //!
 //! Three pieces that do not know each other. `ReadOp`/`ActOp` are what was asked for, as data;

@@ -1,3 +1,4 @@
+// §spec motor-de-workflows
 import type { Edge, Node } from "@xyflow/react";
 import type { GraphEdge, GraphNode, NodeKind, Role } from "../data/workflow-graph";
 

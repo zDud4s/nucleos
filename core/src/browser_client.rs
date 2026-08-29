@@ -1,3 +1,5 @@
+//! §spec pilar-de-browser
+//!
 //! Typed HTTP client for the browser sidecar's loopback API.
 //!
 //! The same separation `web_client.rs` has, for the same reason: `browser.rs` owns the domain and

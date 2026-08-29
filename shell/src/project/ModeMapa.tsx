@@ -1,6 +1,7 @@
 // §spec mapa-do-projeto
 import { useProjectMap } from "../data/project-map";
-import { buildMap } from "../canvas/map-model";
+import { MapaCanvas } from "../canvas/MapaCanvas";
+import { buildMap, declaredCoverage } from "../canvas/map-model";
 import { Carimbos } from "./Carimbos";
 import { ExtrairSpec } from "./ExtrairSpec";
 import { Juncao } from "./Juncao";
@@ -97,6 +98,7 @@ function Derived({ projectId }: { projectId: string }) {
     modules,
     imports,
     unread,
+    foreign,
     junction,
     standings,
     stamps,
@@ -111,6 +113,15 @@ function Derived({ projectId }: { projectId: string }) {
   // núcleo sends none of those today, and the day it does this number must not quietly start
   // counting things nobody will ever see.
   const built = buildMap(modules, imports);
+  // **§8 on screen, because until now it was legible only to the parser.** A bare `§7` names a
+  // section of *some* document; the header says which. Every confirmation this mode draws below
+  // rests on that, so a reader has to be able to ask how much of the project has said it — a
+  // green over an undeclared file is a guess wearing the same colour as a fact.
+  //
+  // Counted over the files that name a section and not over `modules.length`, and the two must
+  // not be confused: a file with no `§` has nothing to declare, and the denominator on the line
+  // above is a different question with a different answer.
+  const declared = declaredCoverage(modules, foreign);
 
   return (
     <div className="flex flex-col gap-6">
@@ -121,6 +132,15 @@ function Derived({ projectId }: { projectId: string }) {
             module{modules.length === 1 ? "" : "s"} this reader could read
           </span>
         </p>
+        {declared.citing > 0 ? (
+          <p className="mt-2 font-display text-3xl text-text">
+            {declared.saying}
+            <span className="ml-2 text-sm text-text-faint">
+              of {declared.citing} file{declared.citing === 1 ? "" : "s"} naming a section say
+              which document it belongs to
+            </span>
+          </p>
+        ) : null}
         <p className="mt-1 text-xs text-text-muted">
           joined by {built.edges.length} link{built.edges.length === 1 ? "" : "s"}
           {unread.length > 0
@@ -128,6 +148,17 @@ function Derived({ projectId }: { projectId: string }) {
             : ""}
         </p>
       </div>
+      {/*
+        The structure layer as a picture, one level above the file. Drawn here and not as a panel
+        of its own for the reason the junction is: it reads the same answer, and a query of its own
+        would walk the tree twice per open.
+
+        **Above the junction, and the order is an argument.** The junction says how firmly each
+        decision is tied to code; whether that means anything depends on how much of the project
+        declared which document its sections belong to. The picture is where that is visible, so it
+        is read first.
+      */}
+      <MapaCanvas modules={modules} foreign={foreign} imports={imports} />
       <Juncao junction={junction} projectId={projectId} />
       {/*
         Drawn here rather than as a panel of its own for the reason the junction is: the standings,

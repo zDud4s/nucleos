@@ -1,3 +1,5 @@
+//! §spec email-pillar
+//!
 //! The email pillar's domain core (spec §4): ingestion, the noise gate, and the cursor.
 //!
 //! This module owns every statement that touches `emails` and `email_cursor` — `storage.rs` stays

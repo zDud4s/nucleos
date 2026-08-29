@@ -1,3 +1,5 @@
+//! §spec agenticos-foundation-and-autopilot
+
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{FromRow, SqlitePool};

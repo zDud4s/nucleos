@@ -1,3 +1,4 @@
+// §spec motor-de-workflows
 import { describe, expect, it } from "vitest";
 import { graphNode } from "../test/harness";
 import type { GraphEdge } from "../data/workflow-graph";

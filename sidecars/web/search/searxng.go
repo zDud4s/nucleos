@@ -1,3 +1,5 @@
+// §spec pilar-de-web
+
 package search
 
 import (

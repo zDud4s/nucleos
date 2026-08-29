@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package profile owns the directories a browser runs in, and the naming that keeps two of them
 // apart.
 //

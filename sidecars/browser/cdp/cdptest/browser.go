@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package cdptest is a fake browser that speaks CDP over a real socket.
 //
 // It exists so the driver can be tested without Chrome, for the reason `search.Fake` exists in the

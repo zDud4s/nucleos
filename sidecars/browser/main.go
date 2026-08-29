@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Command browser-sidecar drives a real browser on the núcleo's behalf.
 //
 // It is the only process in NucleOS that renders somebody else's HTML and runs their JavaScript. It

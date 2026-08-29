@@ -1,3 +1,5 @@
+//! §spec fila-vcs
+//!
 //! The shared-state git/`gh` queue: at most one operation per repository, ever.
 //!
 //! Two agents deciding to merge at the same moment is the problem this exists for. Git's index and

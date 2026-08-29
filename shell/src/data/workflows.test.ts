@@ -1,3 +1,4 @@
+// §spec motor-de-workflows
 import { describe, expect, it } from "vitest";
 import { installedWorkflow } from "../test/harness";
 import { driftingWorkflows, sinceText, standingSentence, standingTone } from "./workflows";

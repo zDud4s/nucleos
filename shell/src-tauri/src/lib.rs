@@ -1,3 +1,5 @@
+//! §spec agenticos-foundation-and-autopilot
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 /// The OS calls that carry those decisions out, and nothing else. Holds no rules.
 pub mod dictation;

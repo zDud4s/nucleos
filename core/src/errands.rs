@@ -1,3 +1,5 @@
+//! §spec assuntos-fora-de-codigo
+//!
 //! Errands: standing work that is not a code project — a Telegram topic with a folder, a notebook
 //! and a toolbox of its own.
 //!

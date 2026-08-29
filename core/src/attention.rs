@@ -1,3 +1,5 @@
+//! §spec pilar-de-web
+//!
 //! The owner-attention brake for autonomous starts.
 //!
 //! Presence is an explicit, expiring heartbeat from a foreground client, never inferred from API

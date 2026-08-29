@@ -22,7 +22,7 @@
 //! *nothing in this repository claims §9* are opposite answers, and only one of them is true of
 //! the 77 Go files that name a section.
 
-use crate::map_join::{Citation, citations};
+use crate::map_join::{Citation, citations, declared_document};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -336,6 +336,20 @@ pub struct Module {
     /// reason to write code; the gap growing silently every time somebody tests what they named,
     /// with nothing that would ever announce it, is not.
     pub cites: Vec<Citation>,
+    /// The document this file declares with a `§spec` header, or `None`.
+    ///
+    /// **Read from this file's own source and never folded from a sibling**, unlike
+    /// [`Module::cites`] right above — and the paragraph there says why the two differ. A citation
+    /// is a claim about a decision and belongs to the module whether its test or its body writes
+    /// it; a declaration is a claim about *this file*, so a test that declares and a module that
+    /// does not is a fact worth being able to see rather than one to average away.
+    ///
+    /// **This exists because the answer had nowhere to go.** The header decides which decision a
+    /// bare `§7` anchors, so it is already the difference between a confirmed row and a guess —
+    /// and it was legible only to the parser. Nothing on the owner's screen could say how much of
+    /// a project had said which document it implements, which is the one number that tells them
+    /// whether the map's confirmations mean anything yet.
+    pub spec: Option<String>,
     /// Something tests it.
     pub tested: bool,
 }
@@ -352,6 +366,13 @@ pub struct Import {
 pub struct Foreign {
     pub path: String,
     pub cites: Vec<Citation>,
+    /// The document this file declares, exactly as [`Module::spec`] carries it.
+    ///
+    /// **Foreign files declare too, and 68 of this repository's do.** A Go file's header is read
+    /// by the same substring search as any other — that is [`crate::map_join::declaration`]'s
+    /// second property — and dropping it here would make the sidecars look undeclared on a screen
+    /// that is counting exactly that.
+    pub spec: Option<String>,
 }
 
 /// The whole structure layer.
@@ -428,6 +449,7 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
                     foreign.push(Foreign {
                         path: path.clone(),
                         cites,
+                        spec: declared_document(&source),
                     });
                 }
             }
@@ -462,6 +484,9 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
             reader,
             declares: cites_section(&source),
             cites: cites.into_iter().collect(),
+            // `&source` and not the sibling test's — see `Module::spec`. `cites` above folds the
+            // two on purpose and this must not, so the read is deliberately of a different string.
+            spec: declared_document(&source),
             tested,
         });
         sources.insert(path.clone(), source);
@@ -1036,7 +1061,7 @@ import type { GraphNode } from "../data/workflow-graph";
         write(
             &root,
             "sidecars/echo/main.go",
-            "// §9 echo — the sidecar contract\npackage main\n",
+            "// §9 pilar-de-web — the sidecar contract\npackage main\n",
         );
 
         let found = structure(&root).expect("structure");
@@ -1056,8 +1081,73 @@ import type { GraphNode } from "../data/workflow-graph";
             found.foreign[0].cites,
             vec![Citation {
                 section: "9".to_string(),
-                named: Some("echo".to_string()),
+                // A real slug and not the word `echo`: since 2026-08-28 a one-word tail is
+                // prose and never becomes a citation's document (see
+                // [`crate::map_join::citations`]). This test is about a Go file's citations
+                // being COLLECTED, which needs a tail that survives to be worth asserting.
+                named: Some("pilar-de-web".to_string()),
             }]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_reports_the_document_it_declares_and_never_its_sibling_s() {
+        // The header decides which decision a bare `§7` anchors, so it is already the difference
+        // between a confirmed row and a guess. It was legible only to the parser, and a screen
+        // that cannot say how much of a project has declared cannot say what its confirmations
+        // are worth.
+        let root = scratch("declares-document");
+        write(
+            &root,
+            "core/src/a.rs",
+            "//! §spec mapa-do-projeto\n//! §5.1 here\n",
+        );
+        write(&root, "core/src/b.rs", "//! §5.1 and no header at all\n");
+        write(
+            &root,
+            "sidecars/echo/main.go",
+            "// §spec pilar-de-web\n// §9 here\npackage main\n",
+        );
+        // The module declares nothing and its sibling test declares: `cites` folds the two and
+        // `spec` must not. A test file is a file, and the sweep writes a header into it for
+        // itself — passing the module's down would be the second entry point taking a default
+        // that `map_join::citations` refuses to grow.
+        write(
+            &root,
+            "shell/src/c.ts",
+            "export const c = 1;\n// §9.2 named here\n",
+        );
+        write(
+            &root,
+            "shell/src/c.test.ts",
+            "// §spec workspace-de-projeto\nimport \"./c\";\n",
+        );
+
+        let found = structure(&root).expect("structure");
+        let spec_of = |path: &str| {
+            found
+                .modules
+                .iter()
+                .find(|module| module.path == path)
+                .unwrap_or_else(|| panic!("{path} is a module"))
+                .spec
+                .clone()
+        };
+
+        assert_eq!(spec_of("core/src/a.rs"), Some("mapa-do-projeto".to_owned()));
+        assert_eq!(spec_of("core/src/b.rs"), None);
+        assert_eq!(
+            spec_of("shell/src/c.ts"),
+            None,
+            "the sibling test declared, and a declaration governs its own file"
+        );
+        assert_eq!(
+            found.foreign[0].spec,
+            Some("pilar-de-web".to_owned()),
+            "68 Go files in this repository declare; dropping theirs would make the sidecars \
+             look undeclared on a screen that counts exactly that"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -1375,7 +1465,7 @@ mod tests {
         write(
             &root,
             "sidecars/echo/main.go",
-            "// §9 echo — the sidecar contract\npackage main\n",
+            "// §9 pilar-de-web — the sidecar contract\npackage main\n",
         );
         // Read by nobody and folded into nothing, so a header here would govern no citation at all.
         write(&root, "shell/src/data/wire.d.ts", "// §4 is mentioned\n");

@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 package serve
 
 import (

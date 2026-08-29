@@ -1,3 +1,5 @@
+// §spec email-pillar
+
 // Package fetch serves one attachment's bytes to the núcleo, on demand.
 //
 // It exists because attachments are deliberately not stored (spec §1.5, migration 0021): the núcleo

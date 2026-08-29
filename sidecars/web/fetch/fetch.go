@@ -1,3 +1,5 @@
+// §spec pilar-de-web
+
 // Package fetch retrieves one page from a destination somebody else chose.
 //
 // Every value in this package is a limit. That is the whole design: the caller controls the URL, so

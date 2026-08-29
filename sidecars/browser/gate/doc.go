@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package gate is spec §11's first eight tests against a real browser.
 //
 // It is empty by design outside the `browsergate` build tag: the rest of the suite runs without

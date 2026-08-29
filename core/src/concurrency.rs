@@ -1,3 +1,5 @@
+//! §spec trabalho-noturno-e-jobs-paralelos
+//!
 //! Numbered concurrency slots (night-jobs spec §7.1).
 //!
 //! What bounds how much autonomous work one project — and one machine — may have in flight at once.
