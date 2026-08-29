@@ -2089,32 +2089,42 @@ function ModelMenu({
               </span>
             </DropdownMenuRadioItem>
           )}
-          {choices.map((choice) => (
-            <DropdownMenuRadioItem
-              key={choice.id}
-              value={choice.id}
-              /* A local model can be configured and still not be running. The daemon lists it
-                 because it is named; this is the separate question of whether it answers. */
-              disabled={choice.brain === "local" && localUnavailable}
-            >
-              {choice.label}
-              {choice.brain === "local" && (
-                <span className="chats-tool-why">
-                  {localUnavailable
-                    ? "not running on this machine"
-                    : "on this machine"}
-                </span>
-              )}
-              {choice.brain === "openrouter" && (
-                /* Said before the pick, not after: the local mark above answers "is it running
-                   here", and this one answers the question that matters just as much for a
-                   hosted choice — whose machine the words end up on. */
-                <span className="chats-tool-why">
-                  off this machine — sent to a third-party provider
-                </span>
-              )}
-            </DropdownMenuRadioItem>
-          ))}
+          {choices.map((choice) => {
+            /* Two facts about a choice, read as one verdict on picking it: where the words go,
+               and whether the model can work the tools a turn reaches for. Composed into one
+               line rather than stacked as two spans, because the row is one line tall. */
+            const why = [
+              choice.brain === "local"
+                ? localUnavailable
+                  ? "not running on this machine"
+                  : "on this machine"
+                : choice.brain === "openrouter"
+                  ? /* Said before the pick, not after: the local mark answers "is it running
+                       here", and this one answers the question that matters just as much for a
+                       hosted choice — whose machine the words end up on. */
+                    "off this machine — sent to a third-party provider"
+                  : null,
+              /* Only `false` earns a mark. Absent is "nobody asked", which is the ordinary state
+                 of every choice nothing has introspected — marking that would put a warning on
+                 most of the menu and teach people to read past it. */
+              choice.tools === false ? "cannot use tools" : null,
+            ].filter((note): note is string => note !== null);
+
+            return (
+              <DropdownMenuRadioItem
+                key={choice.id}
+                value={choice.id}
+                /* A local model can be configured and still not be running. The daemon lists it
+                   because it is named; this is the separate question of whether it answers. */
+                disabled={choice.brain === "local" && localUnavailable}
+              >
+                {choice.label}
+                {why.length > 0 && (
+                  <span className="chats-tool-why">{why.join(" · ")}</span>
+                )}
+              </DropdownMenuRadioItem>
+            );
+          })}
         </DropdownMenuRadioGroup>
         {children}
       </DropdownMenuContent>

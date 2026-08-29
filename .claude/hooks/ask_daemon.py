@@ -114,6 +114,54 @@ def deny(reason: str) -> None:
     sys.exit(0)
 
 
+def configured_target_dir(path):
+    """`build.target-dir` out of one cargo config file, or None if it says nothing.
+
+    Parsed rather than grepped. The config this exists for explains the setting in a
+    comment that itself contains `CARGO_TARGET_DIR = "..."`, so a regex over the file
+    finds the documentation before it finds the setting. Every failure -- no file, no
+    `tomllib`, malformed TOML -- is None: this only ever ADDS places to look, so a
+    reader that gives up leaves the old behaviour exactly as it was.
+    """
+    try:
+        import tomllib
+
+        with open(path, "rb") as handle:
+            configured = tomllib.load(handle).get("build", {}).get("target-dir")
+        return configured if isinstance(configured, str) and configured else None
+    except Exception:
+        return None
+
+
+def cargo_target_dirs(main_root, environ=None, configs=None):
+    """Every directory cargo might have built into, in cargo's own precedence order.
+
+    `CARGO_TARGET_DIR` beats `build.target-dir` in a config file, which beats
+    `<root>/target`. A LIST and not one resolved answer, because this is looking for a
+    file that exists rather than reproducing cargo's decision: a binary left in an older
+    location still prints the token, and this must not refuse because it went looking in
+    only the newest place.
+    """
+    environ = os.environ if environ is None else environ
+    if configs is None:
+        cargo_home = environ.get("CARGO_HOME") or os.path.expanduser("~/.cargo")
+        configs = [
+            os.path.join(cargo_home, "config.toml"),
+            os.path.join(main_root, ".cargo", "config.toml"),
+        ]
+
+    roots = []
+    from_env = environ.get("CARGO_TARGET_DIR")
+    if from_env:
+        roots.append(from_env)
+    for config in configs:
+        configured = configured_target_dir(config)
+        if configured:
+            roots.append(configured)
+    roots.append(os.path.join(main_root, "target"))
+    return roots
+
+
 def control_token(cwd: str) -> str:
     """The daemon's own token, read the way the desktop app reads it.
 
@@ -125,6 +173,13 @@ def control_token(cwd: str) -> str:
     The binary is located from the repository rather than from PATH: a linked worktree
     has no `target/` of its own, but `--git-common-dir` names the main checkout from
     inside any of them.
+
+    Where cargo PUT it is a second question, and assuming `<main_root>/target` is how this
+    guard spent a day inert. On a machine whose worktrees share one build tree outside the
+    repository there is no `target/` at all, so every merge, push, tag and fetch from every
+    agent session was refused for a missing token -- a guard failing closed on its own
+    configuration, saying nothing about why. `cargo_target_dirs` mirrors cargo's own
+    precedence instead of guessing at one location.
     """
     from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
     if from_env:
@@ -138,14 +193,15 @@ def control_token(cwd: str) -> str:
         deny("could not locate the repository to find the daemon binary - failing closed")
     main_root = os.path.dirname(common.stdout.strip())
 
-    for build in ("debug", "release"):
-        binary = os.path.join(main_root, "target", build, "nucleos-core.exe")
-        if os.path.exists(binary):
-            printed = subprocess.run(
-                [binary, "--print-token"], capture_output=True, text=True, timeout=20
-            )
-            if printed.returncode == 0 and printed.stdout.strip():
-                return printed.stdout.strip()
+    for root in cargo_target_dirs(main_root):
+        for build in ("debug", "release"):
+            binary = os.path.join(root, build, "nucleos-core.exe")
+            if os.path.exists(binary):
+                printed = subprocess.run(
+                    [binary, "--print-token"], capture_output=True, text=True, timeout=20
+                )
+                if printed.returncode == 0 and printed.stdout.strip():
+                    return printed.stdout.strip()
     deny(
         "this is a git operation the queue performs, and the daemon token could not be "
         "read to queue it - failing closed. Run it from a terminal if you meant to act "

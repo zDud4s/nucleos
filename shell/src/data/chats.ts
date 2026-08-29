@@ -464,6 +464,14 @@ export interface ModelChoice {
   efforts: string[];
   /** Which agent CLI runs it. Absent means the Claude CLI. */
   runner?: string | null;
+  /**
+   * Whether this model declares tool calling. Absent or `null` means nobody has asked.
+   *
+   * Three states and not two, and the third is why this is drawn at all: `false` is worth
+   * warning about, and absent is the ordinary state of every choice the daemon never
+   * introspects. Treating absent as `false` would mark almost the whole menu.
+   */
+  tools?: boolean | null;
 }
 
 /** `GET /assistant/models` — the menu, and what an unpinned conversation runs on. */

@@ -1098,7 +1098,7 @@ impl Driver {
                 (seat_idx, outcome)
             }
         });
-        let outcomes = futures_join_all(running).await;
+        let outcomes = crate::join::all(running).await;
 
         let mut answers = BTreeMap::new();
         for (seat_idx, outcome) in outcomes {
@@ -1178,7 +1178,7 @@ impl Driver {
                 (*viewer, allowed, outcome)
             })
         });
-        let outcomes = futures_join_all(ranking).await;
+        let outcomes = crate::join::all(ranking).await;
 
         let mut votes: BTreeMap<usize, Vec<Ranking>> = BTreeMap::new();
         for (seat_idx, allowed, outcome) in outcomes {
@@ -1712,42 +1712,6 @@ fn tail_of(text: &str) -> String {
         .skip(trimmed.chars().count() - LIMIT)
         .collect();
     format!("…{tail}")
-}
-
-/// Awaits a set of futures concurrently and returns their results in order.
-///
-/// Hand-written because this crate does not depend on `futures`, and the one thing needed from it
-/// is this. `tokio::spawn` per future would work and is worse: it would need every future to be
-/// `'static`, which would mean cloning the whole `Driver` per seat.
-async fn futures_join_all<F: std::future::Future>(
-    futures: impl IntoIterator<Item = F>,
-) -> Vec<F::Output> {
-    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
-    let mut results: Vec<Option<F::Output>> = (0..pending.len()).map(|_| None).collect();
-    let mut remaining = pending.len();
-
-    std::future::poll_fn(|context| {
-        for (index, future) in pending.iter_mut().enumerate() {
-            if results[index].is_some() {
-                continue;
-            }
-            if let std::task::Poll::Ready(output) = future.as_mut().poll(context) {
-                results[index] = Some(output);
-                remaining -= 1;
-            }
-        }
-        if remaining == 0 {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-
-    results
-        .into_iter()
-        .map(|result| result.expect("every future resolved before the join returned"))
-        .collect()
 }
 
 /// Terminates every seat run still in flight and settles the council as `cancelled`.
