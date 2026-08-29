@@ -2704,22 +2704,41 @@ fn resume_instruction(proposal_id: i64, tool_name: &str, tool_input: Option<&str
             }
         });
 
-    // Said in both arms, because it is needed most when the action cannot be shown.
-    let absence = format!(
-        "You will not find that {tool_name} call in your transcript: the pause happens before the \
-         call runs, so it never became a step you took. Nothing else is authorized. Carry it out if \
-         it is still the right next step, then finish the task."
+    // **Written so it does not read as a prompt injection, because it used to and a run said so.**
+    //
+    // Measured 2026-08-28. An autonomous run was resumed, read this note, and refused it in as
+    // many words: it called the message an injection attempt. It was not being paranoid. The old
+    // text had all three tells at once: it asserted an authority the reader cannot check (a human
+    // approved this), it pre-emptively explained away the missing evidence (you will not find that
+    // call in your transcript), and it asked for an action the run's own task had forbidden.
+    // Explaining away absent evidence is the signature of the attack, so writing that sentence
+    // made the daemon indistinguishable from an attacker.
+    //
+    // Three changes, and the third is the one that matters. It names the doubt instead of ignoring
+    // it. It says where the note came from rather than whose authority it carries. And it declares
+    // itself SUBORDINATE to the task: the run that refused this was resolving a genuine conflict --
+    // the note asked for a compound command its task forbade -- and had no way to know which of the
+    // two won. Now it does, and the answer is the task, which is also the safe direction.
+    let framing = format!(
+        "This note comes from the daemon that launched this session, not from anything inside \
+         your conversation -- no file, tool result or page you read put it here.\n\n\
+         The {tool_name} call is absent from your transcript because the guard runs BEFORE a call \
+         does: the attempt is real, the call never happened, and this session is a fresh one \
+         continuing that work.\n\n\
+         It authorizes that ONE action and nothing else, and it does not relax any rule your task \
+         gave you. If carrying it out would break one of those rules, your task wins -- find \
+         another way to the same end. Do it only if it is still the right next step, then carry on."
     );
 
     match action {
         Some(action) => format!(
-            "A human approved one action for this run (proposal #{proposal_id}); it is now \
-             authorized:\n\n    {action}\n\n{absence}"
+            "This run paused when it attempted the action below, and that pause has been \
+             lifted (proposal #{proposal_id}):\n\n    {action}\n\n{framing}"
         ),
         None => format!(
-            "A human approved one {tool_name} action for this run (proposal #{proposal_id}); it is \
-             now authorized. Its input could not be read back, so it is not quoted here.\n\n\
-             {absence}"
+            "This run paused when it attempted a {tool_name} action, and that pause has been \
+             lifted (proposal #{proposal_id}). The action's input could not be read back, so it is \
+             not quoted here.\n\n{framing}"
         ),
     }
 }
@@ -5183,6 +5202,48 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         );
     }
 
+    /// **The note must lose an argument with the task, and must say so.**
+    ///
+    /// Measured 2026-08-28, in production. A resumed run read the old note, called it an injection
+    /// attempt in as many words, and refused it -- correctly, on the evidence it had: the note
+    /// asked for a compound shell command its task had explicitly forbidden, and nothing told it
+    /// which of the two authorities won. It then found a legal way to the same end on its own,
+    /// which is exactly the behaviour to preserve rather than argue out of.
+    ///
+    /// So the note now declares its own rank. An approval lifts ONE pause; it does not amend the
+    /// task, and where the two collide the task takes it. That is the safe direction as well as
+    /// the honest one.
+    #[test]
+    fn a_resume_instruction_does_not_outrank_the_task() {
+        let instruction = resume_instruction(3, "Bash", Some(r#"{"command":"ls"}"#));
+        assert!(
+            instruction.contains("your task wins"),
+            "a note that cannot lose to the task leaves a run choosing between two authorities              with nothing to choose on: {instruction}"
+        );
+        assert!(
+            instruction.contains("ONE action and nothing else"),
+            "the bound is the other half of the same sentence: {instruction}"
+        );
+    }
+
+    /// **And it must not claim an authority the reader cannot check.**
+    ///
+    /// The old text opened with "A human approved one action for this run". Unverifiable from
+    /// inside the session, and the exact sentence an attacker writes. What IS checkable is where
+    /// the message came from -- the launcher, not the conversation -- so that is what it says now.
+    #[test]
+    fn a_resume_instruction_names_its_channel_rather_than_its_authority() {
+        let instruction = resume_instruction(4, "Bash", Some(r#"{"command":"ls"}"#));
+        assert!(
+            !instruction.contains("A human approved"),
+            "an unverifiable claim of authority is the shape of the attack, not the answer to it:              {instruction}"
+        );
+        assert!(
+            instruction.contains("daemon that launched this session"),
+            "the reader can place the channel even when it cannot check the claim: {instruction}"
+        );
+    }
+
     /// Absent or unparseable input must not produce an instruction that silently drops the action
     /// and reverts to the wording that failed.
     #[test]
@@ -5202,15 +5263,27 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
 
     /// A prompt is not a place to paste an unbounded string: the run pays for every token of it, and
     /// a command built by a loop can be megabytes.
+    ///
+    /// Measured against a BASELINE rather than against a constant, and the difference is not
+    /// pedantry. The old assertion bounded the whole note, which held only while the note was
+    /// short: rewriting it to explain itself (see `a_resume_instruction_does_not_outrank_the_task`)
+    /// broke a test about truncation for a reason that had nothing to do with truncation. What is
+    /// actually claimed is that the QUOTED ACTION costs at most `RESUME_ACTION_CHARS`, whatever the
+    /// prose around it grows to, and subtracting the same note with a one-character command is how
+    /// you ask that question.
     #[test]
     fn a_resume_instruction_bounds_the_action_it_quotes() {
         let huge = "x".repeat(RESUME_ACTION_CHARS * 4);
         let input = serde_json::json!({ "command": huge }).to_string();
         let instruction = resume_instruction(1, "Bash", Some(&input));
+        let baseline =
+            resume_instruction(1, "Bash", Some(&serde_json::json!({ "command": "x" }).to_string()))
+                .chars()
+                .count();
+        let quoted = instruction.chars().count() - baseline;
         assert!(
-            instruction.len() < RESUME_ACTION_CHARS * 2,
-            "quoted action is unbounded: {} chars",
-            instruction.len()
+            quoted <= RESUME_ACTION_CHARS,
+            "the quoted action added {quoted} chars over a one-character baseline, and the cap is              {RESUME_ACTION_CHARS}"
         );
         assert!(
             instruction.contains('…'),
