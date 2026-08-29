@@ -746,8 +746,7 @@ pub async fn default_remote_branch(
     let budget = deadline.saturating_duration_since(std::time::Instant::now());
     if budget.is_zero() {
         return Err(
-            "the operation ran out of time before origin's default branch could be read"
-                .to_owned(),
+            "the operation ran out of time before origin's default branch could be read".to_owned(),
         );
     }
     let result = run_git(

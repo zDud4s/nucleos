@@ -132,7 +132,10 @@ pub async fn integration_branch(
 /// whoever ran `git remote add` or `git clone` set it. `master` and `main` after, in that order,
 /// because they are the two names a repository with no remote configured is plausibly using; a
 /// third name would have to be declared, not guessed.
-async fn derive_integration_branch(project_root: &Path, deadline: Instant) -> Result<String, String> {
+async fn derive_integration_branch(
+    project_root: &Path,
+    deadline: Instant,
+) -> Result<String, String> {
     if let Some(branch) = crate::git_exec::default_remote_branch(project_root, deadline).await? {
         return Ok(branch);
     }
@@ -238,20 +241,18 @@ pub async fn submit(
     if from_resolution
         && let Some(escalated_id) =
             crate::resolver::escalated_request_id(pool, repo.project_id(), source.as_str()).await
-    {
-        if let Err(error) = sqlx::query("UPDATE vcs_requests SET resolved_by = ? WHERE id = ?")
+        && let Err(error) = sqlx::query("UPDATE vcs_requests SET resolved_by = ? WHERE id = ?")
             .bind(id)
             .bind(escalated_id)
             .execute(pool)
             .await
-        {
-            tracing::warn!(
-                escalated_id,
-                id,
-                %error,
-                "land: admitted a resolution but could not link it back to the escalation it answers"
-            );
-        }
+    {
+        tracing::warn!(
+            escalated_id,
+            id,
+            %error,
+            "land: admitted a resolution but could not link it back to the escalation it answers"
+        );
     }
 
     Ok(id)
@@ -259,6 +260,12 @@ pub async fn submit(
 
 #[cfg(test)]
 mod tests {
+    // A process-wide guard held across awaits on purpose: it serialises mutation of the shared
+    // NUCLEOS_WORKTREE_ROOT override, and there is no multi-thread runtime here to starve. Same
+    // guard and same reasoning as `git_exec::tests`, which these tests borrow their repositories
+    // from.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
@@ -280,7 +287,12 @@ mod tests {
     /// One row on the roster, the shape every test here needs: a project whose root is a real
     /// repository, and an integration branch either left to be derived (`None`) or declared
     /// (`Some`) so a test can isolate submission from derivation.
-    async fn seed_project(pool: &sqlx::SqlitePool, project_id: &str, root: &Path, branch: Option<&str>) {
+    async fn seed_project(
+        pool: &sqlx::SqlitePool,
+        project_id: &str,
+        root: &Path,
+        branch: Option<&str>,
+    ) {
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
              VALUES (?, 'active', ?, ?)",
@@ -350,7 +362,8 @@ mod tests {
     /// this module existed, `http.rs` read the target off exactly this checkout's HEAD, so a
     /// landing would have gone to `parked`. It has to land on `master` instead.
     #[tokio::test]
-    async fn a_landing_targets_the_declared_branch_even_though_the_main_checkout_stands_elsewhere() {
+    async fn a_landing_targets_the_declared_branch_even_though_the_main_checkout_stands_elsewhere()
+    {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-regression-", "chore/other");
@@ -402,7 +415,10 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-ancestor-", "chore/other");
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
-        assert!(git_in(&repo, &["merge", "--no-ff", "-m", "already landed", "feat/x"]));
+        assert!(git_in(
+            &repo,
+            &["merge", "--no-ff", "-m", "already landed", "feat/x"]
+        ));
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -414,13 +430,20 @@ mod tests {
             matches!(refusal, LandRefusal::NothingToLand(_)),
             "got {refusal:?}"
         );
-        assert!(refusal.message().contains("nothing to land"), "{}", refusal.message());
+        assert!(
+            refusal.message().contains("nothing to land"),
+            "{}",
+            refusal.message()
+        );
 
         let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(queued, 0, "a refusal this early must never occupy a slot in the queue");
+        assert_eq!(
+            queued, 0,
+            "a refusal this early must never occupy a slot in the queue"
+        );
     }
 
     /// Decision #2's other refusal: a project whose declared branch has since been renamed or
@@ -534,8 +557,14 @@ mod tests {
             .unwrap();
 
         // The agent's resolution: a real merge commit, both sides kept, no markers left.
-        assert!(git_in(&repo, &["checkout", "-q", "-b", "nucleos/run-42", "master"]));
-        assert!(!git_in(&repo, &["merge", "--no-ff", "feat/x"]), "the merge conflicts, by design");
+        assert!(git_in(
+            &repo,
+            &["checkout", "-q", "-b", "nucleos/run-42", "master"]
+        ));
+        assert!(
+            !git_in(&repo, &["merge", "--no-ff", "feat/x"]),
+            "the merge conflicts, by design"
+        );
         std::fs::write(repo.join("seed.txt"), "ours\ntheirs\n").expect("write the resolution");
         assert!(git_in(&repo, &["add", "-A"]));
         assert!(git_in(&repo, &["commit", "--no-edit"]));
@@ -544,7 +573,10 @@ mod tests {
         let resolution = submit(&pool, &repo_id, &repo, "nucleos/run-42", deadline())
             .await
             .expect("a verified resolution is admitted");
-        assert_ne!(resolution, original, "the resolution is a NEW request, not the old one reborn");
+        assert_ne!(
+            resolution, original,
+            "the resolution is a NEW request, not the old one reborn"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT from_resolution FROM vcs_requests WHERE id = ?")
                 .bind(resolution)
@@ -555,11 +587,13 @@ mod tests {
             "a resolution's branch has to be VERIFIED before it is merged"
         );
         assert_eq!(
-            sqlx::query_scalar::<_, Option<i64>>("SELECT resolved_by FROM vcs_requests WHERE id = ?")
-                .bind(original)
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT resolved_by FROM vcs_requests WHERE id = ?"
+            )
+            .bind(original)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
             Some(resolution),
             "the original escalation has to name its answer the moment the answer is admitted, \
              not once the answer finishes"
@@ -580,7 +614,10 @@ mod tests {
         let ticket = crate::vcs::wait_for(&pool, original, std::time::Duration::ZERO)
             .await
             .expect("the original id is still a live ticket");
-        assert_eq!(ticket.id, original, "the ticket the session holds keeps its own id");
+        assert_eq!(
+            ticket.id, original,
+            "the ticket the session holds keeps its own id"
+        );
         assert_eq!(
             ticket.status, "succeeded",
             "the wait follows resolved_by past the escalation to the resolution that answered it"
@@ -599,7 +636,10 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-notify-", "chore/other");
-        assert!(git_in(&repo, &["checkout", "-q", "-b", "nucleos/run-77", "feat/x"]));
+        assert!(git_in(
+            &repo,
+            &["checkout", "-q", "-b", "nucleos/run-77", "feat/x"]
+        ));
         assert!(git_in(&repo, &["checkout", "-q", "chore/other"]));
         seed_project(&pool, "alpha", &repo, Some("master")).await;
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");

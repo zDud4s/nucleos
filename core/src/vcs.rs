@@ -1770,6 +1770,13 @@ pub const TERMINAL_STATUSES: [&str; 7] = [
     "escalated",
 ];
 
+/// The four columns every read of `vcs_requests` in [`wait_for`] selects, named once for the
+/// reason the other `*Row` aliases in this crate give: three of the four are `Option` and two of
+/// those are `Option<String>`, so a `SELECT` that swapped the resulting sha for the failure
+/// reason would still typecheck, and would surface as a ticket reporting a hash where its reason
+/// belongs.
+type TicketRow = (String, Option<String>, Option<String>, Option<i64>);
+
 /// Blocks the caller until request `id` reaches a terminal status or `deadline` passes — whichever
 /// comes first — and returns a `Ticket` either way.
 ///
@@ -1833,7 +1840,7 @@ pub async fn wait_for(
     let started = std::time::Instant::now();
     let mut current = id;
     loop {
-        let row: Option<(String, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+        let row: Option<TicketRow> = sqlx::query_as(
             "SELECT status, result_sha, failure_reason, resolved_by FROM vcs_requests WHERE id = ?",
         )
         .bind(current)
@@ -2335,8 +2342,7 @@ pub async fn drain_once(
     // ending on a message nobody reads. Scoped to `Op::Merge` — every other operation's "moved"
     // is a different failure with a different remedy, and none of the rest publishes by
     // compare-and-swap against a target this queue does not own the way it owns a merge's.
-    let outcome = if matches!(claimed.op, Op::Merge { .. }) && outcome_is_a_moved_target(&outcome)
-    {
+    let outcome = if matches!(claimed.op, Op::Merge { .. }) && outcome_is_a_moved_target(&outcome) {
         match requeue_after_moved_target(pool, id).await {
             Ok(MovedTargetRetry::Requeued) => return true,
             Ok(MovedTargetRetry::CeilingReached(replacement)) => replacement,
@@ -5877,7 +5883,10 @@ mod tests {
         assert!(drain_once(&pool, "alpha", &lands).await);
 
         let ticket = wait_for(&pool, id, Duration::ZERO).await.unwrap();
-        assert_eq!(ticket.id, id, "the same ticket the caller was already holding");
+        assert_eq!(
+            ticket.id, id,
+            "the same ticket the caller was already holding"
+        );
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
     }
@@ -5902,7 +5911,10 @@ mod tests {
             let moved = FakeVcsExecutor::failing_with(
                 "master moved while the merge was being computed, so it was not published; resubmit",
             );
-            assert!(drain_once(&pool, "alpha", &moved).await, "attempt {attempt}");
+            assert!(
+                drain_once(&pool, "alpha", &moved).await,
+                "attempt {attempt}"
+            );
         }
 
         assert_eq!(status_of(&pool, id).await, "failed");
