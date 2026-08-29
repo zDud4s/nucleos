@@ -62,12 +62,19 @@ pub fn reader_for(path: &str) -> Option<Reader> {
 /// — and without this every route would be drawn with no edge to the module it serves, which
 /// is half the graph missing.
 ///
-/// **Deliberately not a parser.** A `crate::` inside a string literal or a comment counts as
-/// an edge. The error that produces is one extra edge between two modules that already mention
-/// each other by name — cheap, visible, and correctable by looking. The error a real parser
-/// would avoid does not justify pulling `syn` into this slice.
+/// **Deliberately not a parser.** A `crate::` inside a string literal still counts as an edge.
+/// The error a real parser would avoid does not justify pulling `syn` into this slice.
+///
+/// Comments are the exception, and they are cut. The original reasoning was that an extra edge
+/// would only ever appear "between two modules that already mention each other by name", which is
+/// cheap and visible. Measured against rust-analyzer's own index of the crate, that reasoning is
+/// wrong: 26 of the 598 edges between core files do not exist, and 21 of them come from a
+/// `[`crate::x`]` rustdoc link between modules with no other relationship at all. The better this
+/// crate is documented, the more dependencies the map invented — which is the opposite of what a
+/// map for checking your assumptions is for.
 pub fn rust_imports(source: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
+    let source = &without_comments(source);
     for (index, _) in source.match_indices("crate::") {
         let rest = &source[index + "crate::".len()..];
 
@@ -90,6 +97,103 @@ pub fn rust_imports(source: &str) -> BTreeSet<String> {
         }
     }
     found
+}
+
+/// The source with every comment replaced by a space, and nothing else touched.
+///
+/// It has to know what a string is, or a `//` inside a URL literal would swallow the rest of its
+/// line and lose the real imports after it — trading one wrong answer for another. Raw strings are
+/// copied whole for the same reason, and block comments nest, because in Rust they do.
+///
+/// A `'"'` character literal would still open a string here and eat until the next quote. That is
+/// the one case left, it is not in this crate, and it is cheaper to say so than to teach this
+/// function the difference between a character literal and a lifetime.
+fn without_comments(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let here = chars[i];
+        let next = chars.get(i + 1).copied().unwrap_or('\0');
+
+        // `r"..."` and `r#"..."#` are text all the way through, hashes and all.
+        if here == 'r' && (next == '"' || next == '#') {
+            let mut hashes = 0;
+            let mut at = i + 1;
+            while chars.get(at) == Some(&'#') {
+                hashes += 1;
+                at += 1;
+            }
+            if chars.get(at) == Some(&'"') {
+                out.extend(&chars[i..=at]);
+                at += 1;
+                while at < chars.len() {
+                    let closes = chars[at] == '"'
+                        && (1..=hashes).all(|step| chars.get(at + step) == Some(&'#'));
+                    if closes {
+                        out.extend(&chars[at..=at + hashes]);
+                        at += hashes + 1;
+                        break;
+                    }
+                    out.push(chars[at]);
+                    at += 1;
+                }
+                i = at;
+                continue;
+            }
+        }
+
+        if here == '"' {
+            out.push(here);
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    out.push(chars[i]);
+                    if let Some(&escaped) = chars.get(i + 1) {
+                        out.push(escaped);
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push(chars[i]);
+                i += 1;
+                if chars[i - 1] == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if here == '/' && next == '/' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            out.push(' ');
+            continue;
+        }
+
+        if here == '/' && next == '*' {
+            let mut depth = 1;
+            i += 2;
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+
+        out.push(here);
+        i += 1;
+    }
+    out
 }
 
 /// The identifier a piece of text starts with, or nothing.
@@ -723,6 +827,37 @@ use crate::{budget, health};
     fn a_module_named_more_than_once_still_appears_once() {
         let source = "use crate::storage;\nuse crate::storage::Thing;";
         assert_eq!(rust_imports(source).len(), 1);
+    }
+
+    #[test]
+    fn a_doc_comment_linking_to_another_module_is_not_a_dependency() {
+        // `[`crate::x`]` is how rustdoc links one item to another, and this crate uses it
+        // everywhere. Counted as an import it invents a dependency whose only existence is the
+        // sentence it appears in. The cost was assumed to be "one extra edge between two modules
+        // that already mention each other by name"; measured against rust-analyzer's own index of
+        // the crate, 26 of the 598 edges between core files do not exist, and 21 of those are a
+        // link exactly like the ones below — between modules with no other relationship at all.
+        let source = r#"
+//! The junction lives here. [`crate::map_anchor`] is what proposes the rest.
+
+/// Shared with [`crate::map_triage::parse_answer`] rather than respelled there.
+/* crate::map_orphan is not a dependency either, and nor is a block comment. */
+use crate::storage;
+"#;
+        let found = rust_imports(source);
+        assert!(found.contains("storage"));
+        assert!(!found.contains("map_anchor"));
+        assert!(!found.contains("map_triage"));
+        assert!(!found.contains("map_orphan"));
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn a_double_slash_inside_a_string_does_not_hide_the_rest_of_the_line() {
+        // The comment cutter has to know what a string is, or a URL in a literal would swallow
+        // the code after it and lose real imports — trading one wrong answer for another.
+        let source = "let url = \"https://example.com\"; crate::storage::open();";
+        assert!(rust_imports(source).contains("storage"));
     }
 
     #[test]
