@@ -121,15 +121,16 @@ impl CommandResult {
 /// `Err` is reserved for "we could not find out": git would not start, or the deadline passed. A
 /// non-zero exit is `Ok` — it is git's answer, and a conflicted merge arrives that way.
 ///
-/// **`git`, `add_worktree`, `repo_key`, `current_branch`, `toplevel` and `origin_and_head` are the
-/// only sanctioned production entries**, and a new caller belongs behind one of them rather than
-/// here: each is a place where whatever is left of the operation's budget is computed and an
-/// already-spent one is refused *before* a child is spawned, which `output()` would otherwise do
-/// eagerly. The last four are on the list because they pass that same test rather than because they
-/// arrived later — each computes its own remaining budget and returns without spawning when there
-/// is none. A caller that reaches past the six takes its `Duration` from somewhere else and quietly
-/// loses that gate. Naming them makes the gate greppable rather than conventional. The tests below
-/// call this directly on purpose — they are testing the transport itself.
+/// **`git`, `add_worktree`, `repo_key`, `current_branch`, `toplevel`, `origin_and_head`,
+/// `branch_exists`, `is_ancestor` and `default_remote_branch` are the only sanctioned production
+/// entries**, and a new caller belongs behind one of them rather than here: each is a place where
+/// whatever is left of the operation's budget is computed and an already-spent one is refused
+/// *before* a child is spawned, which `output()` would otherwise do eagerly. Everything past `git`
+/// is on the list because it passes that same test rather than because of when it arrived — each
+/// computes its own remaining budget and returns without spawning when there is none. A caller
+/// that reaches past this list takes its `Duration` from somewhere else and quietly loses that
+/// gate. Naming them makes the gate greppable rather than conventional. The tests below call this
+/// directly on purpose — they are testing the transport itself.
 ///
 /// **`map_stamp::digest` is a seventh caller and is deliberately outside that rule**, recorded here
 /// so the list above stays true rather than merely old. The gate the six enforce is the VCS queue's
@@ -660,6 +661,114 @@ pub async fn origin_and_head(
     .filter(|line| !line.is_empty());
 
     (remote, head)
+}
+
+/// Whether `refs/heads/<branch>` exists in the repository at `path`.
+///
+/// A seventh sanctioned entry to `run_git`, for the reason the others are: it computes what is
+/// left of the budget and refuses before spawning. `land.rs` is the one caller — it is what stands
+/// between `autopilot_state.integration_branch` and a name that used to resolve and does not any
+/// more, so a landing refuses by name instead of failing three git commands deep inside a merge.
+///
+/// `show-ref --verify --quiet` rather than `rev-parse --verify`: the latter also accepts a sha, a
+/// tag, or anything else that resolves, and what this answers is narrower — is there a LOCAL
+/// BRANCH by this name, the one thing a landing may target.
+pub async fn branch_exists(
+    path: &Path,
+    branch: &str,
+    deadline: std::time::Instant,
+) -> Result<bool, String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err("the operation ran out of time before the branch could be checked".to_owned());
+    }
+    let reference = format!("refs/heads/{branch}");
+    let result = run_git(
+        path,
+        &[
+            OsStr::new("show-ref"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new(&reference),
+        ],
+        budget,
+    )
+    .await?;
+    Ok(result.succeeded())
+}
+
+/// Whether `ancestor` is reachable from `descendant` — `merge-base --is-ancestor`, read as a bool
+/// rather than an `Outcome`, because the one caller (`land.rs`, decision #3) uses this to decide
+/// whether to submit at all and has no row yet to write an outcome onto.
+///
+/// An eighth sanctioned entry to `run_git`, for the reason the others are.
+///
+/// Non-zero is read as "no" without inspecting which non-zero. `--is-ancestor` uses 1 for a plain
+/// "not an ancestor" and something else for "not even a commit", and both branches named here have
+/// already been resolved by the caller before this runs — `land::submit` reads `source` off
+/// `current_branch` and `target` off `integration_branch`, neither of which hands this a name git
+/// cannot find. A future caller that cannot make the same guarantee owes its own check first.
+pub async fn is_ancestor(
+    path: &Path,
+    ancestor: &str,
+    descendant: &str,
+    deadline: std::time::Instant,
+) -> Result<bool, String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err(
+            "the operation ran out of time before the merge base could be checked".to_owned(),
+        );
+    }
+    let result = run_git(
+        path,
+        &[
+            OsStr::new("merge-base"),
+            OsStr::new("--is-ancestor"),
+            OsStr::new(ancestor),
+            OsStr::new(descendant),
+        ],
+        budget,
+    )
+    .await?;
+    Ok(result.succeeded())
+}
+
+/// The branch `origin`'s `HEAD` points at, or `None` when there is no `origin` or no such symbolic
+/// ref — never an error, because "cannot derive this way" is not "something is broken", and
+/// `land::integration_branch` has two more ways to answer before it has to refuse.
+///
+/// A ninth sanctioned entry to `run_git`, for the reason the others are.
+pub async fn default_remote_branch(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err(
+            "the operation ran out of time before origin's default branch could be read"
+                .to_owned(),
+        );
+    }
+    let result = run_git(
+        path,
+        &[
+            OsStr::new("symbolic-ref"),
+            OsStr::new("refs/remotes/origin/HEAD"),
+        ],
+        budget,
+    )
+    .await?;
+    if !result.succeeded() {
+        return Ok(None);
+    }
+    Ok(result
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| line.trim().strip_prefix("refs/remotes/origin/"))
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned))
 }
 
 /// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it
