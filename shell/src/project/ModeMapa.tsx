@@ -1,7 +1,8 @@
 // §spec mapa-do-projeto
 import { useProjectMap } from "../data/project-map";
 import { MapaCanvas } from "../canvas/MapaCanvas";
-import { buildMap, declaredCoverage } from "../canvas/map-model";
+import { declaredCoverage } from "../canvas/map-model";
+import { drawableLinks } from "../canvas/map-graphs";
 import { Carimbos } from "./Carimbos";
 import { ExtrairSpec } from "./ExtrairSpec";
 import { Juncao } from "./Juncao";
@@ -108,11 +109,9 @@ function Derived({ projectId }: { projectId: string }) {
     recency,
     last_triaged_at,
   } = map.data;
-  // `buildMap` rather than `imports.length`, and the difference is the whole point: this counts
-  // the links the map would actually draw, which drops any edge with an end it cannot find. The
-  // núcleo sends none of those today, and the day it does this number must not quietly start
-  // counting things nobody will ever see.
-  const built = buildMap(modules, imports);
+  // Counted rather than taken from `imports.length`: this is the number of links the map would
+  // actually draw, which drops any edge with an end it cannot find.
+  const links = drawableLinks(modules, imports);
   // **§8 on screen, because until now it was legible only to the parser.** A bare `§7` names a
   // section of *some* document; the header says which. Every confirmation this mode draws below
   // rests on that, so a reader has to be able to ask how much of the project has said it — a
@@ -142,7 +141,7 @@ function Derived({ projectId }: { projectId: string }) {
           </p>
         ) : null}
         <p className="mt-1 text-xs text-text-muted">
-          joined by {built.edges.length} link{built.edges.length === 1 ? "" : "s"}
+          joined by {links} link{links === 1 ? "" : "s"}
           {unread.length > 0
             ? ` · ${unread.length} file${unread.length === 1 ? "" : "s"} in a language it cannot read yet`
             : ""}
@@ -158,7 +157,7 @@ function Derived({ projectId }: { projectId: string }) {
         declared which document its sections belong to. The picture is where that is visible, so it
         is read first.
       */}
-      <MapaCanvas modules={modules} foreign={foreign} imports={imports} />
+      <MapaCanvas modules={modules} imports={imports} />
       <Juncao junction={junction} projectId={projectId} />
       {/*
         Drawn here rather than as a panel of its own for the reason the junction is: the standings,

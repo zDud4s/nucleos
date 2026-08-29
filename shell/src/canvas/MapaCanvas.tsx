@@ -1,344 +1,263 @@
 // §spec mapa-do-projeto
-import {
-  BaseEdge,
-  EdgeLabelRenderer,
-  Handle,
-  Position,
-  ReactFlow,
-  ReactFlowProvider,
-  getSmoothStepPath,
-  type EdgeProps,
-  type EdgeTypes,
-  type NodeProps,
-  type NodeTypes,
-} from "@xyflow/react";
-// Through the bundle, never a CDN — the Tauri window's CSP is `default-src 'self'`, so a
-// stylesheet fetched from anywhere else is a blank canvas in the shipped app and a working one in
-// the dev server. Same argument as `WorkflowCanvas`, and the same import.
-import "@xyflow/react/dist/style.css";
-import type { ForeignFile, MapImport, MapModule } from "../data/project-map";
-import { useState } from "react";
-import {
-  buildDocuments,
-  buildMap,
-  filesOf,
-  moduleTone,
-  UNDECLARED,
-  type DocumentEdgeData,
-  type DocumentFlowEdge,
-  type DocumentFlowNode,
-  type DocumentNodeData,
-  type MapFlowEdge,
-  type MapFlowNode,
-} from "./map-model";
+import { useMemo, useState } from "react";
+import type { MapImport, MapModule } from "../data/project-map";
+import { NODE_H, type Layout } from "./layered";
+import { buildCommunities, buildCommunity, cellKey, moduleName } from "./map-graphs";
 
 /**
- * The project one level above the file: **a node is a document, and its files are the ones that
- * said so.**
+ * How this project is built, as two nested pictures.
  *
- * **This is the first drawing of this map that fits on a screen, and the reason is the header.**
- * The file-level picture is 264 nodes; grouping them by folder — the only other boundary this
- * repository has — was measured and fails in both directions, because `core/src` is a single
- * directory holding the whole núcleo and `shell/src/project/` holds files of four different
- * documents. `§spec` is a boundary the owner wrote, so this grouping is derived rather than
- * invented, and it does not rot when somebody adds a file.
+ * **The instrument changes with the density, and that is the whole design.** This repository is 253
+ * files joined by 1033 dependencies — four a file, and node-link drawings stop being readable
+ * somewhere near two and a half. The first version of this screen drew them anyway: measured
+ * afterwards, 73% of its edges crossed a box they had nothing to do with, and one corridor carried
+ * 78 lines. So the project as a whole is a **matrix**, which scales to hundreds of rows and puts
+ * every dependency that points backwards below the diagonal, where it can be counted.
  *
- * **What is true here is the sizes and the edges. Position is not.** Nodes are ordered by size and
- * laid on a grid so the picture is stable between reads, and nothing about where a document sits
- * says anything about it. A layout that looked meaningful and was not would be the false
- * confidence this whole feature exists against, drawn instead of written.
+ * Inside a community the graph is sparse — that is what being a community means — and it is drawn
+ * as a layered picture. Where even that would not read, the reason is shown instead of the picture.
+ * **A drawing nobody can follow is worse than a sentence saying why, because it still looks like an
+ * answer** — and looking like an answer while being unreadable is the failure this whole map exists
+ * to refuse.
  *
- * **The pile that declares no document is drawn, and it is the point rather than the leftover.**
- * It is exactly the §8 debt — files naming a section without saying which document — and while it
- * is large every confirmation elsewhere on this screen rests on files that did say. Hiding it
- * would draw the project as more organised than it is.
- *
- * **What this drawing does not show, said here because the picture cannot say it:** it does not go
- * inside a document, so it says nothing about how one is built; it draws no edge for a Go file,
- * because nothing here knows what one imports, though those files do count toward a document's
- * size; and a weight is a count of imports and never a claim that they matter.
+ * Nothing here is a `xyflow` canvas, unlike its two neighbours. Those lay out as they render; this
+ * one already knows every coordinate before it draws, because the number that decides whether a
+ * community is drawable has to be the number the drawing actually has. Handing the positions to a
+ * library that may adjust them would put those two apart.
  */
-
-/**
- * Module scope, for the reason `WorkflowCanvas` records: xyflow compares these by reference and
- * rebuilds every node when either changes, so declaring them inside the component is a full
- * remount on every render — intermittent rather than constant once the compiler memoises around
- * it, which is worse.
- */
-const nodeTypes: NodeTypes = { documentNode: DocumentNode, mapNode: ModuleNode };
-const edgeTypes: EdgeTypes = { documentEdge: DocumentEdgeLine, mapEdge: ModuleEdgeLine };
-
-/**
- * Above this, an edge carries its number.
- *
- * **A threshold and not a filter: every edge is drawn.** Labelling all of them turns the picture
- * into a field of digits and labelling none throws away the one quantity here. The number is
- * stated in the caption below the canvas rather than left for somebody to infer, which is the same
- * rule the rest of this map keeps — a drawing that omits has to say what it omitted.
- */
-const LABEL_FROM = 4;
-
-/* ------------------------------------------------------------------ node -- */
-
-function DocumentNode({ data }: NodeProps<DocumentFlowNode>) {
-  const { slug, files, citing } = data as DocumentNodeData;
-  const undeclared = slug === UNDECLARED;
-
-  return (
-    <>
-      <Handle type="target" position={Position.Left} isConnectable={false} />
-      <div
-        // The longest slugs truncate at this width. The full name is on the element for a hover
-        // and in the label for a screen reader, so nothing is only in the pixels.
-        title={undeclared ? undefined : (slug ?? undefined)}
-        aria-label={
-          undeclared
-            ? `${files} file${files === 1 ? "" : "s"} naming a section under no document`
-            : `${slug}, ${files} file${files === 1 ? "" : "s"}`
-        }
-        className={[
-          "flex w-[170px] flex-col gap-1 rounded-lg px-3 py-2 text-left",
-          // Dashed and muted, the way `resto` is drawn everywhere else in this project: present,
-          // counted, and plainly not a document somebody decided.
-          undeclared
-            ? "border-2 border-dashed border-border bg-surface-sunken"
-            : "border-2 border-border bg-surface",
-        ].join(" ")}
-      >
-        <span
-          className={`truncate font-display text-sm ${undeclared ? "text-text-muted" : "text-text"}`}
-        >
-          {undeclared ? "no document" : slug}
-        </span>
-        <span className="text-[10px] uppercase tracking-wide text-text-faint">
-          {files} file{files === 1 ? "" : "s"}
-          {/*
-            The second number only when it differs. A document whose files all name a section is
-            the ordinary case, and printing `12 of 12` on every node would spend the reader's
-            attention on the rows where nothing is happening.
-          */}
-          {citing === files ? "" : ` · ${citing} name a section`}
-        </span>
-      </div>
-      <Handle type="source" position={Position.Right} isConnectable={false} />
-    </>
-  );
-}
-
-/* --------------------------------------------------------- node, level 2 -- */
-
-/**
- * One file inside an open document.
- *
- * The tone is {@link moduleTone}'s, unchanged: *did anybody ask for this* is the same question one
- * level down, and giving it a second vocabulary here would be two answers on two screens.
- */
-function ModuleNode({ data }: NodeProps<MapFlowNode>) {
-  const module = (data as { module: MapModule }).module;
-  const name = module.path.slice(module.path.lastIndexOf("/") + 1);
-  const tone = moduleTone(module);
-
-  return (
-    <>
-      <Handle type="target" position={Position.Left} isConnectable={false} />
-      <div
-        title={module.path}
-        aria-label={`${module.path}, ${module.cites.length} citation${module.cites.length === 1 ? "" : "s"}`}
-        className="flex w-[170px] flex-col rounded-md border-2 bg-surface px-2 py-1 text-left"
-        style={{ borderColor: `var(--tone-${tone}-border)` }}
-      >
-        <span className="truncate font-mono text-[11px] text-text">{name}</span>
-        <span className="truncate text-[10px] text-text-faint">{module.path}</span>
-      </div>
-      <Handle type="source" position={Position.Right} isConnectable={false} />
-    </>
-  );
-}
-
-function ModuleEdgeLine({
-  sourceX,
-  sourceY,
-  targetX,
-  targetY,
-  sourcePosition,
-  targetPosition,
-}: EdgeProps) {
-  const [path] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-    sourcePosition,
-    targetPosition,
-  });
-  return <BaseEdge path={path} style={{ strokeWidth: 1, stroke: "var(--border)" }} />;
-}
-
-/* ------------------------------------------------------------------ edge -- */
-
-function DocumentEdgeLine({
-  sourceX,
-  sourceY,
-  targetX,
-  targetY,
-  sourcePosition,
-  targetPosition,
-  data,
-}: EdgeProps<DocumentFlowEdge>) {
-  const weight = (data as DocumentEdgeData | undefined)?.weight ?? 1;
-  const [path, labelX, labelY] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-    sourcePosition,
-    targetPosition,
-  });
-
-  return (
-    <>
-      <BaseEdge
-        path={path}
-        style={{
-          // Width carries the count, capped so one heavy pair cannot drown the rest of the
-          // picture. The cap is why the number is also printed above `LABEL_FROM`: past it the
-          // stroke stops being able to say how much heavier a pair is.
-          strokeWidth: Math.min(1 + weight * 0.35, 5),
-          stroke: "var(--border-strong)",
-        }}
-      />
-      {weight >= LABEL_FROM ? (
-        <EdgeLabelRenderer>
-          <span
-            style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
-            className="pointer-events-none absolute rounded-pill border border-border bg-surface px-1.5 py-0.5 text-[10px] text-text-muted"
-          >
-            {weight}
-          </span>
-        </EdgeLabelRenderer>
-      ) : null}
-    </>
-  );
-}
-
-/* ---------------------------------------------------------------- canvas -- */
 
 export interface MapaCanvasProps {
   modules: MapModule[];
-  foreign: ForeignFile[];
   imports: MapImport[];
 }
 
-function MapaSurface({ modules, foreign, imports }: MapaCanvasProps) {
-  /**
-   * Which document is open, or `null` for the whole project.
-   *
-   * **An object rather than the slug itself, because `null` is a document here** — the pile that
-   * declares none is a box like any other and has to be openable. A bare `string | null` would
-   * make *the undeclared pile* and *nothing is open* the same value, and the one screen where that
-   * collapse shows up is the one screen it must not.
-   */
-  const [open, setOpen] = useState<{ slug: string | null } | null>(null);
-  const model = buildDocuments(modules, foreign, imports);
+export function MapaCanvas({ modules, imports }: MapaCanvasProps) {
+  const [open, setOpen] = useState<string | null>(null);
+  const matrix = useMemo(() => buildCommunities(modules, imports), [modules, imports]);
+  const inside = useMemo(
+    () => (open === null ? null : buildCommunity(matrix.members.get(open) ?? [], imports)),
+    [open, matrix, imports],
+  );
 
-  if (model.nodes.length === 0) {
-    // §11's project without specs, and the sentence it insists on. An empty canvas would be the
-    // cheapest lie in the document — it looks like a map with nothing in it rather than like a
-    // project nobody has told anything yet.
-    return (
-      <p className="text-sm text-text-faint">
-        Nothing in this project names a spec section yet, so there are no documents to draw.
-      </p>
-    );
+  if (matrix.order.length === 0) {
+    return <p className="text-sm text-text-faint">Nothing here imports anything else.</p>;
   }
 
-  const inside = open === null ? null : buildMap(filesOf(modules, open.slug), imports);
-  const name = open === null ? null : (open.slug ?? "no document");
-  // Counted rather than drawn: nothing here knows what a Go file imports, so drawing one inside a
-  // document would put a node with no edges beside nodes whose edges mean something.
-  const unread =
-    open === null ? 0 : foreign.filter((file) => (file.spec ?? null) === open.slug).length;
-
-  return (
-    <div className="flex flex-col gap-2">
-      {open === null ? null : (
+  if (open !== null && inside !== null) {
+    const members = matrix.members.get(open) ?? [];
+    return (
+      <div className="flex flex-col gap-2">
         <div className="flex items-baseline gap-3">
           <button
             type="button"
             onClick={() => setOpen(null)}
             className="rounded-pill border border-border px-2 py-0.5 text-xs text-text-muted hover:text-text"
           >
-            &larr; all documents
+            ← whole project
           </button>
-          <span className="font-display text-sm text-text">{name}</span>
+          <span className="font-display text-sm text-text">{open}</span>
           <span className="text-xs text-text-faint">
-            {inside?.nodes.length ?? 0} file{inside?.nodes.length === 1 ? "" : "s"} this reader
-            follows
-            {unread > 0
-              ? ` · ${unread} more in a language it cannot read, drawn nowhere`
-              : ""}
+            {members.length} file{members.length === 1 ? "" : "s"} ·{" "}
+            {inside.links.length} import{inside.links.length === 1 ? "" : "s"} between them
           </span>
         </div>
-      )}
-      <div className="h-[520px] w-full overflow-hidden rounded-lg border border-border bg-surface-sunken">
-        {/*
-          Both levels share one canvas, so the generics are written out: inferred from the
-          first branch they would be the document level's, and the file level would not
-          typecheck against them.
-        */}
-        <ReactFlow<DocumentFlowNode | MapFlowNode, DocumentFlowEdge | MapFlowEdge>
-          key={open === null ? "documents" : `inside:${open.slug ?? ""}`}
-          nodes={inside?.nodes ?? model.nodes}
-          edges={inside?.edges ?? model.edges}
-          nodeTypes={nodeTypes}
-          edgeTypes={edgeTypes}
-          onNodeClick={(_event, node) => {
-            // Only the top level opens. A file has nowhere further to go yet, and a click that
-            // silently does nothing is worse than one that was never offered.
-            if (open !== null) return;
-            const slug = (node.data as DocumentNodeData).slug;
-            setOpen({ slug });
-          }}
-          /*
-            Draggable, unlike the workflow canvas, and the difference is what the layout means. A
-            workflow's layout IS the sequence, so a node moved by hand would say something false.
-            Here position carries nothing, so moving one costs nothing and untangling the picture
-            by hand is the only tool this drawing offers.
-          */
-          nodesDraggable
-          nodesConnectable={false}
-          elementsSelectable={false}
-          deleteKeyCode={null}
-          proOptions={{ hideAttribution: false }}
-          fitView
-        />
-      </div>
-      <p className="text-xs text-text-muted">
-        {open === null ? (
-          <>
-            A box is a document and its files are the ones carrying its <code>§spec</code> header;
-            a line is one document&rsquo;s files importing another&rsquo;s, thicker the more of them
-            there are, numbered from {LABEL_FROM}. Click a box to open it. Where a box sits means
-            nothing. Go files count toward a box and carry no lines, because nothing here can read
-            what one imports.
-          </>
+        {inside.refused.length > 0 ? (
+          <Refused reasons={inside.refused} />
         ) : (
-          <>
-            The files that declared this document, and the imports between them — an import leaving
-            it is not drawn here, because this level is about how one document is built. A file
-            outlined faintly is one that names no section: it is inside this document and nothing
-            has asked for it.
-          </>
+          <Graph drawn={inside.drawn} />
         )}
-      </p>
+        <ol className="flex flex-col gap-0.5">
+          {members.map((path) => (
+            <li key={path} className="font-mono text-[11px] text-text-muted">
+              {path}
+            </li>
+          ))}
+        </ol>
+      </div>
+    );
+  }
+
+  return <Matrix matrix={matrix} onOpen={setOpen} />;
+}
+
+/** The honest half: why a picture is not being drawn, in the numbers that decided it. */
+function Refused({ reasons }: { reasons: string[] }) {
+  return (
+    <div className="rounded-lg border border-border bg-surface-sunken px-4 py-3">
+      <p className="text-sm text-text">This one does not draw, and pretending otherwise would help nobody.</p>
+      <ul className="mt-1 list-disc pl-5 text-xs text-text-muted">
+        {reasons.map((reason) => (
+          <li key={reason}>{reason}</li>
+        ))}
+      </ul>
     </div>
   );
 }
 
-export function MapaCanvas(props: MapaCanvasProps) {
+/**
+ * The dependencies between communities as a grid.
+ *
+ * Rows are ordered so as little as possible falls below the diagonal — the ordering by depth this
+ * replaced put 146 of 372 dependencies down there where a better one puts 84, so more than half of
+ * the arrows a reader saw pointing backwards were the sort's fault and not the code's. **What is
+ * left below the diagonal after this is coupling no arrangement removes**, which is the only form
+ * of that number worth acting on.
+ */
+function Matrix({
+  matrix,
+  onOpen,
+}: {
+  matrix: ReturnType<typeof buildCommunities>;
+  onOpen: (title: string) => void;
+}) {
+  const total = matrix.back + matrix.forward;
+  const share = total === 0 ? 0 : Math.round((100 * matrix.back) / total);
   return (
-    <ReactFlowProvider>
-      <MapaSurface {...props} />
-    </ReactFlowProvider>
+    <div className="flex flex-col gap-3">
+      <p className="max-w-prose text-sm text-text-muted">
+        {matrix.files} files joined by {matrix.deps} dependencies — {(matrix.deps / matrix.files).toFixed(1)}{" "}
+        each. No arrangement of boxes and arrows survives that, so this is a matrix: each row uses
+        the columns marked in it. The files were grouped into {matrix.order.length} communities found
+        from the imports themselves. <span className="text-text">A mark above the diagonal is a
+        dependency that goes down. One below points backwards</span> — and no reordering removes it.
+      </p>
+      <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
+        <span>
+          <span className="font-display text-sm text-text">{matrix.forward}</span> forwards
+        </span>
+        <span>
+          <span className="font-display text-sm text-text">{matrix.back}</span> backwards · {share}%
+        </span>
+        {matrix.alone.length > 0 ? (
+          <span title={matrix.alone.join("\n")}>
+            <span className="font-display text-sm text-text">{matrix.alone.length}</span> with no
+            dependency either way
+          </span>
+        ) : null}
+      </div>
+      <div className="max-h-[560px] w-full overflow-auto rounded-lg border border-border bg-surface p-3">
+        <table className="border-collapse font-mono text-[10px]">
+          <thead>
+            <tr>
+              <th />
+              {matrix.order.map((title) => (
+                <th key={title} className="h-28 align-bottom pb-1">
+                  <button
+                    type="button"
+                    onClick={() => onOpen(title)}
+                    className="[writing-mode:vertical-rl] rotate-180 text-text-muted hover:text-text"
+                  >
+                    {title}
+                  </button>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {matrix.order.map((row, i) => (
+              <tr key={row}>
+                <th className="whitespace-nowrap px-1 text-right font-normal">
+                  <button
+                    type="button"
+                    onClick={() => onOpen(row)}
+                    className="text-text-muted hover:text-text"
+                  >
+                    {row}{" "}
+                    <span className="text-text-faint">{matrix.members.get(row)?.length}</span>
+                  </button>
+                </th>
+                {matrix.order.map((column, j) => {
+                  const weight = matrix.cells.get(cellKey(row, column));
+                  const tone =
+                    i === j
+                      ? "bg-surface-sunken"
+                      : weight === undefined
+                        ? ""
+                        : j > i
+                          ? "bg-accent/30"
+                          : "bg-danger/30";
+                  return (
+                    <td
+                      key={column}
+                      title={weight === undefined ? undefined : `${row} uses ${column} — ${weight}`}
+                      className={`h-[19px] w-[19px] border border-border-subtle text-center ${tone}`}
+                    >
+                      {weight ?? ""}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
+
+const PAD = 26;
+
+/** One community's files, laid out so a caller sits above what it calls. */
+function Graph({ drawn }: { drawn: Layout }) {
+  const at = new Map(drawn.nodes.map((node) => [node.id, { x: node.x, y: node.y }]));
+  for (const [id, where] of Object.entries(drawn.bends)) at.set(id, where);
+  const isBend = (id: string) => drawn.bends[id] !== undefined;
+
+  return (
+    <div className="max-h-[560px] w-full overflow-auto rounded-lg border border-border bg-surface">
+      <svg
+        width={drawn.width + PAD * 2}
+        height={drawn.height + PAD * 2}
+        viewBox={`${-PAD} ${-PAD + NODE_H / 2} ${drawn.width + PAD * 2} ${drawn.height + PAD * 2}`}
+      >
+        <g>
+          {drawn.segments.map((segment) => {
+            const a = at.get(segment.from);
+            const b = at.get(segment.to);
+            if (!a || !b) return null;
+            const y1 = a.y + (isBend(segment.from) ? 0 : NODE_H / 2);
+            const y2 = b.y - (isBend(segment.to) ? 0 : NODE_H / 2);
+            const mid = (y1 + y2) / 2;
+            return (
+              <path
+                key={`${segment.from}>${segment.to}`}
+                d={`M${a.x} ${y1} C${a.x} ${mid} ${b.x} ${mid} ${b.x} ${y2}`}
+                fill="none"
+                className={segment.reversed ? "stroke-danger" : "stroke-border"}
+                strokeWidth={1.2}
+                strokeDasharray={segment.reversed ? "4 3" : undefined}
+              />
+            );
+          })}
+        </g>
+        <g>
+          {drawn.nodes.map((node) => (
+            <g key={node.id} transform={`translate(${node.x - node.width / 2},${node.y - NODE_H / 2})`}>
+              <title>{node.id}</title>
+              <rect
+                width={node.width}
+                height={NODE_H}
+                rx={4}
+                className="fill-surface stroke-border"
+                strokeWidth={1.2}
+              />
+              {node.lines.map((line, index) => (
+                <text
+                  key={line}
+                  x={node.width / 2}
+                  y={(node.lines.length > 1 ? 15 : 21) + index * 12}
+                  textAnchor="middle"
+                  className="fill-text font-mono text-[11px]"
+                >
+                  {line}
+                </text>
+              ))}
+            </g>
+          ))}
+        </g>
+      </svg>
+    </div>
+  );
+}
+
+export { moduleName };

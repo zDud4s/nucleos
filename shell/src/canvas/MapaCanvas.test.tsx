@@ -1,143 +1,87 @@
 // §spec mapa-do-projeto
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 
-/**
- * jsdom has no layout and no CSS transforms, and xyflow constructs a `DOMMatrixReadOnly` on mount.
- * The same stub `WorkflowGraph` and the fleet canvas use, for the same reason: the absence is a
- * fact about the environment and not a fault in the component.
- */
-vi.stubGlobal(
-  "DOMMatrixReadOnly",
-  class {
-    m22 = 1;
-    constructor(_transform?: string) {}
-  },
-);
-
 import { MapaCanvas } from "./MapaCanvas";
-import type { ForeignFile, MapModule } from "../data/project-map";
+import type { MapImport, MapModule } from "../data/project-map";
 
-const cites = [{ section: "7", named: null }];
-
-const mod = (path: string, spec: string | null, naming = true): MapModule => ({
+const mod = (path: string): MapModule => ({
   path,
   reader: path.endsWith(".rs") ? "rust" : "typescript",
-  declares: naming,
-  cites: naming ? cites : [],
-  spec,
+  declares: false,
+  cites: [],
+  spec: null,
   tested: false,
 });
 
-const go = (path: string, spec: string | null): ForeignFile => ({ path, cites, spec });
+const link = (from: string, to: string): MapImport => ({ from, to });
+
+/** Two clumps wired inside themselves and joined by a single thread — the shape a codebase has. */
+const twoGroups = {
+  modules: ["a1", "a2", "a3", "b1", "b2", "b3"].map((n) => mod(`core/src/${n}.rs`)),
+  imports: [
+    link("core/src/a1.rs", "core/src/a2.rs"),
+    link("core/src/a2.rs", "core/src/a3.rs"),
+    link("core/src/a3.rs", "core/src/a1.rs"),
+    link("core/src/b1.rs", "core/src/b2.rs"),
+    link("core/src/b2.rs", "core/src/b3.rs"),
+    link("core/src/b3.rs", "core/src/b1.rs"),
+    link("core/src/a1.rs", "core/src/b1.rs"),
+  ],
+};
 
 describe("MapaCanvas", () => {
-  it("draws a box per document and never lets the undeclared pile pass as one", () => {
-    // The pile is the §8 debt and the whole reason it is drawn is that it is large. Naming it
-    // after a document — or leaving it out — would draw the project as more decided than it is,
-    // which is the failure this map exists against.
-    render(
-      <MapaCanvas
-        modules={[
-          mod("core/src/map_join.rs", "mapa-do-projeto"),
-          mod("core/src/http.rs", null),
-        ]}
-        foreign={[go("sidecars/browser/fence/csp.go", "pilar-de-browser")]}
-        imports={[]}
-      />,
-    );
-
-    expect(screen.getByLabelText("mapa-do-projeto, 1 file")).toBeTruthy();
-    expect(screen.getByLabelText("1 file naming a section under no document")).toBeTruthy();
-    // The Go file counts toward its document even though nothing here can read what it imports.
-    expect(screen.getByLabelText("pilar-de-browser, 1 file")).toBeTruthy();
+  it("draws the whole project as a matrix rather than as boxes and arrows", () => {
+    // Four dependencies a file is past where any layered drawing reads, and the first version of
+    // this screen drew one anyway: 73% of its edges crossed a box they had nothing to do with.
+    render(<MapaCanvas modules={twoGroups.modules} imports={twoGroups.imports} />);
+    expect(screen.getByRole("table")).toBeTruthy();
+    expect(screen.getByText(/dependencies/)).toBeTruthy();
   });
 
-  it("says in words which edges carry their number, because the picture cannot", () => {
-    // Every edge is drawn and only the heavy ones are labelled. A reader who is not told the
-    // threshold reads the unlabelled lines as weightless, which is a drawing that omits without
-    // saying so — the one thing the rest of this feature never does.
-    render(
-      <MapaCanvas modules={[mod("core/src/a.rs", "mapa-do-projeto")]} foreign={[]} imports={[]} />,
-    );
-    expect(screen.getByText(/numbered from 4/)).toBeTruthy();
-    expect(screen.getByText(/Where a box sits means nothing/)).toBeTruthy();
+  it("counts what points backwards, because that is the number somebody might act on", () => {
+    render(<MapaCanvas modules={twoGroups.modules} imports={twoGroups.imports} />);
+    // The word appears twice — once explaining the diagonal, once as the count. That is the point:
+    // the reader is told what the mark means and then how many of them there are.
+    expect(screen.getAllByText(/backwards/).length).toBeGreaterThan(1);
+    expect(screen.getByText(/forwards/)).toBeTruthy();
   });
 
-  it("tells a project that names no section, instead of drawing an empty canvas", () => {
-    // §11. An empty frame is the cheapest lie available here: it reads as a map of nothing rather
-    // than as a project nobody has told anything yet.
-    render(
-      <MapaCanvas
-        modules={[mod("core/src/quiet.rs", null, false)]}
-        foreign={[]}
-        imports={[]}
-      />,
-    );
-    expect(screen.getByText(/no documents to draw/)).toBeTruthy();
-  });
-});
-
-describe("MapaCanvas, opened", () => {
-  const open = (label: string) => {
-    // xyflow puts its click handler on the node wrapper, not on the box we drew inside it.
-    const box = screen.getByLabelText(label);
-    const node = box.closest(".react-flow__node");
-    expect(node).toBeTruthy();
-    fireEvent.click(node as Element);
-  };
-
-  it("opens a document onto the files that declared it, and comes back", () => {
-    render(
-      <MapaCanvas
-        modules={[
-          mod("core/src/map_join.rs", "mapa-do-projeto"),
-          mod("core/src/map_store.rs", "mapa-do-projeto"),
-          mod("core/src/browser.rs", "pilar-de-browser"),
-        ]}
-        foreign={[]}
-        imports={[{ from: "core/src/map_join.rs", to: "core/src/map_store.rs" }]}
-      />,
-    );
-
-    open("mapa-do-projeto, 2 files");
-    expect(screen.getByLabelText("core/src/map_join.rs, 1 citation")).toBeTruthy();
-    // The other document's file is not in here. A level that showed everything would be the
-    // level above it, with worse labels.
-    expect(screen.queryByLabelText("core/src/browser.rs, 1 citation")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: /all documents/ }));
-    expect(screen.getByLabelText("pilar-de-browser, 1 file")).toBeTruthy();
+  it("opens a community when its name is clicked, and comes back", () => {
+    render(<MapaCanvas modules={twoGroups.modules} imports={twoGroups.imports} />);
+    const rows = screen.getAllByRole("button");
+    const first = rows.find((button) => /^a[123]|^b[123]/.test(button.textContent ?? ""));
+    expect(first).toBeTruthy();
+    fireEvent.click(first!);
+    expect(screen.getByText("← whole project")).toBeTruthy();
+    fireEvent.click(screen.getByText("← whole project"));
+    expect(screen.getByRole("table")).toBeTruthy();
   });
 
-  it("opens the undeclared pile too, which is why `null` is not the closed state", () => {
-    // A bare `string | null` would make *the undeclared pile* and *nothing is open* one value.
-    // The pile is the §8 debt and the second-largest box in this project — the one box somebody
-    // most needs to open, and the one a collapsed state would make unopenable.
-    render(
-      <MapaCanvas
-        modules={[mod("core/src/http.rs", null), mod("core/src/a.rs", "mapa-do-projeto")]}
-        foreign={[]}
-        imports={[]}
-      />,
-    );
-
-    open("1 file naming a section under no document");
-    expect(screen.getByLabelText("core/src/http.rs, 1 citation")).toBeTruthy();
-    expect(screen.getByText("no document")).toBeTruthy();
+  it("says why it will not draw a community rather than drawing one nobody can follow", () => {
+    // Six files each importing every other is 5 links a box, twice the measured limit. A picture
+    // that looks like an answer while being unreadable is the failure this map exists to refuse.
+    const names = ["c1", "c2", "c3", "c4", "c5", "c6"].map((n) => `core/src/${n}.rs`);
+    const dense: MapImport[] = [];
+    for (const from of names) for (const to of names) if (from !== to) dense.push(link(from, to));
+    render(<MapaCanvas modules={names.map(mod)} imports={dense} />);
+    fireEvent.click(screen.getAllByRole("button")[0]);
+    expect(screen.getByText(/does not draw/)).toBeTruthy();
+    expect(screen.getByText(/ligações por caixa/)).toBeTruthy();
   });
 
-  it("says what the level below leaves out, as the level above does", () => {
-    render(
-      <MapaCanvas
-        modules={[mod("core/src/browser.rs", "pilar-de-browser")]}
-        foreign={[go("sidecars/browser/fence/csp.go", "pilar-de-browser")]}
-        imports={[]}
-      />,
-    );
-    open("pilar-de-browser, 2 files");
-    // The Go file counted toward the box and cannot be drawn inside it, so the count says so
-    // rather than the picture quietly being one file short of its own label.
-    expect(screen.getByText(/1 more in a language it cannot read, drawn nowhere/)).toBeTruthy();
+  it("keeps two files that share a name as two files", () => {
+    // `core/src/presets.rs` and `shell/src/data/presets.ts` are different files, and the first
+    // reading of the real answer merged them into one box because it keyed on the name.
+    const modules = [mod("core/src/presets.rs"), mod("shell/src/data/presets.ts"), mod("core/src/a.rs")];
+    const imports = [link("core/src/a.rs", "core/src/presets.rs")];
+    render(<MapaCanvas modules={modules} imports={imports} />);
+    // Only the two that are joined are boxes; the third has no dependency either way and is listed.
+    expect(screen.getByText(/with no/)).toBeTruthy();
+  });
+
+  it("says so plainly when nothing imports anything", () => {
+    render(<MapaCanvas modules={[mod("core/src/lonely.rs")]} imports={[]} />);
+    expect(screen.getByText(/Nothing here imports anything else/)).toBeTruthy();
   });
 });
