@@ -328,11 +328,49 @@ def main() -> None:
         deny("daemon returned a non-object decision body - failing closed")
 
     verdict = decision.get("decision")
+    if verdict == "asking":
+        decision = wait_for_answer(daemon_url, token, run_id)
+        verdict = decision.get("decision")
     if verdict in ("deny", "pending_approval"):
         deny(decision.get("reason", ""))
     if verdict != "allow":
         deny(f"daemon returned an unrecognized decision {verdict!r} - failing closed")
     approve(decision.get("reason", "autopilot: allowed"))
+
+
+def wait_for_answer(daemon_url, token, run_id):
+    """Waits for the person to answer for a tool call the daemon is holding.
+
+    The gate above answers in five seconds because that is all the time a tool call
+    can spare. A call somebody has to say yes to cannot be answered in five seconds,
+    so the daemon says `asking` and the waiting happens here instead -- which keeps
+    the ordinary call as fast as it was and confines the long timeout to the one
+    case that earned it. A daemon that is simply down still fails at the first call,
+    in five seconds, exactly as before.
+
+    Fifty seconds against the daemon's own forty-five, so the daemon is what decides
+    a question nobody answered rather than this timing out first and saying something
+    less useful. Every failure here is a refusal: a tool call that cannot be allowed
+    must never be allowed by default.
+    """
+    body = json.dumps({"run_id": run_id}).encode()
+    request = urllib.request.Request(
+        f"{daemon_url}/hooks/ask-wait",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=50) as response:
+            answered = json.loads(response.read())
+    except Exception as exc:
+        deny(f"nobody could be asked about this ({exc}) - failing closed")
+    if not isinstance(answered, dict):
+        deny("daemon returned a non-object answer body - failing closed")
+    return answered
 
 
 if __name__ == "__main__":
