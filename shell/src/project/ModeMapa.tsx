@@ -162,7 +162,13 @@ function Derived({ projectId }: { projectId: string }) {
         declared which document its sections belong to. The picture is where that is visible, so it
         is read first.
       */}
-      <MapaCanvas projectId={projectId} modules={modules} imports={imports} />
+      <MapaCanvas
+        projectId={projectId}
+        modules={modules}
+        imports={imports}
+        junction={junction}
+        standings={standings}
+      />
       <Juncao junction={junction} projectId={projectId} />
       {/*
         Drawn here rather than as a panel of its own for the reason the junction is: the standings,

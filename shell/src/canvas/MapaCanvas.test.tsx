@@ -11,7 +11,15 @@ vi.mock("../data/client", async (original) => ({
 
 import { MapaCanvas } from "./MapaCanvas";
 import { createAppQueryClient } from "../app/queryClient";
-import type { FileItem, FileItems, MapImport, MapModule } from "../data/project-map";
+import type {
+  Anchored,
+  FileItem,
+  FileItems,
+  Junction,
+  MapImport,
+  MapModule,
+  Standing,
+} from "../data/project-map";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -53,10 +61,37 @@ const twoGroups = {
   ],
 };
 
-function draw(modules: MapModule[], imports: MapImport[]) {
+/** A junction with nothing approved: the day-one shape, and the one most tests want. */
+const emptyJunction: Junction = {
+  decisions: [],
+  unclaimed: [],
+  unmatched: [],
+  counts: {
+    decisions: 0,
+    declared: 0,
+    ambiguous: 0,
+    silent: 0,
+    unnumbered: 0,
+    unclaimed: 0,
+    unmatched: 0,
+  },
+};
+
+function draw(
+  modules: MapModule[],
+  imports: MapImport[],
+  junction: Junction = emptyJunction,
+  standings: Record<string, Standing> = {},
+) {
   return render(
     <QueryClientProvider client={createAppQueryClient()}>
-      <MapaCanvas projectId="alpha" modules={modules} imports={imports} />
+      <MapaCanvas
+        projectId="alpha"
+        modules={modules}
+        imports={imports}
+        junction={junction}
+        standings={standings}
+      />
     </QueryClientProvider>,
   );
 }
@@ -210,5 +245,80 @@ describe("MapaCanvas — one file's own declarations", () => {
     const back = await screen.findByText(/^← /);
     fireEvent.click(back);
     expect(screen.getByText("← whole project")).toBeTruthy();
+  });
+});
+
+/* --------------------------------------------- the verdict, over the picture -- */
+
+const claim = (over: Partial<Anchored> = {}): Anchored => ({
+  decision_id: 1,
+  ordinal: 1,
+  spec_slug: "mapa-do-projeto",
+  section: "5.1",
+  text: "The map derives its structure on every read.",
+  kind: "countable",
+  anchor: "declared",
+  modules: [],
+  foreign: [],
+  record: null,
+  ...over,
+});
+
+const withClaims = (decisions: Anchored[]): Junction => ({ ...emptyJunction, decisions });
+
+describe("MapaCanvas — what was asked for", () => {
+  it("marks a file no approved decision names, where the file is listed", () => {
+    // §5.1's pile, in place rather than in a panel somewhere else. Derived, and the title says so:
+    // nothing here is the owner's word.
+    draw(twoGroups.modules, twoGroups.imports);
+    openFirstCommunity();
+    expect(screen.getAllByText(/nothing asked for it/).length).toBeGreaterThan(0);
+  });
+
+  it("does not mark a file a decision does name", () => {
+    const all = twoGroups.modules.map((m) => m.path);
+    draw(twoGroups.modules, twoGroups.imports, withClaims([claim({ modules: all })]));
+    openFirstCommunity();
+    expect(screen.queryByText(/nothing asked for it/)).toBeNull();
+  });
+
+  it("shows the decisions that claim a file, and the owner's word on each", async () => {
+    daemon.apiFetch.mockResolvedValue(answer());
+    draw(
+      twoGroups.modules,
+      twoGroups.imports,
+      withClaims([claim({ decision_id: 7, modules: twoGroups.modules.map((m) => m.path) })]),
+      { "7": { state: "settled", stamped_at: "2026-08-30T00:00:00Z", watch: {} as never } },
+    );
+    await openFirstFile();
+
+    await waitFor(() => expect(screen.getByText(/Decisions that claim this file/)).toBeTruthy());
+    expect(screen.getByText(/The map derives its structure/)).toBeTruthy();
+    expect(screen.getByText("stamped")).toBeTruthy();
+  });
+
+  it("says a decision nobody has looked at is exactly that, and never a green", async () => {
+    // §6.1 is the sharpest edge of §5: a silence is not the owner's verdict, and a screen that
+    // let the two share a face would be the false confidence this map exists to remove.
+    daemon.apiFetch.mockResolvedValue(answer());
+    draw(
+      twoGroups.modules,
+      twoGroups.imports,
+      withClaims([claim({ decision_id: 7, modules: twoGroups.modules.map((m) => m.path) })]),
+      {},
+    );
+    await openFirstFile();
+
+    await waitFor(() => expect(screen.getByText("nobody has looked")).toBeTruthy());
+  });
+
+  it("says so plainly when no decision names the open file", async () => {
+    daemon.apiFetch.mockResolvedValue(answer());
+    draw(twoGroups.modules, twoGroups.imports);
+    await openFirstFile();
+
+    await waitFor(() =>
+      expect(screen.getByText(/No approved decision names this file/)).toBeTruthy(),
+    );
   });
 });

@@ -1,10 +1,18 @@
 // §spec mapa-do-projeto
 import { useMemo, useState } from "react";
-import type { FileItems, MapImport, MapModule } from "../data/project-map";
+import type {
+  Anchored,
+  FileItems,
+  Junction,
+  MapImport,
+  MapModule,
+  Standing,
+} from "../data/project-map";
 import { useFileItems } from "../data/project-map";
 import { NODE_H, type Layout } from "./layered";
 import { buildCommunities, buildCommunity, cellKey, moduleName } from "./map-graphs";
 import { buildFileItems, fileFacts } from "./map-items";
+import { claimedFiles, claimsFor, isSettled, standingLabel } from "./map-claims";
 
 /**
  * How this project is built, as three nested pictures.
@@ -44,9 +52,24 @@ export interface MapaCanvasProps {
   projectId: string;
   modules: MapModule[];
   imports: MapImport[];
+  /**
+   * §16.4's L3, which is a verdict crossing every level rather than a level of its own.
+   *
+   * Read off the same answer the structure is, so the two cannot disagree about a project whose
+   * folder moved between them — the reason the junction is drawn inside this component's parent
+   * and not fetched again.
+   */
+  junction: Junction;
+  standings: Record<string, Standing>;
 }
 
-export function MapaCanvas({ projectId, modules, imports }: MapaCanvasProps) {
+export function MapaCanvas({
+  projectId,
+  modules,
+  imports,
+  junction,
+  standings,
+}: MapaCanvasProps) {
   const [open, setOpen] = useState<string | null>(null);
   const [openFile, setOpenFile] = useState<string | null>(null);
   const matrix = useMemo(() => buildCommunities(modules, imports), [modules, imports]);
@@ -54,6 +77,7 @@ export function MapaCanvas({ projectId, modules, imports }: MapaCanvasProps) {
     () => (open === null ? null : buildCommunity(matrix.members.get(open) ?? [], imports)),
     [open, matrix, imports],
   );
+  const claimed = useMemo(() => claimedFiles(junction), [junction]);
 
   if (matrix.order.length === 0) {
     return <p className="text-sm text-text-faint">Nothing here imports anything else.</p>;
@@ -66,6 +90,8 @@ export function MapaCanvas({ projectId, modules, imports }: MapaCanvasProps) {
         path={openFile}
         back={open ?? "whole project"}
         onBack={() => setOpenFile(null)}
+        claims={claimsFor(junction, openFile)}
+        standings={standings}
       />
     );
   }
@@ -103,6 +129,14 @@ export function MapaCanvas({ projectId, modules, imports }: MapaCanvasProps) {
               >
                 {path}
               </button>
+              {claimed.has(path) ? null : (
+                <span
+                  className="ml-2 text-[10px] text-text-faint"
+                  title="No approved decision names this file. Derived from the junction, and not a verdict about the code."
+                >
+                  nothing asked for it
+                </span>
+              )}
             </li>
           ))}
         </ol>
@@ -141,11 +175,15 @@ function FileLevel({
   path,
   back,
   onBack,
+  claims,
+  standings,
 }: {
   projectId: string;
   path: string;
   back: string;
   onBack: () => void;
+  claims: Anchored[];
+  standings: Record<string, Standing>;
 }) {
   const found = useFileItems(projectId, path);
 
@@ -170,6 +208,62 @@ function FileLevel({
       ) : (
         <FileDrawing found={found.data} />
       )}
+      <Claims claims={claims} standings={standings} />
+    </div>
+  );
+}
+
+/**
+ * Which decisions claim this file, and what the owner has said about each.
+ *
+ * **§16.4's L3, read from the end a reader is standing at.** The spec describes a decision lighting
+ * up the files under it; somebody looking at a file wants the same join backwards — *what was this
+ * supposed to be, and is that still true?* It is the same data, so it needs no second query.
+ *
+ * **Two questions, drawn apart, because §5 forbids collapsing them.** *No decision names this file*
+ * is derived and nobody said it; *this decision is stamped* is the owner's word and nothing else
+ * can make it. One badge blending them would put the map and the owner in one voice.
+ *
+ * A decision is drawn below the picture rather than over it. The drawing answers *what is in here*;
+ * this answers *was it wanted*, and §5 keeps those on separate axes rather than tinting one with
+ * the other.
+ */
+function Claims({
+  claims,
+  standings,
+}: {
+  claims: Anchored[];
+  standings: Record<string, Standing>;
+}) {
+  if (claims.length === 0) {
+    return (
+      <p className="max-w-prose text-xs text-text-faint">
+        No approved decision names this file. That is §5.1&rsquo;s pile &mdash; code nobody asked
+        for &mdash; and it is a fact about what has been declared, not a verdict about the code.
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <h3 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
+        Decisions that claim this file
+      </h3>
+      <ul className="flex flex-col gap-1">
+        {claims.map((claim) => {
+          const standing = standings[String(claim.decision_id)];
+          return (
+            <li key={claim.decision_id} className="max-w-prose text-xs text-text-muted">
+              <span className="font-mono text-[11px] text-text-faint">
+                {claim.spec_slug} §{claim.section}
+              </span>{" "}
+              <span className={isSettled(standing) ? "text-accent" : "text-text-faint"}>
+                {standingLabel(standing)}
+              </span>
+              <span className="ml-1 text-text">{claim.text}</span>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
