@@ -103,7 +103,7 @@ describe("MapaCanvas", () => {
     draw(names.map(mod), dense);
     fireEvent.click(screen.getAllByRole("button")[0]);
     expect(screen.getByText(/does not draw/)).toBeTruthy();
-    expect(screen.getByText(/ligações por caixa/)).toBeTruthy();
+    expect(screen.getByText(/links a box/)).toBeTruthy();
   });
 
   it("keeps two files that share a name as two files", () => {

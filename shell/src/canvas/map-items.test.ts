@@ -104,12 +104,12 @@ describe("buildFileItems", () => {
   });
 
   it("refuses a file with more declarations than a picture holds, and says the number", () => {
-    // 45 boxes is past the measured limit. `http.rs` declares 383, and a drawing of it would look
+    // 45 boxes is past the measured limit. `http.rs` declares 385, and a drawing of it would look
     // like an answer while being unreadable — the one failure this whole map exists to refuse.
     const many = Array.from({ length: 45 }, (_, i) => item(`f${i}`));
     const drawing = buildFileItems(file(many));
     expect(drawing.refused.length).toBeGreaterThan(0);
-    expect(drawing.refused.join(" ")).toMatch(/45 caixas/);
+    expect(drawing.refused.join(" ")).toMatch(/45 boxes/);
   });
 
   it("draws a file whose declarations use nothing of each other", () => {
