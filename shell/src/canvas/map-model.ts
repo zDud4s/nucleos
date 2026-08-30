@@ -59,8 +59,9 @@ export function declaredCoverage(
  * wrong answer, which is the failure this map exists to refuse, reached through a version skew
  * nobody would think to look for.
  *
- * One place, so the two readers above cannot drift apart on it.
+ * One place, so the readers above cannot drift apart on it — `map-sides.ts` asks the same question
+ * a side at a time and must get the same answer, or the top of the screen contradicts its header.
  */
-function declaredIn(file: { spec?: string | null }): string | null {
+export function declaredIn(file: { spec?: string | null }): string | null {
   return file.spec ?? null;
 }

@@ -166,6 +166,8 @@ function Derived({ projectId }: { projectId: string }) {
         projectId={projectId}
         modules={modules}
         imports={imports}
+        unread={unread}
+        foreign={foreign}
         junction={junction}
         standings={standings}
       />

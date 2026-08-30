@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import type {
   Anchored,
   FileItems,
+  ForeignFile,
   Junction,
   MapImport,
   MapModule,
@@ -13,9 +14,15 @@ import { NODE_H, type Layout } from "./layered";
 import { buildCommunities, buildCommunity, cellKey, moduleName } from "./map-graphs";
 import { buildFileItems, fileFacts } from "./map-items";
 import { claimedFiles, claimsFor, isSettled, standingLabel } from "./map-claims";
+import { buildSeam, isBlindSpot, type Seam } from "./map-sides";
 
 /**
- * How this project is built, as three nested pictures.
+ * How this project is built, as three nested pictures under one header.
+ *
+ * **The header is §16.4's L0 and it does not nest**, because the fact it carries is one no box
+ * inside it can hold: this product has three sides that share no source, and a fourth piece —
+ * `sidecars/`, 168 files — that nothing here can read at all. §16.5 forbids a descent that hides
+ * a seam, so the seam stays on screen rather than behind a click somebody may never make.
  *
  * **The instrument changes with the density, and that is the whole design.** This repository is 253
  * files joined by 1033 dependencies — four a file, and node-link drawings stop being readable
@@ -53,6 +60,16 @@ export interface MapaCanvasProps {
   modules: MapModule[];
   imports: MapImport[];
   /**
+   * What the walk found and no reader here understood, and the part of it that names a `§`.
+   *
+   * Needed by the top level and by nothing below it. §16.5 asks the top to carry the facts no
+   * single box can hold, and *there is a side of this product nothing here can read* is the
+   * largest of them: 168 files under `sidecars/`, which a picture drawn only from modules would
+   * report as a project that does not have them.
+   */
+  unread: string[];
+  foreign: ForeignFile[];
+  /**
    * §16.4's L3, which is a verdict crossing every level rather than a level of its own.
    *
    * Read off the same answer the structure is, so the two cannot disagree about a project whose
@@ -67,6 +84,8 @@ export function MapaCanvas({
   projectId,
   modules,
   imports,
+  unread,
+  foreign,
   junction,
   standings,
 }: MapaCanvasProps) {
@@ -78,9 +97,18 @@ export function MapaCanvas({
     [open, matrix, imports],
   );
   const claimed = useMemo(() => claimedFiles(junction), [junction]);
+  const seam = useMemo(
+    () => buildSeam(modules, imports, unread, foreign),
+    [modules, imports, unread, foreign],
+  );
 
   if (matrix.order.length === 0) {
-    return <p className="text-sm text-text-faint">Nothing here imports anything else.</p>;
+    return (
+      <div className="flex flex-col gap-4">
+        <Sides seam={seam} />
+        <p className="text-sm text-text-faint">Nothing here imports anything else.</p>
+      </div>
+    );
   }
 
   if (openFile !== null) {
@@ -144,7 +172,12 @@ export function MapaCanvas({
     );
   }
 
-  return <Matrix matrix={matrix} onOpen={setOpen} />;
+  return (
+    <div className="flex flex-col gap-4">
+      <Sides seam={seam} />
+      <Matrix matrix={matrix} onOpen={setOpen} />
+    </div>
+  );
 }
 
 /** The honest half: why a picture is not being drawn, in the numbers that decided it. */
@@ -354,6 +387,108 @@ function FileDrawing({ found }: { found: FileItems }) {
           </li>
         ))}
       </ol>
+    </div>
+  );
+}
+
+/**
+ * §16.4's L0 — the sides of the product, and what runs between them.
+ *
+ * **A header rather than a step you click into**, and that is §16.5's rule applied to the
+ * navigation itself. *Descending may hide detail; it may never hide a seam* — so the seam is on
+ * screen while the matrix is, instead of behind a click somebody may never make.
+ *
+ * **The zero is the hardest thing on this panel to draw honestly.** Three boxes with no line
+ * between them is the truth and reads as independence, which is not. A Rust file cannot import a
+ * TypeScript module in either direction, and the núcleo resolves `crate::` only inside a file's own
+ * folder — so nothing crosses and nothing could. What the three islands say is that these sides
+ * share no source. What passes between them is HTTP, and this map does not read it. That sentence
+ * is printed rather than implied, because a number whose only possible value is zero looks like a
+ * clean bill of health and is not one.
+ */
+function Sides({ seam }: { seam: Seam }) {
+  // Two reasons a folder earns a line, and they are different facts. A folder with no box is a
+  // piece of the product this map is blind to. A folder that has a box and still holds files
+  // nothing reads is a side with something behind it — `core/`'s 131 are its SQL migrations, and 15
+  // of them name a section. Only the repository root is left out when it cites nothing: five config
+  // files are not a side of anything, and calling them one next to `sidecars/` flattens the
+  // difference this level exists to draw.
+  const quiet = seam.unread.filter(
+    (folder) =>
+      folder.citing > 0 || (isBlindSpot(seam, folder.folder) && folder.folder !== "(root)"),
+  );
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap gap-2">
+        {seam.sides.map((side) => (
+          <div
+            key={side.key}
+            className="flex min-w-[150px] flex-col gap-0.5 rounded-lg border border-border bg-surface px-3 py-2"
+          >
+            <span className="font-display text-sm text-text">{side.folder}</span>
+            <span className="text-[10px] uppercase tracking-wide text-text-faint">{side.reader}</span>
+            <span className="mt-1 text-xs text-text-muted">
+              <span className="font-display text-sm text-text">{side.files}</span> file
+              {side.files === 1 ? "" : "s"} · {side.imports} import{side.imports === 1 ? "" : "s"}{" "}
+              inside
+            </span>
+            <span
+              className="text-xs text-text-muted"
+              title="Of the files naming a section, the ones whose header says which document it belongs to. Counted over citing files, as the header above is, so the two agree."
+            >
+              {side.citing === 0
+                ? "nothing here cites a section"
+                : `${side.declared} of ${side.citing} say which document`}
+            </span>
+            <span className="text-xs text-text-muted" title="Files with a test beside them.">
+              {side.tested} have a test
+            </span>
+          </div>
+        ))}
+      </div>
+      <p className="max-w-prose text-sm text-text-muted">
+        {seam.crossing === 0 ? (
+          <>
+            <span className="text-text">No import crosses between them, and none could</span> — a
+            Rust file cannot import a TypeScript module, and the núcleo resolves an import only
+            inside the file&apos;s own folder. So this says these sides share no source; it does not
+            say they are independent. What passes between them is HTTP, which this map does not
+            read.
+          </>
+        ) : (
+          <>
+            <span className="text-danger">{seam.crossing}</span> import
+            {seam.crossing === 1 ? "" : "s"} cross between sides. Nothing here should be able to do
+            that, so the walk and this drawing disagree about what a side is.
+          </>
+        )}
+        {seam.loose > 0 ? (
+          <>
+            {" "}
+            <span className="text-danger">{seam.loose}</span> import
+            {seam.loose === 1 ? " ends" : "s end"} on no file this map lists.
+          </>
+        ) : null}
+      </p>
+      {quiet.map((folder) => (
+        <p key={folder.folder} className="max-w-prose text-sm text-text-muted">
+          <span className="font-mono text-text">{folder.folder}/</span>{" "}
+          {isBlindSpot(seam, folder.folder) ? (
+            <>
+              is <span className="text-text">{folder.files} files nothing here can read</span> — no
+              box above is about it.
+            </>
+          ) : (
+            <>
+              also holds <span className="text-text">{folder.files} files nothing here can read</span>
+              , behind the box that is about it.
+            </>
+          )}{" "}
+          {folder.citing === 0
+            ? "None of them names a section, so nothing can be said about what they were asked to do."
+            : `${folder.citing} of them name a section, and ${folder.declared} say which document.`}
+        </p>
+      ))}
     </div>
   );
 }

@@ -15,6 +15,7 @@ import type {
   Anchored,
   FileItem,
   FileItems,
+  ForeignFile,
   Junction,
   MapImport,
   MapModule,
@@ -82,6 +83,7 @@ function draw(
   imports: MapImport[],
   junction: Junction = emptyJunction,
   standings: Record<string, Standing> = {},
+  outside: { unread?: string[]; foreign?: ForeignFile[] } = {},
 ) {
   return render(
     <QueryClientProvider client={createAppQueryClient()}>
@@ -89,6 +91,8 @@ function draw(
         projectId="alpha"
         modules={modules}
         imports={imports}
+        unread={outside.unread ?? []}
+        foreign={outside.foreign ?? []}
         junction={junction}
         standings={standings}
       />
@@ -320,5 +324,57 @@ describe("MapaCanvas — what was asked for", () => {
     await waitFor(() =>
       expect(screen.getByText(/No approved decision names this file/)).toBeTruthy(),
     );
+  });
+});
+
+describe("the sides of the product", () => {
+  it("draws one box a side, and a folder holding two of them is two boxes", () => {
+    // `shell/` is the web app and the Tauri host. They share no source, and a box named after the
+    // folder alone would merge them and hide exactly the seam this level exists to show.
+    draw(
+      [mod("core/src/a.rs"), mod("shell/src/x.ts"), mod("shell/src-tauri/src/main.rs")],
+      [link("core/src/a.rs", "core/src/a.rs")],
+    );
+    expect(screen.getAllByText("shell")).toHaveLength(2);
+    expect(screen.getByText("core")).toBeTruthy();
+    // Two rust boxes and one typescript: the daemon and the Tauri host are both Rust and are not
+    // one side, which is the whole reason a side is a pair and not a folder.
+    expect(screen.getAllByText("rust")).toHaveLength(2);
+    expect(screen.getAllByText("typescript")).toHaveLength(1);
+  });
+
+  it("says what nothing crossing means, rather than leaving three islands to imply it", () => {
+    // The number can only be zero: no Rust file imports a TypeScript module and the núcleo resolves
+    // imports inside one folder. Drawn without the sentence it reads as a clean bill of health.
+    draw([mod("core/src/a.rs"), mod("shell/src/x.ts")], []);
+    expect(screen.getByText(/No import crosses between them, and none could/)).toBeTruthy();
+    expect(screen.getByText(/HTTP, which this map does not read/)).toBeTruthy();
+  });
+
+  it("names a side of the product it cannot read at all, and how much of it declared", () => {
+    draw([mod("core/src/a.rs")], [], emptyJunction, {}, {
+      unread: ["sidecars/echo/main.go", "sidecars/echo/quiet.go", "core/db/0001.sql"],
+      foreign: [
+        { path: "sidecars/echo/main.go", cites: [{ section: "3", named: null }], spec: "echo" },
+      ],
+    });
+    expect(screen.getByText("sidecars/")).toBeTruthy();
+    expect(screen.getByText(/2 files nothing here can read/)).toBeTruthy();
+    expect(screen.getByText(/1 of them name a section, and 1 say which document/)).toBeTruthy();
+    // `core/` has unread files too and a box above; reporting it the same way would say the núcleo
+    // is as invisible as the Go services.
+    expect(screen.queryByText("core/")).toBeNull();
+  });
+
+  it("says when a side that does have a box is still hiding files that name a section", () => {
+    // `core/`'s 131 unread files are its SQL migrations, and 15 of them name a `§`. That is §8 debt
+    // sitting behind a box, which is the one place a reader would never think to look for it.
+    draw([mod("core/src/a.rs")], [], emptyJunction, {}, {
+      unread: ["core/db/0001.sql", "core/db/0002.sql"],
+      foreign: [{ path: "core/db/0001.sql", cites: [{ section: "3", named: null }], spec: null }],
+    });
+    expect(screen.getByText("core/")).toBeTruthy();
+    expect(screen.getByText(/also holds/)).toBeTruthy();
+    expect(screen.getByText(/1 of them name a section, and 0 say which document/)).toBeTruthy();
   });
 });
