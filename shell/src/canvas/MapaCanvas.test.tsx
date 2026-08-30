@@ -1,9 +1,21 @@
 // §spec mapa-do-projeto
-import { describe, expect, it } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
+
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
+vi.mock("../data/client", async (original) => ({
+  ...(await original<typeof import("../data/client")>()),
+  ...daemon,
+}));
 
 import { MapaCanvas } from "./MapaCanvas";
-import type { MapImport, MapModule } from "../data/project-map";
+import { createAppQueryClient } from "../app/queryClient";
+import type { FileItem, FileItems, MapImport, MapModule } from "../data/project-map";
+
+beforeEach(() => {
+  daemon.apiFetch.mockReset();
+});
 
 const mod = (path: string): MapModule => ({
   path,
@@ -15,6 +27,17 @@ const mod = (path: string): MapModule => ({
 });
 
 const link = (from: string, to: string): MapImport => ({ from, to });
+
+const item = (id: string, over: Partial<FileItem> = {}): FileItem => ({
+  id,
+  name: id,
+  container: null,
+  kind: "function",
+  exported: false,
+  documented: false,
+  line: 1,
+  ...over,
+});
 
 /** Two clumps wired inside themselves and joined by a single thread — the shape a codebase has. */
 const twoGroups = {
@@ -30,17 +53,33 @@ const twoGroups = {
   ],
 };
 
+function draw(modules: MapModule[], imports: MapImport[]) {
+  return render(
+    <QueryClientProvider client={createAppQueryClient()}>
+      <MapaCanvas projectId="alpha" modules={modules} imports={imports} />
+    </QueryClientProvider>,
+  );
+}
+
+/** Open the first community, which is where the files become reachable. */
+function openFirstCommunity() {
+  const rows = screen.getAllByRole("button");
+  const first = rows.find((button) => /^a[123]|^b[123]/.test(button.textContent ?? ""));
+  expect(first).toBeTruthy();
+  fireEvent.click(first!);
+}
+
 describe("MapaCanvas", () => {
   it("draws the whole project as a matrix rather than as boxes and arrows", () => {
     // Four dependencies a file is past where any layered drawing reads, and the first version of
     // this screen drew one anyway: 73% of its edges crossed a box they had nothing to do with.
-    render(<MapaCanvas modules={twoGroups.modules} imports={twoGroups.imports} />);
+    draw(twoGroups.modules, twoGroups.imports);
     expect(screen.getByRole("table")).toBeTruthy();
     expect(screen.getByText(/dependencies/)).toBeTruthy();
   });
 
   it("counts what points backwards, because that is the number somebody might act on", () => {
-    render(<MapaCanvas modules={twoGroups.modules} imports={twoGroups.imports} />);
+    draw(twoGroups.modules, twoGroups.imports);
     // The word appears twice — once explaining the diagonal, once as the count. That is the point:
     // the reader is told what the mark means and then how many of them there are.
     expect(screen.getAllByText(/backwards/).length).toBeGreaterThan(1);
@@ -48,11 +87,8 @@ describe("MapaCanvas", () => {
   });
 
   it("opens a community when its name is clicked, and comes back", () => {
-    render(<MapaCanvas modules={twoGroups.modules} imports={twoGroups.imports} />);
-    const rows = screen.getAllByRole("button");
-    const first = rows.find((button) => /^a[123]|^b[123]/.test(button.textContent ?? ""));
-    expect(first).toBeTruthy();
-    fireEvent.click(first!);
+    draw(twoGroups.modules, twoGroups.imports);
+    openFirstCommunity();
     expect(screen.getByText("← whole project")).toBeTruthy();
     fireEvent.click(screen.getByText("← whole project"));
     expect(screen.getByRole("table")).toBeTruthy();
@@ -64,7 +100,7 @@ describe("MapaCanvas", () => {
     const names = ["c1", "c2", "c3", "c4", "c5", "c6"].map((n) => `core/src/${n}.rs`);
     const dense: MapImport[] = [];
     for (const from of names) for (const to of names) if (from !== to) dense.push(link(from, to));
-    render(<MapaCanvas modules={names.map(mod)} imports={dense} />);
+    draw(names.map(mod), dense);
     fireEvent.click(screen.getAllByRole("button")[0]);
     expect(screen.getByText(/does not draw/)).toBeTruthy();
     expect(screen.getByText(/ligações por caixa/)).toBeTruthy();
@@ -75,13 +111,104 @@ describe("MapaCanvas", () => {
     // reading of the real answer merged them into one box because it keyed on the name.
     const modules = [mod("core/src/presets.rs"), mod("shell/src/data/presets.ts"), mod("core/src/a.rs")];
     const imports = [link("core/src/a.rs", "core/src/presets.rs")];
-    render(<MapaCanvas modules={modules} imports={imports} />);
+    draw(modules, imports);
     // Only the two that are joined are boxes; the third has no dependency either way and is listed.
     expect(screen.getByText(/with no/)).toBeTruthy();
   });
 
   it("says so plainly when nothing imports anything", () => {
-    render(<MapaCanvas modules={[mod("core/src/lonely.rs")]} imports={[]} />);
+    draw([mod("core/src/lonely.rs")], []);
     expect(screen.getByText(/Nothing here imports anything else/)).toBeTruthy();
+  });
+});
+
+/* ------------------------------------------------ the step below the file -- */
+
+const answer = (over: Partial<FileItems> = {}): FileItems => ({
+  path: "core/src/a1.rs",
+  reader: "rust",
+  items: [
+    item("open", { exported: true, documented: true, line: 12 }),
+    item("shut", { line: 30 }),
+  ],
+  references: [{ from: "open", to: "shut" }],
+  missed: [],
+  ...over,
+});
+
+/** Open the first community, then the first file listed inside it. */
+async function openFirstFile() {
+  openFirstCommunity();
+  const file = screen.getAllByRole("button").find((b) => /^core\/src\//.test(b.textContent ?? ""));
+  expect(file).toBeTruthy();
+  fireEvent.click(file!);
+  await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalled());
+}
+
+describe("MapaCanvas — one file's own declarations", () => {
+  it("asks the route that answers about a single file, and only once one is opened", async () => {
+    // The whole-project answer already walks the tree and reads three tables. Carrying every
+    // file's items on it would multiply the largest answer the daemon sends by the size of the
+    // project, for a level nobody looks at until they click into it.
+    daemon.apiFetch.mockResolvedValue(answer());
+    draw(twoGroups.modules, twoGroups.imports);
+    expect(daemon.apiFetch).not.toHaveBeenCalled();
+
+    await openFirstFile();
+
+    expect(daemon.apiFetch).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/projects\/alpha\/map\/items\?path=core%2Fsrc%2F/),
+    );
+  });
+
+  it("counts what the file offers, explains, and leaves unreached", async () => {
+    daemon.apiFetch.mockResolvedValue(answer());
+    draw(twoGroups.modules, twoGroups.imports);
+    await openFirstFile();
+
+    await waitFor(() => expect(screen.getByText(/reachable from outside/)).toBeTruthy());
+    expect(screen.getByText(/with a doc comment/)).toBeTruthy();
+    // `open` is exported and `shut` is reached by it, so nothing is stranded.
+    expect(screen.queryByText(/nothing here/)).toBeNull();
+  });
+
+  it("names a declaration nothing reaches, which is the closest this level gets to a verdict", async () => {
+    daemon.apiFetch.mockResolvedValue(
+      answer({ items: [item("used", { exported: true }), item("stranded")], references: [] }),
+    );
+    draw(twoGroups.modules, twoGroups.imports);
+    await openFirstFile();
+
+    await waitFor(() => expect(screen.getByText(/nothing here/)).toBeTruthy());
+  });
+
+  it("prints what the reader could not see, because descending may hide detail and never a seam", async () => {
+    // §16.5, one floor down. A file drawn as two boxes when it declares forty things has told its
+    // owner something false, and this sentence is the only thing standing between the two.
+    daemon.apiFetch.mockResolvedValue(answer({ missed: ["7 nested functions not drawn"] }));
+    draw(twoGroups.modules, twoGroups.imports);
+    await openFirstFile();
+
+    await waitFor(() => expect(screen.getByText(/7 nested functions not drawn/)).toBeTruthy());
+  });
+
+  it("says a language it cannot read is unread rather than empty", async () => {
+    // *I cannot read Go* and *this file declares nothing* are opposite answers, and the structure
+    // layer already spent a paragraph refusing to collapse them.
+    daemon.apiFetch.mockResolvedValue(answer({ reader: null, items: [], references: [] }));
+    draw(twoGroups.modules, twoGroups.imports);
+    await openFirstFile();
+
+    await waitFor(() => expect(screen.getByText(/Nothing here reads this language yet/)).toBeTruthy());
+  });
+
+  it("comes back up to the community it was opened from", async () => {
+    daemon.apiFetch.mockResolvedValue(answer());
+    draw(twoGroups.modules, twoGroups.imports);
+    await openFirstFile();
+
+    const back = await screen.findByText(/^← /);
+    fireEvent.click(back);
+    expect(screen.getByText("← whole project")).toBeTruthy();
   });
 });

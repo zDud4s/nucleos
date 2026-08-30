@@ -148,16 +148,21 @@ function Derived({ projectId }: { projectId: string }) {
         </p>
       </div>
       {/*
-        The structure layer as a picture, one level above the file. Drawn here and not as a panel
-        of its own for the reason the junction is: it reads the same answer, and a query of its own
-        would walk the tree twice per open.
+        The structure layer as a picture: the whole project, one community, and one file's own
+        declarations. Drawn here and not as a panel of its own for the reason the junction is —
+        the two upper levels read THIS answer, and a query of their own would walk the tree twice
+        per open.
+
+        The file level is the exception and does not contradict the rule: it reads one file, which
+        this answer does not carry and could not carry cheaply. Its route is asked only once a
+        reader opens something, so the cost lands on the click rather than on every open.
 
         **Above the junction, and the order is an argument.** The junction says how firmly each
         decision is tied to code; whether that means anything depends on how much of the project
         declared which document its sections belong to. The picture is where that is visible, so it
         is read first.
       */}
-      <MapaCanvas modules={modules} imports={imports} />
+      <MapaCanvas projectId={projectId} modules={modules} imports={imports} />
       <Juncao junction={junction} projectId={projectId} />
       {/*
         Drawn here rather than as a panel of its own for the reason the junction is: the standings,

@@ -95,6 +95,11 @@ pub fn build_router(state: AppState) -> Router {
         // Which specs a project has, so the extraction button offers a list and not a text box.
         // Beside `map` because it answers about the same tree, read the same way.
         .route("/projects/{id}/map/specs", get(get_project_map_specs))
+        // One file's own declarations — the step below the file, fetched only when somebody opens
+        // one. Beside `map` because it answers about the same tree; separate from it because
+        // folding it in would multiply the largest answer this daemon sends by the size of the
+        // project, to carry a level nobody has asked for yet.
+        .route("/projects/{id}/map/items", get(get_project_map_items))
         // The intention layer, beside the structure layer it will one day be joined to. A POST and
         // deliberately in no table in `auth.rs`: reading a map costs nothing and a read-only key
         // buys it, while extracting spends a model — which is not something that key ever bought.
@@ -4017,6 +4022,60 @@ async fn get_project_map_specs(
     .await
     .map(Json)
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// What `GET …/map/items` is asked about: one file of the project.
+#[derive(Deserialize)]
+struct MapItemsQuery {
+    /// Relative to the project root, with forward slashes — exactly as `GET /map` spells a module.
+    ///
+    /// The client sends back a path this map already gave it, which is what makes the guard below
+    /// a guard against a *forged* request rather than against its own shell.
+    path: String,
+}
+
+/// What one file declares, and which of those things use each other.
+///
+/// **A route of its own, and never a field on `GET /map`.** The whole-project answer already walks
+/// the tree, asks git for every anchor's digest and reads three tables; folding every file's items
+/// into it would multiply the largest response this daemon sends by the size of the project, to
+/// carry a level nobody is looking at until they click into it. This is the one place in the map
+/// where laziness is not a premature optimisation but the shape of the question: a reader opens one
+/// file at a time.
+///
+/// **The path is checked and never trusted, even though the shell only ever sends one back.** A
+/// route that reads a caller-supplied path is a file-disclosure hole the moment anything but that
+/// shell speaks to it, and [`crate::inspect::resolved_within`] is already the answer to exactly this
+/// — including the case a lexical check cannot see, where a junction inside the project resolves
+/// outside it. Reusing it rather than writing a second guard is the same rule the rest of this file
+/// keeps: a check that lives in a handler is a check the second caller forgets.
+///
+/// **A file this reader does not understand is a `200` and not a `404`**, carrying `reader: null`
+/// and no items. *I cannot read Go* and *there is no such file* are opposite answers, and the
+/// structure layer already spent a paragraph refusing to collapse them — [`crate::project_map`]'s
+/// `unread` exists for that reason. A `404` here would reopen it one level down.
+async fn get_project_map_items(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<MapItemsQuery>,
+) -> Result<Json<crate::map_items::Items>, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    // On `spawn_blocking` for the reason `get_project_map` gives: this canonicalizes and reads a
+    // file, and the daemon is also answering a three-second poll.
+    let asked = query.path.clone();
+    tokio::task::spawn_blocking(move || {
+        let full =
+            crate::inspect::resolved_within(&root, &query.path).map_err(|error| match error {
+                crate::inspect::InspectError::UnsafePath => StatusCode::BAD_REQUEST,
+                _ => StatusCode::NOT_FOUND,
+            })?;
+        let source = std::fs::read_to_string(&full).map_err(|_| StatusCode::NOT_FOUND)?;
+        Ok(crate::map_items::items(&asked, &source))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -17100,6 +17159,99 @@ mod tests {
         assert_eq!(
             get_json(&state, "/projects/alpha/map/specs").await,
             serde_json::json!([])
+        );
+    }
+
+    /// A GET that is allowed to fail, for the refusals `get_json` would assert away.
+    async fn get_status(state: &AppState, uri: &str) -> StatusCode {
+        build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn one_files_declarations_come_back_with_what_uses_what() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(
+            dir.path().join("core/src/gate.rs"),
+            "/// Opens it.\npub fn open() {\n    shut();\n}\n\nfn shut() {}\n",
+        )
+        .unwrap();
+
+        let answer = get_json(&state, "/projects/alpha/map/items?path=core/src/gate.rs").await;
+
+        assert_eq!(answer["reader"], "rust");
+        let items = answer["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "open");
+        assert_eq!(items[0]["exported"], true);
+        assert_eq!(items[0]["documented"], true);
+        assert_eq!(items[1]["id"], "shut");
+        assert_eq!(items[1]["exported"], false);
+        // The edge is the point of the level: `open` is drawn above `shut` because it calls it.
+        assert_eq!(
+            answer["references"],
+            serde_json::json!([{ "from": "open", "to": "shut" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_climbing_out_of_the_project_is_refused_before_anything_is_read() {
+        // The shell only ever sends back a path this map gave it. This is about everything else
+        // that can reach the port: without the guard the route reads any file the daemon can.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let outside = dir.path().parent().unwrap().join("secrets.rs");
+        std::fs::write(&outside, "pub fn token() {}\n").unwrap();
+
+        assert_eq!(
+            get_status(&state, "/projects/alpha/map/items?path=../secrets.rs").await,
+            StatusCode::BAD_REQUEST
+        );
+        std::fs::remove_file(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn a_language_nobody_here_reads_is_an_answer_and_never_a_refusal() {
+        // *I cannot read Go* and *there is no such file* are opposite answers, and the structure
+        // layer already refuses to collapse them. A 404 here would reopen that one level down.
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("sidecars/echo")).unwrap();
+        std::fs::write(
+            dir.path().join("sidecars/echo/main.go"),
+            "package main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+
+        let answer = get_json(
+            &state,
+            "/projects/alpha/map/items?path=sidecars/echo/main.go",
+        )
+        .await;
+
+        assert_eq!(answer["reader"], serde_json::Value::Null);
+        assert_eq!(answer["items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_there_is_a_404_and_not_an_empty_drawing() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        assert_eq!(
+            get_status(&state, "/projects/alpha/map/items?path=core/src/absent.rs").await,
+            StatusCode::NOT_FOUND
         );
     }
 

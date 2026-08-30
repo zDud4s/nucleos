@@ -688,6 +688,75 @@ export function useProjectMap(projectId: string | null) {
 }
 
 /**
+ * What kind of thing one declaration is, at the resolution a drawing cares about.
+ *
+ * Coarser than either language's grammar on purpose, and the núcleo's `map_items::ItemKind` argues
+ * why: `struct`, `enum`, `type` and `interface` are one shape on a screen, and four legends nobody
+ * reads is worse than one word that is true.
+ */
+export type ItemKind = "function" | "method" | "shape" | "constant" | "module" | "contract";
+
+/** One thing a file declares. */
+export interface FileItem {
+  /** Unique within the file: the bare name, or `Type::method` where it has a container. */
+  id: string;
+  /** What a box is labelled with. */
+  name: string;
+  container: string | null;
+  kind: ItemKind;
+  /** Anything outside this file can reach it — `pub` in any form, or `export`. */
+  exported: boolean;
+  documented: boolean;
+  /** 1-based, and the declaration's own line rather than its doc comment's. */
+  line: number;
+}
+
+/** One declaration names another, inside the file that declares both. */
+export interface ItemReference {
+  from: string;
+  to: string;
+}
+
+/**
+ * Everything one file says about itself.
+ *
+ * **`missed` is on the wire because §16.5 puts it there.** *Descer um nível pode esconder detalhe;
+ * nunca pode esconder uma costura.* A file drawn as four boxes when it declares forty things has
+ * told its owner something false, and the only thing between this drawing and that is a sentence
+ * saying what the reader could not see. It is rendered, not logged.
+ */
+export interface FileItems {
+  path: string;
+  /** `null` when nobody here reads this language — and then `items` is empty, not absent. */
+  reader: "rust" | "typescript" | null;
+  items: FileItem[];
+  references: ItemReference[];
+  missed: string[];
+}
+
+/**
+ * What one file declares, read only once somebody opens it.
+ *
+ * **Its own route and its own query, unlike the junction and the stamps**, which ride on `GET /map`
+ * precisely because they answer about the same walk. This does not: it reads a single file, and
+ * folding it into the map would multiply the largest answer the daemon sends by the size of the
+ * project to carry a level nobody has asked for yet. The map is read when the mode opens; this is
+ * read when a reader points at something.
+ */
+export function useFileItems(projectId: string | null, path: string | null) {
+  return useQuery({
+    queryKey: keys.projects.mapItems(projectId ?? "", path ?? ""),
+    queryFn: () =>
+      apiFetch<FileItems>(
+        `/projects/${encodeURIComponent(projectId ?? "")}/map/items?path=${encodeURIComponent(
+          path ?? "",
+        )}`,
+      ),
+    enabled: projectId !== null && projectId !== "" && path !== null && path !== "",
+  });
+}
+
+/**
  * The intention layer: what a model read out of a spec, waiting for its owner to say yes or no.
  *
  * `kind` really is spelled `countable`/`character` on the wire. The núcleo's own column holds

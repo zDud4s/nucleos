@@ -129,6 +129,15 @@ export const keys = {
     map: (projectId: string) => ["projects", projectId, "map"] as const,
     /** The documents this project keeps, by the name the owner reads. */
     mapSpecs: (projectId: string) => ["projects", projectId, "map", "specs"] as const,
+    /**
+     * What ONE file declares — the step below the file, fetched only when somebody opens one.
+     *
+     * Keyed by the path, so opening a second file does not evict the first: a reader climbing back
+     * up the ladder and down another branch gets the drawing they already had rather than a
+     * spinner over a file whose contents cannot have changed in between.
+     */
+    mapItems: (projectId: string, path: string) =>
+      ["projects", projectId, "map", "items", path] as const,
     /** The decisions waiting to be read. A table, unlike `map`, which is derived. */
     mapDecisions: (projectId: string) => ["projects", projectId, "map", "decisions"] as const,
     /**
