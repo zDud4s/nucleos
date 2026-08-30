@@ -1,3 +1,5 @@
+// §spec workspace-de-projeto
+
 import { useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";

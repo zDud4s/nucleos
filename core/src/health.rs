@@ -1,3 +1,5 @@
+//! §spec pilar-de-browser
+//!
 //! Bounded, credential-safe readiness readout for the protected HTTP API.
 //!
 //! Sidecar entries report liveness: the supervisor publishes whether it started each child and

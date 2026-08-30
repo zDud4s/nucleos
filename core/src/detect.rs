@@ -1,3 +1,5 @@
+//! §spec workspace-de-projeto
+//!
 //! What is already in a folder somebody is about to hand this app.
 //!
 //! §9's second step, and the one that decides whether the app is hostile to what exists. A project

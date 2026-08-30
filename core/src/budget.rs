@@ -1,3 +1,5 @@
+//! §spec agenticos-foundation-and-autopilot
+
 use chrono::{DateTime, Datelike, Utc};
 use sqlx::SqlitePool;
 

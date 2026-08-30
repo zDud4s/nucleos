@@ -1,3 +1,5 @@
+//! §spec agenticos-foundation-and-autopilot
+//!
 //! The work-in-progress brake (spec §8.4/§8.7).
 //!
 //! The budget bounds what autonomy costs; this bounds what it costs *you*. An unbounded approval

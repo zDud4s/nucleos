@@ -1,3 +1,5 @@
+//! §spec workspace-de-projeto
+//!
 //! The commands a project declares about itself, and what each of them last said.
 //!
 //! **Not `commands.rs`.** That module reads the slash commands a *conversation* can offer off disk

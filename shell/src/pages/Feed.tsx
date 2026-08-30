@@ -1,3 +1,5 @@
+// §spec novo-frontend
+
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
