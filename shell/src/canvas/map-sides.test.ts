@@ -1,7 +1,7 @@
 // §spec mapa-do-projeto
 import { describe, expect, it } from "vitest";
 
-import { buildSeam, isBlindSpot, sideOf, topFolder } from "./map-sides";
+import { buildSides, isBlindSpot, sideOf, topFolder } from "./map-sides";
 import { declaredCoverage } from "./map-model";
 import type { ForeignFile, MapModule } from "../data/project-map";
 
@@ -40,9 +40,9 @@ describe("sideOf", () => {
   });
 });
 
-describe("buildSeam", () => {
+describe("buildSides", () => {
   it("counts each side's files, its own imports, its headers and its tests", () => {
-    const seam = buildSeam(
+    const sides = buildSides(
       [
         module("core/src/a.rs", { cites: cite, spec: "map", tested: true }),
         module("core/src/b.rs"),
@@ -55,7 +55,7 @@ describe("buildSeam", () => {
       [],
       [],
     );
-    expect(seam.sides).toEqual([
+    expect(sides.sides).toEqual([
       {
         key: "core · rust",
         folder: "core",
@@ -82,7 +82,7 @@ describe("buildSeam", () => {
   it("counts headers over the files that cite, which is the denominator the screen's own header uses", () => {
     // A module with no `§` has nothing to disambiguate. Counting it as undeclared would report a
     // debt that does not exist and make the number fall whenever somebody adds an unrelated file.
-    const seam = buildSeam(
+    const sides = buildSides(
       [
         module("core/src/a.rs", { cites: cite, spec: "map" }),
         module("core/src/b.rs", { cites: cite }),
@@ -92,9 +92,9 @@ describe("buildSeam", () => {
       [],
       [],
     );
-    expect(seam.sides[0].citing).toBe(2);
-    expect(seam.sides[0].declared).toBe(1);
-    expect(seam.sides[0].files).toBe(3);
+    expect(sides.sides[0].citing).toBe(2);
+    expect(sides.sides[0].declared).toBe(1);
+    expect(sides.sides[0].files).toBe(3);
   });
 
   it("reads a núcleo that sends no spec field at all as having declared nothing", () => {
@@ -103,43 +103,43 @@ describe("buildSeam", () => {
     // exists to refuse, reached through a version skew nobody would think to look for.
     const older = { ...module("core/src/a.rs", { cites: cite }) } as MapModule;
     delete (older as { spec?: string | null }).spec;
-    expect(buildSeam([older], [], [], []).sides[0].declared).toBe(0);
+    expect(buildSides([older], [], [], []).sides[0].declared).toBe(0);
   });
 
   it("orders the boxes by size, so the order is a fact and not the alphabet", () => {
-    const seam = buildSeam(
+    const sides = buildSides(
       [module("aaa/src/x.ts"), module("zzz/src/a.rs"), module("zzz/src/b.rs")],
       [],
       [],
       [],
     );
-    expect(seam.sides.map((side) => side.key)).toEqual(["zzz · rust", "aaa · typescript"]);
+    expect(sides.sides.map((side) => side.key)).toEqual(["zzz · rust", "aaa · typescript"]);
   });
 
   it("counts an import that leaves its side rather than folding it into the side's own", () => {
     // Nothing crosses today and nothing can. The number exists so the day it stops being zero the
     // picture says so, instead of a new line appearing inside a box as if it had always been there.
-    const seam = buildSeam(
+    const sides = buildSides(
       [module("core/src/a.rs"), module("shell/src/x.ts")],
       [{ from: "core/src/a.rs", to: "shell/src/x.ts" }],
       [],
       [],
     );
-    expect(seam.crossing).toBe(1);
-    expect(seam.sides.every((side) => side.imports === 0)).toBe(true);
+    expect(sides.crossing).toBe(1);
+    expect(sides.sides.every((side) => side.imports === 0)).toBe(true);
   });
 
   it("counts an edge whose end is no module at all, instead of dropping it", () => {
     // The núcleo only emits edges between modules it listed, so this must stay zero. A silent drop
     // would let the two halves drift apart with the drawing still looking complete.
-    const seam = buildSeam(
+    const sides = buildSides(
       [module("core/src/a.rs")],
       [{ from: "core/src/a.rs", to: "gone.rs" }],
       [],
       [],
     );
-    expect(seam.loose).toBe(1);
-    expect(seam.crossing).toBe(0);
+    expect(sides.loose).toBe(1);
+    expect(sides.crossing).toBe(0);
   });
 
   it("reports what each folder hides, and how much of it still names a document", () => {
@@ -147,7 +147,7 @@ describe("buildSeam", () => {
       { path: "sidecars/echo/main.go", cites: [{ section: "3", named: null }], spec: "echo" },
       { path: "sidecars/echo/quiet.go", cites: [{ section: "3", named: null }], spec: null },
     ];
-    const seam = buildSeam(
+    const sides = buildSides(
       [module("core/src/a.rs")],
       [],
       [
@@ -158,7 +158,7 @@ describe("buildSeam", () => {
       ],
       foreign,
     );
-    expect(seam.unread).toEqual([
+    expect(sides.unread).toEqual([
       { folder: "sidecars", files: 3, citing: 2, declared: 1 },
       { folder: "core", files: 1, citing: 0, declared: 0 },
     ]);
@@ -169,14 +169,14 @@ describe("isBlindSpot", () => {
   it("separates a folder this map cannot read at all from one it merely has files left over in", () => {
     // `core/` has 131 unread files and a box; `sidecars/` has 168 and none. Reporting them the same
     // way would say the núcleo is as invisible as the Go services, which is the opposite of true.
-    const seam = buildSeam(
+    const sides = buildSides(
       [module("core/src/a.rs")],
       [],
       ["sidecars/echo/main.go", "core/db/0001.sql"],
       [],
     );
-    expect(isBlindSpot(seam, "sidecars")).toBe(true);
-    expect(isBlindSpot(seam, "core")).toBe(false);
+    expect(isBlindSpot(sides, "sidecars")).toBe(true);
+    expect(isBlindSpot(sides, "core")).toBe(false);
   });
 });
 
@@ -195,14 +195,19 @@ describe("the boxes and the header above them", () => {
       { path: "sidecars/echo/main.go", cites: cite, spec: "echo" },
       { path: "sidecars/echo/quiet.go", cites: cite, spec: null },
     ];
-    const seam = buildSeam(modules, [], ["sidecars/echo/main.go", "sidecars/echo/quiet.go"], foreign);
+    const found = buildSides(
+      modules,
+      [],
+      ["sidecars/echo/main.go", "sidecars/echo/quiet.go"],
+      foreign,
+    );
     const header = declaredCoverage(modules, foreign);
-    const sides = seam.sides.reduce((n, side) => n + side.citing, 0);
-    const blind = seam.unread.reduce((n, quiet) => n + quiet.citing, 0);
-    expect(sides + blind).toBe(header.citing);
+    const inBoxes = found.sides.reduce((n, side) => n + side.citing, 0);
+    const behind = found.unread.reduce((n, quiet) => n + quiet.citing, 0);
+    expect(inBoxes + behind).toBe(header.citing);
     const saying =
-      seam.sides.reduce((n, side) => n + side.declared, 0) +
-      seam.unread.reduce((n, quiet) => n + quiet.declared, 0);
+      found.sides.reduce((n, side) => n + side.declared, 0) +
+      found.unread.reduce((n, quiet) => n + quiet.declared, 0);
     expect(saying).toBe(header.saying);
   });
 });

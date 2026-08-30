@@ -49,6 +49,7 @@ mod map_items;
 mod map_join;
 mod map_orphan;
 mod map_recency;
+mod map_seam;
 mod map_stamp;
 mod map_store;
 mod map_triage;

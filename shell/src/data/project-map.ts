@@ -587,9 +587,90 @@ export interface TriageReport {
   unreadable_anchors: number;
 }
 
+/** A call site this scan could say nothing about, because its path is not a literal. */
+export interface SeamSite {
+  file: string;
+  line: number;
+}
+
+/** One call from the shell to the daemon, with its path as written. */
+export interface SeamCall {
+  /** The path with every interpolated expression written `{}`, and the query string dropped. */
+  path: string;
+  file: string;
+  line: number;
+}
+
+/**
+ * A call whose path is partly assembled at run time.
+ *
+ * **Neither a match nor a miss, and drawn as neither.** A path like `/email/queue` with a trailing
+ * expression is one the núcleo's scan cannot finish reading: what the expression appends may be a
+ * query string, another segment or nothing. Counting it as matched would claim a route was reached
+ * that may not be; counting it as missing would report a bug in working code.
+ */
+export interface SeamComputed extends SeamCall {
+  /** Routes this call could be. Empty when none fits under any reading. */
+  candidates: string[];
+}
+
+/**
+ * The boundary between the two sides of the product, read from both ends — §16.4's L0.
+ *
+ * **The map's answer to *where is the boundary?*, which used to be an absence.** Nothing in `core/`
+ * imports anything in `shell/` and nothing could, so the two sides drawn as boxes look independent
+ * and are not. The boundary is this list of routes, and the núcleo now reads both ends of it: what
+ * it registers, and what the shell asks for.
+ */
+export interface Seam {
+  /** Every route the daemon registers outside its own tests. **This is the boundary.** */
+  served: string[];
+  /** Call sites found, including the ones whose path could not be read. */
+  calls: number;
+  matched: number;
+  computed: SeamComputed[];
+  /**
+   * Calls matching no served route under any reading.
+   *
+   * **The finding.** A screen asking for a route nobody serves compiles, ships, and fails in front
+   * of whoever opened it.
+   */
+  unmatched: SeamCall[];
+  /**
+   * Call sites handing in a path built elsewhere.
+   *
+   * Not noise to hide: a route only these reach appears in {@link Seam.uncalled} as though nothing
+   * wanted it, so this number is what says how much that list is worth.
+   */
+  opaque: SeamSite[];
+  /**
+   * Served routes no call here reaches — **and *no screen* is not *nothing*.**
+   *
+   * The hooks, the webhook and the browser's verbs are called by agents and sidecars over the same
+   * HTTP, which this scan does not read. Read as dead code, this list deletes working routes.
+   */
+  uncalled: string[];
+}
+
 export interface ProjectMap {
   modules: MapModule[];
   imports: MapImport[];
+  /**
+   * §16.4's L0, on this answer rather than behind a route of its own.
+   *
+   * The seam is the top of the picture and is on screen the moment the map is, so a second request
+   * would fire on every open — and would walk the tree again to learn what `modules` above already
+   * says. `map/items` is the opposite case and has its own route: it is asked about one file, once
+   * somebody opens it.
+   *
+   * **Optional, and not because the núcleo might choose not to answer.** `apiFetch<T>` is a cast: a
+   * daemon older than this field sends an answer with no `seam` in it and TypeScript will still
+   * hand this object over as though there were one. Typed as always present, the first line that
+   * read `seam.served.length` threw and took the whole map screen down — measured, because it
+   * happened. So the absence is in the type, and the panel says *this daemon does not report the
+   * boundary* rather than showing a boundary of zero routes, which is a different and false claim.
+   */
+  seam?: Seam;
   /**
    * Files no reader here understands, kept rather than dropped.
    *

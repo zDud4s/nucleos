@@ -74,7 +74,7 @@ export interface Unread {
   declared: number;
 }
 
-export interface Seam {
+export interface Sides {
   /** Largest first, so the box order is a fact about the project and not about the alphabet. */
   sides: Side[];
   unread: Unread[];
@@ -109,15 +109,19 @@ export function sideOf(module: MapModule): string {
 /**
  * The sides, what each one hides, and how much passes between them.
  *
+ * Named for the boxes rather than for the seam, because the seam itself is read by the núcleo
+ * and arrives on the same answer as {@link ../data/project-map!Seam} — the routes are the boundary,
+ * and these are the sides it runs between.
+ *
  * Everything here is counted off the answer the structure layer already sends. There is no second
  * walk and no second definition of a side — §16.3's fourth consequence, applied one level up.
  */
-export function buildSeam(
+export function buildSides(
   modules: MapModule[],
   imports: MapImport[],
   unread: string[],
   foreign: ForeignFile[],
-): Seam {
+): Sides {
   const sides = new Map<string, Side>();
   const of = new Map<string, string>();
   for (const module of modules) {
@@ -195,6 +199,6 @@ export function buildSeam(
  * only one that has finished declaring: 77 citing files and 77 headers, where the núcleo and the
  * shell are still counting.
  */
-export function isBlindSpot(seam: Seam, folder: string): boolean {
-  return !seam.sides.some((side) => side.folder === folder);
+export function isBlindSpot(sides: Sides, folder: string): boolean {
+  return !sides.sides.some((side) => side.folder === folder);
 }

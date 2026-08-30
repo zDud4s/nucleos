@@ -3518,6 +3518,16 @@ async fn get_project_readings(
 struct MapAnswer {
     #[serde(flatten)]
     structure: crate::project_map::Structure,
+    /// §16.4's L0: the boundary between the two sides of this product, read from both ends.
+    ///
+    /// **On this answer and not on a route of its own, unlike `map/items`, and the difference is
+    /// which question it belongs to.** Items are asked about one file once somebody opens it, so
+    /// their cost lands on a click. The seam is the top of the picture and is on screen the moment
+    /// the map is, so a route of its own would be a second request fired every time — and it would
+    /// walk the tree again to learn what `structure` above already knows. It is computed from
+    /// exactly those modules for the same reason: one definition of *which files are this
+    /// project*.
+    seam: crate::map_seam::Seam,
     junction: crate::map_join::Junction,
     /// Where each decision stands, by `decision_id`.
     ///
@@ -3662,6 +3672,23 @@ async fn get_project_map(
     let root = resolve_read_root(&state, &id, None).await?;
     let (structure, mut junction) = project_junction(&state, &id, root.clone()).await?;
 
+    // Re-reads the sources `structure` already opened, and that is the cheaper of the two options
+    // rather than an oversight: holding every file of a thousand-file project in memory to save one
+    // pass would trade a bounded read for an unbounded allocation on a route somebody is waiting
+    // on. `spawn_blocking` because it is file IO in an async handler, the same reason the walk
+    // above is one.
+    let seam = {
+        let root = root.clone();
+        let modules = structure.modules.clone();
+        tokio::task::spawn_blocking(move || crate::map_seam::seam(&root, &modules))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|error| {
+                tracing::warn!(%error, project_id = %id, "reading the seam failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+
     // One `git ls-files` for the union of every decision's anchor paths, sliced per decision
     // afterwards, and the same reading `POST /map/triage` shows the model. See [`anchor_digests`]
     // for why it is one call and one function.
@@ -3790,6 +3817,7 @@ async fn get_project_map(
 
     Ok(Json(MapAnswer {
         structure,
+        seam,
         junction,
         standings,
         stamps,
@@ -14300,6 +14328,76 @@ mod tests {
         let unread = map["unread"].as_array().unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0], "core/src/notes.go");
+    }
+
+    #[tokio::test]
+    async fn the_map_carries_the_seam_between_the_two_sides_of_the_product() {
+        let state = test_state().await;
+        let dir = project_with_rules(
+            &state,
+            "alpha",
+            "gate_command: cargo test
+",
+        )
+        .await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("shell/src/data")).unwrap();
+        std::fs::write(
+            dir.path().join("core/src/http.rs"),
+            "fn app() -> Router { Router::new().route(\"/things\", get(h)).route(\"/quiet\", get(h)) }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("shell/src/data/things.ts"),
+            "export const load = () => apiFetch<Thing[]>(\"/things\");
+",
+        )
+        .unwrap();
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let seam = &map["seam"];
+        assert_eq!(seam["served"], serde_json::json!(["/quiet", "/things"]));
+        assert_eq!(seam["matched"], 1);
+        assert_eq!(seam["unmatched"].as_array().unwrap().len(), 0);
+        // A route nothing on a screen calls is reported and not accused: agents and sidecars reach
+        // this daemon over the same HTTP, which nothing here reads.
+        assert_eq!(seam["uncalled"], serde_json::json!(["/quiet"]));
+    }
+
+    #[tokio::test]
+    async fn a_screen_asking_for_a_route_nobody_serves_comes_back_named() {
+        // The failure this half of the map exists for: it compiles, it ships, and it fails in front
+        // of whoever opened the screen. Nothing in this repository checked it before.
+        let state = test_state().await;
+        let dir = project_with_rules(
+            &state,
+            "alpha",
+            "gate_command: cargo test
+",
+        )
+        .await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("shell/src/data")).unwrap();
+        std::fs::write(
+            dir.path().join("core/src/http.rs"),
+            "fn app() -> Router { Router::new().route(\"/things\", get(h)) }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("shell/src/data/things.ts"),
+            "export const load = () => apiFetch<Thing[]>(\"/thingz\");
+",
+        )
+        .unwrap();
+
+        let map = get_json(&state, "/projects/alpha/map").await;
+        let unmatched = map["seam"]["unmatched"].as_array().unwrap();
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(unmatched[0]["path"], "/thingz");
+        assert_eq!(unmatched[0]["file"], "shell/src/data/things.ts");
+        assert_eq!(unmatched[0]["line"], 1);
     }
 
     #[tokio::test]

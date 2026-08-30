@@ -100,6 +100,7 @@ function Derived({ projectId }: { projectId: string }) {
     imports,
     unread,
     foreign,
+    seam,
     junction,
     standings,
     stamps,
@@ -168,6 +169,7 @@ function Derived({ projectId }: { projectId: string }) {
         imports={imports}
         unread={unread}
         foreign={foreign}
+        seam={seam}
         junction={junction}
         standings={standings}
       />

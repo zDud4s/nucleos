@@ -176,7 +176,7 @@ pub fn items(path: &str, source: &str) -> Items {
 /// left is a `'"'` character literal, which opens a string here and closes it at the next quote:
 /// the same gap [`crate::project_map`] declares, in the same words, and for the same reason it is
 /// cheaper to say so than to teach this the difference between a character literal and a lifetime.
-fn mask(source: &str, rust: bool) -> Vec<char> {
+pub(crate) fn mask(source: &str, rust: bool) -> Vec<char> {
     let chars: Vec<char> = source.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(chars.len());
     let mut i = 0;
@@ -573,7 +573,7 @@ fn body_of(masked: &[char], from: usize) -> Option<(usize, usize)> {
 }
 
 /// The `}` closing the `{` at `open`, counting nested braces.
-fn match_brace(masked: &[char], open: usize) -> Option<usize> {
+pub(crate) fn match_brace(masked: &[char], open: usize) -> Option<usize> {
     let mut depth = 0;
     let mut i = open;
     while i < masked.len() {
