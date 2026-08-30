@@ -4181,6 +4181,29 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
     // a job admitted at 03:00 could otherwise keep starting nodes at 08:00 with the owner at the
     // keyboard. The item in flight is never killed — its gate has already run or is about to — so
     // this only ever refuses to start the NEXT one.
+    // Switched off per project in `.ai/autopilot.yaml`, and read HERE rather than once at
+    // admission for the same reason decision 10 gives about the check itself: a job admitted under
+    // one setting must not go on starting nodes under it after the owner changed their mind.
+    //
+    // A rules file that cannot be read leaves the brake ON. That is the direction every other arm
+    // of this chain fails in, and the asymmetry is the argument: being wrong this way costs a job
+    // that waits, and being wrong the other way starts a node in a worktree somebody is using.
+    let brake_applies =
+        match crate::config::load_schedule_rules(std::path::Path::new(&job.project_root)) {
+            Ok(rules) => rules.attention_brake(),
+            Err(error) => {
+                tracing::warn!(
+                    job_id = job.id,
+                    %error,
+                    "could not read this project's autopilot rules; keeping the attention brake on"
+                );
+                true
+            }
+        };
+    if !brake_applies {
+        return Brake::Go;
+    }
+
     match crate::attention::attention_permits_new_run(
         &state.pool,
         &state.run_handles,
@@ -10353,6 +10376,63 @@ mod tests {
         advance(&state, &job, Utc::now()).await;
         assert_eq!(job_status(&pool, job_id).await, "waiting");
         assert_eq!(item_statuses(&pool, job_id).await[1], "pending");
+    }
+
+    /// The same setup as the test above, with the brake switched off in the project's rules.
+    ///
+    /// The heartbeat is still fresh — the owner IS at the keyboard — so this asserts the switch and
+    /// not the absence of a signal. What changes is only whether the job asks.
+    #[tokio::test]
+    async fn a_project_that_switched_the_brake_off_is_not_parked_by_a_present_owner() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        std::fs::create_dir_all(worktree.path().join(".ai")).unwrap();
+        std::fs::write(
+            worktree.path().join(".ai").join("autopilot.yaml"),
+            "attention_brake: false\n",
+        )
+        .unwrap();
+        sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
+            .bind(worktree.path().to_string_lossy().into_owned())
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["implemented", "pending"]).await;
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('project', 'project-a', ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Continued);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        // What this asserts is the brake and only the brake: the job is not parked, and not parked
+        // for this reason. Whether the next node then reaches `running` is the spawn path's
+        // business — it provisions a checkout and starts a CLI, neither of which this bench sets
+        // up — and it has its own tests. Asserting it here would have made this test fail for
+        // reasons that have nothing to do with the switch it exists to cover.
+        assert_ne!(
+            job_status(&pool, job_id).await,
+            "waiting",
+            "the brake is off, so the owner being present must not park this job"
+        );
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(reason.as_deref(), Some("attention"));
     }
 
     /// Decision 14, and the reason parked time counts toward it: without that, parking would be a
