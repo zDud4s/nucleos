@@ -556,6 +556,40 @@ pub async fn pretooluse_decision(
         });
     }
 
+    // **A park that cannot be answered is a refusal that also destroys an item, so it is spelled as
+    // a refusal.** See `a_park_here_would_only_destroy` for the whole argument; the short of it is
+    // that a job node's park never becomes an `action-approval` — it becomes a `skipped-item` — so
+    // the command is refused either way and the only question is whether the item's work survives
+    // the asking. Job 22 on 2026-08-30 is the measurement: it asked about one path outside its
+    // worktree, was correctly refused, and lost the whole item plus everything it had already
+    // written for it.
+    //
+    // Placed AFTER the two `deny` branches above and before the pause below, so it can only ever
+    // convert a `pending_approval`, never soften a `deny`.
+    if classification.decision.decision == "pending_approval"
+        && is_in_flight
+        && a_park_here_would_only_destroy(&state.pool, run_id, &mode).await
+    {
+        tracing::info!(
+            run_id,
+            tool_name = %payload.tool_name,
+            action_class = classification.action_class,
+            "pretooluse-decision: refused rather than parked — a park here would only end the item"
+        );
+        record_refused_action(
+            &state,
+            &payload,
+            &payload.tool_name,
+            None,
+            &classification.reason,
+        )
+        .await;
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!("{} {A_PARK_HERE_WOULD_END_THE_ITEM}", classification.reason),
+        });
+    }
+
     if classification.decision.decision == "pending_approval" {
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
@@ -651,6 +685,61 @@ async fn unrecognized_policy_for(
         Some(_) => crate::classifier::Unrecognized::MayBeConfined,
         None => crate::classifier::Unrecognized::AsksAPerson,
     }
+}
+
+/// The sentence a node gets instead of being put down for asking.
+pub const A_PARK_HERE_WOULD_END_THE_ITEM: &str = "this is unattended work you were asked to finish, so there is nobody to approve this and \
+     nothing is waiting on an answer. It is refused, it has been written down for the owner to \
+     read, and the item is still yours: do not retry it, do the rest of the work.";
+
+/// Whether parking THIS run would destroy its item rather than ask anybody anything.
+///
+/// **The premise, and it is what makes this a refusal rather than a loosening: in a job, a park is
+/// already a refusal.** `pause_for_approval` sends a node that owns an item — and every stage in
+/// `NODES_THAT_GIVE_UP` — down `skip_the_item`, which mints a `skipped-item` record and never a
+/// `action-approval`. Nothing is ever approved and nothing ever resumes. The command does not run
+/// either way, so no command this daemon blocks today becomes runnable; the only thing that changes
+/// is whether the item's work survives the asking.
+///
+/// Measured: 16 items across 7 jobs have been skipped, and 257 of the 278 refusals ever recorded
+/// were `unrecognized` — a class that means the classifier had no opinion, not that anything was
+/// dangerous.
+///
+/// The **plan** node is deliberately excluded, by being neither an item-owner nor in
+/// `NODES_THAT_GIVE_UP`. Its park is the one that is a real question: it produces the queue, so
+/// there is nothing partial to preserve, and `pause_for_approval` gives it a real
+/// `action-approval` a person can answer and resume. Refusing there would throw away the one case
+/// where asking works.
+///
+/// Requested work only, on the same signal `unrecognized_policy_for` reads, and for the same reason:
+/// a job a schedule started was never agreed to, and the strict road is the right one for it.
+///
+/// Fails closed everywhere: any error, any missing row, anything not a job node answers `false` and
+/// the run parks exactly as it did before this existed.
+async fn a_park_here_would_only_destroy(pool: &sqlx::SqlitePool, run_id: i64, mode: &str) -> bool {
+    if !crate::runs::runs_unattended(mode) {
+        return false;
+    }
+    // Read-only, and it mirrors `put_the_item_down`'s WHERE clause plus the `NODES_THAT_GIVE_UP`
+    // arm beside it. Two copies of one condition, which is a thing this file distrusts — so
+    // `a_refusal_and_a_skip_agree_about_which_nodes_they_cover` pins them against each other.
+    let answer: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM runs
+         JOIN jobs ON jobs.id = runs.job_id
+         WHERE runs.id = ?
+           AND jobs.rule_name IS NULL
+           AND (EXISTS (SELECT 1 FROM job_items
+                        WHERE job_items.job_id = jobs.id
+                          AND job_items.run_id = runs.id
+                          AND job_items.status = 'running')
+                OR runs.stage IN ('review', 'replan'))",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    answer.is_some()
 }
 
 /// The conversation a run belongs to, or `None` for a run that is nobody's turn.
@@ -1016,7 +1105,12 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                     tool,
                     "pretooluse-decision: an errand may not act without a person"
                 );
-                record_refused_action(state, payload, tool, errand).await;
+                // The reason the errand is GIVEN, not the untrusted-context one this used to
+                // record. They are different statements and only one of them is true here: a clean
+                // errand has read nobody's words, and the file's own argument for keeping the two
+                // constants apart — "a model told something false about itself will try to work
+                // around it" — applies to the record a person reads as much as to the reply.
+                record_refused_action(state, payload, tool, errand, ERRAND_MAY_NOT_ACT).await;
                 return Json(Decision {
                     decision: "deny".to_owned(),
                     reason: ERRAND_MAY_NOT_ACT.to_owned(),
@@ -1041,7 +1135,14 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
                     // could disagree only by being asked at different moments, and a record naming
                     // a different errand than the one the barrier judged is worse than an unnamed
                     // one.
-                    record_refused_action(state, payload, tool, errand).await;
+                    record_refused_action(
+                        state,
+                        payload,
+                        tool,
+                        errand,
+                        UNTRUSTED_CONTEXT_DENY_REASON,
+                    )
+                    .await;
                     Json(Decision {
                         decision: "deny".to_owned(),
                         reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
@@ -1095,6 +1196,7 @@ async fn record_refused_action(
     payload: &PreToolUsePayload,
     tool: &str,
     errand: Option<i64>,
+    reason: &str,
 ) {
     let session_id =
         sqlx::query_scalar::<_, Option<String>>("SELECT session_id FROM runs WHERE id = ?")
@@ -1119,7 +1221,7 @@ async fn record_refused_action(
         session_id.as_deref(),
         errand,
         tool,
-        UNTRUSTED_CONTEXT_DENY_REASON,
+        reason,
         Some(&payload.tool_input.to_string()),
         read_from.as_deref(),
     )
@@ -1326,7 +1428,14 @@ async fn team_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<De
                     // Written down for the reason the orchestrator's is: the alçada exists so a
                     // person reads a queue, and a refusal that leaves no trace is a department that
                     // quietly stopped asking with nothing anywhere saying why.
-                    record_refused_action(state, payload, tool, None).await;
+                    record_refused_action(
+                        state,
+                        payload,
+                        tool,
+                        None,
+                        UNTRUSTED_CONTEXT_DENY_REASON,
+                    )
+                    .await;
                     Json(Decision {
                         decision: "deny".to_owned(),
                         reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
@@ -2034,6 +2143,165 @@ mod tests {
             unrecognized_policy_for(&state.pool, 999_999, "worktree").await,
             Unrecognized::AsksAPerson
         );
+    }
+
+    /// The other road out of the same door, and the one the owner asked for: the call is refused,
+    /// the item is NOT put down, and the work the node has already done stays where it is.
+    #[tokio::test]
+    async fn a_requested_jobs_node_is_refused_rather_than_put_down() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "frobnicate --hard"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+        assert!(
+            decision.reason.contains("the item is still yours"),
+            "the node was not told it may carry on: {}",
+            decision.reason
+        );
+
+        let item: String =
+            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? AND run_id = ?")
+                .bind(job_id)
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(item, "running", "the item was put down for asking");
+
+        let run_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "running", "the run was terminated for asking");
+
+        // The owner still gets the decision, as a record rather than as a question.
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["refused-action"]);
+    }
+
+    /// The plan node keeps parking, and this is the test that stops the refusal spreading to it.
+    ///
+    /// Its park is the only one in a job that is a real question: it produces the queue, so there
+    /// is nothing partial to lose, and the proposal it mints can be answered and resumed.
+    #[tokio::test]
+    async fn a_requested_jobs_plan_node_still_parks_because_its_park_can_be_answered() {
+        let state = test_state().await;
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        // What makes it a plan node: it owns no running item, and its stage says so.
+        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET stage = 'plan' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &serde_json::json!({
+                "run_id": run_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "frobnicate --hard"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM proposals")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds,
+            vec!["action-approval"],
+            "a plan node's park has to stay something a person can answer"
+        );
+    }
+
+    /// The two copies of one condition, pinned against each other.
+    ///
+    /// `a_park_here_would_only_destroy` spells out in SQL what `pause_for_approval` decides in Rust
+    /// with `put_the_item_down` and `NODES_THAT_GIVE_UP`. Two statements of one rule drift, and the
+    /// drift would be silent and one-directional — the predicate saying "refuse" for a node the
+    /// other road would have parked answerably, or the reverse. So both are asked, per shape.
+    #[tokio::test]
+    async fn a_refusal_and_a_skip_agree_about_which_nodes_they_cover() {
+        for (stage, owns_an_item, ends_the_node) in [
+            ("implement", true, true),
+            ("review", false, true),
+            ("replan", false, true),
+            // The exception, and the only one.
+            ("plan", false, false),
+            // A stage that gives up owns no item; one that owns an item is covered whatever its
+            // stage says, which is why the first row and this one must disagree.
+            ("implement", false, false),
+        ] {
+            let state = test_state().await;
+            let (job_id, run_id) = in_flight_job_node(&state).await;
+            if !owns_an_item {
+                sqlx::query(
+                    "UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?",
+                )
+                .bind(job_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            }
+            sqlx::query("UPDATE runs SET stage = ? WHERE id = ?")
+                .bind(stage)
+                .bind(run_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                a_park_here_would_only_destroy(&state.pool, run_id, "worktree").await,
+                ends_the_node,
+                "stage {stage}, owns_an_item {owns_an_item}: the predicate and the skip road \
+                 disagree about this shape"
+            );
+            // And the other half of the conjunction, on the same row: scheduled work keeps the
+            // skip road whatever its shape.
+            nobody_asked_for_this_job(&state.pool, job_id).await;
+            assert!(
+                !a_park_here_would_only_destroy(&state.pool, run_id, "worktree").await,
+                "stage {stage}: work nobody asked for was given the refusal road"
+            );
+        }
+    }
+
+    /// Make this job one a SCHEDULE started rather than one the owner asked for.
+    ///
+    /// The four tests below cover the road a park takes when it ENDS a node, and since 2026-08-30
+    /// that road belongs to proactive work: a job the owner asked for is refused the call and keeps
+    /// its item (`a_park_here_would_only_destroy`). The road did not go away and neither did its
+    /// tests — they say which work it applies to now, in one line each.
+    async fn nobody_asked_for_this_job(pool: &sqlx::SqlitePool, job_id: i64) {
+        sqlx::query("UPDATE jobs SET rule_name = 'nightly' WHERE id = ?")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     /// A `runs` row without an abort handle: the run exists and its mode is on record, but nothing
@@ -3103,6 +3371,7 @@ mod tests {
     async fn a_jobs_node_skips_its_item_instead_of_parking_the_job() {
         let state = test_state().await;
         let (job_id, run_id) = in_flight_job_node(&state).await;
+        nobody_asked_for_this_job(&state.pool, job_id).await;
         let app = test_router(state.clone());
 
         let decision = decide(
@@ -3459,6 +3728,7 @@ mod tests {
     async fn a_jobs_replan_node_gives_up_instead_of_parking_the_job() {
         let state = test_state().await;
         let (job_id, run_id) = in_flight_job_node(&state).await;
+        nobody_asked_for_this_job(&state.pool, job_id).await;
         sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
             .bind(job_id)
             .execute(&state.pool)
@@ -3513,6 +3783,7 @@ mod tests {
     async fn a_jobs_review_node_gives_up_the_review_instead_of_parking_the_job() {
         let state = test_state().await;
         let (job_id, run_id) = in_flight_job_node(&state).await;
+        nobody_asked_for_this_job(&state.pool, job_id).await;
         // What makes it a review node: it owns no running item, and its stage says so.
         sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
             .bind(job_id)
@@ -3585,6 +3856,7 @@ mod tests {
     async fn the_item_is_marked_even_when_nothing_else_about_the_skip_can_happen() {
         let state = test_state().await;
         let (job_id, run_id) = in_flight_job_node(&state).await;
+        nobody_asked_for_this_job(&state.pool, job_id).await;
         sqlx::query("DELETE FROM worktrees WHERE owner_kind = 'job' AND owner_id = ?")
             .bind(job_id)
             .execute(&state.pool)
