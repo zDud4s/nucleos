@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 10;
+pub const CLASSIFIER_VERSION: u32 = 11;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -3562,7 +3562,11 @@ mod tests {
     /// and stopped it writing one, 8 took the git subcommands that cannot mutate as a group, 9
     /// stopped counting output thrown at the null device as a file write, 10 gave the classifier
     /// a fourth argument and a class to go with it — `github-read`, the first verdict in this
-    /// file that a person's own file decides. The
+    /// file that a person's own file decides, 11 stopped the guards reading a quoted separator as
+    /// a separator, took the text filters and three more read-only `git` subcommands into the safe
+    /// list, and added `confined-to-workspace` — the first class whose verdict depends on WHO asked
+    /// for the work, since it is offered only to an unattended node of a job the owner commissioned.
+    /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
     /// night of 2026-08-08 and everything after it look alike.
@@ -3576,7 +3580,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 10);
+        assert_eq!(CLASSIFIER_VERSION, 11);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
