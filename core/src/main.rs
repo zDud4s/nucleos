@@ -17,6 +17,7 @@ mod chat_notices;
 mod chats;
 mod classifier;
 mod collision;
+mod command_reader;
 mod commands;
 mod concurrency;
 mod config;
