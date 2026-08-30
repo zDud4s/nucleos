@@ -2887,6 +2887,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
                 &input,
                 Some(std::path::Path::new(&wt_path)),
                 &state.github.policy,
+                // Labelling an action a person has just approved, not deciding one. The strict
+                // reading keeps the recorded class the same as the one that was shown to them.
+                crate::classifier::Unrecognized::AsksAPerson,
             )
             .action_class
         });

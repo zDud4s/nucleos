@@ -344,6 +344,7 @@ pub async fn pretooluse_decision(
         &payload.tool_input,
         cwd.as_deref().map(Path::new),
         &state.github.policy,
+        unrecognized_policy_for(&state.pool, run_id, &mode).await,
     );
     tracing::info!(
         tool_name = %payload.tool_name,
@@ -613,6 +614,45 @@ pub const ERRAND_MAY_NOT_ACT: &str =
 /// act while nothing third-party has entered the turn — but not both, and not in that order. It is
 /// deliberately not a hard split of the tool set, because reading mail from a phone is the feature,
 /// and the ordering costs the owner one extra message rather than the tool.
+/// What an unrecognised command gets for THIS run: a person, or a chance to prove it is confined.
+///
+/// Both halves of `classifier::Unrecognized`'s conjunction are answered here, and neither is
+/// guessed:
+///
+/// - **the owner asked for it** — `jobs.rule_name IS NULL`. The column has meant this since jobs
+///   existed (`NewJob::rule_name`: "`None` for a job nobody scheduled"), and nothing had ever read
+///   it to decide anything. A run with no `job_id` at all is not covered: a standalone `POST /runs`
+///   IS requested work, but the daemon does not record who created a run — `runs.origin` exists and
+///   is NULL on all 292 rows — so there is no signal to read, and inventing one from the absence of
+///   a `job_id` would hand the same widening to every run a schedule starts.
+/// - **nobody is awake** — `runs_unattended`, the one definition of that word, so this cannot drift
+///   from the three policies that already read it.
+///
+/// Fails closed in every direction: an error, a missing row, an unknown run all give
+/// `AsksAPerson`, which is what every caller got before this function existed.
+async fn unrecognized_policy_for(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    mode: &str,
+) -> crate::classifier::Unrecognized {
+    if !crate::runs::runs_unattended(mode) {
+        return crate::classifier::Unrecognized::AsksAPerson;
+    }
+    let asked_for: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM runs JOIN jobs ON jobs.id = runs.job_id
+         WHERE runs.id = ? AND jobs.rule_name IS NULL",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    match asked_for {
+        Some(_) => crate::classifier::Unrecognized::MayBeConfined,
+        None => crate::classifier::Unrecognized::AsksAPerson,
+    }
+}
+
 /// The conversation a run belongs to, or `None` for a run that is nobody's turn.
 async fn chat_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Option<String> {
     sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
@@ -795,6 +835,9 @@ async fn rooted_decision(
         &payload.tool_input,
         Some(Path::new(root)),
         &state.github.policy,
+        // A rooted turn is a conversation. Somebody asked for it AND is sitting in front of it, so
+        // a park costs them ten seconds and buys the strict reading.
+        crate::classifier::Unrecognized::AsksAPerson,
     );
     if classification.decision.decision == "deny" {
         return Json(Decision {
@@ -1942,6 +1985,57 @@ mod tests {
         (job_id, run_id)
     }
 
+    /// Which runs earn the confinement widening, and which do not — the whole conjunction, one
+    /// case per way of failing it.
+    ///
+    /// The last two are the ones worth having: this function is the only thing standing between
+    /// "the owner asked for this" and "an unrecognised command may run", so every way of NOT being
+    /// that has to come back `AsksAPerson` rather than fall through to it.
+    #[tokio::test]
+    async fn only_an_unattended_node_of_a_job_the_owner_asked_for_may_be_confined() {
+        use crate::classifier::Unrecognized;
+        let state = test_state().await;
+
+        // Asked for (`rule_name IS NULL`) and unattended: the case the whole thing exists for.
+        let (job_id, run_id) = in_flight_job_node(&state).await;
+        assert_eq!(
+            unrecognized_policy_for(&state.pool, run_id, "worktree").await,
+            Unrecognized::MayBeConfined
+        );
+
+        // Same run, same job, watched by a person: a park costs them ten seconds.
+        assert_eq!(
+            unrecognized_policy_for(&state.pool, run_id, "real").await,
+            Unrecognized::AsksAPerson
+        );
+
+        // Same run, same mode, but now the job came from a schedule. Nobody agreed to this work.
+        sqlx::query("UPDATE jobs SET rule_name = 'nightly' WHERE id = ?")
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            unrecognized_policy_for(&state.pool, run_id, "worktree").await,
+            Unrecognized::AsksAPerson
+        );
+
+        // A run belonging to no job at all. It may well have been requested — a standalone
+        // `POST /runs` is — but the daemon records no origin for a run, so there is nothing to
+        // read and the strict answer is the only honest one.
+        let orphan = in_flight_run(&state, "worktree", Some("proj"), None, None).await;
+        assert_eq!(
+            unrecognized_policy_for(&state.pool, orphan, "worktree").await,
+            Unrecognized::AsksAPerson
+        );
+
+        // A run id that names nothing.
+        assert_eq!(
+            unrecognized_policy_for(&state.pool, 999_999, "worktree").await,
+            Unrecognized::AsksAPerson
+        );
+    }
+
     /// A `runs` row without an abort handle: the run exists and its mode is on record, but nothing
     /// is executing under it. Every barrier that reads `mode` has to hold here too, because this is
     /// the state a run passes through on its way out — and the state a forged request would claim.
@@ -2561,8 +2655,13 @@ mod tests {
     #[tokio::test]
     async fn pends_unrecognized_command() {
         let tool_input = serde_json::json!({"command": "frobnicate --hard"});
-        let classification =
-            classifier::classify("Bash", &tool_input, None, &crate::github::Policy::empty());
+        let classification = classifier::classify(
+            "Bash",
+            &tool_input,
+            None,
+            &crate::github::Policy::empty(),
+            classifier::Unrecognized::AsksAPerson,
+        );
         assert_eq!(classification.action_class, "unrecognized");
 
         let app = test_router(test_state().await);
