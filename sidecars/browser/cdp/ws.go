@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 // Package cdp speaks the Chrome DevTools Protocol.
 //
 // # Why the WebSocket is hand-rolled

@@ -1,5 +1,7 @@
 //go:build browsergate
 
+// §spec pilar-de-browser
+
 package gate_test
 
 import (

@@ -1,3 +1,5 @@
+// §spec mapa-do-projeto
+
 import { describe, expect, it } from "vitest";
 import { declaredCoverage } from "./map-model";
 import type { ForeignFile, MapModule } from "../data/project-map";

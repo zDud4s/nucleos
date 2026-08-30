@@ -1,3 +1,5 @@
+// §spec pilar-de-browser
+
 package launch
 
 // Health is spec §9.4: three questions, reported separately.
