@@ -283,3 +283,354 @@ export function pathUpTo(path: string, depth: number): string {
 export function joinPath(path: string, name: string): string {
   return path === "" ? name : `${path}/${name}`;
 }
+
+/* ------------------------------------------------------------ the views -- */
+
+/** The four views, in the order the tabs read. */
+export const VIEWS = ["browse", "search", "diff", "rules"] as const;
+export type ProjectView = (typeof VIEWS)[number];
+
+/**
+ * A `$view` param as one of the four.
+ *
+ * Falls back rather than refusing. TanStack hands route params through as
+ * strings with no validation of its own, so `/projects/alpha/brwose` is a path
+ * a person can reach by typing — and answering a typo with a dead end teaches
+ * nothing. Browse is the right landing: it is the view that needs no input.
+ *
+ * `rules` needs no input either, and is the view worth more. It is not the
+ * landing anyway: this is a documented, tested contract with a stated reason,
+ * and the header and the concerns strip now report a project's faults from
+ * every view — so landing on `browse` is no longer landing on a dead end.
+ */
+export function normaliseView(raw: string | undefined): ProjectView {
+  const candidate = (raw ?? "").trim().toLowerCase();
+  return (VIEWS as readonly string[]).includes(candidate) ? (candidate as ProjectView) : "browse";
+}
+
+/* -------------------------------------------------- what runs on its own -- */
+
+/**
+ * What makes a rule go: a clock, or a commit.
+ *
+ * The two used to be two panels, and a project with two schedules and one
+ * trigger read as two half-empty lists rather than as *three things run here
+ * without you*. They are one class of thing — a rule that starts work when
+ * nobody asked — with different clocks, so they are one table with a column
+ * that says which clock.
+ */
+export type RuleClock = "cron" | "commit";
+
+/**
+ * One vocabulary for the state of a rule, across both clocks.
+ *
+ * `armed` used to mean two different things in two adjacent panels: on a
+ * schedule that the cron parses and today's allowance is not spent, on a
+ * trigger that a commit has been seen. Same word, same green pill, different
+ * fact. `unseen` is the trigger's own state and says so.
+ */
+export type RuleState = "armed" | "never-fires" | "capped" | "unseen";
+
+/** One rule that starts work here without you, whichever clock drives it. */
+export interface AutonomyRule {
+  name: string;
+  clock: RuleClock;
+  /** What makes it go: the cron expression, or the branch. */
+  when: string;
+  /** A cron's timezone. `null` for a commit rule, which has no clock to place. */
+  zone: string | null;
+  state: RuleState;
+  /** The daemon's own account of why this never fires. Non-null only for `never-fires`. */
+  problem: string | null;
+  /** What the rule asks for, in the words somebody wrote in the file. */
+  prompt: string;
+  /** Where it runs, when that is not the project root. */
+  cwd: string | null;
+  /** A cron's next fire. `null` for a commit rule, and for a cron that is broken. */
+  next: string | null;
+  last: string | null;
+  /** Today's allowance. `null` for a commit rule, which has none. */
+  today: { fired: number; cap: number } | null;
+  /** The commit a trigger last saw. `null` for a cron rule and for a trigger with none. */
+  sha: string | null;
+}
+
+/** The word each state deserves, said once, in the one vocabulary. */
+export const RULE_STATE_WORD: Record<RuleState, string> = {
+  armed: "armed",
+  "never-fires": "never fires",
+  capped: "capped today",
+  unseen: "no commit seen yet",
+};
+
+/**
+ * Everything that starts work in this project without being asked, as one list.
+ *
+ * Schedules first, then repo triggers, each in the order the file names them:
+ * a clock is the commoner case and the one somebody is usually looking for, and
+ * re-sorting a file's own order would make a rule hard to find in the document
+ * it came from.
+ */
+export function autonomyOf(rules: ProjectRules): AutonomyRule[] {
+  const clocks: AutonomyRule[] = rules.schedules.map((schedule) => ({
+    name: schedule.name,
+    clock: "cron",
+    when: schedule.cron,
+    // `null` is UTC — the scheduler's own default, not an unset field.
+    zone: schedule.timezone ?? "UTC",
+    state: scheduleNeverFires(schedule)
+      ? "never-fires"
+      : scheduleCapped(schedule)
+        ? "capped"
+        : "armed",
+    problem: schedule.problem,
+    prompt: schedule.prompt,
+    cwd: schedule.cwd,
+    next: schedule.next_fire_at,
+    last: schedule.last_fired_at,
+    today: { fired: schedule.fires_today, cap: schedule.daily_cap },
+    sha: null,
+  }));
+
+  const commits: AutonomyRule[] = rules.repo_triggers.map((trigger) => ({
+    name: trigger.name,
+    clock: "commit",
+    when: trigger.branch,
+    zone: null,
+    state: trigger.last_sha === null ? "unseen" : "armed",
+    problem: null,
+    prompt: trigger.prompt,
+    cwd: null,
+    next: null,
+    last: null,
+    today: null,
+    sha: trigger.last_sha,
+  }));
+
+  return [...clocks, ...commits];
+}
+
+/* ------------------------------------------------------------- concerns -- */
+
+/**
+ * The ways a project can be stopped without looking stopped.
+ *
+ * Every one of these means *this project is doing less than somebody thinks*,
+ * and not one of them is visible from the roster. They used to be scattered
+ * across three of five stacked panels, two of them in muted body text — so the
+ * page that a completely halted project produced was one alert, two panels
+ * saying "nothing is scheduled" (which the alert had just disclaimed), and the
+ * two most consequential sentences on the page in the quietest style on it.
+ */
+export type ConcernKind =
+  | "rules-unreadable"
+  | "gate-missing"
+  | "folder-gone"
+  | "rules-inert"
+  | "brake-holding"
+  | "folder-unset";
+
+/**
+ * How bad a finding is, and therefore what to do about it.
+ *
+ * Three, because they ask for three different responses: `stopped` is happening
+ * now and will not clear itself, `held` clears when the thing it waits for
+ * happens, and `unfinished` is a setup nobody completed. Collapsing them into
+ * one alarm makes a brake that is working correctly look like a fault.
+ */
+export type ConcernWeight = "stopped" | "held" | "unfinished";
+
+export interface Concern {
+  kind: ConcernKind;
+  weight: ConcernWeight;
+  /** What is wrong and what it costs, in one sentence. */
+  said: string;
+  /** The view that answers it, so a finding leads somewhere. */
+  view: ProjectView;
+}
+
+/**
+ * Everything wrong with this project, worst first.
+ *
+ * `rootExists` is the roster's own answer and is not on the rules read, so it
+ * is passed in rather than fetched again: `null` means no folder was ever
+ * named, `false` means one was and is not there, and `undefined` is a daemon
+ * older than this shell — which reads as "not named" rather than inventing a
+ * folder that is there.
+ *
+ * Each sentence is a headline and not a paragraph: the panel that answers the
+ * finding says it again at length, and two near-identical paragraphs seven
+ * hundred pixels apart read as a defect rather than as a summary.
+ *
+ * Returns empty when there is nothing wrong, and the strip that draws it
+ * renders nothing at all for an empty list. A permanently visible "all clear"
+ * would be a hole in every healthy project's page.
+ */
+export function concernsOf(rules: ProjectRules, rootExists: boolean | null | undefined): Concern[] {
+  const found: Concern[] = [];
+
+  if (rules.rules_file === "unreadable") {
+    found.push({
+      kind: "rules-unreadable",
+      weight: "stopped",
+      said: "The rules file will not parse — nothing runs here at all.",
+      view: "rules",
+    });
+  }
+
+  // The queue refuses every merge while this holds, over a key in a gitignored
+  // file. A refusal nobody can explain is the worst of the gate's three states.
+  const gated = rules.gate_command !== null && rules.gate_command.trim() !== "";
+  if (rules.gate_before_publish && !gated) {
+    found.push({
+      kind: "gate-missing",
+      weight: "stopped",
+      said: "Merges need a gate and none is set — every merge is refused.",
+      view: "rules",
+    });
+  }
+
+  if (rules.project_root !== null && rootExists === false) {
+    found.push({
+      kind: "folder-gone",
+      weight: "stopped",
+      said: "The recorded folder is not on this disk — nothing here can be read.",
+      view: "browse",
+    });
+  }
+
+  const inert = autonomyOf(rules).filter((rule) => rule.state === "never-fires").length;
+  if (inert > 0) {
+    found.push({
+      kind: "rules-inert",
+      weight: "held",
+      said:
+        inert === 1
+          ? "One rule is armed and can never fire."
+          : `${inert} rules are armed and can never fire.`,
+      view: "rules",
+    });
+  }
+
+  if (rules.queue_full) {
+    found.push({
+      kind: "brake-holding",
+      weight: "held",
+      said: "The ceiling is holding new work back until something is reviewed.",
+      view: "rules",
+    });
+  }
+
+  if (rules.project_root === null) {
+    found.push({
+      kind: "folder-unset",
+      weight: "unfinished",
+      said: "No folder has been recorded, so there is nothing to look inside.",
+      view: "rules",
+    });
+  }
+
+  return found;
+}
+
+/**
+ * One derived sentence about this project, for the page header.
+ *
+ * The header used to carry a constant — "reading the folder as it is on disk
+ * right now" — which describes the page rather than reporting on its subject,
+ * and which is false on the view that reads no folder at all. `PageHeader` says
+ * what belongs here in its own docstring: *the line that changes*.
+ *
+ * Nothing to say returns `undefined`, and the header then draws no line.
+ */
+export function headlineFor(rules: ProjectRules): string {
+  const parts: string[] = [rules.project_root ?? "no folder recorded"];
+
+  const running = autonomyOf(rules);
+  if (rules.rules_file === "unreadable") {
+    parts.push("rules unreadable");
+  } else if (running.length === 0) {
+    parts.push("nothing runs on its own");
+  } else {
+    const inert = running.filter((rule) => rule.state === "never-fires").length;
+    const said = `${running.length} ${running.length === 1 ? "rule" : "rules"} on its own`;
+    parts.push(inert === 0 ? said : `${said}, ${inert} never firing`);
+  }
+
+  if (rules.wip_limit === null) {
+    parts.push(`${rules.open_proposals} open, no ceiling`);
+  } else {
+    parts.push(
+      `${rules.open_proposals} of ${rules.wip_limit} open${rules.queue_full ? ", holding" : ""}`,
+    );
+  }
+
+  return parts.join(" · ");
+}
+
+/* ---------------------------------------------------------- reading text -- */
+
+/**
+ * A diff's lines, tagged by what git's first column says.
+ *
+ * Colour alone would not carry this — the `+` and the `-` are already at the
+ * start of each line and do the work for anybody who cannot separate the hues.
+ * The tag is what lets the stylesheet reinforce it.
+ */
+export type DiffLineKind = "add" | "remove" | "hunk" | "file" | "context";
+
+export interface DiffLine {
+  kind: DiffLineKind;
+  text: string;
+}
+
+/**
+ * How many lines of a diff are worth drawing one span each.
+ *
+ * A `git diff` of a dirty working tree has no upper bound — a regenerated lock
+ * file alone is tens of thousands of lines — and a span per line is a DOM node
+ * per line. Past this the diff is drawn as one block of text and the page says
+ * why, which is honest and stays fast.
+ */
+export const DIFF_LINE_CAP = 2000;
+
+export function diffLines(diff: string): DiffLine[] {
+  return diff.split("\n").map((text) => ({ kind: diffLineKind(text), text }));
+}
+
+function diffLineKind(line: string): DiffLineKind {
+  if (line.startsWith("@@")) return "hunk";
+  // `+++` and `---` are the file header's, not a changed line's, and they come
+  // in a pair that would otherwise read as one addition and one removal.
+  if (line.startsWith("+++") || line.startsWith("---")) return "file";
+  if (line.startsWith("diff --git") || line.startsWith("index ")) return "file";
+  if (line.startsWith("+")) return "add";
+  if (line.startsWith("-")) return "remove";
+  return "context";
+}
+
+/** Grep hits gathered under the file they are in, in the order the daemon sent them. */
+export interface MatchGroup {
+  path: string;
+  matches: InspectMatch[];
+}
+
+/**
+ * Matches grouped by file.
+ *
+ * A flat list repeats the path once per hit — forty times for a common word —
+ * and the path is the longest thing on the row. Grouped, the path is said once
+ * and the lines sit under it, which is what every reader of grep output does.
+ */
+export function groupMatches(matches: InspectMatch[]): MatchGroup[] {
+  const groups: MatchGroup[] = [];
+  for (const match of matches) {
+    const last = groups[groups.length - 1];
+    if (last !== undefined && last.path === match.path) {
+      last.matches.push(match);
+      continue;
+    }
+    groups.push({ path: match.path, matches: [match] });
+  }
+  return groups;
+}

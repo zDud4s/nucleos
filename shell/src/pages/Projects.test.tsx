@@ -146,6 +146,11 @@ async function renderProjects(initialPath: string) {
       getParentRoute: () => rootRoute,
       path: "/projects/$projectId/$view",
       component: Projects,
+      /* The folder, the open file and the query live in the location now, so a
+         router that dropped them would render a page that cannot browse. This
+         mirrors `router.tsx`; the case that proves the REAL route carries them
+         mounts the whole app, at the bottom of this file. */
+      validateSearch: (search: Record<string, unknown>) => search,
     }),
   ];
   const router = createRouter({
@@ -197,8 +202,13 @@ describe("Projects - the work-in-progress ceiling", () => {
         body: JSON.stringify({ limit: 3 }),
       });
     });
-    // The write is read back, not assumed: the panel refetches and says so.
-    expect(await screen.findByText(/with 0 open/)).toBeDefined();
+    // The write is read back, not assumed: the panel refetches and says so. The
+    // reading is a `Meter` — a count against a ceiling is the exact thing that
+    // primitive draws — and its label carries the same two numbers the bar does,
+    // which is what anything that cannot render a bar gets.
+    expect(
+      await screen.findByRole("img", { name: "open and unreviewed: 0 of 3" }),
+    ).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: "Remove the ceiling" }));
 
@@ -215,6 +225,9 @@ describe("Projects - the work-in-progress ceiling", () => {
       .map(([, init]) => String((init as RequestInit).body));
     expect(bodies).not.toContain(JSON.stringify({ limit: 0 }));
     expect(await screen.findByText(/no ceiling at all/)).toBeDefined();
+    // `null` draws a dashed rail saying so, which cannot be read as either an
+    // empty bar or a full one — the distinction this whole panel defends.
+    expect(await screen.findByRole("img", { name: /no ceiling/ })).toBeDefined();
   });
 });
 
@@ -246,8 +259,18 @@ describe("Projects - a rules file that cannot be read", () => {
 
     // And the empty rule lists below are explained rather than read as "there
     // are none": nothing could be loaded, which is a different fact.
-    expect(within(alert).getByText(/none could be loaded/)).toBeDefined();
+    expect(within(alert).getByText(/none of it could be loaded/)).toBeDefined();
     expect(screen.getByText("unreadable")).toBeDefined();
+
+    /*
+      And the list is not drawn at all. It used to print "nothing is scheduled"
+      and "no commit starts anything here" in two full panels directly under
+      this alert — four hundred pixels spent saying something the paragraph
+      above had just disclaimed. Saying nothing is the honest answer: nothing
+      about this project's rules is known.
+    */
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByText(/Nothing starts work here by itself/)).toBeNull();
   });
 
   it("does not call an absent rules file a fault", async () => {
@@ -289,14 +312,34 @@ describe("Projects - whether a merge waits for the gate", () => {
 
     await renderProjects("/projects/alpha/rules");
 
-    expect(await screen.findByText(/none is configured, so the queue refuses them/)).toBeDefined();
+    /*
+      An alert, and it names the key. It used to be a muted paragraph — quieter
+      than the sentence above it — inside a panel drawn `variant="dim"`, which
+      the primitive defines as "present but not the thing you came for". The
+      panel's own comment called this the worst of the three states; only the
+      styling disagreed.
+    */
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/gate_before_publish is on and no gate command is set/);
+    expect(alert.textContent).toMatch(/refuses every merge/);
   });
 });
 
 /* ------------------------------------------- the rules a person cannot see -- */
 
-describe("Projects - rules that are armed and inert", () => {
-  it("says a rule never fires, why, and what its silence would otherwise look like", async () => {
+describe("Projects - what starts work without you", () => {
+  /**
+   * One table over both clocks.
+   *
+   * Schedules and repo triggers used to be two panels, so a project with two of
+   * one and one of the other read as two half-empty lists rather than as three
+   * things that run here on their own — and `armed` meant two different things
+   * in the two of them, in the same green pill: on a schedule that the cron
+   * parses and today's allowance is not spent, on a trigger that a commit has
+   * been seen. One vocabulary now, and a trigger with nothing to compare
+   * against says exactly that.
+   */
+  it("draws both clocks as one list, and says what each rule is doing", async () => {
     answerWith(
       projectsWorld({
         rules: rules({
@@ -324,18 +367,193 @@ describe("Projects - rules that are armed and inert", () => {
 
     await renderProjects("/projects/alpha/rules");
 
-    const schedules = await screen.findByRole("list", { name: "Scheduled rules" });
-    expect(within(schedules).getByText("never fires")).toBeDefined();
+    const table = await screen.findByRole("table", { name: /start work in this project/ });
+    expect(within(table).getByText("never fires")).toBeDefined();
     // The daemon logs this at debug 2,880 times a day and the rule silently does
     // nothing; the page is where that stops being invisible.
-    expect(within(schedules).getByText("unknown timezone: Europe/Lisboa")).toBeDefined();
-    expect(within(schedules).getByText("UTC")).toBeDefined();
+    expect(within(table).getByText("unknown timezone: Europe/Lisboa")).toBeDefined();
+    expect(within(table).getByText("UTC")).toBeDefined();
 
-    // Armed with no first commit to compare against fires nothing, by design —
-    // and "armed" on its own would read as "will run".
-    const triggers = screen.getByRole("list", { name: "Repo triggers" });
-    expect(within(triggers).getByText("no commit seen yet")).toBeDefined();
-    expect(within(triggers).getByText(/no commit to compare a new one against/)).toBeDefined();
+    // Both rules are in the one table, and the trigger's state is its own word
+    // rather than the schedule's. "armed" on a trigger with no commit read as
+    // "will run", which is the opposite of what it means.
+    expect(within(table).getByText("nightly")).toBeDefined();
+    expect(within(table).getByText("on-main")).toBeDefined();
+    expect(within(table).getByText("no commit seen yet")).toBeDefined();
+    expect(within(table).queryByText("armed")).toBeNull();
+  });
+
+  /* The primitive that exists for exactly this and that this page had never
+     used. "Nothing is scheduled" and "no commit starts anything here" were two
+     sentences saying nothing twice. */
+  it("teaches rather than saying nothing twice, when nothing runs on its own", async () => {
+    answerWith(projectsWorld({ rules: rules({ schedules: [], repo_triggers: [] }) }));
+
+    await renderProjects("/projects/alpha/rules");
+
+    expect(await screen.findByText(/Nothing starts work here by itself/)).toBeDefined();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+});
+
+/* --------------------------------------------- what is wrong, at the top -- */
+
+describe("Projects - the concerns strip", () => {
+  /**
+   * The findings a person could not reach.
+   *
+   * Three of these lived under the fourth tab — the one with the most generic
+   * name on the page, behind a link from the Código mode that advertises only
+   * the other three — and two of them were muted body text quieter than the
+   * paragraph above them. Somebody landing on `browse`, which is where every
+   * arrival lands, could not learn that the project in front of them was doing
+   * nothing at all.
+   */
+  it("reports a halted project from a view that reads no rules", async () => {
+    answerWith(
+      projectsWorld({
+        rules: rules({
+          rules_file: "unreadable",
+          rules_error: "unknown field `schedule` at line 3 column 1",
+          gate_command: null,
+          gate_before_publish: true,
+          wip_limit: 2,
+          open_proposals: 2,
+          queue_full: true,
+        }),
+      }),
+    );
+
+    // Browse, deliberately: the finding must reach somebody who never opens the
+    // view that answers it.
+    await renderProjects("/projects/alpha/browse");
+
+    const strip = await screen.findByRole("region", { name: "What is wrong here" });
+    expect(within(strip).getByText(/nothing runs here at all/)).toBeDefined();
+    expect(within(strip).getByText(/every merge is refused/)).toBeDefined();
+    expect(within(strip).getByText(/holding new work back/)).toBeDefined();
+
+    /*
+      A headline and not the panel's paragraph. The two used to be the same
+      sentence twice, seven hundred pixels apart, which reads as a defect
+      rather than as a summary — and the panel is where the key somebody has
+      to change gets named.
+    */
+    expect(within(strip).queryByText(/gate_before_publish/)).toBeNull();
+
+    // And each leads to the view that answers it, rather than being a dead end.
+    expect(within(strip).getAllByRole("link", { name: "On its own" }).length).toBeGreaterThan(0);
+  });
+
+  /* Nothing at all when nothing is wrong. An "all clear" row would be a
+     permanent hole in the top of every healthy project's page — the same reason
+     the Teams console's in-flight strip renders nothing when nothing runs. */
+  it("draws nothing when there is nothing wrong", async () => {
+    answerWith(projectsWorld({ rules: rules({ wip_limit: 4, open_proposals: 1 }) }));
+
+    await renderProjects("/projects/alpha/rules");
+
+    await screen.findByRole("heading", { level: 1, name: "alpha" });
+    expect(screen.queryByRole("region", { name: "What is wrong here" })).toBeNull();
+  });
+
+  /* `PageHeader` forbids what this page used to do: "not a description of the
+     page — the title already says what the page is". It said "reading the
+     folder as it is on disk right now" on every view, including the one that
+     reads no folder. */
+  it("says what it found in the headline, not what the page is", async () => {
+    answerWith(
+      projectsWorld({
+        rules: rules({
+          project_root: "C:/repos/alpha",
+          wip_limit: 4,
+          open_proposals: 3,
+          schedules: [
+            {
+              name: "nightly",
+              cron: "0 3 * * *",
+              prompt: "tidy",
+              cwd: null,
+              timezone: null,
+              next_fire_at: null,
+              problem: "unknown timezone: Europe/Lisboa",
+              last_fired_at: null,
+              fires_today: 0,
+              daily_cap: 4,
+            },
+          ],
+        }),
+      }),
+    );
+
+    await renderProjects("/projects/alpha/browse");
+
+    expect(await screen.findByText(/1 rule on its own, 1 never firing/)).toBeDefined();
+    expect(screen.queryByText(/reading the folder as it is on disk right now/)).toBeNull();
+  });
+});
+
+/* ------------------------------------- the folder somebody is looking at -- */
+
+describe("Projects - what survives a reload", () => {
+  /**
+   * The claim the module header had been making since it was written.
+   *
+   * "The four views are in the route so a folder somebody is looking at
+   * survives a reload and can be linked to" — but only the VIEW ever was. The
+   * folder, the open file and the query were `useState`, so every one of them
+   * died on the first refresh and a search that found the thing could not be
+   * sent to anybody. Rendering straight at the URL is the reload.
+   */
+  it("opens on the folder and the file the location names", async () => {
+    answerWith(
+      projectsWorld({
+        entries: [{ name: "gate.rs", is_dir: false }],
+        file: "pub fn command(&self) -> Option<&str> {",
+      }),
+    );
+
+    await renderProjects("/projects/alpha/browse?path=core%2Fsrc&file=core%2Fsrc%2Fgate.rs");
+
+    // The trail is where the URL said, and the segment being stood on is text
+    // rather than a disabled control — it was the accent at 45% opacity, which
+    // made the one crumb worth reading the faintest thing in the trail.
+    const trail = await screen.findByRole("navigation", { name: "Folder path" });
+    const here = within(trail).getByText("/ src");
+    expect(here.getAttribute("aria-current")).toBe("location");
+    expect(here.closest("button")).toBeNull();
+
+    // And the file the URL named is open beside the listing, not lost.
+    expect(await screen.findByText("core/src/gate.rs")).toBeDefined();
+    expect(await screen.findByText(/pub fn command/)).toBeDefined();
+  });
+
+  it("opens on the search the location names, so a result can be sent to somebody", async () => {
+    answerWith(
+      projectsWorld({
+        matches: [
+          { path: "core/src/gate.rs", line: 47, text: "pub fn before_publish" },
+          { path: "core/src/gate.rs", line: 61, text: "if self.before_publish" },
+          { path: "core/src/vcs.rs", line: 612, text: "rules.gate_before_publish" },
+        ],
+      }),
+    );
+
+    await renderProjects("/projects/alpha/search?q=before_publish");
+
+    // Asked, not typed: the query came out of the location and the results are
+    // already there, with no keystroke in this test at all.
+    const found = await screen.findByRole("list", { name: "Matches" });
+    // The path once per file rather than once per hit — it is the longest thing
+    // on a row, and a common word in a real repository answers forty times.
+    expect(within(found).getAllByText("core/src/gate.rs")).toHaveLength(1);
+    expect(within(found).getByText("47")).toBeDefined();
+    expect(within(found).getByText("61")).toBeDefined();
+
+    // And the field is seeded from the location, so a link somebody followed
+    // shows the query that produced what they are looking at.
+    const field = screen.getByLabelText("Text to find") as HTMLInputElement;
+    expect(field.value).toBe("before_publish");
   });
 });
 
@@ -365,5 +583,27 @@ describe("Projects - the route", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Projects" })).toBeDefined();
     expect(router.state.location.pathname).toBe("/projects");
     expect(screen.queryByText("Projects is not built yet")).toBeNull();
+  });
+
+  /**
+   * The second full-app mount in this file, and the only thing that can prove
+   * what it proves.
+   *
+   * The routes built locally above declare their own `validateSearch`, so they
+   * would carry a folder through even if the real route dropped it — and a
+   * search param the router does not validate is a search param the page never
+   * sees. This is the reload, through the tree the app actually ships.
+   */
+  it("carries the folder through the real route, not just the one built here", async () => {
+    answerWith(projectsWorld({ entries: [{ name: "gate.rs", is_dir: false }] }));
+
+    const { router } = await renderApp({
+      initialPath: "/projects/alpha/inspect/browse?path=core%2Fsrc",
+    });
+
+    expect(await screen.findByRole("navigation", { name: "Folder path" })).toBeDefined();
+    expect(within(await screen.findByRole("navigation", { name: "Folder path" })).getByText("/ src"))
+      .toBeDefined();
+    expect(router.state.location.pathname).toBe("/projects/alpha/inspect/browse");
   });
 });

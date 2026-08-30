@@ -320,6 +320,24 @@ const SHOTS_TO_TAKE = [
   ["12-catalogue-editor", { path: "/agents", press: "Auditor Sénior" }],
   ["13-catalogue-editor-light", { path: "/agents", press: "Auditor Sénior", theme: "light" }],
   ["14-catalogue-new", { path: "/agents", press: "New agent" }],
+
+  /* The inspector. Four views over four deliberately awkward projects: `alpha`
+     works and is busy, `bravo` is stopped in the two ways nothing else in the
+     app reports, `charlie` was never given a folder, `delta` has one and no
+     rules — which is ordinary and must not photograph as a fault. */
+  ["20-inspect-browse", { path: "/projects/alpha/inspect/browse" }],
+  ["21-inspect-browse-light", { path: "/projects/alpha/inspect/browse", theme: "light" }],
+  /* The folder and the file come out of the URL now, so the shot is the reload
+     rather than a click the harness has to fake — and it photographs the two
+     column split, which only exists when a file is open. */
+  ["22-inspect-file", { path: "/projects/alpha/inspect/browse?path=core/src&file=core/src/config.rs" }],
+  ["23-inspect-search", { path: "/projects/alpha/inspect/search?q=gate_before_publish" }],
+  ["24-inspect-diff", { path: "/projects/alpha/inspect/diff" }],
+  ["25-inspect-rules", { path: "/projects/alpha/inspect/rules" }],
+  ["26-inspect-rules-light", { path: "/projects/alpha/inspect/rules", theme: "light" }],
+  ["27-inspect-stopped", { path: "/projects/bravo/inspect/rules" }],
+  ["28-inspect-no-folder", { path: "/projects/charlie/inspect/browse" }],
+  ["29-inspect-nothing-runs", { path: "/projects/delta/inspect/rules" }],
 ];
 
 let clean = true;
