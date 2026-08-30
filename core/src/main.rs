@@ -73,6 +73,7 @@ mod refine;
 mod relay;
 mod repo_trigger;
 mod resolver;
+mod run_stop;
 mod runner;
 mod runs;
 mod scheduler;

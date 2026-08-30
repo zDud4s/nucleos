@@ -610,7 +610,7 @@ fn classifier_governs_tools(
 ///
 /// Derived from `base` rather than given a constant of its own, so a test that shortens the clock
 /// still gets a short one, and an operator who tunes the deadline moves both together.
-fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
+pub(crate) fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
     if runs_unattended(mode) {
         base * crate::state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER
     } else {
@@ -628,7 +628,10 @@ fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Dur
 ///
 /// `email_triage` stays on the short one for its own reason, unchanged: it classifies one message
 /// against a local model, and a triage run silent for five minutes is stuck rather than busy.
-fn progress_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
+pub(crate) fn progress_timeout_for_mode(
+    base: std::time::Duration,
+    mode: &str,
+) -> std::time::Duration {
     if runs_unattended(mode) {
         base * crate::state::AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER
     } else {
