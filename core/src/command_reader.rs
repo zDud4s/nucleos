@@ -88,6 +88,27 @@ pub fn read(command: &str, shell: Shell) -> Reading<'_> {
         return Reading::Unreadable("command substitution runs a nested command");
     }
 
+    // **The assignments this reader strips are the reason this check has to exist.**
+    //
+    // `push_segment` drops leading `FOO=bar` because they belong to the shell rather than to the
+    // command, which is right for naming what ran — but it means `PATH=/tmp/x cargo test` arrives
+    // at the verdict as `cargo test`. A run may write files inside its own workspace, so it can put
+    // a `cargo` on a path it controls and then have the real one resolve to it. `export PATH=…` in
+    // an earlier segment does the same thing to every segment after it.
+    //
+    // Scanned over the whole raw line rather than per segment, and deliberately: the cost is
+    // refusing a line that merely MENTIONS one of these names as an argument (`echo PATH=x`), which
+    // is a false alarm, and the alternative is tracking which position each token is in. Refusing
+    // too much is the direction this file is allowed to be wrong in.
+    if let Some(name) = assigns_a_loader_variable(command) {
+        return match name {
+            // One `&'static str` per name, because `Unreadable` carries one and building a string
+            // here would make the whole enum own its reason for the sake of a message.
+            "path" => Reading::Unreadable("assigning PATH changes which program runs"),
+            _ => Reading::Unreadable("assigning a loader variable changes which program runs"),
+        };
+    }
+
     let policy = Policy {
         parens: false,
         lone_ampersand_refuses: true,
@@ -125,6 +146,46 @@ pub fn segments(command: &str, shell: Shell) -> Vec<&str> {
         Shell::PowerShell => blind_walk(command, policy),
     };
     walked.unwrap_or_default()
+}
+
+/// PURE: the same line with every character inside quotes replaced by `x`, or `None` when a quote
+/// is left open.
+///
+/// **What it is for, and it is one thing.** Splitting the line is only half of honouring quotes.
+/// The classifier's shape guards — "does this hold a `|`", "does this hold a `>`" — scan a segment
+/// for metacharacters, and a `|` the walk correctly KEPT inside an argument is still a `|` to a
+/// `contains`. That is not a hypothetical: run 900391 died in nine seconds on
+/// `grep -n "^mod \|^pub mod " core/src/main.rs`, whose alternation the walk reads perfectly and
+/// whose guard then refused, so the reader alone fixed nothing.
+///
+/// `x` rather than a space, and per character: the token structure has to survive, or a guard that
+/// reads tokens would see a quoted `a > b` turn into three of them and refuse a different way.
+///
+/// **Never for identity.** The masked line says WHERE the shell will act, never WHAT ran — the
+/// program name and its flags must be read off the original, or `--output=x` hides behind a quote.
+///
+/// `None` for an unterminated quote, and the caller must read it as "refuse". Everything after an
+/// unclosed `"` would otherwise mask as quoted, which turns the one line whose extent nobody can
+/// prove into the one line with no metacharacters in it.
+pub fn without_quoted_text(command: &str) -> Option<String> {
+    let mut masked = String::with_capacity(command.len());
+    let mut single = false;
+    let mut double = false;
+    for c in command.chars() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                masked.push('x');
+            }
+            '"' if !single => {
+                double = !double;
+                masked.push('x');
+            }
+            _ if single || double => masked.push('x'),
+            _ => masked.push(c),
+        }
+    }
+    (!single && !double).then_some(masked)
 }
 
 /// The quote-aware walk, lifted from `vcs::shell_segments` where it was already trusted with the
@@ -294,6 +355,42 @@ fn blind_walk(command: &str, policy: Policy) -> Result<Vec<&str>, &'static str> 
     Ok(segments)
 }
 
+/// PURE: the loader variable this line assigns, lowercased, or `None`.
+///
+/// The list is short on purpose and every entry earns its place by changing WHICH FILE runs or is
+/// loaded, rather than by being sensitive. `PATH` and `PATHEXT` decide what a bare program name
+/// resolves to; the `LD_`/`DYLD_` family injects code into a process that was going to be safe;
+/// `COMSPEC` and `SHELL` name the interpreter a program shells out to; `BASH_ENV` and `ENV` are
+/// scripts a non-interactive shell sources before it runs anything.
+///
+/// Variables that merely change behaviour — `CARGO_TARGET_DIR`, `RUST_LOG`, a project's own
+/// configuration — are deliberately NOT here. An autonomous run is told to set `CARGO_TARGET_DIR`
+/// by this repository's own instructions, and refusing it would close the door this work opened.
+fn assigns_a_loader_variable(command: &str) -> Option<&'static str> {
+    const LOADER_VARIABLES: &[&str] = &[
+        "path",
+        "pathext",
+        "ld_preload",
+        "ld_library_path",
+        "ld_audit",
+        "dyld_insert_libraries",
+        "dyld_library_path",
+        "comspec",
+        "shell",
+        "bash_env",
+        "env",
+        "ifs",
+    ];
+    command.split_whitespace().find_map(|token| {
+        let (name, _) = token.split_once('=')?;
+        let name = name.trim_start_matches('$').to_ascii_lowercase();
+        LOADER_VARIABLES
+            .iter()
+            .find(|known| ***known == name)
+            .copied()
+    })
+}
+
 /// One segment, trimmed and with leading environment assignments stripped, unless it is empty.
 ///
 /// `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and leaving
@@ -426,6 +523,38 @@ mod tests {
         assert_eq!(pieces("ls a\r\nls b"), vec!["ls a", "ls b"]);
     }
 
+    /// The hole this reader opened by inheriting `push_segment`, and the reason the check exists.
+    ///
+    /// Stripping `FOO=bar` is right for naming what ran, and it made `PATH=/tmp/x cargo test`
+    /// arrive at the verdict as a plain `cargo test`. A run may write inside its own workspace, so
+    /// it can put a `cargo` where it controls and have the real one resolve to it.
+    #[test]
+    fn an_assignment_that_changes_which_program_runs_is_refused() {
+        for command in [
+            "PATH=/tmp/evil cargo test",
+            "export PATH=/tmp/evil",
+            "LD_PRELOAD=./x.so cargo test",
+            "ls && export COMSPEC=C:/evil.exe",
+        ] {
+            assert!(
+                matches!(posix(command), Reading::Unreadable(_)),
+                "{command} should not be readable"
+            );
+        }
+    }
+
+    /// The other half of the same decision, and it is what keeps the check from closing the door
+    /// this work opened: this repository's own instructions tell an autonomous run to set
+    /// `CARGO_TARGET_DIR`, because the daemon holds the shared one.
+    #[test]
+    fn an_assignment_that_only_changes_behaviour_is_read_as_the_command_it_prefixes() {
+        assert_eq!(
+            pieces("CARGO_TARGET_DIR=C:/t cargo test"),
+            vec!["cargo test"]
+        );
+        assert_eq!(pieces("RUST_LOG=debug cargo check"), vec!["cargo check"]);
+    }
+
     #[test]
     fn a_here_string_swallows_nothing() {
         assert_eq!(
@@ -480,5 +609,54 @@ mod tests {
     fn the_classifier_reading_leaves_a_find_expression_whole() {
         let command = r"find . \( -name a -o -name b \)";
         assert_eq!(pieces(command), vec![command]);
+    }
+
+    /// The mask says WHERE the shell acts and forgets WHAT ran, and both halves are asserted here
+    /// because a caller that read identity off it would be reading `xxxx`.
+    #[test]
+    fn the_mask_blanks_what_is_quoted_and_keeps_the_shape_around_it() {
+        let masked = without_quoted_text(r#"grep -n "^mod \|^pub mod " core/src/main.rs"#).unwrap();
+        assert!(
+            !masked.contains('|'),
+            "the quoted alternation survived: {masked}"
+        );
+        assert!(
+            masked.starts_with("grep -n "),
+            "the program was masked: {masked}"
+        );
+        assert!(
+            masked.ends_with(" core/src/main.rs"),
+            "an argument was masked: {masked}"
+        );
+
+        // The separator outside the quotes survives; the one inside does not.
+        let masked = without_quoted_text(r#"git commit -m "a > b" | cat"#).unwrap();
+        assert!(
+            !masked.contains('>'),
+            "the quoted redirect survived: {masked}"
+        );
+        assert!(
+            masked.ends_with(" | cat"),
+            "the real pipe was masked: {masked}"
+        );
+        // Same character count, so a token that was one word stays one word.
+        let line = "echo 'a;b' c";
+        assert_eq!(
+            without_quoted_text(line)
+                .unwrap()
+                .split_whitespace()
+                .count(),
+            line.split_whitespace().count()
+        );
+    }
+
+    /// The refusal the callers depend on. Without it the line whose extent nobody can prove is the
+    /// line that masks to no metacharacters at all — the safest-looking of them all.
+    #[test]
+    fn an_unterminated_quote_masks_to_nothing_a_caller_may_trust() {
+        assert!(without_quoted_text(r#"echo "unclosed | whoami"#).is_none());
+        assert!(without_quoted_text("echo 'unclosed ; whoami").is_none());
+        // A quote closed by the OTHER kind is still open.
+        assert!(without_quoted_text(r#"echo "a' "#).is_none());
     }
 }

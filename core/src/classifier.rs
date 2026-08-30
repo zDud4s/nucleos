@@ -237,6 +237,29 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "git diff-tree",
     "git count-objects",
     "git grep",
+    // The second group, and it is here for the same reason the first one is: these were being
+    // discovered a dogfood night per command. Job 21 (2026-08-30) lost two of its four items to
+    // exactly two of them — `git reflog -20` stopped the review node and `git worktree list`
+    // stopped an implement node, and neither was a decision anybody wanted to make.
+    //
+    // `git worktree list` is pinned to the SUBCOMMAND rather than to the porcelain: `git worktree`
+    // adds, removes, moves and prunes, and no argument turns `list` into one of those.
+    // `git show-ref` needs an entry of its own because `matches_command_prefix` matches on a word
+    // boundary, so the `git show` above does not cover it; it is the same shape as `git rev-parse`
+    // and `git for-each-ref` already in the group above — plumbing with no writing spelling.
+    //
+    // `git reflog` is the exception and takes the whole porcelain, because its reading spelling
+    // takes arguments that cannot be enumerated — `-20`, `-n 20`, `--date=iso` are all the same
+    // read, and an exact list like `git branch`'s would have missed the one that actually cost the
+    // night. Its two destroying subcommands are refused next to the program instead, in
+    // `uses_a_flag_its_program_makes_dangerous`.
+    //
+    // `git stash list` and `git config --get` are NOT here, and their absence is the older decision
+    // rather than an oversight: `git_subcommands_that_can_mutate_stay_pending` pins both, arguing
+    // the porcelain and not the spelling. Neither cost a run, so neither is reversed here.
+    "git worktree list",
+    "git show-ref",
+    "git reflog",
     "cargo test",
     "cargo check",
     "cargo fmt --check",
@@ -291,6 +314,45 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "head",
     "tail",
     "wc",
+    // The text filters, added as a GROUP for the reason `git rev-parse` and its neighbours were:
+    // they were being discovered one autonomous run at a time. On 2026-08-29, `find … | sort`
+    // stopped a run four decisions in, and `sort` is as much a read as `head` is.
+    //
+    // `sort` is the one with a writing spelling, and `-o` is taken back below. `--output` was
+    // already refused for every program by `writes_an_output_file`.
+    //
+    // Deliberately absent, and each for its own reason rather than for caution in general:
+    //   `sed`  — `-i` edits in place, and the `e` command executes.
+    //   `awk`  — `system()` runs a command and `print > file` writes one.
+    //   `tee`  — writing is the whole program.
+    //   `xargs`— it exists to run the command it is given.
+    //   `uniq` — reads like the rest, but a SECOND positional argument is an output file, and
+    //            counting operands means knowing which of its flags take values. Left out until
+    //            something measures that it is worth that guard.
+    "sort",
+    "cut",
+    "tr",
+    "nl",
+    "rev",
+    "basename",
+    "dirname",
+    // `cmd || true` is how a shell says "this one is allowed to fail", and a run that cannot write
+    // it reaches for something the list does not have.
+    "true",
+    "false",
+    // Setting a variable for the segments that follow. Safe HERE and not in general: the reader
+    // refuses the whole line when it assigns a variable that changes which program runs or what it
+    // loads (`command_reader::assigns_a_loader_variable`), so what reaches this list can only change
+    // behaviour. Without it, `export CARGO_TARGET_DIR=…` — which this repository's own instructions
+    // tell an autonomous run to set, because the alternative is a build overwriting the running
+    // daemon — could not be set.
+    //
+    // What this does NOT rescue, and the distinction is worth stating because all three look
+    // alike: proposals #87, #88 and #96 each paired that export with `export PATH=…`, and the PATH
+    // half is still refused, deliberately. Those three did not need it — Git's bash already puts
+    // `/usr/bin` first — and CLAUDE.md was corrected on 2026-08-30 so a run stops being told to
+    // write it.
+    "export",
 ];
 /// Read-only commands whose safety lives in the EXACT form, so they get no argument tolerance: for
 /// `git branch` and `git remote` the listing spelling and the mutating spelling share a first token
@@ -743,9 +805,15 @@ fn classification(decision: &str, action_class: &'static str, reason: &str) -> C
 /// or is glued on (`2>out.txt`, `2>>out.txt`, `>&out.txt`). `<` has no stream-joining spelling worth
 /// keeping, so it counts whole. `&>out.txt` never arrives here at all — the lone `&` refuses the
 /// line one level up.
+/// Read outside quotes for the reason `has_shell_control` is: a commit message is the likeliest
+/// place in this repository for a `>` to appear as text, and `git commit -m "a > b"` is not a
+/// redirect. The mask keeps the token structure, so the `N>&M` shapes below still read as tokens.
 fn redirects_a_file(segment: &str) -> bool {
-    segment.contains('<')
-        || segment
+    let Some(masked) = crate::command_reader::without_quoted_text(segment) else {
+        return true;
+    };
+    masked.contains('<')
+        || masked
             .split_whitespace()
             .any(|token| token.contains('>') && !touches_no_file(token))
 }
@@ -927,15 +995,30 @@ fn has_destructive_flags(command: &str) -> bool {
 /// so refusing it would cost ordinary commit messages without closing anything.
 ///
 /// Now a backstop rather than the front door, and the split is worth knowing when reading this file
-/// top to bottom. `classify_shell_command` reaches `is_safe_command` only through `shell_segments`,
-/// which refuses `$(`, backticks and a lone `&` and cuts the line at every separator, and then
-/// through `classify_segment`, which refuses `<` and every `>` that could reach a file and strips
-/// the ones that could not. By the time a segment arrives here no character in this list can be in
-/// it. It stays because `is_safe_command` is a predicate about a command rather than about a
-/// segment, and the day something else calls it with a whole line the guard should be there.
+/// top to bottom. `classify_shell_command` reaches `is_safe_command` only through the command
+/// reader, which refuses `$(`, backticks and a lone `&` and cuts the line at every separator, and
+/// then through `classify_segment`, which refuses `<` and every `>` that could reach a file and
+/// strips the ones that could not. It stays because `is_safe_command` is a predicate about a
+/// command rather than about a segment, and the day something else calls it with a whole line the
+/// guard should be there.
+///
+/// **Read outside quotes, since 2026-08-30, and that correction is the whole point of the reader.**
+/// The walk keeps a quoted `|` inside its argument because a shell does; a `contains` over the raw
+/// segment then found it anyway and refused. `grep -n "^mod \|^pub mod " core/src/main.rs` is the
+/// measured case — an alternation in a pattern, nine seconds into run 900391 — and there is nothing
+/// to decide about it. Substitution is the exception and is still read RAW: `"$(whoami)"` and a
+/// backtick both run a nested command from inside double quotes, so masking would hide them.
 fn has_shell_control(command: &str) -> bool {
-    const SHELL_CONTROL: &[char] = &[';', '|', '&', '>', '<', '\n', '\r', '`'];
-    command.contains(SHELL_CONTROL) || command.contains("$(")
+    if command.contains('`') || command.contains("$(") {
+        return true;
+    }
+    // An unterminated quote is the one line whose extent cannot be proved, and it masks to a line
+    // with no metacharacters left in it. Refuse instead.
+    let Some(masked) = crate::command_reader::without_quoted_text(command) else {
+        return true;
+    };
+    const SHELL_CONTROL: &[char] = &[';', '|', '&', '>', '<', '\n', '\r'];
+    masked.contains(SHELL_CONTROL)
 }
 
 fn is_safe_command(command: &str) -> bool {
@@ -1023,7 +1106,21 @@ fn uses_a_flag_its_program_makes_dangerous(command: &str) -> bool {
         return false;
     };
     match program {
-        "go" => tokens.any(|token| token == "-o"),
+        // `-o` names an output binary on `go build`/`go test` and an output FILE on `sort`, and
+        // both take a path — so `go build -o ../../x.exe` and `sort -o ../../x f` write outside the
+        // workspace with none of the containment guards seeing it, because those read a tool call's
+        // `file_path` and a shell command has none. On `grep` the same two characters mean
+        // `--only-matching` and print to stdout, which is why this guard has to know the program.
+        "go" | "sort" => tokens.any(|token| token == "-o"),
+        // `git reflog` earns a prefix on the read list because its default subcommand shows. Two
+        // of its subcommands destroy instead: `expire` prunes entries and `delete` removes one,
+        // and the reflog is the last copy of a commit a reset walked away from. Read here rather
+        // than pinned as exact spellings, because the READING form takes arguments nobody can
+        // enumerate — see the list entry for the argument.
+        "git" => {
+            tokens.next() == Some("reflog")
+                && tokens.any(|token| matches!(token, "expire" | "delete"))
+        }
         // `tail -f` never returns. Not a security hole — but an autonomous run that hangs until its
         // ceiling is the failure this whole feature exists to avoid, and it costs a whole night.
         // `-F` needs no arm of its own: the command reaching here has been lowercased already.
@@ -2850,6 +2947,111 @@ mod tests {
             "pending_approval",
             "unrecognized",
         );
+    }
+
+    /// The three shapes that stopped autonomous runs on 2026-08-29, and none of them was a
+    /// decision anybody wanted to make: a pipe into `sort`, the environment this repository's own
+    /// instructions tell a run to set, and a `grep` whose pattern holds an alternation.
+    #[test]
+    fn the_read_only_shapes_that_stopped_four_runs_are_allowed() {
+        for command in [
+            r#"find . -name "*.rs" | sort"#,
+            "export CARGO_TARGET_DIR=C:/t && cargo test",
+            r#"grep -n "^mod \|^pub mod " core/src/main.rs | head -30"#,
+            "cargo check --tests 2>&1 | tail -80",
+            "cargo test || true",
+        ] {
+            let got = classify("Bash", &json!({ "command": command }), None);
+            // Named rather than folded into `assert_classification`: this is a table of five
+            // different lines, and a bare `left == right` says which verdict was wrong without
+            // saying which line produced it — which is a second run just to find out.
+            assert_eq!(
+                (got.decision.decision.as_str(), got.action_class),
+                ("allow", "read-local"),
+                "this line should not cost an approval: {command}"
+            );
+        }
+    }
+
+    /// The other half, and it is what makes the group above a decision rather than a widening: the
+    /// writing spellings of the same programs, and the assignment that changes which program runs.
+    #[test]
+    fn the_writing_spellings_of_those_same_programs_still_ask() {
+        for command in [
+            // `-o` is an output FILE on sort, and takes a path like `go build -o` does.
+            "sort -o ../../out.txt in.txt",
+            // Deliberately never added to the list: `-i` edits in place.
+            "sed -i s/a/b/ file.rs",
+            // `system()` runs a command.
+            r#"awk "{system(\"whoami\")}" file"#,
+            // Writing is the whole program.
+            "cargo test | tee out.txt",
+            // The hole the shared reader opened by stripping leading assignments.
+            "PATH=/tmp/evil cargo test",
+        ] {
+            let got = classify("Bash", &json!({ "command": command }), None);
+            assert_eq!(
+                (got.decision.decision.as_str(), got.action_class),
+                ("pending_approval", "unrecognized"),
+                "this line should still reach a person: {command}"
+            );
+        }
+    }
+
+    /// The other guard the masked reading corrects, and the one likeliest to bite: a commit message
+    /// is where a `>` or a `<` appears as prose, and `redirects_a_file` was reading it as a write.
+    /// The pair is the assertion — the quoted arrow is text, the bare one is still a file.
+    #[test]
+    fn an_arrow_inside_a_message_is_prose_and_outside_it_is_a_file() {
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({ "command": r#"git commit -m "read() -> Reading, and < is fine""# }),
+                None,
+            ),
+            "allow",
+            "vcs-local",
+        );
+        assert_classification(
+            classify("Bash", &json!({ "command": "git log > out.txt" }), None),
+            "pending_approval",
+            "unrecognized",
+        );
+    }
+
+    /// The two git reads that cost job 21 two of its four items, in the exact spelling the run
+    /// wrote them, plus the destroying spellings that keep the new entries honest.
+    #[test]
+    fn the_git_reads_that_stopped_job_21_are_allowed_and_the_writes_are_not() {
+        for command in [
+            // Review node, 2026-08-30 03:10.
+            r#"git branch -a -v && echo "---REFLOG---" && git reflog -20"#,
+            // Implement node, 2026-08-30 03:07.
+            "git worktree list; echo ---; git branch -a | head -50",
+            "git reflog show --date=iso",
+            "git show-ref --tags",
+        ] {
+            let got = classify("Bash", &json!({ "command": command }), None);
+            assert_eq!(
+                got.decision.decision, "allow",
+                "this read should not cost an approval: {command}"
+            );
+        }
+
+        for command in [
+            // Prunes the record a recovery reads.
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{0}",
+            // The porcelain whose subcommands write; only the pinned reading form is allowed.
+            "git worktree remove ../other",
+            "git worktree prune",
+        ] {
+            let got = classify("Bash", &json!({ "command": command }), None);
+            assert_ne!(
+                got.decision.decision, "allow",
+                "this write was waved through: {command}"
+            );
+        }
     }
 
     #[test]
