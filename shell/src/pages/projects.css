@@ -8,10 +8,12 @@
  * the defect shows up only as something looking wrong on a screen nobody is
  * testing. The other direction rots more quietly: five `.pj-chip-*` rules
  * outlived the project picker by a month, because the check had only ever been
- * run one way round. Both directions, every time:
+ * run one way round. Both directions, every time — and by the script rather
+ * than by hand, because a plain grep truncates `pj-concern-${weight}` to
+ * `pj-concern-` and then reports three live rules as dead, which is worse than
+ * no check at all:
  *
- *   grep -oh 'pj-[a-z-]*' src/pages/Projects.tsx | sort -u
- *   grep -oh '^\.pj-[a-z-]*' src/pages/projects.css | tr -d '.' | sort -u
+ *   node scripts/css-contract.mjs projects
  *
  * Everything here that shows a file, a path or a diff is monospaced and scrolls
  * **inside its own box**: a Windows path and a git diff are both wider than a
