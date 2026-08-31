@@ -150,7 +150,11 @@ export function ModeCodigo({ projectId, run, onPickRun }: ModeCodigoProps) {
  */
 function InspectorLink({ projectId }: { projectId: string }) {
   return (
-    <p className="text-xs text-text-faint">
+    /* The same measure as the sentence above it in the empty-state card. Without
+       it the two doors ran 1,590px on one line — a ribbon twice the width of
+       everything around it, which is the sort of thing a passing suite says
+       nothing about. */
+    <p className="mt-2 max-w-prose text-xs text-text-faint">
       <Link
         className="underline underline-offset-2"
         to="/projects/$projectId/inspect/$view"

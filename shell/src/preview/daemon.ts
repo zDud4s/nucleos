@@ -1,4 +1,5 @@
 import type { Agent } from "../data/agents";
+import type { Concurrency } from "../data/fleet";
 import type {
   InspectEntry,
   InspectMatch,
@@ -848,6 +849,16 @@ const MATCHES: InspectMatch[] = [
  * window into a connection state and hide the thing being looked at.
  */
 export function answer(path: string, init?: RequestInit): unknown {
+  /*
+    The house's capacity, with nobody holding a slot. It is here so the Codigo
+    mode can be photographed at all: it reads `concurrency.data?.projects` and
+    then calls `.find` on it unguarded, so the empty-list default this file
+    gives everything else was a crash rather than an empty screen — and the
+    empty screen is exactly the one worth looking at, because the door into the
+    inspector is drawn in it.
+  */
+  if (path === "/concurrency") return { house: { limit: 4, held: 0 }, projects: [] } satisfies Concurrency;
+
   if (path === "/projects") return PROJECTS;
 
   /*

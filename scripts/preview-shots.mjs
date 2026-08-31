@@ -338,6 +338,10 @@ const SHOTS_TO_TAKE = [
   ["27-inspect-stopped", { path: "/projects/bravo/inspect/rules" }],
   ["28-inspect-no-folder", { path: "/projects/charlie/inspect/browse" }],
   ["29-inspect-nothing-runs", { path: "/projects/delta/inspect/rules" }],
+
+  /* The Codigo mode's empty state, which is where both doors into the inspector
+     are drawn — and the only place in the app that opens it. */
+  ["30-codigo-doors", { path: "/projects/alpha/codigo" }],
 ];
 
 let clean = true;
