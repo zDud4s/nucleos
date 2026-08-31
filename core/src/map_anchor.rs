@@ -3304,7 +3304,38 @@ mod tests {
 
         let root = repository_root();
         let specs = catalogue(&root);
+
+        // No corpus at all, which is a fact about the checkout and not about this table.
+        //
+        // `.ai/` is gitignored by the owner's standing decision, so a git worktree and a fresh
+        // clone both start with an empty `.ai/specs/` -- and then every pair below fails on a slug
+        // the checkout cannot possibly hold. The first one reported wins, so the suite says "the
+        // ground truth scores core/src/email.rs against 2026-07-28-email-pillar-design, which this
+        // project does not have", which reads as a regression in a table nobody touched. It stopped
+        // a `gates.sh all` in a worktree on 2026-08-31 and cost a bisection of 3,229 tests to
+        // recognise. This repository keeps worktrees for autonomous jobs, so it will happen again.
+        //
+        // Skipped and not relaxed: nothing below is weakened. The moment the corpus is here, every
+        // assertion runs at full strength, and a real corpus missing one spec still fails -- which
+        // is the case this test was written for.
+        //
+        // The condition is NONE of the table's slugs, not an empty folder. A worktree where
+        // somebody wrote one spec of their own holds a corpus of exactly one, which is not empty
+        // and answers nothing -- the first draft of this guard checked `is_empty()` and would have
+        // failed in the very checkout that prompted it. Some present and some missing is the real
+        // finding and still fails.
         let slugs: BTreeSet<&str> = specs.iter().map(|spec| spec.slug.as_str()).collect();
+        if !GROUND_TRUTH.iter().any(|(_, slug)| slugs.contains(slug)) {
+            eprintln!(
+                "skipped: {} holds none of the {} documents this table scores against, so there is \
+                 nothing here to check it with. `.ai/` is gitignored, so a worktree and a fresh \
+                 clone both start without the corpus; copy `.ai/specs/` in from the main checkout \
+                 to run this.",
+                root.display(),
+                GROUND_TRUTH.len()
+            );
+            return;
+        }
         for (file, slug) in GROUND_TRUTH {
             assert!(
                 slugs.contains(slug),
