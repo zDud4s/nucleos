@@ -276,6 +276,12 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/presets/{id}"),
     (Method::GET, "/runs/awaiting-approval"),
     (Method::GET, "/runs/{id}"),
+    // A stop report reads rows that already happened: the run's own row plus, for a `gate` or
+    // `timeout` kind, the `shadow_decisions` leading up to it. It starts nothing and holds no
+    // resource, so a read-only key that could not reach it would have to be handed Admin — the
+    // scope that CAN launch runs — for a route that launches none. The narrower grant is the
+    // safer one.
+    (Method::GET, "/runs/{id}/stop"),
     (Method::GET, "/assistant/{turn_id}"),
     (Method::GET, "/jobs"),
     (Method::GET, "/jobs/{id}"),
@@ -1506,6 +1512,14 @@ mod tests {
         }
         assert!(!permits(&scope, &Method::GET, "/future-sensitive-route"));
         assert!(!permits(&scope, &Method::POST, "/status"));
+    }
+
+    /// A stop report is a read of rows that already happened, not an action — so the weakest key
+    /// reaches it, the same as `GET /runs/{id}` beside it in the table.
+    #[test]
+    fn a_read_only_api_key_may_read_why_a_run_stopped() {
+        let scope = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        assert!(permits(&scope, &Method::GET, "/runs/{id}/stop"));
     }
 
     /// Sending is Admin-only by construction: `POST /email/send` is in NEITHER table.

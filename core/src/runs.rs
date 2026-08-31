@@ -3242,6 +3242,154 @@ pub async fn get_run(
     Ok(Json(run))
 }
 
+/// `?leading=` on `GET /runs/{id}/stop`: how many decisions accompany the last one. Absent is
+/// [`STOP_LEADING_DEFAULT`]; anything above [`STOP_LEADING_MAX`] is clamped rather than refused
+/// (spec §4).
+#[derive(serde::Deserialize)]
+pub struct StopQuery {
+    pub leading: Option<i64>,
+}
+
+const STOP_LEADING_DEFAULT: i64 = 10;
+const STOP_LEADING_MAX: i64 = 100;
+
+/// The `runs` columns `GET /runs/{id}/stop` needs, read in one query the way `get_run` reads its
+/// own wider set. Not `RunStatusResponse`: that struct answers a different route's shape, and
+/// borrowing it here would make an unrelated route's column list load-bearing for this one's.
+#[derive(sqlx::FromRow)]
+struct RunStopRow {
+    status: String,
+    mode: String,
+    exit_code: Option<i64>,
+    stderr: Option<String>,
+    successor_run_id: Option<i64>,
+    created_at: String,
+    completed_at: Option<String>,
+}
+
+/// One `shadow_decisions` row, read for `GET /runs/{id}/stop` only — the same seven columns spec
+/// §5.2 lists, in the shape `sqlx` fills directly rather than a positional tuple.
+#[derive(sqlx::FromRow)]
+struct StopDecisionRow {
+    tool_name: String,
+    action_class: String,
+    decision: String,
+    reason: Option<String>,
+    classifier_version: i64,
+    policy_digest: Option<String>,
+    tool_input: Option<String>,
+    created_at: String,
+}
+
+impl StopDecisionRow {
+    fn into_view(self) -> crate::run_stop::GateDecisionView {
+        crate::run_stop::gate_decision_view(
+            self.tool_name,
+            self.action_class,
+            self.decision,
+            self.reason,
+            self.classifier_version,
+            self.policy_digest,
+            self.tool_input,
+            self.created_at,
+        )
+    }
+}
+
+/// Seconds between `created_at` and `completed_at` — or, for a run still running, between
+/// `created_at` and now. Always a majorant of how long the run actually ran (spec §6): the
+/// interval includes any time the run spent queued before it started, which `runs` does not
+/// record separately.
+///
+/// `None` only if `created_at` itself fails to parse, which every writer of that column in this
+/// codebase writes as `chrono::Utc::now().to_rfc3339()` — so in practice this is infallible.
+fn elapsed_seconds_since_created(created_at: &str, completed_at: Option<&str>) -> Option<i64> {
+    let parse = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value).map(|when| when.with_timezone(&chrono::Utc))
+    };
+    let created = parse(created_at).ok()?;
+    let end = match completed_at {
+        Some(value) => parse(value).ok()?,
+        None => chrono::Utc::now(),
+    };
+    Some((end - created).num_seconds())
+}
+
+/// `GET /runs/{id}/stop` (spec `.ai/specs/2026-08-29-porque-parou-design.md` §4): why a run
+/// stopped, in one call. `404` if the run does not exist; `200` — never `204` — for every run that
+/// does, including one still `running` (spec §4, §11 item 5).
+///
+/// Thin by design (spec §7): this reads the run row and, only for `gate` and `timeout` kinds, the
+/// `shadow_decisions` leading up to it, and hands both to `run_stop::build_response` to become the
+/// answer. Deriving `kind` here first — rather than inside `build_response` — is what lets this
+/// skip the `shadow_decisions` query entirely for the other six kinds.
+pub async fn get_run_stop(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<StopQuery>,
+) -> Result<Json<crate::run_stop::RunStopResponse>, StatusCode> {
+    let row = sqlx::query_as::<_, RunStopRow>(
+        "SELECT status, mode, exit_code, stderr, successor_run_id, created_at, completed_at
+         FROM runs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let kind =
+        crate::run_stop::derive_kind(&row.status).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let decisions = if crate::run_stop::kind_shows_leading_up(kind) {
+        let leading = query
+            .leading
+            .unwrap_or(STOP_LEADING_DEFAULT)
+            .clamp(0, STOP_LEADING_MAX);
+        // `kind: gate` fetches one extra row: the newest fills `gate`, and the `leading` after it
+        // fill `leading_up`. `kind: timeout` never fills `gate` (spec §5.1), so it fetches exactly
+        // `leading` rows, all of which become `leading_up` — otherwise `leading_up` would end up one
+        // row longer than `?leading=` promised.
+        let limit = if crate::run_stop::kind_shows_gate(kind) {
+            leading + 1
+        } else {
+            leading
+        };
+        sqlx::query_as::<_, StopDecisionRow>(
+            "SELECT tool_name, action_class, decision, reason, classifier_version, policy_digest,
+                    tool_input, created_at
+             FROM shadow_decisions WHERE run_id = ?
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(id)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(StopDecisionRow::into_view)
+        .collect()
+    } else {
+        Vec::new()
+    };
+
+    let elapsed_seconds =
+        elapsed_seconds_since_created(&row.created_at, row.completed_at.as_deref())
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(crate::run_stop::build_response(
+        id,
+        row.status,
+        kind,
+        &row.mode,
+        elapsed_seconds,
+        row.exit_code,
+        row.stderr,
+        row.successor_run_id,
+        decisions,
+    )))
+}
+
 /// PURE: whether a run status means the run is over for good.
 ///
 /// `finalize_termination` is called with three distinct statuses by five callers, and one of them —

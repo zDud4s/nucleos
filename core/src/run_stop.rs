@@ -8,19 +8,6 @@
 //! and the `shadow_decisions` rows stays in the HTTP handler, which calls the functions here to turn
 //! what it read into a response.
 
-// This is a bin-only crate, so dead-code reachability starts at `main`, and this module has no
-// caller yet: `GET /runs/{id}/stop` is a later item of the same job (spec §7's own handler, in
-// `http.rs`) that reads the run row and the `shadow_decisions` rows and calls what is defined here
-// to turn them into a response. Until that lands, nothing reachable from `main` ever calls into this
-// file.
-//
-// Scoped to the non-test build, the way `contacts.rs` and `errands.rs` scope their own suppression,
-// so it silences only the absence of a production caller. Under `cfg(test)` the lint stays live —
-// every item below is exercised by this module's own table tests, and one that stops being exercised
-// has to say so. The instruction, not a description: DELETE THIS LINE with the change that wires
-// `http.rs` to this module.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde::Serialize;
 
 use crate::runs::{ENDED_RUN_STATUSES, TERMINAL_RUN_STATUSES};
@@ -157,6 +144,16 @@ pub(crate) fn kind_shows_leading_up(kind: Kind) -> bool {
     matches!(kind, Kind::Gate | Kind::Timeout)
 }
 
+/// Whether `kind` is the one the response carries the `gate` object for (spec §5.1's table: only
+/// the `awaiting_approval` row lists "objecto `gate`" in its "traz" column — the `timed_out` row
+/// lists only "objecto `timeout` + `leading_up`"). A `timeout` stop was not caused by any one
+/// decision the way a pending gate is, so nothing is singled out of `leading_up` for it: `gate`
+/// stays `null` and every fetched decision — not `leading_up.len() + 1` of them — lands in
+/// `leading_up`.
+pub(crate) fn kind_shows_gate(kind: Kind) -> bool {
+    matches!(kind, Kind::Gate)
+}
+
 /// One `shadow_decisions` row as the response reports it (spec §5.2): the same columns the table
 /// holds, except `tool_input` — which can be a whole file — is truncated, and the truncation is
 /// declared by the sibling `tool_input_truncated` rather than folded into the field as a marker
@@ -199,6 +196,129 @@ pub struct RunStopResponse {
     pub stderr_tail: Option<String>,
     /// `kind: superseded` only.
     pub successor_run_id: Option<i64>,
+}
+
+/// How much of a raw `tool_input` a [`GateDecisionView`] carries verbatim before it is cut (spec
+/// §5.2: "pode ser um ficheiro inteiro"). Not spec-fixed; chosen to keep one decision readable
+/// without making a `leading_up` list of a hundred of them heavy.
+const TOOL_INPUT_PREVIEW_CHARS: usize = 2000;
+
+/// PURE: builds one [`GateDecisionView`] from a `shadow_decisions` row's own columns, applying the
+/// §5.2 truncation. The HTTP handler reads the row; this is the shaping of it into the response.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gate_decision_view(
+    tool_name: String,
+    action_class: String,
+    decision: String,
+    reason: Option<String>,
+    classifier_version: i64,
+    policy_digest: Option<String>,
+    tool_input: Option<String>,
+    created_at: String,
+) -> GateDecisionView {
+    let tool_input_truncated = tool_input
+        .as_deref()
+        .is_some_and(|raw| raw.chars().count() > TOOL_INPUT_PREVIEW_CHARS);
+    let tool_input = if tool_input_truncated {
+        tool_input.map(|raw| raw.chars().take(TOOL_INPUT_PREVIEW_CHARS).collect())
+    } else {
+        tool_input
+    };
+    GateDecisionView {
+        tool_name,
+        action_class,
+        decision,
+        reason,
+        classifier_version,
+        policy_digest,
+        tool_input,
+        tool_input_truncated,
+        created_at,
+    }
+}
+
+/// The one sentence every response carries (spec §5: "sempre presente"), one per `kind` — even
+/// `completed` and `running`, which are not a stop in the sense the rest of the response describes.
+fn summary_for(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Gate => "the run is paused, waiting for a human to approve or deny a tool call",
+        Kind::Timeout => "the run timed out",
+        Kind::Failed => "the run failed",
+        Kind::Cancelled => "the run was cancelled",
+        Kind::Interrupted => "the run was interrupted",
+        Kind::Superseded => "the run was superseded by a later run",
+        Kind::Completed => "the run completed",
+        Kind::Running => "the run is still running",
+    }
+}
+
+/// PURE: assembles the full [`RunStopResponse`] (spec §5, §7's "montar a resposta") from `kind`
+/// plus everything the HTTP handler read — the run's own columns and, for `gate` and `timeout`
+/// kinds, the `shadow_decisions` rows newest-first. `kind` arrives already derived rather than
+/// being derived again in here, because the handler needs it first anyway, to decide whether the
+/// `shadow_decisions` query is worth making.
+///
+/// `decisions` splits in one place: for `kind: gate` only, its first row (the most recent) becomes
+/// `gate` and the rest become `leading_up`; for `kind: timeout`, nothing is singled out — every row
+/// passed in becomes `leading_up` and `gate` stays `None` (spec §5.1's table credits `timed_out`
+/// with "objecto `timeout` + `leading_up`" only, not `gate`). Every other kind gets `None` for both,
+/// per spec §5.1's "os campos ausentes vão a null e não omitidos". Every other kind-specific field
+/// follows the same rule: present in the struct, `None` unless `kind` is the one kind that uses it.
+///
+/// Callers must size `decisions` to match: `leading + 1` rows for `kind: gate` (one becomes `gate`,
+/// `leading` remain), `leading` rows for `kind: timeout` (all become `leading_up`) — otherwise
+/// `leading_up`'s length silently drifts from what `?leading=` promised.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_response(
+    run_id: i64,
+    status: String,
+    kind: Kind,
+    mode: &str,
+    elapsed_seconds: i64,
+    exit_code: Option<i64>,
+    stderr_tail: Option<String>,
+    successor_run_id: Option<i64>,
+    decisions: Vec<GateDecisionView>,
+) -> RunStopResponse {
+    let mut decisions = decisions.into_iter();
+    let gate = if kind_shows_gate(kind) {
+        decisions.next()
+    } else {
+        None
+    };
+    let leading_up = if kind_shows_leading_up(kind) {
+        Some(decisions.collect())
+    } else {
+        None
+    };
+    let timeout =
+        matches!(kind, Kind::Timeout).then(|| derive_timeout_verdict(elapsed_seconds, mode));
+
+    RunStopResponse {
+        run_id,
+        status,
+        kind,
+        summary: summary_for(kind).to_owned(),
+        decisions_recorded: decisions_recorded(mode),
+        gate,
+        timeout,
+        leading_up,
+        exit_code: if kind == Kind::Failed {
+            exit_code
+        } else {
+            None
+        },
+        stderr_tail: if kind == Kind::Failed {
+            stderr_tail
+        } else {
+            None
+        },
+        successor_run_id: if kind == Kind::Superseded {
+            successor_run_id
+        } else {
+            None
+        },
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +508,179 @@ mod tests {
             value["tool_input"],
             serde_json::json!("{\"command\":\"ls\"}")
         );
+    }
+
+    fn decision(tool_input: Option<&str>) -> GateDecisionView {
+        gate_decision_view(
+            "Bash".to_owned(),
+            "read-local".to_owned(),
+            "allow".to_owned(),
+            Some("read-only".to_owned()),
+            11,
+            Some("abc123".to_owned()),
+            tool_input.map(str::to_owned),
+            "2026-08-29T00:00:00Z".to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_short_tool_input_passes_through_unmarked() {
+        let view = decision(Some(r#"{"command":"ls"}"#));
+        assert_eq!(view.tool_input.as_deref(), Some(r#"{"command":"ls"}"#));
+        assert!(!view.tool_input_truncated);
+    }
+
+    #[test]
+    fn a_tool_input_over_the_preview_cap_is_cut_and_flagged() {
+        let huge = "x".repeat(TOOL_INPUT_PREVIEW_CHARS * 2);
+        let view = decision(Some(&huge));
+        assert_eq!(
+            view.tool_input.as_ref().map(String::len),
+            Some(TOOL_INPUT_PREVIEW_CHARS)
+        );
+        assert!(view.tool_input_truncated);
+    }
+
+    #[test]
+    fn no_tool_input_at_all_is_not_a_truncation() {
+        let view = decision(None);
+        assert_eq!(view.tool_input, None);
+        assert!(!view.tool_input_truncated);
+    }
+
+    /// Spec §5.1: only `gate` and `timeout` carry `gate`/`leading_up`; the other six kinds carry
+    /// neither, whatever `decisions` the handler happened to pass in.
+    #[test]
+    fn only_the_gate_kind_singles_out_a_gate_from_decisions() {
+        let decisions = vec![decision(Some("most recent")), decision(Some("older"))];
+
+        let gate_response = build_response(
+            1,
+            "irrelevant".to_owned(),
+            Kind::Gate,
+            "shadow",
+            0,
+            None,
+            None,
+            None,
+            decisions.clone(),
+        );
+        assert_eq!(
+            gate_response.gate.as_ref().map(|g| &g.tool_input),
+            Some(&Some("most recent".to_owned()))
+        );
+        assert_eq!(gate_response.leading_up.map(|rest| rest.len()), Some(1));
+
+        for kind in [
+            Kind::Failed,
+            Kind::Cancelled,
+            Kind::Interrupted,
+            Kind::Superseded,
+            Kind::Completed,
+            Kind::Running,
+        ] {
+            let response = build_response(
+                1,
+                "irrelevant".to_owned(),
+                kind,
+                "shadow",
+                0,
+                None,
+                None,
+                None,
+                decisions.clone(),
+            );
+            assert_eq!(response.gate, None, "{kind:?}");
+            assert_eq!(response.leading_up, None, "{kind:?}");
+        }
+    }
+
+    /// Spec §5.1's table credits `timed_out` with "objecto `timeout` + `leading_up`" only — not
+    /// `gate`. A timeout was not caused by any one decision the way a pending gate is, so nothing is
+    /// singled out: every row the caller passes in lands in `leading_up`, and `gate` stays `None`
+    /// even though `shadow_decisions` rows exist for the run.
+    #[test]
+    fn the_timeout_kind_never_singles_out_a_gate() {
+        let decisions = vec![decision(Some("most recent")), decision(Some("older"))];
+
+        let response = build_response(
+            1,
+            "timed_out".to_owned(),
+            Kind::Timeout,
+            "shadow",
+            0,
+            None,
+            None,
+            None,
+            decisions,
+        );
+        assert_eq!(response.gate, None);
+        assert_eq!(response.leading_up.map(|rest| rest.len()), Some(2));
+    }
+
+    /// Spec §5.1: each kind-specific field is `Some` only for the one kind that uses it.
+    #[test]
+    fn kind_specific_fields_are_populated_only_for_their_own_kind() {
+        let failed = build_response(
+            1,
+            "failed".to_owned(),
+            Kind::Failed,
+            "real",
+            0,
+            Some(1),
+            Some("boom".to_owned()),
+            None,
+            vec![],
+        );
+        assert_eq!(failed.exit_code, Some(1));
+        assert_eq!(failed.stderr_tail.as_deref(), Some("boom"));
+        assert_eq!(failed.successor_run_id, None);
+
+        let superseded = build_response(
+            1,
+            "superseded".to_owned(),
+            Kind::Superseded,
+            "real",
+            0,
+            Some(1),
+            Some("boom".to_owned()),
+            Some(2),
+            vec![],
+        );
+        assert_eq!(superseded.exit_code, None);
+        assert_eq!(superseded.stderr_tail, None);
+        assert_eq!(superseded.successor_run_id, Some(2));
+    }
+
+    #[test]
+    fn build_response_derives_the_timeout_payload_only_for_the_timeout_kind() {
+        let timeout = build_response(
+            1,
+            "timed_out".to_owned(),
+            Kind::Timeout,
+            "worktree",
+            37 * 60,
+            None,
+            None,
+            None,
+            vec![],
+        );
+        assert_eq!(
+            timeout.timeout.map(|payload| payload.verdict),
+            Some(Verdict::Silence)
+        );
+
+        let completed = build_response(
+            1,
+            "completed".to_owned(),
+            Kind::Completed,
+            "worktree",
+            37 * 60,
+            None,
+            None,
+            None,
+            vec![],
+        );
+        assert_eq!(completed.timeout, None);
     }
 }
