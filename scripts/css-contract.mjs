@@ -43,21 +43,28 @@
  * rule beneath it as spoken for, and is listed separately as something a person
  * has to read.
  *
- * **What it cannot decide, and says so by naming the file.** A kebab string in a
- * literal is indistinguishable from a class name. Two of the three findings it
- * reports today are that ambiguity and not defects: `fleet-exclusion` is an API
- * value in `data/waiting.ts`, and `chats-zoom` is a test asserting a class is
- * ABSENT (`.not.toContain`). Both are one line to dismiss because the location
- * is printed beside them. The third is real, and is the kind only this finds:
- * `.sy-token-name` is styled in `system.css` and written in `System.tsx` only as
- * an `id`, so the rule matches nothing — live-looking, and dead. It is left
- * alone here deliberately: repairing it means deciding whether the Name field
- * was meant to carry that class, which changes how System looks, and that is
- * not a call this pass gets to make.
+ * **Every finding it made before this paragraph was its own bug**, which is
+ * worth recording because each was the same mistake in a new coat: deleting a
+ * name from the index everywhere because ONE occurrence of it was something
+ * else. `teams-alone` is a literal class and the stem of `teams-alone-${mode}`.
+ * `sy-token-name` is the id of a field in the mint form and the class on a
+ * token's name in the list below it. `feed-kind-options` is a `<datalist>` id
+ * and the `list=` pointing at it. Each was reported as a live rule gone dead or
+ * a class nobody styled, and each is repaired the same way — mask the
+ * occurrence, never the name. A checker that cries wolf is worse than none,
+ * because acting on it deletes working CSS.
+ *
+ * **What it cannot decide, it says by naming the file.** A kebab string in a
+ * literal is indistinguishable from a class name, and the two findings left in
+ * this repository are exactly that: `fleet-exclusion` is an API value in
+ * `data/waiting.ts`, and `chats-zoom` is a test asserting a class is ABSENT
+ * (`.not.toContain`). Neither is a defect, and both are one line to dismiss
+ * because the location is printed beside them. 18 of 20 sheets are clean.
  *
  * Scaffolding, not a gate. It reports; `scripts/gates.sh` does not call it.
- * Wiring it in means first answering those three, which is a different piece of
- * work from building the instrument that says which ones there are.
+ * Wiring it in means deciding what to do about those two — a suppression list,
+ * or extraction narrowed to `className` — which is a different piece of work
+ * from building the instrument that says which ones there are.
  *
  *   node scripts/css-contract.mjs [name ...]
  */
@@ -75,6 +82,18 @@ const SHARED = new Set(["ui"]);
 
 /** A family with one rule in it is a coincidence, not a namespace. */
 const FAMILY_FLOOR = 2;
+
+/**
+ * Every attribute that carries an element id rather than a class name.
+ *
+ * More than `id` and `htmlFor`, and the list is not decorative: `feed-kind-options`
+ * is a `<datalist>` id and the `list=` on the input that points at it, and with
+ * only the first two masked it was reported as a class nobody had styled. The
+ * ARIA relations are here for the same reason, before they cost somebody the
+ * same ten minutes.
+ */
+const ID_REFERENCE =
+  /(?:id|htmlFor|list|form|aria-labelledby|aria-describedby|aria-controls|aria-owns|aria-activedescendant)="[a-z][a-z0-9-]*"/g;
 
 /** Comments carry class names as prose — `.pj-chip-*` in a sentence is not a rule. */
 const stripCss = (text) => text.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -106,7 +125,6 @@ function sourcesUnder(dir) {
 function indexSources() {
   const named = new Set();
   const stems = new Set();
-  const ids = new Set();
   const where = new Map();
   /* Where each token was written, so a reader can dismiss a false one at a
      glance. A kebab string in a literal is indistinguishable from a class name
@@ -116,7 +134,6 @@ function indexSources() {
 
   for (const path of sourcesUnder(SRC)) {
     const text = stripCode(readFileSync(path, "utf8"));
-    for (const m of text.matchAll(/(?:id|htmlFor)="([a-z][a-z0-9-]*)"/g)) ids.add(m[1]);
     for (const m of text.matchAll(/([a-z][a-z0-9]*(?:-[a-z0-9]+)*-)\$\{/g)) stems.add(m[1]);
     /*
       Blank out the hole and the name in front of it, and only there.
@@ -128,7 +145,17 @@ function indexSources() {
       dropping it reported three live rules as dead. Masking the occurrence
       leaves every other mention of the name standing.
     */
-    const masked = text.replace(/[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\$\{[^}]*\}/g, " ");
+    const masked = text
+      /*
+        The id and the label that points at it, blanked where they are written.
+        A name can be BOTH: `sy-token-name` is the id of a field in the mint
+        form and the class on a token's name in the list below it. Dropping the
+        name from the index because one occurrence was an id reported a live
+        rule as dead — the same mistake as deleting a stem's head, one line
+        further down, and it was made here first.
+      */
+      .replace(ID_REFERENCE, " ")
+      .replace(/[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\$\{[^}]*\}/g, " ");
     for (const m of masked.matchAll(/[a-z][a-z0-9]*(?:-[a-z0-9]+)+/g)) {
       named.add(m[0]);
       if (!seen.has(m[0])) seen.set(m[0], new Set());
@@ -138,7 +165,6 @@ function indexSources() {
       where.get(family).add(basename(path));
     }
   }
-  for (const id of ids) named.delete(id);
   return { named, stems, where, seen };
 }
 
