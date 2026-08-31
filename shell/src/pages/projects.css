@@ -3,14 +3,23 @@
  * is for the queue, `ap-` for the cockpit and `fleet-` for the fleet.
  *
  * The rule this file lives under: **no class appears in `Projects.tsx` that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing. Grep the component against this
- * file before calling the page done.
+ * not defined below, and no rule below has no user in `Projects.tsx`.** `tsc`
+ * and vitest both pass happily on a class no stylesheet has ever heard of, and
+ * the defect shows up only as something looking wrong on a screen nobody is
+ * testing. The other direction rots more quietly: five `.pj-chip-*` rules
+ * outlived the project picker by a month, because the check had only ever been
+ * run one way round. Both directions, every time — and by the script rather
+ * than by hand, because a plain grep truncates `pj-concern-${weight}` to
+ * `pj-concern-` and then reports three live rules as dead, which is worse than
+ * no check at all:
  *
- * Everything here that shows a file, a path or a diff is monospaced and wraps
- * rather than scrolls the page: a Windows path and a git diff are both wider
- * than a panel, and a page that scrolls sideways to show them loses the rail.
+ *   node scripts/css-contract.mjs projects
+ *
+ * Everything here that shows a file, a path or a diff is monospaced and scrolls
+ * **inside its own box**: a Windows path and a git diff are both wider than a
+ * panel, and a page that scrolls sideways to show them loses the rail. Wrapping
+ * is not an option for the two that carry line numbers beside them — text that
+ * wraps and numbers that do not desynchronise on the first long line.
  */
 
 /* =============================================================== the page == */
@@ -48,6 +57,31 @@
   color: var(--text-faint);
 }
 
+/* The way back out, under the headline. Two links, because the workspace and the
+   roster are different places — not a door to a wizard, which is the Roster's. */
+.pj-back {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-sm);
+}
+
+/**
+ * A mark's meaning in words, for anything that does not render — a screen
+ * reader, a stylesheet that failed to load, a copy-paste into a mail. The same
+ * treatment `teams-said` and `ui-who-said` give theirs; there is no shared
+ * class in this app and each stylesheet carries its own.
+ */
+.pj-said {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 /**
  * Something is not there, and which *kind* of not-there it is matters.
  *
@@ -66,48 +100,95 @@
   color: var(--text-muted);
 }
 
-/* ============================================================== the picker == */
+/* ============================================================== concerns == */
 
-.pj-picker {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
+/**
+ * What is wrong with this project, above everything, on every view.
+ *
+ * Its own shape and nothing else's: not a panel (it is not a section of the
+ * page), not a badge (it is a sentence), not the `.pj-absence` note (that is
+ * one read that failed, this is the project's condition). A row is a mark, a
+ * sentence and a way to the view that answers it.
+ *
+ * Nothing is drawn when nothing is wrong — the component returns null — so
+ * there is no "all clear" row taking up the top of every healthy page.
+ */
+.pj-concerns {
   margin: 0 0 var(--space-4);
+  max-width: 64rem;
+}
+
+.pj-concern-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.pj-chip {
+.pj-concern {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  align-items: baseline;
+  gap: var(--space-3);
   padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  background: var(--surface-raised);
-}
-
-.pj-chip-active {
-  border-color: var(--accent);
-  background: var(--accent-quiet);
-}
-
-.pj-chip-link {
-  text-decoration: none;
-  color: inherit;
-}
-
-.pj-chip-link:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
+  border-left: 3px solid var(--border-strong);
   border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
 }
 
-.pj-chip-name {
-  font-family: var(--font-display);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-semibold);
+/* The mark is a glyph and never only a colour: one in twelve of the people who
+   would use this cannot separate the red from the amber. */
+.pj-concern-mark {
+  flex: none;
+  width: 1rem;
+  font-family: var(--font-mono);
+  font-weight: var(--weight-bold);
+  text-align: center;
+}
+
+.pj-concern-said {
+  flex: 1 1 auto;
+  min-width: 0;
   color: var(--text);
+}
+
+.pj-concern-where {
+  flex: none;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+/* Happening now, and it will not clear itself. */
+.pj-concern-stopped {
+  border-left-color: var(--tone-danger-fg);
+  background: var(--tone-danger-bg);
+}
+
+.pj-concern-stopped .pj-concern-mark {
+  color: var(--tone-danger-fg);
+}
+
+/* Working as designed, and holding something back until you act. */
+.pj-concern-held {
+  border-left-color: var(--tone-paused-fg);
+  background: var(--tone-paused-bg);
+}
+
+.pj-concern-held .pj-concern-mark {
+  color: var(--tone-paused-fg);
+}
+
+/* A setup nobody finished. Not a fault, and not drawn as one. */
+.pj-concern-unfinished {
+  border-left-color: var(--tone-info-border);
+  background: var(--tone-info-bg);
+}
+
+.pj-concern-unfinished .pj-concern-mark {
+  color: var(--tone-info-fg);
 }
 
 /* ================================================================== tabs == */
@@ -142,7 +223,41 @@
   border-bottom-color: var(--accent);
 }
 
+/**
+ * The fourth tab is not a fourth peer.
+ *
+ * Browse, Search and Diff are three ways of reading the tree, and the Código
+ * mode supersedes all three the day it grows them. This one answers what the
+ * project does without you, is superseded by nothing that exists, and holds the
+ * only control on the page. The rule says so without a second row of chrome.
+ */
+.pj-tab-apart {
+  margin-left: var(--space-3);
+  padding-left: var(--space-5);
+  border-left: 1px solid var(--border);
+}
+
 /* ============================================================== browsing == */
+
+/**
+ * The listing, and the file opened from it beside rather than under it.
+ *
+ * One column until there is room for two: a file pushed below a nine-row
+ * listing puts the thing you asked for off the bottom of the window. Same shape
+ * and same breakpoint intent as the Código mode's review surface, which solved
+ * this first.
+ */
+.pj-browse {
+  display: grid;
+  gap: var(--space-4);
+}
+
+@media (min-width: 60rem) {
+  .pj-browse-split {
+    grid-template-columns: 20rem minmax(0, 1fr);
+    align-items: start;
+  }
+}
 
 .pj-crumbs {
   display: flex;
@@ -157,6 +272,21 @@
   font-size: var(--text-xs);
 }
 
+/**
+ * Where you are standing, as text.
+ *
+ * It was a disabled `Button variant="link"` — the accent at 45% opacity with no
+ * background of its own — so the crumb somebody most wants to read was the
+ * faintest thing in the trail and looked broken rather than current. A screen
+ * showed that; jsdom never could.
+ */
+.pj-crumb-here {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
 .pj-listing {
   display: flex;
   flex-direction: column;
@@ -166,7 +296,6 @@
 }
 
 .pj-entry {
-  padding: 2px 0;
   border-bottom: 1px solid var(--border);
 }
 
@@ -174,15 +303,54 @@
   border-bottom: 0;
 }
 
-.pj-entry-name {
+/**
+ * One entry, as a row rather than as a hyperlink.
+ *
+ * Every row used to be an underlined accent link, so a nine-file folder was
+ * nine underlines in the identity colour — and the accent is identity, never a
+ * category. The rule that made folders lead was dead on arrival for the same
+ * reason: `ui-button-link` had already painted every row accent, so the only
+ * thing separating a folder from a file was the trailing slash.
+ */
+.pj-entry-link {
+  display: block;
+  padding: 3px var(--space-2);
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  word-break: break-all;
 }
 
-/* Folders lead, so a deep tree can be walked without reading every file name. */
-.pj-entry-dir .pj-entry-name {
-  color: var(--accent);
+.pj-entry-link:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.pj-entry-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* The file currently open beside the listing. */
+.pj-entry-link[aria-current] {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/* Folders lead, so a deep tree can be walked without reading every file name —
+   by weight and lightness, which is what is left once the accent goes back to
+   being identity. */
+.pj-entry-dir {
+  color: var(--text);
   font-weight: var(--weight-medium);
+}
+
+/* Said explicitly rather than left to the default, so the contract at the top of
+   this file can be checked in both directions without a special case. */
+.pj-entry-file {
+  color: var(--text-muted);
 }
 
 .pj-file-path {
@@ -194,27 +362,47 @@
 }
 
 /**
- * A file's contents.
+ * A file's contents, with its lines numbered.
  *
  * Capped and scrolled inside its own box: a page that grows to the length of
- * whatever was opened loses the panel below it, and the panel below it is the
- * one that says what the project does on its own.
+ * whatever was opened loses the panel below it.
+ *
+ * Two `pre`s in a grid and not one, because the numbers must not be selectable
+ * with the text — a copied block that carries `1 2 3` down its left edge is a
+ * block nobody can paste. Neither wraps: numbers beside wrapping text
+ * desynchronise on the first long line, so this scrolls sideways within the box.
  */
-.pj-file-body,
-.pj-diff {
+.pj-file-body {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-3);
   margin: 0;
   padding: var(--space-3);
   max-height: 32rem;
   overflow: auto;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
-  color: var(--text-muted);
   background: var(--surface-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+}
+
+.pj-file-nums,
+.pj-file-text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
   white-space: pre;
   tab-size: 4;
+}
+
+.pj-file-nums {
+  text-align: right;
+  color: var(--text-faint);
+  user-select: none;
+}
+
+.pj-file-text {
+  color: var(--text-muted);
 }
 
 /* =============================================================== searching == */
@@ -234,6 +422,9 @@
   color: var(--text-faint);
 }
 
+/* Its own background, always. `base.css` resets only `font` and `color` on a
+   control and deliberately never `background` — two defects that reached a
+   screen came from a control that assumed otherwise. */
 .pj-field-input {
   width: 100%;
   max-width: 32rem;
@@ -262,35 +453,63 @@
   gap: var(--space-2);
 }
 
+/**
+ * Hits, gathered under the file they are in.
+ *
+ * The path is said once per file and not once per hit. It is the longest thing
+ * on a row, and a common word in a real repository answers forty times.
+ */
 .pj-matches {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-3);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.pj-match {
+.pj-match-group {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-  padding: var(--space-1) 0;
-  border-bottom: 1px solid var(--border);
+  flex-direction: column;
+  gap: var(--space-1);
 }
 
 .pj-match-path {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--accent);
+  text-decoration: none;
   word-break: break-all;
 }
 
+.pj-match-path:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+.pj-match-lines {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-left: 1px solid var(--border);
+}
+
+.pj-match {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: 1px 0 1px var(--space-3);
+}
+
 .pj-match-line {
+  flex: none;
+  min-width: 3ch;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
+  text-align: right;
   color: var(--text-faint);
 }
 
@@ -304,39 +523,253 @@
   word-break: break-word;
 }
 
-/* ================================================================== rules == */
+/* ==================================================================== diff == */
 
-.pj-rules {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
+.pj-diff {
   margin: 0;
-  padding: 0;
-  list-style: none;
+  padding: var(--space-3);
+  max-height: 32rem;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  white-space: pre;
+  tab-size: 4;
 }
 
-.pj-rule {
+/**
+ * One line of a diff.
+ *
+ * A block so the tint reaches the full width of the box rather than stopping at
+ * the end of the text, which is what makes a run of removals read as one thing.
+ * The minimum height is for the empty lines a diff is full of: a block with no
+ * content is a block with no height, and the gaps would close up.
+ *
+ * The colour reinforces the `+` and the `-` that are already the first
+ * character of every line; it is never the only copy of the fact.
+ */
+.pj-diff-line {
+  display: block;
+  min-height: 1.35em;
+}
+
+.pj-diff-add {
+  color: var(--tone-active-fg);
+  background: var(--tone-active-bg);
+}
+
+.pj-diff-remove {
+  color: var(--tone-danger-fg);
+  background: var(--tone-danger-bg);
+}
+
+/* Where in the file, which is navigation rather than change. */
+.pj-diff-hunk {
+  color: var(--tone-info-fg);
+}
+
+/* Which file — including the `---`/`+++` pair, which is a header and not one
+   removal and one addition. */
+.pj-diff-file {
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+.pj-diff-context {
+  color: var(--text-muted);
+}
+
+/* ============================================================== on its own == */
+
+/**
+ * Which file this view is reading, and what state it is in.
+ *
+ * A line, not a panel and not a badge. It was a bordered section spending a
+ * hundred and forty pixels on a path and one word, with the word in the same
+ * filled pill a rule's state uses — so a file's condition and a schedule's
+ * condition were the same shape and neither could be told from the other
+ * without reading it.
+ */
+.pj-source {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
 }
 
-.pj-rule-head {
+.pj-source-line {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
 }
 
-.pj-rule-name {
-  font-family: var(--font-display);
+.pj-source-name {
+  font-family: var(--font-mono);
   font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.pj-source-state {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.pj-source-present {
+  color: var(--tone-active-fg);
+}
+
+/* Ordinary: the file is gitignored, so a fresh clone and every worktree has none. */
+.pj-source-absent {
+  color: var(--text-faint);
+}
+
+.pj-source-unreadable {
+  color: var(--tone-danger-fg);
+}
+
+/**
+ * What starts work here without you: schedules and repo triggers, one table.
+ *
+ * Two lists became one for the reason the Teams console became a table. A
+ * project with two schedules and one trigger read as two half-empty panels
+ * instead of as *three things run here on their own*, and a block that some
+ * rows have and others do not starts the next row at a different height every
+ * time. Columns cannot have that defect, by being columns.
+ *
+ * Its own scroller, so six columns slide inside this box rather than making the
+ * whole document — and the rail with it — move sideways.
+ */
+.pj-table-scroller {
+  overflow-x: auto;
+}
+
+.pj-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.pj-table thead th {
+  padding: 0 var(--space-3) var(--space-2);
+  border-bottom: 1px solid var(--border-strong);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--text-faint);
+}
+
+.pj-table tbody th,
+.pj-table tbody td {
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+/* The problem row carries the border for the pair, so a rule and its reason read
+   as one thing rather than as two rows that happen to be adjacent. */
+.pj-table tbody tr.pj-row-problem th,
+.pj-table tbody tr.pj-row-problem td {
+  border-bottom: 0;
+}
+
+.pj-row-name {
+  min-width: 14rem;
+  max-width: 22rem;
+  font-weight: var(--weight-regular);
+}
+
+.pj-row-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-family: var(--font-display);
+  font-size: var(--text-base);
   font-weight: var(--weight-semibold);
   color: var(--text);
+}
+
+/* A clock or a commit, as a mark. Not a colour, and not a second badge. */
+.pj-row-kind {
+  flex: none;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+/*
+  What the rule asks for, always drawn and clamped to one line. A prompt is a
+  paragraph somebody wrote in a file; left to its full length it would set the
+  height of every column beside it, and shown only when short it would start the
+  next row at two different heights.
+*/
+.pj-row-asks {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  overflow: hidden;
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.pj-row-where {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* Figures line up under each other, which is the whole reason this is a table. */
+.pj-col-num {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.pj-figure {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.pj-figure-of {
+  color: var(--text-faint);
+}
+
+/* Today's allowance is spent. `6 / 6` and `5 / 6` are one glyph apart and are
+   not the same news. */
+.pj-figure-full {
+  color: var(--tone-paused-fg);
+}
+
+/* No such reading for this kind of rule — a commit has no next fire and no
+   daily cap. Absence drawn as absence, never as zero. */
+.pj-figure-none {
+  color: var(--text-faint);
+}
+
+/*
+  What makes a rule go. A cron expression is a literal and gets a box; a branch
+  is a name and does not. One chip for both had `0 3 * * *` and `main` wearing
+  identical clothes.
+*/
+.pj-when {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
 }
 
 .pj-cron,
@@ -355,32 +788,33 @@
   word-break: break-all;
 }
 
-.pj-rule-facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-4);
-  margin: 0;
-}
-
-.pj-fact {
+/*
+  Two lines, deliberately. On one line the commit it last saw wrapped wherever
+  the column happened to end — "a commit on main · last saw" and then the hash
+  by itself underneath, which reads as a sentence that broke rather than as two
+  facts.
+*/
+.pj-branch {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.pj-fact dt {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
+.pj-branch-what {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
-.pj-fact dd {
-  margin: 0;
+.pj-branch-name {
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums;
+  font-size: var(--text-xs);
   color: var(--text);
+}
+
+.pj-branch-seen {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
 }
 
 /**
@@ -389,7 +823,8 @@
  * The loudest thing on this page, and it earns it: an unparseable cron or an
  * unknown timezone makes the tick skip the rule 2,880 times a day and log at
  * debug, so the rule silently does nothing and the file looks fine. This is
- * where that stops being invisible.
+ * where that stops being invisible. Shared with the gate's contradiction, which
+ * is the same class of fact: a rule that cannot do what it says it does.
  */
 .pj-problem {
   margin: 0;
@@ -401,6 +836,11 @@
   font-size: var(--text-xs);
   line-height: var(--leading-normal);
   color: var(--tone-danger-fg);
+}
+
+/* Under the rule it belongs to, indented past the mark so the pair reads as one. */
+.pj-problem-cell {
+  padding-top: 0 !important;
 }
 
 /* The same weight for a rules file that would not parse — it stops the whole
@@ -439,28 +879,11 @@
   word-break: break-word;
 }
 
-/* What the rule actually asks for, in the words somebody wrote in the file. */
-.pj-prompt {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
-}
-
 /* ================================================================ the brake == */
 
 .pj-wip-state {
-  margin: 0 0 var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
+  margin: var(--space-3) 0;
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
-  color: var(--text);
-}
-
-/* The door to the wizard, under the headline: an action taken from the list of what exists. */
-.pj-add {
-  margin: 0 0 var(--space-4, 1rem);
-  font-size: var(--text-sm, 0.875rem);
+  color: var(--text-muted);
 }

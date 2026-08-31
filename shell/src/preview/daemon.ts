@@ -1,5 +1,11 @@
 import type { Agent } from "../data/agents";
-import type { BudgetView } from "../data/system";
+import type { Concurrency } from "../data/fleet";
+import type {
+  InspectEntry,
+  InspectMatch,
+  ProjectRules,
+} from "../data/projects";
+import type { BudgetView, ProjectSummary } from "../data/system";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 
 /**
@@ -518,6 +524,320 @@ export const AGENTS: Agent[] = [
   }),
 ];
 
+/* --------------------------------------------------------- the projects -- */
+
+/**
+ * Four projects, chosen so the inspector has to answer something awkward.
+ *
+ * The page's whole subject is what a project does when nobody is watching, and
+ * the states that matter are the ones nothing else in the app reports: a rules
+ * file that will not parse, a rule that is armed and inert, a queue that
+ * refuses every merge over a key in a gitignored file, a brake that is holding.
+ * A preview with one healthy project would photograph none of them.
+ *
+ * `alpha` works and is busy, `bravo` is broken in the two ways that stop a
+ * project silently, `charlie` has never been given a folder, and `delta` has a
+ * folder and no rules at all — which is ordinary and must not read as a fault.
+ */
+function project(overrides: Partial<ProjectSummary>): ProjectSummary {
+  return {
+    project_id: "x",
+    mode: "shadow",
+    project_root: null,
+    pending: 0,
+    classes_ready: 0,
+    classes_total: 0,
+    promotable: false,
+    open_proposals: 0,
+    wip_limit: null,
+    queue_full: false,
+    root_exists: null,
+    last_gate: null,
+    last_gate_at: null,
+    ...overrides,
+  };
+}
+
+export const PROJECTS: ProjectSummary[] = [
+  project({
+    project_id: "alpha",
+    mode: "shadow",
+    project_root: "C:/repos/alpha",
+    root_exists: true,
+    open_proposals: 3,
+    wip_limit: 4,
+    classes_ready: 2,
+    classes_total: 5,
+    last_gate: "passed",
+    last_gate_at: ago(3 * 3600_000),
+  }),
+  project({
+    project_id: "bravo",
+    mode: "active",
+    project_root: "C:/repos/bravo-servicos-partilhados",
+    root_exists: true,
+    // At the ceiling: the brake is holding, which is one of the five findings.
+    open_proposals: 2,
+    wip_limit: 2,
+    queue_full: true,
+    last_gate: "failed",
+    last_gate_at: ago(2 * DAY),
+  }),
+  project({ project_id: "charlie", mode: "off" }),
+  project({
+    project_id: "delta",
+    project_root: "C:/repos/delta",
+    root_exists: true,
+    wip_limit: null,
+  }),
+];
+
+/**
+ * A moment relative to the REAL clock, not the frozen one.
+ *
+ * Everything else here is pinned to `NOW` so a screenshot taken twice is the
+ * same screenshot. These two cannot be: `RelativeTime` reads against the
+ * machine's own clock, so a next fire pinned to a fixed date photographs as
+ * "6d ago" — a next fire in the past, which is a lie in the picture rather
+ * than a stable one. The strings drift by an hour between runs; the direction
+ * of time does not.
+ */
+function fromNow(ms: number): string {
+  return new Date(Date.now() + ms).toISOString();
+}
+
+function rules(overrides: Partial<ProjectRules>): ProjectRules {
+  return {
+    project_id: "x",
+    project_root: null,
+    rules_file: "absent",
+    rules_error: null,
+    gate_command: null,
+    gate_before_publish: false,
+    schedules: [],
+    repo_triggers: [],
+    wip_limit: null,
+    open_proposals: 0,
+    queue_full: false,
+    ...overrides,
+  };
+}
+
+const ALPHA_RULES: ProjectRules = rules({
+  project_id: "alpha",
+  project_root: "C:/repos/alpha",
+  rules_file: "present",
+  gate_command: "cargo test -p nucleos-core --all-features",
+  gate_before_publish: true,
+  wip_limit: 4,
+  open_proposals: 3,
+  schedules: [
+    {
+      name: "nightly-tidy",
+      cron: "0 3 * * *",
+      prompt: "Tidy the imports and run the formatter over anything that moved today.",
+      cwd: null,
+      timezone: "Europe/Lisbon",
+      next_fire_at: fromNow(5 * 3600_000),
+      problem: null,
+      last_fired_at: fromNow(-21 * 3600_000),
+      fires_today: 1,
+      daily_cap: 4,
+    },
+    {
+      /* Armed and inert. The daemon skips this rule 2,880 times a day and logs
+         at debug, so without this row the rule silently never runs. */
+      name: "weekly-audit",
+      cron: "0 7 * * MON",
+      prompt: "Read what changed this week and write down anything that looks like a decision.",
+      cwd: "core",
+      timezone: "Europe/Lisboa",
+      next_fire_at: null,
+      problem: "unknown timezone: Europe/Lisboa",
+      last_fired_at: null,
+      fires_today: 0,
+      daily_cap: 1,
+    },
+    {
+      /* Today's allowance spent — a rule that is fine and will not run again
+         until midnight, which is a different fact from both of the above. */
+      name: "hourly-sweep",
+      cron: "0 * * * *",
+      prompt:
+        "Sweep the queue for proposals nobody has answered and summarise them in one line each, so that the morning does not start with forty unread rows and no idea which of them matters.",
+      cwd: null,
+      timezone: null,
+      next_fire_at: fromNow(40 * 60_000),
+      problem: null,
+      last_fired_at: fromNow(-40 * 60_000),
+      fires_today: 6,
+      daily_cap: 6,
+    },
+  ],
+  repo_triggers: [
+    {
+      name: "on-main",
+      branch: "main",
+      prompt: "Run the gate on whatever just landed.",
+      last_sha: "9f2c1ab7d4e08b3c5a6f7e8d9c0b1a2f3e4d5c6b",
+    },
+    {
+      /* Armed with nothing to compare against fires nothing, by design. */
+      name: "on-release",
+      branch: "release/2026-09",
+      prompt: "Build the installer and attach it to the draft release.",
+      last_sha: null,
+    },
+  ],
+});
+
+const BRAVO_RULES: ProjectRules = rules({
+  project_id: "bravo",
+  project_root: "C:/repos/bravo-servicos-partilhados",
+  /* The two silent stoppers at once: a file that will not parse, so every rule
+     below is absent because none could be loaded — and a queue set to wait for
+     a gate that does not exist, which refuses every merge. */
+  rules_file: "unreadable",
+  rules_error:
+    "unknown field `schedule`, expected one of `schedules`, `repo_triggers`, `gate`, `gate_before_publish`, `wip_limit` at line 3 column 1",
+  gate_command: null,
+  gate_before_publish: true,
+  wip_limit: 2,
+  open_proposals: 2,
+  queue_full: true,
+});
+
+const CHARLIE_RULES: ProjectRules = rules({ project_id: "charlie" });
+
+/* A folder, a readable file, and nothing in it. Ordinary, and the page must not
+   dress it as a fault: the file is gitignored, so a fresh clone has none. */
+const DELTA_RULES: ProjectRules = rules({
+  project_id: "delta",
+  project_root: "C:/repos/delta",
+  rules_file: "present",
+  gate_command: "npm run gate",
+});
+
+const RULES: Record<string, ProjectRules> = {
+  alpha: ALPHA_RULES,
+  bravo: BRAVO_RULES,
+  charlie: CHARLIE_RULES,
+  delta: DELTA_RULES,
+};
+
+/**
+ * One folder of `alpha`, by path.
+ *
+ * Deep enough to need a breadcrumb trail, and with one name long enough to ask
+ * the listing whether its column width was chosen or merely happened.
+ */
+const TREE: Record<string, InspectEntry[]> = {
+  "": [
+    { name: ".ai", is_dir: true },
+    { name: "core", is_dir: true },
+    { name: "shell", is_dir: true },
+    { name: "sidecars", is_dir: true },
+    { name: ".gitignore", is_dir: false },
+    { name: "AGENTS.md", is_dir: false },
+    { name: "Cargo.lock", is_dir: false },
+    { name: "Cargo.toml", is_dir: false },
+    { name: "README.md", is_dir: false },
+  ],
+  core: [
+    { name: "src", is_dir: true },
+    { name: "tests", is_dir: true },
+    { name: "Cargo.toml", is_dir: false },
+  ],
+  "core/src": [
+    { name: "autopilot", is_dir: true },
+    { name: "config.rs", is_dir: false },
+    { name: "gate.rs", is_dir: false },
+    { name: "inspect.rs", is_dir: false },
+    { name: "job.rs", is_dir: false },
+    { name: "main.rs", is_dir: false },
+    { name: "ownership.rs", is_dir: false },
+    { name: "the_scheduler_and_everything_it_reads_from_disk.rs", is_dir: false },
+  ],
+};
+
+/** A file worth opening: the very document this page reports on. */
+const FILE = `# Read on open, never polled. The núcleo parses this strictly, so an
+# unknown key is an error rather than a silently empty ruleset.
+
+schedules:
+  - name: nightly-tidy
+    cron: "0 3 * * *"
+    timezone: Europe/Lisbon
+    daily_cap: 4
+    prompt: >-
+      Tidy the imports and run the formatter over anything that moved today.
+
+  # Switched off since the timezone stopped parsing. Leave this comment here —
+  # a form would re-serialise the file and delete it.
+  - name: weekly-audit
+    cron: "0 7 * * MON"
+    timezone: Europe/Lisboa
+    daily_cap: 1
+    cwd: core
+    prompt: Read what changed this week.
+
+gate: cargo test -p nucleos-core --all-features
+gate_before_publish: true
+wip_limit: 4
+`;
+
+/** An uncommitted diff, with the four line kinds a reader has to tell apart. */
+const DIFF = `diff --git a/core/src/gate.rs b/core/src/gate.rs
+index 3a1f9c2..b7e4d81 100644
+--- a/core/src/gate.rs
++++ b/core/src/gate.rs
+@@ -41,9 +41,14 @@ impl Gate {
+     pub fn command(&self) -> Option<&str> {
+-        self.command.as_deref()
++        // An empty string is not a command. It reached here as one, and the
++        // queue then measured every merge against a shell that does nothing.
++        match self.command.as_deref() {
++            Some(text) if text.trim().is_empty() => None,
++            other => other,
++        }
+     }
+
+     pub fn before_publish(&self) -> bool {
+         self.before_publish
+     }
+diff --git a/core/src/config.rs b/core/src/config.rs
+index 8c2b0d4..1e9a3f7 100644
+--- a/core/src/config.rs
++++ b/core/src/config.rs
+@@ -12,6 +12,7 @@ pub struct Rules {
+     pub schedules: Vec<Schedule>,
+     pub repo_triggers: Vec<RepoTrigger>,
++    pub gate_before_publish: bool,
+ }
+`;
+
+/** Matches for `gate_before_publish`, spread over the files that mention it. */
+const MATCHES: InspectMatch[] = [
+  { path: ".ai/autopilot.yaml", line: 21, text: "gate_before_publish: true" },
+  { path: "core/src/config.rs", line: 15, text: "    pub gate_before_publish: bool," },
+  {
+    path: "core/src/config.rs",
+    line: 88,
+    text: "            gate_before_publish: raw.gate_before_publish.unwrap_or(false),",
+  },
+  { path: "core/src/gate.rs", line: 47, text: "    pub fn before_publish(&self) -> bool {" },
+  {
+    path: "core/src/vcs.rs",
+    line: 612,
+    text: "        if rules.gate_before_publish && rules.gate_command.is_none() {",
+  },
+  {
+    path: "shell/src/pages/Projects.tsx",
+    line: 528,
+    text: "      <GatePanel command={rules.data.gate_command} beforePublish={rules.data.gate_before_publish} />",
+  },
+];
+
 /* ------------------------------------------------------------- the router -- */
 
 /**
@@ -529,6 +849,33 @@ export const AGENTS: Agent[] = [
  * window into a connection state and hide the thing being looked at.
  */
 export function answer(path: string, init?: RequestInit): unknown {
+  /*
+    The house's capacity, with nobody holding a slot. It is here so the Codigo
+    mode can be photographed at all: it reads `concurrency.data?.projects` and
+    then calls `.find` on it unguarded, so the empty-list default this file
+    gives everything else was a crash rather than an empty screen — and the
+    empty screen is exactly the one worth looking at, because the door into the
+    inspector is drawn in it.
+  */
+  if (path === "/concurrency") return { house: { limit: 4, held: 0 }, projects: [] } satisfies Concurrency;
+
+  if (path === "/projects") return PROJECTS;
+
+  /*
+    The inspector's readers, which are the only routes here that carry a query
+    string — so the path is split before it is matched. `cat` and `diff` are
+    NOT here: they come back from the núcleo as a bare `String` and are answered
+    by `answerText`, which is the same split `Projects.test.tsx` records.
+  */
+  const [route, query] = splitQuery(path);
+  const inspect = /^\/projects\/([^/]+)\/(rules|ls|grep)$/.exec(route);
+  if (inspect !== null) {
+    const [, id, reader] = inspect;
+    if (reader === "rules") return RULES[id] ?? rules({ project_id: id });
+    if (reader === "ls") return TREE[query.get("path") ?? ""] ?? [];
+    return query.get("q") === null ? [] : MATCHES;
+  }
+
   if (path === "/teams") return TEAMS;
   if (path === "/team-runs") return RUNS;
   if (path === "/team-triggers") return TRIGGERS;
@@ -573,4 +920,46 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
 
   return [];
+}
+
+/** A path and its query, apart. The inspect readers are the only routes with one. */
+function splitQuery(path: string): [string, URLSearchParams] {
+  const cut = path.indexOf("?");
+  if (cut === -1) return [path, new URLSearchParams()];
+  return [path.slice(0, cut), new URLSearchParams(path.slice(cut + 1))];
+}
+
+/**
+ * The routes that answer with text rather than JSON.
+ *
+ * `get_project_cat` and `get_project_diff` return a bare `String`, so the shell
+ * reads them through `apiText` and not `apiFetch`. Without this split the
+ * preview would hand both of them a JSON body and photograph a file whose
+ * entire contents were `[]` — which is exactly the defect `Projects.test.tsx`
+ * mocks two clients to avoid.
+ *
+ * `null` means *not a text route*, which is different from a text route with
+ * nothing in it: an empty file and a clean tree are both real answers.
+ */
+export function answerText(path: string): string | null {
+  const [route] = splitQuery(path);
+  const reader = /^\/projects\/([^/]+)\/(cat|diff)$/.exec(route);
+  if (reader === null) return null;
+  return reader[2] === "cat" ? FILE : DIFF;
+}
+
+/**
+ * The paths this núcleo refuses, and with what status.
+ *
+ * Everything else answers 200, deliberately — see the note on `answer`. The
+ * exception is a project with no recorded folder: the inspect routes really do
+ * answer 404 for it, and that 404 is one of the three the page is built to tell
+ * apart. Left at 200 it would be the one absence nobody could ever photograph.
+ */
+export function refusal(path: string): number | null {
+  const [route] = splitQuery(path);
+  const reader = /^\/projects\/([^/]+)\/(ls|cat|grep|diff)$/.exec(route);
+  if (reader === null) return null;
+  const root = PROJECTS.find((row) => row.project_id === reader[1])?.project_root ?? null;
+  return root === null ? 404 : null;
 }

@@ -128,23 +128,33 @@ export function ModeCodigo({ projectId, run, onPickRun }: ModeCodigoProps) {
  * trusting.
  */
 /**
- * The door to the read-only inspector, and the one place in the app that opens it.
+ * The doors to the read-only inspector, and the one place in the app that opens them.
  *
  * **It is not this mode with a different skin, and that is why it survives.** The Código mode reads
  * a RUN&rsquo;s worktree: what one piece of work changed, against the branch it started from. The
  * inspector reads the project&rsquo;s own folder as it is on disk right now — no run, no branch
  * point — which is what somebody wants when they are asking whether a file is even there, or
- * grepping for a name across the repository, or reading the schedule rules.
+ * grepping for a name across the repository.
  *
- * The link lives here rather than in the rail because that is the design&rsquo;s rule about the
+ * **Two links and not one, because the inspector answers two questions with different
+ * lifespans.** Browse, search and diff read the tree, and this mode supersedes all three the day
+ * it grows them. *On its own* reads what the project does when nobody asks — its schedules, its
+ * repo triggers, its gate, its ceiling — and nothing that exists supersedes it; the config editor
+ * that would is still only designed. One link advertising only the three condemned views left the
+ * one durable view unmentioned at the only entrance to the page that holds it, which is how a
+ * capability gets lost without anybody deciding to lose it.
+ *
+ * The links live here rather than in the rail because that is the design&rsquo;s rule about the
  * rail, and here rather than on the roster because the roster answers about every project at once
- * and this is about one. Until the Código mode grows a browse and a search of its own, removing the
- * link would be losing a working capability quietly — which the router&rsquo;s own comment says is
- * the failure mode to avoid.
+ * and this is about one.
  */
 function InspectorLink({ projectId }: { projectId: string }) {
   return (
-    <p className="text-xs text-text-faint">
+    /* The same measure as the sentence above it in the empty-state card. Without
+       it the two doors ran 1,590px on one line — a ribbon twice the width of
+       everything around it, which is the sort of thing a passing suite says
+       nothing about. */
+    <p className="mt-2 max-w-prose text-xs text-text-faint">
       <Link
         className="underline underline-offset-2"
         to="/projects/$projectId/inspect/$view"
@@ -152,7 +162,15 @@ function InspectorLink({ projectId }: { projectId: string }) {
       >
         Browse, search and diff the folder itself
       </Link>{" "}
-      — the project as it is on disk, with no run in the way.
+      — the project as it is on disk, with no run in the way. Or{" "}
+      <Link
+        className="underline underline-offset-2"
+        to="/projects/$projectId/inspect/$view"
+        params={{ projectId, view: "rules" }}
+      >
+        what it does on its own
+      </Link>{" "}
+      — its schedules, its repo triggers, its gate and its ceiling.
     </p>
   );
 }

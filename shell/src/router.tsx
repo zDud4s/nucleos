@@ -151,6 +151,11 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * belongs in the location — a slot on the State mode links straight to it, and a review somebody
  * is in the middle of survives a reload.
  */
+/** A search param that is really there. Empty and absent are the same claim. */
+function someText(raw: unknown): string | undefined {
+  return typeof raw === "string" && raw !== "" ? raw : undefined;
+}
+
 const DETAIL_ROUTES: {
   path: string;
   component: () => ReactNode;
@@ -197,7 +202,30 @@ const DETAIL_ROUTES: {
    * IN is a link from the Código mode, which is where somebody already reading
    * this project's code would go looking for a file tree.
    */
-  { path: "/projects/$projectId/inspect/$view", component: Projects },
+  {
+    path: "/projects/$projectId/inspect/$view",
+    component: Projects,
+    /*
+      Where in the tree, and what was searched for. The page's header has always
+      claimed the views are in the route "so a folder somebody is looking at
+      survives a reload and can be linked to" — but only the VIEW ever was, and
+      the folder, the open file and the query were component state that died on
+      the first refresh. A search that found the thing could not be sent to
+      anybody. Now it can.
+
+      Strings, unvalidated, and deliberately so: a path in a URL is a claim, and
+      the núcleo already refuses one that leaves the project's folder with a
+      sentence explaining why. A router that answered it with a dead end would
+      take that explanation away from the page that gives it. Empty becomes
+      absent, so a cleared field leaves no `?path=` behind it.
+    */
+    validateSearch: (search) => ({
+      path: someText(search.path),
+      file: someText(search.file),
+      q: someText(search.q),
+      under: someText(search.under),
+    }),
+  },
   { path: "/chats/$chatId", component: Chats },
   { path: "/errands/$errandId", component: Errands },
   { path: "/council/$councilId", component: Council },

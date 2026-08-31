@@ -10,7 +10,7 @@ import "../app.css";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
 import { adoptStyleNonce } from "../lib/style-nonce";
-import { answer } from "./daemon";
+import { answer, answerText, refusal } from "./daemon";
 
 /**
  * The page the screenshot harness loads.
@@ -47,6 +47,22 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (path === "/health") return new Response("ok", { status: 200 });
   // `apiText`, not `apiFetch` — the connection gate reads this one as prose.
   if (path === "/status") return new Response("daemon running", { status: 200 });
+
+  /*
+    Three answers and not one, because the núcleo gives three. A refusal carries
+    a status the page reads as meaning; a text route carries a bare `String`
+    the shell reads through `apiText`; everything else is JSON. Answering all of
+    them with a JSON 200 — which is what this did — photographs a file whose
+    entire contents are `[]`, and makes the three different 404s the inspector
+    is built to tell apart unreachable.
+  */
+  const status = refusal(path);
+  if (status !== null) return new Response("", { status });
+
+  const text = answerText(path);
+  if (text !== null) {
+    return new Response(text, { status: 200, headers: { "content-type": "text/plain" } });
+  }
 
   const body = answer(path, init);
   return new Response(JSON.stringify(body), {
