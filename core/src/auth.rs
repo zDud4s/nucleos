@@ -276,6 +276,12 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/presets/{id}"),
     (Method::GET, "/runs/awaiting-approval"),
     (Method::GET, "/runs/{id}"),
+    // A stop report reads rows that already happened: the run's own row plus, for a `gate` or
+    // `timeout` kind, the `shadow_decisions` leading up to it. It starts nothing and holds no
+    // resource, so a read-only key that could not reach it would have to be handed Admin — the
+    // scope that CAN launch runs — for a route that launches none. The narrower grant is the
+    // safer one.
+    (Method::GET, "/runs/{id}/stop"),
     (Method::GET, "/assistant/{turn_id}"),
     (Method::GET, "/jobs"),
     (Method::GET, "/jobs/{id}"),
@@ -887,6 +893,9 @@ mod tests {
             .route("/feed", get(|| async {}))
             .route("/runs", get(|| async {}).post(|| async {}))
             .route("/runs/{id}", get(|| async {}))
+            // A stand-in, like the gate route below: this file's tests are about who may reach a
+            // path, and the path is what `permits` matches on.
+            .route("/runs/{id}/stop", get(|| async {}))
             .route("/jobs", get(|| async {}).post(|| async {}))
             .route("/webhooks/push", post(|| async {}))
             .route("/presets", get(|| async {}).post(|| async {}))
@@ -1506,6 +1515,41 @@ mod tests {
         }
         assert!(!permits(&scope, &Method::GET, "/future-sensitive-route"));
         assert!(!permits(&scope, &Method::POST, "/status"));
+    }
+
+    /// A stop report is a read of rows that already happened, not an action — so the weakest key
+    /// reaches it, the same as `GET /runs/{id}` beside it in the table.
+    #[test]
+    fn a_read_only_api_key_may_read_why_a_run_stopped() {
+        let scope = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        assert!(permits(&scope, &Method::GET, "/runs/{id}/stop"));
+    }
+
+    /// §11 item 9, asked of a real token through the real middleware rather than of `permits`.
+    ///
+    /// The unit test above and this one are not the same assertion twice. `permits` answers about a
+    /// PATTERN; a request carries a path, and between them sit the token store, the middleware and
+    /// axum's matcher. A route graded correctly in the table and mounted where the matcher never
+    /// hands it that pattern would pass the test above and `401` here.
+    ///
+    /// The write beside it is what makes the read mean anything: the same key must NOT be able to
+    /// cancel the run it can read about.
+    #[tokio::test]
+    async fn a_read_only_key_reads_a_stop_report_over_http_and_still_cannot_act() {
+        let state = test_state("control-token").await;
+        let token = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let app = protected_router(state);
+
+        assert_eq!(
+            status_of(&app, "GET", "/runs/9/stop", &token).await,
+            StatusCode::OK,
+            "a stop report starts nothing and holds nothing"
+        );
+        assert_eq!(
+            status_of(&app, "POST", "/runs", &token).await,
+            StatusCode::FORBIDDEN,
+            "and the same key must not be able to launch one"
+        );
     }
 
     /// Sending is Admin-only by construction: `POST /email/send` is in NEITHER table.

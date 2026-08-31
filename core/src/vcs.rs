@@ -744,151 +744,17 @@ pub async fn resolve_repo(
 /// **Still not a shell parser, and it must not become one.** It does not expand anything, does not
 /// understand backslash escapes, and does not follow `$(…)`. What it now refuses to do is invent a
 /// command out of prose — which is a smaller claim than parsing shell, and the only one this needed.
+/// **The grammar moved.** Everything the comment above describes — the quote tracking, the heredoc
+/// bodies, the here-string that must not be read as an opener — now lives in `command_reader`,
+/// which is the single reader this daemon has for a shell line. It moved because there were TWO,
+/// with opposite policies: this one followed quotes and the classifier's did not, and the blind one
+/// decided whether an autonomous run could continue. On 2026-08-29 it stopped four of them.
+///
+/// The queue keeps the reading that never refuses, and that is a deliberate asymmetry rather than a
+/// leftover: a caller asking whether a line CONTAINS a merge most needs to keep scanning the line it
+/// cannot fully read, because handing back nothing there would read as "no merge here".
 pub fn shell_segments(command: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    // Carried across lines on purpose: a quote left open at a line's end is still open on the next
-    // one, which is exactly the shape a multi-line string in an embedded script has.
-    let mut single = false;
-    let mut double = false;
-    // The heredoc currently swallowing lines, if any: its terminator and whether `<<-` allows that
-    // terminator to be indented with tabs.
-    let mut swallowing: Option<(&str, bool)> = None;
-
-    for line in command.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\n', '\r']);
-
-        if let Some((terminator, strip_tabs)) = swallowing {
-            let probe = if strip_tabs {
-                body.trim_start_matches('\t')
-            } else {
-                body
-            };
-            if probe == terminator {
-                swallowing = None;
-            }
-            // Either way this line was the heredoc's, and a heredoc's content is never a command.
-            continue;
-        }
-
-        // Collected while scanning and armed only at the line's end: `cat <<A <<B` is legal, and
-        // both bodies follow the whole line rather than the operator that named them.
-        let mut opened: Vec<(&str, bool)> = Vec::new();
-        let mut start = 0usize;
-        let mut chars = body.char_indices().peekable();
-
-        while let Some((at, c)) = chars.next() {
-            match c {
-                '\'' if !double => single = !single,
-                '"' if !single => double = !double,
-                '<' if !single && !double => {
-                    let rest = &body[at..];
-                    // **Every `<` run is stepped over as a unit, and that is not tidiness.** Landing
-                    // on the second `<` of a `<<<` leaves `<< "some text"` ahead, which reads as a
-                    // heredoc whose terminator is `some text` — so a here-string would swallow the
-                    // rest of the script, including real commands. Caught by
-                    // `a_here_string_swallows_nothing`.
-                    let width = if rest.starts_with("<<<") {
-                        // A here-string carries its operand on the same line and opens no body.
-                        "<<<".len()
-                    } else if let Some((terminator, strip_tabs, width)) = heredoc_opened_at(rest) {
-                        opened.push((terminator, strip_tabs));
-                        // Stepping over the whole `<<WORD` spelling also keeps a quote inside the
-                        // delimiter (`<<'EOF'`) from flipping the quote state for the rest of the
-                        // line.
-                        width
-                    } else if rest.starts_with("<<") {
-                        // `<<` naming nothing. Nothing to swallow until, and stepping over both
-                        // keeps the second one from being read as a fresh opener.
-                        "<<".len()
-                    } else {
-                        // A plain `<` redirect.
-                        c.len_utf8()
-                    };
-                    while chars.peek().is_some_and(|(next, _)| *next < at + width) {
-                        chars.next();
-                    }
-                }
-                ';' | '&' | '|' | '(' | ')' if !single && !double => {
-                    push_segment(&mut segments, &body[start..at]);
-                    start = at + c.len_utf8();
-                }
-                _ => {}
-            }
-        }
-        push_segment(&mut segments, &body[start..]);
-
-        // One at a time, and the rest are dropped: a second body would need the first to have been
-        // consumed to know where it begins, and this walk does not read that far ahead. Dropping
-        // them keeps the conservative direction — an unread body is never mistaken for a command.
-        swallowing = opened.into_iter().next();
-    }
-
-    segments
-}
-
-/// One segment, trimmed and with leading environment assignments stripped, unless it is empty.
-///
-/// `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and leaving them
-/// in makes `program` read `FOO=bar` and the whole segment parse as nothing.
-fn push_segment<'a>(segments: &mut Vec<&'a str>, raw: &'a str) {
-    let mut rest = raw.trim();
-    while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
-        if head.contains('=') && !head.starts_with('-') {
-            rest = tail.trim_start();
-        } else {
-            break;
-        }
-    }
-    if !rest.is_empty() {
-        segments.push(rest);
-    }
-}
-
-/// PURE: the heredoc a `<<` at the start of `rest` opens — its terminator, whether `<<-` lets that
-/// terminator be indented with tabs, and how many bytes the whole `<<WORD` spelling occupies.
-///
-/// `None` when this is not a heredoc opener at all, which covers two cases worth naming: `<<<` is a
-/// here-string, whose operand sits on the same line and which opens no body; and a bare `<<` with
-/// nothing after it names no terminator, so there is nothing to swallow until.
-///
-/// The terminator may be quoted — `<<'EOF'` and `<<"EOF"` both mean the literal word `EOF`, and the
-/// quotes only decide whether the shell expands the body. Since nothing here expands anything, the
-/// two are the same to this function, and the width it reports includes the quotes so the caller can
-/// step over them without flipping its own quote state.
-fn heredoc_opened_at(rest: &str) -> Option<(&str, bool, usize)> {
-    let after = rest.strip_prefix("<<")?;
-    if after.starts_with('<') {
-        return None;
-    }
-    let (strip_tabs, after) = match after.strip_prefix('-') {
-        Some(after) => (true, after),
-        None => (false, after),
-    };
-    let spaces = after.len() - after.trim_start_matches([' ', '\t']).len();
-    let after = &after[spaces..];
-
-    let (terminator, taken) = match after.chars().next() {
-        Some(quote @ ('\'' | '"')) => {
-            let inside = &after[quote.len_utf8()..];
-            let end = inside.find(quote)?;
-            (&inside[..end], end + 2 * quote.len_utf8())
-        }
-        _ => {
-            let end = after
-                .find(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
-                .unwrap_or(after.len());
-            if end == 0 {
-                return None;
-            }
-            (&after[..end], end)
-        }
-    };
-
-    Some((
-        terminator,
-        strip_tabs,
-        "<<".len() + usize::from(strip_tabs) + spaces + taken,
-    ))
+    crate::command_reader::segments(command, crate::command_reader::Shell::Posix)
 }
 
 pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {

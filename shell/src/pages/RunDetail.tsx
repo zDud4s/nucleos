@@ -8,10 +8,12 @@ import {
   useEndTurns,
   useReleaseWorktree,
   useRun,
+  useRunStop,
   useRunTail,
   useSteerRun,
   type RunDetail as Run,
   type RunTailChunk,
+  type StopDecision,
 } from "../data/runs";
 import {
   Button,
@@ -110,6 +112,10 @@ function KnownRun({ id }: { id: number }) {
 
       <FactsPanel run={detail} />
       <GateBlock run={detail} />
+      {/* After the deterministic gate and before the output, which is the order
+          a person reads them in: what the suite said, then why the run ended,
+          then what it printed on the way. */}
+      <StopBlock id={id} alive={alive} />
       <RunTail id={id} alive={alive} recorded={detail.stdout} />
       <StdStreams run={detail} />
       {/* Absent, not disabled. `steerable` was decided when the run was created
@@ -208,6 +214,111 @@ function GateBlock({ run }: { run: Run }) {
       )}
     </Panel>
   );
+}
+
+/* --------------------------------------------------------- why it stopped -- */
+
+/**
+ * Why the run stopped, which is a different question from the one the panel
+ * above answers.
+ *
+ * **The two titles carry the whole distinction and neither may say just "gate".**
+ * "Gate" above is the DETERMINISTIC gate: a test suite that ran and returned an
+ * exit code, a verdict about the code. This is the TOOL gate: the classifier
+ * deciding, call by call, whether the run was allowed to do a thing — and its
+ * `kind: "gate"` means the run stopped waiting for a person to say yes. Two
+ * mechanisms, one word, and a reader who conflates them draws exactly the wrong
+ * conclusion about why their night ended.
+ *
+ * Nothing is rendered from `leading_up` for a kind that does not carry it: the
+ * daemon sends `null` there rather than omitting the key, so an empty list and
+ * "not applicable" stay distinguishable.
+ */
+function StopBlock({ id, alive }: { id: number; alive: boolean }) {
+  const { data, isError } = useRunStop(id, alive);
+
+  // Silent while it has not arrived and silent if it fails. This block is an
+  // explanation of something already visible above, so a spinner or an error
+  // strip here would be a second failure report about a page that is fine.
+  if (isError || !data) return null;
+
+  return (
+    <Panel title="Why it stopped">
+      <p className="runs-gate-line">{data.summary}</p>
+
+      {/* §5.3. An empty list is the same shape whether the mode records nothing
+          or the run simply asked for nothing, and only one of those is worth a
+          person's time. */}
+      {!data.decisions_recorded && (
+        <p className="runs-gate-note">
+          This run was watched by the person who started it, so the tool gate recorded no decisions
+          for it. Nothing is missing.
+        </p>
+      )}
+
+      {data.timeout !== null && (
+        <p className="runs-gate-note">
+          {`Ran ${minutes(data.timeout.elapsed_seconds)} against a ${minutes(
+            data.timeout.silence_ceiling_seconds,
+          )} silence ceiling and a ${minutes(data.timeout.wall_ceiling_seconds)} wall clock. `}
+          {data.timeout.verdict === "silence"
+            ? "It went quiet: the wall clock was nowhere near, so what ran out was patience with a run that had stopped reporting."
+            : "Which of the two fired cannot be told apart from here, because the elapsed time is measured from when the run was created rather than from when it began."}
+        </p>
+      )}
+
+      {data.gate !== null && <StopDecisionLine decision={data.gate} highlight />}
+
+      {data.exit_code !== null && <p className="runs-gate-note">{`Exit code ${data.exit_code}.`}</p>}
+      {data.stderr_tail !== null && data.stderr_tail !== "" && (
+        <pre className="runs-pre">{data.stderr_tail}</pre>
+      )}
+      {data.successor_run_id !== null && (
+        <p className="runs-gate-note">
+          <Link to="/runs/$runId" params={{ runId: String(data.successor_run_id) }}>
+            {`Continued as run ${data.successor_run_id}`}
+          </Link>
+        </p>
+      )}
+
+      {data.leading_up !== null && data.leading_up.length > 0 && (
+        <>
+          <p className="runs-gate-note">What it did just before, most recent first:</p>
+          {data.leading_up.map((decision, index) => (
+            <StopDecisionLine key={`${decision.created_at}-${index}`} decision={decision} />
+          ))}
+        </>
+      )}
+    </Panel>
+  );
+}
+
+/**
+ * One decision, as a line.
+ *
+ * `tool_input_truncated` is rendered as words rather than as an ellipsis glued
+ * to the text, for the reason the field exists at all: a command that genuinely
+ * ends in `...` and one that was cut must not look the same.
+ */
+function StopDecisionLine({ decision, highlight }: { decision: StopDecision; highlight?: boolean }) {
+  return (
+    <div className={highlight ? "runs-gate-line" : "runs-gate-note"}>
+      <span>{`${decision.tool_name} — ${decision.decision} (${decision.action_class})`}</span>
+      {decision.reason !== null && <span>{` ${decision.reason}`}</span>}
+      {decision.tool_input !== null && decision.tool_input !== "" && (
+        <pre className="runs-pre">{decision.tool_input}</pre>
+      )}
+      {decision.tool_input_truncated && (
+        <span className="runs-gate-note">cut for length; the daemon holds the rest</span>
+      )}
+    </div>
+  );
+}
+
+/** Seconds as a person reads them. Whole minutes: nothing here turns on a second. */
+function minutes(seconds: number): string {
+  const whole = Math.round(seconds / 60);
+  return whole === 1 ? "1 minute" : `${whole} minutes`;
 }
 
 /* ----------------------------------------------------------------- tail -- */

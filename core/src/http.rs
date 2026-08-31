@@ -328,6 +328,11 @@ pub fn build_router(state: AppState) -> Router {
         // `run_events` is not written until the run ends and there is nothing durable to read while
         // the thing is actually happening.
         .route("/runs/{id}/tail", get(crate::runs::get_run_tail))
+        // Why it stopped, not how it is doing: reads the run row plus, for a `gate` or `timeout`
+        // kind only, the `shadow_decisions` leading up to it (spec
+        // `.ai/specs/2026-08-29-porque-parou-design.md` §4, §7). Read-only front to back — see
+        // `run_stop.rs`.
+        .route("/runs/{id}/stop", get(crate::runs::get_run_stop))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route(
             "/runs/{id}/message",

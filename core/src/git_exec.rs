@@ -1748,7 +1748,7 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                         // changes nothing. The arithmetic is the reason rather than the taste:
                         // `deadline` was fixed at `now + OPERATION_TIMEOUT` (300s) when this
                         // operation started, and a gate may legitimately outlast it
-                        // (`DEFAULT_GATE_TIMEOUT` is 900s). Letting a measurement — which spawns no
+                        // (`DEFAULT_GATE_TIMEOUT` is 2700s). Letting a measurement — which spawns no
                         // git at all — spend the git budget would make every gated merge die at
                         // `update-ref` saying the budget was spent, which reads as a broken queue
                         // rather than as a slow suite. An UNGATED merge keeps the one deadline it

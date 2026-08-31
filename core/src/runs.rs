@@ -610,7 +610,7 @@ fn classifier_governs_tools(
 ///
 /// Derived from `base` rather than given a constant of its own, so a test that shortens the clock
 /// still gets a short one, and an operator who tunes the deadline moves both together.
-fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
+pub(crate) fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
     if runs_unattended(mode) {
         base * crate::state::AUTONOMOUS_RUN_TIMEOUT_MULTIPLIER
     } else {
@@ -628,7 +628,10 @@ fn run_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Dur
 ///
 /// `email_triage` stays on the short one for its own reason, unchanged: it classifies one message
 /// against a local model, and a triage run silent for five minutes is stuck rather than busy.
-fn progress_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::time::Duration {
+pub(crate) fn progress_timeout_for_mode(
+    base: std::time::Duration,
+    mode: &str,
+) -> std::time::Duration {
     if runs_unattended(mode) {
         base * crate::state::AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER
     } else {
@@ -2887,6 +2890,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
                 &input,
                 Some(std::path::Path::new(&wt_path)),
                 &state.github.policy,
+                // Labelling an action a person has just approved, not deciding one. The strict
+                // reading keeps the recorded class the same as the one that was shown to them.
+                crate::classifier::Unrecognized::AsksAPerson,
             )
             .action_class
         });
@@ -3234,6 +3240,154 @@ pub async fn get_run(
     .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(run))
+}
+
+/// `?leading=` on `GET /runs/{id}/stop`: how many decisions accompany the last one. Absent is
+/// [`STOP_LEADING_DEFAULT`]; anything above [`STOP_LEADING_MAX`] is clamped rather than refused
+/// (spec §4).
+#[derive(serde::Deserialize)]
+pub struct StopQuery {
+    pub leading: Option<i64>,
+}
+
+const STOP_LEADING_DEFAULT: i64 = 10;
+const STOP_LEADING_MAX: i64 = 100;
+
+/// The `runs` columns `GET /runs/{id}/stop` needs, read in one query the way `get_run` reads its
+/// own wider set. Not `RunStatusResponse`: that struct answers a different route's shape, and
+/// borrowing it here would make an unrelated route's column list load-bearing for this one's.
+#[derive(sqlx::FromRow)]
+struct RunStopRow {
+    status: String,
+    mode: String,
+    exit_code: Option<i64>,
+    stderr: Option<String>,
+    successor_run_id: Option<i64>,
+    created_at: String,
+    completed_at: Option<String>,
+}
+
+/// One `shadow_decisions` row, read for `GET /runs/{id}/stop` only — the same seven columns spec
+/// §5.2 lists, in the shape `sqlx` fills directly rather than a positional tuple.
+#[derive(sqlx::FromRow)]
+struct StopDecisionRow {
+    tool_name: String,
+    action_class: String,
+    decision: String,
+    reason: Option<String>,
+    classifier_version: i64,
+    policy_digest: Option<String>,
+    tool_input: Option<String>,
+    created_at: String,
+}
+
+impl StopDecisionRow {
+    fn into_view(self) -> crate::run_stop::GateDecisionView {
+        crate::run_stop::gate_decision_view(
+            self.tool_name,
+            self.action_class,
+            self.decision,
+            self.reason,
+            self.classifier_version,
+            self.policy_digest,
+            self.tool_input,
+            self.created_at,
+        )
+    }
+}
+
+/// Seconds between `created_at` and `completed_at` — or, for a run still running, between
+/// `created_at` and now. Always a majorant of how long the run actually ran (spec §6): the
+/// interval includes any time the run spent queued before it started, which `runs` does not
+/// record separately.
+///
+/// `None` only if `created_at` itself fails to parse, which every writer of that column in this
+/// codebase writes as `chrono::Utc::now().to_rfc3339()` — so in practice this is infallible.
+fn elapsed_seconds_since_created(created_at: &str, completed_at: Option<&str>) -> Option<i64> {
+    let parse = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value).map(|when| when.with_timezone(&chrono::Utc))
+    };
+    let created = parse(created_at).ok()?;
+    let end = match completed_at {
+        Some(value) => parse(value).ok()?,
+        None => chrono::Utc::now(),
+    };
+    Some((end - created).num_seconds())
+}
+
+/// `GET /runs/{id}/stop` (spec `.ai/specs/2026-08-29-porque-parou-design.md` §4): why a run
+/// stopped, in one call. `404` if the run does not exist; `200` — never `204` — for every run that
+/// does, including one still `running` (spec §4, §11 item 5).
+///
+/// Thin by design (spec §7): this reads the run row and, only for `gate` and `timeout` kinds, the
+/// `shadow_decisions` leading up to it, and hands both to `run_stop::build_response` to become the
+/// answer. Deriving `kind` here first — rather than inside `build_response` — is what lets this
+/// skip the `shadow_decisions` query entirely for the other six kinds.
+pub async fn get_run_stop(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<StopQuery>,
+) -> Result<Json<crate::run_stop::RunStopResponse>, StatusCode> {
+    let row = sqlx::query_as::<_, RunStopRow>(
+        "SELECT status, mode, exit_code, stderr, successor_run_id, created_at, completed_at
+         FROM runs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let kind =
+        crate::run_stop::derive_kind(&row.status).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let decisions = if crate::run_stop::kind_shows_leading_up(kind) {
+        let leading = query
+            .leading
+            .unwrap_or(STOP_LEADING_DEFAULT)
+            .clamp(0, STOP_LEADING_MAX);
+        // `kind: gate` fetches one extra row: the newest fills `gate`, and the `leading` after it
+        // fill `leading_up`. `kind: timeout` never fills `gate` (spec §5.1), so it fetches exactly
+        // `leading` rows, all of which become `leading_up` — otherwise `leading_up` would end up one
+        // row longer than `?leading=` promised.
+        let limit = if crate::run_stop::kind_shows_gate(kind) {
+            leading + 1
+        } else {
+            leading
+        };
+        sqlx::query_as::<_, StopDecisionRow>(
+            "SELECT tool_name, action_class, decision, reason, classifier_version, policy_digest,
+                    tool_input, created_at
+             FROM shadow_decisions WHERE run_id = ?
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(id)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(StopDecisionRow::into_view)
+        .collect()
+    } else {
+        Vec::new()
+    };
+
+    let elapsed_seconds =
+        elapsed_seconds_since_created(&row.created_at, row.completed_at.as_deref())
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(crate::run_stop::build_response(
+        id,
+        row.status,
+        kind,
+        &row.mode,
+        elapsed_seconds,
+        row.exit_code,
+        row.stderr,
+        row.successor_run_id,
+        decisions,
+    )))
 }
 
 /// PURE: whether a run status means the run is over for good.
@@ -4544,8 +4698,202 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         Router::new()
             .route("/runs", post(create_run))
             .route("/runs/{id}", get(get_run))
+            .route("/runs/{id}/stop", get(get_run_stop))
             .route("/runs/{id}/cancel", post(cancel_run))
             .with_state(state)
+    }
+
+    /// Seeds one `runs` row outright, which is the only way to reach most of the statuses below.
+    ///
+    /// `create_run` writes `running` and the driver writes the rest, so a test that went through
+    /// the front door could exercise exactly one of the eight kinds. Every case here is about what
+    /// a STATUS answers, never about how the run got into it, so the row is the honest fixture.
+    ///
+    /// `completed_at` is `None` for a run still going, and that is not a detail: it is what makes
+    /// `elapsed_seconds_since_created` measure against now instead of against an ending.
+    async fn seed_run_row(
+        pool: &sqlx::SqlitePool,
+        status: &str,
+        mode: &str,
+        created_at: &str,
+        completed_at: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at, completed_at)
+             VALUES ('a run', ?, ?, ?, ?)",
+        )
+        .bind(status)
+        .bind(mode)
+        .bind(created_at)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// `n` decisions on one run, a second apart so `ORDER BY id DESC` and "most recent first" mean
+    /// the same thing and the window tests can name which rows they expect back.
+    async fn seed_decisions(pool: &sqlx::SqlitePool, run_id: i64, n: i64) {
+        for i in 0..n {
+            sqlx::query(
+                "INSERT INTO shadow_decisions
+                 (run_id, tool_name, decision, action_class, classifier_version, created_at)
+                 VALUES (?, 'Bash', 'allow', 'read-local', 11, ?)",
+            )
+            .bind(run_id)
+            .bind(format!("2026-08-30T00:{:02}:{:02}Z", i / 60, i % 60))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The route's answer as it goes over the wire.
+    ///
+    /// Read as a `Value` rather than deserialised into `RunStopResponse`, deliberately: the struct
+    /// is `Serialize` only, and the thing under test is the JSON a shell receives — including which
+    /// keys are present as `null` rather than absent, which a typed round trip would hide.
+    async fn stop_report(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    /// §11 item 4. `decisions_recorded` is a claim about the MODE, not about an empty table.
+    ///
+    /// Two runs identical in every other way — same status, same absence of decision rows — so the
+    /// only thing that can move the flag is the mode. Asserted in both directions, because a
+    /// function that returned `false` unconditionally would satisfy the `real` half on its own and
+    /// is exactly the shape this field would rot into.
+    ///
+    /// `leading_up` is `[]` and not absent for the `real` run: §5.1 puts missing fields at null or
+    /// empty rather than omitting them, so the shell never has to tell "this run recorded nothing"
+    /// apart from "the daemon stopped sending this key".
+    #[tokio::test]
+    async fn a_real_mode_run_reports_that_it_recorded_no_decisions_and_a_worktree_one_that_it_did() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let started = "2026-08-30T00:00:00Z";
+        let ended = "2026-08-30T00:10:00Z";
+
+        let real = seed_run_row(&pool, "timed_out", "real", started, Some(ended)).await;
+        let worktree = seed_run_row(&pool, "timed_out", "worktree", started, Some(ended)).await;
+
+        let (status, body) = stop_report(&app, &format!("/runs/{real}/stop")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decisions_recorded"], serde_json::json!(false));
+        assert_eq!(
+            body["leading_up"],
+            serde_json::json!([]),
+            "an empty list, not a missing key"
+        );
+
+        let (_, body) = stop_report(&app, &format!("/runs/{worktree}/stop")).await;
+        assert_eq!(
+            body["decisions_recorded"],
+            serde_json::json!(true),
+            "the same run in a mode that IS governed by the tool gate"
+        );
+    }
+
+    /// §11 item 5. A run still going is answered, not deferred.
+    ///
+    /// `200` and never `204`: the caller asked why this run stopped and the answer — "it has not" —
+    /// is a real one. A no-content reply would read as "the daemon has nothing on this run", which
+    /// is what `404` already means for a run that does not exist.
+    ///
+    /// The two kind-specific payloads are asserted null rather than left unchecked, because a
+    /// `timeout` block on a live run would be a verdict about a deadline nothing has reached.
+    #[tokio::test]
+    async fn a_run_still_going_is_answered_two_hundred_with_the_running_kind() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let id = seed_run_row(&pool, "running", "worktree", "2026-08-30T00:00:00Z", None).await;
+
+        let (status, body) = stop_report(&app, &format!("/runs/{id}/stop")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["kind"], serde_json::json!("running"));
+        assert_eq!(body["status"], serde_json::json!("running"));
+        assert!(
+            body["summary"].as_str().is_some_and(|s| !s.is_empty()),
+            "§5 says the sentence is always present, live runs included"
+        );
+        assert_eq!(body["timeout"], serde_json::Value::Null);
+        assert_eq!(body["leading_up"], serde_json::Value::Null);
+    }
+
+    /// §11 item 6. A run nobody created is `404`, and is told apart from one that recorded nothing.
+    #[tokio::test]
+    async fn a_run_that_was_never_created_is_four_oh_four() {
+        let state = test_state().await;
+        let app = test_router(state);
+
+        let (status, _) = stop_report(&app, "/runs/424242/stop").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// §11 item 7. The window has a default, and an over-large one is CLAMPED rather than refused.
+    ///
+    /// Refusing would be the easier thing to write and the wrong behaviour: the caller asking for
+    /// five hundred wants as many as they can have, and a `400` teaches them to guess the cap.
+    ///
+    /// 120 rows so that both the default and the ceiling cut something — against 100 rows the
+    /// clamp and the row count would agree by accident and the assertion would hold with the clamp
+    /// deleted.
+    #[tokio::test]
+    async fn the_leading_window_defaults_to_ten_and_clamps_rather_than_refusing() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let id = seed_run_row(
+            &pool,
+            "timed_out",
+            "worktree",
+            "2026-08-30T00:00:00Z",
+            Some("2026-08-30T00:10:00Z"),
+        )
+        .await;
+        seed_decisions(&pool, id, 120).await;
+
+        let window = async |uri: String| {
+            let (status, body) = stop_report(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            body["leading_up"].as_array().unwrap().len()
+        };
+
+        assert_eq!(
+            window(format!("/runs/{id}/stop")).await,
+            STOP_LEADING_DEFAULT as usize,
+            "omitting the parameter"
+        );
+        assert_eq!(
+            window(format!("/runs/{id}/stop?leading=500")).await,
+            STOP_LEADING_MAX as usize,
+            "over the ceiling: clamped, and answered rather than refused"
+        );
+        assert_eq!(
+            window(format!("/runs/{id}/stop?leading=3")).await,
+            3,
+            "under the ceiling: exactly what was asked for"
+        );
+        assert_eq!(
+            window(format!("/runs/{id}/stop?leading=0")).await,
+            0,
+            "zero is a number, not an absent parameter"
+        );
     }
 
     async fn create_run_via_http(app: &Router, prompt: &str) -> CreateRunResponse {

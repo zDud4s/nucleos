@@ -654,6 +654,29 @@ pub struct RoundState {
     /// added nothing has an unchanged branch, and reviewing it spends a whole run re-reading a diff
     /// nobody wrote.
     pub round_added_nothing: bool,
+    /// Whether a broken item may open another round instead of ending the job.
+    ///
+    /// True for a job the owner asked for and gave an allowance to — `JobRow::commissioned_with_an_
+    /// allowance`, the same predicate the budget and the life ceiling use. **Zero value is false**,
+    /// so every job that existed before this ends exactly where it always ended.
+    ///
+    /// Named for what it licenses rather than for who asked, because two decisions read it and
+    /// neither is about who asked: `next_step` walks past a broken item instead of ending the queue
+    /// at it, and `close_the_round` asks for another plan instead of finishing.
+    ///
+    /// **Both are licensed by the same fact about the TREE, and not by the owner's wish.** A red
+    /// gate is reverted by `record_gate` and a dead node by `reconcile_nodes`, each to the item's
+    /// own footing, BEFORE either is marked — so by the time this is read the rejected or
+    /// unmeasured work is already off the branch and there is nothing left to build on top of.
+    /// Where that revert fails, neither caller reaches this at all: the job is retired on the spot,
+    /// because a tree that could not be put back is the one case where carrying on is worse than
+    /// stopping early.
+    ///
+    /// `GateErrored` stays outside this whatever it says. A gate that would not run measured
+    /// nothing and is deliberately never reverted — its work might be perfectly good, and
+    /// destroying it would be worse than stopping — which leaves the build-on-top argument exactly
+    /// true for it and for it alone.
+    pub a_broken_item_may_go_round_again: bool,
 }
 
 impl Default for RoundState {
@@ -666,6 +689,7 @@ impl Default for RoundState {
             replanning: false,
             replanned: Replan::NotYet,
             round_added_nothing: false,
+            a_broken_item_may_go_round_again: false,
         }
     }
 }
@@ -815,9 +839,23 @@ pub fn next_step(job: &JobView) -> Next {
     //
     // `Cancelled` keeps no guard, in either kind of job. It is not a claim about trees — it is a
     // person having stopped this, and carrying on would be answering them.
+    // `Failed` now carries a second guard, and it is the same argument the `GateFailed` paragraph
+    // above makes, arriving one state later. The reason a dead node ended the queue was that its
+    // tree held edits nothing had measured and the next item would build on them — true of every
+    // node that ends `timed_out`, `interrupted` or broken. `reconcile_nodes` now puts that tree
+    // back to the item's footing before it marks the item, for a job the owner commissioned, so
+    // the edits are gone by the time this reads the state and the reason has been removed rather
+    // than overruled. A revert that could not be done never gets here: the job is retired there.
+    //
+    // Measured 2026-08-30: job 23's item was implemented, gated red, retried — and its retry was
+    // killed mid-flight, which marked the item `failed` and ended the job with three items never
+    // attempted. Nothing about those three was broken.
+    let broken_item_ends_the_queue = !job.rounds.a_broken_item_may_go_round_again;
     for item in job.items.iter().map(|item| &item.state) {
         match item {
-            ItemState::Failed if !job.has_team => return Next::Finish(Outcome::Failed),
+            ItemState::Failed if !job.has_team && broken_item_ends_the_queue => {
+                return Next::Finish(Outcome::Failed);
+            }
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
             ItemState::GateErrored if !job.has_team => return Next::Finish(Outcome::GateErrored),
             _ => {}
@@ -1141,8 +1179,42 @@ fn close_the_round(job: &JobView) -> Next {
     // Asked of `failed_ending` rather than spelled out, because this used to name `GateFailed` and
     // nothing else and was right only because the short-circuit at the top of `next_step` reached
     // `Failed` and `GateErrored` first. A team job has no such short-circuit.
+    //
+    // **Except for a red gate on work the owner asked for, which goes round again.** The sentence
+    // above is the reason to stop, and for `GateFailed` it is no longer true: `record_gate` reverts
+    // the item to its footing before the queue is allowed to move, so by the time this is read the
+    // rejected work is already off the branch and there is nothing to build on top of. `next_step`
+    // made exactly this move once already, taking `GateFailed` out of its short-circuit so a red
+    // gate stopped ending the round at the first of five items — "what survives is the ENDING". The
+    // same argument crosses a round boundary, and this is the same move made there.
+    //
+    // Told to stop and it stops: the ceiling, the dry-round brake and the item's own gate retries
+    // all still apply, so this buys ROUNDS the owner already authorised and never an extra one. And
+    // it is scoped to `GateFailed` alone. `GateErrored` is deliberately not reverted — a gate that
+    // would not run measured nothing, so its work might be perfectly good and destroying it would
+    // be worse than stopping — which means the rejected-work argument is still exactly true for it,
+    // and it still ends the job here. So does `Failed`.
+    //
+    // **What this does NOT do is soften the ending.** The failed item keeps its row, `failed_ending`
+    // keeps finding it, and when the rounds do run out the job is still reported `gate_failed`. A
+    // replan that supersedes the item with a different approach cannot clear that mark — worth
+    // knowing before reading a `gate_failed` job as one that achieved nothing.
     if let Some(outcome) = failed_ending(job) {
-        return Next::Finish(outcome);
+        let go_round_again = matches!(outcome, Outcome::GateFailed | Outcome::Failed)
+            && job.rounds.a_broken_item_may_go_round_again
+            && job.rounds.round + 1 < job.rounds.max_rounds
+            && job.rounds.dry_rounds < DRY_ROUNDS_TO_STOP;
+        if !go_round_again {
+            return Next::Finish(outcome);
+        }
+        // The in-flight check that the happy path gets below, and it is needed here for the same
+        // reason: between spawning a replan and its items landing the queue is unchanged, so
+        // without this every tick would spawn another one.
+        return if job.rounds.replanning {
+            Next::Wait
+        } else {
+            Next::SpawnReplan
+        };
     }
 
     // (1) The replan declared itself done. The cheapest ending there is, and the most trustworthy:
@@ -1379,18 +1451,14 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     .await?;
     let stage = effective_status(&status, resume_status.as_deref());
 
-    let (round, dry_rounds, max_rounds, replan_done, opened_by): (
-        i64,
-        i64,
-        Option<i64>,
-        i64,
-        Option<i64>,
-    ) = sqlx::query_as(
-        "SELECT round, dry_rounds, max_rounds, replan_done, replan_run_id FROM jobs WHERE id = ?",
-    )
-    .bind(job_id)
-    .fetch_one(pool)
-    .await?;
+    let (round, dry_rounds, max_rounds, replan_done, opened_by, rule_name, budget_usd): RoundColumns =
+        sqlx::query_as(
+            "SELECT round, dry_rounds, max_rounds, replan_done, replan_run_id, rule_name, budget_usd
+             FROM jobs WHERE id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await?;
 
     // Deliberately NOT filtered by round, and the reason is worth writing down because filtering is
     // the obvious thing to reach for. A round closes only when every item in it is terminal, so an
@@ -1559,6 +1627,10 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             } else {
                 Replan::NotYet
             },
+            a_broken_item_may_go_round_again: commissioned_with_an_allowance(
+                rule_name.as_deref(),
+                budget_usd,
+            ),
         },
         has_team: team_id.is_some(),
         max_parallel: max_parallel.max(1) as usize,
@@ -2183,6 +2255,12 @@ pub struct JobRow {
     /// This job's own allowance. `None` means only the house limit governs, which is what every
     /// `graph:` rule has always meant and keeps meaning.
     pub budget_usd: Option<f64>,
+    /// The schedule that started this job, and `None` when a person asked for it directly.
+    ///
+    /// Read only through `commissioned_with_an_allowance`, which is where the rule it feeds lives.
+    /// It is the same signal `hooks::unrecognized_policy_for` reads for the same distinction — see
+    /// `NewJob::rule_name` for what the column has always meant.
+    pub rule_name: Option<String>,
     pub created_at: String,
 }
 
@@ -2190,6 +2268,47 @@ impl JobRow {
     fn stage(&self) -> &str {
         effective_status(&self.status, self.resume_status.as_deref())
     }
+
+    /// Whether the owner asked for this job **and** named what it may spend.
+    ///
+    /// Delegates rather than restating: `load_view` asks the same question of loose columns, and
+    /// this module has been bitten three times by one rule written in two places.
+    fn commissioned_with_an_allowance(&self) -> bool {
+        commissioned_with_an_allowance(self.rule_name.as_deref(), self.budget_usd)
+    }
+}
+
+/// The `jobs` row `load_view` reads about rounds and about who asked, in `SELECT` order.
+///
+/// Named because clippy counts seven of them as a type worth naming, and it is right for a better
+/// reason than the count: the tuple is positional, three of its members are `Option<i64>`, and
+/// nothing but the order stops `max_rounds` being bound to `replan_run_id`. Keep it in step with
+/// the query below — they are read together or not at all.
+type RoundColumns = (
+    i64,
+    i64,
+    Option<i64>,
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<f64>,
+);
+
+/// PURE: whether the owner asked for this job **and** named what it may spend.
+///
+/// The one question three different limits ask — the house budget in `brakes`, the life ceiling in
+/// `drive`, and whether a red gate may go round again in `close_the_round` — and it lives in one
+/// function so they cannot answer it differently. All three were written to pace autonomy nobody
+/// asked for, and all three were governing work somebody had commissioned; the fix is the same fix,
+/// so the predicate must be the same predicate.
+///
+/// **Both halves, and the conjunction is the whole safety argument.** `rule_name.is_none()` alone
+/// would exempt a job a person asked for and gave no number to, leaving nothing at all holding it.
+/// `budget_usd.is_some()` alone would exempt a scheduled job that happens to carry an allowance,
+/// which is exactly the proactive autonomy the house limits exist for. Only together do they mean:
+/// a person decided this should happen, and said how far it may go.
+fn commissioned_with_an_allowance(rule_name: Option<&str>, budget_usd: Option<f64>) -> bool {
+    rule_name.is_none() && budget_usd.is_some()
 }
 
 /// Spelled out rather than built from `LIVE_STATUSES`, because sqlx refuses SQL assembled at
@@ -2197,7 +2316,7 @@ impl JobRow {
 /// constant and the migration's index, so the three cannot drift apart in silence.
 const LIVE_JOBS_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
                                     wait_reason, max_items, gate_each, head_sha, round, budget_usd,
-                                    created_at
+                                    rule_name, created_at
                              FROM jobs
                              WHERE status IN ('planning','implementing','gating','reviewing',
                                               'awaiting_approval','waiting')
@@ -2205,7 +2324,7 @@ const LIVE_JOBS_SQL: &str = "SELECT id, project_id, project_root, prompt, status
 
 const ONE_JOB_SQL: &str = "SELECT id, project_id, project_root, prompt, status, resume_status,
                                   wait_reason, max_items, gate_each, head_sha, round, budget_usd,
-                                    created_at
+                                  rule_name, created_at
                            FROM jobs WHERE id = ?";
 
 pub async fn live_jobs(pool: &SqlitePool) -> sqlx::Result<Vec<JobRow>> {
@@ -2219,13 +2338,36 @@ async fn load_job(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobRow> {
         .await
 }
 
-/// How long a job may live, counting every minute it spent parked.
+/// How long a job nobody asked for may live, counting every minute it spent parked.
 ///
 /// Decision 14. Counting `waiting` is the whole point: without it, parking would be a way around
 /// the ceiling, and a starved job would hold a worktree and the project's slot indefinitely. A
 /// nightly job that starts at 03:00 is retired by 07:00, which is why the attention brake rarely
 /// has to be the thing that stops it.
+///
+/// That sentence is the tell, and it is why this is no longer the only ceiling: every word of the
+/// reasoning above is about a **scheduled** job. See `COMMISSIONED_JOB_LIFETIME`.
 pub const MAX_JOB_LIFETIME: chrono::Duration = chrono::Duration::hours(4);
+
+/// How long a job the owner asked for and funded may live.
+///
+/// **Four hours was a pacing decision about proactive autonomy, and it was retiring commissioned
+/// work.** The same argument as the house budget one stage earlier: a limit written to stop the
+/// daemon drifting on its own was governing a task a person had explicitly asked for. Measured
+/// 2026-08-30 on job 23, which lost roughly eighty minutes of its four hours parked on the very
+/// budget brake that turned out not to apply to it — parked time counts, so a brake that should
+/// never have fired also ate the ceiling.
+///
+/// And the plainest reason of all: **a night is eight hours, not four.** A ceiling shorter than the
+/// span somebody asks for makes the request impossible to satisfy however well everything else runs.
+///
+/// Twelve, not infinity, and that is deliberate. The real bound on a commissioned job is its
+/// allowance — it stops when the money the owner named runs out, which is a truer limit for work
+/// somebody is paying for than a wall clock is. This stays as the backstop for the case money
+/// cannot catch: a job that idles without spending would otherwise hold a worktree and the
+/// project's slot forever. `commissioned_with_an_allowance` is what picks between the two, so a
+/// job with no allowance keeps the four hours and is never left with no bound at all.
+pub const COMMISSIONED_JOB_LIFETIME: chrono::Duration = chrono::Duration::hours(12);
 
 /// How many moves one pass will make for a single job.
 ///
@@ -2424,13 +2566,39 @@ pub fn plan_prompt(
 /// Told to prefer `done` explicitly, and that is not politeness. The failure this feature has to
 /// avoid is a job that will not admit it is finished: ending #4 (out of rounds) costs a full round of
 /// runs to discover, where ending #1 costs one node.
+/// An item the last round did not finish, and what is known about why.
+///
+/// Read by `replan_prompt` and by nothing else. Both shapes of not-finishing are here and are kept
+/// apart, because they call for different next moves: a gate that spoke gives the node something
+/// concrete to answer, and a node that died before any gate looked leaves the item unmeasured —
+/// which is worth saying plainly rather than dressing up as a verdict nobody reached.
+pub struct Unfinished {
+    pub ordinal: usize,
+    pub description: String,
+    /// The tail of what the gate printed rejecting this item, or `None` when nothing gated it.
+    pub gate_output: Option<String>,
+}
+
 pub fn replan_prompt(
     task: &str,
     round: i64,
     archives: &[String],
     artifacts: &str,
     graph: Option<&Graph>,
+    unfinished: &[Unfinished],
 ) -> String {
+    // **"Do not repropose any of it" is qualified when something broke, and the qualification is
+    // the point.** Unqualified it is right about work that LANDED — reproposing a green item wastes
+    // a round redoing it. Aimed at an item the gate rejected it is exactly backwards: that item is
+    // the one thing the round did not achieve, and the sentence tells the node to leave it alone.
+    // Measured 2026-08-30 on job 23, whose first item went red and whose next round would have read
+    // this and gone looking for something else to do.
+    let leave_alone = if unfinished.is_empty() {
+        " Do not repropose any of it."
+    } else {
+        " Do not repropose the parts of it that LANDED. What did not is listed below, and \
+         reproposing that — differently — is the point of this round."
+    };
     let history = if archives.is_empty() {
         // Reachable when the archive copy failed, and the honest thing to say is that it is missing.
         // Claiming a file that is not there sends the node looking, and what it finds is nothing.
@@ -2439,9 +2607,39 @@ pub fn replan_prompt(
             .to_owned()
     } else {
         format!(
-            "What the earlier rounds already tried is in {}. Do not repropose any of it.",
+            "What the earlier rounds already tried is in {}.{leave_alone}",
             archives.join(", ")
         )
+    };
+    // Named, with the gate's own words where a gate spoke. `implement_prompt` already carries the
+    // gate output into a RETRY of the same item, for the reason §5.4 makes structural: no node ever
+    // sees another's session, so a node that cannot see what it broke spends a whole run
+    // rediscovering what the gate already printed. A replan is the same node in the same position,
+    // one round later, and it was the one place that argument had not reached.
+    //
+    // The tree is NOT the answer to this. A red item was reverted to its footing before the queue
+    // moved on, so what the gate objected to is not there to read — the branch shows the work as
+    // never having been done, which is true and is not why.
+    let broke = if unfinished.is_empty() {
+        String::new()
+    } else {
+        let mut lines = String::from(
+            "\n\nWhat the last round could not finish, and what is known about why:\n\n",
+        );
+        for item in unfinished {
+            lines.push_str(&format!(
+                "- item {}: {}\n",
+                item.ordinal + 1,
+                item.description
+            ));
+            match &item.gate_output {
+                Some(output) => lines.push_str(&format!("  the gate said:\n{output}\n")),
+                None => lines.push_str(
+                    "  its node ended before any gate looked at it, so nothing measured this one.\n",
+                ),
+            }
+        }
+        lines
     };
     // The graph rules are repeated here word for word rather than referred to, and the reason is
     // that the node reading them is not the node that read them before. A replan writes items into
@@ -2469,7 +2667,7 @@ pub fn replan_prompt(
     format!(
         "You are the REPLAN node of an autonomous job, at the end of round {round}. The working tree \
          holds everything the job has done so far.\n\n\
-         {history}\n\n\
+         {history}{broke}\n\n\
          Decide whether the task below is finished. Write ONE of these to {artifacts}/plan.json and \
          change nothing else:\n\n\
          {{\"done\": true, \"why\": \"...\"}}\n\
@@ -2612,7 +2810,17 @@ async fn say(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
 /// A pass does this before it decides anything, and it is the only part that runs whatever the
 /// brakes say: it records work that already happened. Refusing to write down a finished node
 /// because the budget ran out would lose the node and repeat it.
-async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
+/// What `reconcile_nodes` leaves behind for the pass that called it.
+///
+/// A bool would have done and would have read as a bool at the call site. This exists because the
+/// one case that stops a pass — a worktree that could not be put back — retires the job as it goes,
+/// and a caller that carried on would be driving a job that has already ended.
+enum Reconciled {
+    KeepGoing,
+    JobRetired,
+}
+
+async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconciled> {
     let pool = &state.pool;
 
     // The two statuses excluded here are `node_in_flight`'s, written out because sqlx will not take
@@ -2642,6 +2850,52 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
             STATUS_CANCELLED => STATUS_CANCELLED,
             _ => "failed",
         };
+
+        // **The tree is put back BEFORE the item is marked, and that order is what lets the queue
+        // carry on.** The paragraph above is the reason a dead node ended the chain: its tree holds
+        // edits nothing measured, and the next item would build on them. That is a statement about
+        // the TREE, so it is answered by fixing the tree rather than by ending the job — exactly
+        // what `record_gate` already does for a gate that went red, and this is the same move for
+        // the other way an item can break. `next_step` reads the state afterwards and walks past it.
+        //
+        // Only for a job the owner commissioned and funded, because only there is a longer leash
+        // something somebody asked for. A scheduled job keeps the old ending, untouched.
+        //
+        // A revert that FAILS retires the job here and now. It is the one case where carrying on is
+        // worse than stopping: the branch holds work nothing has looked at, `next_step` would walk
+        // past the item believing otherwise, and the item after it would build on top. Stopping
+        // hands the branch to a person with everything still on it.
+        if item_status == "failed" && job.commissioned_with_an_allowance() {
+            let ordinal = ordinal as usize;
+            let put_back = match (
+                job_worktree(pool, job.id).await,
+                revert_point(pool, job, ordinal).await,
+            ) {
+                (Ok(Some((worktree, _))), Some(footing)) => {
+                    crate::worktree::revert_to(&worktree, &footing)
+                        .await
+                        .is_ok()
+                }
+                _ => false,
+            };
+            if !put_back {
+                let _ = retire(pool, job.id, STATUS_STOPPED).await;
+                say(
+                    pool,
+                    job,
+                    "job_gate_failed",
+                    &format!(
+                        "job {} at item {}: its node ended `{run_status}` and the worktree could \
+                         not be put back, so the job stopped with the work still on the branch",
+                        job.id,
+                        ordinal + 1
+                    ),
+                )
+                .await;
+                return Ok(Reconciled::JobRetired);
+            }
+        }
+
         sqlx::query("UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ?")
             .bind(item_status)
             .bind(job.id)
@@ -2686,7 +2940,7 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     // off — it leaves the job wherever it found it. Cheap when there is nothing to take: one indexed
     // read of the latest `replan` run, and the very common case is that there has never been one.
     ingest_replan(state, job).await?;
-    Ok(())
+    Ok(Reconciled::KeepGoing)
 }
 
 /// Whether one of this job's nodes has stopped to ask permission.
@@ -4110,26 +4364,45 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
         }
     }
 
-    // Decision 9. Which of the two limits fired decides whether waiting is patience or a hang.
-    match crate::budget::budget_permits_new_run(&state.pool, now).await {
-        crate::budget::BudgetDecision::Allow => {}
-        crate::budget::BudgetDecision::Pause {
-            reason,
-            kind: crate::budget::PauseKind::Transient,
-        } => {
-            return Brake::Park {
-                reason: "budget",
-                detail: reason,
-            };
+    // **The house budget paces PROACTIVE autonomy, and a job the owner asked for with an allowance
+    // of its own is not that.** The same argument `http::create_job` already makes about the scoped
+    // kills, the budget and the WIP limit on the way in — "a person asking for a job through the
+    // shell or the Telegram assistant is not that" — and it stopped at the door. Past it, the daily
+    // and hourly house limits governed a job somebody had explicitly commissioned and given a
+    // number to, which is the owner's spend decision being overruled by the daemon's own pacing.
+    //
+    // Measured 2026-08-30: job 23 was created for $25, spent $10.36 doing real work, and the next
+    // node was about to be parked by an $8/hour house limit — a limit whose whole purpose is to
+    // stop the daemon spending fast on things nobody asked for.
+    //
+    // **The exemption is conditional on there being another bound, and that is the whole of its
+    // safety.** A requested job with no `budget_usd` of its own has nothing else holding it, so it
+    // keeps the house limits exactly as before; the ceiling it escapes is replaced by the one the
+    // owner named, never by nothing. A life ceiling bounds both cases regardless — a different one
+    // each, chosen by this same predicate, which is why the predicate lives on `JobRow`.
+    if !job.commissioned_with_an_allowance() {
+        // Decision 9. Which of the two limits fired decides whether waiting is patience or a hang.
+        match crate::budget::budget_permits_new_run(&state.pool, now).await {
+            crate::budget::BudgetDecision::Allow => {}
+            crate::budget::BudgetDecision::Pause {
+                reason,
+                kind: crate::budget::PauseKind::Transient,
+            } => {
+                return Brake::Park {
+                    reason: "budget",
+                    detail: reason,
+                };
+            }
+            crate::budget::BudgetDecision::Pause {
+                reason,
+                kind: crate::budget::PauseKind::Window,
+            } => return Brake::Stop { detail: reason },
         }
-        crate::budget::BudgetDecision::Pause {
-            reason,
-            kind: crate::budget::PauseKind::Window,
-        } => return Brake::Stop { detail: reason },
     }
 
-    // The job's own ceiling, under the house's. Two different questions and both worth asking: a job
-    // can be stopped by what it was given or by what is left in the till.
+    // The job's own ceiling — under the house's for work nobody asked for, and INSTEAD of it for
+    // work somebody did. Two different questions and both worth asking: a job can be stopped by
+    // what it was given or by what is left in the till.
     //
     // `Stop` and never `Park`, which is the whole difference from the window brake above. A calendar
     // window reopens; a task's allowance does not, and a job parked on it would sit there until the
@@ -4181,6 +4454,29 @@ async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Brake {
     // a job admitted at 03:00 could otherwise keep starting nodes at 08:00 with the owner at the
     // keyboard. The item in flight is never killed — its gate has already run or is about to — so
     // this only ever refuses to start the NEXT one.
+    // Switched off per project in `.ai/autopilot.yaml`, and read HERE rather than once at
+    // admission for the same reason decision 10 gives about the check itself: a job admitted under
+    // one setting must not go on starting nodes under it after the owner changed their mind.
+    //
+    // A rules file that cannot be read leaves the brake ON. That is the direction every other arm
+    // of this chain fails in, and the asymmetry is the argument: being wrong this way costs a job
+    // that waits, and being wrong the other way starts a node in a worktree somebody is using.
+    let brake_applies =
+        match crate::config::load_schedule_rules(std::path::Path::new(&job.project_root)) {
+            Ok(rules) => rules.attention_brake(),
+            Err(error) => {
+                tracing::warn!(
+                    job_id = job.id,
+                    %error,
+                    "could not read this project's autopilot rules; keeping the attention brake on"
+                );
+                true
+            }
+        };
+    if !brake_applies {
+        return Brake::Go;
+    }
+
     match crate::attention::attention_permits_new_run(
         &state.pool,
         &state.run_handles,
@@ -4414,6 +4710,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 &archives,
                 &artifacts,
                 graph_rules(pool, job).await.as_ref(),
+                &unfinished_items(pool, job.id).await,
             );
             spawn_node(state, job, "replan", prompt, None, worktree, NoRoom::Park).await
         }
@@ -4425,6 +4722,34 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
         | Next::MergeItem { .. }
         | Next::Orphan { .. } => Step::Stopped,
     }
+}
+
+/// The items a replan needs told about: the ones that broke, worst-known-first by ordinal.
+///
+/// `gate_failed` and `failed` and nothing else. `skipped` is deliberately absent — a skipped item is
+/// a proposal waiting for a person, not work that went wrong, and listing it here would ask the
+/// replan to route around a decision that is not its to make. `gate_errored` is absent because it
+/// ends the job outright, so no replan ever runs to read it.
+///
+/// A read that fails costs the replan its context and nothing else, so it answers with an empty
+/// list rather than refusing: the round it is about to open is worth more than the paragraph.
+async fn unfinished_items(pool: &SqlitePool, job_id: i64) -> Vec<Unfinished> {
+    sqlx::query_as::<_, (i64, String, Option<String>)>(
+        "SELECT ordinal, description, gate_output FROM job_items
+         WHERE job_id = ? AND status IN ('gate_failed', 'failed')
+         ORDER BY ordinal",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(ordinal, description, gate_output)| Unfinished {
+        ordinal: ordinal as usize,
+        description,
+        gate_output,
+    })
+    .collect()
 }
 
 /// Starts one item's node: the whole of what the batch loop does for one ordinal.
@@ -4508,14 +4833,30 @@ async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
     let pool = &state.pool;
 
     // Bookkeeping about work that already happened, before any decision and before any brake.
-    if let Err(error) = reconcile_nodes(state, &job).await {
-        tracing::warn!(job_id = job.id, %error, "could not reconcile a job's nodes");
-        return;
+    match reconcile_nodes(state, &job).await {
+        Ok(Reconciled::KeepGoing) => {}
+        // Already retired, and with a line in the feed saying why. Carrying on would drive a job
+        // that has ended — and, in the one case that returns this, would advance the queue onto a
+        // tree that could not be put back.
+        Ok(Reconciled::JobRetired) => return,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not reconcile a job's nodes");
+            return;
+        }
     }
 
     // Decision 14, checked before anything is started and while parked, since parked time counts.
+    //
+    // Which ceiling is a question about who asked, exactly as the house budget below is — see
+    // `COMMISSIONED_JOB_LIFETIME`. The message says the number it actually applied rather than a
+    // constant, so a reader is never told four hours by a job that got twelve.
+    let ceiling = if job.commissioned_with_an_allowance() {
+        COMMISSIONED_JOB_LIFETIME
+    } else {
+        MAX_JOB_LIFETIME
+    };
     if let Ok(started) = DateTime::parse_from_rfc3339(&job.created_at)
-        && now.signed_duration_since(started.with_timezone(&Utc)) > MAX_JOB_LIFETIME
+        && now.signed_duration_since(started.with_timezone(&Utc)) > ceiling
     {
         let _ = retire(pool, job.id, STATUS_EXPIRED).await;
         say(
@@ -4525,7 +4866,7 @@ async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
             &format!(
                 "job {} passed the {}-hour ceiling and stopped; what it finished is on its branch",
                 job.id,
-                MAX_JOB_LIFETIME.num_hours()
+                ceiling.num_hours()
             ),
         )
         .await;
@@ -5268,6 +5609,15 @@ mod tests {
 
     async fn feed_kinds(pool: &sqlx::SqlitePool) -> Vec<String> {
         sqlx::query_scalar("SELECT kind FROM feed ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// What the feed actually said, for the cases where the wording carries a fact a reader acts
+    /// on — a ceiling's number, say — and not only that something happened.
+    async fn feed_texts(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed ORDER BY id")
             .fetch_all(pool)
             .await
             .unwrap()
@@ -6599,9 +6949,11 @@ mod tests {
             &["plan-0.json".to_owned(), "plan-1.json".to_owned()],
             "/wt/.nucleos",
             None,
+            &[],
         );
         assert!(with.contains("plan-0.json, plan-1.json"));
-        assert!(with.contains("Do not repropose"));
+        // Nothing broke in this round, so the instruction keeps the flat form it always had.
+        assert!(with.contains("Do not repropose any of it."));
         assert!(with.contains("/wt/.nucleos/plan.json"));
         assert!(with.contains("add shout and whisper"));
         // Ending #1 is one node; ending #4 costs a whole round to reach the same place, so the node
@@ -6610,7 +6962,7 @@ mod tests {
 
         // No archives is a reachable state — the copy can fail — and the honest thing is to say so.
         // Naming a file that is not there sends the node looking, and what it finds is nothing.
-        let without = replan_prompt("t", 1, &[], "/wt/.nucleos", None);
+        let without = replan_prompt("t", 1, &[], "/wt/.nucleos", None, &[]);
         assert!(without.contains("could not be recovered"));
         assert!(!without.contains("Do not repropose"));
     }
@@ -6625,7 +6977,7 @@ mod tests {
     #[test]
     fn every_node_that_could_reach_for_git_is_told_the_job_commits() {
         let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos", None, false);
-        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos", None);
+        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos", None, &[]);
         // No hint, because what this pins is the paragraph every node gets regardless of one.
         let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None, None);
 
@@ -6650,7 +7002,7 @@ mod tests {
     /// node. `Read`, `Grep` and `Glob` need nobody and were there the whole time.
     #[test]
     fn the_nodes_that_only_look_are_told_what_to_look_with() {
-        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None);
+        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None, &[]);
         let review = review_prompt(Some("abc123"), "/wt/.nucleos");
 
         for prompt in [&replan, &review] {
@@ -6897,14 +7249,14 @@ mod tests {
         assert!(prompt.contains("depends_on"));
         assert!(prompt.contains("EARLIER ordinal"));
 
-        let replan = replan_prompt("t", 2, &[], "/wt/.nucleos", Some(&directed(9)));
+        let replan = replan_prompt("t", 2, &[], "/wt/.nucleos", Some(&directed(9)), &[]);
         assert!(replan.contains("numbered from 9"), "{replan}");
         assert!(replan.contains("depends_on"));
 
         // And a job without a team is told none of it, because none of it applies.
         let plain = plan_prompt("t", 5, "/wt/.nucleos", None, false);
         assert!(!plain.contains("depends_on"));
-        assert!(!replan_prompt("t", 2, &[], "/wt/.nucleos", None).contains("depends_on"));
+        assert!(!replan_prompt("t", 2, &[], "/wt/.nucleos", None, &[]).contains("depends_on"));
     }
 
     /// The hint is the planner's, and it is optional at both ends: a planner that names files is
@@ -7557,11 +7909,11 @@ mod tests {
         );
     }
 
-    /// A red gate ends the job whatever the rounds say.
+    /// A red gate ends a job NOBODY ASKED FOR, whatever the rounds say.
     ///
-    /// The per-item revert stops the NEXT ITEM building on work the gate rejected; that reason does
-    /// not stop being true at a round boundary, and a replan looking at a branch carrying a red item
-    /// would plan on top of it.
+    /// `..RoundState::default()` leaves `a_broken_item_may_go_round_again` false, which is what a
+    /// scheduled job gets and what every job got before that field existed — so this keeps asking
+    /// the question it was written to ask, about the work it still holds for.
     #[test]
     fn a_red_gate_ends_a_job_that_had_rounds_left() {
         assert_eq!(
@@ -7575,6 +7927,178 @@ mod tests {
                 }
             )),
             Next::Finish(Outcome::GateFailed)
+        );
+    }
+
+    /// A replan is told what broke, and stops being told to leave it alone.
+    ///
+    /// Two faults in one paragraph, and the second is the one that would have survived a fix to the
+    /// first. `implement_prompt` already carries the gate's output into a RETRY of an item, because
+    /// §5.4 keeps no node from ever seeing another's session — so a node that cannot see what it
+    /// broke spends a whole run rediscovering what the gate already printed. A replan is that same
+    /// node one round later and was the one place the argument had not reached.
+    ///
+    /// And "Do not repropose any of it" is right about work that LANDED and exactly backwards aimed
+    /// at an item the gate rejected: that item is the one thing the round did not achieve.
+    ///
+    /// The unmeasured arm is not decoration. An item whose node died before any gate looked at it
+    /// has no verdict to hand on, and saying so plainly beats inventing one — a replan told "the
+    /// gate said nothing" would reasonably read that as the gate having been content.
+    #[test]
+    fn a_replan_is_handed_what_broke_and_told_that_reproposing_it_is_the_point() {
+        let archives = ["plan-0.json".to_owned()];
+        let gated = Unfinished {
+            ordinal: 2,
+            description: "wire the handler".to_owned(),
+            gate_output: Some("error[E0061]: this function takes 6 arguments".to_owned()),
+        };
+        let unmeasured = Unfinished {
+            ordinal: 4,
+            description: "the database-backed tests".to_owned(),
+            gate_output: None,
+        };
+
+        let prompt = replan_prompt(
+            "t",
+            1,
+            &archives,
+            "/wt/.nucleos",
+            None,
+            &[gated, unmeasured],
+        );
+
+        // Ordinals are shown one-based, as every other line a person reads about items is.
+        assert!(prompt.contains("item 3: wire the handler"), "{prompt}");
+        assert!(prompt.contains("error[E0061]"), "{prompt}");
+        assert!(
+            prompt.contains("item 5: the database-backed tests"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("nothing measured this one"), "{prompt}");
+
+        // The instruction is qualified rather than dropped: the parts that landed are still not to
+        // be reproposed, and a round that lost that half would redo its own finished work.
+        assert!(prompt.contains("the parts of it that LANDED"), "{prompt}");
+        assert!(!prompt.contains("Do not repropose any of it."), "{prompt}");
+    }
+
+    /// A dead node stops ending the queue at the item it died on, and the items after it run.
+    ///
+    /// This is the one that would have saved job 23, and the arithmetic is the argument: its item 0
+    /// was implemented, gated red, retried, and the retry was killed mid-flight — which marked the
+    /// item `failed` and finished the job with items 1, 2 and 3 never attempted. Nothing about
+    /// those three was broken, and nothing about them had been measured either way.
+    ///
+    /// The pending item is what the assertion is really about. `Finish` here means three items
+    /// thrown away for one that broke; anything else means the queue carries on to them.
+    #[test]
+    fn a_dead_node_no_longer_takes_the_items_after_it_when_the_owner_asked_for_the_work() {
+        let queue = [ItemState::Failed, ItemState::Pending];
+        let rounds = |commissioned| RoundState {
+            round: 0,
+            max_rounds: 4,
+            a_broken_item_may_go_round_again: commissioned,
+            ..RoundState::default()
+        };
+
+        assert_eq!(
+            next_step(&view_in_round(&queue, ReviewState::Done, rounds(false))),
+            Next::Finish(Outcome::Failed),
+            "a job nobody asked for ends exactly where it always did"
+        );
+        assert_ne!(
+            next_step(&view_in_round(&queue, ReviewState::Done, rounds(true))),
+            Next::Finish(Outcome::Failed),
+            "and one the owner commissioned reaches the item that was never tried"
+        );
+    }
+
+    /// A red gate on work the owner asked for goes round again instead of ending the night.
+    ///
+    /// The measurement behind it: job 23, 2026-08-30, was given four rounds and $25, went red on
+    /// its first item in round 0, and under the arm above would have been reported `gate_failed`
+    /// with three rounds and $14.63 never touched.
+    ///
+    /// Every row here is a way the change could be too broad, which is the risk in it — an
+    /// exemption that swallowed the other endings would turn "keep trying" into "never stop".
+    #[test]
+    fn a_red_gate_on_commissioned_work_goes_round_again_but_nothing_else_does() {
+        let commissioned = |round, dry, items: &[ItemState]| {
+            view_in_round(
+                items,
+                ReviewState::Done,
+                RoundState {
+                    round,
+                    max_rounds: 4,
+                    dry_rounds: dry,
+                    a_broken_item_may_go_round_again: true,
+                    ..RoundState::default()
+                },
+            )
+        };
+        let red = [ItemState::Passed, ItemState::GateFailed];
+
+        // The change itself: rounds left, so the job asks for another plan rather than giving up.
+        assert_eq!(next_step(&commissioned(0, 0, &red)), Next::SpawnReplan);
+
+        // Out of rounds. The ending is NOT softened — the failed item still decides what the job is
+        // reported as, and `gate_failed` is what a person reads in the morning.
+        assert_eq!(
+            next_step(&commissioned(3, 0, &red)),
+            Next::Finish(Outcome::GateFailed)
+        );
+
+        // Dried up: two rounds that added nothing stop it, exactly as they stop a happy job. Without
+        // this arm a red item the replan cannot fix would spin against `max_rounds` spending money.
+        assert_eq!(
+            next_step(&commissioned(0, DRY_ROUNDS_TO_STOP, &red)),
+            Next::Finish(Outcome::GateFailed)
+        );
+
+        // A dead node goes round again too, and for the same reason rather than by analogy:
+        // `reconcile_nodes` puts its tree back to the item's footing before marking it, exactly as
+        // `record_gate` does for a red gate, so the unmeasured edits are gone by the time this
+        // reads the state.
+        assert_eq!(
+            next_step(&commissioned(0, 0, &[ItemState::Passed, ItemState::Failed])),
+            Next::SpawnReplan
+        );
+
+        // `GateErrored` is the one that does NOT move, and it is why the set is written out rather
+        // than as "any unhappy ending". A gate that would not RUN measured nothing and is
+        // deliberately never reverted — its work might be perfectly good — so the build-on-top
+        // argument is still exactly true for it.
+        //
+        // Asked of `close_the_round` and NOT of `next_step`, which would have been the comfortable
+        // thing to write and would have proved nothing: `next_step` short-circuits on `GateErrored`
+        // before a round is ever closed, so it answers `Finish` whatever this branch says, and a
+        // widening of the set above would have sailed past a green assertion.
+        assert_eq!(
+            close_the_round(&commissioned(0, 0, &[ItemState::GateErrored])),
+            Next::Finish(Outcome::GateErrored)
+        );
+        // Cancelled is a person having stopped this. No revert makes that stale, and carrying on
+        // would be answering them.
+        assert_eq!(
+            next_step(&commissioned(0, 0, &[ItemState::Cancelled])),
+            Next::Finish(Outcome::Cancelled)
+        );
+
+        // A replan already in flight is waited on, not spawned twice — the same trap the happy path
+        // has its own guard for.
+        assert_eq!(
+            next_step(&view_in_round(
+                &red,
+                ReviewState::Done,
+                RoundState {
+                    round: 0,
+                    max_rounds: 4,
+                    replanning: true,
+                    a_broken_item_may_go_round_again: true,
+                    ..RoundState::default()
+                }
+            )),
+            Next::Wait
         );
     }
 
@@ -10073,6 +10597,64 @@ mod tests {
         assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
     }
 
+    /// The house budget against the four shapes of job, and only one of them escapes it.
+    ///
+    /// The escape is the point of the change and the three that do NOT escape are the point of the
+    /// test: an exemption whose condition is a conjunction fails silently in three directions if
+    /// only the happy one is asserted.
+    #[tokio::test]
+    async fn only_a_commissioned_job_with_an_allowance_escapes_the_house_budget() {
+        // A house limit already spent past, so anything the house governs stops here.
+        async fn bench(rule: Option<&str>, allowance: Option<f64>) -> (AppState, JobRow) {
+            let pool = test_pool().await;
+            let state = test_state(pool.clone()).await;
+            set_budget(&pool, Some(5.0), None).await;
+            let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+            seed_job_run(&pool, job_id, 50.0).await;
+            sqlx::query("UPDATE jobs SET rule_name = ?, budget_usd = ? WHERE id = ?")
+                .bind(rule)
+                .bind(allowance)
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let job = load_job(&pool, job_id).await.unwrap();
+            (state, job)
+        }
+
+        // Nobody asked for it: the house governs however it was configured.
+        let (state, job) = bench(Some("nightly"), Some(500.0)).await;
+        assert!(
+            !matches!(brakes(&state, &job, Utc::now()).await, Brake::Go),
+            "a scheduled job walked past the house budget"
+        );
+
+        // Asked for, but named no number of its own — so the house limit is the ONLY bound there
+        // is, and taking it away would leave nothing. This is the arm that keeps the exemption
+        // safe rather than merely narrow.
+        let (state, job) = bench(None, None).await;
+        assert!(
+            !matches!(brakes(&state, &job, Utc::now()).await, Brake::Go),
+            "a job with no allowance of its own was left unbounded"
+        );
+
+        // Asked for AND given a number: the owner's spend decision, and it is the one that governs.
+        // Its own allowance still has room, so this must go.
+        let (state, job) = bench(None, Some(500.0)).await;
+        assert!(
+            matches!(brakes(&state, &job, Utc::now()).await, Brake::Go),
+            "work the owner commissioned and funded was paced by the house anyway"
+        );
+
+        // And the exemption reaches the house budget and nothing else: the job's OWN allowance,
+        // spent, still stops it.
+        let (state, job) = bench(None, Some(10.0)).await;
+        assert!(
+            matches!(brakes(&state, &job, Utc::now()).await, Brake::Stop { .. }),
+            "the exemption swallowed the job's own ceiling as well"
+        );
+    }
+
     async fn exclude(pool: &sqlx::SqlitePool, project_id: &str, low: i64, high: i64) {
         sqlx::query(
             "INSERT INTO fleet_exclusions
@@ -10355,6 +10937,63 @@ mod tests {
         assert_eq!(item_statuses(&pool, job_id).await[1], "pending");
     }
 
+    /// The same setup as the test above, with the brake switched off in the project's rules.
+    ///
+    /// The heartbeat is still fresh — the owner IS at the keyboard — so this asserts the switch and
+    /// not the absence of a signal. What changes is only whether the job asks.
+    #[tokio::test]
+    async fn a_project_that_switched_the_brake_off_is_not_parked_by_a_present_owner() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        std::fs::create_dir_all(worktree.path().join(".ai")).unwrap();
+        std::fs::write(
+            worktree.path().join(".ai").join("autopilot.yaml"),
+            "attention_brake: false\n",
+        )
+        .unwrap();
+        sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
+            .bind(worktree.path().to_string_lossy().into_owned())
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["implemented", "pending"]).await;
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('project', 'project-a', ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Continued);
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        // What this asserts is the brake and only the brake: the job is not parked, and not parked
+        // for this reason. Whether the next node then reaches `running` is the spawn path's
+        // business — it provisions a checkout and starts a CLI, neither of which this bench sets
+        // up — and it has its own tests. Asserting it here would have made this test fail for
+        // reasons that have nothing to do with the switch it exists to cover.
+        assert_ne!(
+            job_status(&pool, job_id).await,
+            "waiting",
+            "the brake is off, so the owner being present must not park this job"
+        );
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(reason.as_deref(), Some("attention"));
+    }
+
     /// Decision 14, and the reason parked time counts toward it: without that, parking would be a
     /// way around the ceiling and a starved job would hold a worktree and the project's slot for
     /// as long as the contention lasted.
@@ -10377,6 +11016,67 @@ mod tests {
 
         assert_eq!(job_status(&pool, job_id).await, STATUS_EXPIRED);
         assert!(feed_kinds(&pool).await.contains(&"job_expired".to_owned()));
+    }
+
+    /// The life ceiling asks who commissioned the job, and answers with a different number.
+    ///
+    /// Three ages against one job, because the risk here is a change that reads as "commissioned
+    /// work never expires": past four hours it must survive, past twelve it must not, and the
+    /// message it leaves must name twelve rather than the constant the other branch uses.
+    ///
+    /// The job is held still by its OWN allowance, already spent past, and that choice is the
+    /// test working at all. `drive` reads the ceiling before it unparks and long before it would
+    /// start anything, and the job's budget is read after — so the job is driven for real, nothing
+    /// is spawned, and the only thing that can retire it is the clock under test. The kill switch
+    /// would have been the obvious way to hold it and is the wrong one: `job_tick` returns on it
+    /// before `drive` is ever called, so the ceiling would never be reached and every arm here
+    /// would pass for the wrong reason.
+    #[tokio::test]
+    async fn a_commissioned_job_is_kept_to_its_own_clock_and_not_the_nightly_one() {
+        async fn tick_at(age: chrono::Duration) -> (sqlx::SqlitePool, i64) {
+            let pool = test_pool().await;
+            let state = test_state(pool.clone()).await;
+            let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+            seed_items(&pool, job_id, &["pending"]).await;
+            seed_job_run(&pool, job_id, 50.0).await;
+            sqlx::query(
+                "UPDATE jobs SET rule_name = NULL, budget_usd = 25.0, created_at = ? WHERE id = ?",
+            )
+            .bind((Utc::now() - age).to_rfc3339())
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            job_tick(&state, Utc::now()).await;
+            (pool, job_id)
+        }
+
+        // Past the ceiling that governs work nobody asked for, and this job was asked for.
+        let (pool, job_id) = tick_at(MAX_JOB_LIFETIME + chrono::Duration::hours(1)).await;
+        assert_ne!(
+            job_status(&pool, job_id).await,
+            STATUS_EXPIRED,
+            "a job the owner commissioned was retired by the nightly ceiling"
+        );
+
+        // A whole night in, and still inside its own.
+        let (pool, job_id) = tick_at(chrono::Duration::hours(8)).await;
+        assert_ne!(
+            job_status(&pool, job_id).await,
+            STATUS_EXPIRED,
+            "eight hours is the span an overnight run is asked for, and it did not survive it"
+        );
+
+        // Past its own, where the backstop is the point: the exemption is a longer clock, not none.
+        let (pool, job_id) =
+            tick_at(COMMISSIONED_JOB_LIFETIME + chrono::Duration::minutes(1)).await;
+        assert_eq!(job_status(&pool, job_id).await, STATUS_EXPIRED);
+        let told = feed_texts(&pool).await;
+        assert!(
+            told.iter().any(|line| line.contains("12-hour")),
+            "the job was told the wrong ceiling had retired it: {told:?}"
+        );
     }
 
     /// The panic button stops the chain, not just the node. It does not mark anything terminal,

@@ -1,6 +1,6 @@
 import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -12,7 +12,7 @@ vi.mock("../data/client", async (original) => ({
 
 import { ApiUnavailable } from "../data/client";
 import { keys } from "../data/keys";
-import type { RunDetail, RunTailChunk } from "../data/runs";
+import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
 import { daemonFetch, daemonState, project, renderApp } from "../test/harness";
 
 beforeEach(() => {
@@ -63,11 +63,20 @@ function detailFetch(
   run: RunDetail,
   tail: (since: number) => RunTailChunk | undefined,
   asked: string[],
+  stop?: RunStop,
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState({ projects: [project({ project_id: "alpha" })] }));
   return async (path, init) => {
     if (init?.method !== undefined && init.method !== "GET") return await shared(path, init);
     if (path === `/runs/${run.id}`) return run;
+    // Refused when a test passes none, deliberately: that is the shape of every
+    // test written before this route existed, and serving them a report would
+    // hide the thing worth pinning — that the block stays silent rather than
+    // drawing a failure over a page that is fine.
+    if (path === `/runs/${run.id}/stop`) {
+      if (stop === undefined) throw new Error("no stop report for this run");
+      return stop;
+    }
     const cursor = new RegExp(`^/runs/${run.id}/tail\\?since=(\\d+)$`).exec(path);
     if (cursor !== null) {
       asked.push(path);
@@ -81,6 +90,31 @@ function detailFetch(
 
 /** The daemon has no live tail for this run — a 204, which `apiFetch` hands back as `undefined`. */
 const NO_TAIL = () => undefined;
+
+/**
+ * A stop report, with every kind-specific field at `null` unless a case names it.
+ *
+ * That default is the contract and not laziness: the daemon sends every field
+ * present and null rather than omitting the ones a kind does not use, so a
+ * fixture that left them out would let a component read `undefined` under a type
+ * promising otherwise — and pass.
+ */
+function stopReport(overrides: Partial<RunStop> = {}): RunStop {
+  return {
+    run_id: 5,
+    status: "completed",
+    kind: "completed",
+    summary: "the run completed",
+    decisions_recorded: true,
+    gate: null,
+    timeout: null,
+    leading_up: null,
+    exit_code: null,
+    stderr_tail: null,
+    successor_run_id: null,
+    ...overrides,
+  };
+}
 
 /* ----------------------------------------------------------------- gate -- */
 
@@ -119,6 +153,158 @@ describe("RunDetail — the gate", () => {
 
     expect(await screen.findByText("gate not measured")).toBeDefined();
     expect(screen.queryByText("gate failed")).toBeNull();
+  });
+});
+
+/* --------------------------------------------------------- why it stopped -- */
+
+describe("RunDetail — why it stopped", () => {
+  /**
+   * §9's first requirement, and the one the whole block exists to satisfy: this
+   * panel and the gate panel above it must not read as the same thing.
+   *
+   * "Gate" above is a test suite's exit code — a verdict about the CODE. Here,
+   * `kind: "gate"` means the run stopped waiting for a person to approve a tool
+   * call — a fact about the DAEMON. One word, two mechanisms, and a reader who
+   * conflates them concludes their tests failed when nothing ran them.
+   */
+  it("gives the tool gate a title of its own rather than a second panel called Gate", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({ status: "awaiting_approval" }),
+        NO_TAIL,
+        [],
+        stopReport({
+          status: "awaiting_approval",
+          kind: "gate",
+          summary: "the run is waiting for somebody to approve a tool call",
+          gate: {
+            tool_name: "Bash",
+            action_class: "unrecognized",
+            decision: "pending_approval",
+            reason: "unrecognized shell commands and code execution require approval",
+            classifier_version: 11,
+            policy_digest: null,
+            tool_input: '{"command":"cargo fmt --all -- --check"}',
+            tool_input_truncated: false,
+            created_at: "2026-08-30T23:32:15Z",
+          },
+        }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText("Why it stopped")).toBeDefined();
+    // The deterministic gate keeps its own panel and its own name beside this one.
+    expect(screen.getByText("Gate")).toBeDefined();
+    expect(screen.getByText(/approve a tool call/)).toBeDefined();
+    expect(screen.getByText(/unrecognized shell commands/)).toBeDefined();
+  });
+
+  /**
+   * §9: nothing is rendered for a live run except that it is still going.
+   *
+   * The two kind-specific blocks are asserted ABSENT rather than left unchecked,
+   * because a timeout verdict on a run still going would be a statement about a
+   * deadline nothing has reached.
+   */
+  it("tells a live run it has not stopped, and says nothing else about it", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({ status: "running", stdout: null }),
+        NO_TAIL,
+        [],
+        stopReport({
+          status: "running",
+          kind: "running",
+          summary: "the run is still going",
+        }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText("the run is still going")).toBeDefined();
+    // Scoped to this panel and not to the page. "Exit code" is also a label in
+    // the facts panel above, so a bare `queryByText` here asserts something
+    // about a block this test is not about — and fails for a reason that has
+    // nothing to do with §9. Found by writing it the loose way first.
+    const panel = screen.getByText("Why it stopped").closest("section");
+    expect(panel).not.toBeNull();
+    expect(within(panel as HTMLElement).queryByText(/silence ceiling/)).toBeNull();
+    expect(within(panel as HTMLElement).queryByText(/Exit code/)).toBeNull();
+  });
+
+  /**
+   * §5.3, and it is the difference between an absence and a silence. An empty
+   * list is the same shape whether the mode records nothing or the run simply
+   * asked for nothing, and only one of those is worth a person's attention.
+   */
+  it("says a real-mode run records no decisions rather than showing an empty list", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail(),
+        NO_TAIL,
+        [],
+        stopReport({ decisions_recorded: false, leading_up: [] }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText(/recorded no decisions/)).toBeDefined();
+    expect(screen.getByText(/Nothing is missing/)).toBeDefined();
+  });
+
+  /**
+   * §6. The verdict a person can act on is which ceiling fired, and `silence`
+   * is only claimable because the wall clock was nowhere near — which is what
+   * the sentence has to convey, in minutes, without ever naming a `wall`
+   * verdict the daemon cannot support.
+   */
+  it("reads a timeout as the silence it was, against a wall clock that was nowhere near", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({ status: "timed_out" }),
+        NO_TAIL,
+        [],
+        stopReport({
+          status: "timed_out",
+          kind: "timeout",
+          summary: "the run timed out",
+          timeout: {
+            elapsed_seconds: 1923,
+            wall_ceiling_seconds: 7200,
+            silence_ceiling_seconds: 1800,
+            measured_from: "created_at",
+            verdict: "silence",
+          },
+          leading_up: [],
+        }),
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText(/32 minutes against a 30 minutes silence ceiling/)).toBeDefined();
+    expect(screen.getByText(/120 minutes wall clock/)).toBeDefined();
+    expect(screen.getByText(/stopped reporting/)).toBeDefined();
+  });
+
+  /**
+   * The block explains something already on the page, so a daemon that will not
+   * answer this one route must cost a reader nothing. An error strip here would
+   * be a second failure report about a page that rendered fine.
+   */
+  it("stays silent when the report cannot be had, rather than reporting its own failure", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail(), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    // The page itself is there.
+    expect(await screen.findByText("Gate")).toBeDefined();
+    expect(screen.queryByText("Why it stopped")).toBeNull();
   });
 });
 

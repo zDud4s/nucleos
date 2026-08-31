@@ -1485,6 +1485,32 @@ pub struct AutopilotRules {
     /// `git_exec::gate_the_merge`, which is the only reader.
     #[serde(default)]
     pub gate_before_publish: bool,
+    /// Whether a job asks if the owner is at the keyboard before it starts its next node.
+    ///
+    /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
+    /// `Some(true)`: `load_schedule_rules` returns `AutopilotRules::default()` for a project with
+    /// no rules file at all, and a plain `bool` would have made that derived default `false` — a
+    /// brake that switched itself off on every project that never configured anything. The zero
+    /// value therefore means "not configured", and `attention_brake()` below supplies the answer.
+    ///
+    /// Off, `attention::attention_permits_new_run` is never consulted for this project's jobs and
+    /// they start nodes with the owner watching. That is the point of switching it off — a job is
+    /// night work and nobody can watch night work happen — and it is also the whole cost: an
+    /// autonomous node may move the worktree under a person who is working in it.
+    #[serde(default)]
+    pub attention_brake: Option<bool>,
+}
+
+impl AutopilotRules {
+    /// Whether the attention brake applies, resolving the unconfigured case to ON.
+    ///
+    /// A reader rather than a field read for the reason `gate_retries` is one: a caller that took
+    /// `attention_brake` straight off the struct would have to decide what `None` means every time
+    /// it asked, and the direction it is cheapest to get wrong is the one that starts a node while
+    /// somebody is typing.
+    pub fn attention_brake(&self) -> bool {
+        self.attention_brake.unwrap_or(true)
+    }
 }
 
 /// Where a project keeps its rules, relative to its root, in forward slashes.
@@ -2811,6 +2837,31 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             load_schedule_rules(dir.path()).unwrap(),
             AutopilotRules::default()
         );
+    }
+
+    /// The brake a project never configured is ON, and the derived `Default` is exactly why this
+    /// is worth an assertion of its own: `attention_brake` is the one field here whose zero value
+    /// would otherwise have meant "off", on every project that has no rules file at all.
+    #[test]
+    fn a_project_that_configured_nothing_keeps_the_attention_brake() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
+        assert!(AutopilotRules::default().attention_brake());
+    }
+
+    #[test]
+    fn the_attention_brake_is_switched_off_by_name_and_back_on_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai")).unwrap();
+        let path = dir.path().join(".ai").join("autopilot.yaml");
+
+        std::fs::write(&path, "attention_brake: false\n").unwrap();
+        assert!(!load_schedule_rules(dir.path()).unwrap().attention_brake());
+
+        // Spelled out rather than left to the test above: "absent" and "present and true" are
+        // different inputs that must reach the same answer, and only one of them is the default.
+        std::fs::write(&path, "attention_brake: true\n").unwrap();
+        assert!(load_schedule_rules(dir.path()).unwrap().attention_brake());
     }
 
     #[test]

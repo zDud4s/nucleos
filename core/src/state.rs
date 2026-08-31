@@ -70,19 +70,57 @@ pub const DEFAULT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
 /// and the prompt written to work around it ("commit before compiling, always") is a workaround
 /// for this number rather than advice about git.
 ///
-/// 15 minutes is a bound, not a measurement: it is a little over five times the measured compile
-/// and still finite, which is the property that matters. An interactive run keeps the short one —
-/// somebody is watching it, and five minutes of silence in front of a person is already too long.
+/// **Measured again, 2026-08-30, and the number above was the wrong operation.** `cargo check
+/// --tests` is what a run does while it is writing code; what it does before it can say it is done
+/// is `scripts/gates.sh core`, and the test binary alone reported `finished in 643.57s` on this
+/// workspace — 10m43s of execution, with the compile and link on top of it. That is ONE tool call,
+/// streaming nothing, against a 15-minute deadline. "A little over five times the measured compile"
+/// was true of the compile and never true of the suite, and the margin it describes does not exist:
+/// the run that has to prove its work green is silent for very nearly the whole allowance, and on a
+/// loaded machine for more than it.
+///
+/// Run 900393 is the observed shape rather than the proof: killed at 32 minutes having written
+/// nothing, its last 16 minutes silent. That one was reading a 3000-line file, not compiling, and
+/// an honest reading is that the deadline may well have been right about it. The argument for
+/// raising it is the gate measurement above and not that run — but the two together say the same
+/// thing, which is that 15 minutes is inside the length of one legitimate step in this repository.
+///
+/// So 6, which is 30 minutes: comfortably past one full green gate and still finite. It is a bound
+/// and not a measurement, the same as 15 was — what changed is which operation it has to clear. An
+/// interactive run keeps the short one; somebody is watching it, and five minutes of silence in
+/// front of a person is already too long.
+///
+/// **What this does NOT weaken.** The wall clock is untouched, so an autonomous run still cannot
+/// exceed two hours, and money still bounds a run that streams forever. What is given up is
+/// catching a wedged run in 15 minutes instead of 30 — half an hour of one slot, against a night.
 ///
 /// Derived as a multiplier rather than given its own `Duration` for `run_timeout_for_mode`'s
 /// reason: a test that shortens the deadline must still get a short one.
-pub const AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER: u32 = 3;
+pub const AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER: u32 = 6;
 
 /// Production default for how long a repository verification gate may run.
 ///
 /// A gate is a subprocess over a repository the daemon does not control, so its deadline answers a
 /// different question from how long the agent itself may run and must remain independently chosen.
-pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(900);
+///
+/// **Measured 2026-08-30: 900 seconds was shorter than this repository's own gate.**
+/// `scripts/gates.sh core` — the `gate_command` this project has configured — took **1015 seconds**
+/// end to end on a WARM incremental build in the main checkout: fmt, clippy over all targets, then
+/// 3224 tests. A job runs it in a worktree of its own, where cargo has nothing to reuse, so that
+/// number is a floor and not an estimate.
+///
+/// What made this worth finding rather than merely slow: a gate that outruns this deadline comes
+/// back `Errored`, and `job::item_state_from` puts `gate_errored` deliberately outside the retry
+/// arithmetic — "a gate that would not run measured nothing, so there is nothing to attempt again".
+/// So the item is over, with no second chance, and so is every other item of that job for the same
+/// reason. A repository whose suite is longer than this constant cannot finish an autonomous job at
+/// all, and the symptom is a night of `gate_errored` that reads like broken code.
+///
+/// 2700 seconds is 45 minutes: comfortably past the measured 1015 with room for a cold worktree,
+/// and still finite. It is bounded on the other side by `job::MAX_JOB_LIFETIME` (4 hours), which is
+/// the real reason not to go higher — a job that spends three quarters of its night inside one gate
+/// has not been saved by a longer deadline.
+pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(2700);
 
 /// In-flight runs' abort handles, keyed by `runs.id`.
 pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
