@@ -262,6 +262,87 @@ export function useRunTail(id: number, since: number, alive: boolean) {
 }
 
 /**
+ * One decision the tool gate made, as `GET /runs/{id}/stop` reports it.
+ *
+ * `tool_input` is a PREVIEW and `tool_input_truncated` says whether it is the
+ * whole thing. The flag is a sibling field rather than an ellipsis inside the
+ * text on purpose: a marker in the string is indistinguishable from a command
+ * that happens to end in one.
+ */
+export interface StopDecision {
+  tool_name: string;
+  action_class: string;
+  decision: string;
+  reason: string | null;
+  classifier_version: number;
+  policy_digest: string | null;
+  tool_input: string | null;
+  tool_input_truncated: boolean;
+  created_at: string;
+}
+
+/**
+ * Why a run stopped.
+ *
+ * Every kind-specific field is present and `null` for a kind that does not use
+ * it, never omitted — so a missing `timeout` means "this was not a timeout" and
+ * never "the daemon stopped sending this field".
+ *
+ * `verdict` is only ever `"silence"` or `"undetermined"`. There is deliberately
+ * no `"wall"`: affirming the wall clock fired would need the moment the run
+ * actually started, and `elapsed_seconds` is measured from `created_at`, which
+ * includes any time the run waited before it began.
+ */
+export interface RunStop {
+  run_id: number;
+  status: string;
+  kind:
+    | "gate"
+    | "timeout"
+    | "failed"
+    | "cancelled"
+    | "interrupted"
+    | "superseded"
+    | "completed"
+    | "running";
+  summary: string;
+  /** False for `real` mode, which is governed by the person at the keyboard and records nothing. */
+  decisions_recorded: boolean;
+  gate: StopDecision | null;
+  timeout: {
+    elapsed_seconds: number;
+    wall_ceiling_seconds: number;
+    silence_ceiling_seconds: number;
+    measured_from: string;
+    verdict: "silence" | "undetermined";
+  } | null;
+  leading_up: StopDecision[] | null;
+  exit_code: number | null;
+  stderr_tail: string | null;
+  successor_run_id: number | null;
+}
+
+/**
+ * Why this run stopped, for the block on the run page.
+ *
+ * **No poll of its own.** It rides the cadence the page is already keeping —
+ * the same `alive` the tail is given — rather than choosing an interval here.
+ * A second cadence on one page is two answers about one run arriving at
+ * different moments, which is how a header and a panel end up disagreeing.
+ *
+ * A live run is still asked, and answers `kind: "running"`: "it has not
+ * stopped" is a real answer to this question, and the block says so. Once the
+ * run is over the report is immutable, so the poll stops with the page's.
+ */
+export function useRunStop(id: number, alive: boolean) {
+  return useQuery({
+    queryKey: keys.runs.stop(id),
+    queryFn: () => apiFetch<RunStop>(`/runs/${id}/stop`),
+    refetchInterval: alive ? POLL.fast : false,
+  });
+}
+
+/**
  * Ask for a run.
  *
  * No optimistic row: a run does not exist until the daemon says it does, and

@@ -86,6 +86,12 @@ export const keys = {
     detail: (id: number) => ["runs", "detail", id] as const,
     /** The byte cursor lives in component state; the key only separates the tails. */
     tail: (id: number) => ["runs", "tail", id] as const,
+    /**
+     * Why the run stopped. Its own entry rather than a slice of `detail`: the
+     * report reads `shadow_decisions` as well as the run row, so it is a second
+     * answer about one run and not a projection of the first.
+     */
+    stop: (id: number) => ["runs", "stop", id] as const,
     awaitingApproval: ["runs", "awaiting-approval"] as const,
   },
 
