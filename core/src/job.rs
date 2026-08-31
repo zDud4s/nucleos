@@ -654,16 +654,29 @@ pub struct RoundState {
     /// added nothing has an unchanged branch, and reviewing it spends a whole run re-reading a diff
     /// nobody wrote.
     pub round_added_nothing: bool,
-    /// Whether a red gate may open another round instead of ending the job.
+    /// Whether a broken item may open another round instead of ending the job.
     ///
     /// True for a job the owner asked for and gave an allowance to — `JobRow::commissioned_with_an_
     /// allowance`, the same predicate the budget and the life ceiling use. **Zero value is false**,
     /// so every job that existed before this ends exactly where it always ended.
     ///
-    /// Named for what it licenses rather than for who asked, because that is what `close_the_round`
-    /// needs to know and the ONLY thing this changes. It licenses nothing else: a `GateErrored` item
-    /// still ends the job whatever this says, and so does a `Failed` one.
-    pub a_red_gate_may_go_round_again: bool,
+    /// Named for what it licenses rather than for who asked, because two decisions read it and
+    /// neither is about who asked: `next_step` walks past a broken item instead of ending the queue
+    /// at it, and `close_the_round` asks for another plan instead of finishing.
+    ///
+    /// **Both are licensed by the same fact about the TREE, and not by the owner's wish.** A red
+    /// gate is reverted by `record_gate` and a dead node by `reconcile_nodes`, each to the item's
+    /// own footing, BEFORE either is marked — so by the time this is read the rejected or
+    /// unmeasured work is already off the branch and there is nothing left to build on top of.
+    /// Where that revert fails, neither caller reaches this at all: the job is retired on the spot,
+    /// because a tree that could not be put back is the one case where carrying on is worse than
+    /// stopping early.
+    ///
+    /// `GateErrored` stays outside this whatever it says. A gate that would not run measured
+    /// nothing and is deliberately never reverted — its work might be perfectly good, and
+    /// destroying it would be worse than stopping — which leaves the build-on-top argument exactly
+    /// true for it and for it alone.
+    pub a_broken_item_may_go_round_again: bool,
 }
 
 impl Default for RoundState {
@@ -676,7 +689,7 @@ impl Default for RoundState {
             replanning: false,
             replanned: Replan::NotYet,
             round_added_nothing: false,
-            a_red_gate_may_go_round_again: false,
+            a_broken_item_may_go_round_again: false,
         }
     }
 }
@@ -826,9 +839,23 @@ pub fn next_step(job: &JobView) -> Next {
     //
     // `Cancelled` keeps no guard, in either kind of job. It is not a claim about trees — it is a
     // person having stopped this, and carrying on would be answering them.
+    // `Failed` now carries a second guard, and it is the same argument the `GateFailed` paragraph
+    // above makes, arriving one state later. The reason a dead node ended the queue was that its
+    // tree held edits nothing had measured and the next item would build on them — true of every
+    // node that ends `timed_out`, `interrupted` or broken. `reconcile_nodes` now puts that tree
+    // back to the item's footing before it marks the item, for a job the owner commissioned, so
+    // the edits are gone by the time this reads the state and the reason has been removed rather
+    // than overruled. A revert that could not be done never gets here: the job is retired there.
+    //
+    // Measured 2026-08-30: job 23's item was implemented, gated red, retried — and its retry was
+    // killed mid-flight, which marked the item `failed` and ended the job with three items never
+    // attempted. Nothing about those three was broken.
+    let broken_item_ends_the_queue = !job.rounds.a_broken_item_may_go_round_again;
     for item in job.items.iter().map(|item| &item.state) {
         match item {
-            ItemState::Failed if !job.has_team => return Next::Finish(Outcome::Failed),
+            ItemState::Failed if !job.has_team && broken_item_ends_the_queue => {
+                return Next::Finish(Outcome::Failed);
+            }
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
             ItemState::GateErrored if !job.has_team => return Next::Finish(Outcome::GateErrored),
             _ => {}
@@ -1173,8 +1200,8 @@ fn close_the_round(job: &JobView) -> Next {
     // replan that supersedes the item with a different approach cannot clear that mark — worth
     // knowing before reading a `gate_failed` job as one that achieved nothing.
     if let Some(outcome) = failed_ending(job) {
-        let go_round_again = outcome == Outcome::GateFailed
-            && job.rounds.a_red_gate_may_go_round_again
+        let go_round_again = matches!(outcome, Outcome::GateFailed | Outcome::Failed)
+            && job.rounds.a_broken_item_may_go_round_again
             && job.rounds.round + 1 < job.rounds.max_rounds
             && job.rounds.dry_rounds < DRY_ROUNDS_TO_STOP;
         if !go_round_again {
@@ -1600,7 +1627,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
             } else {
                 Replan::NotYet
             },
-            a_red_gate_may_go_round_again: commissioned_with_an_allowance(
+            a_broken_item_may_go_round_again: commissioned_with_an_allowance(
                 rule_name.as_deref(),
                 budget_usd,
             ),
@@ -2539,13 +2566,39 @@ pub fn plan_prompt(
 /// Told to prefer `done` explicitly, and that is not politeness. The failure this feature has to
 /// avoid is a job that will not admit it is finished: ending #4 (out of rounds) costs a full round of
 /// runs to discover, where ending #1 costs one node.
+/// An item the last round did not finish, and what is known about why.
+///
+/// Read by `replan_prompt` and by nothing else. Both shapes of not-finishing are here and are kept
+/// apart, because they call for different next moves: a gate that spoke gives the node something
+/// concrete to answer, and a node that died before any gate looked leaves the item unmeasured —
+/// which is worth saying plainly rather than dressing up as a verdict nobody reached.
+pub struct Unfinished {
+    pub ordinal: usize,
+    pub description: String,
+    /// The tail of what the gate printed rejecting this item, or `None` when nothing gated it.
+    pub gate_output: Option<String>,
+}
+
 pub fn replan_prompt(
     task: &str,
     round: i64,
     archives: &[String],
     artifacts: &str,
     graph: Option<&Graph>,
+    unfinished: &[Unfinished],
 ) -> String {
+    // **"Do not repropose any of it" is qualified when something broke, and the qualification is
+    // the point.** Unqualified it is right about work that LANDED — reproposing a green item wastes
+    // a round redoing it. Aimed at an item the gate rejected it is exactly backwards: that item is
+    // the one thing the round did not achieve, and the sentence tells the node to leave it alone.
+    // Measured 2026-08-30 on job 23, whose first item went red and whose next round would have read
+    // this and gone looking for something else to do.
+    let leave_alone = if unfinished.is_empty() {
+        " Do not repropose any of it."
+    } else {
+        " Do not repropose the parts of it that LANDED. What did not is listed below, and \
+         reproposing that — differently — is the point of this round."
+    };
     let history = if archives.is_empty() {
         // Reachable when the archive copy failed, and the honest thing to say is that it is missing.
         // Claiming a file that is not there sends the node looking, and what it finds is nothing.
@@ -2554,9 +2607,39 @@ pub fn replan_prompt(
             .to_owned()
     } else {
         format!(
-            "What the earlier rounds already tried is in {}. Do not repropose any of it.",
+            "What the earlier rounds already tried is in {}.{leave_alone}",
             archives.join(", ")
         )
+    };
+    // Named, with the gate's own words where a gate spoke. `implement_prompt` already carries the
+    // gate output into a RETRY of the same item, for the reason §5.4 makes structural: no node ever
+    // sees another's session, so a node that cannot see what it broke spends a whole run
+    // rediscovering what the gate already printed. A replan is the same node in the same position,
+    // one round later, and it was the one place that argument had not reached.
+    //
+    // The tree is NOT the answer to this. A red item was reverted to its footing before the queue
+    // moved on, so what the gate objected to is not there to read — the branch shows the work as
+    // never having been done, which is true and is not why.
+    let broke = if unfinished.is_empty() {
+        String::new()
+    } else {
+        let mut lines = String::from(
+            "\n\nWhat the last round could not finish, and what is known about why:\n\n",
+        );
+        for item in unfinished {
+            lines.push_str(&format!(
+                "- item {}: {}\n",
+                item.ordinal + 1,
+                item.description
+            ));
+            match &item.gate_output {
+                Some(output) => lines.push_str(&format!("  the gate said:\n{output}\n")),
+                None => lines.push_str(
+                    "  its node ended before any gate looked at it, so nothing measured this one.\n",
+                ),
+            }
+        }
+        lines
     };
     // The graph rules are repeated here word for word rather than referred to, and the reason is
     // that the node reading them is not the node that read them before. A replan writes items into
@@ -2584,7 +2667,7 @@ pub fn replan_prompt(
     format!(
         "You are the REPLAN node of an autonomous job, at the end of round {round}. The working tree \
          holds everything the job has done so far.\n\n\
-         {history}\n\n\
+         {history}{broke}\n\n\
          Decide whether the task below is finished. Write ONE of these to {artifacts}/plan.json and \
          change nothing else:\n\n\
          {{\"done\": true, \"why\": \"...\"}}\n\
@@ -2727,7 +2810,17 @@ async fn say(pool: &SqlitePool, job: &JobRow, kind: &str, summary: &str) {
 /// A pass does this before it decides anything, and it is the only part that runs whatever the
 /// brakes say: it records work that already happened. Refusing to write down a finished node
 /// because the budget ran out would lose the node and repeat it.
-async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
+/// What `reconcile_nodes` leaves behind for the pass that called it.
+///
+/// A bool would have done and would have read as a bool at the call site. This exists because the
+/// one case that stops a pass — a worktree that could not be put back — retires the job as it goes,
+/// and a caller that carried on would be driving a job that has already ended.
+enum Reconciled {
+    KeepGoing,
+    JobRetired,
+}
+
+async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconciled> {
     let pool = &state.pool;
 
     // The two statuses excluded here are `node_in_flight`'s, written out because sqlx will not take
@@ -2757,6 +2850,52 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
             STATUS_CANCELLED => STATUS_CANCELLED,
             _ => "failed",
         };
+
+        // **The tree is put back BEFORE the item is marked, and that order is what lets the queue
+        // carry on.** The paragraph above is the reason a dead node ended the chain: its tree holds
+        // edits nothing measured, and the next item would build on them. That is a statement about
+        // the TREE, so it is answered by fixing the tree rather than by ending the job — exactly
+        // what `record_gate` already does for a gate that went red, and this is the same move for
+        // the other way an item can break. `next_step` reads the state afterwards and walks past it.
+        //
+        // Only for a job the owner commissioned and funded, because only there is a longer leash
+        // something somebody asked for. A scheduled job keeps the old ending, untouched.
+        //
+        // A revert that FAILS retires the job here and now. It is the one case where carrying on is
+        // worse than stopping: the branch holds work nothing has looked at, `next_step` would walk
+        // past the item believing otherwise, and the item after it would build on top. Stopping
+        // hands the branch to a person with everything still on it.
+        if item_status == "failed" && job.commissioned_with_an_allowance() {
+            let ordinal = ordinal as usize;
+            let put_back = match (
+                job_worktree(pool, job.id).await,
+                revert_point(pool, job, ordinal).await,
+            ) {
+                (Ok(Some((worktree, _))), Some(footing)) => {
+                    crate::worktree::revert_to(&worktree, &footing)
+                        .await
+                        .is_ok()
+                }
+                _ => false,
+            };
+            if !put_back {
+                let _ = retire(pool, job.id, STATUS_STOPPED).await;
+                say(
+                    pool,
+                    job,
+                    "job_gate_failed",
+                    &format!(
+                        "job {} at item {}: its node ended `{run_status}` and the worktree could \
+                         not be put back, so the job stopped with the work still on the branch",
+                        job.id,
+                        ordinal + 1
+                    ),
+                )
+                .await;
+                return Ok(Reconciled::JobRetired);
+            }
+        }
+
         sqlx::query("UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ?")
             .bind(item_status)
             .bind(job.id)
@@ -2801,7 +2940,7 @@ async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     // off — it leaves the job wherever it found it. Cheap when there is nothing to take: one indexed
     // read of the latest `replan` run, and the very common case is that there has never been one.
     ingest_replan(state, job).await?;
-    Ok(())
+    Ok(Reconciled::KeepGoing)
 }
 
 /// Whether one of this job's nodes has stopped to ask permission.
@@ -4571,6 +4710,7 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
                 &archives,
                 &artifacts,
                 graph_rules(pool, job).await.as_ref(),
+                &unfinished_items(pool, job.id).await,
             );
             spawn_node(state, job, "replan", prompt, None, worktree, NoRoom::Park).await
         }
@@ -4582,6 +4722,34 @@ async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
         | Next::MergeItem { .. }
         | Next::Orphan { .. } => Step::Stopped,
     }
+}
+
+/// The items a replan needs told about: the ones that broke, worst-known-first by ordinal.
+///
+/// `gate_failed` and `failed` and nothing else. `skipped` is deliberately absent — a skipped item is
+/// a proposal waiting for a person, not work that went wrong, and listing it here would ask the
+/// replan to route around a decision that is not its to make. `gate_errored` is absent because it
+/// ends the job outright, so no replan ever runs to read it.
+///
+/// A read that fails costs the replan its context and nothing else, so it answers with an empty
+/// list rather than refusing: the round it is about to open is worth more than the paragraph.
+async fn unfinished_items(pool: &SqlitePool, job_id: i64) -> Vec<Unfinished> {
+    sqlx::query_as::<_, (i64, String, Option<String>)>(
+        "SELECT ordinal, description, gate_output FROM job_items
+         WHERE job_id = ? AND status IN ('gate_failed', 'failed')
+         ORDER BY ordinal",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(ordinal, description, gate_output)| Unfinished {
+        ordinal: ordinal as usize,
+        description,
+        gate_output,
+    })
+    .collect()
 }
 
 /// Starts one item's node: the whole of what the batch loop does for one ordinal.
@@ -4665,9 +4833,16 @@ async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
     let pool = &state.pool;
 
     // Bookkeeping about work that already happened, before any decision and before any brake.
-    if let Err(error) = reconcile_nodes(state, &job).await {
-        tracing::warn!(job_id = job.id, %error, "could not reconcile a job's nodes");
-        return;
+    match reconcile_nodes(state, &job).await {
+        Ok(Reconciled::KeepGoing) => {}
+        // Already retired, and with a line in the feed saying why. Carrying on would drive a job
+        // that has ended — and, in the one case that returns this, would advance the queue onto a
+        // tree that could not be put back.
+        Ok(Reconciled::JobRetired) => return,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not reconcile a job's nodes");
+            return;
+        }
     }
 
     // Decision 14, checked before anything is started and while parked, since parked time counts.
@@ -6774,9 +6949,11 @@ mod tests {
             &["plan-0.json".to_owned(), "plan-1.json".to_owned()],
             "/wt/.nucleos",
             None,
+            &[],
         );
         assert!(with.contains("plan-0.json, plan-1.json"));
-        assert!(with.contains("Do not repropose"));
+        // Nothing broke in this round, so the instruction keeps the flat form it always had.
+        assert!(with.contains("Do not repropose any of it."));
         assert!(with.contains("/wt/.nucleos/plan.json"));
         assert!(with.contains("add shout and whisper"));
         // Ending #1 is one node; ending #4 costs a whole round to reach the same place, so the node
@@ -6785,7 +6962,7 @@ mod tests {
 
         // No archives is a reachable state — the copy can fail — and the honest thing is to say so.
         // Naming a file that is not there sends the node looking, and what it finds is nothing.
-        let without = replan_prompt("t", 1, &[], "/wt/.nucleos", None);
+        let without = replan_prompt("t", 1, &[], "/wt/.nucleos", None, &[]);
         assert!(without.contains("could not be recovered"));
         assert!(!without.contains("Do not repropose"));
     }
@@ -6800,7 +6977,7 @@ mod tests {
     #[test]
     fn every_node_that_could_reach_for_git_is_told_the_job_commits() {
         let plan = plan_prompt("add eight modules", 5, "/wt/.nucleos", None, false);
-        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos", None);
+        let replan = replan_prompt("add eight modules", 1, &[], "/wt/.nucleos", None, &[]);
         // No hint, because what this pins is the paragraph every node gets regardless of one.
         let implement = implement_prompt("write shout.py", 0, 4, "/wt/.nucleos", &[], None, None);
 
@@ -6825,7 +7002,7 @@ mod tests {
     /// node. `Read`, `Grep` and `Glob` need nobody and were there the whole time.
     #[test]
     fn the_nodes_that_only_look_are_told_what_to_look_with() {
-        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None);
+        let replan = replan_prompt("t", 1, &[], "/wt/.nucleos", None, &[]);
         let review = review_prompt(Some("abc123"), "/wt/.nucleos");
 
         for prompt in [&replan, &review] {
@@ -7072,14 +7249,14 @@ mod tests {
         assert!(prompt.contains("depends_on"));
         assert!(prompt.contains("EARLIER ordinal"));
 
-        let replan = replan_prompt("t", 2, &[], "/wt/.nucleos", Some(&directed(9)));
+        let replan = replan_prompt("t", 2, &[], "/wt/.nucleos", Some(&directed(9)), &[]);
         assert!(replan.contains("numbered from 9"), "{replan}");
         assert!(replan.contains("depends_on"));
 
         // And a job without a team is told none of it, because none of it applies.
         let plain = plan_prompt("t", 5, "/wt/.nucleos", None, false);
         assert!(!plain.contains("depends_on"));
-        assert!(!replan_prompt("t", 2, &[], "/wt/.nucleos", None).contains("depends_on"));
+        assert!(!replan_prompt("t", 2, &[], "/wt/.nucleos", None, &[]).contains("depends_on"));
     }
 
     /// The hint is the planner's, and it is optional at both ends: a planner that names files is
@@ -7734,7 +7911,7 @@ mod tests {
 
     /// A red gate ends a job NOBODY ASKED FOR, whatever the rounds say.
     ///
-    /// `..RoundState::default()` leaves `a_red_gate_may_go_round_again` false, which is what a
+    /// `..RoundState::default()` leaves `a_broken_item_may_go_round_again` false, which is what a
     /// scheduled job gets and what every job got before that field existed — so this keeps asking
     /// the question it was written to ask, about the work it still holds for.
     #[test]
@@ -7750,6 +7927,89 @@ mod tests {
                 }
             )),
             Next::Finish(Outcome::GateFailed)
+        );
+    }
+
+    /// A replan is told what broke, and stops being told to leave it alone.
+    ///
+    /// Two faults in one paragraph, and the second is the one that would have survived a fix to the
+    /// first. `implement_prompt` already carries the gate's output into a RETRY of an item, because
+    /// §5.4 keeps no node from ever seeing another's session — so a node that cannot see what it
+    /// broke spends a whole run rediscovering what the gate already printed. A replan is that same
+    /// node one round later and was the one place the argument had not reached.
+    ///
+    /// And "Do not repropose any of it" is right about work that LANDED and exactly backwards aimed
+    /// at an item the gate rejected: that item is the one thing the round did not achieve.
+    ///
+    /// The unmeasured arm is not decoration. An item whose node died before any gate looked at it
+    /// has no verdict to hand on, and saying so plainly beats inventing one — a replan told "the
+    /// gate said nothing" would reasonably read that as the gate having been content.
+    #[test]
+    fn a_replan_is_handed_what_broke_and_told_that_reproposing_it_is_the_point() {
+        let archives = ["plan-0.json".to_owned()];
+        let gated = Unfinished {
+            ordinal: 2,
+            description: "wire the handler".to_owned(),
+            gate_output: Some("error[E0061]: this function takes 6 arguments".to_owned()),
+        };
+        let unmeasured = Unfinished {
+            ordinal: 4,
+            description: "the database-backed tests".to_owned(),
+            gate_output: None,
+        };
+
+        let prompt = replan_prompt(
+            "t",
+            1,
+            &archives,
+            "/wt/.nucleos",
+            None,
+            &[gated, unmeasured],
+        );
+
+        // Ordinals are shown one-based, as every other line a person reads about items is.
+        assert!(prompt.contains("item 3: wire the handler"), "{prompt}");
+        assert!(prompt.contains("error[E0061]"), "{prompt}");
+        assert!(
+            prompt.contains("item 5: the database-backed tests"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("nothing measured this one"), "{prompt}");
+
+        // The instruction is qualified rather than dropped: the parts that landed are still not to
+        // be reproposed, and a round that lost that half would redo its own finished work.
+        assert!(prompt.contains("the parts of it that LANDED"), "{prompt}");
+        assert!(!prompt.contains("Do not repropose any of it."), "{prompt}");
+    }
+
+    /// A dead node stops ending the queue at the item it died on, and the items after it run.
+    ///
+    /// This is the one that would have saved job 23, and the arithmetic is the argument: its item 0
+    /// was implemented, gated red, retried, and the retry was killed mid-flight — which marked the
+    /// item `failed` and finished the job with items 1, 2 and 3 never attempted. Nothing about
+    /// those three was broken, and nothing about them had been measured either way.
+    ///
+    /// The pending item is what the assertion is really about. `Finish` here means three items
+    /// thrown away for one that broke; anything else means the queue carries on to them.
+    #[test]
+    fn a_dead_node_no_longer_takes_the_items_after_it_when_the_owner_asked_for_the_work() {
+        let queue = [ItemState::Failed, ItemState::Pending];
+        let rounds = |commissioned| RoundState {
+            round: 0,
+            max_rounds: 4,
+            a_broken_item_may_go_round_again: commissioned,
+            ..RoundState::default()
+        };
+
+        assert_eq!(
+            next_step(&view_in_round(&queue, ReviewState::Done, rounds(false))),
+            Next::Finish(Outcome::Failed),
+            "a job nobody asked for ends exactly where it always did"
+        );
+        assert_ne!(
+            next_step(&view_in_round(&queue, ReviewState::Done, rounds(true))),
+            Next::Finish(Outcome::Failed),
+            "and one the owner commissioned reaches the item that was never tried"
         );
     }
 
@@ -7771,7 +8031,7 @@ mod tests {
                     round,
                     max_rounds: 4,
                     dry_rounds: dry,
-                    a_red_gate_may_go_round_again: true,
+                    a_broken_item_may_go_round_again: true,
                     ..RoundState::default()
                 },
             )
@@ -7795,22 +8055,33 @@ mod tests {
             Next::Finish(Outcome::GateFailed)
         );
 
-        // Scoped to the red gate, and these two are why the scope is written as an equality rather
-        // than as "any unhappy ending". A gate that would not RUN measured nothing and is never
-        // reverted, so the rejected-work argument is still exactly true for it; a `Failed` item is
-        // the work itself having broken.
+        // A dead node goes round again too, and for the same reason rather than by analogy:
+        // `reconcile_nodes` puts its tree back to the item's footing before marking it, exactly as
+        // `record_gate` does for a red gate, so the unmeasured edits are gone by the time this
+        // reads the state.
+        assert_eq!(
+            next_step(&commissioned(0, 0, &[ItemState::Passed, ItemState::Failed])),
+            Next::SpawnReplan
+        );
+
+        // `GateErrored` is the one that does NOT move, and it is why the set is written out rather
+        // than as "any unhappy ending". A gate that would not RUN measured nothing and is
+        // deliberately never reverted — its work might be perfectly good — so the build-on-top
+        // argument is still exactly true for it.
         //
         // Asked of `close_the_round` and NOT of `next_step`, which would have been the comfortable
-        // thing to write and would have proved nothing: `next_step` short-circuits on both of these
+        // thing to write and would have proved nothing: `next_step` short-circuits on `GateErrored`
         // before a round is ever closed, so it answers `Finish` whatever this branch says, and a
-        // widening of the equality above would have sailed past a green assertion.
+        // widening of the set above would have sailed past a green assertion.
         assert_eq!(
             close_the_round(&commissioned(0, 0, &[ItemState::GateErrored])),
             Next::Finish(Outcome::GateErrored)
         );
+        // Cancelled is a person having stopped this. No revert makes that stale, and carrying on
+        // would be answering them.
         assert_eq!(
-            close_the_round(&commissioned(0, 0, &[ItemState::Failed])),
-            Next::Finish(Outcome::Failed)
+            next_step(&commissioned(0, 0, &[ItemState::Cancelled])),
+            Next::Finish(Outcome::Cancelled)
         );
 
         // A replan already in flight is waited on, not spawned twice — the same trap the happy path
@@ -7823,7 +8094,7 @@ mod tests {
                     round: 0,
                     max_rounds: 4,
                     replanning: true,
-                    a_red_gate_may_go_round_again: true,
+                    a_broken_item_may_go_round_again: true,
                     ..RoundState::default()
                 }
             )),
