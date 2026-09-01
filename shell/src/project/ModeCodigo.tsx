@@ -13,6 +13,7 @@ import {
 } from "../data/project-code";
 import { openInVscode, vscodeUrl } from "../lib/vscode";
 import { isApiRefusal } from "../data/client";
+import { Teach } from "../ui";
 
 /**
  * "What is this?" — a review surface, not an IDE.
@@ -64,15 +65,21 @@ export function ModeCodigo({ projectId, run, onPickRun }: ModeCodigoProps) {
   }
 
   if (selected === null) {
+    /*
+      `Teach` and not a card of this mode's own. This is the one shape that primitive exists for —
+      an empty list somebody arrived at meaning to do something, where the useful thing to hold the
+      space is how the machine works — and a bordered card beside it was a second answer to the
+      same question at a different padding. The tab strip now says this before the press; what is
+      left here is what a person needs once they have pressed anyway.
+    */
     return (
-      <div className="rounded-lg border border-border bg-surface p-6">
-        <p className="font-display text-lg text-text-muted">Nothing to review in {projectId}.</p>
-        <p className="mt-2 max-w-prose text-sm text-text-faint">
+      <Teach title={`Nothing to review in ${projectId}`}>
+        <p>
           This mode reads a run&rsquo;s worktree. When one is working here, its changed files appear
           on the left — and the whole repository stays where it is, in the editor.
         </p>
         <InspectorLink projectId={projectId} />
-      </div>
+      </Teach>
     );
   }
 
@@ -150,7 +157,7 @@ export function ModeCodigo({ projectId, run, onPickRun }: ModeCodigoProps) {
  */
 function InspectorLink({ projectId }: { projectId: string }) {
   return (
-    /* The same measure as the sentence above it in the empty-state card. Without
+    /* The same measure as the sentence it follows in the empty state. Without
        it the two doors ran 1,590px on one line — a ribbon twice the width of
        everything around it, which is the sort of thing a passing suite says
        nothing about. */

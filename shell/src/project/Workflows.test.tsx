@@ -106,7 +106,7 @@ describe("the workflows mode", () => {
     expect(guard).toBeTruthy();
     // Inline, not a modal: nothing here is a dialog, and the rest of the page is still on screen.
     expect(rendered.container.querySelector("dialog")).toBeNull();
-    expect(screen.getByText("On this machine")).toBeTruthy();
+    expect(await screen.findByText("On this machine")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "edit in the library" }));
     expect(opener.openUrl).toHaveBeenCalledWith("vscode://file/C:/lib/harness/1.0");

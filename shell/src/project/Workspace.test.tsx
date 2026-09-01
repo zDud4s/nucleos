@@ -115,8 +115,44 @@ describe("the project workspace", () => {
     expect(await screen.findByRole("link", { name: "State" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "State" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Map" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Code" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Workflows" })).toBeTruthy();
+    // By prefix from here down: two of the four carry a count of what they hold, which is the next
+    // test's subject and not this one's.
+    expect(screen.getByRole("link", { name: /^Code/ })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /^Workflows/ })).toBeTruthy();
+  });
+
+  /**
+   * Two of the four are doors rather than places.
+   *
+   * Code reads a *run's* worktree and Workflows reads an installed bundle, and on most projects
+   * most of the time there is neither — so four equal tabs send somebody through a click onto a
+   * page whose whole content explains why it is empty. The strip says how much is there before the
+   * press instead.
+   *
+   * **A nought and never the em dash**, which is the point the test below this one protects: on
+   * these pages the dash means a reading nobody took, and how many runs hold a worktree here is a
+   * reading the daemon gave.
+   *
+   * **What is asserted as hard as the number is that nothing was taken away.** The route, the link
+   * and the press all survive; a tab that quietly stopped working would be a capability lost to a
+   * cosmetic change, and this workspace has already lost one that way.
+   */
+  it("says how much the two conditional modes are holding, and still opens them", async () => {
+    await openWorkspace();
+
+    const code = await screen.findByRole("link", { name: /^Code/ });
+    await waitFor(() => expect(code.textContent).toBe("Code0"));
+    expect(code.getAttribute("title")).toMatch(/No run is working here/);
+    expect(screen.getByRole("link", { name: /^Workflows/ }).textContent).toBe("Workflows0");
+
+    // The two that answer about the project itself are never numbered: both are true of a project
+    // the moment it exists, whatever is or is not running in it.
+    expect(screen.getByRole("link", { name: "State" }).textContent).toBe("State");
+    expect(screen.getByRole("link", { name: "Map" }).textContent).toBe("Map");
+
+    // Quiet is drawn, and it is drawn by the tone rather than by taking anything away.
+    expect(code.className).not.toBe(screen.getByRole("link", { name: "Map" }).className);
+    expect(code.getAttribute("href")).toBe("/projects/nucleos/codigo");
   });
 
   /**
@@ -395,7 +431,7 @@ describe("the project workspace", () => {
   it("mounts the workflows mode on the library and the project's pins", async () => {
     await openWorkspace({ mode: "workflows" });
     expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
-    expect(screen.getByText("On this machine")).toBeTruthy();
+    expect(await screen.findByText("On this machine")).toBeTruthy();
   });
 
   /**
