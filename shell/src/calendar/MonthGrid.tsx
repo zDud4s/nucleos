@@ -8,7 +8,7 @@ import {
   type EventOccurrence,
 } from "../data/calendar";
 import { monthMatrix, nowFraction, sameDay, weekdayLabels } from "../lib/calendar-grid";
-import { dateKeyOf, groupByLocalDay, placementOf, type Slot } from "./slot";
+import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot } from "./slot";
 
 /**
  * The month: six weeks always, a heading row, and at most three chips a day.
@@ -42,6 +42,7 @@ export interface MonthGridProps {
   config: CalendarConfigView | undefined;
   selected: Slot;
   onSelect: (slot: Slot) => void;
+  drag: DragHandlers;
 }
 
 /**
@@ -57,7 +58,15 @@ const KEY_STEPS: Record<string, number> = {
   ArrowDown: 7,
 };
 
-export function MonthGrid({ anchor, occurrences, now, config, selected, onSelect }: MonthGridProps) {
+export function MonthGrid({
+  anchor,
+  occurrences,
+  now,
+  config,
+  selected,
+  onSelect,
+  drag,
+}: MonthGridProps) {
   const weeks = monthMatrix(anchor);
   const days = weeks.flat();
   const byDay = groupByLocalDay(occurrences);
@@ -139,6 +148,7 @@ export function MonthGrid({ anchor, occurrences, now, config, selected, onSelect
                 working={isWorkingDay(day, config)}
                 selected={sameDay(day, selected.day)}
                 onSelect={onSelect}
+                drag={drag}
               />
             ))}
           </div>
@@ -156,6 +166,7 @@ interface DayCellProps {
   working: boolean;
   selected: boolean;
   onSelect: (slot: Slot) => void;
+  drag: DragHandlers;
 }
 
 /**
@@ -174,17 +185,28 @@ interface DayCellProps {
  * what an earlier draft did, dimming both the outside days and the weekends —
  * makes a Saturday in the next month indistinguishable from either.
  */
-function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect }: DayCellProps) {
+function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect, drag }: DayCellProps) {
   const hours = dayHours(day);
   const today = sameDay(day, now);
   const shown = occurrences.slice(0, MAX_CHIPS);
   const hidden = occurrences.length - shown.length;
+
+  /*
+    A cell is a drop target only while something is actually being dragged, and
+    only when the drop would change the date. Lighting up the day an occurrence
+    already sits on invites a gesture whose whole effect is to write an
+    exception row saying nothing changed — `moveFromDrop` refuses that, and not
+    offering it is better than refusing it silently.
+  */
+  const takes =
+    drag.dragging !== null && !sameDay(placementOf(drag.dragging).day, day);
 
   const classes = ["calendar-day"];
   if (!inMonth) classes.push("calendar-day-outside");
   if (!working) classes.push("calendar-day-closed");
   if (today) classes.push("calendar-day-today");
   if (selected) classes.push("calendar-day-selected");
+  if (takes) classes.push("calendar-day-takes");
 
   /*
     The whole cell's accessible name, because the visible content is a bare
@@ -216,6 +238,21 @@ function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect }
         aria-label={said}
         aria-pressed={selected}
         onClick={() => onSelect({ day, hour: null })}
+        /*
+          `preventDefault` on dragover is what MAKES an element a drop target —
+          the default action of that event is to refuse the drop. It reads like
+          a no-op and is the entire opt-in.
+        */
+        onDragOver={(event) => {
+          if (!takes) return;
+          event.preventDefault();
+        }}
+        onDrop={(event) => {
+          if (!takes) return;
+          event.preventDefault();
+          // A month cell can only name a day; the occurrence keeps its time.
+          drag.onDrop(day, null);
+        }}
       >
         <span className="calendar-day-head">
           <span className="calendar-day-number">{day.getDate()}</span>
@@ -233,6 +270,7 @@ function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect }
             <Chip
               key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}
               occurrence={occurrence}
+              drag={drag}
             />
           ))}
           {hidden > 0 && <span className="calendar-day-more">+{hidden} more</span>}
@@ -261,14 +299,39 @@ function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect }
  * works it out. Knowing an event is not where its series put it is the
  * difference between "I misremembered" and "something moved this".
  */
-function Chip({ occurrence }: { occurrence: EventOccurrence }) {
+function Chip({ occurrence, drag }: { occurrence: EventOccurrence; drag: DragHandlers }) {
   const proposal = occurrence.source === "proposal";
   const { clock, moved } = placementOf(occurrence);
+  const held =
+    drag.dragging !== null &&
+    occurrenceKey(drag.dragging.event_id, drag.dragging.occurrence_local) ===
+      occurrenceKey(occurrence.event_id, occurrence.occurrence_local);
+
   const classes = ["calendar-chip"];
   if (proposal) classes.push("calendar-chip-proposal");
   if (moved) classes.push("calendar-chip-moved");
+  if (held) classes.push("calendar-chip-held");
+
   return (
-    <span className={classes.join(" ")}>
+    <span
+      className={classes.join(" ")}
+      draggable
+      onDragStart={(event) => {
+        /*
+          The key goes into the transfer as well as into React state. Nothing
+          reads it back — the state is what the drop uses — but a drag with an
+          empty `dataTransfer` is not a drag as far as the platform is
+          concerned, and Firefox in particular cancels it before it starts.
+        */
+        event.dataTransfer.setData(
+          "text/plain",
+          occurrenceKey(occurrence.event_id, occurrence.occurrence_local),
+        );
+        event.dataTransfer.effectAllowed = "move";
+        drag.onDragStart(occurrence);
+      }}
+      onDragEnd={() => drag.onDragEnd()}
+    >
       <span className="calendar-chip-clock">{clock}</span>
       <span className="calendar-chip-title">{occurrence.title}</span>
       {proposal && <span className="calendar-visually-hidden">proposed</span>}

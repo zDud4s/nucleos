@@ -110,6 +110,8 @@ const params = new URLSearchParams(window.location.search);
 const path = params.get("path") ?? "/teams";
 const tab = params.get("tab");
 const press = params.get("press");
+/** The title of an occurrence to pick up and hold, so the drag state can be photographed. */
+const drag = params.get("drag");
 
 interface PreviewWindow {
   /** Set once the page has settled, so the driver shoots a finished frame and not a spinner. */
@@ -174,10 +176,34 @@ function pressButton(name: string): boolean {
   return true;
 }
 
+/**
+ * Pick an occurrence up, and leave it up.
+ *
+ * A drag is a *state* the page enters, and every affordance that state turns
+ * on — which days would take the drop, which block is in the hand — exists
+ * only while it lasts. A harness that could not begin one would photograph the
+ * calendar with dragging built and none of it ever on screen, which is the
+ * same blind spot `press` was added for.
+ *
+ * A real `DragEvent` with a real `DataTransfer`, not a synthetic click:
+ * `dragstart` is what the components listen for, and the transfer is what they
+ * write the occurrence key into.
+ */
+function startDrag(title: string): boolean {
+  const holds = [...document.querySelectorAll(".calendar-chip, .calendar-block")];
+  const wanted = holds.find((one) => (one.textContent ?? "").includes(title));
+  if (wanted === undefined) return false;
+  wanted.dispatchEvent(
+    new DragEvent("dragstart", { bubbles: true, dataTransfer: new DataTransfer() }),
+  );
+  return true;
+}
+
 /* Long enough for the queries to answer and the fonts to land. */
 window.setTimeout(() => {
   if (tab !== null) openTab(tab);
   if (press !== null) pressButton(press);
+  if (drag !== null) startDrag(drag);
   window.setTimeout(() => {
     window.__preview.ready = true;
   }, 400);

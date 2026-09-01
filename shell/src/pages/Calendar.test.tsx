@@ -345,6 +345,56 @@ describe("the page", () => {
     expect(month.getAttribute("aria-pressed")).toBe("true");
   });
 
+  /**
+   * The whole gesture, end to end, and the one thing about it that can go
+   * quietly wrong: a drop must address the occurrence by its ORIGINAL local
+   * start. Sending where it landed writes a second exception row instead of
+   * relocating the first — the defect the `datetime-local` path has its own
+   * double-move test for, arriving here by a different door.
+   */
+  it("a drag sends the original local start, not where it was dropped", async () => {
+    const seen: Record<string, unknown> = {};
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST" && typeof init.body === "string") {
+        seen[path] = JSON.parse(init.body);
+      }
+      if (path.startsWith("/calendar/events?")) return [occurrence()];
+      if (path === "/calendar/busy") return { busy: true };
+      if (path === "/calendar/config") return CONFIG;
+      return [];
+    });
+
+    const { container } = await page("/calendar?on=2026-08-20");
+
+    /*
+      Scoped to the grid. The title is on screen twice by design — once as a
+      chip in the cell and once in the sheet below, which is the whole point of
+      the two halves — so a bare `findByText` finds both and refuses.
+    */
+    await waitFor(() => expect(container.querySelector(".calendar-chip")).not.toBeNull());
+    const chip = container.querySelector(".calendar-chip") as HTMLElement;
+
+    fireEvent.dragStart(chip, {
+      dataTransfer: { setData: () => {}, effectAllowed: "" },
+    });
+
+    // The 27th: a different day, so a real move.
+    const target = [...container.querySelectorAll(".calendar-day")].find((cell) =>
+      (cell.getAttribute("data-day") ?? "") === "2026-08-27",
+    ) as HTMLElement;
+    fireEvent.dragOver(target);
+    fireEvent.drop(target);
+
+    await waitFor(() => expect(seen["/calendar/events/1/move"]).toBeDefined());
+    expect(seen["/calendar/events/1/move"]).toEqual({
+      // The identity, untouched — never the destination.
+      occurrence_local: "2026-08-20T09:00:00",
+      // The day changed and the time did not: a month cell cannot name an hour.
+      to_local: "2026-08-27T09:00:00",
+      duration_minutes: 30,
+    });
+  });
+
   it("says the núcleo did not answer rather than drawing an empty month", async () => {
     daemon.apiFetch.mockImplementation(async (path: string) => {
       if (path.startsWith("/calendar/events")) throw new Error("connection refused");

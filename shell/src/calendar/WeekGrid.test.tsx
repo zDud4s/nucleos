@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { WeekGrid } from "./WeekGrid";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
-import type { Slot } from "./slot";
+import type { DragHandlers, Slot } from "./slot";
 
 /**
  * The week grid.
@@ -43,8 +43,20 @@ function occurrence(overrides: Partial<EventOccurrence> = {}): EventOccurrence {
   };
 }
 
+/** A drag that is not happening, which is the state every test but the drag ones is in. */
+const NO_DRAG: DragHandlers = {
+  dragging: null,
+  onDragStart: () => {},
+  onDragEnd: () => {},
+  onDrop: () => {},
+};
+
 /** The week of Monday 17 August 2026, which contains the Thursday the fixtures use. */
-function week(occurrences: EventOccurrence[], onSelect: (slot: Slot) => void = () => {}) {
+function week(
+  occurrences: EventOccurrence[],
+  onSelect: (slot: Slot) => void = () => {},
+  drag: DragHandlers = NO_DRAG,
+) {
   return render(
     <WeekGrid
       anchor={new Date(2026, 7, 20)}
@@ -53,6 +65,7 @@ function week(occurrences: EventOccurrence[], onSelect: (slot: Slot) => void = (
       config={CONFIG}
       selected={{ day: new Date(2026, 7, 20), hour: null }}
       onSelect={onSelect}
+      drag={drag}
     />,
   );
 }
@@ -178,6 +191,7 @@ describe("a day that is not 24 hours", () => {
         config={CONFIG}
         selected={{ day: new Date(2026, 2, 29), hour: null }}
         onSelect={() => {}}
+        drag={NO_DRAG}
       />,
     );
 
@@ -197,6 +211,7 @@ describe("a day that is not 24 hours", () => {
         config={CONFIG}
         selected={{ day: new Date(2026, 2, 29), hour: null }}
         onSelect={() => {}}
+        drag={NO_DRAG}
       />,
     );
 
@@ -222,10 +237,103 @@ describe("the now rule", () => {
         config={CONFIG}
         selected={{ day: new Date(2026, 7, 20), hour: null }}
         onSelect={() => {}}
+        drag={NO_DRAG}
       />,
     );
 
     expect(container.querySelectorAll(".calendar-now-rule")).toHaveLength(0);
+  });
+});
+
+describe("dragging a block", () => {
+  /** The hour comes from the BAND, which is what makes a 23-hour day come out right. */
+  it("drops on a band and names that band's own hour", () => {
+    const dropped: { day: Date; hour: number | null }[] = [];
+    week([occurrence()], () => {}, {
+      ...NO_DRAG,
+      dragging: occurrence(),
+      onDrop: (day, hour) => dropped.push({ day, hour }),
+    });
+
+    const friday = new Date(2026, 7, 21).toLocaleDateString(undefined, {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+    });
+    const target = screen.getByLabelText(`${friday} at 15:00`);
+    fireEvent.dragOver(target);
+    fireEvent.drop(target);
+
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0].hour).toBe(15);
+    expect(dropped[0].day.getDate()).toBe(21);
+  });
+
+  it("picks the block up and puts the key on the transfer", () => {
+    const picked: EventOccurrence[] = [];
+    const transfer = { setData: vi.fn(), effectAllowed: "" };
+    week([occurrence()], () => {}, { ...NO_DRAG, onDragStart: (row) => picked.push(row) });
+
+    fireEvent.dragStart(blockFor("Standup"), { dataTransfer: transfer });
+
+    expect(picked[0].occurrence_local).toBe("2026-08-20T09:00:00");
+    expect(transfer.setData).toHaveBeenCalledWith("text/plain", "1:2026-08-20T09:00:00");
+  });
+
+  /**
+   * Every band takes a drop — there is no hour of a day an occurrence cannot
+   * be moved to — but only while something is actually in the hand.
+   */
+  it("offers every band while dragging, and none when not", () => {
+    const { container: idle } = week([occurrence()]);
+    expect(idle.querySelectorAll(".calendar-slot-takes")).toHaveLength(0);
+
+    const { container: dragging } = week([occurrence()], () => {}, {
+      ...NO_DRAG,
+      dragging: occurrence(),
+    });
+    // Seven ordinary columns of 24 bands.
+    expect(dragging.querySelectorAll(".calendar-slot-takes")).toHaveLength(7 * 24);
+  });
+
+  it("fades the block that is in the hand", () => {
+    week([occurrence()], () => {}, { ...NO_DRAG, dragging: occurrence() });
+    expect(blockFor("Standup").className).toContain("calendar-block-held");
+  });
+
+  /**
+   * On the day the clocks go forward there is no **01** band, so a drag cannot
+   * ask for an hour that does not exist on that day. That is the whole reason
+   * the hour is read off the band's own instant rather than counted from the
+   * index — counting would have offered 01:00 and then 22:00 twice.
+   *
+   * The missing hour is 01 and not 02, which is worth stating because the
+   * first draft of this test asserted the wrong one: Lisbon jumps at 01:00
+   * WET, so the clock goes 00:59 → 02:00 and it is one o'clock that never
+   * happens.
+   */
+  it("offers no 01:00 band on the day the clocks go forward", () => {
+    render(
+      <WeekGrid
+        anchor={new Date(2026, 2, 29)}
+        occurrences={[]}
+        now={new Date(2026, 2, 25, 12, 0)}
+        config={CONFIG}
+        selected={{ day: new Date(2026, 2, 29), hour: null }}
+        onSelect={() => {}}
+        drag={{ ...NO_DRAG, dragging: occurrence() }}
+      />,
+    );
+
+    const named = (day: Date) =>
+      day.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" });
+
+    expect(screen.queryByLabelText(`${named(new Date(2026, 2, 29))} at 01:00`)).toBeNull();
+    // The bands either side of the hole are both there, and only one hour is missing.
+    expect(screen.getByLabelText(`${named(new Date(2026, 2, 29))} at 00:00`)).toBeDefined();
+    expect(screen.getByLabelText(`${named(new Date(2026, 2, 29))} at 02:00`)).toBeDefined();
+    // Its neighbour, an ordinary day, has its one o'clock.
+    expect(screen.getByLabelText(`${named(new Date(2026, 2, 28))} at 01:00`)).toBeDefined();
   });
 });
 

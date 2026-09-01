@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MonthGrid, NowLine } from "./MonthGrid";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
+import type { DragHandlers } from "./slot";
 
 /**
  * The month grid.
@@ -40,6 +41,14 @@ function occurrence(overrides: Partial<EventOccurrence> = {}): EventOccurrence {
   };
 }
 
+/** A drag that is not happening, which is the state every test but the drag ones is in. */
+const NO_DRAG: DragHandlers = {
+  dragging: null,
+  onDragStart: () => {},
+  onDragEnd: () => {},
+  onDrop: () => {},
+};
+
 function august(occurrences: EventOccurrence[], overrides: Partial<Parameters<typeof MonthGrid>[0]> = {}) {
   return render(
     <MonthGrid
@@ -49,6 +58,7 @@ function august(occurrences: EventOccurrence[], overrides: Partial<Parameters<ty
       config={CONFIG}
       selected={{ day: new Date(2026, 7, 20), hour: null }}
       onSelect={() => {}}
+      drag={NO_DRAG}
       {...overrides}
     />,
   );
@@ -189,6 +199,7 @@ describe("the shapes a day can carry", () => {
         config={CONFIG}
         selected={{ day: new Date(2026, 2, 15), hour: null }}
         onSelect={() => {}}
+        drag={NO_DRAG}
       />,
     );
 
@@ -208,6 +219,7 @@ describe("the shapes a day can carry", () => {
         config={CONFIG}
         selected={{ day: new Date(2026, 9, 15), hour: null }}
         onSelect={() => {}}
+        drag={NO_DRAG}
       />,
     );
 
@@ -263,6 +275,75 @@ describe("selection", () => {
     august([]);
     expect(within(cellFor(aug(20))).getByRole("button").getAttribute("aria-pressed")).toBe("true");
     expect(within(cellFor(aug(19))).getByRole("button").getAttribute("aria-pressed")).toBe("false");
+  });
+});
+
+/* --------------------------------------------------------------- dragging -- */
+
+describe("dragging a chip to another day", () => {
+  /** A drag with an empty `dataTransfer` is not a drag: Firefox cancels it outright. */
+  it("picks the occurrence up, and puts the key on the transfer", () => {
+    const picked: EventOccurrence[] = [];
+    const transfer = { setData: vi.fn(), effectAllowed: "" };
+    august([occurrence()], { drag: { ...NO_DRAG, onDragStart: (row) => picked.push(row) } });
+
+    fireEvent.dragStart(screen.getByText("Standup").parentElement as HTMLElement, {
+      dataTransfer: transfer,
+    });
+
+    expect(picked).toHaveLength(1);
+    expect(picked[0].occurrence_local).toBe("2026-08-20T09:00:00");
+    expect(transfer.setData).toHaveBeenCalledWith("text/plain", "1:2026-08-20T09:00:00");
+  });
+
+  it("drops on a day and names it, with no hour a month cell cannot know", () => {
+    const dropped: { day: Date; hour: number | null }[] = [];
+    august([occurrence()], {
+      drag: {
+        ...NO_DRAG,
+        dragging: occurrence(),
+        onDrop: (day, hour) => dropped.push({ day, hour }),
+      },
+    });
+
+    const target = within(cellFor(aug(27))).getByRole("button");
+    fireEvent.dragOver(target);
+    fireEvent.drop(target);
+
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0].day.getDate()).toBe(27);
+    expect(dropped[0].hour).toBeNull();
+  });
+
+  /**
+   * The day it already sits on is not a target. `moveFromDrop` refuses that
+   * drop anyway, and not offering it is better than refusing it silently.
+   */
+  it("does not offer the day the occurrence is already on", () => {
+    const dropped: Date[] = [];
+    august([occurrence()], {
+      drag: { ...NO_DRAG, dragging: occurrence(), onDrop: (day) => dropped.push(day) },
+    });
+
+    const itsOwnDay = within(cellFor(aug(20))).getByRole("button");
+    expect(itsOwnDay.className).not.toContain("calendar-day-takes");
+    fireEvent.drop(itsOwnDay);
+    expect(dropped).toEqual([]);
+
+    // Every other day does take it.
+    expect(within(cellFor(aug(27))).getByRole("button").className).toContain("calendar-day-takes");
+  });
+
+  it("marks no day at all while nothing is being dragged", () => {
+    const { container } = august([occurrence()]);
+    expect(container.querySelectorAll(".calendar-day-takes")).toHaveLength(0);
+  });
+
+  it("fades the chip that is in the hand", () => {
+    august([occurrence()], { drag: { ...NO_DRAG, dragging: occurrence() } });
+    expect((screen.getByText("Standup").parentElement as HTMLElement).className).toContain(
+      "calendar-chip-held",
+    );
   });
 });
 

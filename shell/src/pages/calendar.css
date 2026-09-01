@@ -226,6 +226,36 @@
   box-shadow: inset 0 0 0 2px var(--border-strong);
 }
 
+/* ------------------------------------------------------------- dragging -- */
+
+/*
+   A cell that would take the drop — marked on HOVER only, and never the day
+   the occurrence already sits on, since that drop would change nothing.
+
+   The first version outlined every eligible cell for the whole drag, and the
+   screenshot settled it: forty-one dashed boxes at once is not an affordance,
+   it is noise, and the month stopped reading as a calendar. It also told the
+   reader nothing they did not know — an occurrence can go on any day. The
+   cursor is over one cell at a time and that is where the eye is, which is
+   what the week's bands already did; this now matches them rather than
+   contradicting them.
+*/
+.calendar-day-takes:hover {
+  background: var(--tone-info-bg);
+  box-shadow: inset 0 0 0 2px var(--tone-info-fg);
+}
+
+/* What is in the hand. Faded where it came from, so the eye follows the
+   cursor rather than arguing with the copy left behind. */
+.calendar-chip-held,
+.calendar-block-held {
+  opacity: 0.4;
+}
+
+.calendar-chip[draggable="true"] {
+  cursor: grab;
+}
+
 .calendar-day-head {
   display: flex;
   flex-wrap: wrap;
@@ -496,6 +526,14 @@
   box-shadow: inset 0 0 0 1px var(--border-strong);
 }
 
+/* Every band takes a drop while a drag is in flight — there is no hour of a
+   day an occurrence cannot be moved to — so the affordance is the hover, not a
+   permanent outline on 168 slots. */
+.calendar-slot-takes:hover {
+  background: var(--tone-info-bg);
+  box-shadow: inset 0 0 0 1px var(--tone-info-fg);
+}
+
 /*
   One line, clock then title — the same shape as a month chip, and for a reason
   the first screenshot made obvious. Stacked in a column, a 30-minute meeting
@@ -539,6 +577,10 @@
 .calendar-block:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
+}
+
+.calendar-block[draggable="true"] {
+  cursor: grab;
 }
 
 .calendar-block-clock {

@@ -31,6 +31,23 @@ export interface Slot {
 }
 
 /**
+ * The drag, as both grids see it.
+ *
+ * One shape rather than four loose props, because a month cell and a week slot
+ * are the same gesture at two granularities and the page holds the state for
+ * both. A grid never decides what a drop MEANS — it says what was picked up
+ * and where it was let go, and `drag.ts` and the page decide the rest.
+ */
+export interface DragHandlers {
+  /** What is under the hand right now, or `null`. Read during `dragover`. */
+  dragging: EventOccurrence | null;
+  onDragStart: (occurrence: EventOccurrence) => void;
+  onDragEnd: () => void;
+  /** `hour` is `null` from a month cell, which can only name a day. */
+  onDrop: (day: Date, hour: number | null) => void;
+}
+
+/**
  * A day's own `"YYYY-MM-DD"`, built from the same local getters `monthMatrix`
  * used to construct the day — never re-parsed through a `Date`, so a grid
  * cell's key can never disagree with the box that was placed into it.

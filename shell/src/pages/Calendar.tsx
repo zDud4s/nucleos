@@ -10,9 +10,11 @@ import {
   useBusy,
   useCalendarConfig,
   useCalendarEvents,
+  useMoveOccurrence,
   type CalendarConfigView,
   type EventOccurrence,
 } from "../data/calendar";
+import { moveFromDrop } from "../calendar/drag";
 import { isHeld, usePendingNotifications, type PendingNotification } from "../data/feed";
 import { dayBounds, monthMatrix, weekOf } from "../lib/calendar-grid";
 import { Badge, Button, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime } from "../ui";
@@ -40,10 +42,11 @@ import "./calendar.css";
  * off the day itself via `lib/calendar-grid.ts`'s `dayBounds`/`hoursInSpan` —
  * a local calendar day whose real span is 23 or 25 hours, not 24.
  *
- * **Drag-to-move is v2**, by design §6.14's own Notes and by the original
- * `calendario-local` spec, which puts month/week views *with dragging*
- * explicitly out of scope. (This module used to call it a "v1 parity gap"
- * alongside the week view. The week view was scope; the drag never was.)
+ * **Dragging moves an occurrence**, which design §6.14's Notes deferred to v2
+ * and the owner has since called in. It is an addition and never a
+ * replacement: the `datetime-local` in `DaySheet` is still how an exact time
+ * is named, and is the only way for anyone not using a mouse. What a drop
+ * means lives in `calendar/drag.ts`, away from either grid.
  */
 
 type View = "month" | "week";
@@ -209,6 +212,45 @@ export function Calendar() {
     publish(view, slot.day);
   }
 
+  /**
+   * The occurrence currently under the hand, and what a drop does with it.
+   *
+   * Held here rather than in either grid because the grids are peers and the
+   * mutation is the page's: `DaySheet` owns the same write for its
+   * `datetime-local`, and two components asking for `useMoveOccurrence`
+   * separately would be two caches to invalidate.
+   *
+   * React state and not only `dataTransfer`, because the payload has to be
+   * readable during `dragover` — which is where a drop target decides whether
+   * to light up — and every browser deliberately blanks `dataTransfer` on
+   * that event so a page cannot read what it is not yet holding. The transfer
+   * still carries the key, so the drag is a real drag to the operating system
+   * rather than a mousedown this page is pretending about.
+   */
+  const [dragging, setDragging] = useState<EventOccurrence | null>(null);
+  const move = useMoveOccurrence();
+
+  function drop(day: Date, hour: number | null) {
+    const occurrence = dragging;
+    setDragging(null);
+    if (occurrence === null) return;
+
+    const next = moveFromDrop(occurrence, day, hour);
+    // `null` is a drop that changes nothing — picked up and put back.
+    if (next === null) return;
+
+    move.mutate({
+      eventId: occurrence.event_id,
+      // The ORIGINAL local start, always. Never `next.toLocal`.
+      occurrenceLocal: occurrence.occurrence_local,
+      toLocal: next.toLocal,
+      durationMinutes: next.durationMinutes,
+    });
+    select({ day, hour });
+  }
+
+  const drag = { dragging, onDragStart: setDragging, onDragEnd: () => setDragging(null), onDrop: drop };
+
   const { from, to } = visibleWindow(anchor, view);
   const events = useCalendarEvents(from, to);
   const busy = useBusy();
@@ -311,6 +353,7 @@ export function Calendar() {
               config={config.data}
               selected={selected}
               onSelect={select}
+              drag={drag}
             />
           ) : (
             <MonthGrid
@@ -320,8 +363,10 @@ export function Calendar() {
               config={config.data}
               selected={selected}
               onSelect={select}
+              drag={drag}
             />
           ))}
+        {move.isError && <MoveError error={move.error} />}
       </Panel>
 
       <Panel title="Selected day">
@@ -353,6 +398,20 @@ function weekLabel(days: Date[]): string {
 function EventsError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return <ErrorNote>the núcleo did not answer — nothing is known about this month</ErrorNote>;
+}
+
+/**
+ * A refusal on a drag, said next to the grid it happened on.
+ *
+ * Reported here and not inside the block that was dragged, because after a
+ * failed move the block is back where it started and there is nothing left on
+ * screen pointing at it — a message attached to it would appear in whichever
+ * cell the person was no longer looking at. The `DaySheet` reports the same
+ * write beside its own control, where there IS something to attach it to.
+ */
+function MoveError({ error }: { error: unknown }) {
+  if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
+  return <ErrorNote>the núcleo did not answer — nothing was moved</ErrorNote>;
 }
 
 /* ------------------------------------------------------------------ busy -- */

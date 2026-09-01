@@ -224,7 +224,7 @@ await mkdir(SHOTS, { recursive: true });
  * that reads well above the fold and falls apart below it is exactly the defect
  * a viewport-sized screenshot hides.
  */
-async function shoot(name, { path, tab, press, theme = "dark" }) {
+async function shoot(name, { path, tab, press, drag, theme = "dark" }) {
   await send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-color-scheme", value: theme }],
   }, sessionId);
@@ -236,6 +236,9 @@ async function shoot(name, { path, tab, press, theme = "dark" }) {
     /* The label of a button to click once the page has settled — how a surface
        that opens from a control gets photographed at all. See `preview/main.tsx`. */
     ...(press === undefined ? {} : { press }),
+    /* The title of an occurrence to pick up and hold. A drag is a state the
+       page enters, and everything it turns on exists only while it lasts. */
+    ...(drag === undefined ? {} : { drag }),
   });
   await send("Page.navigate", { url: `${origin}/preview.html?${query}` }, sessionId);
 
@@ -367,6 +370,13 @@ const SHOTS_TO_TAKE = [
      as a page that failed to load — the state every grid gets wrong first. */
   ["45-calendar-empty", { path: "/calendar?on=2027-02-15" }],
   ["46-calendar-empty-light", { path: "/calendar?on=2027-02-15", theme: "light" }],
+  /* Mid-drag, which is the only state where the drop targets exist at all —
+     and the one thing about dragging no test can judge: whether the dashed
+     "this would take it" reads as a different thing from the solid selection
+     ring, and whether thirty-odd outlined cells at once is legible or a mess. */
+  ["47-calendar-dragging", { path: "/calendar?on=2026-08-24", drag: "Reconcile the ledger" }],
+  ["48-calendar-dragging-light", { path: "/calendar?on=2026-08-24", drag: "Reconcile the ledger", theme: "light" }],
+  ["49-calendar-week-dragging", { path: "/calendar?view=week&on=2026-08-25", drag: "Design review" }],
 ];
 
 let clean = true;

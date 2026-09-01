@@ -17,7 +17,7 @@ import {
   sameDay,
   weekOf,
 } from "../lib/calendar-grid";
-import { dateKeyOf, groupByLocalDay, placementOf, type Slot } from "./slot";
+import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot } from "./slot";
 
 /**
  * The week, with an hour axis — which is the whole reason it exists.
@@ -43,10 +43,12 @@ import { dateKeyOf, groupByLocalDay, placementOf, type Slot } from "./slot";
  * a shared 24 would draw a 23-hour day as though it had 24 hours in it, which
  * is the error `hourMarks` was written to avoid.
  *
- * Drag-to-move is **not** here and is not an oversight: design §6.14's Notes
- * put it in v2, and the original `calendario-local` spec puts month/week views
- * *with dragging* explicitly out of scope. An occurrence moves through the
- * `datetime-local` in `DaySheet`.
+ * **A block can be dragged to another hour or another day**, which the design
+ * deferred to v2 and the owner has since called in. This is the view where
+ * that gesture can mean something exact — a month cell can only name a day —
+ * and what a drop means lives in `drag.ts` rather than here. It adds to the
+ * `datetime-local` in `DaySheet` and replaces nothing: dragging is a mouse
+ * gesture, and the control remains the only way to name a time without one.
  */
 
 export interface WeekGridProps {
@@ -56,9 +58,18 @@ export interface WeekGridProps {
   config: CalendarConfigView | undefined;
   selected: Slot;
   onSelect: (slot: Slot) => void;
+  drag: DragHandlers;
 }
 
-export function WeekGrid({ anchor, occurrences, now, config, selected, onSelect }: WeekGridProps) {
+export function WeekGrid({
+  anchor,
+  occurrences,
+  now,
+  config,
+  selected,
+  onSelect,
+  drag,
+}: WeekGridProps) {
   const days = weekOf(anchor);
   const byDay = groupByLocalDay(occurrences);
   /* The gutter is labelled from the first day of the row — see the header. */
@@ -103,6 +114,7 @@ export function WeekGrid({ anchor, occurrences, now, config, selected, onSelect 
             config={config}
             selected={selected}
             onSelect={onSelect}
+            drag={drag}
           />
         ))}
       </div>
@@ -156,6 +168,7 @@ function DayColumn({
   config,
   selected,
   onSelect,
+  drag,
 }: {
   day: Date;
   occurrences: EventOccurrence[];
@@ -163,6 +176,7 @@ function DayColumn({
   config: CalendarConfigView | undefined;
   selected: Slot;
   onSelect: (slot: Slot) => void;
+  drag: DragHandlers;
 }) {
   const [start, end] = dayBounds(day);
   const slots = hourSlots(start, end);
@@ -217,24 +231,44 @@ function DayColumn({
         Underneath the events rather than over them: a slot that swallowed the
         click on a meeting would make the events unreachable.
       */}
-      {slots.map((slot, index) => (
-        <button
-          type="button"
-          key={`${slot.hour}-${index}`}
-          className={
-            selected.hour === slot.hour && sameDay(day, selected.day)
-              ? "calendar-slot calendar-slot-selected"
-              : "calendar-slot"
-          }
-          style={{ top: `${slot.top * 100}%`, height: `${slot.height * 100}%` }}
-          aria-label={`${day.toLocaleDateString(undefined, {
-            weekday: "long",
-            day: "numeric",
-            month: "long",
-          })} at ${String(slot.hour).padStart(2, "0")}:00`}
-          onClick={() => onSelect({ day, hour: slot.hour })}
-        />
-      ))}
+      {slots.map((slot, index) => {
+        const classes = ["calendar-slot"];
+        if (selected.hour === slot.hour && sameDay(day, selected.day)) {
+          classes.push("calendar-slot-selected");
+        }
+        if (drag.dragging !== null) classes.push("calendar-slot-takes");
+        return (
+          <button
+            type="button"
+            key={`${slot.hour}-${index}`}
+            className={classes.join(" ")}
+            style={{ top: `${slot.top * 100}%`, height: `${slot.height * 100}%` }}
+            aria-label={`${day.toLocaleDateString(undefined, {
+              weekday: "long",
+              day: "numeric",
+              month: "long",
+            })} at ${String(slot.hour).padStart(2, "0")}:00`}
+            onClick={() => onSelect({ day, hour: slot.hour })}
+            /* `preventDefault` on dragover is the opt-in: the event's default
+               action is to refuse the drop. */
+            onDragOver={(event) => {
+              if (drag.dragging === null) return;
+              event.preventDefault();
+            }}
+            onDrop={(event) => {
+              if (drag.dragging === null) return;
+              event.preventDefault();
+              /*
+                The band's OWN hour, read back from the instant by `hourSlots`
+                — not the index. On the day the clocks go back there are two
+                bands calling themselves 02, and both mean 02:00; on the day
+                they go forward the eleventh band is 12, not 11.
+              */
+              drag.onDrop(day, slot.hour);
+            }}
+          />
+        );
+      })}
 
       {occurrences.map((occurrence) => (
         <Block
@@ -245,6 +279,7 @@ function DayColumn({
           lane={lanes.get(occurrence) ?? { lane: 0, lanes: 1 }}
           onSelect={onSelect}
           day={day}
+          drag={drag}
         />
       ))}
 
@@ -261,6 +296,7 @@ function Block({
   lane,
   day,
   onSelect,
+  drag,
 }: {
   occurrence: EventOccurrence;
   dayStart: Date;
@@ -268,15 +304,22 @@ function Block({
   lane: { lane: number; lanes: number };
   day: Date;
   onSelect: (slot: Slot) => void;
+  drag: DragHandlers;
 }) {
   const placement = placementOf(occurrence);
   const box = placeInDay(placement.startsAt, placement.endsAt, dayStart, dayEnd);
   if (box === null) return null;
 
+  const held =
+    drag.dragging !== null &&
+    occurrenceKey(drag.dragging.event_id, drag.dragging.occurrence_local) ===
+      occurrenceKey(occurrence.event_id, occurrence.occurrence_local);
+
   const width = 100 / lane.lanes;
   const classes = ["calendar-block"];
   if (occurrence.source === "proposal") classes.push("calendar-block-proposal");
   if (placement.moved) classes.push("calendar-block-moved");
+  if (held) classes.push("calendar-block-held");
 
   return (
     <button
@@ -289,6 +332,16 @@ function Block({
         width: `${width}%`,
       }}
       onClick={() => onSelect({ day, hour: placement.startsAt.getHours() })}
+      draggable
+      onDragStart={(event) => {
+        event.dataTransfer.setData(
+          "text/plain",
+          occurrenceKey(occurrence.event_id, occurrence.occurrence_local),
+        );
+        event.dataTransfer.effectAllowed = "move";
+        drag.onDragStart(occurrence);
+      }}
+      onDragEnd={() => drag.onDragEnd()}
     >
       <span className="calendar-block-clock">{placement.clock}</span>
       <span className="calendar-block-title">{occurrence.title}</span>
