@@ -139,11 +139,34 @@ function pressButton(name: string): boolean {
   return true;
 }
 
+/**
+ * Press several, separated by `|`, each after the last has rendered.
+ *
+ * One press could only ever reach a surface that is one click from the load, and the ones worth
+ * looking at are often two: a job's item graph in the fleet is behind `Show items` and then
+ * `As a graph`, and the second button does not exist in the DOM until the first has been
+ * clicked and React has painted. Pressing them in a single tick finds only the first.
+ *
+ * A name containing no `|` behaves exactly as it did, so every existing shot is unaffected.
+ */
+function pressAll(names: string[]): void {
+  const [next, ...rest] = names;
+  if (next === undefined) return;
+  pressButton(next);
+  if (rest.length > 0) window.setTimeout(() => pressAll(rest), 250);
+}
+
 /* Long enough for the queries to answer and the fonts to land. */
 window.setTimeout(() => {
   if (tab !== null) openTab(tab);
-  if (press !== null) pressButton(press);
-  window.setTimeout(() => {
-    window.__preview.ready = true;
-  }, 400);
+  const presses = press === null ? [] : press.split("|");
+  pressAll(presses);
+  window.setTimeout(
+    () => {
+      window.__preview.ready = true;
+    },
+    // Each extra press costs a tick before the page has settled; declaring ready on the old
+    // fixed delay would shoot the frame between two clicks.
+    400 + Math.max(0, presses.length - 1) * 250,
+  );
 }, 900);
