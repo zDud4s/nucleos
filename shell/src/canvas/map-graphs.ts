@@ -234,3 +234,76 @@ export function buildCommunity(
   const links = linksBetween(imports, inside);
   return { ...draw([...members].sort(), links, 5), links };
 }
+
+/** One community's traffic with another, in the direction it flows. */
+export interface Traffic {
+  title: string;
+  /** Imports crossing, which is the same number the matrix cell holds. */
+  weight: number;
+}
+
+/**
+ * Which communities this one leans on, and which lean on it.
+ *
+ * **Navigation along the structure rather than along a list.** The rail answers
+ * *what else is there*; this answers *what does this one actually touch*, which
+ * is the question somebody standing inside a community has. They are different
+ * questions and a reader with only the first has to guess.
+ *
+ * The two directions stay apart and are never summed. `council` using `job` and
+ * `job` using `council` are opposite facts about a dependency, and one number
+ * over the pair would say a community is "connected to" another while hiding
+ * which way the arrow points — the same flattening the matrix exists to refuse
+ * by putting one above the diagonal and the other below.
+ *
+ * Read off `cells`, which the matrix already computed. A second walk of the
+ * imports could disagree with the picture drawn beside it.
+ */
+export function trafficFor(
+  matrix: CommunityMatrix,
+  title: string,
+): { uses: Traffic[]; usedBy: Traffic[] } {
+  const uses: Traffic[] = [];
+  const usedBy: Traffic[] = [];
+  for (const [at, weight] of matrix.cells) {
+    const [from, to] = at.split("\0");
+    if (from === title) uses.push({ title: to, weight });
+    else if (to === title) usedBy.push({ title: from, weight });
+  }
+  const heaviest = (a: Traffic, b: Traffic) => b.weight - a.weight || a.title.localeCompare(b.title);
+  return { uses: uses.sort(heaviest), usedBy: usedBy.sort(heaviest) };
+}
+
+/**
+ * One file and everything in its community that touches it, drawn.
+ *
+ * **The answer to a refusal that is not another refusal.** A community too dense
+ * to draw is told so honestly today, in the numbers that decided it — and then
+ * the reader has nothing. The page this was measured against offers the way out
+ * instead: *"escolhe um módulo e vês só ele e os vizinhos directos"*. A
+ * neighbourhood is small by construction, so it draws where the whole does not,
+ * and it is still the truth: every link shown is a link that exists.
+ *
+ * Direct neighbours only, in both directions. Two steps out is the density that
+ * refused in the first place, arriving one ring later.
+ */
+export function sliceAround(
+  members: string[],
+  imports: MapImport[],
+  centre: string,
+): Drawing & { links: Link[]; members: string[] } {
+  const links = linksBetween(imports, new Set(members));
+  const near = new Set<string>([centre]);
+  for (const link of links) {
+    if (link.from === centre) near.add(link.to);
+    if (link.to === centre) near.add(link.from);
+  }
+  const shown = [...near].sort();
+  const between = links.filter((link) => near.has(link.from) && near.has(link.to));
+  return { ...draw(shown, between, 5), links: between, members: shown };
+}
+
+/** How many files in the community touch this one, either way. */
+export function neighbourCount(members: string[], imports: MapImport[], centre: string): number {
+  return sliceAround(members, imports, centre).members.length - 1;
+}
