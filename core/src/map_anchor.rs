@@ -76,14 +76,16 @@
 //! ## A file's neighbours are evidence, and they are still not a decider
 //!
 //! **Every one of the four distinct wrong slugs the gate has produced is a vocabulary collision.**
-//! `map_store.rs`, `Carimbos.tsx` and `Triagem.tsx` all landed under
+//! `map_store.rs`, `StampsPanel.tsx` and `TriagePanel.tsx` all landed under
 //! `2026-07-28-retrospective-attribution-design`, because *carimbos, triador, silenciado* is that
 //! document's vocabulary as much as it is the map's. Reading harder does not fix that: the words
-//! genuinely belong to both.
+//! genuinely belong to both. The two shell files were named `Carimbos.tsx` and `Triagem.tsx` when
+//! this was measured, which is half of why they collided; the English names they carry now remove
+//! the filename from the collision and leave the vocabulary inside them, which is the harder half.
 //!
 //! What does not belong to both is the import graph. **Three of the four wrong answers are
-//! neighbours of a file the model placed correctly in every run** — `Triagem.tsx`, `Carimbos.tsx`
-//! and `shell/src/canvas/map-model.ts` are all one edge from `ModeMapa.tsx` — and the fourth,
+//! neighbours of a file the model placed correctly in every run** — `TriagePanel.tsx`, `StampsPanel.tsx`
+//! and `shell/src/canvas/map-model.ts` are all one edge from `ModeMap.tsx` — and the fourth,
 //! `map_store.rs`, sits among the six other `map_*` modules. A right answer was one edge away each
 //! time. [`Neighbour`], [`to_reask`] and [`reask`] are that edge, put into the prompt.
 //!
@@ -340,7 +342,7 @@ pub const MAX_NEIGHBOURS: usize = 12;
 ///
 /// **Far less than [`MAX_WHY_BYTES`], because it is a sentence about a different file.** What it
 /// buys is the one thing a bare slug cannot say: whether the neighbour is a sibling or a router.
-/// *"the module comment names the map mode"* earns its bytes beside `ModeMapa.tsx`; the remaining
+/// *"the module comment names the map mode"* earns its bytes beside `ModeMap.tsx`; the remaining
 /// four hundred of a full reason do not, twelve times over.
 ///
 /// It is carried at all rather than dropped, and the trade is worth stating out loud: a
@@ -412,7 +414,7 @@ impl Question {
 /// file lives in `shell/src/canvas/`*, and that folder genuinely holds `map-model.ts` and
 /// `workflow-model.ts`, which belong to **two different documents**. A signal that folded in folder
 /// proximity would have confirmed that answer rather than corrected it. What separates the two
-/// files is that one is imported by `ModeMapa.tsx` and the other by `WorkflowCanvas.tsx`; nothing
+/// files is that one is imported by `ModeMap.tsx` and the other by `WorkflowCanvas.tsx`; nothing
 /// about where they sit on disk separates them at all.
 ///
 /// Edges are read undirected. *A imports B* and *B imports A* are the same fact about whether the
@@ -434,7 +436,7 @@ pub struct Neighbour {
     /// How many files it shares an edge with across the whole graph.
     ///
     /// **Shown to the model, because it is the one number that separates a sibling from a
-    /// router.** `Juncao.tsx` has two edges and one of them is `ModeMapa.tsx`; `http.rs` has 75 and
+    /// router.** `JunctionPanel.tsx` has two edges and one of them is `ModeMap.tsx`; `http.rs` has 75 and
     /// belongs with none of them.
     pub degree: usize,
 }
@@ -794,7 +796,7 @@ pub const NEIGHBOUR_PROMPT_VERSION: u32 = 1;
 /// says is chosen against a specific failure. **It must not read as a vote.** Three of the four
 /// wrong slugs sat one edge from a file the model placed correctly every time, so the pull to write
 /// *most of your neighbours said X* is strong and it is wrong — an edge is real evidence about some
-/// pairs (`ModeMapa.tsx` mounts `Triagem.tsx`) and no evidence at all about others (`git_exec.rs`
+/// pairs (`ModeMap.tsx` mounts `TriagePanel.tsx`) and no evidence at all about others (`git_exec.rs`
 /// runs git for the map slice and belongs to the document about git). So the block states the
 /// edges, states each neighbour's degree, and names both readings — corroboration when the
 /// neighbours agree with each other, and **`none`** when they do not. It never names a rule for
@@ -949,7 +951,7 @@ const ANCHOR_OUTPUT_CONTRACT: &str = "Answer with exactly one JSON object and no
 /// unchanged repository disagree about which files were safe to annotate"* — read as though it
 /// covered both arms, and it turned out to be an exact prediction of what happens on the arm it did
 /// not cover: three runs of the ground-truth gate against one unchanged checkout scored **22, 26
-/// and 21 out of 30**, agreed on only sixteen files, and twice put `Triagem.tsx` under a document
+/// and 21 out of 30**, agreed on only sixteen files, and twice put `TriagePanel.tsx` under a document
 /// that is not its own. **The product's default brain is the cloud one** (`claude-sonnet-5`), so
 /// that is the arm the property was most needed on and least true of.
 ///
@@ -2320,13 +2322,13 @@ mod tests {
     #[test]
     fn a_neighbourhood_is_evidence_in_the_prompt_and_never_a_vote_to_be_counted() {
         let file = asked(
-            "shell/src/project/Triagem.tsx",
-            "// Triagem. §8 says which document a citation names.\n",
+            "shell/src/project/TriagePanel.tsx",
+            "// TriagePanel. §8 says which document a citation names.\n",
         );
         let around = Neighbourhood {
             heard: vec![
                 Neighbour {
-                    path: "shell/src/project/ModeMapa.tsx".to_owned(),
+                    path: "shell/src/project/ModeMap.tsx".to_owned(),
                     proposed: Some(MAP.to_owned()),
                     why: "the module comment names the map mode".to_owned(),
                     degree: 8,
@@ -2346,7 +2348,7 @@ mod tests {
         // What it shows: the path, the answer, the sentence behind the answer, and the degree —
         // which is the one number separating the mode screen that mounts this file from a router
         // that imports half the project.
-        assert!(prompt.contains("shell/src/project/ModeMapa.tsx (8 edges)"));
+        assert!(prompt.contains("shell/src/project/ModeMap.tsx (8 edges)"));
         assert!(prompt.contains("the module comment names the map mode"));
         assert!(prompt.contains("shell/src/data/project-map.ts (10 edges) — none"));
         assert!(
@@ -2378,34 +2380,34 @@ mod tests {
 
     #[test]
     fn an_import_edge_is_read_in_both_directions() {
-        // `Structure::imports` records `ModeMapa.tsx -> Triagem.tsx` and nothing the other way,
+        // `Structure::imports` records `ModeMap.tsx -> TriagePanel.tsx` and nothing the other way,
         // because that is the direction the `import` statement is written in. Read one-way, a file
         // sees the modules it uses and never the mode screen that mounts it — and that is precisely
         // the edge carrying the answer for three of the four files this signal was built for. The
         // question being asked is whether the two are near each other in the thing being built,
         // and that question has no direction.
         let first = swept(vec![
-            placed("shell/src/project/Triagem.tsx", WORKSPACE),
-            placed("shell/src/project/ModeMapa.tsx", MAP),
+            placed("shell/src/project/TriagePanel.tsx", WORKSPACE),
+            placed("shell/src/project/ModeMap.tsx", MAP),
         ]);
         let edges = [edge(
-            "shell/src/project/ModeMapa.tsx",
-            "shell/src/project/Triagem.tsx",
+            "shell/src/project/ModeMap.tsx",
+            "shell/src/project/TriagePanel.tsx",
         )];
 
         let again = to_reask(&first, &edges);
 
-        let triagem = asked_again(&again, "shell/src/project/Triagem.tsx")
+        let triage_panel = asked_again(&again, "shell/src/project/TriagePanel.tsx")
             .expect("the file the edge points AT has heard from the file it points FROM");
-        assert_eq!(triagem.reason, ReaskReason::Alone);
-        assert_eq!(triagem.around.heard.len(), 1);
+        assert_eq!(triage_panel.reason, ReaskReason::Alone);
+        assert_eq!(triage_panel.around.heard.len(), 1);
         assert_eq!(
-            triagem.around.heard[0].path,
-            "shell/src/project/ModeMapa.tsx"
+            triage_panel.around.heard[0].path,
+            "shell/src/project/ModeMap.tsx"
         );
         // And symmetrically: both ends of a disagreement are asked again, because deciding which
         // end is the suspect one would be deciding the answer.
-        assert!(asked_again(&again, "shell/src/project/ModeMapa.tsx").is_some());
+        assert!(asked_again(&again, "shell/src/project/ModeMap.tsx").is_some());
     }
 
     #[test]
@@ -2535,10 +2537,10 @@ mod tests {
         // would be the finding that this signal is not a signal here.
         let first = swept(vec![
             declined("shell/src/canvas/map-model.ts"),
-            placed("shell/src/project/ModeMapa.tsx", MAP),
+            placed("shell/src/project/ModeMap.tsx", MAP),
         ]);
         let edges = [edge(
-            "shell/src/project/ModeMapa.tsx",
+            "shell/src/project/ModeMap.tsx",
             "shell/src/canvas/map-model.ts",
         )];
 
@@ -2547,7 +2549,7 @@ mod tests {
 
         assert_eq!(model.reason, ReaskReason::Silent);
         assert!(
-            asked_again(&again, "shell/src/project/ModeMapa.tsx").is_none(),
+            asked_again(&again, "shell/src/project/ModeMap.tsx").is_none(),
             "an abstaining neighbour is not a disagreement, so the file that answered is left \
              exactly where it was"
         );
@@ -2601,13 +2603,13 @@ mod tests {
         // would break the one invariant that says a report is not quietly short — that the three
         // lists still partition the files the first pass was handed.
         let first = swept(vec![
-            placed("shell/src/project/Triagem.tsx", WORKSPACE),
-            placed("shell/src/project/Carimbos.tsx", WORKSPACE),
+            placed("shell/src/project/TriagePanel.tsx", WORKSPACE),
+            placed("shell/src/project/StampsPanel.tsx", WORKSPACE),
         ]);
         let second = Sweep {
-            verdicts: vec![placed("shell/src/project/Triagem.tsx", MAP)],
+            verdicts: vec![placed("shell/src/project/TriagePanel.tsx", MAP)],
             failed: vec![(
-                "shell/src/project/Carimbos.tsx".to_owned(),
+                "shell/src/project/StampsPanel.tsx".to_owned(),
                 "the CLI exited 1".to_owned(),
             )],
             ..Sweep::default()
@@ -2619,12 +2621,12 @@ mod tests {
         assert_eq!(
             settled.verdicts[1].proposed.as_deref(),
             Some(MAP),
-            "the second reading of Triagem.tsx stands"
+            "the second reading of TriagePanel.tsx stands"
         );
         assert_eq!(
             settled.verdicts[0].proposed.as_deref(),
             Some(WORKSPACE),
-            "Carimbos.tsx's second call never landed, so its first answer is untouched"
+            "StampsPanel.tsx's second call never landed, so its first answer is untouched"
         );
         assert!(
             settled.failed.is_empty(),
@@ -3227,19 +3229,19 @@ mod tests {
         ("core/src/map_store.rs", "2026-08-24-mapa-do-projeto-design"),
         ("core/src/map_stamp.rs", "2026-08-24-mapa-do-projeto-design"),
         (
-            "shell/src/project/Triagem.tsx",
+            "shell/src/project/TriagePanel.tsx",
             "2026-08-24-mapa-do-projeto-design",
         ),
         (
-            "shell/src/project/Juncao.tsx",
+            "shell/src/project/JunctionPanel.tsx",
             "2026-08-24-mapa-do-projeto-design",
         ),
         (
-            "shell/src/project/Carimbos.tsx",
+            "shell/src/project/StampsPanel.tsx",
             "2026-08-24-mapa-do-projeto-design",
         ),
         (
-            "shell/src/project/ModeMapa.tsx",
+            "shell/src/project/ModeMap.tsx",
             "2026-08-24-mapa-do-projeto-design",
         ),
         (
@@ -3888,7 +3890,7 @@ mod tests {
     ///   the gate's 14 second questions. It is this design's third constraint — *a file whose
     ///   neighbours disagree should find abstention EASIER, not harder* — working, and it is only
     ///   visible at this scale.
-    /// - **`Triagem.tsx` was the wrong slug, and the neighbourhood corrected it.** The first pass
+    /// - **`TriagePanel.tsx` was the wrong slug, and the neighbourhood corrected it.** The first pass
     ///   put it under `2026-07-28-retrospective-attribution-design`, which is the precise vocabulary
     ///   collision this signal exists for, and the second pass moved it while naming all three of
     ///   its import neighbours. Across the gate's three runs the first pass never once got that file
