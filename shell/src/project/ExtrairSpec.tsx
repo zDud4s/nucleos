@@ -118,10 +118,24 @@ export function ExtrairSpec({ projectId }: ExtrairSpecProps) {
             aria-pressed={slug === chosen}
             disabled={extract.isPending}
             onClick={() => setChosen(slug)}
+            /*
+              `shrink-0`, and without it this list is blank.
+
+              The box is a flex column with `max-h-64` and `overflow-y-auto`, and
+              a flex item shrinks before its parent scrolls. Fourteen rows in
+              240px of room came out 13px tall each — under one line of 15px
+              text — and `truncate` brought `overflow: hidden` with it, so every
+              row clipped its own name away and the picker rendered as fourteen
+              empty slabs that could not be scrolled either. Measured in the
+              browser: it is why nothing here could be chosen.
+
+              Not a `max-h` to fight over: the height is the design, the rows
+              are what must keep theirs and let the box scroll.
+            */
             className={
               slug === chosen
-                ? "truncate rounded-sm border border-accent bg-surface-raised px-2 py-1 text-left font-mono text-xs text-text"
-                : "truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text-muted enabled:hover:text-text disabled:opacity-40"
+                ? "shrink-0 truncate rounded-sm border border-accent bg-surface-raised px-2 py-1 text-left font-mono text-xs text-text"
+                : "shrink-0 truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text-muted enabled:hover:text-text disabled:opacity-40"
             }
           >
             {slug}
