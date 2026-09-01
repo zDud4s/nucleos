@@ -1,5 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { useConcurrency } from "../data/fleet";
+import { Quiet } from "../ui";
 
 /**
  * How full this project is, as slots rather than as a number.
@@ -59,6 +60,23 @@ export function Occupancy({ projectId }: OccupancyProps) {
    * says what is running instead of pretending to know how much fits.
    */
   if (limit === null) {
+    /*
+      No ceiling and nothing running is the ordinary state of a project nobody has scheduled
+      anything in, and it used to cost a sentence plus an empty row. Why it is not a ceiling of
+      zero is worth reading once and is not worth a line of every visit, so it moves behind the
+      question rather than being deleted.
+    */
+    if (slots.length === 0) {
+      return (
+        <Quiet says="no ceiling · nothing in flight">
+          A ceiling is this app&rsquo;s main brake, and nothing here bounds how many worktrees may
+          be open at once. That is not the same as a ceiling of zero: the daemon starts work while{" "}
+          <span className="font-mono">open &lt; limit</span>, so a zero would mean never start
+          anything again.
+        </Quiet>
+      );
+    }
+
     return (
       <div className="flex flex-col gap-2">
         <p className="text-sm text-text-muted">

@@ -17,6 +17,7 @@ import {
   type Installed,
 } from "../data/workflows";
 import { openInVscode } from "../lib/vscode";
+import { Quiet } from "../ui";
 import { WorkflowChain, WorkflowGraph } from "./WorkflowGraph";
 
 /**
@@ -558,25 +559,25 @@ export function WorkflowSummary({ projectId }: { projectId: string }) {
 
   if (installed.isError || installed.data === undefined) {
     return (
-      <div className="rounded-lg border border-dashed border-border bg-surface-sunken p-4">
-        <p className="text-sm text-text-muted">
-          {installed.isError
-            ? "The núcleo did not say which workflows this project uses."
-            : "Reading this project's workflows…"}
-        </p>
-      </div>
+      <p className="text-sm text-text-faint">
+        {installed.isError
+          ? "The núcleo did not say which workflows this project uses."
+          : "Reading this project's workflows…"}
+      </p>
     );
   }
 
   if (installed.data.length === 0) {
+    /*
+      A dashed box around two sentences was the loudest thing on this page about the one section
+      with nothing in it. The sentence that makes the emptiness a state rather than a gap is kept
+      and moved behind the question; what is left is the fact.
+    */
     return (
-      <div className="rounded-lg border border-dashed border-border bg-surface-sunken p-4">
-        <p className="text-sm text-text-muted">No workflow is installed here.</p>
-        <p className="mt-1 text-xs text-text-faint">
-          Which is a real answer and not a gap — this project develops however whoever is at the
-          keyboard decides.
-        </p>
-      </div>
+      <Quiet says="none installed">
+        Which is a real answer and not a gap — this project develops however whoever is at the
+        keyboard decides.
+      </Quiet>
     );
   }
 

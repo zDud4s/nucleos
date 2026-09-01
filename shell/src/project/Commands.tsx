@@ -10,6 +10,7 @@ import {
   useRunProjectCommand,
   type ProjectCommand,
 } from "../data/project-commands";
+import { Quiet } from "../ui";
 import {
   CommandDialog,
   CommandEmpty,
@@ -73,15 +74,52 @@ export function Commands({ projectId }: CommandsProps) {
   const gates = rows.filter((row) => row.is_gate);
   const refused = run.isError && isApiRefusal(run.error) ? run.error : null;
 
+  const declare = (
+    <button
+      type="button"
+      onClick={() => setManaging(!managing)}
+      className="text-xs text-text-faint underline-offset-2 hover:underline"
+    >
+      {managing ? "done" : "declare a command"}
+    </button>
+  );
+
+  /*
+    The palette is offered from both shapes below and written once. Closed, it puts nothing in the
+    document at all, which is what lets the quiet line be the section's only child.
+  */
+  const palette = (
+    <CommandPalette
+      rows={rows}
+      projectId={projectId}
+      open={paletteOpen}
+      onOpenChange={setPaletteOpen}
+      onRun={(id) => run.mutate({ projectId, id })}
+    />
+  );
+
+  /*
+    Nothing declared, and nobody halfway through declaring one. The sentence about declaration
+    rather than detection is kept and not cut — "nothing declared yet" on its own reads as a list
+    that failed to load, and this one never fills itself — but it is worth a click rather than a
+    paragraph of every visit. The one gesture that would fill the section stays in front of you.
+  */
+  if (rows.length === 0 && !managing) {
+    return (
+      <>
+        <Quiet says="none declared" action={declare}>
+          A command is a name, something to run, and whether its result is a verdict on the
+          project — declaration rather than detection, so a list nobody agreed to cannot appear on
+          its own.
+        </Quiet>
+        {palette}
+      </>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-2">
-      {rows.length === 0 ? (
-        <p className="text-sm text-text-faint">
-          Nothing declared yet. A command is a name, something to run, and whether its result is a
-          verdict on the project — declaration rather than detection, so a list nobody agreed to
-          cannot appear on its own.
-        </p>
-      ) : (
+      {rows.length === 0 ? null : (
         <>
           <div className="flex flex-wrap items-center gap-2">
             {gates.length === 0 ? (
@@ -119,24 +157,10 @@ export function Commands({ projectId }: CommandsProps) {
         </>
       )}
 
-      <div>
-        <button
-          type="button"
-          onClick={() => setManaging(!managing)}
-          className="text-xs text-text-faint underline-offset-2 hover:underline"
-        >
-          {managing ? "done" : "declare a command"}
-        </button>
-      </div>
+      <div>{declare}</div>
       {managing ? <Manage projectId={projectId} rows={rows} /> : null}
 
-      <CommandPalette
-        rows={rows}
-        projectId={projectId}
-        open={paletteOpen}
-        onOpenChange={setPaletteOpen}
-        onRun={(id) => run.mutate({ projectId, id })}
-      />
+      {palette}
     </div>
   );
 }

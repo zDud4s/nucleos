@@ -9,6 +9,7 @@ import {
 } from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
+import { Section } from "../ui";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
 import { Occupancy } from "./Occupancy";
@@ -114,24 +115,6 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
         <OwnedFiles projectId={projectId} />
       </Section>
     </div>
-  );
-}
-
-/**
- * A panel of the page.
- *
- * The `aria-label` is not decoration: it is the handle the composition test grabs the page by, and
- * it is the same handle a screen reader uses. Protecting the structure somebody hears and the
- * structure somebody sees with one assertion is worth more than protecting either alone.
- */
-function Section({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <section aria-label={label} className="flex flex-col gap-3">
-      <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
-        {label}
-      </h2>
-      {children}
-    </section>
   );
 }
 
