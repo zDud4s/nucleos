@@ -531,13 +531,20 @@ export interface VoiceConfig {
   max_body_bytes: number;
 }
 
-/** `GET /calendar/config` — also NOT under `/config/`. */
-export interface CalendarConfig {
-  default_tz: string;
-  working_hours_start: string;
-  working_hours_end: string;
-  working_weekdays: string[];
-}
+/**
+ * `GET /calendar/config` — also NOT under `/config/`, and owned by the pillar.
+ *
+ * Re-exported rather than declared, because it was declared twice: this module
+ * had its own `CalendarConfig` and `useCalendarConfig` against the same route,
+ * keyed `["system","config","calendar"]`, while `data/calendar.ts` had
+ * `CalendarConfigView` keyed `["calendar","config"]`. Two identical types and
+ * two cache entries for one route — the System page and the Calendar page each
+ * fetching it and neither able to see the other's answer. The pillar's module
+ * is the owner; the alias keeps this module's name for the System page, which
+ * reads it as one config among six.
+ */
+export type { CalendarConfigView as CalendarConfig } from "./calendar";
+export { useCalendarConfig } from "./calendar";
 
 /** The e-mail pillar's own configuration. No poll: config does not change while the window is open. */
 export function useEmailConfig() {
@@ -555,13 +562,6 @@ export function useVoiceConfig() {
   });
 }
 
-/** The calendar pillar's own configuration — `GET /calendar/config`, asymmetric with the other two. */
-export function useCalendarConfig() {
-  return useQuery({
-    queryKey: keys.system.config("calendar"),
-    queryFn: () => apiFetch<CalendarConfig>("/calendar/config"),
-  });
-}
 
 /* -------------------------------------------------------------------- pii -- */
 

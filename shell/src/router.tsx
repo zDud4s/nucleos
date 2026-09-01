@@ -11,7 +11,7 @@ import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Agents } from "./pages/Agents";
 import { Autopilot } from "./pages/Autopilot";
 import { Browser } from "./pages/Browser";
-import { Calendar } from "./pages/Calendar";
+import { Calendar, validateCalendarSearch } from "./pages/Calendar";
 import { Chats } from "./pages/Chats";
 import { Contacts } from "./pages/Contacts";
 import { Council } from "./pages/Council";
@@ -96,6 +96,7 @@ export const PAGES: Record<string, () => ReactNode> = {
 const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => object> = {
   "/runs": validateRunSearch,
   "/feed": validateFeedSearch,
+  "/calendar": validateCalendarSearch,
 };
 
 /**

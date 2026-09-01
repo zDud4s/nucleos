@@ -54,6 +54,33 @@ export function hourMarks(start: Date, end: Date): { hour: number; fraction: num
   return marks;
 }
 
+/** One clickable hour of a day column: which hour it is, and where it sits. */
+export interface HourSlot {
+  /** The hour a person living that day would call it, 0–23. */
+  hour: number;
+  top: number;
+  height: number;
+}
+
+/**
+ * The hour-tall bands of one day, as fractions of that day's own span.
+ *
+ * The cells between {@link hourMarks}'s lines, and the thing a person actually
+ * clicks to start drafting at nine in the morning. Same DST honesty as the
+ * marks, and the same consequence: a spring-forward day has 23 bands and no
+ * 02:00, and an autumn day has 25 with **two** bands labelled 02 — which is
+ * not a duplicate to be filtered out, it is the hour genuinely happening
+ * twice. Both create an event at 02:00; which of the two the daemon resolves
+ * to is `resolve`'s business in `recurrence.rs`, not this grid's.
+ */
+export function hourSlots(start: Date, end: Date): HourSlot[] {
+  const hours = hoursInSpan(start, end);
+  return Array.from({ length: Math.max(hours, 0) }, (_, index) => {
+    const at = new Date(start.getTime() + index * HOUR_MS);
+    return { hour: at.getHours(), top: index / hours, height: 1 / hours };
+  });
+}
+
 /**
  * Where a block sits inside a day, or `null` when it does not touch that day at all.
  *
@@ -168,6 +195,79 @@ export function weekOf(anchor: Date): Date[] {
     { length: 7 },
     (_, index) =>
       new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() - offset + index),
+  );
+}
+
+/**
+ * The seven column headings, Monday first, in the reader's own language.
+ *
+ * Built from real dates in a week whose Monday is known — 1 January 2024 —
+ * rather than from a hard-coded list, so the labels come out of `Intl` in
+ * whatever locale the window is running under and match the days the grid
+ * actually draws. A literal `["Mon", …]` would be seven English strings in an
+ * app that formats every other date through `toLocaleDateString`.
+ *
+ * `short` and `long` together because they are two different jobs: the short
+ * form is what fits the column, and the long form is what a screen reader
+ * should say instead of "Wed".
+ */
+export function weekdayLabels(locale?: string): { short: string; long: string }[] {
+  const MONDAY = new Date(2024, 0, 1);
+  return Array.from({ length: 7 }, (_, index) => {
+    const day = new Date(MONDAY.getFullYear(), MONDAY.getMonth(), MONDAY.getDate() + index);
+    return {
+      short: day.toLocaleDateString(locale, { weekday: "short" }),
+      long: day.toLocaleDateString(locale, { weekday: "long" }),
+    };
+  });
+}
+
+/**
+ * The local wall clock of an occurrence, as `"HH:MM"`.
+ *
+ * Sliced out of `occurrence_local` rather than read off a `Date`, for the same
+ * reason {@link inputFromStamp} truncates: the stamp is already local text
+ * with no offset in it, and putting it through a `Date` would apply this
+ * machine's zone to a string that never had one. A month chip that said 08:00
+ * for an event the daemon calls 09:00 is exactly the drift the whole
+ * `occurrence_local` design exists to prevent.
+ */
+export function clockOfStamp(stamp: string): string {
+  return stamp.slice(11, 16);
+}
+
+/** The same reading off an instant, for the one case the stamp cannot answer — see `placementOf`. */
+export function clockOfInstant(at: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
+}
+
+/**
+ * A local stamp as the instant this machine would call it, or `null` if it is
+ * not one.
+ *
+ * The deliberate inverse of everything else here, and the only place a local
+ * stamp is allowed near a `Date`: it exists to be COMPARED against
+ * `starts_at`, never to be displayed. `placementOf` uses the comparison to
+ * tell an occurrence sitting where it was written from one that has been
+ * moved, which the wire format does not say outright.
+ *
+ * On the one hour a year that does not exist, `Date` normalises 01:30 forward
+ * to 02:30 and the comparison reports a move that never happened. That is
+ * survivable by construction: the fallback for "moved" is to place the
+ * occurrence by its instant, which is right either way.
+ */
+export function localDateOfStamp(stamp: string): Date | null {
+  const parsed = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(stamp);
+  if (parsed === null) return null;
+  const [, year, month, day, hour, minute, second] = parsed;
+  return new Date(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second ?? "0"),
   );
 }
 

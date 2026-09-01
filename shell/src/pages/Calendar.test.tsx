@@ -1,5 +1,5 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -9,9 +9,39 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { CalendarGrid, DraftEventForm, OccurrenceActions } from "./Calendar";
-import type { EventOccurrence } from "../data/calendar";
-import { renderWithQuery } from "../test/harness";
+import { ApiRefusal } from "../data/client";
+import {
+  BusyIndicator,
+  Calendar,
+  HeldNotifications,
+  headline,
+  useMinuteClock,
+  visibleWindow,
+  type CalendarSearch,
+} from "./Calendar";
+import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
+import type { PendingNotification } from "../data/feed";
+import { renderWithQuery, renderWithRouter } from "../test/harness";
+
+/**
+ * The page inside a real router, because two of the things it does are part of
+ * the location: `?view=` and `?on=`. `renderWithRouter` mounts the component in
+ * a tree built from the app's own `NAV_PATHS`, so a navigation this page makes
+ * resolves against a route that really exists — the same reason `Feed.test.tsx`
+ * uses it rather than `renderApp`, which would drag the gate, the rail and
+ * their live queries around every assertion.
+ */
+function page(path = "/calendar") {
+  return renderWithRouter(<Calendar />, { initialPath: path });
+}
+
+beforeAll(() => {
+  vi.stubEnv("TZ", "Europe/Lisbon");
+});
+
+afterAll(() => {
+  vi.unstubAllEnvs();
+});
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -19,106 +49,323 @@ beforeEach(() => {
   daemon.probeHealth.mockReset();
 });
 
-/** The dwell `ConfirmButton` needs between arming and confirming — a real gap. */
-function afterDwell(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 350));
+const CONFIG: CalendarConfigView = {
+  default_tz: "Europe/Lisbon",
+  working_hours_start: "09:00",
+  working_hours_end: "18:00",
+  working_weekdays: ["mon", "tue", "wed", "thu", "fri"],
+};
+
+function occurrence(overrides: Partial<EventOccurrence> = {}): EventOccurrence {
+  return {
+    event_id: 1,
+    title: "Standup",
+    source: "human",
+    occurrence_local: "2026-08-20T09:00:00",
+    starts_at: "2026-08-20T08:00:00Z",
+    ends_at: "2026-08-20T08:30:00Z",
+    ...overrides,
+  };
 }
 
-/* --------------------------------------------------------------- the grid -- */
+/* ------------------------------------------------------------- the clock -- */
 
-describe("Calendar — the month grid", () => {
-  // `dayHours` reads a real local day span, which only differs from 24 on the
-  // two real transition days of a real zone's year — so this suite pins the
-  // process to one, through vitest's own env stub rather than `process.env`
-  // (this project's `lib` carries no Node types), and only for its own
-  // duration.
-  beforeAll(() => {
-    // Lisbon, 29 March 2026: clocks jump 01:00 WET to 02:00 WEST, so the
-    // local calendar day is 23 hours, not 24.
-    vi.stubEnv("TZ", "Europe/Lisbon");
+describe("useMinuteClock", () => {
+  /**
+   * The page had no clock of its own: `now` was a bare `new Date()` evaluated
+   * during render, so the "now" reading advanced only when something else
+   * re-rendered the page — in practice the busy poll, which ran at 3 s and was
+   * therefore acting as an undeclared clock. Design §6.14 asks for 60 s.
+   */
+  it("advances on its own, without anything else re-rendering the page", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 20, 9, 0, 0));
+
+    const { result } = renderHook(() => useMinuteClock());
+    expect(result.current.getMinutes()).toBe(0);
+
+    // Advancing the fake timers advances the mocked clock with them, so the
+    // tick and the time it reads move together — setting the system time as
+    // well would move it twice.
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    expect(result.current.getMinutes()).toBe(1);
+    vi.useRealTimers();
   });
 
-  afterAll(() => {
-    vi.unstubAllEnvs();
-  });
+  it("stops when the page goes away", () => {
+    vi.useFakeTimers();
+    const cleared = vi.spyOn(globalThis, "clearInterval");
 
-  it("draws expanded occurrences in the month grid with a short-day badge on a DST day", () => {
-    const occurrence: EventOccurrence = {
-      event_id: 1,
-      title: "Spring sync",
-      source: "human",
-      // The daemon's own local wall clock — this is what places the box, not
-      // `starts_at`.
-      occurrence_local: "2026-03-29T10:00:00",
-      starts_at: "2026-03-29T09:00:00Z",
-      ends_at: "2026-03-29T09:30:00Z",
-    };
+    const { unmount } = renderHook(() => useMinuteClock());
+    unmount();
 
-    render(<CalendarGrid anchor={new Date(2026, 2, 1)} occurrences={[occurrence]} now={new Date(2026, 2, 15)} />);
-
-    // The occurrence really expanded into its own day cell.
-    expect(screen.getByText("Spring sync")).toBeDefined();
-
-    // And only the short day itself carries the badge.
-    const cells = screen.getAllByRole("gridcell");
-    const shortCell = cells.find((cell) => within(cell).queryByText(/short day/) !== null);
-    expect(shortCell).toBeDefined();
-    expect(within(shortCell as HTMLElement).getByText("29")).toBeDefined();
-    expect(within(shortCell as HTMLElement).getByText("Spring sync")).toBeDefined();
-
-    // No other cell in this month claims the badge — Lisbon has one spring
-    // transition, not several.
-    const otherBadged = cells.filter((cell) => cell !== shortCell && within(cell).queryByText(/short day|long day/) !== null);
-    expect(otherBadged).toEqual([]);
+    expect(cleared).toHaveBeenCalled();
+    cleared.mockRestore();
+    vi.useRealTimers();
   });
 });
 
-/* --------------------------------------------------------- writing to it -- */
+/* ------------------------------------------------------------ the window -- */
 
-describe("Calendar — writing to the daemon", () => {
-  it("sends no freq for a one-off draft and addresses a skip by occurrence_local", async () => {
-    const seen: Record<string, unknown> = {};
-    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (init?.method !== undefined && init.method !== "GET" && typeof init.body === "string") {
-        seen[`${init.method} ${path}`] = JSON.parse(init.body);
-      }
-      if (path === "/calendar/events" && init?.method === "POST") return { id: 9 };
+describe("visibleWindow", () => {
+  /** The month asks for the six weeks it DRAWS, not the calendar month. */
+  it("covers the whole six-week month grid", () => {
+    const { from, to } = visibleWindow(new Date(2026, 7, 1), "month");
+    // August 2026 starts on a Saturday, so the grid opens on Monday 27 July.
+    expect(new Date(from).getDate()).toBe(27);
+    expect(new Date(from).getMonth()).toBe(6);
+    // Six weeks later, ending at the midnight after Sunday 6 September.
+    expect(new Date(to).getMonth()).toBe(8);
+  });
+
+  it("covers exactly the seven days of a week", () => {
+    const { from, to } = visibleWindow(new Date(2026, 7, 20), "week");
+    expect(new Date(from).getDate()).toBe(17);
+    expect(new Date(to).getDate()).toBe(24);
+    // Seven days, in whatever the local offsets of the two ends are.
+    expect(new Date(to).getTime() - new Date(from).getTime()).toBe(7 * 86_400_000);
+  });
+});
+
+/* ---------------------------------------------------------- the headline -- */
+
+describe("headline", () => {
+  /**
+   * It said "this month" and counted the six-week window — up to twelve days
+   * of neighbouring months folded into the number, on every page load.
+   */
+  it("counts only the month it names", () => {
+    const rows = [
+      occurrence({ event_id: 1 }),
+      // 30 July, which the August grid draws but August does not contain.
+      occurrence({
+        event_id: 2,
+        occurrence_local: "2026-07-30T09:00:00",
+        starts_at: "2026-07-30T08:00:00Z",
+        ends_at: "2026-07-30T08:30:00Z",
+      }),
+    ];
+
+    expect(headline(rows, new Date(2026, 7, 1), "month", CONFIG)).toContain("1 occurrence this month");
+  });
+
+  it("counts the whole window when the window IS the week", () => {
+    expect(headline([occurrence(), occurrence({ event_id: 2 })], new Date(2026, 7, 20), "week", CONFIG))
+      .toContain("2 occurrences this week");
+  });
+
+  it("says nothing at all until the config has answered", () => {
+    expect(headline([occurrence()], new Date(2026, 7, 1), "month", undefined)).toBeUndefined();
+  });
+});
+
+/* ------------------------------------------------------------------ busy -- */
+
+describe("BusyIndicator", () => {
+  it("says which of the two states this machine is in", () => {
+    const { rerender } = render(<BusyIndicator busy={true} />);
+    expect(screen.getByText("busy right now")).toBeDefined();
+
+    rerender(<BusyIndicator busy={false} />);
+    expect(screen.getByText("free right now")).toBeDefined();
+  });
+
+  /** `GET /calendar/busy` never refuses, so the only other state is "not answered yet". */
+  it("draws nothing before the first answer", () => {
+    const { container } = render(<BusyIndicator busy={undefined} />);
+    expect(container.firstChild).toBeNull();
+  });
+});
+
+/* --------------------------------------------------- held notifications -- */
+
+function notification(overrides: Partial<PendingNotification> = {}): PendingNotification {
+  return {
+    id: 1,
+    kind: "email_arrived",
+    summary: "the accountant replied",
+    queued_at: "2026-08-20T08:00:00Z",
+    delivered_at: null,
+    ...overrides,
+  };
+}
+
+describe("HeldNotifications", () => {
+  /**
+   * Two lists and never one merged: the fear this feature earns is "did the
+   * calendar swallow something", and a queue showing only what is still held
+   * cannot answer it.
+   */
+  it("keeps what is held apart from what was let through", async () => {
+    daemon.apiFetch.mockResolvedValue([
+      notification({ id: 1, summary: "still waiting" }),
+      notification({ id: 2, summary: "went out later", delivered_at: "2026-08-20T09:00:00Z" }),
+    ]);
+
+    renderWithQuery(<HeldNotifications />);
+
+    const held = await screen.findByLabelText("Held notifications");
+    const released = await screen.findByLabelText("Released notifications");
+    expect(within(held).getByText("still waiting")).toBeDefined();
+    expect(within(released).getByText("went out later")).toBeDefined();
+    expect(within(held).queryByText("went out later")).toBeNull();
+  });
+
+  it("says plainly when nothing has been held", async () => {
+    daemon.apiFetch.mockResolvedValue([]);
+    renderWithQuery(<HeldNotifications />);
+    expect(await screen.findByText("nothing has been held.")).toBeDefined();
+  });
+
+  it("does not pretend an unanswered route means nothing was held", async () => {
+    daemon.apiFetch.mockRejectedValue(new Error("connection refused"));
+    renderWithQuery(<HeldNotifications />);
+    expect(await screen.findByText(/nothing is known about held notifications/)).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------------- the page -- */
+
+describe("the page", () => {
+  beforeEach(() => {
+    // Pinned, or the assertions below pass in August and fail in October — and
+    // `shouldAdvanceTime` so react-query's own waits still resolve.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date(2026, 7, 20, 12, 0, 0));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function answering(rows: EventOccurrence[]) {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith("/calendar/events")) return rows;
+      if (path === "/calendar/busy") return { busy: true };
+      if (path === "/calendar/config") return CONFIG;
+      if (path === "/notifications/pending") return [];
       return undefined;
     });
+  }
 
-    renderWithQuery(<DraftEventForm />);
+  it("opens on this month, with today selected and its day in the sheet", async () => {
+    answering([occurrence()]);
+    await page();
 
-    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Coffee" } });
-    fireEvent.change(screen.getByLabelText("Starts"), { target: { value: "2026-08-20T09:00" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add to calendar" }));
+    // The month's own name, and the honest count beside it.
+    expect(await screen.findByText(/1 occurrence this month/)).toBeDefined();
+    // The sheet opens on today rather than on nothing.
+    const sheet = await screen.findByRole("heading", { level: 3 });
+    expect(sheet.textContent).toContain("20");
+    expect(await screen.findByRole("button", { name: "Skip this occurrence" })).toBeDefined();
+  });
 
-    await waitFor(() => expect(seen["POST /calendar/events"]).toBeDefined());
-    const created = seen["POST /calendar/events"] as Record<string, unknown>;
+  it("switches to the week and keeps the day it was showing", async () => {
+    answering([occurrence()]);
+    const { container } = await page();
 
-    // A one-off omits the key entirely — never sends it as `null`.
-    expect(Object.prototype.hasOwnProperty.call(created, "freq")).toBe(false);
-    expect(created.title).toBe("Coffee");
-    expect(created.starts_at_local).toBe("2026-08-20T09:00:00");
+    fireEvent.click(await screen.findByRole("button", { name: "Week" }));
 
-    const occurrence: EventOccurrence = {
-      event_id: 4,
-      title: "Weekly check-in",
-      source: "human",
-      occurrence_local: "2026-08-20T09:00:00",
-      starts_at: "2026-08-20T08:00:00Z",
-      ends_at: "2026-08-20T08:30:00Z",
-    };
-    renderWithQuery(<OccurrenceActions occurrence={occurrence} />);
+    await waitFor(() => expect(screen.getByText(/this week/)).toBeDefined());
 
-    // Arm, then confirm — genuinely apart in time so the second click does
-    // not land inside the interlock's dwell.
-    fireEvent.click(screen.getByRole("button", { name: "Skip this occurrence" }));
-    await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Skip it" }));
-
-    // Addressed by `occurrence_local` — there is no occurrence id to send.
-    await waitFor(() =>
-      expect(seen["POST /calendar/events/4/cancel"]).toEqual({ occurrence_local: "2026-08-20T09:00:00" }),
+    // The week containing Thursday 20 August opens on Monday the 17th and ends
+    // on Sunday the 23rd. Read off the heading row rather than searched for as
+    // text: the hour gutter is full of two-digit numbers too.
+    const heads = [...container.querySelectorAll(".calendar-week-head-number")].map(
+      (node) => node.textContent,
     );
+    expect(heads).toEqual(["17", "18", "19", "20", "21", "22", "23"]);
+    // And the day that was selected in the month is still the selected one.
+    expect(screen.getByRole("heading", { level: 3 }).textContent).toContain("20");
+  });
+
+  it("pages to the next month and takes the selection with it", async () => {
+    answering([]);
+    await page();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Next ›" }));
+
+    /*
+      The selection follows, which is the defect this avoids: paging forward
+      used to leave the sheet on a day in the month you had just left, with a
+      heading that disagreed with the whole screen.
+    */
+    await waitFor(() => {
+      const sheet = screen.getByRole("heading", { level: 3 });
+      expect(sheet.textContent).toContain("2026");
+      expect(sheet.textContent).not.toContain("20 de agosto");
+    });
+  });
+
+  /**
+   * The deep link. Worth having on its own — a calendar you can point at — and
+   * the only way the screenshot harness can reach the week of a clock change,
+   * which is otherwise several clicks deep in state no URL could express.
+   */
+  it("opens on the view and the day the location names", async () => {
+    answering([]);
+    const { container } = await page("/calendar?view=week&on=2026-03-29");
+
+    await waitFor(() => {
+      const heads = [...container.querySelectorAll(".calendar-week-head-number")].map(
+        (node) => node.textContent,
+      );
+      // The week containing Sunday 29 March 2026 — Lisbon's 23-hour day.
+      expect(heads).toEqual(["23", "24", "25", "26", "27", "28", "29"]);
+    });
+    expect(screen.getAllByText("23h")).toHaveLength(1);
+  });
+
+  /**
+   * Paging published and selecting did not, which left `?on=` naming a day the
+   * page had stopped showing the moment anybody clicked a cell — so copying
+   * the link handed somebody a different day from the one on screen.
+   */
+  it("takes the location with it when a day is selected", async () => {
+    answering([]);
+    const { router, container } = await page("/calendar?on=2026-08-20");
+
+    await waitFor(() => expect(container.querySelector(".calendar-grid")).not.toBeNull());
+    const grid = container.querySelector(".calendar-grid") as HTMLElement;
+    fireEvent.keyDown(grid, { key: "ArrowRight" });
+
+    await waitFor(() =>
+      expect((router.state.location.search as CalendarSearch).on).toBe("2026-08-21"),
+    );
+  });
+
+  it("ignores a location that names something it cannot use", async () => {
+    answering([]);
+    // Neither of these is a view or a date, so the page opens where it always does.
+    await page("/calendar?view=fortnight&on=yesterday");
+    const month = await screen.findByRole("button", { name: "Month" });
+    expect(month.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("says the núcleo did not answer rather than drawing an empty month", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith("/calendar/events")) throw new Error("connection refused");
+      if (path === "/calendar/config") return CONFIG;
+      return [];
+    });
+    await page();
+
+    expect(await screen.findByText(/nothing is known about this month/)).toBeDefined();
+  });
+
+  it("quotes a refusal on the events route instead of replacing it with generic copy", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith("/calendar/events")) {
+        throw new ApiRefusal(400, "bad_window", "from and to are both required");
+      }
+      if (path === "/calendar/config") return CONFIG;
+      return [];
+    });
+    await page();
+
+    expect(await screen.findByText(/bad_window/)).toBeDefined();
   });
 });

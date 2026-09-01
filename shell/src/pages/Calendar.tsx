@@ -1,50 +1,113 @@
 // §spec calendario-local
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useNavigate, useSearch } from "@tanstack/react-router";
+import { DaySheet } from "../calendar/DaySheet";
+import { MonthGrid } from "../calendar/MonthGrid";
+import { WeekGrid } from "../calendar/WeekGrid";
+import { dateKeyOf, groupByLocalDay, placementOf, type Slot } from "../calendar/slot";
 import { isApiRefusal } from "../data/client";
 import {
-  dayHours,
-  occurrenceKey,
   useBusy,
   useCalendarConfig,
   useCalendarEvents,
-  useCancelOccurrence,
-  useCreateEvent,
-  useDeleteSeries,
-  useMoveOccurrence,
   type CalendarConfigView,
-  type CreateEventRequest,
   type EventOccurrence,
 } from "../data/calendar";
 import { isHeld, usePendingNotifications, type PendingNotification } from "../data/feed";
-import {
-  dayBounds,
-  inputFromStamp,
-  monthMatrix,
-  nowFraction,
-  occurrenceMinutes,
-  sameDay,
-  stampFromInput,
-} from "../lib/calendar-grid";
-import { Badge, Button, ConfirmButton, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime } from "../ui";
+import { dayBounds, monthMatrix, weekOf } from "../lib/calendar-grid";
+import { Badge, Button, ErrorNote, PageHeader, Panel, RefusalNote, RelativeTime } from "../ui";
 import "./calendar.css";
 
 /**
- * Calendar — the month grid, a form for a new event, per-occurrence actions,
- * and the notifications the calendar has held back while you looked busy.
+ * Calendar — a month or a week, the day you have selected, and the
+ * notifications the calendar held back while you looked busy.
  *
- * **Month only, on purpose.** Week view and drag-to-move are v1 parity gaps
- * (design §6.14), both built on the exact same `lib/calendar-grid.ts` helpers
- * this page already uses — a small follow-up, not a rewrite. `OccurrenceActions`
- * moves an occurrence through a `datetime-local` input instead.
+ * **The grid selects and the sheet acts.** These were two disconnected halves:
+ * a grid with no click on it, and below it a flat list of every occurrence in
+ * the six-week window with four controls each. Now a cell selects a day, a
+ * week slot selects a day and an hour, and `DaySheet` is the one place
+ * anything is done — including drafting, which design §6.14 asks for "inline
+ * no slot clicado".
+ *
+ * **Both views, because the month cannot answer the questions the week can.**
+ * Overlap lanes, the working-hours wash and a rule at the current minute all
+ * need a vertical time axis; §6.14 asks for all three, and
+ * `lib/calendar-grid.ts` had the arithmetic for every one of them written and
+ * table-tested with no caller. `WeekGrid` is that caller.
  *
  * **The DST badge is computed here, not asked for.** `GET /calendar/config`
  * carries no such field (`data/calendar.ts`'s header), so `dayHours` reads it
  * off the day itself via `lib/calendar-grid.ts`'s `dayBounds`/`hoursInSpan` —
  * a local calendar day whose real span is 23 or 25 hours, not 24.
+ *
+ * **Drag-to-move is v2**, by design §6.14's own Notes and by the original
+ * `calendario-local` spec, which puts month/week views *with dragging*
+ * explicitly out of scope. (This module used to call it a "v1 parity gap"
+ * alongside the week view. The week view was scope; the drag never was.)
  */
 
-function monthLabel(anchor: Date): string {
-  return anchor.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+type View = "month" | "week";
+
+/**
+ * The two things about this page that are part of the location.
+ *
+ * Which view, and which day it is looking at. Everything else — the draft in
+ * progress, whether the recurrence toggle is open — is genuinely transient and
+ * has no business in a URL.
+ *
+ * It earns its place twice over. A calendar you can link to is worth having on
+ * its own, and it is the only way the four surfaces worth photographing are
+ * reachable at all: the screenshot harness navigates, and the week of a
+ * transition is otherwise four clicks deep in state no `?path=` can express.
+ * The inspector reached the same conclusion for the same reason — its own
+ * shots became a reload rather than a click the harness had to fake.
+ */
+export interface CalendarSearch {
+  view?: View;
+  /** `"YYYY-MM-DD"` — the day to open on and select. */
+  on?: string;
+}
+
+export function validateCalendarSearch(search: Record<string, unknown>): CalendarSearch {
+  const view = search.view === "week" || search.view === "month" ? search.view : undefined;
+  const on = typeof search.on === "string" && /^\d{4}-\d{2}-\d{2}$/.test(search.on) ? search.on : undefined;
+  return { ...(view === undefined ? {} : { view }), ...(on === undefined ? {} : { on }) };
+}
+
+/**
+ * `"2026-03-29"` as a local day, or today.
+ *
+ * Split and constructed rather than passed to `new Date("2026-03-29")`, which
+ * ECMAScript reads as **UTC midnight** for the date-only form — one time zone
+ * west of Greenwich and the calendar would open on the 28th.
+ */
+function dayFromSearch(on: string | undefined): Date {
+  if (on === undefined) return new Date();
+  const [year, month, day] = on.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+/**
+ * A clock of its own, at design §6.14's 60 s.
+ *
+ * The page had none: `now` was a bare `new Date()` evaluated during render, so
+ * the "now" reading advanced only when something *else* re-rendered the page
+ * — in practice the busy poll, which ran at 3 s and was therefore quietly
+ * acting as the clock. Two things were wrong with that. The reading was
+ * hostage to an unrelated query's cadence, and the cadence itself was ten
+ * times what the design asked for. With this here, `useBusy` could be slowed
+ * to the 30 s §6.14 pairs it with.
+ *
+ * A minute is the resolution the reading actually has: the month draws a
+ * progress track and the week a rule, and neither can show a second.
+ */
+export function useMinuteClock(period = 60_000): Date {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), period);
+    return () => clearInterval(timer);
+  }, [period]);
+  return now;
 }
 
 function startOfMonth(date: Date): Date {
@@ -52,214 +115,244 @@ function startOfMonth(date: Date): Date {
 }
 
 /**
- * The RFC 3339 window one month's grid needs — the full six weeks
- * `monthMatrix` draws, not merely the calendar month, since the grid always
- * shows a little of the month either side.
+ * The RFC 3339 window the visible grid needs.
+ *
+ * The month asks for the full six weeks `monthMatrix` draws rather than the
+ * calendar month, since the grid always shows a little of the months either
+ * side; the week asks for its seven days. Both are built from `dayBounds`, so
+ * the bounds a query asks for and the bounds a column is drawn against are the
+ * same arithmetic.
  */
-function monthWindow(anchor: Date): { from: string; to: string } {
-  const weeks = monthMatrix(anchor);
-  const firstDay = weeks[0][0];
-  const lastDay = weeks[weeks.length - 1][6];
-  const [from] = dayBounds(firstDay);
-  const [, to] = dayBounds(lastDay);
+export function visibleWindow(anchor: Date, view: View): { from: string; to: string } {
+  const days = view === "week" ? weekOf(anchor) : monthMatrix(anchor).flat();
+  const [from] = dayBounds(days[0]);
+  const [, to] = dayBounds(days[days.length - 1]);
   return { from: from.toISOString(), to: to.toISOString() };
 }
 
-function headline(rows: EventOccurrence[], config: CalendarConfigView | undefined): string | undefined {
+/**
+ * What the page says it is showing, and how much of it.
+ *
+ * Counted over the period the label NAMES, which it was not: the query covers
+ * the six weeks the grid draws, and the headline counted all of them while
+ * saying "this month" — up to twelve days of other months folded into the
+ * number. A month grid that overstates its own month is a small lie told on
+ * every page load.
+ */
+export function headline(
+  rows: EventOccurrence[],
+  anchor: Date,
+  view: View,
+  config: CalendarConfigView | undefined,
+): string | undefined {
   if (config === undefined) return undefined;
-  const noun = rows.length === 1 ? "occurrence" : "occurrences";
-  return `${rows.length} ${noun} this month — working hours ${config.working_hours_start}–${config.working_hours_end}, ${config.default_tz}`;
+  const inPeriod =
+    view === "week"
+      ? rows
+      : rows.filter((row) => placementOf(row).day.getMonth() === anchor.getMonth());
+  const noun = inPeriod.length === 1 ? "occurrence" : "occurrences";
+  const period = view === "week" ? "this week" : "this month";
+  return `${inPeriod.length} ${noun} ${period} — working hours ${config.working_hours_start}–${config.working_hours_end}, ${config.default_tz}`;
 }
 
 export function Calendar() {
-  const [anchor, setAnchor] = useState(() => startOfMonth(new Date()));
-  const now = new Date();
-  const { from, to } = monthWindow(anchor);
+  const now = useMinuteClock();
+  /*
+    Validated HERE, and not merely at the route.
 
+    `useSearch({ strict: false })` is unvalidated by definition — it hands back
+    whatever is in the location, and `as CalendarSearch` is a claim rather than
+    a check. The route's own `validateSearch` covers the app, but this
+    component is also mounted directly by tests and by the preview harness, and
+    a `?on=yesterday` reaching `dayFromSearch` unfiltered is a `RangeError` out
+    of `toISOString` — a white screen behind an error boundary, from a URL.
+    Running the page's own validator on the way in costs nothing and makes the
+    component correct wherever it is mounted.
+  */
+  const search = validateCalendarSearch(useSearch({ strict: false }) as Record<string, unknown>);
+  const navigate = useNavigate();
+
+  const [view, setView] = useState<View>(search.view ?? "month");
+  const [anchor, setAnchor] = useState(() => {
+    const day = dayFromSearch(search.on);
+    return (search.view ?? "month") === "week" ? day : startOfMonth(day);
+  });
+  const [selected, setSelected] = useState<Slot>(() => ({ day: dayFromSearch(search.on), hour: null }));
+
+  /**
+   * Keep the location saying what is on screen.
+   *
+   * `replace`, so that paging through a year leaves one entry in the history
+   * rather than twelve — the rail's back gesture should return you to the page
+   * you came from, not to August.
+   */
+  function publish(nextView: View, day: Date) {
+    void navigate({
+      to: "/calendar",
+      replace: true,
+      search: validateCalendarSearch({ view: nextView, on: dateKeyOf(day) }),
+    });
+  }
+
+  /**
+   * Select a day — and say so in the location.
+   *
+   * Paging published and selecting did not, which left `?on=` naming a day the
+   * page had stopped showing the moment anybody clicked a cell. A URL that is
+   * right until you touch the page is worse than one that was never there:
+   * copying the link would hand somebody a different day from the one on
+   * screen. The hour deliberately stays out of it — it seeds a draft and is
+   * gone the moment the draft is submitted.
+   */
+  function select(slot: Slot) {
+    setSelected(slot);
+    publish(view, slot.day);
+  }
+
+  const { from, to } = visibleWindow(anchor, view);
   const events = useCalendarEvents(from, to);
   const busy = useBusy();
   const config = useCalendarConfig();
   const rows = events.data ?? [];
+  const byDay = groupByLocalDay(rows);
+
+  /**
+   * Move the grid, and take the selection with it.
+   *
+   * A selection left behind is the defect this avoids: page to December and
+   * the sheet would still be showing a day in August, with a heading that
+   * disagrees with everything on screen. The first of the period is the
+   * honest landing place — except when that period contains today, which is
+   * the day somebody paging back to *now* means.
+   */
+  function goTo(next: Date, nextView: View = view) {
+    setAnchor(next);
+    const days = nextView === "week" ? weekOf(next) : monthMatrix(next).flat();
+    const today = days.find((day) => dateKeyOf(day) === dateKeyOf(now));
+    const first =
+      nextView === "week" ? days[0] : (days.find((day) => day.getMonth() === next.getMonth()) ?? days[0]);
+    const landing = today ?? first;
+    setSelected({ day: landing, hour: null });
+    publish(nextView, landing);
+  }
+
+  function switchTo(nextView: View) {
+    setView(nextView);
+    setAnchor(nextView === "week" ? selected.day : startOfMonth(selected.day));
+    publish(nextView, selected.day);
+  }
+
+  function step(direction: -1 | 1) {
+    goTo(
+      view === "week"
+        ? new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + 7 * direction)
+        : new Date(anchor.getFullYear(), anchor.getMonth() + direction, 1),
+    );
+  }
+
+  const label =
+    view === "week"
+      ? weekLabel(weekOf(anchor))
+      : anchor.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 
   return (
     <>
       <PageHeader
         title="Calendar"
-        headline={headline(rows, config.data)}
+        headline={headline(rows, anchor, view, config.data)}
         actions={<BusyIndicator busy={busy.data?.busy} />}
       />
 
-      <Panel title={monthLabel(anchor)} aside={<MonthNav anchor={anchor} onChange={setAnchor} />}>
+      <Panel
+        title={label}
+        aside={
+          <div className="calendar-nav">
+            <div className="calendar-views" role="group" aria-label="Calendar view">
+              <button
+                type="button"
+                className={view === "month" ? "calendar-view calendar-view-on" : "calendar-view"}
+                aria-pressed={view === "month"}
+                onClick={() => switchTo("month")}
+              >
+                Month
+              </button>
+              <button
+                type="button"
+                className={view === "week" ? "calendar-view calendar-view-on" : "calendar-view"}
+                aria-pressed={view === "week"}
+                onClick={() => switchTo("week")}
+              >
+                Week
+              </button>
+            </div>
+            <Button title={view === "week" ? "Previous week" : "Previous month"} onClick={() => step(-1)}>
+              ‹ Prev
+            </Button>
+            <Button
+              title="Back to today"
+              onClick={() => goTo(view === "week" ? new Date() : startOfMonth(new Date()))}
+            >
+              Today
+            </Button>
+            <Button title={view === "week" ? "Next week" : "Next month"} onClick={() => step(1)}>
+              Next ›
+            </Button>
+          </div>
+        }
+      >
         {events.isError && rows.length === 0 && <EventsError error={events.error} />}
         {events.data === undefined && !events.isError && <p className="calendar-loading">reading the month…</p>}
-        {events.data !== undefined && <CalendarGrid anchor={anchor} occurrences={rows} now={now} />}
+        {events.data !== undefined &&
+          (view === "week" ? (
+            <WeekGrid
+              anchor={anchor}
+              occurrences={rows}
+              now={now}
+              config={config.data}
+              selected={selected}
+              onSelect={select}
+            />
+          ) : (
+            <MonthGrid
+              anchor={anchor}
+              occurrences={rows}
+              now={now}
+              config={config.data}
+              selected={selected}
+              onSelect={select}
+            />
+          ))}
       </Panel>
 
-      <Panel title="New event">
-        <DraftEventForm />
+      <Panel title="Selected day">
+        <DaySheet
+          slot={selected}
+          occurrences={byDay.get(dateKeyOf(selected.day)) ?? []}
+          now={now}
+          config={config.data}
+        />
       </Panel>
-
-      {rows.length > 0 && (
-        <Panel title="This month's occurrences" variant="dim">
-          <ul className="calendar-occurrence-list">
-            {rows.map((occurrence) => (
-              <li key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}>
-                <OccurrenceActions occurrence={occurrence} />
-              </li>
-            ))}
-          </ul>
-        </Panel>
-      )}
 
       <HeldNotifications />
     </>
   );
 }
 
-function MonthNav({ anchor, onChange }: { anchor: Date; onChange: (next: Date) => void }) {
-  return (
-    <div className="calendar-nav">
-      <Button
-        title="Previous month"
-        onClick={() => onChange(new Date(anchor.getFullYear(), anchor.getMonth() - 1, 1))}
-      >
-        ‹ Prev
-      </Button>
-      <Button title="Next month" onClick={() => onChange(new Date(anchor.getFullYear(), anchor.getMonth() + 1, 1))}>
-        Next ›
-      </Button>
-    </div>
-  );
+/** "17–23 August 2026", collapsing whatever the two ends already share. */
+function weekLabel(days: Date[]): string {
+  const first = days[0];
+  const last = days[days.length - 1];
+  const sameMonth = first.getMonth() === last.getMonth() && first.getFullYear() === last.getFullYear();
+  const tail = last.toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" });
+  const head = sameMonth
+    ? String(first.getDate())
+    : first.toLocaleDateString(undefined, { day: "numeric", month: "long" });
+  return `${head}–${tail}`;
 }
 
 function EventsError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return <ErrorNote>the núcleo did not answer — nothing is known about this month</ErrorNote>;
-}
-
-/* ------------------------------------------------------------------ grid -- */
-
-export interface CalendarGridProps {
-  anchor: Date;
-  occurrences: EventOccurrence[];
-  now: Date;
-}
-
-/**
- * The month, six weeks always, each day carrying its own occurrences and its
- * own DST reading.
- *
- * Pure and prop-driven — no query of its own — so the arithmetic can be
- * tested without a daemon or a router behind it.
- */
-export function CalendarGrid({ anchor, occurrences, now }: CalendarGridProps) {
-  const weeks = monthMatrix(anchor);
-  const byDay = groupByLocalDay(occurrences);
-
-  return (
-    <div className="calendar-grid" role="grid" aria-label={monthLabel(anchor)}>
-      {weeks.map((week) => (
-        <div className="calendar-week" role="row" key={dateKeyOf(week[0])}>
-          {week.map((day) => (
-            <DayCell
-              key={dateKeyOf(day)}
-              day={day}
-              inMonth={day.getMonth() === anchor.getMonth()}
-              occurrences={byDay.get(dateKeyOf(day)) ?? []}
-              now={now}
-            />
-          ))}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/**
- * A day's own `"YYYY-MM-DD"`, built from the same local getters `monthMatrix`
- * used to construct the day — never re-parsed through a `Date`, so a grid
- * cell's key can never disagree with the box that was placed into it.
- */
-function dateKeyOf(day: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}`;
-}
-
-/**
- * Occurrences grouped by `occurrence_local`'s own date, not by `starts_at`.
- * `occurrence_local` is the daemon's ORIGINAL local wall clock — the ground
- * truth for which day an occurrence belongs on — so matching against it never
- * has to reckon with this machine's own time zone at all.
- */
-function groupByLocalDay(occurrences: EventOccurrence[]): Map<string, EventOccurrence[]> {
-  const map = new Map<string, EventOccurrence[]>();
-  for (const occurrence of occurrences) {
-    const key = occurrence.occurrence_local.slice(0, 10);
-    const list = map.get(key);
-    if (list === undefined) map.set(key, [occurrence]);
-    else list.push(occurrence);
-  }
-  return map;
-}
-
-function DayCell({
-  day,
-  inMonth,
-  occurrences,
-  now,
-}: {
-  day: Date;
-  inMonth: boolean;
-  occurrences: EventOccurrence[];
-  now: Date;
-}) {
-  const hours = dayHours(day);
-  const today = sameDay(day, now);
-  const classes = ["calendar-day"];
-  if (!inMonth) classes.push("calendar-day-outside");
-  if (today) classes.push("calendar-day-today");
-
-  return (
-    <div className={classes.join(" ")} role="gridcell">
-      <div className="calendar-day-head">
-        <span className="calendar-day-number">{day.getDate()}</span>
-        {hours.short && (
-          <Badge tone="paused" className="calendar-day-dst">
-            {hours.hours}h — short day
-          </Badge>
-        )}
-        {hours.long && (
-          <Badge tone="paused" className="calendar-day-dst">
-            {hours.hours}h — long day
-          </Badge>
-        )}
-      </div>
-      {today && <NowLine day={day} now={now} />}
-      <ul className="calendar-day-events">
-        {occurrences.map((occurrence) => (
-          <li className="calendar-day-event" key={occurrenceKey(occurrence.event_id, occurrence.occurrence_local)}>
-            {occurrence.source === "proposal" && <span className="calendar-day-event-proposal">proposed</span>}
-            {occurrence.title}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-/** How far through today has already passed — absent on every other day. */
-export function NowLine({ day, now }: { day: Date; now: Date }) {
-  const fraction = nowFraction(now, day);
-  if (fraction === null) return null;
-  return (
-    <div
-      className="calendar-now-line"
-      role="img"
-      aria-label={`${Math.round(fraction * 100)}% through today`}
-    >
-      <span className="calendar-now-line-fill" style={{ width: `${Math.round(fraction * 100)}%` }} />
-    </div>
-  );
 }
 
 /* ------------------------------------------------------------------ busy -- */
@@ -271,182 +364,6 @@ export function NowLine({ day, now }: { day: Date; now: Date }) {
 export function BusyIndicator({ busy }: { busy: boolean | undefined }) {
   if (busy === undefined) return null;
   return <Badge tone={busy ? "pending" : "off"}>{busy ? "busy right now" : "free right now"}</Badge>;
-}
-
-/* -------------------------------------------------------------- new event -- */
-
-/**
- * A one-off or a recurring series.
- *
- * Recurrence is offered behind its own toggle, collapsed by default, and
- * `freq` is genuinely absent from the request — not sent as `null` — when
- * the toggle is off: {@link CreateEventRequest}'s header explains why that
- * distinction is the one the daemon actually reads.
- */
-export function DraftEventForm() {
-  const create = useCreateEvent();
-  const [title, setTitle] = useState("");
-  const [start, setStart] = useState("");
-  const [duration, setDuration] = useState(30);
-  const [repeats, setRepeats] = useState(false);
-  const [freq, setFreq] = useState<"daily" | "weekly" | "monthly">("weekly");
-
-  const stamp = stampFromInput(start);
-  const canSubmit = title.trim() !== "" && stamp !== null && duration > 0 && !create.isPending;
-
-  function submit() {
-    if (stamp === null || title.trim() === "") return;
-    const input: CreateEventRequest = {
-      title: title.trim(),
-      starts_at_local: stamp,
-      duration_minutes: duration,
-      // Absent, not null, for a one-off — `JSON.stringify` drops the key.
-      freq: repeats ? freq : undefined,
-    };
-    create.mutate(input, { onSuccess: () => setTitle("") });
-  }
-
-  return (
-    <form className="calendar-draft" onSubmit={(event) => event.preventDefault()}>
-      <label className="calendar-draft-field">
-        <span>Title</span>
-        <input value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Title" />
-      </label>
-      <label className="calendar-draft-field">
-        <span>Starts</span>
-        <input
-          type="datetime-local"
-          value={start}
-          onChange={(event) => setStart(event.target.value)}
-          aria-label="Starts"
-        />
-      </label>
-      <label className="calendar-draft-field">
-        <span>Duration (minutes)</span>
-        <input
-          type="number"
-          min={1}
-          value={duration}
-          onChange={(event) => setDuration(Number(event.target.value))}
-          aria-label="Duration (minutes)"
-        />
-      </label>
-      <label className="calendar-draft-repeats">
-        <input type="checkbox" checked={repeats} onChange={(event) => setRepeats(event.target.checked)} />
-        <span>Repeats</span>
-      </label>
-      {repeats && (
-        <label className="calendar-draft-field">
-          <span>Every</span>
-          <select
-            value={freq}
-            aria-label="Repeat frequency"
-            onChange={(event) => setFreq(event.target.value as "daily" | "weekly" | "monthly")}
-          >
-            <option value="daily">day</option>
-            <option value="weekly">week</option>
-            <option value="monthly">month</option>
-          </select>
-        </label>
-      )}
-      <Button disabled={!canSubmit} onClick={submit}>
-        Add to calendar
-      </Button>
-      {create.isSuccess && (
-        <p className="calendar-outcome" role="status">
-          added — event {create.data.id}
-        </p>
-      )}
-      {create.isError && <DraftError error={create.error} />}
-    </form>
-  );
-}
-
-function DraftError({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing was added</ErrorNote>;
-}
-
-/**
- * The daemon's own sentence, when it really sent one — every refusal `POST
- * /calendar/events` makes is bare prose written on purpose (`data/calendar.ts`
- * carries the list), worth quoting rather than replaced by generic copy.
- */
-function daemonProse(error: { code: string; detail: string }): Record<string, string> {
-  const detail = error.detail.trim();
-  if (detail === "" || detail === error.code) return {};
-  if (detail.split(/\s+/).length < 3) return {};
-  return { [error.code]: detail };
-}
-
-/* --------------------------------------------------------- occurrences -- */
-
-/**
- * Skip, move, or delete the whole series — addressed by `occurrence_local`,
- * never by an occurrence id, because there is no such thing.
- */
-export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence }) {
-  const cancel = useCancelOccurrence();
-  const move = useMoveOccurrence();
-  const deleteSeries = useDeleteSeries();
-  const [moveTo, setMoveTo] = useState(() => inputFromStamp(occurrence.occurrence_local));
-
-  function submitMove() {
-    const stamp = stampFromInput(moveTo);
-    if (stamp === null) return;
-    move.mutate({
-      eventId: occurrence.event_id,
-      occurrenceLocal: occurrence.occurrence_local,
-      toLocal: stamp,
-      durationMinutes: occurrenceMinutes(occurrence.starts_at, occurrence.ends_at),
-    });
-  }
-
-  return (
-    <div className="calendar-occurrence-actions">
-      <p className="calendar-occurrence-title">
-        {occurrence.title}
-        <span className="calendar-occurrence-when">{occurrence.occurrence_local}</span>
-      </p>
-      <div className="calendar-occurrence-controls">
-        <ConfirmButton
-          label="Skip this occurrence"
-          confirmLabel="Skip it"
-          disabled={cancel.isPending}
-          onConfirm={() =>
-            cancel.mutate({ eventId: occurrence.event_id, occurrenceLocal: occurrence.occurrence_local })
-          }
-        />
-        <label className="calendar-move-field">
-          <span>Move to</span>
-          <input
-            type="datetime-local"
-            value={moveTo}
-            onChange={(event) => setMoveTo(event.target.value)}
-            aria-label={`Move ${occurrence.title} to`}
-          />
-        </label>
-        <Button disabled={move.isPending} onClick={submitMove}>
-          Move
-        </Button>
-        <ConfirmButton
-          label="Delete whole series"
-          confirmLabel="Delete every occurrence"
-          variant="danger"
-          disabled={deleteSeries.isPending}
-          onConfirm={() => deleteSeries.mutate(occurrence.event_id)}
-        />
-      </div>
-      {cancel.isError && <OccurrenceError error={cancel.error} what="not skipped" />}
-      {move.isError && <OccurrenceError error={move.error} what="not moved" />}
-      {deleteSeries.isError && <OccurrenceError error={deleteSeries.error} what="the series was not deleted" />}
-    </div>
-  );
-}
-
-function OccurrenceError({ error, what }: { error: unknown; what: string }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
 }
 
 /* ----------------------------------------------------- held notifications -- */
@@ -466,7 +383,7 @@ export function HeldNotifications() {
   const released = rows.filter((row) => !isHeld(row));
 
   return (
-    <Panel title="Held notifications">
+    <Panel title="Held notifications" variant="dim">
       <p className="calendar-note">
         `calendar.rs` fails OPEN by design — a database it cannot read answers "not busy" rather than
         staying silent, since silence here is a message that never arrived.

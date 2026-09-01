@@ -10,7 +10,7 @@ import "../app.css";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
 import { adoptStyleNonce } from "../lib/style-nonce";
-import { answer, answerText, refusal } from "./daemon";
+import { NOW, answer, answerText, refusal } from "./daemon";
 
 /**
  * The page the screenshot harness loads.
@@ -30,6 +30,41 @@ import { answer, answerText, refusal } from "./daemon";
 
 /* Exactly what the app's entry does, first thing, for the same reason. */
 adoptStyleNonce();
+
+/**
+ * The clock, moved to where the fixtures live.
+ *
+ * A calendar is the one page whose picture is worthless without this: it draws
+ * whatever month the machine says it is, so the same shot taken on two days is
+ * two different months and neither can be compared with the other. The
+ * fixtures are pinned to a real week (`daemon.ts`'s `NOW`), and this is what
+ * makes the app agree with them.
+ *
+ * **Shifted, not frozen.** A `Date.now` that always returns the same number
+ * looks simpler and breaks the things under the page: react-query decides
+ * staleness by subtracting timestamps, and a clock that never advances makes
+ * every query eternally fresh or eternally stale depending on which way the
+ * comparison falls. Adding a constant keeps every interval, every timeout and
+ * every duration exactly as long as it really is, and only moves where "now"
+ * sits on the calendar.
+ *
+ * Nothing under `src/` reaches this file, so no shipped code is affected.
+ */
+const RealDate = Date;
+const SKEW = NOW - RealDate.now();
+
+class PreviewDate extends RealDate {
+  constructor(...args: ConstructorParameters<typeof Date> | []) {
+    if (args.length === 0) super(RealDate.now() + SKEW);
+    else super(...(args as ConstructorParameters<typeof Date>));
+  }
+
+  static now(): number {
+    return RealDate.now() + SKEW;
+  }
+}
+
+globalThis.Date = PreviewDate as DateConstructor;
 
 /**
  * The loopback daemon, answered from a table.

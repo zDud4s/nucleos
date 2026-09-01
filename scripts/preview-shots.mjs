@@ -342,6 +342,31 @@ const SHOTS_TO_TAKE = [
   /* The Codigo mode's empty state, which is where both doors into the inspector
      are drawn — and the only place in the app that opens it. */
   ["30-codigo-doors", { path: "/projects/alpha/codigo" }],
+
+  /* The calendar. Its month, view and selected day come out of the URL, so
+     these are reloads rather than clicks the harness has to fake — the same
+     move the inspector made, and the only way the week of a clock change is
+     reachable at all.
+
+     The clock is pinned in `preview/main.tsx` to the week the fixtures live
+     in. Without that a calendar photographs a different month every day and
+     two shots can never be compared. */
+  ["40-calendar-month", { path: "/calendar?on=2026-08-24" }],
+  ["41-calendar-month-light", { path: "/calendar?on=2026-08-24", theme: "light" }],
+  /* Tuesday the 25th: three meetings genuinely overlapping at ten in the
+     morning, which is the only thing that exercises the lane arithmetic — and
+     the one shape the month grid cannot draw at all. */
+  ["42-calendar-week", { path: "/calendar?view=week&on=2026-08-25" }],
+  ["43-calendar-week-light", { path: "/calendar?view=week&on=2026-08-25", theme: "light" }],
+  /* Lisbon's 23-hour day. Six columns of 24 bands and one of 23, with the
+     badge in its heading that says why. If the compression reads as a
+     rendering fault rather than as the fact it is, this is the picture that
+     will say so. */
+  ["44-calendar-dst-week", { path: "/calendar?view=week&on=2026-03-29" }],
+  /* A month with nothing in it, which must read as an empty calendar and not
+     as a page that failed to load — the state every grid gets wrong first. */
+  ["45-calendar-empty", { path: "/calendar?on=2027-02-15" }],
+  ["46-calendar-empty-light", { path: "/calendar?on=2027-02-15", theme: "light" }],
 ];
 
 let clean = true;

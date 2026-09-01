@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  hourMarks, hoursInSpan, inputFromStamp, localStamp, monthMatrix, nowFraction, occurrenceMinutes,
-  overlapLanes, placeInDay, sameDay, stampFromInput, weekOf,
+  clockOfInstant, clockOfStamp, hourMarks, hourSlots, hoursInSpan, inputFromStamp, localDateOfStamp,
+  localStamp, monthMatrix, nowFraction, occurrenceMinutes, overlapLanes, placeInDay, sameDay,
+  stampFromInput, weekOf, weekdayLabels,
 } from "./calendar-grid";
 
 const HOUR = 3_600_000;
@@ -241,5 +242,73 @@ describe("occurrenceMinutes", () => {
 
   it("answers zero for a pair it cannot read, rather than NaN", () => {
     expect(occurrenceMinutes("not a date", "2026-08-03T09:30:00Z")).toBe(0);
+  });
+});
+
+/* --------------------------------------------------- what the week view needed -- */
+
+describe("hourSlots", () => {
+  it("gives an ordinary day 24 bands that tile it exactly", () => {
+    const slots = hourSlots(...span(24));
+    expect(slots).toHaveLength(24);
+    expect(slots[0].top).toBe(0);
+    expect(slots[0].height).toBeCloseTo(1 / 24);
+    // No gap and no overlap: the last band ends exactly at the bottom.
+    expect(slots[23].top + slots[23].height).toBeCloseTo(1);
+  });
+
+  /**
+   * A spring-forward day has 23 bands, not 24 with one hidden — which is the
+   * whole reason the week grid asks each column for its own rather than
+   * sharing one set across the row.
+   */
+  it("gives a short day 23 bands and a long day 25", () => {
+    expect(hourSlots(...span(23))).toHaveLength(23);
+    expect(hourSlots(...span(25))).toHaveLength(25);
+  });
+});
+
+describe("weekdayLabels", () => {
+  /** Monday first, because `monthMatrix` and `weekOf` are — the header has to agree with the grid. */
+  it("starts on Monday and ends on Sunday", () => {
+    const labels = weekdayLabels("en-GB");
+    expect(labels).toHaveLength(7);
+    expect(labels[0].long).toBe("Monday");
+    expect(labels[6].long).toBe("Sunday");
+  });
+
+  it("answers in the locale it is given, rather than in seven English literals", () => {
+    expect(weekdayLabels("pt-PT")[0].long.toLowerCase()).toContain("segunda");
+  });
+});
+
+describe("clockOfStamp and clockOfInstant", () => {
+  it("slices the stamp without ever building a Date from it", () => {
+    expect(clockOfStamp("2026-08-20T09:05:00")).toBe("09:05");
+  });
+
+  it("reads an instant back in this machine's own clock", () => {
+    expect(clockOfInstant(new Date(2026, 7, 20, 9, 5))).toBe("09:05");
+  });
+});
+
+describe("localDateOfStamp", () => {
+  /** Its only job is to be COMPARED with `starts_at` — see `slot.ts`'s `placementOf`. */
+  it("reads a local stamp as the instant this machine would call it", () => {
+    const at = localDateOfStamp("2026-08-20T09:00:00");
+    expect(at?.getFullYear()).toBe(2026);
+    expect(at?.getMonth()).toBe(7);
+    expect(at?.getDate()).toBe(20);
+    expect(at?.getHours()).toBe(9);
+  });
+
+  it("accepts the seconds-less spelling a datetime-local control produces", () => {
+    expect(localDateOfStamp("2026-08-20T09:00")?.getHours()).toBe(9);
+  });
+
+  /** An instant with an offset in it is not a local stamp, and must not be read as one. */
+  it("answers null for anything that is not a local stamp", () => {
+    expect(localDateOfStamp("2026-08-20T08:00:00Z")).toBeNull();
+    expect(localDateOfStamp("")).toBeNull();
   });
 });

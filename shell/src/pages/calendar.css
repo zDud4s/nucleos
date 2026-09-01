@@ -1,13 +1,29 @@
 /**
- * The Calendar slice: the month grid, the draft form, per-occurrence actions
- * and the held notifications, `calendar-` throughout — as `waiting-` is for
- * the decision queue and `mail-` for the sibling pillar.
+ * The Calendar slice: the month grid, the week grid, the selected-day sheet,
+ * the draft form and the held notifications — `calendar-` throughout, as
+ * `waiting-` is for the decision queue and `mail-` for the sibling pillar.
  *
- * The rule this file lives under: **no class appears in `Calendar.tsx` that
- * is not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of — the Calendar tab shipped exactly that once
- * (`ui/nav.ts`'s note). Grep the component against this file before calling
- * the page done.
+ * The rule this file lives under: **no class appears in the components that is
+ * not defined below, and no rule below is left without a user.** `tsc` and
+ * vitest both pass happily on a class no stylesheet has ever heard of — the
+ * Calendar tab shipped exactly that once (`ui/nav.ts`'s note) — and dead CSS
+ * rots the other way round, silently, as a description of the page that lies.
+ * `node scripts/css-contract.mjs calendar` checks both directions.
+ *
+ * **The accent appears exactly once here, as the focus ring.** It had three
+ * jobs in this sheet: today's cell ring, every event's left border, and the
+ * fill of the now line. `tokens.css` is explicit that `--accent` is the one
+ * brand colour and never a state or a reading, and an event chip drawn in it
+ * made "there is something here" read as branding. So: today is a filled date
+ * pill (contrast, the app's documented way of carrying weight without hue),
+ * selection is a ring in `--border-strong`, and the now reading is `info` —
+ * the tone for a fact with no verdict attached, which is what a clock is.
+ *
+ * **Six things a day cell can be, six different shapes**, because they stack:
+ * outside the month is dimmed ink, a non-working day is a sunken surface,
+ * today is a filled pill, selection is a ring, a DST day carries a badge, and
+ * an overflowing day carries a count. Any two of them expressed the same way
+ * makes a Saturday in the next month unreadable.
  */
 
 /* =============================================================== shared == */
@@ -42,12 +58,94 @@
   color: var(--tone-active-fg);
 }
 
+/* Said to a screen reader and to nobody else — the tone that marks a proposal
+   or a moved occurrence is colour, and colour is not a label. */
+.calendar-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* ============================================================ the heading == */
+
 .calendar-nav {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-2);
 }
 
-/* =================================================================== grid == */
+/* A segmented pair rather than two loose buttons: they are one choice, and the
+   shared border is what says so. */
+.calendar-views {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+/* `base.css` resets only `font` and `color` on a button and deliberately never
+   `background`, so every control here brings its own ground. */
+.calendar-view {
+  padding: var(--space-1) var(--space-3);
+  border: 0;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.calendar-view + .calendar-view {
+  border-left: 1px solid var(--border);
+}
+
+.calendar-view:hover {
+  color: var(--text);
+}
+
+.calendar-view-on {
+  background: var(--solid);
+  color: var(--solid-ink);
+}
+
+/* ============================================================ month grid == */
+
+.calendar-month {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/*
+  `minmax(0, 1fr)` and never a bare `1fr`, here and in every other track below.
+
+  `1fr` is `minmax(auto, 1fr)`, so a column refuses to shrink below its content
+  — and a month cell's content is event titles. The first screenshot of this
+  page showed it exactly: five empty rows sat at equal widths and the one row
+  with meetings in it bulged, pushing Saturday off the right-hand edge of the
+  panel. Nothing in jsdom can see that, because jsdom computes no layout at all.
+*/
+.calendar-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+  padding: 0 1px;
+}
+
+.calendar-weekday {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
 
 .calendar-grid {
   display: flex;
@@ -59,32 +157,73 @@
   overflow: hidden;
 }
 
-.calendar-week {
+.calendar-row {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 1px;
 }
 
-.calendar-day {
-  position: relative;
+/* The gridcell is the box; the button inside it is the control. Splitting them
+   keeps `role="gridcell"` on an element that is not also a button, which is
+   what the grid pattern expects.
+
+   `min-width: 0` all the way down, or the ellipsis on a chip title never
+   fires: a flex item's default minimum is its content, so the truncation is
+   only reachable once every ancestor has agreed to be narrower than what is
+   inside it. */
+.calendar-cell {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  min-height: 6rem;
-  padding: var(--space-2);
+  min-width: 0;
   background: var(--surface);
 }
 
-/* A day from the month either side, kept in the grid so the six rows never
-   shift height, and dimmed so it reads as context, not content. */
-.calendar-day-outside {
-  background: var(--surface-sunken);
+.calendar-day {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1);
+  /* Six rows of this is the height the month is promised to keep — see
+     `monthMatrix`. The chips are capped at three so nothing can grow it. */
+  min-height: 6.5rem;
+  padding: var(--space-2);
+  border: 0;
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.calendar-day:hover {
+  background: var(--surface-raised);
+}
+
+.calendar-day:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* A day from the month either side: dimmed INK, and never a dimmed surface —
+   that shape belongs to the non-working day, and a Saturday in the next month
+   has to be able to read as both at once. */
+.calendar-day-outside .calendar-day-number,
+.calendar-day-outside .calendar-chip-title {
   color: var(--text-faint);
 }
 
-.calendar-day-today {
-  background: var(--surface-raised);
-  box-shadow: inset 0 0 0 1px var(--accent);
+/* Not a working day, per `working_weekdays` — a sunken surface. */
+.calendar-day-closed {
+  background: var(--surface-sunken);
+}
+
+.calendar-day-closed:hover {
+  background: var(--surface);
+}
+
+.calendar-day-selected {
+  box-shadow: inset 0 0 0 2px var(--border-strong);
 }
 
 .calendar-day-head {
@@ -95,65 +234,479 @@
 }
 
 .calendar-day-number {
+  min-width: 1.5rem;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
+  text-align: center;
   color: var(--text);
 }
 
-/* The short/long-day badge — computed locally, never asked for. Warm rather
-   than red: a 23- or 25-hour day is a fact about the calendar, not a fault. */
+/* Today, carried by contrast rather than by hue — the same way this app draws
+   a primary button. This was an accent ring, and the accent is the brand. */
+.calendar-day-today .calendar-day-number {
+  background: var(--solid);
+  color: var(--solid-ink);
+  font-weight: var(--weight-semibold);
+}
+
+/* The short/long-day badge. Warm rather than red — a 23- or 25-hour day is a
+   fact about the calendar, not a fault — and reduced to the number: the cell
+   is 6.5rem tall and "23h — short day" was the loudest thing in the month for
+   the rarest fact in it. The sentence lives in the title and in the cell's
+   accessible name. */
 .calendar-day-dst {
+  padding: 0 var(--space-1);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-sm);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-family: var(--font-mono);
   font-size: var(--text-xs);
 }
 
 .calendar-day-events {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+  gap: 2px;
+  min-width: 0;
 }
 
-.calendar-day-event {
+.calendar-day-more {
+  padding-left: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ------------------------------------------------------------------ chip -- */
+
+.calendar-chip {
+  display: flex;
+  gap: var(--space-1);
+  min-width: 0;
   padding: 0 var(--space-1);
-  border-left: 2px solid var(--accent);
-  color: var(--text);
+  border-left: 2px solid var(--border-strong);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
-  overflow-wrap: anywhere;
 }
 
-.calendar-day-event-proposal {
-  margin-right: var(--space-1);
-  padding: 0 var(--space-1);
-  border-radius: var(--radius-sm);
-  background: var(--tone-shadow-bg);
+.calendar-chip-clock {
+  flex: none;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+/* One line, cut with an ellipsis. A month cell cannot afford to wrap: a
+   three-word title used to take three lines and push the day's height out. */
+.calendar-chip-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+/* `shadow` is the app's "deciding, not acting" — exactly an unapproved
+   proposal, and it costs no width, unlike the `PROPOSED` word this replaced. */
+.calendar-chip-proposal {
+  border-left-color: var(--tone-shadow-border);
+}
+
+.calendar-chip-proposal .calendar-chip-clock,
+.calendar-chip-proposal .calendar-chip-title {
   color: var(--tone-shadow-fg);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
 }
 
-/* How far through today has passed. A thin track under the date number
-   rather than a line across the whole cell — the month grid has no hour axis
-   for a line to sit on. */
+/* Moved by an exception. `info`: a fact with no verdict attached. */
+.calendar-chip-moved {
+  border-left-color: var(--tone-info-border);
+}
+
+.calendar-chip-moved .calendar-chip-clock {
+  color: var(--tone-info-fg);
+}
+
+/* -------------------------------------------------------------- now line -- */
+
+/* How far through today has passed. A thin track under the date number rather
+   than a rule across the cell — the month grid has no hour axis for a rule to
+   sit on. The week grid does, and draws one. */
 .calendar-now-line {
+  display: block;
   height: 2px;
   border-radius: var(--radius-pill);
-  background: var(--border-strong);
+  background: var(--border);
   overflow: hidden;
 }
 
 .calendar-now-line-fill {
   display: block;
   height: 100%;
-  background: var(--accent);
+  background: var(--tone-info-fg);
 }
 
-/* ============================================================== draft form == */
+/* ============================================================= week grid == */
+
+.calendar-week-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* One shared column template, so the headings sit over the columns they name.
+   3rem is the gutter; the seven days divide what is left. */
+.calendar-week-heads,
+.calendar-week-body {
+  display: grid;
+  grid-template-columns: 3rem repeat(7, minmax(0, 1fr));
+  gap: 1px;
+}
+
+.calendar-gutter-head {
+  display: block;
+}
+
+.calendar-week-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.calendar-week-head:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.calendar-week-head-name {
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.calendar-week-head-number {
+  min-width: 1.5rem;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  text-align: center;
+  color: var(--text);
+}
+
+.calendar-week-head-closed {
+  background: var(--surface-sunken);
+}
+
+.calendar-week-head-today .calendar-week-head-number {
+  background: var(--solid);
+  color: var(--solid-ink);
+  font-weight: var(--weight-semibold);
+}
+
+.calendar-week-head-selected {
+  box-shadow: inset 0 0 0 2px var(--border-strong);
+}
+
+.calendar-week-body {
+  position: relative;
+  /* Tall enough that an hour is a clickable band rather than a hairline: 24
+     hours over 48rem is 2rem an hour. The panel scrolls; the day does not. */
+  height: 48rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  overflow: hidden;
+}
+
+.calendar-gutter {
+  position: relative;
+  background: var(--surface);
+}
+
+.calendar-gutter-hour {
+  position: absolute;
+  right: var(--space-1);
+  /* The label names the line it sits on, so it is lifted half its own height. */
+  transform: translateY(-50%);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* The column's ground is SUNKEN and the working hours are lifted back to the
+   ordinary surface. The other way round — a lighter band over a normal ground
+   — disappears in the light theme, where `--surface-raised` and `--surface`
+   are the same white. */
+.calendar-column {
+  position: relative;
+  background: var(--surface-sunken);
+}
+
+/* A day nobody works: no wash at all, so the whole column stays sunken. The
+   class marks it for the heading's sake and for anything that reads the DOM. */
+.calendar-column-closed {
+  background: var(--surface-sunken);
+}
+
+.calendar-work-wash {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  background: var(--surface);
+}
+
+.calendar-hour-line {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 1px;
+  background: var(--border);
+}
+
+/* An empty hour, as a control. Transparent and under the blocks — it exists to
+   be clicked, not seen. */
+.calendar-slot {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.calendar-slot:hover {
+  background: var(--surface-raised);
+}
+
+.calendar-slot:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.calendar-slot-selected {
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+/*
+  One line, clock then title — the same shape as a month chip, and for a reason
+  the first screenshot made obvious. Stacked in a column, a 30-minute meeting
+  is 1rem tall at this scale and shows its clock with the title sheared off at
+  the bottom edge; a 15-minute standup showed nothing readable at all. A row
+  survives every height the day can produce, and it means an event looks like
+  an event in both views.
+*/
+.calendar-block {
+  position: absolute;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  min-width: 0;
+  /*
+    A floor, because `placeInDay`'s own floor is one percent of a day and one
+    percent of a day is about eight pixels at this scale — shorter than the
+    line of text inside it. The screenshot showed a fifteen-minute standup as a
+    sliver with its own clock sheared in half. This overhangs the next slot
+    slightly for the shortest events, which is the right trade: a block that
+    reads and overlaps by three pixels beats one that is geometrically perfect
+    and illegible. Genuine collisions are still separated sideways by the lanes.
+  */
+  min-height: 1.15rem;
+  /* Never touching its neighbour: the lane arithmetic divides the column
+     exactly, and this inset is the gutter between two lanes. */
+  padding: 1px var(--space-1);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  line-height: var(--leading-tight);
+  text-align: left;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.calendar-block:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.calendar-block-clock {
+  flex: none;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.calendar-block-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calendar-block-proposal {
+  border-color: var(--tone-shadow-border);
+  background: var(--tone-shadow-bg);
+}
+
+.calendar-block-proposal .calendar-block-clock {
+  color: var(--tone-shadow-fg);
+}
+
+.calendar-block-moved {
+  border-color: var(--tone-info-border);
+  background: var(--tone-info-bg);
+}
+
+.calendar-block-moved .calendar-block-clock {
+  color: var(--tone-info-fg);
+}
+
+/* The current minute, across today's column only — `nowFraction` returns null
+   on every other day, which is what keeps this from being drawn seven times. */
+.calendar-now-rule {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background: var(--tone-info-fg);
+  pointer-events: none;
+}
+
+/* ============================================================ day sheet == */
+
+.calendar-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.calendar-sheet-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.calendar-sheet-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.calendar-sheet-marks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* ========================================================== occurrences == */
+
+.calendar-occurrence-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.calendar-occurrence-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.calendar-occurrence-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.calendar-occurrence-clock {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-regular);
+  color: var(--text-muted);
+}
+
+/* Where the series put it, for an occurrence an exception has moved — the one
+   place `occurrence_local` is shown to a person, because it is the only place
+   the difference between identity and position is worth explaining. */
+.calendar-occurrence-moved {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--tone-info-fg);
+}
+
+.calendar-occurrence-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.calendar-move-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.calendar-move-field input {
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+}
+
+/* ============================================================ draft form == */
 
 .calendar-draft {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.calendar-draft-lead {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.calendar-draft-fields {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
@@ -189,72 +742,6 @@
   gap: var(--space-2);
   font-size: var(--text-sm);
   color: var(--text-muted);
-}
-
-/* ========================================================== occurrences == */
-
-.calendar-occurrence-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.calendar-occurrence-actions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.calendar-occurrence-title {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-  margin: 0;
-  color: var(--text);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-}
-
-.calendar-occurrence-when {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-regular);
-  color: var(--text-faint);
-}
-
-.calendar-occurrence-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--space-2);
-}
-
-.calendar-move-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.calendar-move-field input {
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
 }
 
 /* ==================================================== held notifications == */
