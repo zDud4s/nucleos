@@ -1,10 +1,13 @@
 import type { Agent } from "../data/agents";
 import type { Concurrency } from "../data/fleet";
+import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
   InspectEntry,
   InspectMatch,
   ProjectRules,
 } from "../data/projects";
+import type { Branches } from "../data/project-git";
+import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary } from "../data/system";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 
@@ -838,6 +841,220 @@ const MATCHES: InspectMatch[] = [
   },
 ];
 
+/* ---------------------------------------------------------------- the map -- */
+
+/**
+ * A project the size of this one, so the map can be looked at under load.
+ *
+ * **Generated rather than written out, and the numbers are measured and not
+ * invented.** `GET /projects/nucleos/map` answers with 276 modules and 1067
+ * imports -- 3.9 a file -- across communities whose sizes run from forty-odd
+ * files down to three. Those are the proportions reproduced here. A tidy
+ * fixture of eight boxes would photograph a picture that reads beautifully and
+ * that nobody has ever seen, and the whole complaint this exists to reproduce
+ * is what the drawing does when it is asked to hold a real project.
+ *
+ * The file names are plausible rather than real. What decides whether this
+ * screen can be read is the geometry -- how many boxes, how wide a label, how
+ * many communities down the side of a matrix -- and none of that changes with
+ * the words in them.
+ *
+ * Deterministic, like `NOW` above and for the same reason: a screenshot taken
+ * twice should be the same screenshot, so the pseudo-random walk that wires the
+ * imports is seeded and never `Math.random`.
+ */
+function seeded(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** One directory's worth of files, and how many of them there are. */
+const AREAS: { dir: string; ext: string; reader: MapModule["reader"]; count: number }[] = [
+  { dir: "core/src", ext: "rs", reader: "rust", count: 118 },
+  { dir: "shell/src/data", ext: "ts", reader: "typescript", count: 34 },
+  { dir: "shell/src/pages", ext: "tsx", reader: "typescript", count: 21 },
+  { dir: "shell/src/project", ext: "tsx", reader: "typescript", count: 26 },
+  { dir: "shell/src/canvas", ext: "ts", reader: "typescript", count: 15 },
+  { dir: "shell/src/ui", ext: "tsx", reader: "typescript", count: 19 },
+  { dir: "shell/src/app", ext: "tsx", reader: "typescript", count: 12 },
+];
+
+/**
+ * Stems for the generated names, long and short both.
+ *
+ * The long ones are the point: a community titled `instrumentation` sits
+ * sideways down a matrix column and decides how tall its header has to be, and
+ * a fixture of four-letter names would never ask that question.
+ */
+const STEMS = [
+  "job", "runs", "gate", "land", "vcs", "proposals", "scheduler", "recurrence",
+  "instrumentation", "classifier", "concurrency", "credentials", "resolver",
+  "council", "triage", "sessions", "worktree", "workflow_graph", "map_anchor",
+  "map_join", "map_store", "map_recency", "notifications", "transcription",
+  "attribution", "budget", "collision", "exclusion", "errands", "detect",
+];
+
+function generatedMap(): ProjectMap {
+  const random = seeded(20260831);
+  const modules: MapModule[] = [];
+  const byArea: string[][] = [];
+
+  for (const area of AREAS) {
+    const here: string[] = [];
+    for (let i = 0; i < area.count; i += 1) {
+      const stem = STEMS[(i * 7 + area.dir.length) % STEMS.length];
+      const round = Math.floor(i / STEMS.length);
+      const path = `${area.dir}/${stem}${round === 0 ? "" : `_${round + 1}`}.${area.ext}`;
+      here.push(path);
+      modules.push({
+        path,
+        reader: area.reader,
+        // A little over half declare a section, which is roughly what the real
+        // walk reports and is the number the header above the picture reads.
+        declares: random() < 0.56,
+        cites: [],
+        spec: null,
+        tested: random() < 0.62,
+      });
+    }
+    byArea.push(here);
+  }
+
+  /*
+    Imports: dense inside a directory, thin across. That is what makes a
+    community a community -- the detector finds them from the edges and nothing
+    else -- so wiring them uniformly would produce one undifferentiated blob and
+    photograph a matrix this app would never draw.
+  */
+  const imports: MapImport[] = [];
+  const seen = new Set<string>();
+  const add = (from: string, to: string) => {
+    if (from === to) return;
+    const key = `${from} ${to}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    imports.push({ from, to });
+  };
+
+  for (const here of byArea) {
+    for (let i = 0; i < here.length; i += 1) {
+      // Communities form where a group leans on a few files. Biasing the target
+      // towards the front of the list gives each area two or three of those,
+      // which is the shape the real graph has.
+      const many = 2 + Math.floor(random() * 4);
+      for (let n = 0; n < many; n += 1) {
+        const to = Math.floor(random() ** 2 * here.length);
+        add(here[i], here[to]);
+      }
+    }
+  }
+  for (let n = 0; n < 70; n += 1) {
+    const from = byArea[Math.floor(random() * byArea.length)];
+    const to = byArea[Math.floor(random() * byArea.length)];
+    add(from[Math.floor(random() * from.length)], to[Math.floor(random() * to.length)]);
+  }
+
+  /*
+    What no reader here understands. Real code, most of it -- the Go sidecars,
+    the migrations, the stylesheets -- and the map's own measure of what it
+    cannot see. Drawn as a count and never as boxes, which is why a list of
+    plain paths is the whole of what this needs.
+  */
+  const unread: string[] = [];
+  for (let i = 0; i < 190; i += 1) unread.push(`sidecars/${["echo", "email", "telegram", "web"][i % 4]}/${STEMS[i % STEMS.length]}_${i}.go`);
+  for (let i = 0; i < 140; i += 1) unread.push(`core/migrations/${String(i).padStart(4, "0")}_${STEMS[i % STEMS.length]}.sql`);
+
+  return {
+    modules,
+    imports,
+    unread,
+    foreign: [],
+    seam: {
+      served: [],
+      calls: 0,
+      matched: 0,
+      computed: [],
+      unmatched: [],
+      opaque: [],
+      uncalled: [],
+    },
+    junction: {
+      decisions: [],
+      unclaimed: [],
+      unmatched: [],
+      counts: {
+        decisions: 0,
+        declared: 0,
+        ambiguous: 0,
+        silent: 0,
+        unnumbered: 0,
+        unclaimed: modules.length - 112,
+        unmatched: 112,
+      },
+    },
+    standings: {},
+    stamps: {
+      settled: 0,
+      partial: 0,
+      never: 0,
+      lapsed: 0,
+      withdrawn: 0,
+      guessed: 0,
+      no_anchor: 0,
+      untracked: 0,
+      no_repository: 0,
+      unwatched: 0,
+      decisions: 0,
+    },
+    triage: {},
+    triage_counts: {
+      flagged: 0,
+      silenced: 0,
+      untriaged: 0,
+      unseen: 0,
+      waiting: 0,
+      unchecked: 0,
+    },
+    git_would_not_answer: false,
+    recency: { window: 200, ages: {} },
+    last_triaged_at: null,
+  };
+}
+
+/** Built once: the walk is deterministic, and the shell asks for it on every open. */
+const MAP: ProjectMap = generatedMap();
+
+/* -------------------------------------------------------------- the specs -- */
+
+/**
+ * What the map's picker offers to read.
+ *
+ * Enough of them to overflow the box -- the picker caps at `max-h-64` and
+ * scrolls, and a list of three would photograph a control that never reaches
+ * the state it was built for.
+ */
+const SPECS: string[] = [
+  "2026-07-17-agenticos-foundation-and-autopilot-design",
+  "2026-07-20-telegram-channel-design",
+  "2026-07-28-email-pillar-design",
+  "2026-07-29-autopilot-job-graph-design",
+  "2026-07-29-harness-instrumentation-and-verification-design",
+  "2026-07-30-pilar-de-voz-design",
+  "2026-08-02-fila-vcs-design",
+  "2026-08-04-trabalho-noturno-e-jobs-paralelos-design",
+  "2026-08-09-canvas-da-frota-design",
+  "2026-08-11-equipas-de-agentes-design",
+  "2026-08-15-pilar-de-browser-design",
+  "2026-08-17-novo-frontend-design",
+  "2026-08-24-mapa-do-projeto-design",
+  "2026-08-27-dono-da-arvore-principal-design",
+];
+
 /* ------------------------------------------------------------- the router -- */
 
 /**
@@ -875,6 +1092,88 @@ export function answer(path: string, init?: RequestInit): unknown {
     if (reader === "ls") return TREE[query.get("path") ?? ""] ?? [];
     return query.get("q") === null ? [] : MATCHES;
   }
+
+  /*
+    The four readings the Estado mode leads with — and the reason that mode
+    could not be photographed at all. `ModeEstado` reads
+    `readings.data.efficiency.median_total_tokens`, so the empty-list default
+    threw before a single control was drawn and the whole page came back as the
+    boundary's apology. Same failure as `/concurrency` above, one route along.
+
+    Deliberately not a happy path: some of the runs reported no usage at all,
+    the median moved the right way against the window before it, and fifteen
+    runs were never judged because nothing asked them to be. Every one of those
+    is a sentence this page has to be able to say.
+  */
+  const readings = /^\/projects\/([^/]+)\/readings$/.exec(route);
+  if (readings !== null) {
+    return {
+      window_days: 30,
+      efficiency: {
+        measured_runs: 41,
+        unmeasured_runs: 6,
+        median_total_tokens: 128_400,
+        previous_median_total_tokens: 154_900,
+      },
+      cost: { usd: 13.16, runs: 41 },
+      gate: { passed: 22, failed: 3, errored: 1, no_gate: 15 },
+      delivered: { landed: 9, timed: 7, median_minutes: 34 },
+    } satisfies ProjectReadings;
+  }
+
+  /*
+    Where work lands, and what is standing beside it. An object and not a list,
+    which is why the empty default could not stand in for it: the panel reads
+    `.branches.length` and an array has no such field.
+
+    One branch is `measured: false` on purpose. That is the case the type's own
+    comment exists for -- nobody knows how far ahead it is -- and it is drawn
+    differently from `0/0`, so a preview without one photographs a panel that
+    has never been asked the question.
+  */
+  const branches = /^\/projects\/([^/]+)\/branches$/.exec(route);
+  if (branches !== null) {
+    return {
+      integration: "master",
+      branches: [
+        {
+          name: "master",
+          ahead: 0,
+          behind: 0,
+          measured: true,
+          last_commit_at: ago(2 * 3_600_000),
+          last_subject: "merge feat/inspector-de-projectos into master",
+        },
+        {
+          name: "feat/leitor-de-comandos",
+          ahead: 7,
+          behind: 15,
+          measured: true,
+          last_commit_at: ago(DAY),
+          last_subject: "three limits that pace autonomy nobody asked for",
+        },
+        {
+          name: "tmp/daemon-timeout",
+          ahead: 0,
+          behind: 0,
+          measured: false,
+          last_commit_at: ago(9 * DAY),
+          last_subject: "a deadline that outlives the gate it guards",
+        },
+      ],
+      omitted: 0,
+    } satisfies Branches;
+  }
+
+  /*
+    The documents the map can be asked to read. Real slugs from this repository,
+    long ones included: the picker truncates, and a fixture of short invented
+    names would photograph a box that never has to.
+  */
+  if (/^\/projects\/[^/]+\/map\/specs$/.test(route)) return SPECS;
+  if (/^\/projects\/[^/]+\/map$/.test(route)) return MAP;
+  /* An object with a list inside it, so the empty-list default cannot stand in. */
+  if (/^\/projects\/[^/]+\/map\/silenced$/.test(route)) return { rows: [], total: 0 };
 
   if (path === "/teams") return TEAMS;
   if (path === "/team-runs") return RUNS;
