@@ -55,7 +55,7 @@ import { buildSides, isBlindSpot, type Sides } from "./map-sides";
  * library that may adjust them would put those two apart.
  */
 
-export interface MapaCanvasProps {
+export interface MapCanvasProps {
   /** Needed only by the file level, which is the one thing here that reads a route of its own. */
   projectId: string;
   modules: MapModule[];
@@ -90,7 +90,7 @@ export interface MapaCanvasProps {
   standings: Record<string, Standing>;
 }
 
-export function MapaCanvas({
+export function MapCanvas({
   projectId,
   modules,
   imports,
@@ -99,7 +99,7 @@ export function MapaCanvas({
   seam,
   junction,
   standings,
-}: MapaCanvasProps) {
+}: MapCanvasProps) {
   const [open, setOpen] = useState<string | null>(null);
   const [openFile, setOpenFile] = useState<string | null>(null);
   const matrix = useMemo(() => buildCommunities(modules, imports), [modules, imports]);

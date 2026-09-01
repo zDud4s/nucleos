@@ -1,9 +1,9 @@
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useProjects } from "../data/system";
 import { StateBadge } from "../ui";
-import { ModeEstado } from "./ModeEstado";
-import { ModeMapa } from "./ModeMapa";
-import { ModeCodigo } from "./ModeCodigo";
+import { ModeState } from "./ModeState";
+import { ModeMap } from "./ModeMap";
+import { ModeCode } from "./ModeCode";
 import { ModeWorkflows } from "./ModeWorkflows";
 
 /**
@@ -103,11 +103,11 @@ export function Workspace() {
       </nav>
 
       {mode === "estado" ? (
-        <ModeEstado projectId={projectId} answered={projects.data !== undefined} />
+        <ModeState projectId={projectId} answered={projects.data !== undefined} />
       ) : null}
-      {mode === "mapa" ? <ModeMapa projectId={projectId} /> : null}
+      {mode === "mapa" ? <ModeMap projectId={projectId} /> : null}
       {mode === "codigo" ? (
-        <ModeCodigo
+        <ModeCode
           projectId={projectId}
           run={search.run ?? null}
           /*

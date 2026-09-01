@@ -1,6 +1,6 @@
 // §spec mapa-do-projeto
 import type { Anchored, Junction } from "../data/project-map";
-import { Orfa } from "./Orfa";
+import { OrphanCheck } from "./OrphanCheck";
 
 /**
  * The junction: the nodes that do not match.
@@ -17,7 +17,7 @@ import { Orfa } from "./Orfa";
  * the mismatches lead, and no ambiguous line is ever drawn as a confirmation — a map that is
  * confidently wrong is the disease this feature treats, with better pixels.
  *
- * **Presentational, fed by the query `ModeMapa` already holds.** It reads the map once and never
+ * **Presentational, fed by the query `ModeMap` already holds.** It reads the map once and never
  * again — reading it a second time here would put two answers to one question on one screen, free
  * to disagree.
  *
@@ -28,7 +28,7 @@ import { Orfa } from "./Orfa";
  * button that asks git a question, on the rows of *declared, with no code* and on no others, and
  * it is the opposite of a way to accept without reading: it exists because the pile it sits in is
  * built entirely out of `§` comments, and a comment a rewrite deleted lands a decision there
- * looking exactly like one nobody ever implemented. See {@link Orfa}. It is asked per row and
+ * looking exactly like one nobody ever implemented. See {@link OrphanCheck}. It is asked per row and
  * never on render, so this surface still issues no request of its own when it opens.
  *
  * **No percentage, no single score, no bar** (§12). A collapsed number is exactly the collapse §5
@@ -36,12 +36,12 @@ import { Orfa } from "./Orfa";
  * looks like an answer and was never checked against anything.
  */
 
-export interface JuncaoProps {
+export interface JunctionPanelProps {
   junction: Junction;
   /**
    * Whose history §14's guard asks about.
    *
-   * Threaded down rather than read from a route here, the way `Carimbos` takes it: this component
+   * Threaded down rather than read from a route here, the way `StampsPanel` takes it: this component
    * is handed everything it draws, and a second source for the project id would be a second
    * answer to which project is on screen.
    */
@@ -66,7 +66,7 @@ function plural(count: number, one: string, many: string): string {
   return count === 1 ? one : many;
 }
 
-export function Juncao({ junction, projectId }: JuncaoProps) {
+export function JunctionPanel({ junction, projectId }: JunctionPanelProps) {
   const { decisions, unclaimed, counts } = junction;
 
   /*
@@ -194,7 +194,7 @@ function Silent({ rows, projectId }: { rows: Anchored[]; projectId: string }) {
       <ul aria-label="Decisions nothing names" className="flex flex-col gap-2">
         {shown.map((row) => (
           <Line key={row.decision_id} row={row}>
-            <Orfa projectId={projectId} row={row} />
+            <OrphanCheck projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>

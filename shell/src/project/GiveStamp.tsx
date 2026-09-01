@@ -7,7 +7,7 @@ import { useCarimbar, type Anchored } from "../data/project-map";
  * The owner's verdict on one decision, as three buttons and a note (§5.2).
  *
  * **A module of its own because two piles now ask for it, and there are still only three
- * verdicts.** It began inside `Carimbos.tsx`, whose header said it was the one surface in this mode
+ * verdicts.** It began inside `StampsPanel.tsx`, whose header said it was the one surface in this mode
  * with buttons — true while the only thing that reached the owner was a stamp of theirs going
  * stale. Slice 5 added the other half of §5.3's `J`: the triager flags a decision nobody has
  * stamped, and §5.3 takes that decision out of `K` precisely because it has *arrived*. A flagged
@@ -34,12 +34,12 @@ import { useCarimbar, type Anchored } from "../data/project-map";
  * a surface whose whole promise is that you know what you just answered.
  */
 
-export interface CarimbarProps {
+export interface GiveStampProps {
   projectId: string;
   row: Anchored;
 }
 
-export function Carimbar({ projectId, row }: CarimbarProps) {
+export function GiveStamp({ projectId, row }: GiveStampProps) {
   const [note, setNote] = useState("");
   const carimbar = useCarimbar(projectId);
 

@@ -1,13 +1,13 @@
 // §spec mapa-do-projeto
 import { useProjectMap } from "../data/project-map";
-import { MapaCanvas } from "../canvas/MapaCanvas";
+import { MapCanvas } from "../canvas/MapCanvas";
 import { declaredCoverage } from "../canvas/map-model";
 import { drawableLinks } from "../canvas/map-graphs";
-import { Carimbos } from "./Carimbos";
-import { ExtrairSpec } from "./ExtrairSpec";
-import { Juncao } from "./Juncao";
-import { MapaPorAprovar } from "./MapaPorAprovar";
-import { Triagem } from "./Triagem";
+import { StampsPanel } from "./StampsPanel";
+import { ExtractSpec } from "./ExtractSpec";
+import { JunctionPanel } from "./JunctionPanel";
+import { DecisionsWaiting } from "./DecisionsWaiting";
+import { TriagePanel } from "./TriagePanel";
 
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
@@ -43,16 +43,16 @@ import { Triagem } from "./Triagem";
  * screen, free to disagree about a project whose folder moved between them.
  */
 
-export interface ModeMapaProps {
+export interface ModeMapProps {
   projectId: string;
 }
 
-export function ModeMapa({ projectId }: ModeMapaProps) {
+export function ModeMap({ projectId }: ModeMapProps) {
   return (
     <div className="flex flex-col gap-8">
       <Derived projectId={projectId} />
-      <ExtrairSpec projectId={projectId} />
-      <MapaPorAprovar projectId={projectId} />
+      <ExtractSpec projectId={projectId} />
+      <DecisionsWaiting projectId={projectId} />
       <p className="max-w-prose text-sm text-text-muted">
         Structure, intention, the join between them, your verdict on each line, and what a model
         thought was worth your eyes. The evidence layer is a slice that does not exist yet — nothing
@@ -163,7 +163,7 @@ function Derived({ projectId }: { projectId: string }) {
         declared which document its sections belong to. The picture is where that is visible, so it
         is read first.
       */}
-      <MapaCanvas
+      <MapCanvas
         projectId={projectId}
         modules={modules}
         imports={imports}
@@ -173,7 +173,7 @@ function Derived({ projectId }: { projectId: string }) {
         junction={junction}
         standings={standings}
       />
-      <Juncao junction={junction} projectId={projectId} />
+      <JunctionPanel junction={junction} projectId={projectId} />
       {/*
         Drawn here rather than as a panel of its own for the reason the junction is: the standings,
         the header and `git_would_not_answer` come back on this same answer, flattened. A query of
@@ -181,7 +181,7 @@ function Derived({ projectId }: { projectId: string }) {
         readings of one question on one screen, free to disagree about a project whose folder moved
         between them.
       */}
-      <Carimbos
+      <StampsPanel
         projectId={projectId}
         junction={junction}
         standings={standings}
@@ -202,7 +202,7 @@ function Derived({ projectId }: { projectId: string }) {
         numbers — why `J` is larger than the lapsed pile and why silencing did not make `K`
         smaller — so it reads as the answer to a question the header has just raised.
       */}
-      <Triagem
+      <TriagePanel
         projectId={projectId}
         junction={junction}
         triage={triage}

@@ -47,7 +47,7 @@ export function claimsFor(junction: Junction, path: string): Anchored[] {
 /**
  * What the owner has said about a decision, in the words the stamp panel already uses.
  *
- * **Taken from `Carimbos` rather than invented**, because two screens naming one state differently
+ * **Taken from `StampsPanel` rather than invented**, because two screens naming one state differently
  * is the same decision wearing two faces — and this map exists to catch exactly that kind of quiet
  * disagreement, not to add one.
  */

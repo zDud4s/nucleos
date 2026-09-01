@@ -17,7 +17,7 @@ import {
 } from "../test/harness";
 import { ApiRefusal } from "../data/client";
 import type { ProjectReadings } from "../data/project-readings";
-import { ModeEstado } from "./ModeEstado";
+import { ModeState } from "./ModeState";
 import { normaliseMode } from "./Workspace";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -221,7 +221,7 @@ describe("the project workspace", () => {
     // gate, so by the time it paints the roster has already answered and this
     // state is over. Mounting the mode directly is the only way to see it.
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
-    const { container } = renderWithQuery(<ModeEstado projectId="nucleos" answered={false} />);
+    const { container } = renderWithQuery(<ModeState projectId="nucleos" answered={false} />);
 
     const leading = container.querySelector('section[aria-label="Leading"]');
     expect(leading?.textContent).toBe("Reading nucleos…");

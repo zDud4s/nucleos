@@ -620,5 +620,5 @@ function shortHash(hash: string): string {
   return hash.replace(/^sha256:/, "").slice(0, 12);
 }
 
-/** Re-exported so `ModeEstado` can lead with drift without importing the data layer twice. */
+/** Re-exported so `ModeState` can lead with drift without importing the data layer twice. */
 export { driftingWorkflows };

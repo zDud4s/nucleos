@@ -15,19 +15,19 @@ import {
   type TriageReport,
 } from "../data/project-map";
 import { RelativeTime } from "../ui";
-import { Carimbar } from "./Carimbar";
+import { GiveStamp } from "./GiveStamp";
 
 /**
  * The triager: what a model thought was worth the owner's eyes, and what it decided was not.
  *
- * The third axis. `Juncao` says what can be known without anybody looking, `Carimbos` says what the
+ * The third axis. `JunctionPanel` says what can be known without anybody looking, `StampsPanel` says what the
  * owner said and whether it is still true, and this says what a **model** thought — three readings
  * that §5 refuses to flatten, because *"achatá-las numa só punha o triador e o dono a falar pela
  * mesma boca"*.
  *
  * **This panel owns two of §5.1's four derived states and draws neither of the other two.** *À
  * espera* and *silenciado* are the triager's; *declarado sem código* and *código sem dono* come out
- * of the junction and `Juncao` already draws them. Two panels answering one question is the
+ * of the junction and `JunctionPanel` already draws them. Two panels answering one question is the
  * confusion this mode exists to remove.
  *
  * **Nothing here is drawn in a colour, and that is §6.1 rather than restraint.** *"Se colapsassem,
@@ -35,7 +35,7 @@ import { Carimbar } from "./Carimbar";
  * passava a ser a falsa confiança de novo, agora com autoridade de semáforo."* The safest reading of
  * that paragraph is not *a different green*; it is that a silence has no positive visual weight at
  * all, because a silence is a claim about the **triager** — *sem sinal de problema* — and never a
- * claim about the code. `Carimbos` reached the same place from the other side and for the same
+ * claim about the code. `StampsPanel` reached the same place from the other side and for the same
  * reason: every pile is announced by its own heading and its own sentence, which is a form nobody
  * has to be able to separate two hues to read.
  *
@@ -54,7 +54,7 @@ import { Carimbar } from "./Carimbar";
  * colapso que o §5 proíbe"*. Every number below keeps the words that say which fact it is.
  */
 
-export interface TriagemProps {
+export interface TriagePanelProps {
   projectId: string;
   /** The decisions, already in §10's order — the núcleo sorts before it answers. */
   junction: Junction;
@@ -79,7 +79,7 @@ export interface TriagemProps {
 /**
  * How many rows of a pile are drawn before it is summarised.
  *
- * The number `Juncao` and `Carimbos` both use, and deliberately its own constant rather than a
+ * The number `JunctionPanel` and `StampsPanel` both use, and deliberately its own constant rather than a
  * shared one: three panels over three different piles, and the day one of them wants a different cap
  * the others must not move with it. Whatever is cut is counted out loud beside it.
  */
@@ -100,14 +100,14 @@ interface Judged {
   held: Held;
 }
 
-export function Triagem({
+export function TriagePanel({
   projectId,
   junction,
   triage,
   counts,
   recency,
   lastTriagedAt,
-}: TriagemProps) {
+}: TriagePanelProps) {
   const pile = useSilencedPile(projectId);
 
   /*
@@ -204,7 +204,7 @@ export function Triagem({
 /**
  * The run, and the brain that pays for it.
  *
- * **The brain is chosen here, per press, and is never a setting** — the argument `ExtrairSpec`
+ * **The brain is chosen here, per press, and is never a setting** — the argument `ExtractSpec`
  * makes about the same choice: a setting turns the núcleo's refusal to substitute one brain for
  * another into somebody's permanent default. `cloud` is preselected because it is the one this
  * machine is certain to be able to serve.
@@ -255,7 +255,7 @@ function Run({ projectId }: { projectId: string }) {
       </div>
 
       {/*
-        Said out loud, for `ExtrairSpec`'s reason: the route is synchronous and a batch of model
+        Said out loud, for `ExtractSpec`'s reason: the route is synchronous and a batch of model
         calls is minutes, so a surface that went quiet would look broken at exactly the moment it is
         working.
       */}
@@ -411,10 +411,10 @@ function Ordering({ window }: { window: number | null }) {
  * §5.1's *à espera*: the decisions a model thought deserve the owner's eyes.
  *
  * **The only pile on this panel carrying the verdict control, and that is not generosity.** §5.3
- * takes a flagged decision out of `K` because it has arrived, so `Carimbos` stops drawing it — and a
+ * takes a flagged decision out of `K` because it has arrived, so `StampsPanel` stops drawing it — and a
  * flag with nowhere to answer it would be a nag with no answer, which is how somebody learns to stop
  * reading a queue. The silenced pile below deliberately has none: those rows are still counted in
- * the debt and `Carimbos` still draws them, and two stamping controls for one decision on one screen
+ * the debt and `StampsPanel` still draws them, and two stamping controls for one decision on one screen
  * is the confusion this mode removes.
  *
  * **The way out is a stamp and never a dismissal.** A flag stays until its anchor code moves, which
@@ -451,7 +451,7 @@ function Flagged({
         without saying anything is the didn&rsquo;t-know this map is here to convert.
       </p>
       <Banded rows={shown} recency={recency} label="Decisions the triager flagged">
-        {(pair) => <Carimbar projectId={projectId} row={pair.row} />}
+        {(pair) => <GiveStamp projectId={projectId} row={pair.row} />}
       </Banded>
       {hidden > 0 ? <Hidden count={hidden} /> : null}
     </div>
@@ -501,7 +501,7 @@ function Silenced({ rows, recency }: { rows: Judged[]; recency: Recency }) {
  * backlog nobody has read — §1's false confidence, manufactured by the arithmetic of its own cure,
  * with the sum still reconciling perfectly.
  *
- * The header of `Carimbos` prints this same number, and the repetition is deliberate rather than
+ * The header of `StampsPanel` prints this same number, and the repetition is deliberate rather than
  * an oversight: it is one field read twice, so the two cannot disagree, and this is the one place on
  * the screen where somebody has just watched a queue empty and needs to be told what that did not
  * mean.

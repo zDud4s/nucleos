@@ -21,7 +21,7 @@ import type {
   Watch,
 } from "../data/project-map";
 import { renderWithQuery } from "../test/harness";
-import { Carimbos } from "./Carimbos";
+import { StampsPanel } from "./StampsPanel";
 
 /** One approved decision. The anchor rarely matters here — this panel reads the verdict axis. */
 function anchored(overrides: Partial<Anchored> = {}): Anchored {
@@ -155,7 +155,7 @@ function open(rows: Row[], options: { gitWouldNotAnswer?: boolean; refusal?: unk
   else daemon.apiFetch.mockRejectedValue(options.refusal);
 
   return renderWithQuery(
-    <Carimbos
+    <StampsPanel
       projectId="nucleos"
       junction={junction(rows.map((pair) => pair.row))}
       standings={standings}

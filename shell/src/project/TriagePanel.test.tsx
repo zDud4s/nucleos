@@ -21,7 +21,7 @@ import type {
   TriageReport,
 } from "../data/project-map";
 import { renderWithQuery } from "../test/harness";
-import { Triagem } from "./Triagem";
+import { TriagePanel } from "./TriagePanel";
 
 /** One approved decision nobody has stamped, which is the only kind this panel ever draws. */
 function anchored(overrides: Partial<Anchored> = {}): Anchored {
@@ -181,7 +181,7 @@ function open(options: Open = {}) {
   });
 
   return renderWithQuery(
-    <Triagem
+    <TriagePanel
       projectId="nucleos"
       junction={junction(rows.map((pair) => pair.row))}
       triage={triage}
@@ -211,7 +211,7 @@ describe("what the triager thought, and what it never gets to decide", () => {
    * §5.1 names four derived states and this panel owns two of them. They have to be told apart on
    * screen, and — the half §6.1 spends a paragraph on — *silenciado* may never read as done:
    * *"se colapsassem, a autoridade que foi retirada ao modelo era-lhe devolvida pela porta da
-   * renderização."* The other two states are the junction's and are drawn by `Juncao`; two panels
+   * renderização."* The other two states are the junction's and are drawn by `JunctionPanel`; two panels
    * answering one question is the confusion this mode removes.
    */
   it("draws flagged and silenced apart, and never draws a silence as done", () => {
