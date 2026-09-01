@@ -383,6 +383,15 @@ const SHOTS_TO_TAKE = [
      communities stays put, the open one is marked, and every sibling is one
      click away rather than three. */
   ["34-map-community", { path: "/projects/alpha/mapa", press: "council" }],
+
+  /* The fourth mode, so the workspace can be looked at as the set of four it
+     actually is rather than one page at a time. */
+  ["35-workflows", { path: "/projects/alpha/workflows" }],
+
+  /* A door that is not the picture, which is what the row of views exists for:
+     the junction reached without scrolling a matrix, and the seam still above
+     it — the one thing §16.5 says a view may not take with it. */
+  ["36-map-junction", { path: "/projects/alpha/mapa", press: "Junction" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));

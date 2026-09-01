@@ -481,8 +481,16 @@ describe("the project workspace", () => {
     await renderApp({ initialPath: "/projects/nucleos/mapa" });
 
     // Was `/declaring nothing they implement/`, which this mode no longer says: that count is the
-    // junction's `unclaimed` now, and the structure panel reports what it alone knows.
+    // junction's `unclaimed` now, and the headline reports what it alone knows.
     expect(await screen.findByText(/this reader could read/)).toBeTruthy();
+
+    /*
+      The junction is behind its own door since the mode became five views, so the click is part of
+      what this test proves: the door is there, it is wired, and the panel behind it reads the same
+      answer the headline did. Asserting only the headline would leave a typo in the view condition
+      showing an empty page under a chip that still looked right.
+    */
+    fireEvent.click(screen.getByRole("button", { name: /^Junction/ }));
     expect(screen.getByText(/module nobody asked for/)).toBeTruthy();
   });
 });

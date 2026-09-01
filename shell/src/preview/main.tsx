@@ -130,10 +130,19 @@ function openTab(name: string): boolean {
  * Matched on the trimmed label and clicked, rather than by selector: the label
  * is what a person reads, so a shot that names one is describing what somebody
  * would do rather than what the DOM currently happens to look like.
+ *
+ * Exactly first, then by prefix — the same fallback `openTab` above already
+ * makes, and for the same reason. A control that carries a number reads
+ * `Junction—` or `Specs14` to `textContent`, and a shot naming the word a
+ * person would say should not have to spell the count it happens to have on
+ * the day. Exact wins where both would match, so no existing shot changes
+ * which button it presses.
  */
 function pressButton(name: string): boolean {
   const buttons = [...document.querySelectorAll("button")];
-  const wanted = buttons.find((one) => (one.textContent ?? "").trim() === name);
+  const label = (one: Element) => (one.textContent ?? "").trim();
+  const wanted =
+    buttons.find((one) => label(one) === name) ?? buttons.find((one) => label(one).startsWith(name));
   if (wanted === undefined) return false;
   wanted.click();
   return true;
