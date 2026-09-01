@@ -106,6 +106,18 @@ def cases(tmp):
     yield ("claude context per turn excludes output",
            got["contexts"], [9600])
 
+    # --- Cache weight: Claude fields are disjoint, Codex cached input is not --
+    default = usage_split.collect_claude(30, None, root=root, cache_weight=1.0)
+    weighted = usage_split.collect_claude(30, None, root=root, cache_weight=0.1)
+    yield ("default cache weight leaves Claude totals unchanged",
+           total_of(default["weeks"]), 9650)
+    yield ("Claude cache weight discounts reads, not writes or output",
+           total_of(weighted["weeks"]), 1550.0)
+    yield ("cache weight does not discount Claude context",
+           weighted["contexts"], [9600])
+    yield ("cache weight does not discount context-ceiling session tokens",
+           weighted["sessions"]["s1"]["tokens"], 9650)
+
     # --- Claude: the lane split -----------------------------------------------
     root = os.path.join(tmp, "claude-lanes")
     write_jsonl(os.path.join(root, "proj", "a.jsonl"), [
@@ -156,6 +168,19 @@ def cases(tmp):
     got = usage_split.collect_codex(30, root=root)
     yield ("codex total_tokens already includes cached input",
            total_of(got["weeks"]), 529455)
+    default = usage_split.collect_codex(30, root=root, cache_weight=1.0)
+    weighted = usage_split.collect_codex(30, root=root, cache_weight=0.1)
+    yield ("default cache weight leaves Codex totals unchanged",
+           total_of(default["weeks"]), 529455)
+    yield ("Codex cache weight discounts only the cached subset",
+           total_of(weighted["weeks"]), 96072.6)
+
+    # A weighted total needs a label; otherwise it reads like a raw token count.
+    yield ("weighted reports label the cache-read weight",
+           "cache-read weight of **0.1**" in usage_split.render(
+               {"weeks": weighted["weeks"], "models": {}, "contexts": [], "sessions": {},
+                "raw_total": total_of(weighted["weeks"])},
+               weighted, 30, 250_000, 15, 0.1), True)
 
     # --- Codex: only the weekly rate-limit window counts -----------------------
     root = os.path.join(tmp, "codex-rate")

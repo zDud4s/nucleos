@@ -23,6 +23,9 @@ Accounting differs between the two vendors and is normalized here:
   Codex    ``cached_input_tokens`` is a SUBSET of ``input_tokens``, and
            ``total_tokens`` = input + output. Adding the subset double-counts.
 
+Cache reads can be weighted below fresh input to model billed usage. Cache
+writes remain unweighted: they bill above fresh input, not below it.
+
 ``total_token_usage`` in a Codex rollout is CUMULATIVE per session -- one line
 per turn, each superseding the last. Only the final one counts; summing them
 overstates a session by roughly its turn count.
@@ -36,6 +39,7 @@ Read-only over ``~/.claude/projects/`` and ``~/.codex/sessions/``.
 Usage:
     python scripts/usage_split.py                    # last 30 days
     python scripts/usage_split.py --days 7
+    python scripts/usage_split.py --cache-weight 0.1 # bill cache reads at 10%
     python scripts/usage_split.py --ceiling 250000   # session context ceiling
     python scripts/usage_split.py --json split.json
 """
@@ -103,7 +107,7 @@ def recent_files(root: str, pattern: str, cutoff: float):
     return out
 
 
-def collect_claude(days: int, project_filter, root=None):
+def collect_claude(days: int, project_filter, root=None, cache_weight=1.0):
     # `root` is the seam the test uses: it builds a transcript tree in a temp
     # directory rather than reading the machine's real session history, which
     # would make the test neither hermetic nor repeatable.
@@ -114,6 +118,7 @@ def collect_claude(days: int, project_filter, root=None):
     contexts = []                     # controller context per turn
     sessions = defaultdict(lambda: {"tokens": 0, "turns": 0, "ctx_max": 0,
                                     "ctx_first": None, "model": "?", "project": "?"})
+    raw_total = 0
 
     for path in recent_files(root, os.path.join("**", "*.jsonl"), cutoff):
         project = os.path.basename(os.path.dirname(path))
@@ -137,7 +142,12 @@ def collect_claude(days: int, project_filter, root=None):
             # cost driver: it is re-read every turn, so a session's bill grows
             # with the square of its length, not linearly.
             ctx = fresh + cread + ccreate
-            total = ctx + out
+            # Cache reads may bill below fresh input; cache writes do not. Keep
+            # context raw: a discounted read still occupies the model window.
+            weighted_cread = cread if cache_weight == 1.0 else cread * cache_weight
+            raw_usage = ctx + out
+            total = fresh + weighted_cread + ccreate + out
+            raw_total += raw_usage
             lane = "subagent" if d.get("isSidechain") else "controller"
             model = msg.get("model") or "?"
 
@@ -154,7 +164,9 @@ def collect_claude(days: int, project_filter, root=None):
                 contexts.append(ctx)
                 sid = d.get("sessionId") or path
                 s = sessions[sid]
-                s["tokens"] += total
+                # The ceiling section describes window size, so its session
+                # figures stay raw even when the report totals are weighted.
+                s["tokens"] += raw_usage
                 s["turns"] += 1
                 s["ctx_max"] = max(s["ctx_max"], ctx)
                 if s["ctx_first"] is None:
@@ -162,10 +174,11 @@ def collect_claude(days: int, project_filter, root=None):
                 s["model"] = model
                 s["project"] = project
 
-    return {"weeks": weeks, "models": models, "contexts": contexts, "sessions": sessions}
+    return {"weeks": weeks, "models": models, "contexts": contexts, "sessions": sessions,
+            "raw_total": raw_total}
 
 
-def collect_codex(days: int, root=None):
+def collect_codex(days: int, root=None, cache_weight=1.0):
     root = root or os.path.join(os.path.expanduser("~"), ".codex", "sessions")
     cutoff = time.time() - days * 86400
     weeks = defaultdict(Counter)
@@ -195,9 +208,13 @@ def collect_codex(days: int, root=None):
         sessions += 1
         wk = weeks[iso_week(last_dt)]
         # total_tokens already equals input + output, and cached_input_tokens is
-        # a subset of input -- adding it would double-count.
-        wk["total"] += last_usage.get("total_tokens") or 0
-        wk["cached"] += last_usage.get("cached_input_tokens") or 0
+        # a subset of input. Weight only that subset; adding it would double-count.
+        total_tokens = last_usage.get("total_tokens") or 0
+        cached = last_usage.get("cached_input_tokens") or 0
+        weighted_total = (total_tokens if cache_weight == 1.0 else
+                          total_tokens - cached + cached * cache_weight)
+        wk["total"] += weighted_total
+        wk["cached"] += cached
         wk["output"] += last_usage.get("output_tokens") or 0
 
     rate.sort()
@@ -208,8 +225,11 @@ def pct(part, whole) -> str:
     return f"{100 * part / whole:.1f}%" if whole else "--"
 
 
-def render(claude, codex, days: int, ceiling: int, top: int) -> str:
+def render(claude, codex, days: int, ceiling: int, top: int, cache_weight=1.0) -> str:
     out = [f"# Usage split - Claude vs Codex, last {days} days", ""]
+    if cache_weight != 1.0:
+        out += [f"> Totals use a cache-read weight of **{cache_weight:g}**. Context and "
+                "context-ceiling figures remain raw window size.", ""]
 
     all_weeks = sorted(set(claude["weeks"]) | set(codex["weeks"]))
     out += ["## Weekly split", "",
@@ -220,6 +240,7 @@ def render(claude, codex, days: int, ceiling: int, top: int) -> str:
         x = codex["weeks"][wk]["total"]
         out.append(f"| {wk} | {c/1e6:,.0f}M | {x/1e6:,.0f}M | {pct(c, c + x)} |")
     ct = sum(w["total"] for w in claude["weeks"].values())
+    raw_ct = claude.get("raw_total", ct)
     xt = sum(w["total"] for w in codex["weeks"].values())
     out += [f"| **total** | **{ct/1e6:,.0f}M** | **{xt/1e6:,.0f}M** | **{pct(ct, ct + xt)}** |", ""]
     if xt == 0 and ct > 0:
@@ -261,7 +282,7 @@ def render(claude, codex, days: int, ceiling: int, top: int) -> str:
     else:
         share = sum(s["tokens"] for _, s in over)
         out += [f"{len(over)} of {len(claude['sessions'])} sessions, "
-                f"{pct(share, ct)} of all Claude tokens.", "",
+                f"{pct(share, raw_ct)} of all Claude tokens.", "",
                 "| session | project | model | turns | context in -> peak | tokens |",
                 "|---|---|---|---:|---|---:|"]
         for sid, s in over[:top]:
@@ -298,13 +319,15 @@ def main() -> int:
     ap.add_argument("--project", help="only Claude projects whose directory name contains this")
     ap.add_argument("--json", dest="json_path", help="also dump raw aggregates to this JSON file")
     ap.add_argument("--top", type=int, default=15, help="rows per section (default 15)")
+    ap.add_argument("--cache-weight", type=float, default=1.0,
+                    help="bill cache reads at this weight (default 1.0)")
     args = ap.parse_args()
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    claude = collect_claude(args.days, args.project)
-    codex = collect_codex(args.days)
+    claude = collect_claude(args.days, args.project, cache_weight=args.cache_weight)
+    codex = collect_codex(args.days, cache_weight=args.cache_weight)
 
     if args.json_path:
         payload = {
@@ -320,7 +343,7 @@ def main() -> int:
         with open(args.json_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=1, ensure_ascii=False)
 
-    print(render(claude, codex, args.days, args.ceiling, args.top))
+    print(render(claude, codex, args.days, args.ceiling, args.top, args.cache_weight))
     return 0
 
 
