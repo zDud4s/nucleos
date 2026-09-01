@@ -56,15 +56,25 @@ export function gateOf(project: ProjectSummary): Gate {
  * surface answers is which of twenty-five projects is broken, and a table that hid that under `A`
  * for `ANSup` would be the wall of chips again with straighter edges.
  *
- * Four ranks, in the order somebody can act on them:
+ * Five ranks, in the order somebody can act on them:
  *
  * 0. **The folder is a problem** — missing or never named. Nothing this project does can run, so
  *    every other reading about it is stale by definition.
  * 1. **The gate said no.** The code is broken; that is the one verdict that means it.
  * 2. **Something is waiting on a person.** Work that has stopped, and only a human restarts it.
  * 3. Everything else.
+ * 4. **It is switched off**, which is nobody asking it for anything.
+ *
+ * **The last rank is checked first, and that is the point.** Every rank above it says *this needs
+ * somebody now*, and none of them can be true of a project the owner turned off. The version this
+ * replaces put a dormant project at the very top of the page for having no folder — which is not a
+ * fault in something switched off, it is what switched off looks like — and pushed the one that was
+ * acting, failing its gate and holding two decisions underneath it. Nothing is hidden by the move:
+ * the row still carries every reading it carried before, in the same columns. Only the shouting
+ * stops.
  */
 export function rankOf(project: ProjectSummary): number {
+  if (project.mode === "off") return 4;
   if (folderOf(project) !== "ok") return 0;
   if (gateOf(project) === "failed") return 1;
   if (project.open_proposals > 0) return 2;
@@ -101,6 +111,13 @@ export function inAttentionOrder(rows: ProjectSummary[]): ProjectSummary[] {
  *
  * Only non-zero facts are mentioned. "25 projects · 0 broken" makes somebody read a number to learn
  * nothing, and a page that reports its own good news gets skimmed.
+ *
+ * **`rankOf` growing a fifth rank deliberately did not change this.** Off having stopped being a
+ * reason to shout does not make a switched-off project's absent folder untrue, and the line and the
+ * order are answering two different questions — one tallies what is out there, the other says who
+ * needs somebody first. Filtering the folder counts to live projects was tried and reverted: it
+ * would have made this line stop counting what the rows count, which is the one property the
+ * paragraph above exists to defend. What the row says about that folder is the row's to soften.
  */
 export function headline(rows: ProjectSummary[]): string {
   if (rows.length === 0) return "the núcleo knows of no project";

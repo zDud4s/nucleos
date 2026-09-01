@@ -388,6 +388,11 @@ const SHOTS_TO_TAKE = [
      actually is rather than one page at a time. */
   ["35-workflows", { path: "/projects/alpha/workflows" }],
 
+  /* The roster — every project at once, which is the page the workspace is
+     reached from and the one surface of this pillar nothing had photographed. */
+  ["37-roster", { path: "/projects" }],
+  ["38-roster-light", { path: "/projects", theme: "light" }],
+
   /* A door that is not the picture, which is what the row of views exists for:
      the junction reached without scrolling a matrix, and the seam still above
      it — the one thing §16.5 says a view may not take with it. */

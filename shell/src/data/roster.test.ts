@@ -34,7 +34,15 @@ describe("gateOf", () => {
 });
 
 describe("inAttentionOrder", () => {
-  const ok = { project_root: "C:/x", root_exists: true } as const;
+  /**
+   * A live project whose folder is where it says it is — the case every rank is measured against.
+   *
+   * `mode` is written out because the harness's default is `off`, and off is the one mode that
+   * short-circuits the whole ranking. A fixture that left it implicit would be asking about the
+   * order of projects nobody is asking anything of, which is not what any test below is for — and
+   * that silence is exactly what let the defect these tests now pin live in the file unnoticed.
+   */
+  const ok = { mode: "shadow", project_root: "C:/x", root_exists: true } as const;
 
   /**
    * **The order is the page's answer.** A roster sorted by name answers "where is X", and the
@@ -46,7 +54,7 @@ describe("inAttentionOrder", () => {
       project({ project_id: "quiet", ...ok, last_gate: "passed" }),
       project({ project_id: "waiting", ...ok, open_proposals: 4, last_gate: "passed" }),
       project({ project_id: "failing", ...ok, last_gate: "failed" }),
-      project({ project_id: "gone", project_root: "C:/x", root_exists: false }),
+      project({ project_id: "gone", mode: "shadow", project_root: "C:/x", root_exists: false }),
     ];
 
     expect(inAttentionOrder(rows).map((row) => row.project_id)).toEqual([
@@ -55,6 +63,36 @@ describe("inAttentionOrder", () => {
       "waiting",
       "quiet",
     ]);
+  });
+
+  /**
+   * **The defect, pinned: a sleeping project was leading the page.**
+   *
+   * `charlie` in the preview fixtures is off and has never been given a folder — and no folder was
+   * rank 0, the loudest thing this page has, so it sat at the very top above a project that was
+   * acting, failing its gate and holding two decisions. The fixture file had already written down
+   * what the ranking got wrong: delta having no rules "is ordinary and must not read as a fault".
+   * Neither does charlie having no folder. It is not a fault in something switched off; it is what
+   * switched off looks like.
+   */
+  it("does not let a switched-off project outrank one that needs somebody", () => {
+    const rows = [
+      project({ project_id: "asleep", mode: "off", project_root: null, root_exists: null }),
+      project({ project_id: "acting", ...ok, mode: "active", open_proposals: 2, last_gate: "failed" }),
+    ];
+
+    expect(inAttentionOrder(rows).map((row) => row.project_id)).toEqual(["acting", "asleep"]);
+  });
+
+  /**
+   * Off is checked before every other rank, and that is the whole rule rather than a folder
+   * exemption. A project the owner switched off cannot be *failing right now*, whatever its last
+   * gate said before it was switched off — and none of this hides a reading: the row still draws
+   * the failed gate and the two decisions in the columns it always drew them in.
+   */
+  it("ranks a switched-off project below everything, whatever else it says", () => {
+    expect(rankOf(project({ ...ok, mode: "off", last_gate: "failed", open_proposals: 9 }))).toBe(4);
+    expect(rankOf(project({ mode: "off", project_root: "C:/x", root_exists: false }))).toBe(4);
   });
 
   /** Within one rank, the bigger pile first: 736 decisions outstanding is not 2. */
@@ -73,7 +111,9 @@ describe("inAttentionOrder", () => {
    * there, and every reading about it is stale. The folder is the thing to fix.
    */
   it("ranks a project whose folder is gone by the folder, whatever else it says", () => {
-    expect(rankOf(project({ project_root: "C:/x", root_exists: false, last_gate: "failed" }))).toBe(0);
+    expect(
+      rankOf(project({ mode: "shadow", project_root: "C:/x", root_exists: false, last_gate: "failed" })),
+    ).toBe(0);
   });
 
   /** The cache's array belongs to react-query; sorting it in place would reorder every reader's. */
@@ -92,24 +132,52 @@ describe("headline", () => {
    */
   it("counts folders the same way the rows do", () => {
     const rows = [
-      project({ project_id: "a", project_root: "C:/a", root_exists: true }),
-      project({ project_id: "b", project_root: "C:/b", root_exists: false }),
-      project({ project_id: "c", project_root: "C:/c", root_exists: false }),
+      project({ project_id: "a", mode: "shadow", project_root: "C:/a", root_exists: true }),
+      project({ project_id: "b", mode: "shadow", project_root: "C:/b", root_exists: false }),
+      project({ project_id: "c", mode: "shadow", project_root: "C:/c", root_exists: false }),
     ];
 
     expect(headline(rows)).toContain("2 with the folder gone");
     expect(headline(rows)).not.toContain("all with a folder");
   });
 
+  /**
+   * **And `rankOf` growing its fifth rank did not move this line.** Off having stopped being a
+   * reason to shout does not make a switched-off project's absent folder untrue, and the tempting
+   * change — filter the folder counts to live projects, so the headline and the order agree about
+   * charlie — would have broken the property the test above pins: that this line counts what the
+   * rows count. Two questions, two answers, and neither is the other's summary.
+   */
+  it("counts a switched-off project like any other, whatever the order does with it", () => {
+    const rows = [
+      project({ project_id: "asleep", mode: "off", project_root: null, root_exists: null }),
+      project({ project_id: "moved", mode: "off", project_root: "C:/b", root_exists: false }),
+      project({
+        project_id: "live",
+        mode: "shadow",
+        project_root: "C:/c",
+        root_exists: true,
+        last_gate: "failed",
+      }),
+    ];
+
+    expect(headline(rows)).toBe(
+      "3 projects · 1 with the folder gone · 1 with no folder named · 1 failing the gate",
+    );
+  });
+
   /** Nothing that is zero is mentioned: a page that reports its own good news gets skimmed. */
   it("says only what is true, and stays quiet about what is fine", () => {
-    const clean = [project({ project_id: "a", project_root: "C:/a", root_exists: true })];
+    const clean = [
+      project({ project_id: "a", mode: "shadow", project_root: "C:/a", root_exists: true }),
+    ];
     expect(headline(clean)).toBe("1 project");
 
     const busy = [
       project({ project_id: "a", project_root: "C:/a", root_exists: true, mode: "active" }),
       project({
         project_id: "b",
+        mode: "shadow",
         project_root: "C:/b",
         root_exists: true,
         open_proposals: 171,
