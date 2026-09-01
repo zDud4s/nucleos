@@ -1,5 +1,5 @@
 import type { Agent } from "../data/agents";
-import type { Concurrency } from "../data/fleet";
+import type { Concurrency, Job, JobDetail, JobItem } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
   InspectEntry,
@@ -224,6 +224,91 @@ export const RUNS: TeamRun[] = [
   run({ id: "r9", team_id: "seguranca", request: "Triage the weekly scan", created_at: ago(2 * DAY) }),
   run({ id: "r10", team_id: "informatica", request: "Prove last week's backup restores", created_at: ago(DAY) }),
 ];
+
+/* --------------------------------------------------------------------- jobs -- */
+
+/**
+ * One job, mid-flight, with a queue worth drawing.
+ *
+ * Directed by a team, because `depends_on` and `agent_name` are null for every item of every
+ * job that is not -- and a queue with no dependencies is a straight line, which is the one
+ * shape that says nothing. This one has two roots that can run at once, a join that waits on
+ * both, a second round, and three of the readings that are easy to get wrong:
+ * `gate_failed` (which the wire cannot tell from "going round again"), `cancelled` (withdrawn
+ * work, never the failure tone) and `conflicted` (waiting on a person, not broken).
+ */
+function jobItem(overrides: Partial<JobItem>): JobItem {
+  return {
+    ordinal: 0,
+    description: "",
+    status: "pending",
+    round: 0,
+    run_id: null,
+    gate_status: null,
+    agent_id: null,
+    agent_name: null,
+    depends_on: [],
+    files: [],
+    ...overrides,
+  };
+}
+
+export const JOB: Job = {
+  id: 24,
+  project_id: "alpha",
+  rule_name: "nightly reconciliation",
+  status: "implementing",
+  wait_reason: null,
+  max_items: 8,
+  created_at: ago(DAY / 12),
+  completed_at: null,
+  slot: 0,
+  round: 1,
+  max_rounds: 3,
+  team_id: "financas",
+  team_name: "Finanças",
+  team_max_parallel: 2,
+};
+
+export const JOB_VIEW: JobDetail = {
+  ...JOB,
+  branch: "job/24-reconciliation",
+  items: [
+    jobItem({
+      ordinal: 0, round: 0, description: "read the bank export", status: "passed",
+      gate_status: "passed", agent_id: "auditor", agent_name: "Ana", run_id: 101,
+      files: ["core/src/storage.rs"],
+    }),
+    jobItem({
+      ordinal: 1, round: 0, description: "read the ledger", status: "passed",
+      gate_status: "passed", agent_id: "researcher", agent_name: "Rui", run_id: 102,
+      files: ["core/src/files.rs"],
+    }),
+    jobItem({
+      ordinal: 2, round: 0, description: "match them line by line", status: "running",
+      agent_id: "controller", agent_name: "Ana", run_id: 103, depends_on: [0, 1],
+      files: ["core/src/triage.rs"],
+    }),
+    jobItem({
+      ordinal: 3, round: 0, description: "check the exceptions", status: "pending",
+      agent_id: "reviewer", agent_name: "Rui", depends_on: [2],
+    }),
+    jobItem({
+      ordinal: 4, round: 1, description: "widen the gate", status: "gate_failed",
+      gate_status: "failed", agent_id: "auditor", agent_name: "Ana", run_id: 104,
+      files: ["scripts/gates.sh"],
+    }),
+    jobItem({
+      ordinal: 5, round: 1, description: "drop the old import path", status: "cancelled",
+      agent_id: "researcher", agent_name: "Rui",
+    }),
+    jobItem({
+      ordinal: 6, round: 1, description: "rewrite the importer", status: "conflicted",
+      agent_id: "controller", agent_name: "Ana", run_id: 105, depends_on: [4],
+      files: ["core/src/storage.rs"],
+    }),
+  ],
+};
 
 export const RUN_VIEWS: Record<string, TeamRunView> = {
   "run-live-1": {
@@ -1074,7 +1159,36 @@ export function answer(path: string, init?: RequestInit): unknown {
     empty screen is exactly the one worth looking at, because the door into the
     inspector is drawn in it.
   */
-  if (path === "/concurrency") return { house: { limit: 4, held: 0 }, projects: [] } satisfies Concurrency;
+  if (path === "/concurrency") {
+    return {
+      house: { limit: 4, held: 1 },
+      projects: [
+        {
+          project_id: "alpha",
+          limit: 4,
+          slots: [
+            {
+              project_id: "alpha",
+              slot: 0,
+              owner_kind: "job",
+              owner_id: JOB.id,
+              claimed_at: ago(DAY / 12),
+              job_id: null,
+              ordinal: null,
+              item_status: null,
+            },
+          ],
+          collision: {
+            declared: { state: "clean", overlaps: [] },
+            observed: { state: "not_measured", overlaps: [] },
+          },
+        },
+      ],
+    } satisfies Concurrency;
+  }
+
+  if (path === "/jobs" || path.startsWith("/jobs?")) return [JOB];
+  if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
 
   if (path === "/projects") return PROJECTS;
 
