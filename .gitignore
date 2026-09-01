@@ -104,3 +104,11 @@ design/
 docs/*
 !docs/.gitkeep
 shell/target-test/
+
+# Python bytecode. Never needed an entry before: the only test that imported a module
+# loaded it from `.claude/`, which is ignored wholesale, so the cache landed out of sight.
+# `scripts/test-usage-split.py` imports a module that lives in `scripts/`, and the cache
+# appeared in a tracked directory — where the test selector, which refuses to answer for
+# any path no catalog group claims, stopped the gate over a build artefact.
+__pycache__/
+*.pyc

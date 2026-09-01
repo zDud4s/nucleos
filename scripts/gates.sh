@@ -144,11 +144,13 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     fi
   done
   if [ -z "$py" ]; then
-    echo "python missing — the hook filter and eval approver tests need it (scripts/doctor.sh reports this)" >&2
+    echo "python missing — the hook filter, eval approver and usage-split tests need it (scripts/doctor.sh reports this)" >&2
     failures="$failures  hooks: python not installed"$'\n'
   else
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
+    run "usage: split"    . "$py" scripts/test-usage-split.py
+    run "usage: statusline" . "$py" scripts/test-statusline-context.py
   fi
 fi
 
