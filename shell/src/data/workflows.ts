@@ -207,6 +207,22 @@ export function standingTone(standing: Standing): string {
 }
 
 /**
+ * What no workflow installed *means*, in the one place both surfaces read it from.
+ *
+ * Two screens say it and they rightly say it in two shapes: the State mode says it as a status
+ * with the reason behind a question, and the Workflows mode says it as the heading of a library
+ * somebody has arrived at meaning to install something. The **claim** inside them is one claim,
+ * and it was written twice — one copy said the app does not pretend otherwise by drawing an empty
+ * graph and the other did not, so the same nothing had two explanations and only one of them
+ * mentioned the graph.
+ *
+ * `MODE_SENTENCES` next door exists for exactly this reason, and `Settings` states it: "two copies
+ * of a sentence about restraint would eventually say two different things".
+ */
+export const NO_WORKFLOW_MEANS =
+  "This project develops however whoever is at the keyboard decides — which is a real answer and not a gap.";
+
+/**
  * What a standing means, in words, with the numbers that make it checkable.
  *
  * Pure, and tested without a render, because this is where the never-collapse contract is actually

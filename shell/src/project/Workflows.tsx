@@ -3,6 +3,7 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   driftingWorkflows,
+  NO_WORKFLOW_MEANS,
   sinceText,
   standingSentence,
   standingTone,
@@ -17,7 +18,7 @@ import {
   type Installed,
 } from "../data/workflows";
 import { openInVscode } from "../lib/vscode";
-import { Quiet } from "../ui";
+import { Quiet, Teach } from "../ui";
 import { WorkflowChain, WorkflowGraph } from "./WorkflowGraph";
 
 /**
@@ -52,11 +53,17 @@ export function Workflows({ projectId }: WorkflowsProps) {
   return (
     <div className="flex flex-col gap-6">
       {installed.data.length === 0 ? (
-        <p className="max-w-prose text-sm text-text-muted">
-          No workflow is installed here. This project develops however whoever is at the keyboard
-          decides — which is a real answer, and the app does not pretend otherwise by showing an
-          empty graph.
-        </p>
+        /*
+          `Teach` here and a one-line `Quiet` in the State mode, over the same claim written once.
+          The two are not the same job: this is a page somebody opened meaning to install
+          something, with the library right under it, and that one is a section of a page about
+          how the project is now. What must not differ is what the emptiness MEANS, which is why
+          the sentence comes off the data layer rather than out of this file.
+        */
+        <Teach title="No workflow is installed here">
+          {NO_WORKFLOW_MEANS} The app does not pretend otherwise by drawing an empty graph; a
+          bundle from the library below is what fills this.
+        </Teach>
       ) : (
         <ul className="flex flex-col gap-3">
           {installed.data.map((row) => (
@@ -573,12 +580,7 @@ export function WorkflowSummary({ projectId }: { projectId: string }) {
       with nothing in it. The sentence that makes the emptiness a state rather than a gap is kept
       and moved behind the question; what is left is the fact.
     */
-    return (
-      <Quiet says="none installed">
-        Which is a real answer and not a gap — this project develops however whoever is at the
-        keyboard decides.
-      </Quiet>
-    );
+    return <Quiet says="none installed">{NO_WORKFLOW_MEANS}</Quiet>;
   }
 
   return (
