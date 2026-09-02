@@ -360,6 +360,13 @@ pub fn build_router(state: AppState) -> Router {
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
         .route("/assistant/local-model", get(get_local_model))
+        // Fetching one this machine does not have, and watching it arrive. Under the route above
+        // rather than beside it because it is the same subject — what this machine can answer with
+        // — and a person reading the table should see the two together.
+        .route(
+            "/assistant/local-model/pull",
+            get(get_local_model_pull).post(post_local_model_pull),
+        )
         .route("/assistant/ide-sessions", get(list_ide_sessions))
         // The conversation behind one of them. A GET on the session itself rather than a
         // `/messages` under it: what a session IS, to anything outside this daemon, is what was
@@ -8194,6 +8201,179 @@ async fn get_local_model(State(state): State<AppState>) -> Json<serde_json::Valu
     // to touch beyond the `AppState` literal.
     let available = state.assistants.serves(crate::chats::Brain::Local).is_ok();
     Json(serde_json::json!({ "available": available }))
+}
+
+/// One download of a local model: what it is, where it has got to, and how it ended.
+///
+/// `outcome` is `None` while it runs, and that single field is what "in flight" means here — there
+/// is no separate flag, because two ways to say the same thing is two ways for them to disagree.
+/// A finished pull is KEPT rather than cleared: the window polls, and clearing on completion would
+/// mean the poll that arrives one tick after a successful download finds nothing and cannot tell
+/// "it worked" from "nothing ever happened".
+#[derive(Clone)]
+struct Pull {
+    model: String,
+    /// Ollama's own word for what it is doing, carried through untranslated —
+    /// `capabilities::PullProgress` explains why.
+    status: String,
+    completed: u64,
+    total: u64,
+    outcome: Option<Result<(), String>>,
+}
+
+/// The one download this machine is doing, or the last one it did.
+///
+/// A process-global rather than a field on `AppState`, for the reason `sidecar::SIDECARS` and
+/// `assistant::LIVE_CHATS` are: this is not per-request state that a handler was handed, it is a
+/// fact about the machine — there is one Ollama on it, one disk, and at most one download being
+/// watched. It also sits beside `OLLAMA_TAGS_CLIENT`, which is a static in this module for exactly
+/// the same argument.
+///
+/// **One at a time, deliberately.** Two multi-gigabyte downloads sharing one disk finish later than
+/// the same two in sequence, and the window has one progress bar; a second request while one runs
+/// is refused rather than queued, because a queue nobody can see or cancel is worse than a refusal
+/// somebody can retry.
+///
+/// The one way this can wedge: a task that panicked between its last progress frame and writing its
+/// outcome would leave `outcome: None` forever, and every later pull would be refused until the
+/// daemon restarts. What it runs has no panic path — `pull_local_model` returns its failures — and
+/// the alternative (keeping the `JoinHandle` to ask `is_finished`) costs this type its `Clone` and
+/// the readout its pure test, which is a worse trade for a case that needs a bug to reach.
+static LOCAL_PULL: std::sync::LazyLock<std::sync::Mutex<Option<Pull>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// PURE: a pull -> what the window is told about it.
+///
+/// `percent` is `null` and not `0` when nothing has said how big the download is. Every pull opens
+/// on `pulling manifest`, which carries no counts, and a bar sitting at 0% says a download is
+/// stuck — which one that has not started measuring itself is not.
+///
+/// `state` collapses to three words because three is what a window can draw. `done` and `failed`
+/// stay apart, though both mean "not running": collapsing them would either swallow the reason a
+/// download failed or leave a spinner up after one that worked.
+fn pull_readout(pull: &Pull) -> serde_json::Value {
+    serde_json::json!({
+        "model": pull.model,
+        "state": match &pull.outcome {
+            None => "running",
+            Some(Ok(())) => "done",
+            Some(Err(_)) => "failed",
+        },
+        "status": pull.status,
+        "percent": (pull.total > 0).then(|| pull.completed * 100 / pull.total),
+        "error": match &pull.outcome {
+            Some(Err(reason)) => serde_json::Value::String(reason.clone()),
+            _ => serde_json::Value::Null,
+        },
+    })
+}
+
+/// The client a download runs on, built once and shared.
+///
+/// Emphatically NOT `ollama_tags_client()`: that one is built with `OLLAMA_TAGS_TIMEOUT` so a
+/// wedged Ollama cannot hold up a menu, and a whole-request timeout of a couple of seconds would
+/// abort every download that was working. A pull runs for minutes by design. The connect timeout
+/// stays short, because failing to DIAL is still a fast failure and the person is watching.
+fn ollama_pull_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("HTTP client for the /api/pull stream (check TLS and proxy environment)")
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct PullRequest {
+    /// A choice id from `GET /assistant/models`, and checked against that list — see the handler.
+    model: String,
+}
+
+/// Fetch a local model this machine does not have yet.
+///
+/// Answers `202` the moment the download starts rather than when it finishes, because it finishes
+/// in minutes and no HTTP client on either end would wait. The body is the same readout `GET` on
+/// this path returns, so the window has a first frame to draw without waiting for its own first
+/// poll.
+///
+/// **`menu()` is the allowlist, not the request body.** This is the one route in this file that
+/// makes the machine fetch gigabytes from a name somebody sent, so the name has to be one that was
+/// already written into `.ai/nucleos-models.yaml` or that Ollama already has. Refused with the same
+/// `400` a model the catalogue does not offer gets from `patch_chat`, and for the same reason:
+/// it is the person's name that is wrong, not this daemon's state.
+///
+/// Reachable by the control token and an admin key alone — it is in no scope table, and
+/// `auth::the_pull_routes_are_out_of_an_agents_reach` is where that is held.
+async fn post_local_model_pull(
+    Json(body): Json<PullRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let (_, choices) = menu().await;
+    if !choices
+        .iter()
+        .any(|choice| choice.brain == "local" && choice.id == body.model)
+    {
+        return Err(refusal(StatusCode::BAD_REQUEST, "unknown_model"));
+    }
+
+    let started = {
+        // The whole check-and-claim under one lock, so two requests arriving together cannot both
+        // find the slot free. Nothing is awaited inside it.
+        let mut slot = LOCAL_PULL
+            .lock()
+            .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "pull_state_poisoned"))?;
+        if slot.as_ref().is_some_and(|pull| pull.outcome.is_none()) {
+            return Err(refusal(StatusCode::CONFLICT, "pull_in_flight"));
+        }
+        let started = Pull {
+            model: body.model.clone(),
+            status: "starting".to_owned(),
+            completed: 0,
+            total: 0,
+            outcome: None,
+        };
+        *slot = Some(started.clone());
+        started
+    };
+
+    let model = body.model;
+    tokio::spawn(async move {
+        let outcome = crate::capabilities::pull_local_model(
+            ollama_pull_client(),
+            crate::runner::OLLAMA_BASE_URL,
+            &model,
+            |frame| {
+                if let Ok(mut slot) = LOCAL_PULL.lock()
+                    && let Some(pull) = slot.as_mut()
+                {
+                    pull.status = frame.status;
+                    pull.completed = frame.completed;
+                    pull.total = frame.total;
+                }
+            },
+        )
+        .await;
+        if let Ok(mut slot) = LOCAL_PULL.lock()
+            && let Some(pull) = slot.as_mut()
+        {
+            pull.outcome = Some(outcome);
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(pull_readout(&started))))
+}
+
+/// How the download is going.
+///
+/// `204` when this daemon has not been asked to fetch anything since it started — the same way
+/// `get_assistant_live` above answers a turn nothing is writing. It is emphatically not "the
+/// download failed": a window that read it as one would put an error up on every fresh install.
+async fn get_local_model_pull() -> Result<Json<serde_json::Value>, StatusCode> {
+    let slot = LOCAL_PULL
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pull = slot.as_ref().ok_or(StatusCode::NO_CONTENT)?;
+    Ok(Json(pull_readout(pull)))
 }
 
 /// The conversations the app opened, most recently active first.
@@ -20132,6 +20312,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The same allowlist the picker is served decides what may be downloaded.
+    ///
+    /// A pull is the one route in this file that makes this machine fetch gigabytes from a name in
+    /// a request body, and the catalogue is what keeps that name from being anybody's to choose:
+    /// `menu()` is read here, not `body.model`, so the only models this daemon can be made to
+    /// download are the ones somebody already wrote into `.ai/nucleos-models.yaml` or that Ollama
+    /// already has.
+    ///
+    /// The accept path is deliberately not tested here, and the reason is the one
+    /// `the_menu_reports_installed_for_local_rows_and_nothing_else` above gives: `models_config()`
+    /// resolves to `core/.ai/nucleos-models.yaml` under `cargo test`, which does not exist, so the
+    /// menu a unit test is served names no local model to accept. What CAN be proved here is the
+    /// half that matters for safety — a name the menu does not carry is refused before any network
+    /// call is made — and it is proved with a name that is real on a real machine (`llama3.2:3b`)
+    /// rather than a nonsense string, so the test would still fail if the check were dropped.
+    #[tokio::test]
+    async fn a_pull_is_refused_for_a_model_the_menu_does_not_name() {
+        let state = test_state().await;
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/local-model/pull",
+            Some(serde_json::json!({ "model": "llama3.2:3b" })),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a name the catalogue does not offer must not start a download: {body}"
+        );
+        assert_eq!(body["refusal"], "unknown_model");
+    }
+
+    /// The three states a watcher has to tell apart, and the wire word for each.
+    ///
+    /// PURE, on the readout rather than through the route, and deliberately so: the pull itself
+    /// lives in a process-global (`LOCAL_PULL`), and a test that drove the route would leave a
+    /// finished download in it for whichever test ran next. The shape is what the window reads, so
+    /// the shape is what is pinned.
+    ///
+    /// `done` and `failed` are both "not running", and a window that collapsed them would either
+    /// swallow the reason a download failed or leave a spinner up after a successful one.
+    #[test]
+    fn a_pull_readout_says_which_of_the_three_states_it_is_in() {
+        let running = Pull {
+            model: "qwen3.5:4b".to_owned(),
+            status: "pulling 8934".to_owned(),
+            completed: 50,
+            total: 100,
+            outcome: None,
+        };
+        let readout = pull_readout(&running);
+        assert_eq!(readout["state"], "running");
+        assert_eq!(readout["model"], "qwen3.5:4b");
+        assert_eq!(readout["percent"], 50);
+        assert!(readout["error"].is_null());
+
+        let done = Pull {
+            outcome: Some(Ok(())),
+            ..running.clone()
+        };
+        assert_eq!(pull_readout(&done)["state"], "done");
+        assert!(pull_readout(&done)["error"].is_null());
+
+        let failed = Pull {
+            outcome: Some(Err("pull model manifest: file does not exist".to_owned())),
+            ..running.clone()
+        };
+        assert_eq!(pull_readout(&failed)["state"], "failed");
+        assert_eq!(
+            pull_readout(&failed)["error"],
+            "pull model manifest: file does not exist",
+            "the reason Ollama gave must reach the window, not a status word standing in for it"
+        );
+    }
+
+    /// A download that has not said how big it is reports no percentage at all.
+    ///
+    /// Every pull opens with `pulling manifest`, which carries no counts, and `completed / 0` is
+    /// not a number. `null` and not `0`: a bar sitting at 0% says the download is stuck, and a
+    /// download that has not started measuring itself is not stuck.
+    #[test]
+    fn a_pull_with_no_total_reports_no_percentage_rather_than_zero() {
+        let opening = Pull {
+            model: "qwen3.5:4b".to_owned(),
+            status: "pulling manifest".to_owned(),
+            completed: 0,
+            total: 0,
+            outcome: None,
+        };
+
+        let readout = pull_readout(&opening);
+
+        assert!(
+            readout["percent"].is_null(),
+            "a download with nothing to measure against must say so: {readout}"
+        );
+        assert_eq!(
+            readout["status"], "pulling manifest",
+            "Ollama's own word for what it is doing is what fills the gap a percentage leaves"
+        );
     }
 
     /// The catalogue is the allowlist. Not because an unknown name is dangerous — it becomes one

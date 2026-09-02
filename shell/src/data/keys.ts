@@ -248,6 +248,19 @@ export const keys = {
     detail: (chatId: string) => ["chats", "detail", chatId] as const,
     localModel: ["chats", "local-model"] as const,
     /**
+     * The download of a local model this machine does not have —
+     * `GET /assistant/local-model/pull`.
+     *
+     * A sibling of `localModel` and deliberately NOT `[...localModel, "pull"]`,
+     * though the routes are nested that way: react-query matches by prefix, so
+     * the nested key would be swept by every invalidation of `localModel`. The
+     * two answer questions with opposite cadences — that one is what STARTUP
+     * resolved and cannot change while the daemon runs, this one moves every
+     * second while a download is going — and sharing a prefix would tie the
+     * settled one to the moving one.
+     */
+    localPull: ["chats", "local-pull"] as const,
+    /**
      * The models a conversation may be moved to — `GET /assistant/models`.
      *
      * Its own key and not a child of `detail`, because it is the same answer for

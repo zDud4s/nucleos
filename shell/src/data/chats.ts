@@ -699,6 +699,88 @@ export function useLocalModel() {
   });
 }
 
+/** `GET /assistant/local-model/pull` — one download of a local model, as it goes. */
+export interface LocalPull {
+  model: string;
+  /**
+   * `done` and `failed` are both "not running" and stay apart, because a window that
+   * collapsed them would either swallow the reason a download failed or leave a
+   * spinner up after one that worked.
+   */
+  state: "running" | "done" | "failed";
+  /** Ollama's own word for what it is doing — `pulling manifest`, `success`. */
+  status: string;
+  /**
+   * `null` until something has said how big the download is, which is the whole of
+   * the opening frame. Not `0`: a bar sitting at zero says a download is stuck, and
+   * one that has not started measuring itself is not.
+   */
+  percent: number | null;
+  /** What Ollama said, on `failed`, and `null` otherwise. */
+  error: string | null;
+}
+
+/**
+ * How a download of a local model is going, or `null` if this daemon has not been
+ * asked to fetch anything since it started.
+ *
+ * `null` and not `undefined`: the daemon answers `204` there, which {@link apiFetch}
+ * turns into `undefined`, and react-query treats an `undefined` result as a query
+ * that failed to produce data. It is mapped here rather than at every reader.
+ *
+ * Polled only while something is running. `POLL.fast` is the cadence for "the state
+ * of the machine right now", which is what a download in progress is; a settled
+ * result does not move again until somebody starts another one, and that somebody
+ * goes through {@link usePullLocalModel}, which invalidates this.
+ */
+export function useLocalPull() {
+  return useQuery({
+    queryKey: keys.chats.localPull,
+    queryFn: async ({ client }) => {
+      const before = client.getQueryData<LocalPull | null>(keys.chats.localPull);
+      const pull = (await apiFetch<LocalPull | undefined>("/assistant/local-model/pull")) ?? null;
+      // The one moment the menu became wrong: a model it listed as missing is now
+      // on the disk. Fired on the TRANSITION and not on every read of a finished
+      // download, so a page opened long after the fact does not refetch the
+      // catalogue for news it already has.
+      if (pull?.state === "done" && before?.state === "running") {
+        void client.invalidateQueries({ queryKey: keys.chats.models });
+      }
+      return pull;
+    },
+    refetchInterval: (query) => (query.state.data?.state === "running" ? POLL.fast : false),
+  });
+}
+
+/**
+ * Fetch a local model this machine does not have.
+ *
+ * The daemon answers the moment the download STARTS, not when it finishes — it
+ * finishes in minutes — so the answer is the first frame of progress and never a
+ * completion. What tells somebody it is done is {@link useLocalPull}.
+ *
+ * `retry: false`, like every mutation here: a refusal is semantic — the catalogue
+ * does not name that model, or a download is already running — and asking twice
+ * gets the same answer. The models query is invalidated on success only when the
+ * download itself completes, which this hook cannot know; the reader that polls is
+ * what refreshes the menu, so a model that has just arrived stops being marked as
+ * missing.
+ */
+export function usePullLocalModel() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (model: string) =>
+      apiFetch<LocalPull>("/assistant/local-model/pull", {
+        method: "POST",
+        body: JSON.stringify({ model }),
+      }),
+    retry: false,
+    onSuccess: (pull) => {
+      queryClient.setQueryData(keys.chats.localPull, pull);
+    },
+  });
+}
+
 /**
  * The conversations already had in the IDE that this daemon could continue.
  *

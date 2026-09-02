@@ -2095,6 +2095,51 @@ mod tests {
         }
     }
 
+    /// Downloading a model is the person's decision, and the agent must not be able to make it.
+    ///
+    /// The pull routes spend this machine's bandwidth and disk — a model is gigabytes — on a name
+    /// in a request body, and they are reachable by the human's own key and nothing else. An
+    /// autonomous run that could reach them could fill the disk between one gate check and the
+    /// next, and it would do it through a route that looks like a preference rather than an action.
+    ///
+    /// Asserted as MEMBERSHIP and not through a request, the same way
+    /// `the_routes_that_leave_the_machine_are_in_no_scope_table` above is: `permits` is
+    /// default-deny, so both routes are already out of reach the moment they are written — which
+    /// means the mistake this test catches is not forgetting to add them to a table, but somebody
+    /// later adding them to one. `GET` is listed beside `POST` deliberately: reading the progress
+    /// of a download is harmless on its own, and that is exactly the argument that would get it
+    /// graded a read and put in `READ_ONLY_ROUTES`, one line above the route that starts it.
+    #[test]
+    fn the_pull_routes_are_out_of_an_agents_reach() {
+        for method in [Method::POST, Method::GET] {
+            let path = "/assistant/local-model/pull";
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &method, path)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &method, path)
+                    && !route_is_listed(TEAM_ROUTES, &method, path)
+                    && !route_is_listed(EMAIL_ROUTES, &method, path)
+                    && !route_is_listed(COUNCIL_ROUTES, &method, path),
+                "{method} {path} must stay out of every scope table"
+            );
+            assert!(
+                !permits(&Scope::Run(7), &method, path),
+                "{method} {path} must be unreachable by a run"
+            );
+            assert!(
+                !permits(&Scope::TeamRun("team-1".to_owned()), &method, path),
+                "{method} {path} must be unreachable by a department"
+            );
+            assert!(
+                !permits(&Scope::ApiToken(ApiTokenLevel::RunCreating), &method, path),
+                "{method} {path} must be unreachable by a run-creating key"
+            );
+            assert!(
+                permits(&Scope::Control, &method, path),
+                "{method} {path} must stay reachable by the human's own key"
+            );
+        }
+    }
+
     /// The complement of the table, asserted as membership so that an edit to either list fails
     /// here rather than in production.
     #[test]

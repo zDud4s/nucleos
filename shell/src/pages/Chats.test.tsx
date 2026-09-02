@@ -1220,16 +1220,67 @@ describe("Chats - a model reached over OpenRouter", () => {
     ).toBeDefined();
     expect(within(here).getByRole("menuitemradio", { name: /^qwen3\.5:4b/ })).toBeDefined();
 
-    // The row this packet exists for: a model the daemon offers and this machine does not have.
-    // SHOWN, because seeing it is how somebody learns it can be had at all — Ollama publishes no
-    // list of what is pullable, so if the menu does not say it, nothing does. And not selectable
-    // yet, because picking it today dies at the first turn; the confirmation and the download it
-    // needs are the next packet's, and this assertion is what will have to change when they land.
-    const absent = within(missing).getByRole("menuitemradio", {
+    // A model the daemon offers and this machine does not have. SHOWN, because seeing it is how
+    // somebody learns it can be had at all — Ollama publishes no list of what is pullable, so if
+    // the menu does not say it, nothing does.
+    //
+    // A `menuitem` and NOT a `menuitemradio`, which is the whole difference the download made: the
+    // rows above are a choice of who answers, and this one is an action. Asserted by role rather
+    // than by looks, because the role is what tells somebody arrowing through the menu that
+    // pressing Enter here DOES something instead of selecting something.
+    const absent = within(missing).getByRole("menuitem", {
       name: /^Llama 3\.2 3B/,
     });
-    expect(absent.getAttribute("aria-disabled")).toBe("true");
+    expect(absent.getAttribute("aria-disabled")).toBeNull();
     expect(within(absent).getByText(/not downloaded/i)).toBeDefined();
+  });
+
+  it("asks twice before spending gigabytes on a model this machine does not have", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
+    const started = () =>
+      daemon.apiFetch.mock.calls.filter(
+        (call) => call[0] === "/assistant/local-model/pull" && call[1]?.method === "POST",
+      );
+    // The clock is driven by hand for the dwell below. Fixed rather than advancing, so the gap
+    // between two clicks is this test's decision and not the machine's speed.
+    const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+
+    // One click arms the row and downloads NOTHING. A model is gigabytes over somebody's
+    // connection, and an interlock a stray click gets past is not an interlock.
+    fireEvent.click(row());
+    expect(
+      within(missing).getByRole("menuitem", { name: /click again to download/i }),
+    ).toBeDefined();
+    expect(started()).toHaveLength(0);
+
+    // The second half of a double-click, landing inside the dwell. Ignored — and still armed,
+    // because disarming would punish the reflex and make the row feel broken.
+    fireEvent.click(row());
+    expect(started()).toHaveLength(0);
+    expect(
+      within(missing).getByRole("menuitem", { name: /click again to download/i }),
+    ).toBeDefined();
+
+    // A deliberate second click, once the dwell has passed. This one downloads.
+    now.mockReturnValue(10_000 + 500);
+    fireEvent.click(row());
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/local-model/pull", {
+        method: "POST",
+        // The choice id and not the label: the id is what the daemon checks against its own
+        // catalogue and what it hands Ollama.
+        body: JSON.stringify({ model: "llama3.2:3b" }),
+      });
+    });
+    now.mockRestore();
   });
 
   it("says something true above a turn that moved to the hosted model, rather than the local model's words", async () => {

@@ -489,6 +489,160 @@ pub async fn installed_local_models(client: &reqwest::Client, base_url: &str) ->
     }
 }
 
+/// How far a download has got, as one frame of `/api/pull` says it.
+///
+/// `status` is Ollama's own word for what it is doing — `pulling manifest`, `pulling <digest>`,
+/// `verifying sha256 digest`, `success` — carried through rather than translated, because this
+/// crate does not know the vocabulary and inventing one would mean a frame it had never seen
+/// arriving as silence.
+///
+/// Both counts are `0` on the frames that carry none, which is most of them: only the frames that
+/// are actually moving bytes have `completed` and `total`. Zero and not `Option` because the one
+/// reader is a percentage, `total == 0` is already the "cannot say yet" case a percentage has to
+/// handle, and an `Option` would make it two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullProgress {
+    pub status: String,
+    pub completed: u64,
+    pub total: u64,
+}
+
+/// One readable frame of `/api/pull`'s stream: how far it has got, or why it cannot go on.
+///
+/// A failure is a frame and not an HTTP error, which is the whole reason this enum exists. Ollama
+/// answers `200` and then says `{"error": "..."}` in the body — a model name it does not have, a
+/// disk it cannot write — so a reader that checked only the status code would call a download that
+/// never happened a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullLine {
+    Progress(PullProgress),
+    Failed(String),
+}
+
+/// PURE: one frame of `/api/pull`'s NDJSON -> what it says about the download.
+///
+/// `None` for every line that says nothing about it — a blank line between frames, a body this
+/// crate cannot parse, an object with neither `error` nor `status`. Skipped and never fatal, the
+/// same fail-closed posture `interpret_tags` above takes: one unreadable frame in a stream of
+/// thousands must not abandon a download that is otherwise working.
+///
+/// Documented shape: `{"status": "...", "digest": "...", "total": n, "completed": n}`, with
+/// `digest` and everything else ignored, and `total`/`completed` absent on the frames that move no
+/// bytes. **UNVERIFIED against a real Ollama** for the same reason `interpret_tags` says so of
+/// `/api/tags`; `a_real_ollama_streams_a_pull_it_already_has` is the `#[ignore]`d check.
+pub fn interpret_pull(line: &str) -> Option<PullLine> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+        return Some(PullLine::Failed(error.to_owned()));
+    }
+    let status = value.get("status").and_then(serde_json::Value::as_str)?;
+    Some(PullLine::Progress(PullProgress {
+        status: status.to_owned(),
+        completed: value
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        total: value
+            .get("total")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    }))
+}
+
+/// PURE: the complete lines in a read buffer, leaving any trailing partial one behind.
+///
+/// The reason `pull_local_model` below is not a loop over chunks. A multi-gigabyte download is cut
+/// into reads wherever the kernel felt like cutting it, mid-object as often as not, and a parser
+/// that decoded each read on its own would drop every frame unlucky enough to straddle two — which
+/// on a real download is most of them. Everything before the last newline is whole and comes out;
+/// everything after it waits for the read that finishes it.
+///
+/// Lines are trimmed, so a `\r\n` stream and a blank line between frames both arrive as something
+/// `interpret_pull` already answers `None` to.
+fn take_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=newline).collect();
+        lines.push(String::from_utf8_lossy(&line).trim().to_owned());
+    }
+    lines
+}
+
+/// Fetch a model this machine does not have, over `POST {base_url}/api/pull`, reporting progress
+/// as it goes.
+///
+/// The one read in this module that does NOT fail closed, and the difference is who asked.
+/// `installed_local_models` above answers an empty list on any trouble because nobody asked it
+/// anything — it runs to decorate a menu, and a menu that quietly shows fewer models is better than
+/// one that shows an error nobody can act on. A pull is something a person asked for and is
+/// watching, so every failure is reported: silence would leave a progress bar at zero forever with
+/// nothing to say why.
+///
+/// `progress` is called once per readable frame, in order, from the caller's own task — never
+/// buffered and never coalesced, because the caller is what decides where progress goes and how
+/// often it is worth storing. It must not block: it runs between reads of a live stream.
+///
+/// **A stream that simply stops is a failure.** No `success` frame means the download did not
+/// finish — a killed Ollama, a full disk, a dropped connection — and every byte that did arrive was
+/// valid, so nothing in the loop would otherwise notice. Reporting `Ok` there would leave the
+/// window saying a model is downloaded that is not.
+///
+/// The client is the CALLER's, deliberately, and must not be the short-timeout one
+/// `installed_local_models` is given: a pull runs for minutes, and a 2-second timeout would abort
+/// every download that was working. See `http::ollama_pull_client`.
+pub async fn pull_local_model(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<(), String> {
+    let mut response = client
+        .post(format!("{base_url}/api/pull"))
+        .json(&serde_json::json!({ "model": model, "stream": true }))
+        .send()
+        .await
+        .map_err(|error| format!("Ollama did not answer the download request: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Ollama refused the download with HTTP {}",
+            response.status()
+        ));
+    }
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut succeeded = false;
+    loop {
+        match response
+            .chunk()
+            .await
+            .map_err(|error| format!("the download stream broke: {error}"))?
+        {
+            Some(bytes) => buffer.extend_from_slice(&bytes),
+            // The stream ended. A last frame with no trailing newline is still a frame, so it is
+            // closed here rather than dropped; the buffer is then empty, and the next read ends the
+            // loop for good.
+            None if buffer.is_empty() => break,
+            None => buffer.push(b'\n'),
+        }
+        for line in take_lines(&mut buffer) {
+            match interpret_pull(&line) {
+                Some(PullLine::Failed(reason)) => return Err(reason),
+                Some(PullLine::Progress(frame)) => {
+                    succeeded |= frame.status == "success";
+                    progress(frame);
+                }
+                None => {}
+            }
+        }
+    }
+
+    if succeeded {
+        Ok(())
+    } else {
+        Err("the download stopped before Ollama said it had finished".to_owned())
+    }
+}
+
 /// What an agent CLI declares, without touching the network.
 ///
 /// The CLI-wrap invariant (`AGENTS.md`: wrap the existing agent CLI, never reimplement its loop)
@@ -1481,6 +1635,284 @@ mod tests {
             refusal.contains("structured output"),
             "the missing structured-output capability must be named, not dropped after the first \
              gap: {refusal}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // J. `/api/pull` — fetching a model this machine does not have yet
+    // ---------------------------------------------------------------------------------------
+
+    /// A loopback Ollama `/api/pull` answering a fixed NDJSON body.
+    ///
+    /// Same idiom `stub_ollama_tags` above uses. It does NOT control how the body is cut into
+    /// reads — nothing at this level can, because that is the kernel's decision and not the
+    /// fixture's — so the property that a frame survives being split is pinned where it can be
+    /// pinned exactly: `a_frame_split_across_two_reads_is_taken_only_once_it_is_whole`, on
+    /// `take_lines` itself, with no listener at all.
+    ///
+    /// **The shape is UNVERIFIED against a real Ollama**, exactly as `stub_ollama_tags` says of
+    /// `/api/tags`, and for the same reason — see `a_real_ollama_streams_a_pull_it_already_has` at
+    /// the end of this section, `#[ignore]`d like its two siblings.
+    async fn stub_ollama_pull(body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/api/pull",
+            axum::routing::post(move || async move { body }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    /// PURE: the buffering itself, which is the only part of this read that a network fixture
+    /// cannot pin.
+    ///
+    /// `/api/pull` is the first STREAMING read in this module, and a multi-gigabyte download is cut
+    /// into reads wherever the kernel felt like cutting it — mid-object as often as not. A parser
+    /// that decoded each read on its own would drop every frame unlucky enough to straddle two,
+    /// which on a real download is most of them.
+    ///
+    /// The trailing partial line staying in the buffer is the whole mechanism, so it is asserted
+    /// rather than implied: after the first read the buffer must still hold the half-frame, and
+    /// after the second that frame must come out whole and once.
+    #[test]
+    fn a_frame_split_across_two_reads_is_taken_only_once_it_is_whole() {
+        let mut buffer: Vec<u8> = Vec::new();
+
+        buffer.extend_from_slice(b"{\"status\":\"pulling manifest\"}\n{\"status\":\"pulling 89");
+        assert_eq!(
+            take_lines(&mut buffer),
+            vec!["{\"status\":\"pulling manifest\"}".to_string()],
+            "only the whole frame comes out of the first read"
+        );
+        assert!(
+            !buffer.is_empty(),
+            "the half-frame must stay in the buffer rather than be parsed or dropped"
+        );
+
+        buffer.extend_from_slice(b"34\",\"completed\":50}\n");
+        assert_eq!(
+            take_lines(&mut buffer),
+            vec!["{\"status\":\"pulling 8934\",\"completed\":50}".to_string()],
+            "the frame comes out whole once its second half arrives, and only once"
+        );
+        assert!(
+            buffer.is_empty(),
+            "a buffer whose last byte was a newline holds nothing back"
+        );
+    }
+
+    /// PURE, no listener: one documented progress frame -> the three things a progress bar needs.
+    #[test]
+    fn a_pull_line_says_what_is_happening_and_how_far_it_has_got() {
+        let line = r#"{"status":"pulling 8934d96d3f08","digest":"sha256:8934","total":2142590208,"completed":241970}"#;
+
+        match interpret_pull(line) {
+            Some(PullLine::Progress(progress)) => {
+                assert_eq!(progress.status, "pulling 8934d96d3f08");
+                assert_eq!(progress.completed, 241_970);
+                assert_eq!(progress.total, 2_142_590_208);
+            }
+            other => panic!("a documented progress frame must read as progress: {other:?}"),
+        }
+    }
+
+    /// PURE: the two frames that carry no byte counts at all, which is most of the stream.
+    ///
+    /// `pulling manifest` opens every pull and `success` closes it, and neither has `completed` or
+    /// `total`. Reading an absent count as anything but zero would make the opening frame of every
+    /// download a wild percentage.
+    #[test]
+    fn a_pull_line_with_no_counts_is_progress_at_zero_and_not_a_failure() {
+        for (line, status) in [
+            (r#"{"status":"pulling manifest"}"#, "pulling manifest"),
+            (r#"{"status":"success"}"#, "success"),
+        ] {
+            match interpret_pull(line) {
+                Some(PullLine::Progress(progress)) => {
+                    assert_eq!(progress.status, status);
+                    assert_eq!(progress.completed, 0, "{line}");
+                    assert_eq!(progress.total, 0, "{line}");
+                }
+                other => panic!("{line} must read as progress with no counts: {other:?}"),
+            }
+        }
+    }
+
+    /// PURE: the shape Ollama uses to say the pull cannot happen — a name it does not have, a disk
+    /// it cannot write.
+    ///
+    /// It is a 200 carrying an `error` key, not an HTTP failure, so a reader that checked only the
+    /// status would call a download that never happened a success.
+    #[test]
+    fn a_pull_line_carrying_an_error_is_a_failure_and_not_progress() {
+        let line = r#"{"error":"pull model manifest: file does not exist"}"#;
+
+        match interpret_pull(line) {
+            Some(PullLine::Failed(reason)) => assert!(
+                reason.contains("file does not exist"),
+                "the reason Ollama gave must survive verbatim: {reason}"
+            ),
+            other => panic!("an error frame must read as a failure: {other:?}"),
+        }
+    }
+
+    /// PURE: every shape that is not a frame of this stream at all.
+    ///
+    /// Skipped rather than guessed and never fatal — the same fail-closed posture `interpret_tags`
+    /// takes. A blank line between frames is ordinary, and one unreadable frame in a stream of
+    /// thousands must not abandon a download that is otherwise working.
+    #[test]
+    fn an_unreadable_pull_line_is_skipped_rather_than_guessed() {
+        for line in ["", "   ", "not json at all", "[]", r#"{"other_key": 1}"#] {
+            assert!(
+                interpret_pull(line).is_none(),
+                "a line of this shape says nothing about the download: {line:?}"
+            );
+        }
+    }
+
+    /// The whole read, over a listener: every frame reported once, in order, and then success.
+    ///
+    /// The final frame carries no counts, which is what Ollama really sends — so this also pins
+    /// that the last thing a watcher hears is `success` and not the last percentage before it.
+    #[tokio::test]
+    async fn a_pull_reports_every_frame_and_then_succeeds() {
+        let base_url = stub_ollama_pull(concat!(
+            "{\"status\":\"pulling manifest\"}\n",
+            "{\"status\":\"pulling 8934\",\"completed\":50,\"total\":100}\n",
+            "{\"status\":\"success\"}\n",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let mut seen: Vec<(String, u64, u64)> = Vec::new();
+
+        let outcome = pull_local_model(&client, &base_url, "qwen3.5:4b", |progress| {
+            seen.push((progress.status, progress.completed, progress.total));
+        })
+        .await;
+
+        assert_eq!(outcome, Ok(()), "a stream ending in success must succeed");
+        assert_eq!(
+            seen,
+            vec![
+                ("pulling manifest".to_string(), 0, 0),
+                ("pulling 8934".to_string(), 50, 100),
+                ("success".to_string(), 0, 0),
+            ],
+            "every frame, once, in the order Ollama sent them"
+        );
+    }
+
+    /// A stream that ends in an `error` frame fails, and fails with what Ollama said.
+    ///
+    /// The reason is carried out verbatim rather than replaced with wording of this crate's own,
+    /// because the person reading it is being told why a download they asked for did not happen,
+    /// and Ollama is the only party here that knows.
+    #[tokio::test]
+    async fn a_pull_ollama_refuses_fails_with_the_reason_ollama_gave() {
+        let base_url = stub_ollama_pull(concat!(
+            "{\"status\":\"pulling manifest\"}\n",
+            "{\"error\":\"pull model manifest: file does not exist\"}\n",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let outcome = pull_local_model(&client, &base_url, "nope:1b", |_| {}).await;
+
+        match outcome {
+            Err(reason) => assert!(
+                reason.contains("file does not exist"),
+                "the failure must name what Ollama said: {reason}"
+            ),
+            Ok(()) => panic!("a stream carrying an error frame must not report success"),
+        }
+    }
+
+    /// A stream that simply stops — no `success`, no `error` — is a failure and not a quiet
+    /// success.
+    ///
+    /// This is what a killed Ollama, a full disk or a dropped connection looks like from here, and
+    /// it is the one failure that would otherwise be invisible: every byte that did arrive was
+    /// valid, so nothing in the loop noticed. Reporting `Ok` would leave the window saying a model
+    /// is downloaded that is not, which is worse than any error message.
+    #[tokio::test]
+    async fn a_pull_whose_stream_stops_short_is_a_failure_and_not_a_quiet_success() {
+        let base_url = stub_ollama_pull(concat!(
+            "{\"status\":\"pulling manifest\"}\n",
+            "{\"status\":\"pulling 8934\",\"completed\":50,\"total\":100}\n",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let outcome = pull_local_model(&client, &base_url, "qwen3.5:4b", |_| {}).await;
+
+        assert!(
+            outcome.is_err(),
+            "a stream that never said success must not be reported as one: {outcome:?}"
+        );
+    }
+
+    /// The same connect-failure shape the `/api/tags` reads above are held to, and the one place
+    /// this function's posture DIFFERS from theirs: a pull that cannot dial reports an error.
+    ///
+    /// `installed_local_models` fails closed to an empty list because nobody asked it anything — it
+    /// runs to decorate a menu. A pull is something a person asked for and is watching, so silence
+    /// would leave a progress bar at zero forever with nothing to say why.
+    #[tokio::test]
+    async fn a_pull_that_cannot_reach_ollama_says_so_rather_than_failing_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+
+        let outcome = pull_local_model(&client, &base_url, "qwen3.5:4b", |_| {}).await;
+
+        assert!(
+            outcome.is_err(),
+            "an unreachable Ollama must be reported, not swallowed: {outcome:?}"
+        );
+    }
+
+    /// The one thing no fixture above can check: whether a real `/api/pull` really streams the
+    /// shape every test in this section assumes.
+    ///
+    /// Asks for a model this machine already has, deliberately — Ollama answers such a pull in
+    /// milliseconds with the same frames, so the check costs no bandwidth and downloads nothing.
+    /// `#[ignore]`, exactly like `um_ollama_real_lista_os_modelos_que_esta_maquina_tem` above and
+    /// for the same reason: Ollama is not running on every machine this suite runs on.
+    #[tokio::test]
+    #[ignore = "needs a running Ollama at runner::OLLAMA_BASE_URL with at least one model pulled"]
+    async fn a_real_ollama_streams_a_pull_it_already_has() {
+        let client = reqwest::Client::new();
+        let installed = installed_local_models(&client, crate::runner::OLLAMA_BASE_URL).await;
+        let model = installed
+            .first()
+            .expect("this test needs a machine with at least one model already pulled")
+            .clone();
+        let mut seen: Vec<String> = Vec::new();
+
+        let outcome = pull_local_model(
+            &client,
+            crate::runner::OLLAMA_BASE_URL,
+            &model,
+            |progress| {
+                seen.push(progress.status);
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "re-pulling a model already here must succeed"
+        );
+        assert!(
+            seen.iter().any(|status| status == "success"),
+            "a real pull must end in the `success` frame this module reads as completion: {seen:?}"
         );
     }
 }

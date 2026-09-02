@@ -76,6 +76,8 @@ import {
   useLiveTurn,
   useRelayChain,
   useLocalModel,
+  useLocalPull,
+  usePullLocalModel,
   usePatchChat,
   usePostChatSeen,
   usePostChatTitle,
@@ -2078,6 +2080,16 @@ const MODEL_SECTIONS: {
   },
 ];
 
+/**
+ * The dead time immediately after a missing model is armed for download.
+ *
+ * Mirrors `ConfirmButton`'s own `DWELL_MS` and exists for the reason that component gives: a
+ * double-click is one gesture, and without this it would both arm the row and confirm it, leaving
+ * an interlock that defends against nothing. Duplicated rather than imported because that module
+ * keeps it private, and the number is the same 300 ms on purpose — the two are one behaviour.
+ */
+const ARM_DWELL_MS = 300;
+
 function ModelMenu({
   model,
   onPick,
@@ -2092,6 +2104,21 @@ function ModelMenu({
   const catalogue = useAssistantModels();
   const localModel = useLocalModel();
   const localUnavailable = localModel.data?.available === false;
+  const pull = useLocalPull();
+  const startPull = usePullLocalModel();
+  /* Which missing model is one click from being fetched. The `ConfirmButton` interlock, kept
+     rather than borrowed: that component renders a `Button`, and a button inside a menu is not
+     reachable by the menu's own arrow-key navigation, so importing it here would have cost the
+     keyboard the row entirely. What is kept is the part that matters — arm, then confirm, in
+     place, no dialog.
+
+     Neither of that component's two timers is kept, and for reasons rather than by omission. Its
+     4-second disarm defends a control that stays on screen after you look away; a menu closes the
+     moment you look away, and closing resets this. Its 300 ms dwell IS kept, as `armedAt` below,
+     because a double-click is one gesture and without it a double-click would arm and confirm in
+     one motion — which is the whole interlock, defeated by a reflex. */
+  const [armed, setArmed] = useState<string | null>(null);
+  const armedAt = useRef(0);
 
   const choices = catalogue.data?.choices ?? [];
   const chosen = choices.find((choice) => choice.id === model);
@@ -2104,7 +2131,13 @@ function ModelMenu({
   const shown = chosen?.label ?? model ?? catalogue.data?.configured ?? "Model";
 
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      /* Closing is what disarms. A menu you walked away from is one you closed, which is why this
+         needs none of `ConfirmButton`'s timer — see the comment on `armed` above. */
+      onOpenChange={(open) => {
+        if (!open) setArmed(null);
+      }}
+    >
       <DropdownMenuTrigger
         className="chats-tool"
         /* Spelled out: the visible text is a model's NAME, and a control whose whole accessible
@@ -2146,19 +2179,77 @@ function ModelMenu({
                   {section.label}
                 </DropdownMenuLabel>
                 {held.map((choice) => {
+                  /* A model this machine does not have is not a choice of who answers — it is an
+                     action, and it is drawn as one. A `DropdownMenuItem` inside the radio group
+                     rather than beside it: the sections above and below it are the same menu and
+                     the same list of models, and moving one section out would put the row that
+                     says "not downloaded yet" somewhere other than under its own heading. */
+                  if (choice.installed === false) {
+                    const mine =
+                      pull.data && pull.data.model === choice.id ? pull.data : null;
+                    const running = mine !== null && mine.state === "running";
+                    /* A refusal from the daemon — a name its catalogue no longer carries, or
+                       another download already running — belongs on the row that asked for it and
+                       nowhere else. Without this the row would simply go back to saying "not
+                       downloaded", which is the silent death this whole menu exists to stop. */
+                    const refused =
+                      startPull.isError && startPull.variables === choice.id;
+                    const isArmed = armed === choice.id;
+                    return (
+                      <DropdownMenuItem
+                        key={choice.id}
+                        disabled={running || startPull.isPending}
+                        /* Radix closes the menu on select; both halves of the interlock happen in
+                           here, and the download is watched from this same menu, so the default is
+                           fought exactly as `ExtraDirsMenu` below fights it. */
+                        onSelect={(event) => {
+                          event.preventDefault();
+                          if (!isArmed) {
+                            setArmed(choice.id);
+                            armedAt.current = Date.now();
+                            return;
+                          }
+                          /* The second half of a double-click lands here within the dwell and is
+                             IGNORED — it does not confirm, and it does not disarm either, because
+                             disarming would punish the reflex and make the row feel broken. */
+                          if (Date.now() - armedAt.current < ARM_DWELL_MS) return;
+                          setArmed(null);
+                          startPull.mutate(choice.id);
+                        }}
+                      >
+                        {choice.label}
+                        <span className="chats-tool-why">
+                          {running
+                            ? /* The percentage when there is one, and Ollama's own word for what it
+                                 is doing when there is not — every download opens on a frame that
+                                 has not measured itself yet, and a bar at 0% would say it is
+                                 stuck. */
+                              (mine.percent !== null
+                                ? `${mine.percent}%`
+                                : mine.status)
+                            : mine !== null && mine.state === "failed"
+                              ? /* What Ollama said, not a word of this window's own: the person is
+                                   being told why a download they asked for did not happen, and
+                                   Ollama is the only party here that knows. */
+                                (mine.error ?? "the download failed")
+                              : refused
+                                ? "the núcleo would not start the download"
+                                : isArmed
+                                  ? "click again to download it"
+                                  : "not downloaded"}
+                        </span>
+                      </DropdownMenuItem>
+                    );
+                  }
+
                   /* Two facts about a choice, read as one verdict on picking it: where the words
                      go, and whether the model can work the tools a turn reaches for. Composed into
                      one line rather than stacked as two spans, because the row is one line tall. */
                   const why = [
                     choice.brain === "local"
-                      ? choice.installed === false
-                        ? /* Kept on the row and not left to the heading alone: a menu is read one
-                             line at a time once somebody is arrowing through it, and this is the
-                             note that says the row will not answer until something is fetched. */
-                          "not downloaded"
-                        : localUnavailable
-                          ? "not running on this machine"
-                          : "on this machine"
+                      ? localUnavailable
+                        ? "not running on this machine"
+                        : "on this machine"
                       : choice.brain === "openrouter"
                         ? /* Said before the pick, not after: the local mark answers "is it running
                              here", and this one answers the question that matters just as much for
@@ -2175,15 +2266,11 @@ function ModelMenu({
                     <DropdownMenuRadioItem
                       key={choice.id}
                       value={choice.id}
-                      /* Two separate reasons a local row cannot be picked, and they are not the
-                         same question: the daemon's local route may be down, or the model may not
-                         be on the disk at all. The second one is answerable — fetching it is the
-                         next packet's confirmation-then-download — and until that exists, offering
-                         the row without disabling it would be a pick that dies at the first turn. */
-                      disabled={
-                        choice.brain === "local" &&
-                        (localUnavailable || choice.installed === false)
-                      }
+                      /* The local route being down is the one reason left that a row here cannot be
+                         picked: a model that is not on the disk at all no longer reaches this
+                         branch — it is the action above. This one is not answerable from the menu,
+                         because what fixes it is starting Ollama and restarting the daemon. */
+                      disabled={choice.brain === "local" && localUnavailable}
                     >
                       {choice.label}
                       {why.length > 0 && (
