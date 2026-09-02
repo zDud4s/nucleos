@@ -753,6 +753,43 @@ export function useLocalPull() {
 }
 
 /**
+ * What a model weighs, and whether this machine can carry it.
+ *
+ * `fit` is four-valued and `unknown` is not a failure to handle away: the size
+ * comes from a public registry on the far side of the internet, and a window that
+ * turned "could not ask" into "will not run" would refuse a working model every
+ * time the network hiccuped. Everything downstream treats `unknown` as permission,
+ * not as a verdict.
+ *
+ * `enabled` is what keeps this from being asked for every row in the menu. Only a
+ * model this machine does NOT have has an unanswered question here — for one it
+ * already has, the size is on disk and the download button is not there.
+ *
+ * No `refetchInterval`: a model's size and this machine's memory do not move. This
+ * is the settled one of the three local-model queries.
+ */
+export interface LocalSize {
+  model: string;
+  /** `null` when the registry could not be read. Never `0`, which would grade as "fits". */
+  bytes: number | null;
+  /** This machine's physical RAM. `null` when it could not be measured. */
+  memory: number | null;
+  fit: "comfortable" | "tight" | "too_big" | "unknown";
+  /** Why the size is unknown, when it is. Never shown as an error banner. */
+  error: string | null;
+}
+
+export function useLocalSize(model: string | null) {
+  return useQuery({
+    queryKey: keys.chats.localSize(model ?? ""),
+    queryFn: () =>
+      apiFetch<LocalSize>(`/assistant/local-model/size?model=${encodeURIComponent(model!)}`),
+    enabled: model !== null,
+    staleTime: Infinity,
+  });
+}
+
+/**
  * Fetch a local model this machine does not have.
  *
  * The daemon answers the moment the download STARTS, not when it finishes — it

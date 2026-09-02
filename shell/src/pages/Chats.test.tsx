@@ -430,6 +430,17 @@ function chatsFetchWithEveryRoute(
   chats: ChatSummary[],
   transcripts: Record<string, AssistantTurnRow[]>,
   opts: Parameters<typeof chatsFetch>[2] = {},
+  /**
+   * What the registry says the absent model weighs. Defaulted to `unknown`, which
+   * is the answer a machine with no route to the registry gets — and therefore what
+   * every case that is not ABOUT the size should be asserted against, so none of
+   * them quietly depends on a number.
+   */
+  size: { bytes: number | null; memory: number | null; fit: string } = {
+    bytes: null,
+    memory: null,
+    fit: "unknown",
+  },
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   const base = chatsFetch(chats, transcripts, opts);
   const hosted: ModelChoice = {
@@ -452,6 +463,9 @@ function chatsFetchWithEveryRoute(
         choice.brain === "local" ? { ...choice, installed: true } : choice,
       );
       return { ...models, choices: [...choices, hosted, absent] };
+    }
+    if (path.startsWith("/assistant/local-model/size")) {
+      return { model: absent.id, ...size, error: null };
     }
     return base(path, init);
   };
@@ -1281,6 +1295,74 @@ describe("Chats - a model reached over OpenRouter", () => {
       });
     });
     now.mockRestore();
+  });
+
+  it("refuses to download a model larger than this machine, and says both numbers", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [] },
+        {},
+        // llama3.3:70b against 15.8 GB of RAM, both read from the real thing.
+        { bytes: 42_520_000_000, memory: 15_800_000_000, fit: "too_big" },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
+
+    // BOTH numbers, not just the verdict. "42.5 GB, and this machine has 15.8" is something a
+    // person can act on — a smaller quantisation, another model, more memory — while a bare
+    // "too big" is a wall with no door in it.
+    await waitFor(() => {
+      expect(within(row()).getByText(/42\.5 GB/)).toBeDefined();
+    });
+    expect(within(row()).getByText(/15\.8 GB/)).toBeDefined();
+
+    // And it cannot be started. The interlock is not the guard here: arming a row that can never
+    // run would offer a second click that does nothing, which is worse than a row that says why.
+    expect(row().getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(row());
+    expect(
+      daemon.apiFetch.mock.calls.filter(
+        (call) => call[0] === "/assistant/local-model/pull" && call[1]?.method === "POST",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("shows what a model that fits weighs, and still lets it be downloaded", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [] },
+        {},
+        // qwen3:8b, 5.23 GB, on the same machine — the case this whole feature exists to say yes to.
+        { bytes: 5_230_000_000, memory: 15_800_000_000, fit: "comfortable" },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
+
+    await waitFor(() => {
+      expect(within(row()).getByText(/5\.2 GB/)).toBeDefined();
+    });
+    // A model that fits gets no editorial. The size is the whole message: saying "this will work"
+    // under every row that works is noise somebody learns to stop reading, which is how they miss
+    // the one row that says something else.
+    expect(within(row()).queryByText(/this machine has/i)).toBeNull();
+    expect(row().getAttribute("aria-disabled")).toBeNull();
+
+    fireEvent.click(row());
+    expect(
+      within(missing).getByRole("menuitem", { name: /click again to download/i }),
+    ).toBeDefined();
   });
 
   it("says something true above a turn that moved to the hosted model, rather than the local model's words", async () => {

@@ -77,6 +77,7 @@ import {
   useRelayChain,
   useLocalModel,
   useLocalPull,
+  useLocalSize,
   usePullLocalModel,
   usePatchChat,
   usePostChatSeen,
@@ -131,7 +132,7 @@ import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
 import { ConversationView, useVoiceConversation } from "../data/conversation";
 import type { ConversationPhase } from "../lib/conversation";
-import type { ModelChoice } from "../data/chats";
+import type { LocalPull, ModelChoice } from "../data/chats";
 import {
   Button,
   ConfirmButton,
@@ -2090,6 +2091,109 @@ const MODEL_SECTIONS: {
  */
 const ARM_DWELL_MS = 300;
 
+/**
+ * A byte count as a person reads it. `5230000000` -> `5.2 GB`.
+ *
+ * Decimal gigabytes and not binary, because that is the unit the registry, Ollama and every model
+ * card are written in — showing 4.9 GiB for a model everyone else calls 5.2 GB would be precisely
+ * correct and read as a different model.
+ */
+function gigabytes(bytes: number): string {
+  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+}
+
+/**
+ * One model this machine does not have: what it weighs, whether it fits, and the way to fetch it.
+ *
+ * Its own component rather than a branch inside the menu's `map`, because the size is a query per
+ * model — two absent rows ask two different questions — and a hook cannot live in a loop. The
+ * interlock stays in the parent, where it belongs: it is one armed row at a time across the whole
+ * menu, not a fact about any single row.
+ */
+function MissingModelRow({
+  choice,
+  pull,
+  refused,
+  armed,
+  busy,
+  onSelect,
+}: {
+  choice: ModelChoice;
+  pull: LocalPull | null;
+  refused: boolean;
+  armed: boolean;
+  busy: boolean;
+  onSelect: () => void;
+}) {
+  const size = useLocalSize(choice.id);
+  const running = pull !== null && pull.state === "running";
+  const fit = size.data?.fit ?? "unknown";
+  const tooBig = fit === "too_big";
+  const bytes = size.data?.bytes ?? null;
+
+  /* What the row says when nothing is happening to it. The size leads, because it is the number
+     the decision turns on and the one nothing else in this window can tell somebody.
+
+     `too_big` names BOTH sides. "42.5 GB" alone says nothing about whether that is a lot; "42.5 GB
+     — this machine has 15.8 GB" is a sentence somebody can act on, by picking a smaller
+     quantisation or by buying memory. A bare refusal is a wall with no door in it.
+
+     A model that fits gets no verdict at all, only its size. Writing "this will work" under every
+     row that works is noise a person learns to skip, and skipping it is how they miss the one row
+     that says something else. */
+  const weight =
+    bytes === null
+      ? null
+      : tooBig && size.data?.memory
+        ? `${gigabytes(bytes)} — this machine has ${gigabytes(size.data.memory)}`
+        : fit === "tight"
+          ? `${gigabytes(bytes)} — fits, with little room left`
+          : gigabytes(bytes);
+
+  return (
+    <DropdownMenuItem
+      key={choice.id}
+      /* A model that cannot run is closed rather than armed. Arming it would offer a second click
+         that does nothing, which is a worse answer than a row that says why it is not offering. */
+      disabled={running || busy || tooBig}
+      /* Radix closes the menu on select; both halves of the interlock happen in here, and the
+         download is watched from this same menu, so the default is fought exactly as
+         `ExtraDirsMenu` below fights it. */
+      onSelect={(event) => {
+        event.preventDefault();
+        onSelect();
+      }}
+    >
+      {choice.label}
+      <span className="chats-tool-why">
+        {running
+          ? /* The percentage when there is one, and Ollama's own word for what it is doing when
+               there is not — every download opens on a frame that has not measured itself yet, and
+               a bar at 0% would say it is stuck. */
+            (pull.percent !== null ? `${pull.percent}%` : pull.status)
+          : pull !== null && pull.state === "failed"
+            ? /* What Ollama said, not a word of this window's own: the person is being told why a
+                 download they asked for did not happen, and Ollama is the only party here that
+                 knows. */
+              (pull.error ?? "the download failed")
+            : refused
+              ? "the núcleo would not start the download"
+              : armed
+                ? /* Still leads with the weight, because the second click is the one that spends
+                     it and this is the last moment it can be reconsidered. */
+                  (weight === null
+                    ? "click again to download it"
+                    : `${weight} — click again to download`)
+                : /* `unknown` degrades to exactly what this row said before it could ask: the
+                     registry is a third party on the far side of the internet, and a window that
+                     turned "could not ask" into a verdict would refuse a working model every time
+                     the network hiccuped. */
+                  (weight ?? "not downloaded")}
+      </span>
+    </DropdownMenuItem>
+  );
+}
+
 function ModelMenu({
   model,
   onPick,
@@ -2187,24 +2291,22 @@ function ModelMenu({
                   if (choice.installed === false) {
                     const mine =
                       pull.data && pull.data.model === choice.id ? pull.data : null;
-                    const running = mine !== null && mine.state === "running";
                     /* A refusal from the daemon — a name its catalogue no longer carries, or
                        another download already running — belongs on the row that asked for it and
                        nowhere else. Without this the row would simply go back to saying "not
                        downloaded", which is the silent death this whole menu exists to stop. */
                     const refused =
                       startPull.isError && startPull.variables === choice.id;
-                    const isArmed = armed === choice.id;
                     return (
-                      <DropdownMenuItem
+                      <MissingModelRow
                         key={choice.id}
-                        disabled={running || startPull.isPending}
-                        /* Radix closes the menu on select; both halves of the interlock happen in
-                           here, and the download is watched from this same menu, so the default is
-                           fought exactly as `ExtraDirsMenu` below fights it. */
-                        onSelect={(event) => {
-                          event.preventDefault();
-                          if (!isArmed) {
+                        choice={choice}
+                        pull={mine}
+                        refused={refused}
+                        armed={armed === choice.id}
+                        busy={startPull.isPending}
+                        onSelect={() => {
+                          if (armed !== choice.id) {
                             setArmed(choice.id);
                             armedAt.current = Date.now();
                             return;
@@ -2216,29 +2318,7 @@ function ModelMenu({
                           setArmed(null);
                           startPull.mutate(choice.id);
                         }}
-                      >
-                        {choice.label}
-                        <span className="chats-tool-why">
-                          {running
-                            ? /* The percentage when there is one, and Ollama's own word for what it
-                                 is doing when there is not — every download opens on a frame that
-                                 has not measured itself yet, and a bar at 0% would say it is
-                                 stuck. */
-                              (mine.percent !== null
-                                ? `${mine.percent}%`
-                                : mine.status)
-                            : mine !== null && mine.state === "failed"
-                              ? /* What Ollama said, not a word of this window's own: the person is
-                                   being told why a download they asked for did not happen, and
-                                   Ollama is the only party here that knows. */
-                                (mine.error ?? "the download failed")
-                              : refused
-                                ? "the núcleo would not start the download"
-                                : isArmed
-                                  ? "click again to download it"
-                                  : "not downloaded"}
-                        </span>
-                      </DropdownMenuItem>
+                      />
                     );
                   }
 

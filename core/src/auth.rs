@@ -2111,30 +2111,38 @@ mod tests {
     /// graded a read and put in `READ_ONLY_ROUTES`, one line above the route that starts it.
     #[test]
     fn the_pull_routes_are_out_of_an_agents_reach() {
-        for method in [Method::POST, Method::GET] {
-            let path = "/assistant/local-model/pull";
+        // `size` is here for the same reason `GET pull` is. It downloads nothing and reads a public
+        // catalogue, which is precisely the argument that would get it graded harmless — and what
+        // it actually reports is what this machine has and what it could hold, next door to the
+        // route that spends the disk. It is also the door the pull's own refusal consults.
+        for (method, path) in [
+            (Method::POST, "/assistant/local-model/pull"),
+            (Method::GET, "/assistant/local-model/pull"),
+            (Method::GET, "/assistant/local-model/size"),
+        ] {
+            let method = &method;
             assert!(
-                !route_is_listed(READ_ONLY_ROUTES, &method, path)
-                    && !route_is_listed(RUN_CREATING_ROUTES, &method, path)
-                    && !route_is_listed(TEAM_ROUTES, &method, path)
-                    && !route_is_listed(EMAIL_ROUTES, &method, path)
-                    && !route_is_listed(COUNCIL_ROUTES, &method, path),
+                !route_is_listed(READ_ONLY_ROUTES, method, path)
+                    && !route_is_listed(RUN_CREATING_ROUTES, method, path)
+                    && !route_is_listed(TEAM_ROUTES, method, path)
+                    && !route_is_listed(EMAIL_ROUTES, method, path)
+                    && !route_is_listed(COUNCIL_ROUTES, method, path),
                 "{method} {path} must stay out of every scope table"
             );
             assert!(
-                !permits(&Scope::Run(7), &method, path),
+                !permits(&Scope::Run(7), method, path),
                 "{method} {path} must be unreachable by a run"
             );
             assert!(
-                !permits(&Scope::TeamRun("team-1".to_owned()), &method, path),
+                !permits(&Scope::TeamRun("team-1".to_owned()), method, path),
                 "{method} {path} must be unreachable by a department"
             );
             assert!(
-                !permits(&Scope::ApiToken(ApiTokenLevel::RunCreating), &method, path),
+                !permits(&Scope::ApiToken(ApiTokenLevel::RunCreating), method, path),
                 "{method} {path} must be unreachable by a run-creating key"
             );
             assert!(
-                permits(&Scope::Control, &method, path),
+                permits(&Scope::Control, method, path),
                 "{method} {path} must stay reachable by the human's own key"
             );
         }

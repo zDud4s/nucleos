@@ -367,6 +367,10 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/local-model/pull",
             get(get_local_model_pull).post(post_local_model_pull),
         )
+        // What it weighs, and whether this machine can carry it. Beside the pull because it is the
+        // question asked immediately before one — and the one the pull itself asks to decide
+        // whether to refuse.
+        .route("/assistant/local-model/size", get(get_local_model_size))
         .route("/assistant/ide-sessions", get(list_ide_sessions))
         // The conversation behind one of them. A GET on the session itself rather than a
         // `/messages` under it: what a session IS, to anything outside this daemon, is what was
@@ -8290,6 +8294,97 @@ struct PullRequest {
     model: String,
 }
 
+#[derive(serde::Deserialize)]
+struct SizeQuery {
+    model: String,
+}
+
+/// PURE: what the window draws under a model this machine does not have yet.
+///
+/// Both numbers travel, not just the verdict. "17.4 GB, and this machine has 15.8" is something a
+/// person can act on — a smaller quantisation, a different model, more memory — while a bare
+/// `too_big` is a wall with no door in it. `null` rather than `0` on either side for the reason
+/// `capabilities::interpret_manifest` returns `None`: a zero is a real number that grades as the
+/// most permissive verdict there is, which is the last thing a failed read should produce.
+fn size_readout(model: &str, bytes: Option<u64>, memory: Option<u64>) -> serde_json::Value {
+    let fit = crate::capabilities::model_fit(bytes.unwrap_or(0), memory.unwrap_or(0));
+    serde_json::json!({
+        "model": model,
+        "bytes": bytes,
+        "memory": memory,
+        "fit": match fit {
+            crate::capabilities::Fit::Comfortable => "comfortable",
+            crate::capabilities::Fit::Tight => "tight",
+            crate::capabilities::Fit::TooBig => "too_big",
+            crate::capabilities::Fit::Unknown => "unknown",
+        },
+        "error": serde_json::Value::Null,
+    })
+}
+
+/// Whether this daemon KNOWS a model will not run here — never merely suspects it.
+///
+/// The name says `known` because the answer is asymmetric and the asymmetry is the whole point.
+/// `true` requires two successful reads: a size the registry gave and a memory figure Windows gave.
+/// Every other outcome is `false` — an unreachable registry, a manifest that did not parse, a
+/// machine that could not be measured — because refusing on a failure to MEASURE would hand a third
+/// party on the far side of the internet the power to switch downloads off on this machine.
+///
+/// Its own function rather than a condition inline: the caller is a guard clause whose reader wants
+/// to know what is being refused, not how it was determined.
+async fn known_too_big(model: &str) -> bool {
+    let Ok(bytes) = crate::capabilities::registry_model_size(
+        ollama_tags_client(),
+        crate::capabilities::OLLAMA_REGISTRY_URL,
+        model,
+    )
+    .await
+    else {
+        return false;
+    };
+    let Some(memory) = crate::capabilities::total_memory_bytes() else {
+        return false;
+    };
+    crate::capabilities::model_fit(bytes, memory) == crate::capabilities::Fit::TooBig
+}
+
+/// What a model weighs, and whether this machine can carry it.
+///
+/// Answers the question the download confirmation needs and cannot ask any other way: the local
+/// `/api/tags` knows the size of models already here, which is the case already settled. This reads
+/// the public registry — no key, no account — over the same short-timeout client the `/api/tags`
+/// probes use, because like them it runs to decorate a menu somebody is looking at.
+///
+/// Two failures, answered differently on purpose. A name `registry_path` refuses is a `400`: it can
+/// never work and will not start working on its own. A registry that could not be reached is a
+/// `200` carrying `unknown`, because it is transient and a picker that broke whenever a third party
+/// on the far side of the internet was slow would be a feature that breaks the app it decorates.
+///
+/// Reachable by the control token and an admin key alone — it is in no scope table, and
+/// `auth::the_pull_routes_are_out_of_an_agents_reach` is where that is held.
+async fn get_local_model_size(
+    Query(query): Query<SizeQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if crate::capabilities::registry_path(&query.model).is_none() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "unknown_model"));
+    }
+    let memory = crate::capabilities::total_memory_bytes();
+    match crate::capabilities::registry_model_size(
+        ollama_tags_client(),
+        crate::capabilities::OLLAMA_REGISTRY_URL,
+        &query.model,
+    )
+    .await
+    {
+        Ok(bytes) => Ok(Json(size_readout(&query.model, Some(bytes), memory))),
+        Err(reason) => {
+            let mut readout = size_readout(&query.model, None, memory);
+            readout["error"] = serde_json::Value::String(reason);
+            Ok(Json(readout))
+        }
+    }
+}
+
 /// Fetch a local model this machine does not have yet.
 ///
 /// Answers `202` the moment the download starts rather than when it finishes, because it finishes
@@ -8314,6 +8409,19 @@ async fn post_local_model_pull(
         .any(|choice| choice.brain == "local" && choice.id == body.model)
     {
         return Err(refusal(StatusCode::BAD_REQUEST, "unknown_model"));
+    }
+
+    // Refused BEFORE the download rather than discovered after it. A model larger than this machine
+    // does not become runnable by arriving, so the gigabytes would be spent to prove a thing the
+    // registry will say in one small request.
+    //
+    // Fails OPEN, and that asymmetry is deliberate: only a size this daemon actually read and
+    // actually graded `TooBig` stops anything. An unreachable registry, a manifest it could not
+    // parse, a machine whose memory it could not measure — all of those proceed, because refusing
+    // on a failure to measure would make a third party on the far side of the internet able to
+    // switch off downloads here.
+    if known_too_big(&body.model).await {
+        return Err(refusal(StatusCode::BAD_REQUEST, "model_too_big"));
     }
 
     let started = {
@@ -20417,6 +20525,77 @@ mod tests {
             readout["status"], "pulling manifest",
             "Ollama's own word for what it is doing is what fills the gap a percentage leaves"
         );
+    }
+
+    /// The readout the window draws under a model it does not have yet.
+    ///
+    /// `bytes` and `memory` are both carried rather than only the verdict, because "17.4 GB, and
+    /// this machine has 15.8" is an answer somebody can act on — buy memory, pick a smaller
+    /// quantisation — while a bare `too_big` is a wall.
+    #[test]
+    fn a_size_readout_carries_both_numbers_and_not_only_the_verdict() {
+        let readout = size_readout("gemma3:27b", Some(17_400_000_000), Some(15_800_000_000));
+
+        assert_eq!(readout["model"], "gemma3:27b");
+        assert_eq!(readout["bytes"], 17_400_000_000_u64);
+        assert_eq!(readout["memory"], 15_800_000_000_u64);
+        assert_eq!(readout["fit"], "too_big");
+        assert!(readout["error"].is_null());
+    }
+
+    /// A size nobody could read is `unknown`, and `unknown` never blocks anything.
+    ///
+    /// The registry is a third party on the far side of the internet, and a menu that refused
+    /// downloads whenever it was unreachable would be a feature that breaks the app it decorates.
+    #[test]
+    fn an_unreadable_size_is_unknown_rather_than_a_refusal() {
+        let readout = size_readout("qwen3:8b", None, Some(15_800_000_000));
+
+        assert_eq!(readout["fit"], "unknown");
+        assert!(
+            readout["bytes"].is_null(),
+            "no number is null, never a zero that would grade as `fits`"
+        );
+
+        let unmeasured = size_readout("qwen3:8b", Some(5_230_000_000), None);
+        assert_eq!(
+            unmeasured["fit"], "unknown",
+            "a machine this daemon could not measure grades nothing"
+        );
+    }
+
+    /// The three verdicts reach the wire as the words the window switches on.
+    #[test]
+    fn every_verdict_has_a_name_the_window_can_read() {
+        let machine = Some(15_800_000_000);
+        assert_eq!(
+            size_readout("a", Some(5_230_000_000), machine)["fit"],
+            "comfortable"
+        );
+        assert_eq!(
+            size_readout("a", Some(11_000_000_000), machine)["fit"],
+            "tight"
+        );
+        assert_eq!(
+            size_readout("a", Some(17_400_000_000), machine)["fit"],
+            "too_big"
+        );
+    }
+
+    /// A name the registry path builder refuses is the caller's bug, and answered as one.
+    ///
+    /// Distinct on purpose from an unreachable registry, which is a 200 carrying `unknown`: that
+    /// one is transient and the menu should degrade around it, while this one is a name that can
+    /// never work and will not start working on its own.
+    #[tokio::test]
+    async fn a_malformed_model_name_is_refused_rather_than_reported_as_unknown() {
+        let outcome = get_local_model_size(Query(SizeQuery {
+            model: "../../etc/passwd".to_owned(),
+        }))
+        .await;
+
+        let (status, _) = outcome.expect_err("a name that cannot be a model is a bad request");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// The catalogue is the allowlist. Not because an unknown name is dangerous — it becomes one

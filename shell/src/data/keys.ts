@@ -261,6 +261,17 @@ export const keys = {
      */
     localPull: ["chats", "local-pull"] as const,
     /**
+     * What a model weighs and whether this machine can carry it —
+     * `GET /assistant/local-model/size?model=…`.
+     *
+     * A sibling of the two above for the same prefix reason, and keyed by model
+     * because the answer is per model: two absent rows in one menu ask this at
+     * the same time and must not overwrite each other. It is the most settled of
+     * the three — a model's size and this machine's memory do not move — so it
+     * is also the one that should never be swept by a download's invalidations.
+     */
+    localSize: (model: string) => ["chats", "local-size", model] as const,
+    /**
      * The models a conversation may be moved to — `GET /assistant/models`.
      *
      * Its own key and not a child of `detail`, because it is the same answer for
