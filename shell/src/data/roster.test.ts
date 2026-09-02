@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { project } from "../test/harness";
-import { folderOf, gateOf, headline, inAttentionOrder, rankOf } from "./roster";
+import { folderOf, gateOf, headline, heldBy, inAttentionOrder, onRecord, rankOf } from "./roster";
 
 describe("folderOf", () => {
   /**
@@ -191,5 +191,41 @@ describe("headline", () => {
 
   it("says so when there is nothing at all", () => {
     expect(headline([])).toBe("the núcleo knows of no project");
+  });
+});
+
+describe("the exit", () => {
+  const nothing = { runs: 0, jobs: 0, proposals: 0, decisions: 0, stamps: 0, commands: 0, feed: 0 };
+
+  /**
+   * The phrase the checkbox is read against. Only non-zero facts, for the reason `headline` gives
+   * about itself: a phrase that walked through five zeros to reach one number would bury it.
+   */
+  it("names what is on record, and only what is there", () => {
+    expect(onRecord({ ...nothing, runs: 312, proposals: 8, stamps: 40 })).toBe(
+      "312 runs, 8 proposals and 40 stamps",
+    );
+    expect(onRecord({ ...nothing, runs: 1 })).toBe("1 run");
+  });
+
+  /**
+   * Nothing on record is a third answer, not an empty string.
+   *
+   * A project with no history has nothing to forget, so the checkbox is not offered at all — and
+   * the caller can only know that if this says so rather than handing back a phrase about zero.
+   */
+  it("says nothing at all rather than a phrase about zero", () => {
+    expect(onRecord(nothing)).toBeNull();
+  });
+
+  /**
+   * Both halves, when there are both. They come apart in either direction — a run can hold a slot
+   * before it has checked anything out, and a checkout can outlive the run that made it — so a
+   * phrase naming only the larger number would send somebody to wait for work that had finished.
+   */
+  it("names everything that is holding a project, in both kinds", () => {
+    expect(heldBy({ slots: 1, worktrees: 2 })).toBe("1 slot in flight and 2 worktrees checked out");
+    expect(heldBy({ slots: 0, worktrees: 1 })).toBe("1 worktree checked out");
+    expect(heldBy({ slots: 0, worktrees: 0 })).toBeNull();
   });
 });

@@ -18,6 +18,7 @@ import type { ClassTally } from "../data/autopilot";
 import type { Changed, Worktree } from "../data/project-code";
 import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
+import type { ProjectRecord } from "../data/projects";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
@@ -187,6 +188,24 @@ export interface DaemonState {
   detected: Detected | null;
   /** Every workflow adopted from a folder, as it was sent. */
   adopted: { name: string; path: string }[];
+  /**
+   * What a project would forget by leaving, and what is holding it here.
+   *
+   * One payload for every project, like `readings` above and for the same reason. The default is a
+   * project with nothing on record and nothing in flight — which is the case the remove control has
+   * to get right first, because it is the one where there is no checkbox to offer.
+   */
+  record: ProjectRecord;
+  /** Every removal the shell asked for, as it asked for it — including whether it said to forget. */
+  removed: { projectId: string; forgetHistory: boolean }[];
+  /**
+   * What `DELETE /projects/{id}` refuses with, or `null` to accept.
+   *
+   * The 409 is the half of this route worth testing: work in flight is the state a person meets
+   * when they try to remove the project they have been using, and it is only reachable if the fake
+   * can be told to give it.
+   */
+  removeRefusal: { status: number; code: string; detail: string } | null;
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -241,6 +260,12 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     overlays: [],
     detected: null,
     adopted: [],
+    record: {
+      forgets: { runs: 0, jobs: 0, proposals: 0, decisions: 0, stamps: 0, commands: 0, feed: 0 },
+      holds: { slots: 0, worktrees: 0 },
+    },
+    removed: [],
+    removeRefusal: null,
     ...overrides,
   };
 }
@@ -585,8 +610,38 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return undefined;
     }
 
+    // `DELETE /projects/{id}?forget_history=` — last of the DELETEs, because it is the least
+    // specific: every path above has a segment after the project's, and this one is the project.
+    if (init?.method === "DELETE" && path.startsWith("/projects/")) {
+      if (state.removeRefusal !== null) {
+        const { status, code, detail } = state.removeRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+      const [route, query] = path.split("?");
+      const projectId = decodeURIComponent(route.split("/")[2] ?? "");
+      state.removed.push({
+        projectId,
+        forgetHistory: new URLSearchParams(query ?? "").get("forget_history") === "true",
+      });
+      // The row goes, because the roster behind the panel is what a test watches to know the
+      // removal landed — a fake that recorded the call and left the row would pass a component
+      // that never told react-query anything had changed.
+      state.projects = state.projects.filter((row) => row.project_id !== projectId);
+      return undefined;
+    }
+
     // Parameterised before the exact matches: the readings route carries a project id, which a
     // `switch` over literals cannot express.
+    if (path.startsWith("/projects/") && path.endsWith("/record")) {
+      // 404 for a name the roster does not have, which is what the daemon answers: a record of all
+      // zeros is what an unregistered project and a brand new one both look like, and only one of
+      // them has a remove control that could ever work.
+      const projectId = decodeURIComponent(path.split("/")[2] ?? "");
+      if (!state.projects.some((row) => row.project_id === projectId)) {
+        throw new ApiRefusal(404, "not_found", "no project by that name");
+      }
+      return state.record;
+    }
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;
     if (path.startsWith("/projects/") && path.endsWith("/ownership")) return state.ownership;

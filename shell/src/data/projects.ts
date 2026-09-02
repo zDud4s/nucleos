@@ -208,6 +208,107 @@ export function useSetWipLimit() {
   });
 }
 
+/* ------------------------------------------------------------- the exit -- */
+
+/**
+ * What a project has on record, in the nouns somebody would recognise.
+ *
+ * Every field is a thing this app has a screen for, so each one is something the reader can picture
+ * losing. The daemon counts more tables than these — scheduler bookkeeping, trigger state — and
+ * deliberately does not report them: a number nobody has ever seen a page for makes the decision
+ * harder rather than easier, and forgetting takes them either way.
+ */
+export interface ProjectForgets {
+  runs: number;
+  jobs: number;
+  proposals: number;
+  decisions: number;
+  stamps: number;
+  commands: number;
+  feed: number;
+}
+
+/**
+ * What is still going on in this project right now.
+ *
+ * **A different question from {@link ProjectForgets}, and a different shape for that reason.** One
+ * is what a removal would erase and the other is what stops it happening at all; one flat bag of
+ * numbers would let a panel print "312 runs, 1 slot" as if those were the same kind of fact, and
+ * only the second is a reason the daemon will refuse.
+ */
+export interface ProjectHolds {
+  /** Slots taken right now — a run, a job or one of a job's items, working here. */
+  slots: number;
+  /** Worktrees still checked out on disk. Separate from the slots because the two come apart. */
+  worktrees: number;
+}
+
+export interface ProjectRecord {
+  forgets: ProjectForgets;
+  holds: ProjectHolds;
+}
+
+/**
+ * What removing this project would forget, and what is holding it.
+ *
+ * **On demand and never polled**, like the inspect readers above and for a sharper version of the
+ * same reason: this is nine `COUNT(*)`s over the whole database, asked so that one person can
+ * answer one checkbox. A roster of twenty-five running them on the three-second timer would be
+ * counting a database to draw buttons nobody pressed.
+ *
+ * `enabled` is therefore the control being *open*, not the row being on screen.
+ */
+export function useProjectRecord(projectId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: keys.projects.record(projectId ?? ""),
+    queryFn: () => apiFetch<ProjectRecord>(`/projects/${encodeURIComponent(projectId ?? "")}/record`),
+    enabled: enabled && projectId !== null,
+  });
+}
+
+export interface ProjectRemoval {
+  projectId: string;
+  /**
+   * Whether the record goes with the row.
+   *
+   * Defaulted nowhere and always passed, because the caller deciding is the point: the owner's
+   * standing decision is that history is kept unless somebody says otherwise *at the moment they
+   * say it*, which is a checkbox next to a number and not a default buried in a hook.
+   */
+  forgetHistory: boolean;
+}
+
+/**
+ * Take a project off the roster.
+ *
+ * **Nothing on the disk is touched, and there is no argument here that would make it be.** Deleting
+ * a folder is a second act with its own route and its own confirmation; a flag on this one would
+ * give two very different weights the same shape, and the caller that eventually passed it would be
+ * a caller that meant the reversible one.
+ *
+ * `retry: false` because both refusals this can get are settled answers: a 404 is a name that is
+ * not there, and a 409 is work in flight that a retry a millisecond later cannot have finished.
+ * The 409 clears by the work ending, which is a thing the person watches rather than a thing a
+ * client waits out.
+ */
+export function useRemoveProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ projectId, forgetHistory }: ProjectRemoval) =>
+      apiFetch<void>(
+        `/projects/${encodeURIComponent(projectId)}?forget_history=${forgetHistory ? "true" : "false"}`,
+        { method: "DELETE" },
+      ),
+    retry: false,
+    onSettled: () => {
+      // The roster prefix, which reaches this project's record and every other reader under it —
+      // including, on a refusal, the `holds` the panel is showing, which is exactly the number that
+      // just proved to be out of date.
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
+}
+
 /* --------------------------------------------------------------- readings -- */
 
 /**

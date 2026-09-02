@@ -1219,6 +1219,34 @@ export function answer(path: string, init?: RequestInit): unknown {
     runs were never judged because nothing asked them to be. Every one of those
     is a sentence this page has to be able to say.
   */
+  /*
+    What a project would forget by leaving, and what is holding it. Varied per
+    project on purpose, because the remove panel says three different things and
+    only one of them is reachable from a single fixture: `alpha` has a long
+    record and a job holding a slot, so it photographs the refusal; `bravo` has
+    a record and nothing in flight, which is the ordinary case with the
+    checkbox; `charlie` has nothing at all, and is offered no checkbox because
+    there is nothing to decide about.
+  */
+  const record = /^\/projects\/([^/]+)\/record$/.exec(route);
+  if (record !== null) {
+    const nothing = { runs: 0, jobs: 0, proposals: 0, decisions: 0, stamps: 0, commands: 0, feed: 0 };
+    switch (record[1]) {
+      case "alpha":
+        return {
+          forgets: { ...nothing, runs: 312, jobs: 4, proposals: 3, decisions: 12, stamps: 40, feed: 96 },
+          holds: { slots: 1, worktrees: 1 },
+        };
+      case "bravo":
+        return {
+          forgets: { ...nothing, runs: 58, proposals: 2, commands: 3 },
+          holds: { slots: 0, worktrees: 0 },
+        };
+      default:
+        return { forgets: nothing, holds: { slots: 0, worktrees: 0 } };
+    }
+  }
+
   const readings = /^\/projects\/([^/]+)\/readings$/.exec(route);
   if (readings !== null) {
     return {

@@ -392,6 +392,11 @@ const SHOTS_TO_TAKE = [
      reached from and the one surface of this pillar nothing had photographed. */
   ["37-roster", { path: "/projects" }],
   ["38-roster-light", { path: "/projects", theme: "light" }],
+  /* The way out, open. The press lands on the FIRST `remove` in the table, and
+     the ordering puts `bravo` there — which is the fixture with a record and
+     nothing in flight, so the shot carries the ordinary case: the folder
+     reassurance, the counts, and the checkbox left unticked. */
+  ["39-roster-remove", { path: "/projects", press: "remove" }],
 
   /* A door that is not the picture, which is what the row of views exists for:
      the junction reached without scrolling a matrix, and the seam still above
