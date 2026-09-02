@@ -1,7 +1,7 @@
 // §spec mapa-do-projeto
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
-import { useCarimbar, type Anchored } from "../data/project-map";
+import { useGiveStamp, type Anchored } from "../data/project-map";
 
 /**
  * The owner's verdict on one decision, as three buttons and a note (§5.2).
@@ -41,14 +41,14 @@ export interface GiveStampProps {
 
 export function GiveStamp({ projectId, row }: GiveStampProps) {
   const [note, setNote] = useState("");
-  const carimbar = useCarimbar(projectId);
+  const giveStamp = useGiveStamp(projectId);
 
   const name = `${row.spec_slug} ${row.section}`;
   // Trimmed here against a daemon that trims before it checks, so the button is disabled for
   // exactly the notes the núcleo would refuse and for no others.
   const written = note.trim();
   const send = (verdict: "settled" | "partial" | "withdrawn") =>
-    carimbar.mutate({
+    giveStamp.mutate({
       decisionId: row.decision_id,
       verdict,
       // `null` and never `""`: *said nothing* and *said the empty string* are different, and the
@@ -70,7 +70,7 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
         <button
           type="button"
           aria-label={`stamp ${name} as what you want`}
-          disabled={carimbar.isPending}
+          disabled={giveStamp.isPending}
           onClick={() => send("settled")}
           className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
@@ -79,7 +79,7 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
         <button
           type="button"
           aria-label={`stamp ${name} as part-way`}
-          disabled={carimbar.isPending || written === ""}
+          disabled={giveStamp.isPending || written === ""}
           onClick={() => send("partial")}
           className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
@@ -88,14 +88,14 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
         <button
           type="button"
           aria-label={`stamp ${name} as changed your mind`}
-          disabled={carimbar.isPending}
+          disabled={giveStamp.isPending}
           onClick={() => send("withdrawn")}
           className="rounded-md border border-border px-3 py-1.5 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
         >
           changed my mind
         </button>
       </div>
-      {carimbar.isError ? <Refused error={carimbar.error} /> : null}
+      {giveStamp.isError ? <Refused error={giveStamp.error} /> : null}
     </div>
   );
 }
