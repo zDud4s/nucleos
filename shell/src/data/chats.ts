@@ -472,6 +472,16 @@ export interface ModelChoice {
    * introspects. Treating absent as `false` would mark almost the whole menu.
    */
   tools?: boolean | null;
+  /**
+   * Whether this machine has this LOCAL model pulled. Absent or `null` wherever the question does
+   * not apply, which is every route but `local`: a cloud model runs in somebody else's data centre
+   * and a hosted one is fetched over HTTP, so neither is downloaded or not.
+   *
+   * Unlike `tools` above, `false` here is not a warning — it is an ordinary, actionable state. A
+   * local model the daemon lists and this machine has yet to download is exactly the row somebody
+   * wants to see, because seeing it is how they learn it can be had.
+   */
+  installed?: boolean | null;
 }
 
 /** `GET /assistant/models` — the menu, and what an unpinned conversation runs on. */

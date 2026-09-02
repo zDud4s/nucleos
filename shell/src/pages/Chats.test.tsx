@@ -419,6 +419,45 @@ function chatsFetchWithToollessChoice(
 }
 
 /**
+ * `chatsFetch`'s `/assistant/models`, with one hosted choice AND one local model this machine has
+ * yet to download — a menu carrying all four kinds at once, which is what a test about GROUPING
+ * needs and no other fixture here provides.
+ *
+ * The base fixture's own `qwen3.5:4b` is marked as present rather than left absent: the two local
+ * rows have to differ in exactly the field under test, or the grouping could be reading anything.
+ */
+function chatsFetchWithEveryRoute(
+  chats: ChatSummary[],
+  transcripts: Record<string, AssistantTurnRow[]>,
+  opts: Parameters<typeof chatsFetch>[2] = {},
+): (path: string, init?: RequestInit) => Promise<unknown> {
+  const base = chatsFetch(chats, transcripts, opts);
+  const hosted: ModelChoice = {
+    id: "openrouter-gpt",
+    label: "GPT via OpenRouter",
+    brain: "openrouter",
+    efforts: [],
+  };
+  const absent: ModelChoice = {
+    id: "llama3.2:3b",
+    label: "Llama 3.2 3B",
+    brain: "local",
+    efforts: [],
+    installed: false,
+  };
+  return async (path, init) => {
+    if (path === "/assistant/models") {
+      const models = (await base(path, init)) as AssistantModels;
+      const choices = models.choices.map((choice) =>
+        choice.brain === "local" ? { ...choice, installed: true } : choice,
+      );
+      return { ...models, choices: [...choices, hosted, absent] };
+    }
+    return base(path, init);
+  };
+}
+
+/**
  * The page inside a two-route router, exactly like `Projects.test.tsx`'s
  * `renderProjects`: `renderApp` mounts the gate, the rail and its own live
  * queries around every assertion, which this machine cannot pay for more than
@@ -1156,6 +1195,41 @@ describe("Chats - a model reached over OpenRouter", () => {
         body: JSON.stringify({ model: "openrouter-gpt" }),
       });
     });
+  });
+
+  it("groups the menu by route, and says which local models this machine has", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    // Four groups, because there are four different answers to "where does this actually run", and
+    // a flat list made a person read the note at the end of each line to find out. Queried as
+    // ROLES rather than by reading the DOM order: a group a screen reader announces is the same
+    // fact this test is about, and asserting on order would pass for a menu nobody can navigate.
+    const cli = await screen.findByRole("group", { name: /agent cli/i });
+    const hosted = screen.getByRole("group", { name: /openrouter/i });
+    const here = screen.getByRole("group", { name: /on this machine/i });
+    const missing = screen.getByRole("group", { name: /not downloaded/i });
+
+    expect(within(cli).getByRole("menuitemradio", { name: /^Sonnet/ })).toBeDefined();
+    expect(
+      within(hosted).getByRole("menuitemradio", { name: /^GPT via OpenRouter/ }),
+    ).toBeDefined();
+    expect(within(here).getByRole("menuitemradio", { name: /^qwen3\.5:4b/ })).toBeDefined();
+
+    // The row this packet exists for: a model the daemon offers and this machine does not have.
+    // SHOWN, because seeing it is how somebody learns it can be had at all — Ollama publishes no
+    // list of what is pullable, so if the menu does not say it, nothing does. And not selectable
+    // yet, because picking it today dies at the first turn; the confirmation and the download it
+    // needs are the next packet's, and this assertion is what will have to change when they land.
+    const absent = within(missing).getByRole("menuitemradio", {
+      name: /^Llama 3\.2 3B/,
+    });
+    expect(absent.getAttribute("aria-disabled")).toBe("true");
+    expect(within(absent).getByText(/not downloaded/i)).toBeDefined();
   });
 
   it("says something true above a turn that moved to the hosted model, rather than the local model's words", async () => {

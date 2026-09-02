@@ -20099,6 +20099,41 @@ mod tests {
         assert!(body["configured"].is_string());
     }
 
+    /// `installed` reaches the wire, and reads `null` wherever the question is meaningless.
+    ///
+    /// The other half — `true` for a model this machine has, `false` for one it does not — is
+    /// pinned by `config.rs`'s `a_local_row_is_marked_by_whether_this_machine_has_it` and NOT here,
+    /// and that is a limit rather than a preference: `models_config()` resolves to
+    /// `core/.ai/nucleos-models.yaml` under `cargo test`, a path that does not exist, so a unit
+    /// test here is served the built-in defaults and those name no local model at all. What this
+    /// test can prove is the half that travels: the route serves the field, and a route that is not
+    /// `local` reports it as `null` rather than as a `false` that would put "not installed" on most
+    /// of the menu — the same argument `AssistantChoice::tools` makes for never guessing `false`.
+    #[tokio::test]
+    async fn the_menu_reports_installed_for_local_rows_and_nothing_else() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/models", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let choices = body["choices"].as_array().unwrap();
+        assert!(!choices.is_empty(), "the picker was handed an empty menu");
+        for choice in choices {
+            assert!(
+                choice.get("installed").is_some(),
+                "every choice carries the field, so the window never has to tell absent from \
+                 unanswered: {choice}"
+            );
+            if choice["brain"] != "local" {
+                assert!(
+                    choice["installed"].is_null(),
+                    "only a local model is pulled or not; a {} row claimed otherwise: {choice}",
+                    choice["brain"]
+                );
+            }
+        }
+    }
+
     /// The catalogue is the allowlist. Not because an unknown name is dangerous — it becomes one
     /// element of an argument vector and never a shell word — but because it is a turn that dies at
     /// spawn, on the person's NEXT message, for a reason the window could have given them here.

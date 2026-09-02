@@ -10,6 +10,7 @@ import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -128,6 +129,7 @@ import { stillGoing } from "../lib/editor";
 import { diffLines } from "../lib/diff";
 import { ConversationView, useVoiceConversation } from "../data/conversation";
 import type { ConversationPhase } from "../lib/conversation";
+import type { ModelChoice } from "../data/chats";
 import {
   Button,
   ConfirmButton,
@@ -2033,6 +2035,49 @@ function AutoTitleRefusal({ error }: { error: unknown }) {
  * it is named in the menu rather than left as an empty selection, because a control showing nothing
  * selected reads as broken.
  */
+/**
+ * The four answers to "where does this model actually run", in the order the menu offers them.
+ *
+ * Sections and not one flat list, because the four differ in what they cost and what they risk —
+ * somebody else's data centre, a third party's, this disk, and not yet anywhere — and a person
+ * scanning a flat list had to read the note at the end of every line to tell which was which.
+ *
+ * The order is deliberate: the CLI first because it is what almost every conversation runs on, and
+ * the models this machine does not have last, because they are the only rows that cannot answer
+ * today.
+ *
+ * `installed !== false` and not `=== true` for the local-and-present test: a daemon older than the
+ * field sends no `installed` at all, and every local model it lists is one it found through
+ * `/api/tags`. Reading absent as "not downloaded" would move the whole local menu of such a daemon
+ * into the section that says it cannot answer.
+ */
+const MODEL_SECTIONS: {
+  key: string;
+  label: string;
+  holds: (choice: ModelChoice) => boolean;
+}[] = [
+  {
+    key: "cli",
+    label: "On the agent CLI",
+    holds: (choice) => choice.brain === "cloud",
+  },
+  {
+    key: "hosted",
+    label: "Through OpenRouter",
+    holds: (choice) => choice.brain === "openrouter",
+  },
+  {
+    key: "installed",
+    label: "On this machine",
+    holds: (choice) => choice.brain === "local" && choice.installed !== false,
+  },
+  {
+    key: "absent",
+    label: "Not downloaded yet",
+    holds: (choice) => choice.brain === "local" && choice.installed === false,
+  },
+];
+
 function ModelMenu({
   model,
   onPick,
@@ -2089,40 +2134,67 @@ function ModelMenu({
               </span>
             </DropdownMenuRadioItem>
           )}
-          {choices.map((choice) => {
-            /* Two facts about a choice, read as one verdict on picking it: where the words go,
-               and whether the model can work the tools a turn reaches for. Composed into one
-               line rather than stacked as two spans, because the row is one line tall. */
-            const why = [
-              choice.brain === "local"
-                ? localUnavailable
-                  ? "not running on this machine"
-                  : "on this machine"
-                : choice.brain === "openrouter"
-                  ? /* Said before the pick, not after: the local mark answers "is it running
-                       here", and this one answers the question that matters just as much for a
-                       hosted choice — whose machine the words end up on. */
-                    "off this machine — sent to a third-party provider"
-                  : null,
-              /* Only `false` earns a mark. Absent is "nobody asked", which is the ordinary state
-                 of every choice nothing has introspected — marking that would put a warning on
-                 most of the menu and teach people to read past it. */
-              choice.tools === false ? "cannot use tools" : null,
-            ].filter((note): note is string => note !== null);
-
+          {MODEL_SECTIONS.map((section) => {
+            const held = choices.filter(section.holds);
+            /* An empty section is not drawn at all rather than drawn empty: three of the four are
+               empty on an untouched install, and headings over nothing would make the menu look
+               like it had lost its contents. */
+            if (held.length === 0) return null;
             return (
-              <DropdownMenuRadioItem
-                key={choice.id}
-                value={choice.id}
-                /* A local model can be configured and still not be running. The daemon lists it
-                   because it is named; this is the separate question of whether it answers. */
-                disabled={choice.brain === "local" && localUnavailable}
-              >
-                {choice.label}
-                {why.length > 0 && (
-                  <span className="chats-tool-why">{why.join(" · ")}</span>
-                )}
-              </DropdownMenuRadioItem>
+              <DropdownMenuGroup key={section.key} aria-label={section.label}>
+                <DropdownMenuLabel className="chats-meta-menu-section">
+                  {section.label}
+                </DropdownMenuLabel>
+                {held.map((choice) => {
+                  /* Two facts about a choice, read as one verdict on picking it: where the words
+                     go, and whether the model can work the tools a turn reaches for. Composed into
+                     one line rather than stacked as two spans, because the row is one line tall. */
+                  const why = [
+                    choice.brain === "local"
+                      ? choice.installed === false
+                        ? /* Kept on the row and not left to the heading alone: a menu is read one
+                             line at a time once somebody is arrowing through it, and this is the
+                             note that says the row will not answer until something is fetched. */
+                          "not downloaded"
+                        : localUnavailable
+                          ? "not running on this machine"
+                          : "on this machine"
+                      : choice.brain === "openrouter"
+                        ? /* Said before the pick, not after: the local mark answers "is it running
+                             here", and this one answers the question that matters just as much for
+                             a hosted choice — whose machine the words end up on. */
+                          "off this machine — sent to a third-party provider"
+                        : null,
+                    /* Only `false` earns a mark. Absent is "nobody asked", which is the ordinary
+                       state of every choice nothing has introspected — marking that would put a
+                       warning on most of the menu and teach people to read past it. */
+                    choice.tools === false ? "cannot use tools" : null,
+                  ].filter((note): note is string => note !== null);
+
+                  return (
+                    <DropdownMenuRadioItem
+                      key={choice.id}
+                      value={choice.id}
+                      /* Two separate reasons a local row cannot be picked, and they are not the
+                         same question: the daemon's local route may be down, or the model may not
+                         be on the disk at all. The second one is answerable — fetching it is the
+                         next packet's confirmation-then-download — and until that exists, offering
+                         the row without disabling it would be a pick that dies at the first turn. */
+                      disabled={
+                        choice.brain === "local" &&
+                        (localUnavailable || choice.installed === false)
+                      }
+                    >
+                      {choice.label}
+                      {why.length > 0 && (
+                        <span className="chats-tool-why">
+                          {why.join(" · ")}
+                        </span>
+                      )}
+                    </DropdownMenuRadioItem>
+                  );
+                })}
+              </DropdownMenuGroup>
             );
           })}
         </DropdownMenuRadioGroup>
