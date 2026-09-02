@@ -9,8 +9,10 @@ import {
 } from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
+import { Section } from "../ui";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
+import { DeleteFolder } from "./DeleteFolder";
 import { Occupancy } from "./Occupancy";
 import { OwnedFiles } from "./OwnedFiles";
 import { Settings } from "./Settings";
@@ -31,13 +33,13 @@ import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } fr
  * and there is a test that renders both states and compares the set of panels.
  */
 
-export interface ModeEstadoProps {
+export interface ModeStateProps {
   projectId: string;
   /** Has the roster answered at all? Before it has, nothing here is a measurement. */
   answered: boolean;
 }
 
-export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
+export function ModeState({ projectId, answered }: ModeStateProps) {
   const projects = useProjects();
   const killSwitch = useKillSwitch();
   const budget = useBudget();
@@ -113,25 +115,17 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
       <Section label="Files the app owns">
         <OwnedFiles projectId={projectId} />
       </Section>
-    </div>
-  );
-}
 
-/**
- * A panel of the page.
- *
- * The `aria-label` is not decoration: it is the handle the composition test grabs the page by, and
- * it is the same handle a screen reader uses. Protecting the structure somebody hears and the
- * structure somebody sees with one assertion is worth more than protecting either alone.
- */
-function Section({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <section aria-label={label} className="flex flex-col gap-3">
-      <h2 className="font-display text-xs font-medium uppercase tracking-wider text-text-faint">
-        {label}
-      </h2>
-      {children}
-    </section>
+      {/*
+        Last, and below everything, because it is the only thing on this page that cannot be undone.
+        Here rather than on the roster on purpose: that page compares projects, and a control that
+        destroys one has no business in a column beside three that describe it. Somebody reaching
+        this has already opened the project they mean and scrolled past everything it is doing.
+      */}
+      <Section label="Leaving">
+        <DeleteFolder projectId={projectId} />
+      </Section>
+    </div>
   );
 }
 

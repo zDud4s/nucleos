@@ -115,6 +115,52 @@ textarea {
   color: inherit;
 }
 
+/* A button with no background of its own keeps the user agent's, which is
+   white, under text this reset just made the theme's light foreground: a white
+   slab with an unreadable word in it. It is not a hypothetical -- it has
+   shipped three times now, most recently across the whole of the project's
+   Estado mode, where `edit`, `declare a command`, `off`, `shadow` and both
+   ceiling steppers were all invisible at once.
+
+   Transparent rather than a surface token, because that is what every one of
+   them was drawn for: a border, muted text, and the panel showing through. A
+   button that wants a fill sets one with a class, and a class beats an element
+   selector, so nothing that already had a background loses it.
+
+   Deliberately not extended to `input`, `select` and `textarea`. They have the
+   same hole and it cannot be closed the same way -- a field with no border and
+   no fill is not legible-but-flat, it is gone -- so those are still each their
+   own to paint. */
+/* Inside `@layer base`, and that word is the whole difference between fixing
+   this and breaking every bordered button in the app.
+
+   `tailwind.css` declares `@layer theme, base, components, utilities` and puts
+   the utilities in the last of them. Unlayered CSS — which is what the rest of
+   this file is — beats every layer there is, so the first version of this rule
+   sat above `.border` and `.bg-surface` and won against both: `cloud` and
+   `local` on the map lost their outlines the moment it shipped, seen in a
+   screenshot and not in a test. Layered, it is what it was meant to be: the
+   default a button gets when its class list asks for nothing. */
+@layer base {
+  button {
+    background: transparent;
+  /* And the same hole one property along: the user agent draws every button a
+     `2px outset` border, so a button that asks for none gets one anyway. It is
+     what put a raised grey slab around each row of the map's spec picker, where
+     the design is a bare line of text.
+
+     Written the way Tailwind's own preflight writes it, and for its reason: a
+     bare `border: 0` would set the STYLE to `none`, which `.border` does not
+     restore — it sets only a width — so every deliberately bordered button in
+     the app would quietly lose its outline. Width zero, style solid, colour
+     inherited: a button with no border class shows nothing, and one with
+     `border border-border` is unchanged. */
+    border-width: 0;
+    border-style: solid;
+    border-color: currentColor;
+  }
+}
+
 /* The ring is the one place `--accent` is allowed near a control: it says
    "keyboard is here", which is not a state of anything in the app. */
 :focus-visible {

@@ -305,7 +305,7 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
                           label: project.id,
                           // Estado is where a project opens: it is the mode that
                           // answers the question somebody arrives with.
-                          path: `/projects/${project.id}/estado`,
+                          path: `/projects/${project.id}/state`,
                           // Two letters off the name. Unlike the table's glyphs
                           // these can collide, and that is accepted rather than
                           // solved: the alternative is a generated monogram

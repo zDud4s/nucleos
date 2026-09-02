@@ -1,5 +1,6 @@
 import type { Agent } from "../data/agents";
-import type { Concurrency } from "../data/fleet";
+import type { Concurrency, Job, JobDetail, JobItem } from "../data/fleet";
+import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
 import type {
   InspectEntry,
   InspectMatch,
@@ -7,6 +8,8 @@ import type {
 } from "../data/projects";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { PendingNotification } from "../data/feed";
+import type { Branches } from "../data/project-git";
+import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary } from "../data/system";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 
@@ -223,6 +226,91 @@ export const RUNS: TeamRun[] = [
   run({ id: "r9", team_id: "seguranca", request: "Triage the weekly scan", created_at: ago(2 * DAY) }),
   run({ id: "r10", team_id: "informatica", request: "Prove last week's backup restores", created_at: ago(DAY) }),
 ];
+
+/* --------------------------------------------------------------------- jobs -- */
+
+/**
+ * One job, mid-flight, with a queue worth drawing.
+ *
+ * Directed by a team, because `depends_on` and `agent_name` are null for every item of every
+ * job that is not -- and a queue with no dependencies is a straight line, which is the one
+ * shape that says nothing. This one has two roots that can run at once, a join that waits on
+ * both, a second round, and three of the readings that are easy to get wrong:
+ * `gate_failed` (which the wire cannot tell from "going round again"), `cancelled` (withdrawn
+ * work, never the failure tone) and `conflicted` (waiting on a person, not broken).
+ */
+function jobItem(overrides: Partial<JobItem>): JobItem {
+  return {
+    ordinal: 0,
+    description: "",
+    status: "pending",
+    round: 0,
+    run_id: null,
+    gate_status: null,
+    agent_id: null,
+    agent_name: null,
+    depends_on: [],
+    files: [],
+    ...overrides,
+  };
+}
+
+export const JOB: Job = {
+  id: 24,
+  project_id: "alpha",
+  rule_name: "nightly reconciliation",
+  status: "implementing",
+  wait_reason: null,
+  max_items: 8,
+  created_at: ago(DAY / 12),
+  completed_at: null,
+  slot: 0,
+  round: 1,
+  max_rounds: 3,
+  team_id: "financas",
+  team_name: "Finanças",
+  team_max_parallel: 2,
+};
+
+export const JOB_VIEW: JobDetail = {
+  ...JOB,
+  branch: "job/24-reconciliation",
+  items: [
+    jobItem({
+      ordinal: 0, round: 0, description: "read the bank export", status: "passed",
+      gate_status: "passed", agent_id: "auditor", agent_name: "Ana", run_id: 101,
+      files: ["core/src/storage.rs"],
+    }),
+    jobItem({
+      ordinal: 1, round: 0, description: "read the ledger", status: "passed",
+      gate_status: "passed", agent_id: "researcher", agent_name: "Rui", run_id: 102,
+      files: ["core/src/files.rs"],
+    }),
+    jobItem({
+      ordinal: 2, round: 0, description: "match them line by line", status: "running",
+      agent_id: "controller", agent_name: "Ana", run_id: 103, depends_on: [0, 1],
+      files: ["core/src/triage.rs"],
+    }),
+    jobItem({
+      ordinal: 3, round: 0, description: "check the exceptions", status: "pending",
+      agent_id: "reviewer", agent_name: "Rui", depends_on: [2],
+    }),
+    jobItem({
+      ordinal: 4, round: 1, description: "widen the gate", status: "gate_failed",
+      gate_status: "failed", agent_id: "auditor", agent_name: "Ana", run_id: 104,
+      files: ["scripts/gates.sh"],
+    }),
+    jobItem({
+      ordinal: 5, round: 1, description: "drop the old import path", status: "cancelled",
+      agent_id: "researcher", agent_name: "Rui",
+    }),
+    jobItem({
+      ordinal: 6, round: 1, description: "rewrite the importer", status: "conflicted",
+      agent_id: "controller", agent_name: "Ana", run_id: 105, depends_on: [4],
+      files: ["core/src/storage.rs"],
+    }),
+  ],
+};
 
 export const RUN_VIEWS: Record<string, TeamRunView> = {
   "run-live-1": {
@@ -995,6 +1083,220 @@ export const HELD: PendingNotification[] = [
   },
 ];
 
+/* ---------------------------------------------------------------- the map -- */
+
+/**
+ * A project the size of this one, so the map can be looked at under load.
+ *
+ * **Generated rather than written out, and the numbers are measured and not
+ * invented.** `GET /projects/nucleos/map` answers with 276 modules and 1067
+ * imports -- 3.9 a file -- across communities whose sizes run from forty-odd
+ * files down to three. Those are the proportions reproduced here. A tidy
+ * fixture of eight boxes would photograph a picture that reads beautifully and
+ * that nobody has ever seen, and the whole complaint this exists to reproduce
+ * is what the drawing does when it is asked to hold a real project.
+ *
+ * The file names are plausible rather than real. What decides whether this
+ * screen can be read is the geometry -- how many boxes, how wide a label, how
+ * many communities down the side of a matrix -- and none of that changes with
+ * the words in them.
+ *
+ * Deterministic, like `NOW` above and for the same reason: a screenshot taken
+ * twice should be the same screenshot, so the pseudo-random walk that wires the
+ * imports is seeded and never `Math.random`.
+ */
+function seeded(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** One directory's worth of files, and how many of them there are. */
+const AREAS: { dir: string; ext: string; reader: MapModule["reader"]; count: number }[] = [
+  { dir: "core/src", ext: "rs", reader: "rust", count: 118 },
+  { dir: "shell/src/data", ext: "ts", reader: "typescript", count: 34 },
+  { dir: "shell/src/pages", ext: "tsx", reader: "typescript", count: 21 },
+  { dir: "shell/src/project", ext: "tsx", reader: "typescript", count: 26 },
+  { dir: "shell/src/canvas", ext: "ts", reader: "typescript", count: 15 },
+  { dir: "shell/src/ui", ext: "tsx", reader: "typescript", count: 19 },
+  { dir: "shell/src/app", ext: "tsx", reader: "typescript", count: 12 },
+];
+
+/**
+ * Stems for the generated names, long and short both.
+ *
+ * The long ones are the point: a community titled `instrumentation` sits
+ * sideways down a matrix column and decides how tall its header has to be, and
+ * a fixture of four-letter names would never ask that question.
+ */
+const STEMS = [
+  "job", "runs", "gate", "land", "vcs", "proposals", "scheduler", "recurrence",
+  "instrumentation", "classifier", "concurrency", "credentials", "resolver",
+  "council", "triage", "sessions", "worktree", "workflow_graph", "map_anchor",
+  "map_join", "map_store", "map_recency", "notifications", "transcription",
+  "attribution", "budget", "collision", "exclusion", "errands", "detect",
+];
+
+function generatedMap(): ProjectMap {
+  const random = seeded(20260831);
+  const modules: MapModule[] = [];
+  const byArea: string[][] = [];
+
+  for (const area of AREAS) {
+    const here: string[] = [];
+    for (let i = 0; i < area.count; i += 1) {
+      const stem = STEMS[(i * 7 + area.dir.length) % STEMS.length];
+      const round = Math.floor(i / STEMS.length);
+      const path = `${area.dir}/${stem}${round === 0 ? "" : `_${round + 1}`}.${area.ext}`;
+      here.push(path);
+      modules.push({
+        path,
+        reader: area.reader,
+        // A little over half declare a section, which is roughly what the real
+        // walk reports and is the number the header above the picture reads.
+        declares: random() < 0.56,
+        cites: [],
+        spec: null,
+        tested: random() < 0.62,
+      });
+    }
+    byArea.push(here);
+  }
+
+  /*
+    Imports: dense inside a directory, thin across. That is what makes a
+    community a community -- the detector finds them from the edges and nothing
+    else -- so wiring them uniformly would produce one undifferentiated blob and
+    photograph a matrix this app would never draw.
+  */
+  const imports: MapImport[] = [];
+  const seen = new Set<string>();
+  const add = (from: string, to: string) => {
+    if (from === to) return;
+    const key = `${from} ${to}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    imports.push({ from, to });
+  };
+
+  for (const here of byArea) {
+    for (let i = 0; i < here.length; i += 1) {
+      // Communities form where a group leans on a few files. Biasing the target
+      // towards the front of the list gives each area two or three of those,
+      // which is the shape the real graph has.
+      const many = 2 + Math.floor(random() * 4);
+      for (let n = 0; n < many; n += 1) {
+        const to = Math.floor(random() ** 2 * here.length);
+        add(here[i], here[to]);
+      }
+    }
+  }
+  for (let n = 0; n < 70; n += 1) {
+    const from = byArea[Math.floor(random() * byArea.length)];
+    const to = byArea[Math.floor(random() * byArea.length)];
+    add(from[Math.floor(random() * from.length)], to[Math.floor(random() * to.length)]);
+  }
+
+  /*
+    What no reader here understands. Real code, most of it -- the Go sidecars,
+    the migrations, the stylesheets -- and the map's own measure of what it
+    cannot see. Drawn as a count and never as boxes, which is why a list of
+    plain paths is the whole of what this needs.
+  */
+  const unread: string[] = [];
+  for (let i = 0; i < 190; i += 1) unread.push(`sidecars/${["echo", "email", "telegram", "web"][i % 4]}/${STEMS[i % STEMS.length]}_${i}.go`);
+  for (let i = 0; i < 140; i += 1) unread.push(`core/migrations/${String(i).padStart(4, "0")}_${STEMS[i % STEMS.length]}.sql`);
+
+  return {
+    modules,
+    imports,
+    unread,
+    foreign: [],
+    seam: {
+      served: [],
+      calls: 0,
+      matched: 0,
+      computed: [],
+      unmatched: [],
+      opaque: [],
+      uncalled: [],
+    },
+    junction: {
+      decisions: [],
+      unclaimed: [],
+      unmatched: [],
+      counts: {
+        decisions: 0,
+        declared: 0,
+        ambiguous: 0,
+        silent: 0,
+        unnumbered: 0,
+        unclaimed: modules.length - 112,
+        unmatched: 112,
+      },
+    },
+    standings: {},
+    stamps: {
+      settled: 0,
+      partial: 0,
+      never: 0,
+      lapsed: 0,
+      withdrawn: 0,
+      guessed: 0,
+      no_anchor: 0,
+      untracked: 0,
+      no_repository: 0,
+      unwatched: 0,
+      decisions: 0,
+    },
+    triage: {},
+    triage_counts: {
+      flagged: 0,
+      silenced: 0,
+      untriaged: 0,
+      unseen: 0,
+      waiting: 0,
+      unchecked: 0,
+    },
+    git_would_not_answer: false,
+    recency: { window: 200, ages: {} },
+    last_triaged_at: null,
+  };
+}
+
+/** Built once: the walk is deterministic, and the shell asks for it on every open. */
+const MAP: ProjectMap = generatedMap();
+
+/* -------------------------------------------------------------- the specs -- */
+
+/**
+ * What the map's picker offers to read.
+ *
+ * Enough of them to overflow the box -- the picker caps at `max-h-64` and
+ * scrolls, and a list of three would photograph a control that never reaches
+ * the state it was built for.
+ */
+const SPECS: string[] = [
+  "2026-07-17-agenticos-foundation-and-autopilot-design",
+  "2026-07-20-telegram-channel-design",
+  "2026-07-28-email-pillar-design",
+  "2026-07-29-autopilot-job-graph-design",
+  "2026-07-29-harness-instrumentation-and-verification-design",
+  "2026-07-30-pilar-de-voz-design",
+  "2026-08-02-fila-vcs-design",
+  "2026-08-04-trabalho-noturno-e-jobs-paralelos-design",
+  "2026-08-09-canvas-da-frota-design",
+  "2026-08-11-equipas-de-agentes-design",
+  "2026-08-15-pilar-de-browser-design",
+  "2026-08-17-novo-frontend-design",
+  "2026-08-24-mapa-do-projeto-design",
+  "2026-08-27-dono-da-arvore-principal-design",
+];
+
 /* ------------------------------------------------------------- the router -- */
 
 /**
@@ -1014,7 +1316,36 @@ export function answer(path: string, init?: RequestInit): unknown {
     empty screen is exactly the one worth looking at, because the door into the
     inspector is drawn in it.
   */
-  if (path === "/concurrency") return { house: { limit: 4, held: 0 }, projects: [] } satisfies Concurrency;
+  if (path === "/concurrency") {
+    return {
+      house: { limit: 4, held: 1 },
+      projects: [
+        {
+          project_id: "alpha",
+          limit: 4,
+          slots: [
+            {
+              project_id: "alpha",
+              slot: 0,
+              owner_kind: "job",
+              owner_id: JOB.id,
+              claimed_at: ago(DAY / 12),
+              job_id: null,
+              ordinal: null,
+              item_status: null,
+            },
+          ],
+          collision: {
+            declared: { state: "clean", overlaps: [] },
+            observed: { state: "not_measured", overlaps: [] },
+          },
+        },
+      ],
+    } satisfies Concurrency;
+  }
+
+  if (path === "/jobs" || path.startsWith("/jobs?")) return [JOB];
+  if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
 
   if (path === "/projects") return PROJECTS;
 
@@ -1057,6 +1388,165 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/calendar/busy") return { busy: true };
   if (path === "/calendar/config") return CALENDAR_CONFIG;
   if (path === "/notifications/pending") return HELD;
+
+  /*
+    The four readings the State mode leads with — and the reason that mode
+    could not be photographed at all. `ModeState` reads
+    `readings.data.efficiency.median_total_tokens`, so the empty-list default
+    threw before a single control was drawn and the whole page came back as the
+    boundary's apology. Same failure as `/concurrency` above, one route along.
+
+    Deliberately not a happy path: some of the runs reported no usage at all,
+    the median moved the right way against the window before it, and fifteen
+    runs were never judged because nothing asked them to be. Every one of those
+    is a sentence this page has to be able to say.
+  */
+  /*
+    What a project would forget by leaving, and what is holding it. Varied per
+    project on purpose, because the remove panel says three different things and
+    only one of them is reachable from a single fixture: `alpha` has a long
+    record and a job holding a slot, so it photographs the refusal; `bravo` has
+    a record and nothing in flight, which is the ordinary case with the
+    checkbox; `charlie` has nothing at all, and is offered no checkbox because
+    there is nothing to decide about.
+  */
+  const record = /^\/projects\/([^/]+)\/record$/.exec(route);
+  if (record !== null) {
+    const nothing = { runs: 0, jobs: 0, proposals: 0, decisions: 0, stamps: 0, commands: 0, feed: 0 };
+    switch (record[1]) {
+      case "alpha":
+        return {
+          forgets: { ...nothing, runs: 312, jobs: 4, proposals: 3, decisions: 12, stamps: 40, feed: 96 },
+          holds: { slots: 1, worktrees: 1 },
+        };
+      case "bravo":
+        return {
+          forgets: { ...nothing, runs: 58, proposals: 2, commands: 3 },
+          holds: { slots: 0, worktrees: 0 },
+        };
+      default:
+        return { forgets: nothing, holds: { slots: 0, worktrees: 0 } };
+    }
+  }
+
+  /*
+    What deleting a project's folder would take. Four projects, four different
+    sentences, because the panel says a different one for each and a single
+    fixture would photograph only the dullest: `alpha` has work in flight and
+    real uncommitted work, `bravo` is a repository with no remote at all —
+    which is the case where nothing in it exists anywhere else — `charlie` was
+    never given a folder, and `delta` is a folder git knows nothing about.
+  */
+  const folder = /^\/projects\/([^/]+)\/folder$/.exec(route);
+  if (folder !== null) {
+    switch (folder[1]) {
+      case "alpha":
+        return {
+          root: "C:/repos/alpha",
+          exists: true,
+          only_here: { uncommitted: 12, unpushed: 3 },
+          blocked: null,
+          holds: { slots: 1, worktrees: 1 },
+        };
+      case "bravo":
+        return {
+          root: "C:/repos/bravo-servicos-partilhados",
+          exists: true,
+          only_here: { uncommitted: 0, unpushed: null },
+          blocked: null,
+          holds: { slots: 0, worktrees: 0 },
+        };
+      case "charlie":
+        return {
+          root: null,
+          exists: false,
+          only_here: null,
+          blocked: {
+            refusal: "no_root",
+            detail: "this project has no folder recorded, so there is nothing to delete",
+          },
+          holds: { slots: 0, worktrees: 0 },
+        };
+      default:
+        return {
+          root: "C:/repos/delta",
+          exists: true,
+          only_here: null,
+          blocked: null,
+          holds: { slots: 0, worktrees: 0 },
+        };
+    }
+  }
+
+  const readings = /^\/projects\/([^/]+)\/readings$/.exec(route);
+  if (readings !== null) {
+    return {
+      window_days: 30,
+      efficiency: {
+        measured_runs: 41,
+        unmeasured_runs: 6,
+        median_total_tokens: 128_400,
+        previous_median_total_tokens: 154_900,
+      },
+      cost: { usd: 13.16, runs: 41 },
+      gate: { passed: 22, failed: 3, errored: 1, no_gate: 15 },
+      delivered: { landed: 9, timed: 7, median_minutes: 34 },
+    } satisfies ProjectReadings;
+  }
+
+  /*
+    Where work lands, and what is standing beside it. An object and not a list,
+    which is why the empty default could not stand in for it: the panel reads
+    `.branches.length` and an array has no such field.
+
+    One branch is `measured: false` on purpose. That is the case the type's own
+    comment exists for -- nobody knows how far ahead it is -- and it is drawn
+    differently from `0/0`, so a preview without one photographs a panel that
+    has never been asked the question.
+  */
+  const branches = /^\/projects\/([^/]+)\/branches$/.exec(route);
+  if (branches !== null) {
+    return {
+      integration: "master",
+      branches: [
+        {
+          name: "master",
+          ahead: 0,
+          behind: 0,
+          measured: true,
+          last_commit_at: ago(2 * 3_600_000),
+          last_subject: "merge feat/inspector-de-projectos into master",
+        },
+        {
+          name: "feat/leitor-de-comandos",
+          ahead: 7,
+          behind: 15,
+          measured: true,
+          last_commit_at: ago(DAY),
+          last_subject: "three limits that pace autonomy nobody asked for",
+        },
+        {
+          name: "tmp/daemon-timeout",
+          ahead: 0,
+          behind: 0,
+          measured: false,
+          last_commit_at: ago(9 * DAY),
+          last_subject: "a deadline that outlives the gate it guards",
+        },
+      ],
+      omitted: 0,
+    } satisfies Branches;
+  }
+
+  /*
+    The documents the map can be asked to read. Real slugs from this repository,
+    long ones included: the picker truncates, and a fixture of short invented
+    names would photograph a box that never has to.
+  */
+  if (/^\/projects\/[^/]+\/map\/specs$/.test(route)) return SPECS;
+  if (/^\/projects\/[^/]+\/map$/.test(route)) return MAP;
+  /* An object with a list inside it, so the empty-list default cannot stand in. */
+  if (/^\/projects\/[^/]+\/map\/silenced$/.test(route)) return { rows: [], total: 0 };
 
   if (path === "/teams") return TEAMS;
   if (path === "/team-runs") return RUNS;

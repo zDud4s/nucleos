@@ -900,9 +900,9 @@ import type { GraphNode } from "../data/workflow-graph";
         // reason no one looking at it could ever guess.
         let found = ts_imports(
             "shell/src/project/Workspace.tsx",
-            "import x from './ModeMapa';",
+            "import x from './ModeMap';",
         );
-        assert!(found.contains("shell/src/project/ModeMapa"));
+        assert!(found.contains("shell/src/project/ModeMap"));
     }
 
     #[test]

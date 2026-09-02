@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   Background,
@@ -23,6 +23,7 @@ import {
 // shipped app and a working one in the dev server — the worst pair of outcomes.
 import "@xyflow/react/dist/style.css";
 import { cancellableOwner, useJob, type JobItem, type SlotOwner } from "../data/fleet";
+import { JobProgressGraph, JobProgressLine } from "./JobProgressGraph";
 import { Button, ConfirmButton, StateBadge } from "../ui";
 import {
   clamped,
@@ -304,9 +305,17 @@ function partnerLine(partner: Partner): string {
  * Mounted only when a card is open, which is what "open" means to the hook
  * underneath — asking for every job's item list on every tick would multiply
  * the poll by the number of cards on screen to show rows nobody opened.
+ *
+ * **Two arrangements of one queue**, the same way the page above it is two
+ * arrangements of one fleet. The list answers *what is each item doing* and is
+ * the only one of the two that can carry a gate badge and the link out of a
+ * skipped item; the graph answers *what is waiting on what*, which is in
+ * `depends_on` and which no list can draw. Neither is a better version of the
+ * other, so neither replaces it.
  */
 function JobItemsPanel({ jobId }: { jobId: number }) {
   const job = useJob(jobId);
+  const [drawn, setDrawn] = useState(false);
 
   if (job.data === undefined) {
     return (
@@ -333,6 +342,20 @@ function JobItemsPanel({ jobId }: { jobId: number }) {
           {detail.team_max_parallel !== null && ` — up to ${detail.team_max_parallel} items at once`}
         </p>
       )}
+      {/* The one-line reading sits with the ARRANGEMENT CONTROL rather than on the closed card,
+          and that placement is a constraint and not a preference: the tally counts items, items
+          arrive from `useJob`, and `useJob` only runs while a card is open. Putting this on a
+          closed card would fetch every job's item list on every tick — the exact multiplication
+          this panel's own doc comment exists to prevent. A fleet-wide glance needs the daemon to
+          carry a tally on `/jobs?live=true`; until it does, this is as far out as it can go. */}
+      <div className="fleet-items-head">
+        <JobProgressLine job={detail} items={detail.items} />
+        <Button onClick={() => setDrawn((shown) => !shown)} aria-pressed={drawn}>
+          {drawn ? "As a list" : "As a graph"}
+        </Button>
+      </div>
+      {drawn && <JobProgressGraph job={detail} items={detail.items} />}
+      {!drawn && (
       <ol className="fleet-items" aria-label={`items of job ${jobId}`}>
         {detail.items.map((item, index) => (
           <li key={item.ordinal} className="fleet-item">
@@ -359,6 +382,7 @@ function JobItemsPanel({ jobId }: { jobId: number }) {
           </li>
         ))}
       </ol>
+      )}
     </>
   );
 }

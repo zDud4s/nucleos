@@ -1,13 +1,13 @@
 // §spec mapa-do-projeto
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
-import { useCarimbar, type Anchored } from "../data/project-map";
+import { useGiveStamp, type Anchored } from "../data/project-map";
 
 /**
  * The owner's verdict on one decision, as three buttons and a note (§5.2).
  *
  * **A module of its own because two piles now ask for it, and there are still only three
- * verdicts.** It began inside `Carimbos.tsx`, whose header said it was the one surface in this mode
+ * verdicts.** It began inside `StampsPanel.tsx`, whose header said it was the one surface in this mode
  * with buttons — true while the only thing that reached the owner was a stamp of theirs going
  * stale. Slice 5 added the other half of §5.3's `J`: the triager flags a decision nobody has
  * stamped, and §5.3 takes that decision out of `K` precisely because it has *arrived*. A flagged
@@ -34,21 +34,21 @@ import { useCarimbar, type Anchored } from "../data/project-map";
  * a surface whose whole promise is that you know what you just answered.
  */
 
-export interface CarimbarProps {
+export interface GiveStampProps {
   projectId: string;
   row: Anchored;
 }
 
-export function Carimbar({ projectId, row }: CarimbarProps) {
+export function GiveStamp({ projectId, row }: GiveStampProps) {
   const [note, setNote] = useState("");
-  const carimbar = useCarimbar(projectId);
+  const giveStamp = useGiveStamp(projectId);
 
   const name = `${row.spec_slug} ${row.section}`;
   // Trimmed here against a daemon that trims before it checks, so the button is disabled for
   // exactly the notes the núcleo would refuse and for no others.
   const written = note.trim();
   const send = (verdict: "settled" | "partial" | "withdrawn") =>
-    carimbar.mutate({
+    giveStamp.mutate({
       decisionId: row.decision_id,
       verdict,
       // `null` and never `""`: *said nothing* and *said the empty string* are different, and the
@@ -70,7 +70,7 @@ export function Carimbar({ projectId, row }: CarimbarProps) {
         <button
           type="button"
           aria-label={`stamp ${name} as what you want`}
-          disabled={carimbar.isPending}
+          disabled={giveStamp.isPending}
           onClick={() => send("settled")}
           className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
@@ -79,7 +79,7 @@ export function Carimbar({ projectId, row }: CarimbarProps) {
         <button
           type="button"
           aria-label={`stamp ${name} as part-way`}
-          disabled={carimbar.isPending || written === ""}
+          disabled={giveStamp.isPending || written === ""}
           onClick={() => send("partial")}
           className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
@@ -88,14 +88,14 @@ export function Carimbar({ projectId, row }: CarimbarProps) {
         <button
           type="button"
           aria-label={`stamp ${name} as changed your mind`}
-          disabled={carimbar.isPending}
+          disabled={giveStamp.isPending}
           onClick={() => send("withdrawn")}
           className="rounded-md border border-border px-3 py-1.5 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
         >
           changed my mind
         </button>
       </div>
-      {carimbar.isError ? <Refused error={carimbar.error} /> : null}
+      {giveStamp.isError ? <Refused error={giveStamp.error} /> : null}
     </div>
   );
 }

@@ -208,6 +208,189 @@ export function useSetWipLimit() {
   });
 }
 
+/* ------------------------------------------------------------- the exit -- */
+
+/**
+ * What a project has on record, in the nouns somebody would recognise.
+ *
+ * Every field is a thing this app has a screen for, so each one is something the reader can picture
+ * losing. The daemon counts more tables than these — scheduler bookkeeping, trigger state — and
+ * deliberately does not report them: a number nobody has ever seen a page for makes the decision
+ * harder rather than easier, and forgetting takes them either way.
+ */
+export interface ProjectForgets {
+  runs: number;
+  jobs: number;
+  proposals: number;
+  decisions: number;
+  stamps: number;
+  commands: number;
+  feed: number;
+}
+
+/**
+ * What is still going on in this project right now.
+ *
+ * **A different question from {@link ProjectForgets}, and a different shape for that reason.** One
+ * is what a removal would erase and the other is what stops it happening at all; one flat bag of
+ * numbers would let a panel print "312 runs, 1 slot" as if those were the same kind of fact, and
+ * only the second is a reason the daemon will refuse.
+ */
+export interface ProjectHolds {
+  /** Slots taken right now — a run, a job or one of a job's items, working here. */
+  slots: number;
+  /** Worktrees still checked out on disk. Separate from the slots because the two come apart. */
+  worktrees: number;
+}
+
+export interface ProjectRecord {
+  forgets: ProjectForgets;
+  holds: ProjectHolds;
+}
+
+/**
+ * What removing this project would forget, and what is holding it.
+ *
+ * **On demand and never polled**, like the inspect readers above and for a sharper version of the
+ * same reason: this is nine `COUNT(*)`s over the whole database, asked so that one person can
+ * answer one checkbox. A roster of twenty-five running them on the three-second timer would be
+ * counting a database to draw buttons nobody pressed.
+ *
+ * `enabled` is therefore the control being *open*, not the row being on screen.
+ */
+export function useProjectRecord(projectId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: keys.projects.record(projectId ?? ""),
+    queryFn: () => apiFetch<ProjectRecord>(`/projects/${encodeURIComponent(projectId ?? "")}/record`),
+    enabled: enabled && projectId !== null,
+  });
+}
+
+export interface ProjectRemoval {
+  projectId: string;
+  /**
+   * Whether the record goes with the row.
+   *
+   * Defaulted nowhere and always passed, because the caller deciding is the point: the owner's
+   * standing decision is that history is kept unless somebody says otherwise *at the moment they
+   * say it*, which is a checkbox next to a number and not a default buried in a hook.
+   */
+  forgetHistory: boolean;
+}
+
+/**
+ * Take a project off the roster.
+ *
+ * **Nothing on the disk is touched, and there is no argument here that would make it be.** Deleting
+ * a folder is a second act with its own route and its own confirmation; a flag on this one would
+ * give two very different weights the same shape, and the caller that eventually passed it would be
+ * a caller that meant the reversible one.
+ *
+ * `retry: false` because both refusals this can get are settled answers: a 404 is a name that is
+ * not there, and a 409 is work in flight that a retry a millisecond later cannot have finished.
+ * The 409 clears by the work ending, which is a thing the person watches rather than a thing a
+ * client waits out.
+ */
+export function useRemoveProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ projectId, forgetHistory }: ProjectRemoval) =>
+      apiFetch<void>(
+        `/projects/${encodeURIComponent(projectId)}?forget_history=${forgetHistory ? "true" : "false"}`,
+        { method: "DELETE" },
+      ),
+    retry: false,
+    onSettled: () => {
+      // The roster prefix, which reaches this project's record and every other reader under it —
+      // including, on a refusal, the `holds` the panel is showing, which is exactly the number that
+      // just proved to be out of date.
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
+}
+
+/* ---------------------------------------------------------- the folder -- */
+
+/**
+ * What is in this folder and nowhere else.
+ *
+ * **Not a file count, and that is a decision rather than an omission.** On a working repository a
+ * file count is dominated by `node_modules` and `target`: the big frightening number would be
+ * mostly build output that regenerates in a minute. What cannot be regenerated is work git has not
+ * been told to keep, and work it has been told to keep that no remote has a copy of.
+ */
+export interface OnlyHere {
+  /** Files with changes no commit holds — modified, staged or untracked. */
+  uncommitted: number;
+  /**
+   * Commits no remote has. **`null` is not zero and it is the more serious answer**: a repository
+   * with no remote configured has no elsewhere at all, so every commit in it is only here. Reporting
+   * that as a count would be reporting the size of the history rather than the size of the loss.
+   */
+  unpushed: number | null;
+}
+
+/** A standing refusal about the path itself, named so a page can say it before offering anything. */
+export interface FolderBlock {
+  refusal: string;
+  detail: string;
+}
+
+/**
+ * Everything the delete control has to know before it draws.
+ *
+ * Three questions kept in three fields, because a page says a different sentence for each and a
+ * single "can I?" boolean would collapse them: `only_here` is what would be lost for ever,
+ * `blocked` is a standing refusal about the path, and `holds` is work in flight, which clears on
+ * its own.
+ */
+export interface ProjectFolder {
+  root: string | null;
+  /** Whether the recorded folder is actually on this disk. */
+  exists: boolean;
+  /** `null` for a folder git knows nothing about — the more serious answer, not a missing one. */
+  only_here: OnlyHere | null;
+  blocked: FolderBlock | null;
+  holds: ProjectHolds;
+}
+
+/**
+ * What deleting this project's folder would take.
+ *
+ * Two `git` subprocesses and a `stat` behind it, so `enabled` is the control being open rather than
+ * the page being on screen. Nothing about this belongs on a timer: it is read once, by somebody who
+ * is deciding.
+ */
+export function useProjectFolder(projectId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: keys.projects.folder(projectId ?? ""),
+    queryFn: () => apiFetch<ProjectFolder>(`/projects/${encodeURIComponent(projectId ?? "")}/folder`),
+    enabled: enabled && projectId !== null,
+  });
+}
+
+/**
+ * Delete the folder, and take the project off the roster with it.
+ *
+ * **The only irreversible thing this app does.** Its own route and its own hook rather than an
+ * argument to {@link useRemoveProject}, so that nothing can reach it by passing a flag it did not
+ * read — removing a project cannot be made to touch a disk, whatever it is sent.
+ */
+export function useDeleteProjectFolder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ projectId, forgetHistory }: ProjectRemoval) =>
+      apiFetch<void>(
+        `/projects/${encodeURIComponent(projectId)}/folder?forget_history=${forgetHistory ? "true" : "false"}`,
+        { method: "DELETE" },
+      ),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
+}
+
 /* --------------------------------------------------------------- readings -- */
 
 /**

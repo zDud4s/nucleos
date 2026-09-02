@@ -19,12 +19,12 @@ import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map
  * has a sentence for that refusal, because a generic failure would hide the single property that
  * makes the choice worth offering.
  *
- * Separate from {@link MapaPorAprovar} because these are two jobs: choosing what to read is not
+ * Separate from {@link DecisionsWaiting} because these are two jobs: choosing what to read is not
  * answering what came back, and one file owning a picker, a brain, a mutation, a list and six
  * buttons would be the junk drawer this workspace is built against.
  */
 
-export interface ExtrairSpecProps {
+export interface ExtractSpecProps {
   projectId: string;
 }
 
@@ -51,7 +51,7 @@ const BRAIN_MEANING: Record<Brain, string> = {
   local: "The local brain reads it through the model on this machine. Nothing leaves and nothing is billed — and where no such model is set up, the núcleo refuses rather than quietly reading it in the cloud instead.",
 };
 
-export function ExtrairSpec({ projectId }: ExtrairSpecProps) {
+export function ExtractSpec({ projectId }: ExtractSpecProps) {
   const specs = useProjectSpecs(projectId);
   const extract = useExtractSpec(projectId);
   const [chosen, setChosen] = useState<string | null>(null);
@@ -118,10 +118,24 @@ export function ExtrairSpec({ projectId }: ExtrairSpecProps) {
             aria-pressed={slug === chosen}
             disabled={extract.isPending}
             onClick={() => setChosen(slug)}
+            /*
+              `shrink-0`, and without it this list is blank.
+
+              The box is a flex column with `max-h-64` and `overflow-y-auto`, and
+              a flex item shrinks before its parent scrolls. Fourteen rows in
+              240px of room came out 13px tall each — under one line of 15px
+              text — and `truncate` brought `overflow: hidden` with it, so every
+              row clipped its own name away and the picker rendered as fourteen
+              empty slabs that could not be scrolled either. Measured in the
+              browser: it is why nothing here could be chosen.
+
+              Not a `max-h` to fight over: the height is the design, the rows
+              are what must keep theirs and let the box scroll.
+            */
             className={
               slug === chosen
-                ? "truncate rounded-sm border border-accent bg-surface-raised px-2 py-1 text-left font-mono text-xs text-text"
-                : "truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text-muted enabled:hover:text-text disabled:opacity-40"
+                ? "shrink-0 truncate rounded-sm border border-accent bg-surface-raised px-2 py-1 text-left font-mono text-xs text-text"
+                : "shrink-0 truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text-muted enabled:hover:text-text disabled:opacity-40"
             }
           >
             {slug}
@@ -209,7 +223,7 @@ export function ExtrairSpec({ projectId }: ExtrairSpecProps) {
  *
  * The route refuses with a bare status and no name of its own, so these switch on `status` rather
  * than on `code` — the derived code for a 503 is `unavailable`, which is the floor under a name and
- * not a name. The same reading `ModeCodigo`'s own refusal note takes.
+ * not a name. The same reading `ModeCode`'s own refusal note takes.
  */
 function Failed({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {

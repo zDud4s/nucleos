@@ -206,7 +206,7 @@ export function Projects() {
         from the Código mode wants the first.
       */}
       <p className="pj-back">
-        <Link to="/projects/$projectId/$view" params={{ projectId, view: "codigo" }}>
+        <Link to="/projects/$projectId/$view" params={{ projectId, view: "code" }}>
           ‹ back to {projectId}
         </Link>
         {" · "}

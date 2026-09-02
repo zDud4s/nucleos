@@ -23,6 +23,14 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHELL = join(ROOT, "shell");
 const OUT = join(SHELL, "dist-preview");
 const PATH_UNDER_TEST = process.argv[2] ?? "/teams";
+/**
+ * Buttons to press before reading the page, `|`-separated and pressed in order.
+ *
+ * Without it this tool can only ever report the surface a route loads with, and the ones that go
+ * wrong are usually the ones behind a click — `node scripts/preview-why.mjs /fleet "Show
+ * items|As a graph"`. `preview/main.tsx` does the pressing; this only forwards it.
+ */
+const PRESS = process.argv[3];
 
 const BROWSERS = [
   "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -149,7 +157,10 @@ const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: t
 await send("Runtime.enable", {}, sessionId);
 await send("Page.enable", {}, sessionId);
 
-await send("Page.navigate", { url: `${origin}/preview.html?path=${encodeURIComponent(PATH_UNDER_TEST)}` }, sessionId);
+const query =
+  `path=${encodeURIComponent(PATH_UNDER_TEST)}` +
+  (PRESS === undefined ? "" : `&press=${encodeURIComponent(PRESS)}`);
+await send("Page.navigate", { url: `${origin}/preview.html?${query}` }, sessionId);
 await new Promise((ok) => setTimeout(ok, 6000));
 
 const text = await send(

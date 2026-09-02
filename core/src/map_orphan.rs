@@ -1003,7 +1003,7 @@ mod tests {
     /// The third defect: the pickaxe flags a count that CHANGED, in either direction.
     ///
     /// The sweep took the newest flagged commit for a file and called it the removal.
-    /// `ModeMapa.tsx`'s only flagged commit went from zero occurrences to two — an addition — and
+    /// `ModeMap.tsx`'s only flagged commit went from zero occurrences to two — an addition — and
     /// was reported as having lost the citation it had just gained.
     ///
     /// **The obvious fixture for this does not discriminate, and the first version of this test was

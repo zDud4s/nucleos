@@ -17,11 +17,11 @@ import { useDecideMapLine, useMapDecisions, type MapDecision } from "../data/pro
  * reason, and it passes only while the count is two per line and nothing else.
  */
 
-export interface MapaPorAprovarProps {
+export interface DecisionsWaitingProps {
   projectId: string;
 }
 
-export function MapaPorAprovar({ projectId }: MapaPorAprovarProps) {
+export function DecisionsWaiting({ projectId }: DecisionsWaitingProps) {
   const decisions = useMapDecisions(projectId);
 
   if (decisions.isError) {

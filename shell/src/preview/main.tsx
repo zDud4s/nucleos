@@ -167,13 +167,39 @@ function openTab(name: string): boolean {
  * Matched on the trimmed label and clicked, rather than by selector: the label
  * is what a person reads, so a shot that names one is describing what somebody
  * would do rather than what the DOM currently happens to look like.
+ *
+ * Exactly first, then by prefix — the same fallback `openTab` above already
+ * makes, and for the same reason. A control that carries a number reads
+ * `Junction—` or `Specs14` to `textContent`, and a shot naming the word a
+ * person would say should not have to spell the count it happens to have on
+ * the day. Exact wins where both would match, so no existing shot changes
+ * which button it presses.
  */
 function pressButton(name: string): boolean {
   const buttons = [...document.querySelectorAll("button")];
-  const wanted = buttons.find((one) => (one.textContent ?? "").trim() === name);
+  const label = (one: Element) => (one.textContent ?? "").trim();
+  const wanted =
+    buttons.find((one) => label(one) === name) ?? buttons.find((one) => label(one).startsWith(name));
   if (wanted === undefined) return false;
   wanted.click();
   return true;
+}
+
+/**
+ * Press several, separated by `|`, each after the last has rendered.
+ *
+ * One press could only ever reach a surface that is one click from the load, and the ones worth
+ * looking at are often two: a job's item graph in the fleet is behind `Show items` and then
+ * `As a graph`, and the second button does not exist in the DOM until the first has been
+ * clicked and React has painted. Pressing them in a single tick finds only the first.
+ *
+ * A name containing no `|` behaves exactly as it did, so every existing shot is unaffected.
+ */
+function pressAll(names: string[]): void {
+  const [next, ...rest] = names;
+  if (next === undefined) return;
+  pressButton(next);
+  if (rest.length > 0) window.setTimeout(() => pressAll(rest), 250);
 }
 
 /**
@@ -202,9 +228,15 @@ function startDrag(title: string): boolean {
 /* Long enough for the queries to answer and the fonts to land. */
 window.setTimeout(() => {
   if (tab !== null) openTab(tab);
-  if (press !== null) pressButton(press);
+  const presses = press === null ? [] : press.split("|");
+  pressAll(presses);
   if (drag !== null) startDrag(drag);
-  window.setTimeout(() => {
-    window.__preview.ready = true;
-  }, 400);
+  window.setTimeout(
+    () => {
+      window.__preview.ready = true;
+    },
+    // Each extra press costs a tick before the page has settled; declaring ready on the old
+    // fixed delay would shoot the frame between two clicks.
+    400 + Math.max(0, presses.length - 1) * 250,
+  );
 }, 900);

@@ -267,7 +267,7 @@ describe("the workflow miniature", () => {
     daemon.apiFetch.mockImplementation(daemonFetch(state));
     daemon.apiText.mockImplementation(daemonText(state));
     daemon.probeHealth.mockResolvedValue(true);
-    await renderApp({ initialPath: "/projects/nucleos/estado" });
+    await renderApp({ initialPath: "/projects/nucleos/state" });
 
     const chain = await screen.findByLabelText("harness as a chain");
     expect(Array.from(chain.querySelectorAll("li")).map((item) => item.textContent)).toEqual([

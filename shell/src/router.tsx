@@ -112,22 +112,27 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  * TanStack spells a parameter `$runId`; the page reads it back under that name.
  *
  * `/projects/$projectId/$view` is the second, and it carries a parameter that is
- * not an id: the mode a project is being looked at through — `estado`, `codigo`
+ * not an id: the mode a project is being looked at through — `state`, `code`
  * or `workflows`. It is in the location rather than in component state because
  * a project somebody is working in should survive a reload and be linkable, and
  * it is **not** a search param because it is not a filter: there is exactly one
  * of it and it always has a value.
  *
  * There is no validator for it. A route parameter is a string, anybody can type
- * one, and `Workspace` answers an unrecognised mode with `estado` rather than a
+ * one, and `Workspace` answers an unrecognised mode with `state` rather than a
  * dead end — a typo in a path is not a missing page. Registering a validator
  * here would move that decision away from the page that knows what the modes
  * are.
  *
- * The mode names are the design's, and they are the one place in this app where
- * a route segment is not English. They are identifiers in a URL rather than
- * copy on a screen — the tabs above them read State, Code and Workflows — and
- * renaming them later would break every link somebody kept.
+ * These segments were `estado`, `mapa` and `codigo` until 2026-09-02 — the one
+ * place in this app where a route segment was not English. This paragraph used
+ * to argue for keeping them, and the argument was never that Portuguese was
+ * right: it was that *renaming them later would break every link somebody kept*.
+ * That is a real cost and it is the only one, so the rename came with the only
+ * thing that answers it. `Workspace`'s `RENAMED` map still resolves all three,
+ * an old link lands on the mode it always meant, and the tabs emit the new
+ * segment so an address corrects itself on the first click. The window is meant
+ * to be closed, and the map is where that decision is written down.
  *
  * `/system/$view` is the same idiom again: like `/projects/$projectId/$view`, the
  * view is a path parameter and not a search param — there is exactly one of it, it
@@ -168,7 +173,7 @@ const DETAIL_ROUTES: {
     §3.2 of the frontend spec. It is also three steps long and one of them is a folder path somebody
     may want to go and look up — a modal that had to be dismissed to do that would lose the other
     two. It sits under `/projects/` because that is what it is about, and cannot be confused with a
-    project called `new`: that one would be `/projects/new/estado`, three segments rather than two.
+    project called `new`: that one would be `/projects/new/state`, three segments rather than two.
   */
   { path: "/projects/new", component: NewProject },
   {

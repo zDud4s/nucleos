@@ -89,6 +89,27 @@ pub fn build_router(state: AppState) -> Router {
         // sends the folder as a query rather than in the path, and why this answers about a folder
         // that has no project id yet at all.
         .route("/projects/detect", get(get_project_detect))
+        // The way out, and the reading somebody takes before using it. One project could be added
+        // and none could leave, so the roster only ever grew — a folder that moved, a repository
+        // somebody finished with, a project added to try something once, all of them polled every
+        // three seconds for ever.
+        //
+        // `DELETE /projects/{id}` takes the row off the roster and touches nothing on a disk. There
+        // is deliberately no flag on it that would: deleting a folder is a second act with its own
+        // route and its own refusals, and a `?delete_folder=` here would give two very different
+        // weights one shape.
+        .route("/projects/{id}", delete(delete_project))
+        .route("/projects/{id}/record", get(get_project_record))
+        // The second act, and the only irreversible thing this app does. Its own route rather than
+        // a flag on the one above, so that nothing can reach it by passing an argument it did not
+        // read: `DELETE /projects/{id}` cannot be made to touch a disk, whatever it is sent.
+        //
+        // The GET beside it is what a person reads before deciding — what in that folder exists
+        // nowhere else, and whether the daemon would refuse anyway.
+        .route(
+            "/projects/{id}/folder",
+            get(get_project_folder).delete(delete_project_folder),
+        )
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
@@ -3477,6 +3498,284 @@ async fn get_projects(State(state): State<AppState>) -> Result<Json<Vec<RosterEn
     .await
     .map(Json)
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// What a project would lose by leaving, and what is stopping it.
+///
+/// Fetched by the roster's remove control when somebody opens it, and not before: it is nine
+/// `COUNT(*)`s that only matter once a person is deciding, and a roster of twenty-five would
+/// otherwise run them all every three seconds to draw a button nobody pressed.
+async fn get_project_record(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::project_exit::ProjectRecord>, StatusCode> {
+    // No `resolve_project_root` here, and that is not an oversight: it 404s a project with no
+    // folder named, and `charlie` — registered, switched off, never pointed anywhere — is exactly
+    // the project somebody most wants to remove. The store answers whether the roster knows the
+    // name, which is the only thing this route needs to be sure of.
+    match crate::project_exit::record(&state.pool, &id).await {
+        Ok(Some(record)) => Ok(Json(record)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(project_id = %id, %error, "reading a project's record failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Whether the history goes with the roster row.
+///
+/// A query and not a body, because this is a DELETE and the default has to be the safe one: a
+/// caller that sends nothing keeps everything. `serde`'s default gives exactly that, and it is the
+/// owner's standing decision — history stays unless somebody says otherwise, at the moment they say
+/// it.
+#[derive(Deserialize)]
+struct RemoveProjectQuery {
+    #[serde(default)]
+    forget_history: bool,
+}
+
+/// Take a project off the roster.
+///
+/// **Nothing on the disk is touched here, and there is no flag that would make it be.** Deleting a
+/// folder is a second act with its own route, its own confirmation and its own refusals; a
+/// `?delete_folder=true` on this one would be the same weight for two very different things, and
+/// the caller that eventually passed it would be a caller that meant the reversible one.
+async fn delete_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RemoveProjectQuery>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    match crate::project_exit::remove(&state.pool, &id, query.forget_history).await {
+        Ok(crate::project_exit::Removed::Done { forgotten }) => {
+            tracing::info!(project_id = %id, forgotten, "a project left the roster");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(crate::project_exit::Removed::NotRegistered) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "refusal": "not_registered" })),
+        )),
+        // 409 and not 423: the kill switch's `locked` means a standing decision that a person took,
+        // and this is the opposite — work in progress that clears itself by finishing. The detail
+        // names what is holding it, because "try again later" over an unnamed obstacle is how
+        // somebody ends up pressing a button every minute.
+        Ok(crate::project_exit::Removed::Held(holds)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": "in_flight",
+                "detail": held_by(&holds),
+                "holds": holds,
+            })),
+        )),
+        // Only reachable with `forget_history`, and the sentence says the escape rather than the
+        // constraint: "FOREIGN KEY constraint failed" is true and useless, and the thing to do is
+        // one untick away.
+        Ok(crate::project_exit::Removed::Referenced) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": "history_referenced",
+                "detail": "something outside this project still points at its history — \
+                           removing it without forgetting works, and nothing was touched",
+            })),
+        )),
+        Err(error) => {
+            tracing::warn!(project_id = %id, %error, "removing a project failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "refusal": "internal" })),
+            ))
+        }
+    }
+}
+
+/// A guard that would refuse, named so the screen can say it before anybody presses anything.
+#[derive(serde::Serialize)]
+struct FolderBlock {
+    refusal: &'static str,
+    detail: String,
+}
+
+/// What deleting this project's folder would take, and whether it would be allowed at all.
+///
+/// **Three separate questions, kept apart in three fields**, because a screen has to say a different
+/// sentence for each and a single "can I?" boolean would collapse them. `only_here` is what would be
+/// lost for ever; `blocked` is a standing refusal about the path itself; `holds` is work in flight,
+/// which clears on its own.
+#[derive(serde::Serialize)]
+struct FolderView {
+    /// The recorded root, or `null` for a project nobody ever pointed anywhere.
+    root: Option<String>,
+    /// Whether that folder is actually on this disk. A project pointed at a folder that has already
+    /// gone has nothing to delete, and the screen says so rather than offering the button.
+    exists: bool,
+    /// What is in there and nowhere else, or `null` for a folder git knows nothing about — which is
+    /// the more serious answer and not a missing one.
+    only_here: Option<crate::inspect::OnlyHere>,
+    blocked: Option<FolderBlock>,
+    holds: crate::project_exit::Holds,
+}
+
+async fn get_project_folder(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<FolderView>, StatusCode> {
+    let recorded: Option<Option<String>> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(recorded) = recorded else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let blocked = match crate::project_exit::folder_check(&state.pool, &id, recorded.as_deref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        Ok(_) => None,
+        Err(refusal) => Some(FolderBlock {
+            refusal: refusal.code(),
+            detail: refusal.detail(),
+        }),
+    };
+
+    let record = crate::project_exit::record(&state.pool, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    /*
+       Two `git` subprocesses and a `stat`, on the blocking pool for the reason `get_projects` puts
+       its own probe there: a project root on a disconnected network share blocks for as long as the
+       operating system feels like, and this future is on an executor thread shared by every caller.
+       Asked only when the folder is really there — git in a directory that does not exist answers
+       with an error nobody would learn anything from.
+    */
+    let root = recorded.clone();
+    let (exists, only_here) = tokio::task::spawn_blocking(move || match root {
+        None => (false, None),
+        Some(root) => {
+            let path = std::path::Path::new(&root);
+            if !path.is_dir() {
+                return (false, None);
+            }
+            (true, crate::inspect::only_here(path).ok().flatten())
+        }
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(FolderView {
+        root: recorded,
+        exists,
+        only_here,
+        blocked,
+        holds: record.holds,
+    }))
+}
+
+/// Delete a project's folder, and take it off the roster.
+///
+/// **The kill switch covers this, and it is the clearest case there is for it.** Everything else the
+/// switch stops is autonomous — this is a person pressing a button — but it is also the largest
+/// thing this app can do, and the switch's meaning is *nothing that changes anything happens right
+/// now*. A folder deletion sailing past an engaged emergency stop would be the one exception nobody
+/// would expect.
+async fn delete_project_folder(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RemoveProjectQuery>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "refusal": "internal" })),
+            )
+        })?;
+    if halted {
+        return Err((
+            StatusCode::LOCKED,
+            Json(serde_json::json!({ "refusal": "kill_switch" })),
+        ));
+    }
+
+    match crate::project_exit::delete_folder(&state.pool, &id, query.forget_history).await {
+        Ok(crate::project_exit::Deleted::Done { forgotten }) => {
+            tracing::info!(project_id = %id, forgotten, "a project's folder was deleted");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(crate::project_exit::Deleted::NotRegistered) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "refusal": "not_registered" })),
+        )),
+        Ok(crate::project_exit::Deleted::Held(holds)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": "in_flight",
+                "detail": held_by(&holds),
+                "holds": holds,
+            })),
+        )),
+        Ok(crate::project_exit::Deleted::Refused(refusal)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": refusal.code(),
+                "detail": refusal.detail(),
+            })),
+        )),
+        // Logged at `error` and not `warn`: this is the state that needs a person, and it is the
+        // only outcome in this file where the machine is left partway through something.
+        Ok(crate::project_exit::Deleted::Partial { root, error }) => {
+            tracing::error!(project_id = %id, %root, %error, "a folder was only partly deleted");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "refusal": "partly_deleted",
+                    "detail": format!(
+                        "{id} is off the roster and {root} did not fully delete: {error}. \
+                         What is left has to be removed by hand."
+                    ),
+                })),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(project_id = %id, %error, "deleting a project folder failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "refusal": "internal" })),
+            ))
+        }
+    }
+}
+
+/// The refusal's sentence, built where the numbers are rather than in the shell.
+///
+/// Both halves are named when both are non-zero. They are genuinely two facts — a run can hold a
+/// slot before it has checked anything out, and a checkout can outlive the run that made it — and a
+/// sentence that mentioned only the larger number would send somebody to wait for work that had
+/// already finished.
+fn held_by(holds: &crate::project_exit::Holds) -> String {
+    fn plural(count: i64, one: &str, many: &str) -> String {
+        format!("{count} {}", if count == 1 { one } else { many })
+    }
+
+    let mut parts = Vec::new();
+    if holds.slots > 0 {
+        parts.push(format!(
+            "{} still working here",
+            plural(holds.slots, "slot", "slots")
+        ));
+    }
+    if holds.worktrees > 0 {
+        parts.push(format!(
+            "{} still checked out",
+            plural(holds.worktrees, "worktree", "worktrees")
+        ));
+    }
+    format!("{} — nothing was removed", parts.join(" and "))
 }
 
 async fn get_concurrency(
@@ -23115,6 +23414,62 @@ mod tests {
         assert_eq!(by_id("unset")["root_exists"], serde_json::Value::Null);
         // Flattened, not nested: the shell reads one object per project, as it always did.
         assert_eq!(by_id("rooted")["mode"], "shadow");
+    }
+
+    /// **The way out, end to end, and the refusal names the shell switches on.**
+    ///
+    /// `project_exit`'s own tests cover what the store does; this covers the two things only the
+    /// route decides — that `DELETE /projects/{id}` resolves at all beside the literal
+    /// `/projects/detect`, and that a refusal arrives as `{refusal, detail}` under the name the
+    /// panel writes a sentence for. A refusal renamed here and not there degrades silently to the
+    /// status-derived floor, which says "something about this has already changed" over a project
+    /// somebody is trying to remove.
+    #[tokio::test]
+    async fn a_project_can_leave_the_roster_and_says_why_when_it_cannot() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('spent', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('busy', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO project_slots (project_id, slot, owner_kind, owner_id, claimed_at)
+             VALUES ('busy', 0, 'run', 7, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // The record is readable for a project with no folder named, which is the one somebody most
+        // wants to remove — `resolve_project_root` would have 404'd it.
+        let (status, record) = call(state.clone(), "GET", "/projects/spent/record", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(record["forgets"]["runs"], 0);
+        assert_eq!(record["holds"]["slots"], 0);
+
+        let (status, refusal) = call(state.clone(), "DELETE", "/projects/busy", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refusal["refusal"], "in_flight");
+        assert_eq!(
+            refusal["detail"],
+            "1 slot still working here — nothing was removed"
+        );
+
+        let (status, _) = call(state.clone(), "DELETE", "/projects/spent", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, refusal) = call(state.clone(), "DELETE", "/projects/spent", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refusal["refusal"], "not_registered");
+
+        // And the one that was refused is still there, which is what "nothing was removed" claims.
+        let left: Vec<String> = sqlx::query_scalar("SELECT project_id FROM autopilot_state")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec!["busy"]);
     }
 
     #[tokio::test]

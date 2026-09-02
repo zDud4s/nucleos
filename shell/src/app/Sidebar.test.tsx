@@ -36,7 +36,7 @@ describe("Sidebar", () => {
     );
 
     expect(screen.getByRole("link", { name: "nucleos" }).getAttribute("href")).toContain(
-      "/projects/nucleos/estado",
+      "/projects/nucleos/state",
     );
     // The roster page keeps its place at the head of the group: it answers a
     // fleet-wide question no single workspace can.
@@ -94,7 +94,7 @@ describe("Sidebar", () => {
     const roster = [{ id: "nucleos", mode: "active" as const, pending: 0 }];
 
     const inside = await renderWithRouter(<Sidebar projects={roster} />, {
-      initialPath: "/projects/sidecar/codigo",
+      initialPath: "/projects/sidecar/code",
     });
     expect(screen.getByRole("link", { name: "nucleos" })).toBeTruthy();
     inside.unmount();

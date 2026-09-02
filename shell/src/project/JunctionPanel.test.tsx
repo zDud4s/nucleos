@@ -5,13 +5,13 @@ import { screen, within } from "@testing-library/react";
 // The harness pulls the app's router and client in with it. This surface fetches nothing when it
 // opens — it is handed a `Junction` and draws it — and the one request it can make, §14's guard on
 // a row of *declared, with no code*, only leaves on a press. So this line is for the import graph
-// and not for the component: no test here answers a request, and `Orfa.test.tsx` is where the one
+// and not for the component: no test here answers a request, and `OrphanCheck.test.tsx` is where the one
 // that does lives.
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import type { Anchor, Anchored, Junction } from "../data/project-map";
 import { renderWithQuery } from "../test/harness";
-import { Juncao } from "./Juncao";
+import { JunctionPanel } from "./JunctionPanel";
 
 /**
  * One approved decision, read against the structure layer.
@@ -67,7 +67,7 @@ function junction(overrides: Partial<Omit<Junction, "counts">> = {}): Junction {
 }
 
 function open(overrides: Partial<Omit<Junction, "counts">> = {}) {
-  return renderWithQuery(<Juncao junction={junction(overrides)} projectId="alpha" />);
+  return renderWithQuery(<JunctionPanel junction={junction(overrides)} projectId="alpha" />);
 }
 
 describe("the nodes that do not match", () => {
