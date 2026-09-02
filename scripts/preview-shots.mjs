@@ -397,6 +397,14 @@ const SHOTS_TO_TAKE = [
      nothing in flight, so the shot carries the ordinary case: the folder
      reassurance, the counts, and the checkbox left unticked. */
   ["39-roster-remove", { path: "/projects", press: "remove" }],
+  /* The other exit, which is not on that page at all: the folder delete, at
+     the foot of a project's own State mode. `alpha` because it is the fixture
+     with work in flight AND uncommitted work — the panel says what would be
+     lost and why the button is off, which is the pair worth a picture. */
+  [
+    "40-delete-folder",
+    { path: "/projects/alpha/estado", press: "delete this folder…" },
+  ],
 
   /* A door that is not the picture, which is what the row of views exists for:
      the junction reached without scrolling a matrix, and the seam still above

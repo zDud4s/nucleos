@@ -100,6 +100,16 @@ pub fn build_router(state: AppState) -> Router {
         // weights one shape.
         .route("/projects/{id}", delete(delete_project))
         .route("/projects/{id}/record", get(get_project_record))
+        // The second act, and the only irreversible thing this app does. Its own route rather than
+        // a flag on the one above, so that nothing can reach it by passing an argument it did not
+        // read: `DELETE /projects/{id}` cannot be made to touch a disk, whatever it is sent.
+        //
+        // The GET beside it is what a person reads before deciding — what in that folder exists
+        // nowhere else, and whether the daemon would refuse anyway.
+        .route(
+            "/projects/{id}/folder",
+            get(get_project_folder).delete(delete_project_folder),
+        )
         .route("/projects/{id}/rules", get(get_project_rules))
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
@@ -3570,6 +3580,169 @@ async fn delete_project(
         )),
         Err(error) => {
             tracing::warn!(project_id = %id, %error, "removing a project failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "refusal": "internal" })),
+            ))
+        }
+    }
+}
+
+/// A guard that would refuse, named so the screen can say it before anybody presses anything.
+#[derive(serde::Serialize)]
+struct FolderBlock {
+    refusal: &'static str,
+    detail: String,
+}
+
+/// What deleting this project's folder would take, and whether it would be allowed at all.
+///
+/// **Three separate questions, kept apart in three fields**, because a screen has to say a different
+/// sentence for each and a single "can I?" boolean would collapse them. `only_here` is what would be
+/// lost for ever; `blocked` is a standing refusal about the path itself; `holds` is work in flight,
+/// which clears on its own.
+#[derive(serde::Serialize)]
+struct FolderView {
+    /// The recorded root, or `null` for a project nobody ever pointed anywhere.
+    root: Option<String>,
+    /// Whether that folder is actually on this disk. A project pointed at a folder that has already
+    /// gone has nothing to delete, and the screen says so rather than offering the button.
+    exists: bool,
+    /// What is in there and nowhere else, or `null` for a folder git knows nothing about — which is
+    /// the more serious answer and not a missing one.
+    only_here: Option<crate::inspect::OnlyHere>,
+    blocked: Option<FolderBlock>,
+    holds: crate::project_exit::Holds,
+}
+
+async fn get_project_folder(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<FolderView>, StatusCode> {
+    let recorded: Option<Option<String>> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(recorded) = recorded else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let blocked = match crate::project_exit::folder_check(&state.pool, &id, recorded.as_deref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        Ok(_) => None,
+        Err(refusal) => Some(FolderBlock {
+            refusal: refusal.code(),
+            detail: refusal.detail(),
+        }),
+    };
+
+    let record = crate::project_exit::record(&state.pool, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    /*
+       Two `git` subprocesses and a `stat`, on the blocking pool for the reason `get_projects` puts
+       its own probe there: a project root on a disconnected network share blocks for as long as the
+       operating system feels like, and this future is on an executor thread shared by every caller.
+       Asked only when the folder is really there — git in a directory that does not exist answers
+       with an error nobody would learn anything from.
+    */
+    let root = recorded.clone();
+    let (exists, only_here) = tokio::task::spawn_blocking(move || match root {
+        None => (false, None),
+        Some(root) => {
+            let path = std::path::Path::new(&root);
+            if !path.is_dir() {
+                return (false, None);
+            }
+            (true, crate::inspect::only_here(path).ok().flatten())
+        }
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(FolderView {
+        root: recorded,
+        exists,
+        only_here,
+        blocked,
+        holds: record.holds,
+    }))
+}
+
+/// Delete a project's folder, and take it off the roster.
+///
+/// **The kill switch covers this, and it is the clearest case there is for it.** Everything else the
+/// switch stops is autonomous — this is a person pressing a button — but it is also the largest
+/// thing this app can do, and the switch's meaning is *nothing that changes anything happens right
+/// now*. A folder deletion sailing past an engaged emergency stop would be the one exception nobody
+/// would expect.
+async fn delete_project_folder(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RemoveProjectQuery>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let halted = crate::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "refusal": "internal" })),
+            )
+        })?;
+    if halted {
+        return Err((
+            StatusCode::LOCKED,
+            Json(serde_json::json!({ "refusal": "kill_switch" })),
+        ));
+    }
+
+    match crate::project_exit::delete_folder(&state.pool, &id, query.forget_history).await {
+        Ok(crate::project_exit::Deleted::Done { forgotten }) => {
+            tracing::info!(project_id = %id, forgotten, "a project's folder was deleted");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(crate::project_exit::Deleted::NotRegistered) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "refusal": "not_registered" })),
+        )),
+        Ok(crate::project_exit::Deleted::Held(holds)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": "in_flight",
+                "detail": held_by(&holds),
+                "holds": holds,
+            })),
+        )),
+        Ok(crate::project_exit::Deleted::Refused(refusal)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": refusal.code(),
+                "detail": refusal.detail(),
+            })),
+        )),
+        // Logged at `error` and not `warn`: this is the state that needs a person, and it is the
+        // only outcome in this file where the machine is left partway through something.
+        Ok(crate::project_exit::Deleted::Partial { root, error }) => {
+            tracing::error!(project_id = %id, %root, %error, "a folder was only partly deleted");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "refusal": "partly_deleted",
+                    "detail": format!(
+                        "{id} is off the roster and {root} did not fully delete: {error}. \
+                         What is left has to be removed by hand."
+                    ),
+                })),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(project_id = %id, %error, "deleting a project folder failed");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "refusal": "internal" })),

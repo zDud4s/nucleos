@@ -1247,6 +1247,55 @@ export function answer(path: string, init?: RequestInit): unknown {
     }
   }
 
+  /*
+    What deleting a project's folder would take. Four projects, four different
+    sentences, because the panel says a different one for each and a single
+    fixture would photograph only the dullest: `alpha` has work in flight and
+    real uncommitted work, `bravo` is a repository with no remote at all —
+    which is the case where nothing in it exists anywhere else — `charlie` was
+    never given a folder, and `delta` is a folder git knows nothing about.
+  */
+  const folder = /^\/projects\/([^/]+)\/folder$/.exec(route);
+  if (folder !== null) {
+    switch (folder[1]) {
+      case "alpha":
+        return {
+          root: "C:/repos/alpha",
+          exists: true,
+          only_here: { uncommitted: 12, unpushed: 3 },
+          blocked: null,
+          holds: { slots: 1, worktrees: 1 },
+        };
+      case "bravo":
+        return {
+          root: "C:/repos/bravo-servicos-partilhados",
+          exists: true,
+          only_here: { uncommitted: 0, unpushed: null },
+          blocked: null,
+          holds: { slots: 0, worktrees: 0 },
+        };
+      case "charlie":
+        return {
+          root: null,
+          exists: false,
+          only_here: null,
+          blocked: {
+            refusal: "no_root",
+            detail: "this project has no folder recorded, so there is nothing to delete",
+          },
+          holds: { slots: 0, worktrees: 0 },
+        };
+      default:
+        return {
+          root: "C:/repos/delta",
+          exists: true,
+          only_here: null,
+          blocked: null,
+          holds: { slots: 0, worktrees: 0 },
+        };
+    }
+  }
+
   const readings = /^\/projects\/([^/]+)\/readings$/.exec(route);
   if (readings !== null) {
     return {

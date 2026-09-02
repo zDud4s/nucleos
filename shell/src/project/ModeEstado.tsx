@@ -12,6 +12,7 @@ import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
 import { Section } from "../ui";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
+import { DeleteFolder } from "./DeleteFolder";
 import { Occupancy } from "./Occupancy";
 import { OwnedFiles } from "./OwnedFiles";
 import { Settings } from "./Settings";
@@ -113,6 +114,16 @@ export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
 
       <Section label="Files the app owns">
         <OwnedFiles projectId={projectId} />
+      </Section>
+
+      {/*
+        Last, and below everything, because it is the only thing on this page that cannot be undone.
+        Here rather than on the roster on purpose: that page compares projects, and a control that
+        destroys one has no business in a column beside three that describe it. Somebody reaching
+        this has already opened the project they mean and scrolled past everything it is doing.
+      */}
+      <Section label="Leaving">
+        <DeleteFolder projectId={projectId} />
       </Section>
     </div>
   );

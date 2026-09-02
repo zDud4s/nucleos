@@ -189,6 +189,10 @@ describe("the project workspace", () => {
       "Commands",
       "Settings",
       "Files the app owns",
+      // Last, because it is the only thing on this page that cannot be undone — and present in
+      // both states, like everything else here, because the invariant this test defends is that
+      // nothing appears or vanishes when a proposal lands.
+      "Leaving",
     ]);
   });
 
@@ -272,6 +276,10 @@ describe("the project workspace", () => {
       "Commands",
       "Settings",
       "Files the app owns",
+      // Last, because it is the only thing on this page that cannot be undone — and present in
+      // both states, like everything else here, because the invariant this test defends is that
+      // nothing appears or vanishes when a proposal lands.
+      "Leaving",
     ]);
   });
 

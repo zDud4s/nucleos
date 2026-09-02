@@ -19,6 +19,7 @@
 
 use serde::Serialize;
 use sqlx::SqlitePool;
+use std::path::{Path, PathBuf};
 
 /// Every table in this database that carries a `project_id`, minus `autopilot_state` itself.
 ///
@@ -291,6 +292,264 @@ pub async fn remove(
 /// time it was.
 fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("787"))
+}
+
+/* ------------------------------------------------------------------ the folder -- */
+
+/// Why a folder may not be deleted, in the words the screen will use.
+///
+/// **Every one of these is checked before anything is touched**, and every one names what to do
+/// instead. A refusal somebody cannot act on is a refusal they work around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unsafe {
+    /// The project has no folder recorded, so there is nothing on a disk to delete.
+    NoRoot,
+    /// A drive root, a home directory, or a path one level below a root.
+    TooBig(String),
+    /// Another registered project lives inside this folder, and would go with it.
+    HoldsAnother(String),
+    /// Forgetting the history is what got refused, not the folder. Its own variant because the
+    /// escape is the opposite of giving up: untick the box and the same button works.
+    HistoryReferenced,
+}
+
+impl Unsafe {
+    /// The sentence, built where the reason is known rather than in the shell.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NoRoot => {
+                "this project has no folder recorded, so there is nothing to delete".into()
+            }
+            Self::TooBig(path) => format!(
+                "{path} is too near the top of a disk for this app to delete — \
+                 delete it yourself if that is really what you want"
+            ),
+            Self::HoldsAnother(other) => format!(
+                "{other} is registered inside this folder and would go with it — \
+                 remove that project first, or delete the folder yourself"
+            ),
+            Self::HistoryReferenced => "something outside this project still points at its \
+                 history — untick the box and the folder still goes"
+                .into(),
+        }
+    }
+
+    /// The stable name the shell switches on.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoRoot => "no_root",
+            Self::TooBig(_) => "root_too_big",
+            Self::HoldsAnother(_) => "holds_another_project",
+            Self::HistoryReferenced => "history_referenced",
+        }
+    }
+}
+
+/// A path this app will not delete, whatever it is asked.
+///
+/// **Two normal components, minimum.** A drive root, `/`, and `C:\repos` are all refused;
+/// `C:\repos\alpha` is not. The rule is deliberately blunt and deliberately strict: the cost of
+/// refusing a legitimate `D:\work` is one sentence telling somebody to delete it themselves, and
+/// the cost of the other mistake is a disk. A relative path is refused outright — there is nothing
+/// to resolve it against here, and removing a relative path removes it relative to whatever the
+/// daemon's working directory happens to be.
+fn too_big_to_delete(root: &Path) -> bool {
+    // `dirs` is not a dependency here and does not need to be: these two are what every shell on
+    // both platforms sets, and a machine that sets neither falls through to the component rule
+    // rather than to a delete.
+    let homes = ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(|variable| std::env::var(variable).ok());
+    too_big_beside(root, homes)
+}
+
+/// The rule itself, with the home directories handed in.
+///
+/// Split from the reader above so a test can state which homes it is reasoning about. The
+/// alternative is mutating the process environment inside a test, which is unsound with a
+/// multi-threaded runner and is exactly the shape `nothing_sets_the_worktree_root_without_restoring
+/// _it` exists elsewhere in this crate to catch.
+fn too_big_beside(root: &Path, homes: impl IntoIterator<Item = String>) -> bool {
+    use std::path::Component;
+
+    if !root.is_absolute() {
+        return true;
+    }
+    let normal = root
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)))
+        .count();
+    if normal < 2 {
+        return true;
+    }
+    // The home directory, and everything it is inside. Both directions matter and only one is
+    // obvious: `~` itself is the obvious one, and `C:/Users` is the one that gets missed — and that
+    // one takes every account on the machine with it.
+    for home in homes {
+        let home = PathBuf::from(home);
+        if home.as_os_str().is_empty() {
+            continue;
+        }
+        if root == home || home.starts_with(root) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether this project's folder may be deleted, and why not when it may not.
+///
+/// Its own function because the screen asks it before drawing the control and the route asks it
+/// again before acting: a guard the caller is trusted to have run is a guard the second caller
+/// forgets.
+pub async fn folder_check(
+    pool: &SqlitePool,
+    project_id: &str,
+    root: Option<&str>,
+) -> sqlx::Result<Result<PathBuf, Unsafe>> {
+    let Some(root) = root.filter(|path| !path.trim().is_empty()) else {
+        return Ok(Err(Unsafe::NoRoot));
+    };
+    let root = PathBuf::from(root);
+    if too_big_to_delete(&root) {
+        return Ok(Err(Unsafe::TooBig(root.to_string_lossy().into_owned())));
+    }
+
+    // A project registered inside this one. Cheap — the roster is tens of rows — and it is the
+    // mistake nothing else would catch: a monorepo registered alongside one of its own packages,
+    // where deleting the outer one takes the inner one's folder with it and leaves its roster row
+    // pointing at nothing.
+    let others: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT project_id, project_root FROM autopilot_state WHERE project_id != ?",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    for (other_id, other_root) in others {
+        let Some(other_root) = other_root else {
+            continue;
+        };
+        if Path::new(&other_root).starts_with(&root) {
+            return Ok(Err(Unsafe::HoldsAnother(other_id)));
+        }
+    }
+
+    Ok(Ok(root))
+}
+
+/// What happened when a folder deletion was asked for.
+#[derive(Debug)]
+pub enum Deleted {
+    /// The folder is gone and the project is off the roster.
+    Done { forgotten: u64 },
+    /// Nothing on the roster answers to that name.
+    NotRegistered,
+    /// Work is still in flight here. Nothing was touched.
+    Held(Holds),
+    /// The folder is one this app will not delete.
+    Refused(Unsafe),
+    /// The roster row went and the folder did not, wholly or in part. The one outcome that leaves
+    /// the machine in a state somebody has to finish by hand, so it carries the path and the
+    /// operating system's own words.
+    Partial { root: String, error: String },
+}
+
+/// Delete a project's folder, and take it off the roster.
+///
+/// **The roster row goes first and the folder second, and the order is chosen rather than
+/// incidental.** Off the roster nothing schedules work into this folder — `autopilot_projects`
+/// selects on `mode IN ('shadow','active')`, and there is no row left to select — so the directory
+/// is not being written to while it is being removed. The other order has the failure that matters:
+/// a removal that stops halfway leaves a half-deleted repository that a live project is still
+/// pointed at, and the next tick runs a gate inside it.
+///
+/// The price is `Partial`, which is a real outcome and is reported as one. A row removed and a
+/// folder that would not go is recoverable by hand and is visible; the reverse is neither.
+pub async fn delete_folder(
+    pool: &SqlitePool,
+    project_id: &str,
+    forget_history: bool,
+) -> sqlx::Result<Deleted> {
+    let recorded: Option<Option<String>> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(recorded) = recorded else {
+        return Ok(Deleted::NotRegistered);
+    };
+
+    // The recorded root, and never a path from the request. There is no argument to this function
+    // that could name a directory, which is the property that makes the guards worth having.
+    let root = match folder_check(pool, project_id, recorded.as_deref()).await? {
+        Ok(root) => root,
+        Err(refusal) => return Ok(Deleted::Refused(refusal)),
+    };
+
+    match remove(pool, project_id, forget_history).await? {
+        Removed::Done { forgotten } => {
+            let path = root.clone();
+            let outcome = tokio::task::spawn_blocking(move || remove_tree(&path))
+                .await
+                .map_err(|error| {
+                    sqlx::Error::Protocol(format!("the delete task failed: {error}"))
+                })?;
+            match outcome {
+                Ok(()) => Ok(Deleted::Done { forgotten }),
+                Err(error) => Ok(Deleted::Partial {
+                    root: root.to_string_lossy().into_owned(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+        Removed::NotRegistered => Ok(Deleted::NotRegistered),
+        Removed::Held(holds) => Ok(Deleted::Held(holds)),
+        Removed::Referenced => Ok(Deleted::Refused(Unsafe::HistoryReferenced)),
+    }
+}
+
+/// A recursive removal, with the two things the standard one does not do on this machine.
+///
+/// **Read-only files.** Git marks everything under `.git/objects` read-only, and a plain removal
+/// refuses a read-only file on Windows with `Access is denied`. So the attribute is cleared on the
+/// way down. A repository is the overwhelmingly common case here, which makes this the ordinary
+/// path rather than an edge one.
+///
+/// **Junctions and symlinks.** `symlink_metadata` rather than `metadata`, and a link is unlinked
+/// rather than descended into. Not hypothetical in this repository: `nucleos/target` is a junction
+/// to the shared `C:/Projects/.cargo-target` that every crate on this machine builds into.
+/// Following it would delete twenty other projects' build output — and would do it while reporting
+/// that it had deleted one project's folder.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+
+    if meta.is_symlink() {
+        // A directory symlink or junction is removed as a directory and a file symlink as a file.
+        // Neither touches what it points at.
+        return if meta.is_dir() {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+    }
+
+    let mut permissions = meta.permissions();
+    if permissions.readonly() {
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        // Best effort: a permission that will not clear is reported by the removal below, in words
+        // about the file that actually refused rather than about this attempt.
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            remove_tree(&entry?.path())?;
+        }
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +882,167 @@ mod tests {
         assert_eq!(record.forgets.stamps, 0);
         assert_eq!(record.holds.slots, 1);
         assert_eq!(record.holds.worktrees, 0);
+    }
+
+    /* --------------------------------------------------------------- the folder -- */
+
+    /// **The blunt rule, and it is meant to be blunt.**
+    ///
+    /// The cost of refusing a legitimate `D:\work` is one sentence telling somebody to delete it
+    /// themselves. The cost of the other mistake is a disk. A relative path is in here because
+    /// removing one removes it relative to whatever the daemon's working directory happens to be,
+    /// which on this app is wherever the tray icon was launched from.
+    #[test]
+    fn a_path_near_the_top_of_a_disk_is_never_deleted() {
+        let nowhere = || Vec::<String>::new();
+        assert!(too_big_beside(Path::new("C:/"), nowhere()));
+        assert!(too_big_beside(Path::new("/"), nowhere()));
+        assert!(too_big_beside(Path::new("C:/repos"), nowhere()));
+        assert!(too_big_beside(Path::new("repos/alpha"), nowhere()));
+        assert!(!too_big_beside(Path::new("C:/repos/alpha"), nowhere()));
+
+        // **A POSIX path is not absolute on Windows**, and that is the platform's answer rather
+        // than this rule's: `Path::is_absolute` wants a drive or UNC prefix here, so `/home/me/x`
+        // falls out at the first check as if it were relative. Which is the safe direction, and is
+        // why this assertion is written per platform instead of being deleted — a root spelt that
+        // way is a root on Linux and nowhere to delete from on Windows.
+        assert_eq!(
+            too_big_beside(Path::new("/home/me/alpha"), nowhere()),
+            cfg!(windows)
+        );
+    }
+
+    /// The home directory, and everything it is inside.
+    ///
+    /// Both directions matter and only one is obvious. `~` itself is the obvious one; `C:/Users` is
+    /// the one that gets missed, and it takes every account on the machine with it.
+    ///
+    /// The home is handed in rather than read: the machine running this has one somewhere nobody
+    /// here can predict, and asserting about the real one would pass vacuously wherever the
+    /// variable is unset. Setting it for the test is worse still — mutating the environment under a
+    /// multi-threaded runner is unsound.
+    #[test]
+    fn the_home_directory_and_its_parents_are_never_deleted() {
+        let home = || vec!["C:/Users/someone".to_owned()];
+        assert!(too_big_beside(Path::new("C:/Users/someone"), home()));
+        assert!(too_big_beside(Path::new("C:/Users"), home()));
+        assert!(!too_big_beside(Path::new("C:/Users/someone/repos"), home()));
+    }
+
+    /// **A project registered inside another one, which nothing else would catch.**
+    ///
+    /// A monorepo and one of its own packages, both on the roster. Deleting the outer folder takes
+    /// the inner project's code with it and leaves that project's roster row pointing at nothing —
+    /// a row the app would go on polling, and a folder nobody asked to delete.
+    #[tokio::test]
+    async fn a_folder_holding_another_registered_project_is_refused() {
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('outer', 'shadow', 'C:/repos/mono')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root)
+             VALUES ('inner', 'shadow', 'C:/repos/mono/packages/inner')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let refused = folder_check(&pool, "outer", Some("C:/repos/mono"))
+            .await
+            .unwrap();
+        assert_eq!(refused, Err(Unsafe::HoldsAnother("inner".into())));
+
+        // And the inner one is deletable on its own, which is the half that must not be broken by
+        // the check above: the outer project is not inside it.
+        assert!(
+            folder_check(&pool, "inner", Some("C:/repos/mono/packages/inner"))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    /// The real thing, on a real directory, including the file kind that defeats the standard call.
+    ///
+    /// Git marks everything under `.git/objects` read-only, so a repository is the ordinary case
+    /// here rather than an edge one — and `remove_dir_all` refuses a read-only file on Windows with
+    /// `Access is denied`. Without the attribute being cleared on the way down, deleting a project
+    /// folder would fail on nearly every project this app has.
+    #[tokio::test]
+    async fn deleting_a_folder_takes_the_read_only_files_with_it() {
+        let pool = pool().await;
+        let holder = tempfile::tempdir().unwrap();
+        let root = holder.path().join("alpha");
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        let object = root.join(".git/objects/ab12");
+        std::fs::write(&object, b"an object").unwrap();
+        let mut readonly = std::fs::metadata(&object).unwrap().permissions();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&object, readonly).unwrap();
+
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('alpha', 'shadow', ?)")
+            .bind(root.to_string_lossy().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let done = delete_folder(&pool, "alpha", false).await.unwrap();
+        assert!(matches!(done, Deleted::Done { .. }), "got {done:?}");
+        assert!(!root.exists());
+        assert!(!on_roster(&pool, "alpha").await);
+    }
+
+    /// Held means nothing happened — including to the folder, which is the half worth asserting.
+    ///
+    /// Deleting a directory under a running agent is how a machine ends up with half a repository
+    /// and a process still writing into it.
+    #[tokio::test]
+    async fn a_folder_is_not_deleted_under_work_that_is_still_running() {
+        let pool = pool().await;
+        let holder = tempfile::tempdir().unwrap();
+        let root = holder.path().join("alpha");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("src.rs"), b"fn main() {}").unwrap();
+
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('alpha', 'shadow', ?)")
+            .bind(root.to_string_lossy().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO project_slots (project_id, slot, owner_kind, owner_id, claimed_at)
+             VALUES ('alpha', 0, 'run', 7, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        match delete_folder(&pool, "alpha", false).await.unwrap() {
+            Deleted::Held(holds) => assert_eq!(holds.slots, 1),
+            other => panic!("expected the delete to be refused, got {other:?}"),
+        }
+        assert!(
+            root.join("src.rs").exists(),
+            "nothing on the disk may be touched"
+        );
+        assert!(on_roster(&pool, "alpha").await);
+    }
+
+    /// A project with no folder named has nothing to delete, and says so rather than succeeding.
+    #[tokio::test]
+    async fn a_project_with_no_folder_has_nothing_to_delete() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        assert!(matches!(
+            delete_folder(&pool, "alpha", false).await.unwrap(),
+            Deleted::Refused(Unsafe::NoRoot)
+        ));
+        assert!(on_roster(&pool, "alpha").await, "a refusal removes nothing");
     }
 
     /// A project with nothing on record and a project that does not exist are different answers.

@@ -139,6 +139,13 @@ export const keys = {
      * project that is gone is a number a re-opened control would show about nothing.
      */
     record: (projectId: string) => ["projects", projectId, "record"] as const,
+    /**
+     * What deleting this project's folder would take, and whether it would be allowed.
+     *
+     * Two git subprocesses and a `stat` behind it, so it is fetched only when the control that acts
+     * on it is open — never on the roster, and never on a timer.
+     */
+    folder: (projectId: string) => ["projects", projectId, "folder"] as const,
     /** The project's structure layer, derived off disk on every read. */
     map: (projectId: string) => ["projects", projectId, "map"] as const,
     /** The documents this project keeps, by the name the owner reads. */

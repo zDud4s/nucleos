@@ -18,7 +18,7 @@ import type { ClassTally } from "../data/autopilot";
 import type { Changed, Worktree } from "../data/project-code";
 import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
-import type { ProjectRecord } from "../data/projects";
+import type { ProjectFolder, ProjectRecord } from "../data/projects";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
@@ -206,6 +206,18 @@ export interface DaemonState {
    * can be told to give it.
    */
   removeRefusal: { status: number; code: string; detail: string } | null;
+  /**
+   * What deleting this project's folder would take, and whether it would be allowed.
+   *
+   * The default is the ordinary repository: it is there, git knows it, nothing is uncommitted and
+   * nothing is unpushed. Every sentence the delete control can say is a departure from that, so a
+   * test that needs one says which.
+   */
+  folder: ProjectFolder;
+  /** Every folder deletion the shell asked for, as it asked for it. */
+  folderDeleted: { projectId: string; forgetHistory: boolean }[];
+  /** What `DELETE /projects/{id}/folder` refuses with, or `null` to accept. */
+  folderRefusal: { status: number; code: string; detail: string } | null;
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -266,6 +278,15 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     },
     removed: [],
     removeRefusal: null,
+    folder: {
+      root: "C:/Projects/nucleos",
+      exists: true,
+      only_here: { uncommitted: 0, unpushed: 0 },
+      blocked: null,
+      holds: { slots: 0, worktrees: 0 },
+    },
+    folderDeleted: [],
+    folderRefusal: null,
     ...overrides,
   };
 }
@@ -610,6 +631,23 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return undefined;
     }
 
+    // Ahead of the bare project DELETE below, because it has a segment after the project's and
+    // that DELETE would otherwise swallow it.
+    if (init?.method === "DELETE" && path.split("?")[0].endsWith("/folder")) {
+      if (state.folderRefusal !== null) {
+        const { status, code, detail } = state.folderRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+      const [route, query] = path.split("?");
+      const projectId = decodeURIComponent(route.split("/")[2] ?? "");
+      state.folderDeleted.push({
+        projectId,
+        forgetHistory: new URLSearchParams(query ?? "").get("forget_history") === "true",
+      });
+      state.projects = state.projects.filter((row) => row.project_id !== projectId);
+      return undefined;
+    }
+
     // `DELETE /projects/{id}?forget_history=` — last of the DELETEs, because it is the least
     // specific: every path above has a segment after the project's, and this one is the project.
     if (init?.method === "DELETE" && path.startsWith("/projects/")) {
@@ -632,6 +670,7 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
 
     // Parameterised before the exact matches: the readings route carries a project id, which a
     // `switch` over literals cannot express.
+    if (path.startsWith("/projects/") && path.endsWith("/folder")) return state.folder;
     if (path.startsWith("/projects/") && path.endsWith("/record")) {
       // 404 for a name the roster does not have, which is what the daemon answers: a record of all
       // zeros is what an unregistered project and a brand new one both look like, and only one of
