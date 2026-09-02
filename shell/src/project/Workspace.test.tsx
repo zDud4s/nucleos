@@ -1,6 +1,6 @@
 // §spec workspace-de-projeto
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import {
   daemonFetch,
   daemonState,
@@ -131,8 +131,44 @@ describe("the project workspace", () => {
     expect(await screen.findByRole("link", { name: "State" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "State" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Map" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Code" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Workflows" })).toBeTruthy();
+    // By prefix from here down: two of the four carry a count of what they hold, which is the next
+    // test's subject and not this one's.
+    expect(screen.getByRole("link", { name: /^Code/ })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /^Workflows/ })).toBeTruthy();
+  });
+
+  /**
+   * Two of the four are doors rather than places.
+   *
+   * Code reads a *run's* worktree and Workflows reads an installed bundle, and on most projects
+   * most of the time there is neither — so four equal tabs send somebody through a click onto a
+   * page whose whole content explains why it is empty. The strip says how much is there before the
+   * press instead.
+   *
+   * **A nought and never the em dash**, which is the point the test below this one protects: on
+   * these pages the dash means a reading nobody took, and how many runs hold a worktree here is a
+   * reading the daemon gave.
+   *
+   * **What is asserted as hard as the number is that nothing was taken away.** The route, the link
+   * and the press all survive; a tab that quietly stopped working would be a capability lost to a
+   * cosmetic change, and this workspace has already lost one that way.
+   */
+  it("says how much the two conditional modes are holding, and still opens them", async () => {
+    await openWorkspace();
+
+    const code = await screen.findByRole("link", { name: /^Code/ });
+    await waitFor(() => expect(code.textContent).toBe("Code0"));
+    expect(code.getAttribute("title")).toMatch(/No run is working here/);
+    expect(screen.getByRole("link", { name: /^Workflows/ }).textContent).toBe("Workflows0");
+
+    // The two that answer about the project itself are never numbered: both are true of a project
+    // the moment it exists, whatever is or is not running in it.
+    expect(screen.getByRole("link", { name: "State" }).textContent).toBe("State");
+    expect(screen.getByRole("link", { name: "Map" }).textContent).toBe("Map");
+
+    // Quiet is drawn, and it is drawn by the tone rather than by taking anything away.
+    expect(code.className).not.toBe(screen.getByRole("link", { name: "Map" }).className);
+    expect(code.getAttribute("href")).toBe("/projects/nucleos/code");
   });
 
   /**
@@ -190,6 +226,10 @@ describe("the project workspace", () => {
       "Commands",
       "Settings",
       "Files the app owns",
+      // Last, because it is the only thing on this page that cannot be undone — and present in
+      // both states, like everything else here, because the invariant this test defends is that
+      // nothing appears or vanishes when a proposal lands.
+      "Leaving",
     ]);
   });
 
@@ -273,6 +313,10 @@ describe("the project workspace", () => {
       "Commands",
       "Settings",
       "Files the app owns",
+      // Last, because it is the only thing on this page that cannot be undone — and present in
+      // both states, like everything else here, because the invariant this test defends is that
+      // nothing appears or vanishes when a proposal lands.
+      "Leaving",
     ]);
   });
 
@@ -432,7 +476,7 @@ describe("the project workspace", () => {
   it("mounts the workflows mode on the library and the project's pins", async () => {
     await openWorkspace({ mode: "workflows" });
     expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
-    expect(screen.getByText("On this machine")).toBeTruthy();
+    expect(await screen.findByText("On this machine")).toBeTruthy();
   });
 
   /**
@@ -518,8 +562,16 @@ describe("the project workspace", () => {
     await renderApp({ initialPath: "/projects/nucleos/map" });
 
     // Was `/declaring nothing they implement/`, which this mode no longer says: that count is the
-    // junction's `unclaimed` now, and the structure panel reports what it alone knows.
+    // junction's `unclaimed` now, and the headline reports what it alone knows.
     expect(await screen.findByText(/this reader could read/)).toBeTruthy();
+
+    /*
+      The junction is behind its own door since the mode became five views, so the click is part of
+      what this test proves: the door is there, it is wired, and the panel behind it reads the same
+      answer the headline did. Asserting only the headline would leave a typo in the view condition
+      showing an empty page under a chip that still looked right.
+    */
+    fireEvent.click(screen.getByRole("button", { name: /^Junction/ }));
     expect(screen.getByText(/module nobody asked for/)).toBeTruthy();
   });
 });
@@ -545,7 +597,8 @@ describe("what the app may author", () => {
    */
   it("offers an editor for exactly the files the núcleo says it authors", async () => {
     const nothing = await openState(ownedState({ ownership: [] }));
-    expect(await screen.findByText(/authors no file in this project/)).toBeTruthy();
+    const empty = within(await screen.findByRole("region", { name: "Files the app owns" }));
+    expect(await empty.findByText("none")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "edit" })).toBeNull();
 
     nothing.unmount();
@@ -879,10 +932,23 @@ describe("what this project can be asked to do", () => {
   /**
    * Nothing declared is not an empty bar. Declaration rather than detection is the design's own
    * decision, and the sentence is where somebody learns a list will not appear by itself.
+   *
+   * The sentence is now behind the question rather than on the page, and both halves are asserted:
+   * a quiet line that had quietly lost its reasoning would look exactly like this one and teach
+   * nobody anything.
    */
-  it("says a project has declared nothing rather than showing an empty bar", async () => {
+  it("says a project has declared nothing, with the reason one click away", async () => {
     await openState(withCommands([]));
-    expect(await screen.findByText(/Nothing declared yet/)).toBeTruthy();
+    expect(await screen.findByText("none declared")).toBeTruthy();
+
+    /*
+      Scoped to the section, because a quiet project now has several of these and every one of them
+      asks "why?". That is not ambiguity on screen: each sits inside a named region, which is the
+      context both a reader and a screen reader get it from.
+    */
+    const commands = within(screen.getByRole("region", { name: "Commands" }));
+    fireEvent.click(commands.getByRole("button", { name: "why?" }));
+    expect(commands.getByText(/declaration rather than detection/)).toBeTruthy();
   });
 
   /**

@@ -255,6 +255,32 @@
   color: var(--text);
 }
 
+/* A control that has to be on every row of a table and must not compete with
+   the readings in those rows. Borderless and faint at rest, underlined on
+   hover: findable by anybody looking for it, invisible to anybody scanning the
+   column beside it.
+
+   Its own variant rather than `link`, and the difference is not decoration.
+   `link` spends the identity accent because what it does IS navigation — the
+   same colour as the wordmark and the focus ring, which the design gives to
+   nothing that is a state or an action. The roster's `remove` is an action, and
+   four of them in accent down the right edge were the loudest thing on a page
+   whose whole job is to say which project needs somebody. */
+.ui-button-quiet {
+  padding: 0;
+  background: none;
+  border-color: transparent;
+  color: var(--text-faint);
+  font-weight: var(--weight-regular);
+}
+
+.ui-button-quiet:hover:not(:disabled) {
+  border-color: transparent;
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
 /* Direction, as a glyph rather than as a colour — it reads the same to someone
    who cannot separate the hues, and it survives being placed on any variant. */
 .ui-button-go::before {
@@ -312,6 +338,87 @@
 
 .ui-teach-action {
   margin-top: var(--space-1);
+}
+
+/* --------------------------------------------------------------- section -- */
+
+.ui-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/**
+ * A section whose whole body is one quiet line shares that line with its heading.
+ *
+ * Stacked, a heading over "none declared" costs two rows for the same nothing, and a page with
+ * seven sections pays it seven times over — which is how the emptiest project came to be the
+ * longest page. `:has` is what makes this possible without a prop: whether a panel is quiet is a
+ * fact about the data it fetched, and the section above it never sees that.
+ */
+.ui-section:has(> .ui-quiet) {
+  flex-flow: row wrap;
+  align-items: baseline;
+  column-gap: var(--space-3);
+  row-gap: var(--space-2);
+}
+
+.ui-section-title {
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* ----------------------------------------------------------------- quiet -- */
+
+.ui-quiet {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+.ui-quiet-ask {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  text-underline-offset: 2px;
+}
+
+.ui-quiet-ask:hover {
+  text-decoration: underline;
+}
+
+/**
+ * The gesture, beside the line rather than at the far end of it.
+ *
+ * `margin-left: auto` was the first answer and it put "declare a command" against the right edge
+ * of a 1440px workspace, half a screen from the word it acts on — a control nobody would connect
+ * to the section it belongs to. What separates it here is that it is the only thing on the line
+ * that is not faint prose.
+ */
+.ui-quiet-action {
+  margin-left: var(--space-1);
+}
+
+/**
+ * The paragraph the line replaced, on its own row once asked for.
+ *
+ * `52ch` is the measure `.ui-teach` uses, and for the same reason: this is the same prose that
+ * used to sit in the panel, and prose that runs the width of a workspace is prose nobody finishes.
+ */
+.ui-quiet-why {
+  flex-basis: 100%;
+  max-width: 52ch;
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-faint);
 }
 
 /* ----------------------------------------------------------------- notes -- */

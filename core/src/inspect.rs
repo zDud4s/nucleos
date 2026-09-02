@@ -1623,3 +1623,84 @@ pub(crate) mod tests {
         assert_eq!(project_root(&pool, "unknown").await.unwrap(), None);
     }
 }
+
+/// What exists in this folder and nowhere else.
+///
+/// **Written for the one screen that deletes a folder, and shaped by what it has to say there.**
+/// A file count would be the obvious thing to show somebody about to destroy a directory, and it is
+/// the wrong thing: on a working repository it is dominated by `node_modules` and `target`, so the
+/// big frightening number is mostly build output that would be regenerated in a minute. What cannot
+/// be regenerated is work git has not been told to keep, and work git has been told to keep that no
+/// remote has a copy of. Those two are the whole of what a deletion takes for ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct OnlyHere {
+    /// Files with changes no commit holds — modified, staged or untracked.
+    pub uncommitted: i64,
+    /// Commits on this repository's own branches that no remote has.
+    ///
+    /// **`None` is not zero and it is the more serious answer.** A repository with no remote
+    /// configured has no elsewhere at all: every commit in it is only here, and reporting that as a
+    /// count would be reporting the size of the history rather than the size of the loss. The
+    /// screen says which of the two it is in words.
+    pub unpushed: Option<i64>,
+}
+
+/// Read it, or `None` for a folder that is not a git repository.
+///
+/// `None` is the case that most deserves saying out loud: a folder git knows nothing about has no
+/// commits, no remote and no way for anything in it to exist anywhere else — so the reassurance the
+/// other branch can offer does not apply, and a screen that printed `0 uncommitted` over it would
+/// be reassuring somebody about the most dangerous case there is.
+pub fn only_here(root: &Path) -> Result<Option<OnlyHere>, InspectError> {
+    if !root.join(".git").exists() {
+        return Ok(None);
+    }
+
+    // The same flags `changed_paths` gives this command, and for the same reasons: no optional
+    // locks, because an agent may be running git in this tree at the same moment, and no fsmonitor,
+    // because that is a command string the target repository's own config chooses.
+    let status = run_git(
+        root,
+        &[
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
+    let uncommitted = parse_status_z(&status).len() as i64;
+
+    // Asked before counting, because the count means something different without it. `--branches
+    // --not --remotes` over a repository with no remote is every commit it has ever had, which is a
+    // true answer to a question nobody asked.
+    let remotes = run_git(root, &["--no-optional-locks", "remote"])?;
+    if String::from_utf8_lossy(&remotes).trim().is_empty() {
+        return Ok(Some(OnlyHere {
+            uncommitted,
+            unpushed: None,
+        }));
+    }
+
+    let counted = run_git(
+        root,
+        &[
+            "--no-optional-locks",
+            "rev-list",
+            "--count",
+            "--branches",
+            "--not",
+            "--remotes",
+        ],
+    )?;
+    let unpushed = String::from_utf8_lossy(&counted)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    Ok(Some(OnlyHere {
+        uncommitted,
+        unpushed: Some(unpushed),
+    }))
+}

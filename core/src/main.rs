@@ -66,6 +66,7 @@ mod pressure;
 mod priority;
 mod process_tree;
 mod project_commands;
+mod project_exit;
 mod project_map;
 mod project_readings;
 mod proposals;

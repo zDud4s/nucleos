@@ -20,6 +20,7 @@ export { ErrorNote, type ErrorNoteProps } from "./ErrorNote";
 export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
+export { Quiet, type QuietProps } from "./Quiet";
 /**
  * Three formatters in one module — the recorded exception to one primitive per
  * file. See the header of `readings.tsx` for why they travel together.
@@ -35,6 +36,7 @@ export {
   type RelativeTimeProps,
 } from "./readings";
 export { RefusalNote, type RefusalNoteProps } from "./RefusalNote";
+export { Section, type SectionProps } from "./Section";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";

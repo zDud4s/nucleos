@@ -1,3 +1,4 @@
+import type { ProjectForgets, ProjectHolds } from "./projects";
 import type { ProjectSummary } from "./system";
 
 /**
@@ -56,15 +57,25 @@ export function gateOf(project: ProjectSummary): Gate {
  * surface answers is which of twenty-five projects is broken, and a table that hid that under `A`
  * for `ANSup` would be the wall of chips again with straighter edges.
  *
- * Four ranks, in the order somebody can act on them:
+ * Five ranks, in the order somebody can act on them:
  *
  * 0. **The folder is a problem** — missing or never named. Nothing this project does can run, so
  *    every other reading about it is stale by definition.
  * 1. **The gate said no.** The code is broken; that is the one verdict that means it.
  * 2. **Something is waiting on a person.** Work that has stopped, and only a human restarts it.
  * 3. Everything else.
+ * 4. **It is switched off**, which is nobody asking it for anything.
+ *
+ * **The last rank is checked first, and that is the point.** Every rank above it says *this needs
+ * somebody now*, and none of them can be true of a project the owner turned off. The version this
+ * replaces put a dormant project at the very top of the page for having no folder — which is not a
+ * fault in something switched off, it is what switched off looks like — and pushed the one that was
+ * acting, failing its gate and holding two decisions underneath it. Nothing is hidden by the move:
+ * the row still carries every reading it carried before, in the same columns. Only the shouting
+ * stops.
  */
 export function rankOf(project: ProjectSummary): number {
+  if (project.mode === "off") return 4;
   if (folderOf(project) !== "ok") return 0;
   if (gateOf(project) === "failed") return 1;
   if (project.open_proposals > 0) return 2;
@@ -101,6 +112,13 @@ export function inAttentionOrder(rows: ProjectSummary[]): ProjectSummary[] {
  *
  * Only non-zero facts are mentioned. "25 projects · 0 broken" makes somebody read a number to learn
  * nothing, and a page that reports its own good news gets skimmed.
+ *
+ * **`rankOf` growing a fifth rank deliberately did not change this.** Off having stopped being a
+ * reason to shout does not make a switched-off project's absent folder untrue, and the line and the
+ * order are answering two different questions — one tallies what is out there, the other says who
+ * needs somebody first. Filtering the folder counts to live projects was tried and reverted: it
+ * would have made this line stop counting what the rows count, which is the one property the
+ * paragraph above exists to defend. What the row says about that folder is the row's to soften.
  */
 export function headline(rows: ProjectSummary[]): string {
   if (rows.length === 0) return "the núcleo knows of no project";
@@ -119,4 +137,61 @@ export function headline(rows: ProjectSummary[]): string {
   if (waiting > 0) parts.push(`${waiting} waiting on you`);
 
   return parts.join(" · ");
+}
+
+/* ------------------------------------------------------------------ the exit -- */
+
+/**
+ * What a project has on record, as a phrase.
+ *
+ * **The checkbox is the reason this exists.** "Forget the history too" over no number is not a
+ * decision somebody can take — it asks them to agree to lose an amount they cannot see. So the
+ * counts come back from the daemon and are read out beside it, in the nouns the app's own screens
+ * use.
+ *
+ * Only non-zero facts, for the reason {@link headline} gives about itself: a phrase that walked
+ * through seven zeros to reach one number would bury the number. `null` when there is genuinely
+ * nothing, which is a different answer again — a project with no record has nothing to forget, and
+ * the checkbox should not be offered at all.
+ */
+const RECORD_NOUNS: [keyof ProjectForgets, string, string][] = [
+  ["runs", "run", "runs"],
+  ["jobs", "job", "jobs"],
+  ["proposals", "proposal", "proposals"],
+  ["decisions", "decision", "decisions"],
+  ["stamps", "stamp", "stamps"],
+  ["commands", "command", "commands"],
+  ["feed", "feed entry", "feed entries"],
+];
+
+export function onRecord(forgets: ProjectForgets): string | null {
+  const parts = RECORD_NOUNS.filter(([field]) => forgets[field] > 0).map(
+    ([field, one, many]) => `${forgets[field]} ${forgets[field] === 1 ? one : many}`,
+  );
+  return words(parts);
+}
+
+/**
+ * What is still going on here, as a phrase — or `null` when the answer is nothing.
+ *
+ * **Read before the button is pressed, and that is the point.** The daemon refuses a removal while
+ * work is in flight and writes its own sentence about it, in the past tense: *nothing was removed*.
+ * This is the other moment — the control is open, the person has not pressed anything yet, and what
+ * they need is why the button is off. Two sentences because they are two tenses; a shell that only
+ * had the daemon's would have to let somebody press a button in order to be told they could not.
+ */
+export function heldBy(holds: ProjectHolds): string | null {
+  const parts: string[] = [];
+  if (holds.slots > 0) parts.push(`${holds.slots} ${holds.slots === 1 ? "slot" : "slots"} in flight`);
+  if (holds.worktrees > 0) {
+    parts.push(`${holds.worktrees} ${holds.worktrees === 1 ? "worktree" : "worktrees"} checked out`);
+  }
+  return words(parts);
+}
+
+/** `a`, `a and b`, `a, b and c` — the last join is a word, because a list read aloud has one. */
+function words(parts: string[]): string | null {
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
 }

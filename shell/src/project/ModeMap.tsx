@@ -1,5 +1,7 @@
 // §spec mapa-do-projeto
-import { useProjectMap } from "../data/project-map";
+import { useState } from "react";
+import { useProjectMap, useProjectSpecs, type ProjectMap } from "../data/project-map";
+import { Boundary } from "../canvas/Boundary";
 import { MapCanvas } from "../canvas/MapCanvas";
 import { declaredCoverage } from "../canvas/map-model";
 import { drawableLinks } from "../canvas/map-graphs";
@@ -29,30 +31,98 @@ import { TriagePanel } from "./TriagePanel";
  * a silence is a claim about the triager, a green is the owner's, and nothing here draws the two in
  * a way that could be mistaken one for the other.
  *
- * **The three panels below read three different questions, and one failing does not silence the
- * others.** The structure is derived by walking the project's folder; the pile is a table the
- * daemon answers without touching disk at all — `get_project_map_decisions` resolves the row and
- * never the folder, deliberately, "so a project whose folder has moved still has a pile, which is
- * exactly what somebody looking at a broken project wants". A mode that returned a single sentence
- * on the first failure would take that away for no reason.
+ * **Five doors and not one column, which is that same argument one floor down.** Stacked, this
+ * mode was 3557px: the picture ended at 1723 and everything under it was reached by scrolling past
+ * what you came for, so the three axes §5 keeps apart were flattened into a scrollbar. The row
+ * above them says how much is behind each — the idiom the inspector next door already uses for
+ * exactly this.
  *
- * **The junction is not a fourth question, which is why it is not a fourth panel.** It comes back
+ * **What a door may not hide is the seam.** §16.5 is written against a descent that takes one with
+ * it, and the header the picture used to carry is a caveat on all five: the junction, the stamps
+ * and the triage are counted over the same partial reading the drawing is. So {@link Boundary}
+ * sits above the row rather than inside the picture, on screen whichever door is open.
+ *
+ * **The panels read different questions, and one failing does not silence the others.** The
+ * structure is derived by walking the project's folder; the specs are a listing of a folder; the
+ * pile is a table the daemon answers without touching disk at all — `get_project_map_decisions`
+ * resolves the row and never the folder, deliberately, "so a project whose folder has moved still
+ * has a pile, which is exactly what somebody looking at a broken project wants". A map that could
+ * not be read leaves the four doors that need it saying so, and leaves the fifth working.
+ *
+ * **The junction is not a fourth question, which is why it is not a fourth query.** It comes back
  * on the same answer as the structure — `GET /projects/{id}/map` returns both, flattened — so it
- * is drawn inside the component that holds that query. Giving it a query of its own would ask the
- * daemon to walk the same tree twice per open, and would put two answers to one question on one
- * screen, free to disagree about a project whose folder moved between them.
+ * is drawn off the one query this mode holds. A query apiece would ask the daemon to walk the same
+ * tree four times per open, and would put four answers to one question on one screen, free to
+ * disagree about a project whose folder moved between them.
  */
 
 export interface ModeMapProps {
   projectId: string;
 }
 
+/** The five doors, in the order they read. */
+const VIEWS = ["picture", "junction", "stamps", "triage", "specs"] as const;
+type MapView = (typeof VIEWS)[number];
+
+const VIEW_LABEL: Record<MapView, string> = {
+  picture: "Picture",
+  junction: "Junction",
+  stamps: "Stamps",
+  triage: "Triage",
+  specs: "Specs",
+};
+
 export function ModeMap({ projectId }: ModeMapProps) {
+  const map = useProjectMap(projectId);
+  /*
+    Read here for the number on one door, and by `ExtractSpec` for the picker behind it. Two
+    readers of one query and not two queries: React Query answers both out of the same cache entry,
+    so the number on the door and the list behind it cannot disagree.
+  */
+  const specs = useProjectSpecs(projectId);
+  const [view, setView] = useState<MapView>("picture");
+
   return (
-    <div className="flex flex-col gap-8">
-      <Derived projectId={projectId} />
-      <ExtractSpec projectId={projectId} />
-      <DecisionsWaiting projectId={projectId} />
+    <div className="flex flex-col gap-6">
+      {/*
+        The headline and the seam, above every door. Absent until there is an answer to draw them
+        from — a header of dashes over a map still loading is a measurement nobody took.
+      */}
+      {map.data === undefined ? null : (
+        <>
+          <Headline data={map.data} />
+          <Boundary
+            modules={map.data.modules}
+            imports={map.data.imports}
+            unread={map.data.unread}
+            foreign={map.data.foreign}
+            seam={map.data.seam}
+          />
+        </>
+      )}
+
+      <Views view={view} onView={setView} data={map.data} specs={specs.data?.length ?? null} />
+
+      {view === "specs" ? (
+        /*
+          Two panels behind one door, because they are the two ends of one loop: choosing what gets
+          read, and answering what came back. Neither reads the map, which is why this door still
+          works on a project whose folder has moved.
+        */
+        <div className="flex flex-col gap-8">
+          <ExtractSpec projectId={projectId} />
+          <DecisionsWaiting projectId={projectId} />
+        </div>
+      ) : map.isError ? (
+        <p className="text-sm text-text-faint">
+          The núcleo could not read this project&rsquo;s map — its folder may have moved.
+        </p>
+      ) : map.data === undefined ? (
+        <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>
+      ) : (
+        <Derived projectId={projectId} view={view} data={map.data} />
+      )}
+
       <p className="max-w-prose text-sm text-text-muted">
         Structure, intention, the join between them, your verdict on each line, and what a model
         thought was worth your eyes. The evidence layer is a slice that does not exist yet — nothing
@@ -64,13 +134,98 @@ export function ModeMap({ projectId }: ModeMapProps) {
 }
 
 /**
- * Everything the one map query answers: the structure it walked, and the junction over it.
+ * The row of doors, and the number on each.
  *
- * Named for the query and not for a layer, because it now draws two things and a component called
- * `Structure` that renders the junction would be lying about itself in the file that argues
- * hardest against exactly that.
+ * **A zero is drawn only where a zero was measured.** `JunctionPanel` spends a paragraph refusing to draw
+ * a grid of zeros on a project with no approved decision — *"a row of `0`s reads as a measurement,
+ * and here nothing has been measured"* — and a chip reading `Junction 0` is that same claim in
+ * less space and with more authority. So until one decision is approved, those three doors carry
+ * an em dash: this app's own mark for a reading nobody took, with the reason on hover and the
+ * whole sentence behind the door.
  *
- * **The headline here reports what this half alone knows, and nothing else.** It used to report
+ * The specs door is not like them. A count of documents on disk is a real measurement whatever
+ * else this project has or has not got, so it says the number even when the number is nought.
+ */
+function Views({
+  view,
+  onView,
+  data,
+  specs,
+}: {
+  view: MapView;
+  onView: (view: MapView) => void;
+  data: ProjectMap | undefined;
+  /** How many documents there are to read, or `null` while that listing is unanswered. */
+  specs: number | null;
+}) {
+  const approved = data?.junction.counts.decisions ?? 0;
+  /* Nothing has been read against the code yet, so nothing counted over it is a measurement. */
+  const layered = data !== undefined && approved > 0;
+
+  const counts: Record<MapView, { of: number | null; means: string }> = {
+    picture: {
+      of: null,
+      means: "The project as it is on disk, which is the one layer that is always true.",
+    },
+    junction: {
+      of: layered ? approved : null,
+      means: layered
+        ? `${approved} approved decision${approved === 1 ? "" : "s"} to read the structure against.`
+        : "No decision has been approved yet, so there is nothing to read the structure against.",
+    },
+    stamps: {
+      of: layered ? data.triage_counts.waiting : null,
+      means: layered
+        ? "Decisions on your desk: the stamps that lapsed, plus what the triager flagged."
+        : "Nothing has been approved yet, so there is nothing to stamp.",
+    },
+    triage: {
+      of: layered ? data.triage_counts.flagged : null,
+      means: layered
+        ? "Decisions a model looked at and asked for your eyes on."
+        : "Nothing has been approved yet, so the triager has nothing to look at.",
+    },
+    specs: {
+      of: specs,
+      means:
+        specs === null
+          ? "Still looking for this project's documents."
+          : `${specs} document${specs === 1 ? "" : "s"} a model could read decisions out of.`,
+    },
+  };
+
+  return (
+    <nav aria-label="Views of this map" className="flex flex-wrap gap-2">
+      {VIEWS.map((candidate) => {
+        const { of, means } = counts[candidate];
+        return (
+          <button
+            key={candidate}
+            type="button"
+            onClick={() => onView(candidate)}
+            aria-current={candidate === view ? "true" : undefined}
+            title={means}
+            className={
+              candidate === view
+                ? "inline-flex items-baseline gap-2 rounded-md border border-accent bg-surface-raised px-3 py-1.5 text-xs text-text"
+                : "inline-flex items-baseline gap-2 rounded-md border border-border px-3 py-1.5 text-xs text-text-muted hover:text-text"
+            }
+          >
+            {VIEW_LABEL[candidate]}
+            {candidate === "picture" ? null : (
+              <span className="font-mono text-text-faint">{of === null ? "—" : of}</span>
+            )}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+/**
+ * The map's own headline: the size of what this reader could read, and how much of it said so.
+ *
+ * **It reports what this half alone knows, and nothing else.** It used to report
  * `modules.filter(m => !m.declares).length` under the words "declaring nothing they implement",
  * which is the same concept as `junction.counts.unclaimed` — and the two disagreed. `declares` is
  * `source.contains('§')`, the file's own gesture at a section, bare `§` included; `unclaimed` is
@@ -78,38 +233,11 @@ export function ModeMap({ projectId }: ModeMapProps) {
  * module has always got its `#[cfg(test)]` citations for free. Four modules of this repository are
  * `declares: false` with a non-empty `cites` — their tests name what they prove, so they are not
  * code nobody asked for. Two numbers meaning almost the same thing and disagreeing by four, on one
- * screen, is precisely the confusion this mode exists to remove, so the junction is now the single
+ * screen, is precisely the confusion this mode exists to remove, so the junction is the single
  * owner of that count and this reports the size of what it could read.
  */
-function Derived({ projectId }: { projectId: string }) {
-  const map = useProjectMap(projectId);
-
-  if (map.isError) {
-    return (
-      <p className="text-sm text-text-faint">
-        The núcleo could not read this project&rsquo;s map — its folder may have moved.
-      </p>
-    );
-  }
-  if (map.data === undefined) {
-    return <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>;
-  }
-
-  const {
-    modules,
-    imports,
-    unread,
-    foreign,
-    seam,
-    junction,
-    standings,
-    stamps,
-    triage,
-    triage_counts,
-    git_would_not_answer,
-    recency,
-    last_triaged_at,
-  } = map.data;
+function Headline({ data }: { data: ProjectMap }) {
+  const { modules, imports, unread, foreign } = data;
   // Counted rather than taken from `imports.length`: this is the number of links the map would
   // actually draw, which drops any edge with an end it cannot find.
   const links = drawableLinks(modules, imports);
@@ -124,63 +252,93 @@ function Derived({ projectId }: { projectId: string }) {
   const declared = declaredCoverage(modules, foreign);
 
   return (
-    <div className="flex flex-col gap-6">
-      <div>
-        <p className="mt-1 font-display text-3xl text-text">
-          {modules.length}
+    <div>
+      <p className="mt-1 font-display text-3xl text-text">
+        {modules.length}
+        <span className="ml-2 text-sm text-text-faint">
+          module{modules.length === 1 ? "" : "s"} this reader could read
+        </span>
+      </p>
+      {declared.citing > 0 ? (
+        <p className="mt-2 font-display text-3xl text-text">
+          {declared.saying}
           <span className="ml-2 text-sm text-text-faint">
-            module{modules.length === 1 ? "" : "s"} this reader could read
+            of {declared.citing} file{declared.citing === 1 ? "" : "s"} naming a section say which
+            document it belongs to
           </span>
         </p>
-        {declared.citing > 0 ? (
-          <p className="mt-2 font-display text-3xl text-text">
-            {declared.saying}
-            <span className="ml-2 text-sm text-text-faint">
-              of {declared.citing} file{declared.citing === 1 ? "" : "s"} naming a section say
-              which document it belongs to
-            </span>
-          </p>
-        ) : null}
-        <p className="mt-1 text-xs text-text-muted">
-          joined by {links} link{links === 1 ? "" : "s"}
-          {unread.length > 0
-            ? ` · ${unread.length} file${unread.length === 1 ? "" : "s"} in a language it cannot read yet`
-            : ""}
-        </p>
-      </div>
-      {/*
-        The structure layer as a picture: the whole project, one community, and one file's own
-        declarations. Drawn here and not as a panel of its own for the reason the junction is —
-        the two upper levels read THIS answer, and a query of their own would walk the tree twice
-        per open.
+      ) : null}
+      <p className="mt-1 text-xs text-text-muted">
+        joined by {links} link{links === 1 ? "" : "s"}
+        {unread.length > 0
+          ? ` · ${unread.length} file${unread.length === 1 ? "" : "s"} in a language it cannot read yet`
+          : ""}
+      </p>
+    </div>
+  );
+}
 
-        The file level is the exception and does not contradict the rule: it reads one file, which
-        this answer does not carry and could not carry cheaply. Its route is asked only once a
-        reader opens something, so the cost lands on the click rather than on every open.
+/**
+ * Everything the one map query answers, drawn one door at a time.
+ *
+ * Named for the query and not for a layer, because it draws four different things and a component
+ * called `Structure` that also rendered the junction would be lying about itself in the file that
+ * argues hardest against exactly that.
+ *
+ * Each of the four reads this one answer rather than fetching its own, which is the rule the
+ * mode's header states: a query apiece would walk a thousand-file tree four times per open, and
+ * would put four readings of one question on one screen.
+ */
+function Derived({
+  projectId,
+  view,
+  data,
+}: {
+  projectId: string;
+  view: MapView;
+  data: ProjectMap;
+}) {
+  const {
+    modules,
+    imports,
+    junction,
+    standings,
+    stamps,
+    triage,
+    triage_counts,
+    git_would_not_answer,
+    recency,
+    last_triaged_at,
+  } = data;
 
-        **Above the junction, and the order is an argument.** The junction says how firmly each
-        decision is tied to code; whether that means anything depends on how much of the project
-        declared which document its sections belong to. The picture is where that is visible, so it
-        is read first.
-      */}
+  if (view === "picture") {
+    /*
+      The structure layer as a picture: the whole project, one community, and one file's own
+      declarations. The file level is the one thing here that reads a route of its own — it reads
+      one file, which this answer does not carry and could not carry cheaply, and that route is
+      asked only once a reader opens something, so the cost lands on the click.
+    */
+    return (
       <MapCanvas
         projectId={projectId}
         modules={modules}
         imports={imports}
-        unread={unread}
-        foreign={foreign}
-        seam={seam}
         junction={junction}
         standings={standings}
       />
-      <JunctionPanel junction={junction} projectId={projectId} />
-      {/*
-        Drawn here rather than as a panel of its own for the reason the junction is: the standings,
-        the header and `git_would_not_answer` come back on this same answer, flattened. A query of
-        its own would ask the daemon to walk a thousand-file tree twice per open, and would put two
-        readings of one question on one screen, free to disagree about a project whose folder moved
-        between them.
-      */}
+    );
+  }
+
+  if (view === "junction") {
+    return <JunctionPanel junction={junction} projectId={projectId} />;
+  }
+
+  if (view === "stamps") {
+    /*
+      The standings, §5.3's header and `git_would_not_answer` all come back on this same answer,
+      flattened, which is why this panel has no query of its own.
+    */
+    return (
       <StampsPanel
         projectId={projectId}
         junction={junction}
@@ -190,26 +348,21 @@ function Derived({ projectId }: { projectId: string }) {
         triageCounts={triage_counts}
         gitWouldNotAnswer={git_would_not_answer}
       />
-      {/*
-        The third axis, drawn off this same answer for the reason the other two are — the
-        judgements, their tally and §10's ordering all arrive flattened onto `GET /map`, and a
-        query of its own would walk the tree twice per open and put two readings of one question on
-        one screen. It holds one query the map cannot serve: §6.2's silenced pile has a door of its
-        own, because *sempre acessível* has to survive this map failing to read a folder.
+    );
+  }
 
-        **Below the stamps, and the order is an argument.** §5.3's header sits at the top of the
-        stamp panel and is the first thing read; the triage panel is what explains two of its four
-        numbers — why `J` is larger than the lapsed pile and why silencing did not make `K`
-        smaller — so it reads as the answer to a question the header has just raised.
-      */}
-      <TriagePanel
-        projectId={projectId}
-        junction={junction}
-        triage={triage}
-        counts={triage_counts}
-        recency={recency}
-        lastTriagedAt={last_triaged_at}
-      />
-    </div>
+  /*
+    The third axis. It holds one query the map cannot serve: §6.2's silenced pile has a door of its
+    own, because *sempre acessível* has to survive this map failing to read a folder.
+  */
+  return (
+    <TriagePanel
+      projectId={projectId}
+      junction={junction}
+      triage={triage}
+      counts={triage_counts}
+      recency={recency}
+      lastTriagedAt={last_triaged_at}
+    />
   );
 }

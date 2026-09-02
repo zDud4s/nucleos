@@ -1,6 +1,6 @@
 // §spec motor-de-workflows
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import {
   bundle,
   daemonFetch,
@@ -11,6 +11,7 @@ import {
   renderApp,
   type DaemonState,
 } from "../test/harness";
+import { NO_WORKFLOW_MEANS } from "../data/workflows";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const opener = vi.hoisted(() => ({ openUrl: vi.fn() }));
@@ -44,6 +45,28 @@ describe("the workflows mode", () => {
   it("says a project has no workflow rather than showing an empty graph", async () => {
     await openWorkflows({ library: [] });
     expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
+  });
+
+  /**
+   * The same nothing, on two screens, saying the same thing.
+   *
+   * They are rightly two shapes — a `Teach` here, over the library somebody came to install from,
+   * and one quiet line in the State mode's panel — and the claim inside them was written twice.
+   * One copy said the app does not pretend otherwise by drawing an empty graph and the other did
+   * not, so the same emptiness had two explanations and only one mentioned the graph. Asserted
+   * against the exported sentence rather than against a string typed here, because a test carrying
+   * its own third copy would go green on a page that had drifted from both.
+   */
+  it("explains the emptiness in the same words as the State mode", async () => {
+    const empty = await openWorkflows({ library: [] });
+    expect(await screen.findByText(NO_WORKFLOW_MEANS, { exact: false })).toBeTruthy();
+
+    empty.rendered.unmount();
+
+    await renderApp({ initialPath: "/projects/nucleos/state" });
+    const panel = within(await screen.findByRole("region", { name: "Workflow" }));
+    fireEvent.click(await panel.findByRole("button", { name: "why?" }));
+    expect(panel.getByText(NO_WORKFLOW_MEANS, { exact: false })).toBeTruthy();
   });
 
   /** The library is what you install from, and a bundle already in use says so instead of offering. */
@@ -106,7 +129,7 @@ describe("the workflows mode", () => {
     expect(guard).toBeTruthy();
     // Inline, not a modal: nothing here is a dialog, and the rest of the page is still on screen.
     expect(rendered.container.querySelector("dialog")).toBeNull();
-    expect(screen.getByText("On this machine")).toBeTruthy();
+    expect(await screen.findByText("On this machine")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "edit in the library" }));
     expect(opener.openUrl).toHaveBeenCalledWith("vscode://file/C:/lib/harness/1.0");

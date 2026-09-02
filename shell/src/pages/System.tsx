@@ -329,10 +329,20 @@ function formFromBudget(budget: BudgetView): BudgetFormState {
   };
 }
 
-/** A blank box is `null` — no ceiling — never `0`; a typed `0` is a real ceiling of zero. */
-function parseCeiling(raw: string): number | null {
+type CeilingResult = { ok: true; value: number | null } | { ok: false };
+
+/**
+ * A blank box is `null` — no ceiling — never `0`; a typed `0` is a real
+ * ceiling of zero. Anything that is not a finite number is rejected rather
+ * than coerced: `Number("abc")` is `NaN` and `Number("Infinity")` is
+ * `Infinity`, and `JSON.stringify` writes both of those as `null` — the wire
+ * value for "no ceiling" — which would silently remove a spend ceiling.
+ */
+function parseCeiling(raw: string): CeilingResult {
   const trimmed = raw.trim();
-  return trimmed === "" ? null : Number(trimmed);
+  if (trimmed === "") return { ok: true, value: null };
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? { ok: true, value } : { ok: false };
 }
 
 function parseAmount(raw: string): number {
@@ -353,6 +363,7 @@ function BudgetPanel() {
   const budget = useBudget();
   const setBudget = useSetBudget();
   const [form, setForm] = useState<BudgetFormState | null>(null);
+  const [badCeilings, setBadCeilings] = useState<string[]>([]);
 
   useEffect(() => {
     if (budget.data !== undefined && form === null) {
@@ -392,7 +403,10 @@ function BudgetPanel() {
               inputMode="decimal"
               placeholder="no ceiling"
               value={form.windowLimit}
-              onChange={(event) => setForm({ ...form, windowLimit: event.target.value })}
+              onChange={(event) => {
+                setForm({ ...form, windowLimit: event.target.value });
+                setBadCeilings([]);
+              }}
             />
             <p className="sy-field-hint">
               currently: {form.windowLimit.trim() === "" ? "no ceiling" : `$${form.windowLimit}`}
@@ -422,7 +436,10 @@ function BudgetPanel() {
               inputMode="decimal"
               placeholder="no ceiling"
               value={form.hourlyLimit}
-              onChange={(event) => setForm({ ...form, hourlyLimit: event.target.value })}
+              onChange={(event) => {
+                setForm({ ...form, hourlyLimit: event.target.value });
+                setBadCeilings([]);
+              }}
             />
             <p className="sy-field-hint">
               currently: {form.hourlyLimit.trim() === "" ? "no ceiling" : `$${form.hourlyLimit}`}
@@ -455,16 +472,31 @@ function BudgetPanel() {
             confirmLabel="Send these five fields to the daemon"
             variant="ghost"
             onConfirm={() => {
+              const windowLimit = parseCeiling(form.windowLimit);
+              const hourlyLimit = parseCeiling(form.hourlyLimit);
+              const invalid: string[] = [];
+              if (!windowLimit.ok) invalid.push("the window limit");
+              if (!hourlyLimit.ok) invalid.push("the hourly limit");
+              if (!windowLimit.ok || !hourlyLimit.ok) {
+                setBadCeilings(invalid);
+                return;
+              }
+              setBadCeilings([]);
               const change: BudgetChange = {
-                limit_usd: parseCeiling(form.windowLimit),
+                limit_usd: windowLimit.value,
                 period: form.period,
-                hourly_limit_usd: parseCeiling(form.hourlyLimit),
+                hourly_limit_usd: hourlyLimit.value,
                 per_run_reserve_usd: parseAmount(form.perRunReserve),
                 time_cost_per_hour_usd: parseAmount(form.timeCost),
               };
               setBudget.mutate(change);
             }}
           />
+          {badCeilings.length > 0 && (
+            <ErrorNote>
+              the budget was not sent — {badCeilings.join(" and ")} must be a number, or blank for no ceiling
+            </ErrorNote>
+          )}
           {setBudget.isError && (
             <ErrorNote>the budget was not changed — the núcleo refused or did not answer</ErrorNote>
           )}

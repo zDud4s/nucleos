@@ -131,6 +131,21 @@ export const keys = {
       ["projects", projectId, "grep", q, path] as const,
     diff: (projectId: string, path: string) => ["projects", projectId, "diff", path] as const,
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
+    /**
+     * What this project would lose by leaving, and what is holding it here.
+     *
+     * Under the roster prefix like everything else about a project, which means the removal itself
+     * invalidates it along with the row it just deleted — and a record left in the cache for a
+     * project that is gone is a number a re-opened control would show about nothing.
+     */
+    record: (projectId: string) => ["projects", projectId, "record"] as const,
+    /**
+     * What deleting this project's folder would take, and whether it would be allowed.
+     *
+     * Two git subprocesses and a `stat` behind it, so it is fetched only when the control that acts
+     * on it is open — never on the roster, and never on a timer.
+     */
+    folder: (projectId: string) => ["projects", projectId, "folder"] as const,
     /** The project's structure layer, derived off disk on every read. */
     map: (projectId: string) => ["projects", projectId, "map"] as const,
     /** The documents this project keeps, by the name the owner reads. */
