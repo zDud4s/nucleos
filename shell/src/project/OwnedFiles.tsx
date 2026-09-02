@@ -2,6 +2,7 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useProjectOwnership, useWriteProjectFile, type Claim } from "../data/project-config";
 import { useProjectCat } from "../data/projects";
+import { Quiet } from "../ui";
 
 /**
  * The files this app is the legitimate author of, and the editor for them.
@@ -39,17 +40,26 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
     return <p className="text-sm text-text-faint">Reading the write boundary…</p>;
   }
 
+  /*
+    Nothing claimed is a whole section saying so, and it used to say so twice: once that the app
+    authors nothing here, and once that everything else belongs to the repository — which, with
+    nothing claimed, is the same sentence. One line, and the boundary itself behind the question.
+  */
+  if (ownership.data.length === 0) {
+    return (
+      <Quiet says="none">
+        Every file in this project belongs to the repository, so all of it is read here and edited
+        where code is edited. Which files the app may write is answered by the núcleo rather than
+        decided by this page, so an empty list is a fence rather than a gap.
+      </Quiet>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-3">
-      {ownership.data.length === 0 ? (
-        <p className="text-sm text-text-faint">
-          The app authors no file in this project. Everything here is edited where code is edited.
-        </p>
-      ) : (
-        ownership.data.map((claim) => (
-          <OwnedFile key={claim.path} projectId={projectId} claim={claim} />
-        ))
-      )}
+      {ownership.data.map((claim) => (
+        <OwnedFile key={claim.path} projectId={projectId} claim={claim} />
+      ))}
 
       {/*
         The other layer, said out loud rather than left to be discovered by a missing button. A

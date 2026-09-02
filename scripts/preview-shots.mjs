@@ -16,7 +16,11 @@
  * Scaffolding, not a gate. It asserts nothing and fails nothing; it produces
  * pictures. Nothing in `scripts/gates.sh` calls it.
  *
- *   node scripts/preview-shots.mjs [outdir]
+ *   node scripts/preview-shots.mjs [outdir] [name filter]
+ *
+ * The filter is a plain substring against the shot's name, for the loop this
+ * turns into while a page is being worked on: `… preview-shots map` builds
+ * once and photographs only the map. Absent, it takes everything.
  */
 
 import { spawn } from "node:child_process";
@@ -32,6 +36,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHELL = join(ROOT, "shell");
 const OUT = join(SHELL, "dist-preview");
 const SHOTS = resolve(process.argv[2] ?? join(ROOT, "preview-shots"));
+const ONLY = process.argv[3];
 
 const WIDTH = 1440;
 const HEIGHT = 960;
@@ -278,6 +283,23 @@ async function shoot(name, { path, tab, press, theme = "dark" }) {
     await new Promise((ok) => setTimeout(ok, 350));
   }
 
+  /*
+    Did a picture of the page, or a picture of the apology?
+
+    A render that throws is CAUGHT by the router's error boundary, so nothing
+    reaches `Runtime.exceptionThrown` and `pageErrors` stays empty — this
+    harness reported `ok` over a black rectangle reading "Something went wrong!"
+    and the fault was found by eye, days later, which is precisely the failure
+    it exists to prevent. Detected by the boundary's own words because they are
+    the only thing on the page: a screen that renders those two lines and
+    nothing else has not been photographed, it has been missed.
+  */
+  const apology = await evaluate(`(() => {
+    const said = document.body.innerText.trim();
+    return said.startsWith("Something went wrong!") && said.length < 200;
+  })()`).catch(() => false);
+  if (apology) pageErrors.push("the router's error boundary — the page threw while rendering");
+
   const { data } = await send("Page.captureScreenshot", { format: "png" }, sessionId);
 
   if (tall !== HEIGHT) {
@@ -342,14 +364,63 @@ const SHOTS_TO_TAKE = [
   /* The Codigo mode's empty state, which is where both doors into the inspector
      are drawn — and the only place in the app that opens it. */
   ["30-codigo-doors", { path: "/projects/alpha/codigo" }],
+
+  /* The Estado mode, which is the densest collection of bordered ghost buttons
+     in the app: `edit` on each owned file, `declare a command`, the three mode
+     switches, both ceiling steppers and `no ceiling`. Every one of them was a
+     white slab with an unreadable word in it until `base.css` gave `button` a
+     transparent background — a defect no test could see and a picture cannot
+     miss. Both themes, because the fault only looked like a fault in one. */
+  ["31-estado-controls", { path: "/projects/alpha/estado" }],
+  ["32-estado-controls-light", { path: "/projects/alpha/estado", theme: "light" }],
+
+  /* The map, over a project the size of the real one — 245 modules and about
+     nine hundred imports. Every complaint this page has ever drawn is a
+     complaint about scale, so a fixture that fits comfortably would photograph
+     a screen nobody is looking at. */
+  ["33-map-matrix", { path: "/projects/alpha/mapa" }],
+  /* One level down, which is the state the rail exists for: the list of
+     communities stays put, the open one is marked, and every sibling is one
+     click away rather than three. */
+  ["34-map-community", { path: "/projects/alpha/mapa", press: "council" }],
+
+  /* The fourth mode, so the workspace can be looked at as the set of four it
+     actually is rather than one page at a time. */
+  ["35-workflows", { path: "/projects/alpha/workflows" }],
+
+  /* The roster — every project at once, which is the page the workspace is
+     reached from and the one surface of this pillar nothing had photographed. */
+  ["37-roster", { path: "/projects" }],
+  ["38-roster-light", { path: "/projects", theme: "light" }],
+  /* The way out, open. The press lands on the FIRST `remove` in the table, and
+     the ordering puts `bravo` there — which is the fixture with a record and
+     nothing in flight, so the shot carries the ordinary case: the folder
+     reassurance, the counts, and the checkbox left unticked. */
+  ["39-roster-remove", { path: "/projects", press: "remove" }],
+  /* The other exit, which is not on that page at all: the folder delete, at
+     the foot of a project's own State mode. `alpha` because it is the fixture
+     with work in flight AND uncommitted work — the panel says what would be
+     lost and why the button is off, which is the pair worth a picture. */
+  [
+    "40-delete-folder",
+    { path: "/projects/alpha/estado", press: "delete this folder…" },
+  ],
+
+  /* A door that is not the picture, which is what the row of views exists for:
+     the junction reached without scrolling a matrix, and the seam still above
+     it — the one thing §16.5 says a view may not take with it. */
+  ["36-map-junction", { path: "/projects/alpha/mapa", press: "Junction" }],
 ];
 
+const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));
+if (wanted.length === 0) die(`no shot matches "${ONLY}"`);
+
 let clean = true;
-for (const [name, options] of SHOTS_TO_TAKE) {
+for (const [name, options] of wanted) {
   clean = (await shoot(name, options)) && clean;
 }
 
-console.log("\npreview: " + SHOTS_TO_TAKE.length + " shots in " + SHOTS);
+console.log("\npreview: " + wanted.length + " shots in " + SHOTS);
 if (!clean) console.log("preview: at least one page threw — see the lines above");
 
 chromium.kill();

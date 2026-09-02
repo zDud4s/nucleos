@@ -531,3 +531,203 @@
   stroke: var(--tone-pending-fg);
   stroke-dasharray: 6 4;
 }
+
+/* ---------------------------------------------------- the queue as a graph -- */
+/* `canvas/JobProgressGraph.tsx`. The seven lifecycle classes are the seven state
+   tones from tokens.css, one to one, so this drawing cannot disagree with the
+   badges beside it -- `cancelled` is `off` here for the same reason state-map.ts
+   makes it `off` there: withdrawn work is not a verdict. `todo` takes no tone at
+   all, because an item nobody has started is not in a state yet. */
+
+.jp {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.jp-reading {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  margin: 0;
+}
+
+/* The graph is the one thing here that can outgrow its card: a wide round puts
+   boxes side by side and the panel is a fixed column. It scrolls sideways on its
+   own rather than widening the card, which would push the fleet's other cards
+   off screen to show one job's queue. */
+.jp-svg {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.jp-edge {
+  fill: none;
+  stroke: var(--tone-off-border);
+  stroke-width: 1.5;
+}
+
+/* A cycle in a queue is a defect, not a shape -- `layered.ts` had to reverse the
+   edge to rank the graph at all. Dashed so it does not read as an ordinary
+   dependency drawn upside down. */
+.jp-edge-back {
+  stroke: var(--tone-danger-border);
+  stroke-dasharray: 5 4;
+}
+
+.jp-box {
+  fill: var(--surface-raised);
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.jp-label {
+  fill: var(--text);
+  font-size: 11px;
+}
+
+.jp-ordinal {
+  fill: var(--text-muted);
+  font-size: 9px;
+}
+
+.jp-done .jp-box {
+  fill: var(--tone-active-bg);
+  stroke: var(--tone-active-border);
+}
+
+.jp-running .jp-box {
+  fill: var(--tone-info-bg);
+  stroke: var(--tone-info-border);
+}
+
+.jp-waiting .jp-box {
+  fill: var(--tone-pending-bg);
+  stroke: var(--tone-pending-border);
+}
+
+.jp-gated .jp-box {
+  fill: var(--tone-paused-bg);
+  stroke: var(--tone-paused-border);
+}
+
+.jp-stopped .jp-box {
+  fill: var(--tone-danger-bg);
+  stroke: var(--tone-danger-border);
+}
+
+.jp-withdrawn .jp-box {
+  fill: var(--tone-off-bg);
+  stroke: var(--tone-off-border);
+}
+
+/* The gate said no and the wire cannot say whether the queue owes this item
+   another run. Dashed rather than a second colour: it is the SAME verdict with
+   an unknown sequel, and a colour of its own would read as a different one. */
+.jp-undecided .jp-box {
+  stroke-dasharray: 4 3;
+}
+
+.jp-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.jp-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.jp-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+}
+
+.jp-done .jp-swatch {
+  background: var(--tone-active-bg);
+  border-color: var(--tone-active-border);
+}
+
+.jp-running .jp-swatch {
+  background: var(--tone-info-bg);
+  border-color: var(--tone-info-border);
+}
+
+.jp-waiting .jp-swatch {
+  background: var(--tone-pending-bg);
+  border-color: var(--tone-pending-border);
+}
+
+.jp-gated .jp-swatch {
+  background: var(--tone-paused-bg);
+  border-color: var(--tone-paused-border);
+}
+
+.jp-stopped .jp-swatch {
+  background: var(--tone-danger-bg);
+  border-color: var(--tone-danger-border);
+}
+
+.jp-withdrawn .jp-swatch {
+  background: var(--tone-off-bg);
+  border-color: var(--tone-off-border);
+}
+
+/* The closed-card reading: a bar whose segments are the tally, and the sentence
+   beside it. Not a percentage -- "4/7 done, 1 needing a look" is the thing a
+   person actually wants, and a single number hides the one that matters. */
+.jp-line {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.jp-bar {
+  display: inline-flex;
+  width: 72px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--surface-raised);
+}
+
+.jp-seg {
+  display: block;
+}
+
+.jp-bar .jp-done {
+  background: var(--tone-active-fg);
+}
+
+.jp-bar .jp-running {
+  background: var(--tone-info-fg);
+}
+
+.jp-bar .jp-todo {
+  background: var(--tone-off-border);
+}
+
+.jp-bar .jp-attention {
+  background: var(--tone-pending-fg);
+}
+
+/* The reading and the arrangement control share a line: one says where the queue
+   is, the other changes how you look at it. */
+.fleet-items-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}

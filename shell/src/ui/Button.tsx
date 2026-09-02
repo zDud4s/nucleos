@@ -12,8 +12,14 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
  * row", a fill for the handful of gestures that end something irreversibly.
  * Both are usually wrapped in `ConfirmButton` — the colour warns, the interlock
  * protects, and neither substitutes for the other.
+ *
+ * `quiet` and `link` look alike and are not interchangeable. `link` spends the
+ * identity accent, because what it does is navigation; `quiet` is faint until
+ * hovered, for a control that has to be on every row of a table and must not
+ * compete with the readings in it. Reach for `quiet` whenever the control acts
+ * rather than goes somewhere.
  */
-export type ButtonVariant = "approve" | "ghost" | "danger" | "danger-solid" | "link";
+export type ButtonVariant = "approve" | "ghost" | "danger" | "danger-solid" | "link" | "quiet";
 
 /**
  * Which way the action points.
