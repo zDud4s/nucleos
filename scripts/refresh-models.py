@@ -284,10 +284,16 @@ def render(choices: list[dict]) -> str:
     """One model per line, flow-style, because that is what a person scanning this file wants."""
     lines = [BANNER, f"{KEY}:"]
     for choice in choices:
-        efforts = ", ".join(choice["efforts"])
+        efforts = ", ".join(choice.get("efforts") or [])
+        # OMITTED rather than written empty when there is none: a hosted row has no runner, and
+        # `runner: None` — which is what an f-string makes of Python's `None` — is read back by YAML
+        # as the STRING "None", a runner the daemon does not know. `config.rs` falls unknown names
+        # to `claude`, so the row would then be filtered off the menu by `active_runner()` on any
+        # machine running Codex, for a value nobody wrote.
+        runner = f", runner: {choice['runner']}" if choice.get("runner") else ""
         lines.append(
             f"  - {{ id: {json.dumps(choice['id'])}, label: {json.dumps(choice['label'])}, "
-            f"brain: {choice['brain']}, runner: {choice['runner']}, efforts: [{efforts}] }}"
+            f"brain: {choice['brain']}{runner}, efforts: [{efforts}] }}"
         )
     return "\n".join(lines)
 
@@ -356,7 +362,22 @@ def main() -> int:
             for choice in kept
             # Absent `runner` has always meant `claude`, matching the daemon's own default.
             if (choice.get("runner") or "claude") == runner
+            # ...but only among the CLOUD rows, which are the only ones this script refreshes. A
+            # `brain: openrouter` row carries no runner (it is reached over HTTP, not spawned as
+            # either CLI), so without this it would be bucketed as `claude` and re-emitted by
+            # `render` with a `runner:` it never had.
+            and choice.get("brain", "cloud") == "cloud"
         ]
+
+    def hand_written() -> list[dict]:
+        """The rows this script does not own: anything that is not a cloud CLI model.
+
+        This block is documented in the file as being written by this script, and it is — for the
+        CLI models it reads from the vendors. The hosted (`brain: openrouter`) rows are somebody's
+        deliberate choice of which models the picker offers, and nothing here can regenerate them,
+        so a refresh that dropped them would silently delete configuration every time it ran.
+        """
+        return [choice for choice in kept if choice.get("brain", "cloud") != "cloud"]
 
     refreshed: list[dict] = []
     complained = False
@@ -407,6 +428,13 @@ def main() -> int:
     if not refreshed:
         fail("nothing to write — neither half could be read and the file names none")
         return 1
+
+    # Carried through untouched, after the cloud models, because the menu is written in the order
+    # the window offers it and the CLI's own models are what a person reaches for most.
+    hosted = hand_written()
+    if hosted:
+        print(f"kept {len(hosted)} hand-written row(s) this script does not refresh")
+    refreshed += hosted
 
     block = render(refreshed)
     if args.dry_run:

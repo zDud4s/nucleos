@@ -361,7 +361,13 @@ impl Assistants for ConfiguredAssistants {
                     .ok_or(Refusal::HostedModelNamedButNoKey)?;
                 let chat = crate::openrouter::OpenRouterChat::with_client(
                     self.hosted_client.clone(),
-                    crate::openrouter::OPENROUTER_BASE_URL.to_string(),
+                    // The FIELD, not `openrouter::OPENROUTER_BASE_URL` directly. Behaviour-neutral
+                    // in production — the field is initialised to that same constant and only
+                    // `with_hosted_base_url`, which is `#[cfg(test)]`, ever changes it — but it is
+                    // what lets a test point this route at a stub and read which model actually
+                    // went on the wire. Without it the seam covers discovery
+                    // (`can_serve`/`declared_for`) and stops short of the one path that bills.
+                    self.hosted_base_url.clone(),
                     resolved,
                     key,
                 );
@@ -1153,6 +1159,93 @@ mod tests {
             hosted_hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a hosted pick must reach the hosted catalogue exactly once"
+        );
+    }
+
+    // --- F. which model actually goes on the wire ------------------------------------------------
+
+    /// A loopback `/chat/completions` that KEEPS the request bodies it was sent, answering the one
+    /// shape `openrouter::assistant_message` reads. The hosted sibling of `stub_show_counting`
+    /// above: that one counts calls because the fact under test is how many, this one records them
+    /// because the fact under test is what was asked.
+    async fn stub_completions_recording() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded
+                        .lock()
+                        .expect("the stub's recorder is never held across an await")
+                        .push(body);
+                    axum::Json(serde_json::json!({
+                        "choices": [{ "message": { "content": "ok" } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// The safety proof for the menu carrying hosted rows the config file wrote itself.
+    ///
+    /// `config.rs` used to GENERATE the single hosted entry, and its comment gave the reason: a
+    /// hand-written entry could "name a model the daemon never built a client for, and then a
+    /// person picks one model and a different one answers, silently". This is that failure, asked
+    /// at the seam where it would happen — `resolve_model` returns `pinned.unwrap_or(configured)`
+    /// and `assistant_for` builds the `OpenRouterChat` out of that, so the model on the wire is the
+    /// one that was picked and not the configured default.
+    ///
+    /// End-to-end through `verdict` — one exchange, no tools — rather than an assertion about
+    /// `resolve_model` alone, which `um_modelo_fixado_na_conversa_ganha_ao_configurado` already
+    /// covers: the fact worth pinning here is what reaches the endpoint, and only a request can
+    /// say that.
+    ///
+    /// A REGRESSION GUARD, not a specification of new behaviour: this already held before
+    /// `catalogue_with_installed` learned to keep the file's hosted rows, and it is what makes
+    /// keeping them safe. It was never observed failing on purpose — doing so would have sent a
+    /// request to OpenRouter's real endpoint, which no test here may do.
+    #[tokio::test]
+    async fn a_pinned_hosted_model_beats_the_configured_one_on_the_hosted_route() {
+        let (hosted_base_url, seen) = stub_completions_recording().await;
+        let factory = ConfiguredAssistants::new(
+            None,
+            Some("anthropic/claude-sonnet-4.5".to_string()),
+            Some("key".to_string()),
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            test_pool().await,
+            crate::runner::OLLAMA_BASE_URL.to_string(),
+        )
+        .with_hosted_base_url(hosted_base_url);
+
+        let assistant = factory
+            .assistant_for(Brain::OpenRouter, Some("openai/gpt-5.6"))
+            .expect("a hosted route with a model and a key configured serves");
+        assistant
+            .verdict("hello")
+            .await
+            .expect("the stub answers the shape the reader consumes");
+
+        let bodies = seen
+            .lock()
+            .expect("the stub's recorder is never held across an await");
+        assert_eq!(bodies.len(), 1, "expected exactly one exchange: {bodies:?}");
+        assert_eq!(
+            bodies[0].pointer("/model").and_then(|value| value.as_str()),
+            Some("openai/gpt-5.6"),
+            "the PINNED model must be the one on the wire; the configured default answering here \
+             is the silent swap that kept hosted rows out of the config file"
         );
     }
 }

@@ -269,32 +269,57 @@ impl ModelsConfig {
                 });
             }
         }
-        if let Some(hosted) = &self.hosted_assistant_model {
-            choices.push(AssistantChoice {
-                // GENERATED from the configured model, not written separately -- the same reason
-                // the local entries above are built here rather than configured: this is the one
-                // place either string is written, so the id the picker sends and the model
-                // `main.rs` built the `OpenRouterChat` with cannot come apart. A hand-written entry
-                // could name a model the daemon never built a client for, and then a person picks
-                // one model and a different one answers, silently.
-                id: hosted.clone(),
-                label: hosted.clone(),
-                brain: "openrouter".to_string(),
-                // OpenRouter is not one model behind one dial: some of the models it fronts take a
-                // reasoning effort and some do not, and a name alone does not tell this daemon
-                // which. Unlike the local entries' "Ollama has none", this is "unknown from here" --
-                // and an empty list is the only honest answer to that, so the window offers no dial
-                // for this route rather than guessing one that might not exist for the model named.
-                efforts: Vec::new(),
-                // Not filtered by `active_runner()` and never spawned as either CLI:
-                // `OpenRouterChat` is reached over HTTP, so which agent CLI is installed has
-                // nothing to do with whether this entry belongs on the menu.
-                runner: None,
-                // Unmarked here for the same reason the local entry above is: this function never
-                // touches the network, so whether OpenRouter's catalogue declares tools for this
-                // model is `marked_with`'s job, not a guess made at build time.
-                tools: None,
-            });
+        match &self.hosted_assistant_model {
+            // `hosted_assistant_model` is the SWITCH for this route, not merely its default:
+            // `assistants::resolve_model` refuses `RouteNotConfigured` whatever a pin says when the
+            // route's own config key is absent, so a file listing hosted models with no key
+            // configured must show none of them. Offering one would be a refusal earned by nothing
+            // the person did -- the same argument the local block above makes for installed models
+            // staying off the menu until `local_assistant_model` names one.
+            None => choices.retain(|choice| choice.brain != "openrouter"),
+            // The file's own `brain: openrouter` rows are already in `choices` (they arrived with
+            // `assistant_choices` and the `retain` above only filters `cloud`), so this adds the
+            // CONFIGURED model and nothing else -- and only when the file did not already list it.
+            // One id, one row, exactly as the local block deduplicates its own.
+            Some(hosted)
+                if choices
+                    .iter()
+                    .any(|choice| choice.brain == "openrouter" && &choice.id == hosted) => {}
+            Some(hosted) => {
+                choices.push(AssistantChoice {
+                    // GENERATED from the configured model rather than left to the file, because this is
+                    // what answers a chat that pins nothing: it must be pickable whether or not the
+                    // file also lists it, the same reason the configured LOCAL model always appears
+                    // whether or not `installed` names it.
+                    //
+                    // This used to be the ONLY hosted entry, and the reason given was that a
+                    // hand-written one "could name a model the daemon never built a client for, and
+                    // then a person picks one model and a different one answers, silently". That was
+                    // wrong about this code: `assistants::resolve_model` returns
+                    // `pinned.unwrap_or(configured)` and `assistant_for` builds the `OpenRouterChat`
+                    // out of that resolved name, so the client is built PER TURN from the pick. The
+                    // model on the wire is the one that was picked --
+                    // `assistants.rs`'s `a_pinned_hosted_model_beats_the_configured_one_on_the_hosted_route`
+                    // is the proof, at the seam where the silent swap would have happened.
+                    id: hosted.clone(),
+                    label: hosted.clone(),
+                    brain: "openrouter".to_string(),
+                    // OpenRouter is not one model behind one dial: some of the models it fronts take a
+                    // reasoning effort and some do not, and a name alone does not tell this daemon
+                    // which. Unlike the local entries' "Ollama has none", this is "unknown from here" --
+                    // and an empty list is the only honest answer to that, so the window offers no dial
+                    // for this route rather than guessing one that might not exist for the model named.
+                    efforts: Vec::new(),
+                    // Not filtered by `active_runner()` and never spawned as either CLI:
+                    // `OpenRouterChat` is reached over HTTP, so which agent CLI is installed has
+                    // nothing to do with whether this entry belongs on the menu.
+                    runner: None,
+                    // Unmarked here for the same reason the local entry above is: this function never
+                    // touches the network, so whether OpenRouter's catalogue declares tools for this
+                    // model is `marked_with`'s job, not a guess made at build time.
+                    tools: None,
+                });
+            }
         }
         choices
     }
@@ -2005,6 +2030,97 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             );
             assert_eq!(hosted[0].id, "anthropic/claude-sonnet-4.5");
         }
+    }
+
+    /// The file may name hosted models of its own, and they join the menu BESIDE the one
+    /// `hosted_assistant_model` generates. Three facts, because they are one rule:
+    ///
+    /// 1. A `brain: openrouter` row written into `assistant_choices` reaches the menu. The comment
+    ///    that used to forbid this feared an entry naming "a model the daemon never built a client
+    ///    for" -- but `assistants::resolve_model` returns `pinned.unwrap_or(configured)` and
+    ///    `assistant_for` builds the `OpenRouterChat` from that resolved name, so the client is
+    ///    built PER TURN out of the pick. The fear does not describe this code;
+    ///    `assistants.rs`'s `a_pinned_hosted_model_beats_the_configured_one_on_the_hosted_route`
+    ///    is the proof at the seam where it would have happened.
+    /// 2. The generated entry survives, and exactly once: `hosted_assistant_model` is what answers
+    ///    a chat that pins nothing, so it must be pickable whether or not the file also lists it --
+    ///    the same argument the local block above already makes for the configured local model
+    ///    appearing whether or not `installed` names it.
+    /// 3. `hosted_assistant_model` stays the SWITCH. With none configured, `Assistants::serves`
+    ///    refuses `RouteNotConfigured`, so the file's hosted rows must not reach the menu either:
+    ///    offering them would be a refusal earned by nothing the person did, which is what
+    ///    `the_catalogue_offers_no_hosted_model_when_none_is_configured` already pins for the
+    ///    generated entry.
+    ///
+    /// Runner-independent for the reason the test above gives, asserted again here because these
+    /// rows now arrive through the same list the `retain` filters.
+    #[test]
+    fn hosted_rows_from_the_file_join_the_menu_beside_the_generated_one() {
+        let hosted_row = |id: &str| AssistantChoice {
+            id: id.to_string(),
+            label: id.to_string(),
+            brain: "openrouter".to_string(),
+            efforts: Vec::new(),
+            runner: None,
+            tools: None,
+        };
+        let hosted_ids = |config: &ModelsConfig| -> Vec<String> {
+            config
+                .catalogue()
+                .into_iter()
+                .filter(|choice| choice.brain == "openrouter")
+                .map(|choice| choice.id)
+                .collect()
+        };
+
+        // The file names one hosted model, the config key names another: both are pickable.
+        for runner in [None, Some("codex".to_string())] {
+            let beside = ModelsConfig {
+                hosted_assistant_model: Some("anthropic/claude-sonnet-4.5".to_string()),
+                assistant_choices: vec![hosted_row("openai/gpt-5.6")],
+                primary_runner: runner.clone(),
+                ..ModelsConfig::default()
+            };
+            assert_eq!(
+                hosted_ids(&beside),
+                vec![
+                    "openai/gpt-5.6".to_string(),
+                    "anthropic/claude-sonnet-4.5".to_string(),
+                ],
+                "primary_runner={runner:?}: a hosted row from the file and the generated default \
+                 must both be on the menu, whichever agent CLI is running"
+            );
+        }
+
+        // The file names the configured model too: one id, one row.
+        let repeated = ModelsConfig {
+            hosted_assistant_model: Some("anthropic/claude-sonnet-4.5".to_string()),
+            assistant_choices: vec![
+                hosted_row("openai/gpt-5.6"),
+                hosted_row("anthropic/claude-sonnet-4.5"),
+            ],
+            ..ModelsConfig::default()
+        };
+        assert_eq!(
+            hosted_ids(&repeated),
+            vec![
+                "openai/gpt-5.6".to_string(),
+                "anthropic/claude-sonnet-4.5".to_string(),
+            ],
+            "the configured model listed in the file must not also be generated as a second row"
+        );
+
+        // No hosted model configured: the route is off, so its rows are not offered.
+        let switched_off = ModelsConfig {
+            hosted_assistant_model: None,
+            assistant_choices: vec![hosted_row("openai/gpt-5.6")],
+            ..ModelsConfig::default()
+        };
+        assert!(
+            hosted_ids(&switched_off).is_empty(),
+            "hosted_assistant_model is the switch: with none configured the route refuses \
+             RouteNotConfigured, so its rows must not be on the menu either"
+        );
     }
 
     /// The format `scripts/refresh-models.py` writes, parsed by the code that has to read it.

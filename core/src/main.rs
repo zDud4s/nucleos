@@ -491,6 +491,43 @@ async fn main() {
         return;
     }
 
+    // The other half of the hosted route. `hosted_assistant_model` names the model in
+    // `.ai/nucleos-models.yaml` and this stores the key, and until both exist the route refuses
+    // (`assistants::Refusal::HostedModelNamedButNoKey`) rather than answering. There was no way at
+    // all to store this before: the resolver at the bottom of `main` has read `OPENROUTER_KEY`
+    // since the hosted route shipped, and nothing on this machine ever wrote it — so the whole
+    // route was unreachable by anyone who had not planted a credential by hand.
+    //
+    // Through stdin like the three above, for the reason `read_secret_from_stdin`'s own doc gives:
+    // an argument would put the key in the shell's plaintext history at the exact moment the
+    // operator was securely storing it.
+    if std::env::args().any(|a| a == "--set-openrouter-key") {
+        match read_secret_from_stdin("paste the OpenRouter API key, then press Enter:") {
+            Some(value) => match secrets::store_secret(OPENROUTER_KEY, &value) {
+                Ok(()) => {
+                    println!("openrouter key stored in Credential Manager");
+                    // Said here because this is the last moment the person is listening, and the
+                    // alternative is a chat that refuses with no visible reason: the key alone
+                    // gets a conversation nowhere, and the daemon reads both ONCE, at startup.
+                    eprintln!(
+                        "name a model in `hosted_assistant_model` (.ai/nucleos-models.yaml) too, \
+                         then restart the daemon — both are read at startup and neither half \
+                         answers a chat on its own"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("failed to store openrouter key: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("no openrouter key was read from stdin");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if std::env::args().any(|a| a == "--mcp-tools") {
         // `--box errand --errand <id>` narrows what this process serves. Refused rather than
         // ignored when the box is not one this server knows: a launcher that misspells it would
