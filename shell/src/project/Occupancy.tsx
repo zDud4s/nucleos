@@ -159,7 +159,7 @@ function Slot({
 
   return (
     <Link
-      to={`/projects/${projectId}/codigo`}
+      to={`/projects/${projectId}/code`}
       search={{ run: taken.owner_id }}
       className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2 hover:border-border-strong"
       aria-label={`Review run ${taken.owner_id}`}

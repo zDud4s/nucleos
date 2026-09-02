@@ -119,7 +119,7 @@ function Row({ project }: { project: ProjectSummary }) {
         <Link
           className="underline underline-offset-2"
           to="/projects/$projectId/$view"
-          params={{ projectId: project.project_id, view: "estado" }}
+          params={{ projectId: project.project_id, view: "state" }}
         >
           {project.project_id}
         </Link>
@@ -144,7 +144,7 @@ function Row({ project }: { project: ProjectSummary }) {
           <Link
             className="underline underline-offset-2"
             to="/projects/$projectId/$view"
-            params={{ projectId: project.project_id, view: "estado" }}
+            params={{ projectId: project.project_id, view: "state" }}
           >
             {project.open_proposals}
           </Link>
