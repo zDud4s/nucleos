@@ -489,6 +489,337 @@ pub async fn installed_local_models(client: &reqwest::Client, base_url: &str) ->
     }
 }
 
+/// How far a download has got, as one frame of `/api/pull` says it.
+///
+/// `status` is Ollama's own word for what it is doing — `pulling manifest`, `pulling <digest>`,
+/// `verifying sha256 digest`, `success` — carried through rather than translated, because this
+/// crate does not know the vocabulary and inventing one would mean a frame it had never seen
+/// arriving as silence.
+///
+/// Both counts are `0` on the frames that carry none, which is most of them: only the frames that
+/// are actually moving bytes have `completed` and `total`. Zero and not `Option` because the one
+/// reader is a percentage, `total == 0` is already the "cannot say yet" case a percentage has to
+/// handle, and an `Option` would make it two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullProgress {
+    pub status: String,
+    pub completed: u64,
+    pub total: u64,
+}
+
+/// One readable frame of `/api/pull`'s stream: how far it has got, or why it cannot go on.
+///
+/// A failure is a frame and not an HTTP error, which is the whole reason this enum exists. Ollama
+/// answers `200` and then says `{"error": "..."}` in the body — a model name it does not have, a
+/// disk it cannot write — so a reader that checked only the status code would call a download that
+/// never happened a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullLine {
+    Progress(PullProgress),
+    Failed(String),
+}
+
+/// PURE: one frame of `/api/pull`'s NDJSON -> what it says about the download.
+///
+/// `None` for every line that says nothing about it — a blank line between frames, a body this
+/// crate cannot parse, an object with neither `error` nor `status`. Skipped and never fatal, the
+/// same fail-closed posture `interpret_tags` above takes: one unreadable frame in a stream of
+/// thousands must not abandon a download that is otherwise working.
+///
+/// Documented shape: `{"status": "...", "digest": "...", "total": n, "completed": n}`, with
+/// `digest` and everything else ignored, and `total`/`completed` absent on the frames that move no
+/// bytes. **UNVERIFIED against a real Ollama** for the same reason `interpret_tags` says so of
+/// `/api/tags`; `a_real_ollama_streams_a_pull_it_already_has` is the `#[ignore]`d check.
+pub fn interpret_pull(line: &str) -> Option<PullLine> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+        return Some(PullLine::Failed(error.to_owned()));
+    }
+    let status = value.get("status").and_then(serde_json::Value::as_str)?;
+    Some(PullLine::Progress(PullProgress {
+        status: status.to_owned(),
+        completed: value
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        total: value
+            .get("total")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    }))
+}
+
+/// PURE: the complete lines in a read buffer, leaving any trailing partial one behind.
+///
+/// The reason `pull_local_model` below is not a loop over chunks. A multi-gigabyte download is cut
+/// into reads wherever the kernel felt like cutting it, mid-object as often as not, and a parser
+/// that decoded each read on its own would drop every frame unlucky enough to straddle two — which
+/// on a real download is most of them. Everything before the last newline is whole and comes out;
+/// everything after it waits for the read that finishes it.
+///
+/// Lines are trimmed, so a `\r\n` stream and a blank line between frames both arrive as something
+/// `interpret_pull` already answers `None` to.
+fn take_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=newline).collect();
+        lines.push(String::from_utf8_lossy(&line).trim().to_owned());
+    }
+    lines
+}
+
+/// Fetch a model this machine does not have, over `POST {base_url}/api/pull`, reporting progress
+/// as it goes.
+///
+/// The one read in this module that does NOT fail closed, and the difference is who asked.
+/// `installed_local_models` above answers an empty list on any trouble because nobody asked it
+/// anything — it runs to decorate a menu, and a menu that quietly shows fewer models is better than
+/// one that shows an error nobody can act on. A pull is something a person asked for and is
+/// watching, so every failure is reported: silence would leave a progress bar at zero forever with
+/// nothing to say why.
+///
+/// `progress` is called once per readable frame, in order, from the caller's own task — never
+/// buffered and never coalesced, because the caller is what decides where progress goes and how
+/// often it is worth storing. It must not block: it runs between reads of a live stream.
+///
+/// **A stream that simply stops is a failure.** No `success` frame means the download did not
+/// finish — a killed Ollama, a full disk, a dropped connection — and every byte that did arrive was
+/// valid, so nothing in the loop would otherwise notice. Reporting `Ok` there would leave the
+/// window saying a model is downloaded that is not.
+///
+/// The client is the CALLER's, deliberately, and must not be the short-timeout one
+/// `installed_local_models` is given: a pull runs for minutes, and a 2-second timeout would abort
+/// every download that was working. See `http::ollama_pull_client`.
+/// Ollama's public registry, which serves a model's manifest without a key or an account.
+///
+/// Separate from `runner::OLLAMA_BASE_URL`: that is the daemon on this machine, this is the shared
+/// place it pulls FROM. Asking it what a model weighs is the only way to know before downloading —
+/// the local `/api/tags` lists sizes for models already here, which is the question already
+/// answered.
+pub const OLLAMA_REGISTRY_URL: &str = "https://registry.ollama.ai";
+
+/// PURE: a model name as the registry's own path for its manifest, or `None` when it is not a name.
+///
+/// This is an ALLOWLIST, not a cleaner, and that matters because the name arrives from a request
+/// (`http.rs`) and is interpolated into a path on a host this crate chose. A name carrying `..` or
+/// a `?` would aim the read elsewhere on that host, so the first byte of every segment must be
+/// alphanumeric and the rest a closed set. There is no repairing branch: a name this does not
+/// recognise is not a model, and guessing what somebody meant is how an allowlist becomes a
+/// suggestion.
+///
+/// Ollama's two defaults are applied here rather than at each call site so a bare `qwen3` is spelled
+/// the same way everywhere: no tag means `latest`, and no namespace means `library`.
+pub fn registry_path(model: &str) -> Option<String> {
+    let (repository, tag) = match model.split_once(':') {
+        Some((repository, tag)) => (repository, tag),
+        None => (model, "latest"),
+    };
+    let (namespace, name) = match repository.split_once('/') {
+        Some((namespace, name)) => (namespace, name),
+        None => ("library", repository),
+    };
+    for segment in [namespace, name, tag] {
+        // The leading-byte rule is what rejects `.` and `..` without naming them: a segment that
+        // must START alphanumeric cannot be either, nor a dotfile, and real names never are.
+        if !segment.bytes().next()?.is_ascii_alphanumeric() {
+            return None;
+        }
+        if !segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return None;
+        }
+    }
+    Some(format!("{namespace}/{name}/manifests/{tag}"))
+}
+
+/// PURE: how many bytes a manifest says a model is, or `None` when it does not say.
+///
+/// Every layer counts, because every layer is downloaded — the weights are nearly all of it, but
+/// the template, system prompt and licence are fetched too and a size that excluded them would be
+/// quietly under.
+///
+/// `None` and never `Some(0)`: zero is a real answer meaning "weighs nothing", and `model_fit`
+/// would grade it as the most permissive verdict there is. A failure to read must not arrive at a
+/// caller as the best possible news — the same fail-closed posture `interpret_tags` takes on a body
+/// it cannot parse.
+pub fn interpret_manifest(body: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let layers = value.get("layers")?.as_array()?;
+    let mut total: u64 = 0;
+    for layer in layers {
+        total = total.saturating_add(layer.get("size")?.as_u64()?);
+    }
+    (total > 0).then_some(total)
+}
+
+/// What the registry says a model weighs, before a byte of it is downloaded.
+///
+/// Unlike its neighbours in this module this returns an `Err` rather than failing closed to a quiet
+/// nothing: the two readers that fail closed run to decorate a menu nobody asked about, while this
+/// one answers a question somebody asked out loud — "how big is it?" — and silence there leaves a
+/// download confirmation with nothing to say.
+pub async fn registry_model_size(
+    client: &reqwest::Client,
+    registry_url: &str,
+    model: &str,
+) -> Result<u64, String> {
+    // Before the request, so a refused name costs no connection and cannot be told apart from a
+    // real one by how long it took.
+    let path = registry_path(model)
+        .ok_or_else(|| format!("`{model}` is not a model name the registry could hold"))?;
+    let response = client
+        .get(format!("{registry_url}/v2/{path}"))
+        .send()
+        .await
+        .map_err(|error| format!("the model registry did not answer: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "the registry does not serve `{model}` ({})",
+            response.status()
+        ));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("the registry's answer could not be read: {error}"))?;
+    interpret_manifest(&body)
+        .ok_or_else(|| format!("the registry's manifest for `{model}` did not say a size"))
+}
+
+/// Whether this machine can carry a model, and how comfortably.
+///
+/// Three verdicts and an "unknown", because the middle one is the honest answer for most of the
+/// interesting range and collapsing it either way is a lie: folded into `Comfortable` it recommends
+/// a download that will make the machine crawl, folded into `TooBig` it refuses one that works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Runs with room for the machine to keep doing other things.
+    Comfortable,
+    /// Runs, and takes most of the memory while it does.
+    Tight,
+    /// Does not fit, and downloading it would spend the bandwidth to prove it.
+    TooBig,
+    /// Not enough was read to say — an unmeasurable machine or an unreadable manifest.
+    Unknown,
+}
+
+/// PURE: a model's size against this machine's memory.
+///
+/// The headroom is a fifth of the weights plus a gigabyte. A model needs its weights resident AND a
+/// KV cache that grows with the context it is given, and the machine has to keep running underneath
+/// it; without that margin a 15 GB model on a 16 GB machine grades as "fits" and what actually
+/// happens is the system swaps until somebody force-quits it. `Comfortable` is then the 70% line,
+/// which is where a laptop stops being usable for anything else.
+///
+/// RAM and not VRAM, deliberately. Ollama falls back to the CPU when a model does not fit on the
+/// card, so VRAM answers "will it be fast" while RAM answers "will it run at all" — and this
+/// function is on the path of a menu deciding what to offer, which is the second question.
+///
+/// A zero on either side is `Unknown` rather than a verdict: both mean something could not be read,
+/// and turning that into `TooBig` would refuse every download on a machine this crate merely failed
+/// to measure.
+pub fn model_fit(model_bytes: u64, memory_bytes: u64) -> Fit {
+    if model_bytes == 0 || memory_bytes == 0 {
+        return Fit::Unknown;
+    }
+    let needed = model_bytes
+        .saturating_add(model_bytes / 5)
+        .saturating_add(1_000_000_000);
+    if needed > memory_bytes {
+        return Fit::TooBig;
+    }
+    // `memory / 10 * 7` and not `memory * 7 / 10`: the multiply is what would overflow, and on
+    // these magnitudes the lost remainder is under ten bytes.
+    if needed <= memory_bytes / 10 * 7 {
+        Fit::Comfortable
+    } else {
+        Fit::Tight
+    }
+}
+
+/// How much physical memory this machine has, or `None` when it cannot be asked.
+///
+/// One call, no new crate: `windows-sys` is already a dependency for `process_tree.rs`'s job
+/// objects, and this adds a feature to it rather than a tree. `TotalPhys` is the installed RAM
+/// rather than what is free right now, which is the right number for a menu: what is free changes
+/// every second and would make a model appear and disappear from the picker while somebody read it.
+///
+/// `None` off Windows — this app ships for Windows and a stub that guessed would be worse than a
+/// caller that knows it does not know.
+#[cfg(windows)]
+pub fn total_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is a live, zeroed `MEMORYSTATUSEX` with its own `dwLength` set, which is the
+    // entire contract this call has. It writes only into that struct and takes no ownership.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return None;
+    }
+    (status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+#[cfg(not(windows))]
+pub fn total_memory_bytes() -> Option<u64> {
+    None
+}
+
+pub async fn pull_local_model(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<(), String> {
+    let mut response = client
+        .post(format!("{base_url}/api/pull"))
+        .json(&serde_json::json!({ "model": model, "stream": true }))
+        .send()
+        .await
+        .map_err(|error| format!("Ollama did not answer the download request: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Ollama refused the download with HTTP {}",
+            response.status()
+        ));
+    }
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut succeeded = false;
+    loop {
+        match response
+            .chunk()
+            .await
+            .map_err(|error| format!("the download stream broke: {error}"))?
+        {
+            Some(bytes) => buffer.extend_from_slice(&bytes),
+            // The stream ended. A last frame with no trailing newline is still a frame, so it is
+            // closed here rather than dropped; the buffer is then empty, and the next read ends the
+            // loop for good.
+            None if buffer.is_empty() => break,
+            None => buffer.push(b'\n'),
+        }
+        for line in take_lines(&mut buffer) {
+            match interpret_pull(&line) {
+                Some(PullLine::Failed(reason)) => return Err(reason),
+                Some(PullLine::Progress(frame)) => {
+                    succeeded |= frame.status == "success";
+                    progress(frame);
+                }
+                None => {}
+            }
+        }
+    }
+
+    if succeeded {
+        Ok(())
+    } else {
+        Err("the download stopped before Ollama said it had finished".to_owned())
+    }
+}
+
 /// What an agent CLI declares, without touching the network.
 ///
 /// The CLI-wrap invariant (`AGENTS.md`: wrap the existing agent CLI, never reimplement its loop)
@@ -1481,6 +1812,509 @@ mod tests {
             refusal.contains("structured output"),
             "the missing structured-output capability must be named, not dropped after the first \
              gap: {refusal}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // J. `/api/pull` — fetching a model this machine does not have yet
+    // ---------------------------------------------------------------------------------------
+
+    /// A loopback Ollama `/api/pull` answering a fixed NDJSON body.
+    ///
+    /// Same idiom `stub_ollama_tags` above uses. It does NOT control how the body is cut into
+    /// reads — nothing at this level can, because that is the kernel's decision and not the
+    /// fixture's — so the property that a frame survives being split is pinned where it can be
+    /// pinned exactly: `a_frame_split_across_two_reads_is_taken_only_once_it_is_whole`, on
+    /// `take_lines` itself, with no listener at all.
+    ///
+    /// **The shape is UNVERIFIED against a real Ollama**, exactly as `stub_ollama_tags` says of
+    /// `/api/tags`, and for the same reason — see `a_real_ollama_streams_a_pull_it_already_has` at
+    /// the end of this section, `#[ignore]`d like its two siblings.
+    async fn stub_ollama_pull(body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/api/pull",
+            axum::routing::post(move || async move { body }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    /// PURE: the buffering itself, which is the only part of this read that a network fixture
+    /// cannot pin.
+    ///
+    /// `/api/pull` is the first STREAMING read in this module, and a multi-gigabyte download is cut
+    /// into reads wherever the kernel felt like cutting it — mid-object as often as not. A parser
+    /// that decoded each read on its own would drop every frame unlucky enough to straddle two,
+    /// which on a real download is most of them.
+    ///
+    /// The trailing partial line staying in the buffer is the whole mechanism, so it is asserted
+    /// rather than implied: after the first read the buffer must still hold the half-frame, and
+    /// after the second that frame must come out whole and once.
+    #[test]
+    fn a_frame_split_across_two_reads_is_taken_only_once_it_is_whole() {
+        let mut buffer: Vec<u8> = Vec::new();
+
+        buffer.extend_from_slice(b"{\"status\":\"pulling manifest\"}\n{\"status\":\"pulling 89");
+        assert_eq!(
+            take_lines(&mut buffer),
+            vec!["{\"status\":\"pulling manifest\"}".to_string()],
+            "only the whole frame comes out of the first read"
+        );
+        assert!(
+            !buffer.is_empty(),
+            "the half-frame must stay in the buffer rather than be parsed or dropped"
+        );
+
+        buffer.extend_from_slice(b"34\",\"completed\":50}\n");
+        assert_eq!(
+            take_lines(&mut buffer),
+            vec!["{\"status\":\"pulling 8934\",\"completed\":50}".to_string()],
+            "the frame comes out whole once its second half arrives, and only once"
+        );
+        assert!(
+            buffer.is_empty(),
+            "a buffer whose last byte was a newline holds nothing back"
+        );
+    }
+
+    /// PURE, no listener: one documented progress frame -> the three things a progress bar needs.
+    #[test]
+    fn a_pull_line_says_what_is_happening_and_how_far_it_has_got() {
+        let line = r#"{"status":"pulling 8934d96d3f08","digest":"sha256:8934","total":2142590208,"completed":241970}"#;
+
+        match interpret_pull(line) {
+            Some(PullLine::Progress(progress)) => {
+                assert_eq!(progress.status, "pulling 8934d96d3f08");
+                assert_eq!(progress.completed, 241_970);
+                assert_eq!(progress.total, 2_142_590_208);
+            }
+            other => panic!("a documented progress frame must read as progress: {other:?}"),
+        }
+    }
+
+    /// PURE: the two frames that carry no byte counts at all, which is most of the stream.
+    ///
+    /// `pulling manifest` opens every pull and `success` closes it, and neither has `completed` or
+    /// `total`. Reading an absent count as anything but zero would make the opening frame of every
+    /// download a wild percentage.
+    #[test]
+    fn a_pull_line_with_no_counts_is_progress_at_zero_and_not_a_failure() {
+        for (line, status) in [
+            (r#"{"status":"pulling manifest"}"#, "pulling manifest"),
+            (r#"{"status":"success"}"#, "success"),
+        ] {
+            match interpret_pull(line) {
+                Some(PullLine::Progress(progress)) => {
+                    assert_eq!(progress.status, status);
+                    assert_eq!(progress.completed, 0, "{line}");
+                    assert_eq!(progress.total, 0, "{line}");
+                }
+                other => panic!("{line} must read as progress with no counts: {other:?}"),
+            }
+        }
+    }
+
+    /// PURE: the shape Ollama uses to say the pull cannot happen — a name it does not have, a disk
+    /// it cannot write.
+    ///
+    /// It is a 200 carrying an `error` key, not an HTTP failure, so a reader that checked only the
+    /// status would call a download that never happened a success.
+    #[test]
+    fn a_pull_line_carrying_an_error_is_a_failure_and_not_progress() {
+        let line = r#"{"error":"pull model manifest: file does not exist"}"#;
+
+        match interpret_pull(line) {
+            Some(PullLine::Failed(reason)) => assert!(
+                reason.contains("file does not exist"),
+                "the reason Ollama gave must survive verbatim: {reason}"
+            ),
+            other => panic!("an error frame must read as a failure: {other:?}"),
+        }
+    }
+
+    /// PURE: every shape that is not a frame of this stream at all.
+    ///
+    /// Skipped rather than guessed and never fatal — the same fail-closed posture `interpret_tags`
+    /// takes. A blank line between frames is ordinary, and one unreadable frame in a stream of
+    /// thousands must not abandon a download that is otherwise working.
+    #[test]
+    fn an_unreadable_pull_line_is_skipped_rather_than_guessed() {
+        for line in ["", "   ", "not json at all", "[]", r#"{"other_key": 1}"#] {
+            assert!(
+                interpret_pull(line).is_none(),
+                "a line of this shape says nothing about the download: {line:?}"
+            );
+        }
+    }
+
+    /// The whole read, over a listener: every frame reported once, in order, and then success.
+    ///
+    /// The final frame carries no counts, which is what Ollama really sends — so this also pins
+    /// that the last thing a watcher hears is `success` and not the last percentage before it.
+    #[tokio::test]
+    async fn a_pull_reports_every_frame_and_then_succeeds() {
+        let base_url = stub_ollama_pull(concat!(
+            "{\"status\":\"pulling manifest\"}\n",
+            "{\"status\":\"pulling 8934\",\"completed\":50,\"total\":100}\n",
+            "{\"status\":\"success\"}\n",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let mut seen: Vec<(String, u64, u64)> = Vec::new();
+
+        let outcome = pull_local_model(&client, &base_url, "qwen3.5:4b", |progress| {
+            seen.push((progress.status, progress.completed, progress.total));
+        })
+        .await;
+
+        assert_eq!(outcome, Ok(()), "a stream ending in success must succeed");
+        assert_eq!(
+            seen,
+            vec![
+                ("pulling manifest".to_string(), 0, 0),
+                ("pulling 8934".to_string(), 50, 100),
+                ("success".to_string(), 0, 0),
+            ],
+            "every frame, once, in the order Ollama sent them"
+        );
+    }
+
+    /// A stream that ends in an `error` frame fails, and fails with what Ollama said.
+    ///
+    /// The reason is carried out verbatim rather than replaced with wording of this crate's own,
+    /// because the person reading it is being told why a download they asked for did not happen,
+    /// and Ollama is the only party here that knows.
+    #[tokio::test]
+    async fn a_pull_ollama_refuses_fails_with_the_reason_ollama_gave() {
+        let base_url = stub_ollama_pull(concat!(
+            "{\"status\":\"pulling manifest\"}\n",
+            "{\"error\":\"pull model manifest: file does not exist\"}\n",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let outcome = pull_local_model(&client, &base_url, "nope:1b", |_| {}).await;
+
+        match outcome {
+            Err(reason) => assert!(
+                reason.contains("file does not exist"),
+                "the failure must name what Ollama said: {reason}"
+            ),
+            Ok(()) => panic!("a stream carrying an error frame must not report success"),
+        }
+    }
+
+    /// A stream that simply stops — no `success`, no `error` — is a failure and not a quiet
+    /// success.
+    ///
+    /// This is what a killed Ollama, a full disk or a dropped connection looks like from here, and
+    /// it is the one failure that would otherwise be invisible: every byte that did arrive was
+    /// valid, so nothing in the loop noticed. Reporting `Ok` would leave the window saying a model
+    /// is downloaded that is not, which is worse than any error message.
+    #[tokio::test]
+    async fn a_pull_whose_stream_stops_short_is_a_failure_and_not_a_quiet_success() {
+        let base_url = stub_ollama_pull(concat!(
+            "{\"status\":\"pulling manifest\"}\n",
+            "{\"status\":\"pulling 8934\",\"completed\":50,\"total\":100}\n",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let outcome = pull_local_model(&client, &base_url, "qwen3.5:4b", |_| {}).await;
+
+        assert!(
+            outcome.is_err(),
+            "a stream that never said success must not be reported as one: {outcome:?}"
+        );
+    }
+
+    /// The same connect-failure shape the `/api/tags` reads above are held to, and the one place
+    /// this function's posture DIFFERS from theirs: a pull that cannot dial reports an error.
+    ///
+    /// `installed_local_models` fails closed to an empty list because nobody asked it anything — it
+    /// runs to decorate a menu. A pull is something a person asked for and is watching, so silence
+    /// would leave a progress bar at zero forever with nothing to say why.
+    #[tokio::test]
+    async fn a_pull_that_cannot_reach_ollama_says_so_rather_than_failing_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+
+        let outcome = pull_local_model(&client, &base_url, "qwen3.5:4b", |_| {}).await;
+
+        assert!(
+            outcome.is_err(),
+            "an unreachable Ollama must be reported, not swallowed: {outcome:?}"
+        );
+    }
+
+    /// The one thing no fixture above can check: whether a real `/api/pull` really streams the
+    /// shape every test in this section assumes.
+    ///
+    /// Asks for a model this machine already has, deliberately — Ollama answers such a pull in
+    /// milliseconds with the same frames, so the check costs no bandwidth and downloads nothing.
+    /// `#[ignore]`, exactly like `um_ollama_real_lista_os_modelos_que_esta_maquina_tem` above and
+    /// for the same reason: Ollama is not running on every machine this suite runs on.
+    #[tokio::test]
+    #[ignore = "needs a running Ollama at runner::OLLAMA_BASE_URL with at least one model pulled"]
+    async fn a_real_ollama_streams_a_pull_it_already_has() {
+        let client = reqwest::Client::new();
+        let installed = installed_local_models(&client, crate::runner::OLLAMA_BASE_URL).await;
+        let model = installed
+            .first()
+            .expect("this test needs a machine with at least one model already pulled")
+            .clone();
+        let mut seen: Vec<String> = Vec::new();
+
+        let outcome = pull_local_model(
+            &client,
+            crate::runner::OLLAMA_BASE_URL,
+            &model,
+            |progress| {
+                seen.push(progress.status);
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "re-pulling a model already here must succeed"
+        );
+        assert!(
+            seen.iter().any(|status| status == "success"),
+            "a real pull must end in the `success` frame this module reads as completion: {seen:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // K. What a model weighs, and whether this machine can carry it
+    // ---------------------------------------------------------------------------------------
+
+    /// A loopback stand-in for the public registry, answering one manifest.
+    ///
+    /// Registered under the full `/v2/{path}` shape rather than a wildcard so a mistake in
+    /// `registry_path` shows up as a 404 here instead of passing silently — the path IS half of
+    /// what this section is testing.
+    async fn stub_registry(path: &'static str, body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            &format!("/v2/{path}"),
+            axum::routing::get(move || async move { body }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    /// The four name shapes Ollama takes, each to the one path the registry serves it at.
+    ///
+    /// `latest` and `library` are Ollama's own defaults, applied here rather than at the call site
+    /// so every caller spells a bare `qwen3` the same way.
+    #[test]
+    fn every_shape_of_model_name_lands_on_the_path_the_registry_serves_it_at() {
+        assert_eq!(
+            registry_path("qwen3:8b").as_deref(),
+            Some("library/qwen3/manifests/8b")
+        );
+        assert_eq!(
+            registry_path("qwen3").as_deref(),
+            Some("library/qwen3/manifests/latest"),
+            "a name with no tag is `latest`, which is what `ollama pull` means by it"
+        );
+        assert_eq!(
+            registry_path("hf.co/model:q4").as_deref(),
+            Some("hf.co/model/manifests/q4")
+        );
+        assert_eq!(
+            registry_path("someone/model").as_deref(),
+            Some("someone/model/manifests/latest")
+        );
+    }
+
+    /// The name reaches a URL path, so it is an allowlist and never an escape.
+    ///
+    /// This is the one field in this section that comes from outside — `http.rs` takes it from a
+    /// request — and it is interpolated into a path on a host this crate names. A name that could
+    /// carry `..` or its own query would let a caller aim the read somewhere else on that host, so
+    /// the first byte must be alphanumeric and the rest a closed set. Rejecting is the whole
+    /// answer: there is no sanitising branch that tries to rescue a name, because a name this does
+    /// not recognise is not a model anyway.
+    #[test]
+    fn a_name_that_could_steer_the_path_is_refused_rather_than_cleaned() {
+        for hostile in [
+            "../../etc/passwd",
+            "..",
+            ".hidden",
+            "qwen3:../../x",
+            "a/b/c",
+            "qwen3:8b?x=1",
+            "qwen3:8b#f",
+            "qwen 3",
+            "qwen3:",
+            ":8b",
+            "",
+            "qwen3:8b/../..",
+            "%2e%2e/x",
+        ] {
+            assert_eq!(
+                registry_path(hostile),
+                None,
+                "`{hostile}` must be refused, not repaired"
+            );
+        }
+    }
+
+    /// The manifest's own arithmetic: every layer counts, because every layer is downloaded.
+    #[test]
+    fn a_models_size_is_the_sum_of_every_layer_the_manifest_lists() {
+        let manifest = r#"{
+            "schemaVersion": 2,
+            "config": {"size": 487},
+            "layers": [
+                {"mediaType": "application/vnd.ollama.image.model", "size": 4683074048},
+                {"mediaType": "application/vnd.ollama.image.system", "size": 68},
+                {"mediaType": "application/vnd.ollama.image.template", "size": 1615},
+                {"mediaType": "application/vnd.ollama.image.license", "size": 11343}
+            ]
+        }"#;
+        assert_eq!(
+            interpret_manifest(manifest),
+            Some(4_683_087_074),
+            "the real qwen2.5-coder:7b manifest, measured against the live registry"
+        );
+    }
+
+    /// Unreadable is `None` and never `Some(0)`.
+    ///
+    /// Zero is a real answer meaning "weighs nothing", and a caller grading a download against
+    /// this machine's memory would read it as "fits comfortably" — the most permissive verdict
+    /// there is, produced by the failure to say anything at all.
+    #[test]
+    fn a_manifest_this_crate_cannot_read_yields_no_size_rather_than_a_zero() {
+        assert_eq!(interpret_manifest("not json"), None);
+        assert_eq!(interpret_manifest("{}"), None, "no layers key at all");
+        assert_eq!(interpret_manifest(r#"{"layers": []}"#), None, "no layers");
+        assert_eq!(
+            interpret_manifest(r#"{"layers": [{"mediaType": "x"}]}"#),
+            None,
+            "a layer with no size is a manifest this crate does not understand"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_registry_answers_what_a_model_weighs_before_a_byte_of_it_is_downloaded() {
+        let base = stub_registry(
+            "library/qwen3/manifests/8b",
+            r#"{"layers": [{"size": 5230000000}]}"#,
+        )
+        .await;
+        assert_eq!(
+            registry_model_size(&reqwest::Client::new(), &base, "qwen3:8b").await,
+            Ok(5_230_000_000)
+        );
+    }
+
+    /// A model the registry does not have comes back as a refusal a person can read.
+    #[tokio::test]
+    async fn a_name_the_registry_does_not_serve_is_an_error_and_not_a_guess() {
+        let base = stub_registry("library/qwen3/manifests/8b", "{}").await;
+        let outcome = registry_model_size(&reqwest::Client::new(), &base, "no-such-model:9b").await;
+        assert!(outcome.is_err(), "a 404 must not read as a size");
+        assert!(
+            outcome.unwrap_err().contains("no-such-model:9b"),
+            "the refusal has to name what was asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_the_path_builder_refuses_never_reaches_the_network() {
+        // The base URL is deliberately one nothing is listening on: if this reached the network at
+        // all the test would fail on the connection rather than on the name, which is the point.
+        let outcome =
+            registry_model_size(&reqwest::Client::new(), "http://127.0.0.1:1", "../x").await;
+        assert!(matches!(outcome, Err(reason) if reason.contains("not a model name")));
+    }
+
+    /// The grading, which is the whole feature: three verdicts, and the middle one earns its place.
+    ///
+    /// Measured on the machine this was written for — 15.8 GB of RAM — against sizes read from the
+    /// live registry, so these are not invented numbers: `qwen3:8b` is 5.23 GB and runs,
+    /// `gemma3:27b` is 17.4 GB and does not, and the gap between them is where `Tight` lives.
+    ///
+    /// The headroom is a fifth of the weights plus a gigabyte: a model needs its weights resident
+    /// PLUS a KV cache that grows with the context, and the machine needs to keep running. Without
+    /// it a 15 GB model on a 16 GB machine reads as "fits", and what actually happens is the
+    /// system swaps until somebody force-quits it.
+    #[test]
+    fn a_model_is_graded_against_what_this_machine_actually_has() {
+        const GB: u64 = 1_000_000_000;
+        let machine = 15_800 * GB / 1000;
+
+        assert_eq!(
+            model_fit(5_230_000_000, machine),
+            Fit::Comfortable,
+            "qwen3:8b, 5.23 GB, on 15.8 GB — this is the case the feature exists to say yes to"
+        );
+        assert_eq!(
+            model_fit(17_400_000_000, machine),
+            Fit::TooBig,
+            "gemma3:27b, 17.4 GB, is larger than the whole machine before any headroom"
+        );
+        assert_eq!(
+            model_fit(42_520_000_000, machine),
+            Fit::TooBig,
+            "llama3.3:70b, 42.5 GB"
+        );
+        assert_eq!(
+            model_fit(11 * GB, machine),
+            Fit::Tight,
+            "11 GB needs 14.2 GB of a 15.8 GB machine: it runs, and saying so plainly is not the \
+             same as recommending it"
+        );
+    }
+
+    /// Zero memory is "cannot say", not "nothing fits".
+    ///
+    /// `total_memory_bytes` returns `None` off Windows and on any failure of the one call it
+    /// makes, and a caller that turned that into `TooBig` would refuse every download on a machine
+    /// this crate merely could not measure.
+    #[test]
+    fn a_machine_whose_memory_could_not_be_read_grades_nothing() {
+        assert_eq!(model_fit(5_230_000_000, 0), Fit::Unknown);
+        assert_eq!(
+            model_fit(0, 16_000_000_000),
+            Fit::Unknown,
+            "a size of zero is the unreadable-manifest case and must not read as `fits`"
+        );
+    }
+
+    /// Overflow is a wrong verdict, not a panic, and the wrong verdict is the permissive one.
+    #[test]
+    fn an_absurd_size_saturates_rather_than_wrapping_into_a_yes() {
+        assert_eq!(model_fit(u64::MAX, 16_000_000_000), Fit::TooBig);
+    }
+
+    /// Against this machine, which is the only place the number is real.
+    ///
+    /// `#[ignore]`d not because it is slow but because it asserts a fact about the HOST: it passes
+    /// on any Windows machine with more than a gigabyte and is meaningless on a CI runner with a
+    /// different one. The three siblings in section F are ignored for the same class of reason.
+    #[test]
+    #[ignore = "asserts a fact about the machine it runs on, not about this crate"]
+    fn this_machine_reports_a_memory_size_that_is_not_absurd() {
+        let memory = total_memory_bytes().expect("Windows must answer GlobalMemoryStatusEx");
+        assert!(
+            memory > 1_000_000_000 && memory < 100_000_000_000_000,
+            "a plausible amount of RAM, got {memory}"
         );
     }
 }

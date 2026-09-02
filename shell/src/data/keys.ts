@@ -263,6 +263,30 @@ export const keys = {
     detail: (chatId: string) => ["chats", "detail", chatId] as const,
     localModel: ["chats", "local-model"] as const,
     /**
+     * The download of a local model this machine does not have —
+     * `GET /assistant/local-model/pull`.
+     *
+     * A sibling of `localModel` and deliberately NOT `[...localModel, "pull"]`,
+     * though the routes are nested that way: react-query matches by prefix, so
+     * the nested key would be swept by every invalidation of `localModel`. The
+     * two answer questions with opposite cadences — that one is what STARTUP
+     * resolved and cannot change while the daemon runs, this one moves every
+     * second while a download is going — and sharing a prefix would tie the
+     * settled one to the moving one.
+     */
+    localPull: ["chats", "local-pull"] as const,
+    /**
+     * What a model weighs and whether this machine can carry it —
+     * `GET /assistant/local-model/size?model=…`.
+     *
+     * A sibling of the two above for the same prefix reason, and keyed by model
+     * because the answer is per model: two absent rows in one menu ask this at
+     * the same time and must not overwrite each other. It is the most settled of
+     * the three — a model's size and this machine's memory do not move — so it
+     * is also the one that should never be swept by a download's invalidations.
+     */
+    localSize: (model: string) => ["chats", "local-size", model] as const,
+    /**
      * The models a conversation may be moved to — `GET /assistant/models`.
      *
      * Its own key and not a child of `detail`, because it is the same answer for

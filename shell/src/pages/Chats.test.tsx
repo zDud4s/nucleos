@@ -419,6 +419,59 @@ function chatsFetchWithToollessChoice(
 }
 
 /**
+ * `chatsFetch`'s `/assistant/models`, with one hosted choice AND one local model this machine has
+ * yet to download — a menu carrying all four kinds at once, which is what a test about GROUPING
+ * needs and no other fixture here provides.
+ *
+ * The base fixture's own `qwen3.5:4b` is marked as present rather than left absent: the two local
+ * rows have to differ in exactly the field under test, or the grouping could be reading anything.
+ */
+function chatsFetchWithEveryRoute(
+  chats: ChatSummary[],
+  transcripts: Record<string, AssistantTurnRow[]>,
+  opts: Parameters<typeof chatsFetch>[2] = {},
+  /**
+   * What the registry says the absent model weighs. Defaulted to `unknown`, which
+   * is the answer a machine with no route to the registry gets — and therefore what
+   * every case that is not ABOUT the size should be asserted against, so none of
+   * them quietly depends on a number.
+   */
+  size: { bytes: number | null; memory: number | null; fit: string } = {
+    bytes: null,
+    memory: null,
+    fit: "unknown",
+  },
+): (path: string, init?: RequestInit) => Promise<unknown> {
+  const base = chatsFetch(chats, transcripts, opts);
+  const hosted: ModelChoice = {
+    id: "openrouter-gpt",
+    label: "GPT via OpenRouter",
+    brain: "openrouter",
+    efforts: [],
+  };
+  const absent: ModelChoice = {
+    id: "llama3.2:3b",
+    label: "Llama 3.2 3B",
+    brain: "local",
+    efforts: [],
+    installed: false,
+  };
+  return async (path, init) => {
+    if (path === "/assistant/models") {
+      const models = (await base(path, init)) as AssistantModels;
+      const choices = models.choices.map((choice) =>
+        choice.brain === "local" ? { ...choice, installed: true } : choice,
+      );
+      return { ...models, choices: [...choices, hosted, absent] };
+    }
+    if (path.startsWith("/assistant/local-model/size")) {
+      return { model: absent.id, ...size, error: null };
+    }
+    return base(path, init);
+  };
+}
+
+/**
  * The page inside a two-route router, exactly like `Projects.test.tsx`'s
  * `renderProjects`: `renderApp` mounts the gate, the rail and its own live
  * queries around every assertion, which this machine cannot pay for more than
@@ -1156,6 +1209,160 @@ describe("Chats - a model reached over OpenRouter", () => {
         body: JSON.stringify({ model: "openrouter-gpt" }),
       });
     });
+  });
+
+  it("groups the menu by route, and says which local models this machine has", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    // Four groups, because there are four different answers to "where does this actually run", and
+    // a flat list made a person read the note at the end of each line to find out. Queried as
+    // ROLES rather than by reading the DOM order: a group a screen reader announces is the same
+    // fact this test is about, and asserting on order would pass for a menu nobody can navigate.
+    const cli = await screen.findByRole("group", { name: /agent cli/i });
+    const hosted = screen.getByRole("group", { name: /openrouter/i });
+    const here = screen.getByRole("group", { name: /on this machine/i });
+    const missing = screen.getByRole("group", { name: /not downloaded/i });
+
+    expect(within(cli).getByRole("menuitemradio", { name: /^Sonnet/ })).toBeDefined();
+    expect(
+      within(hosted).getByRole("menuitemradio", { name: /^GPT via OpenRouter/ }),
+    ).toBeDefined();
+    expect(within(here).getByRole("menuitemradio", { name: /^qwen3\.5:4b/ })).toBeDefined();
+
+    // A model the daemon offers and this machine does not have. SHOWN, because seeing it is how
+    // somebody learns it can be had at all — Ollama publishes no list of what is pullable, so if
+    // the menu does not say it, nothing does.
+    //
+    // A `menuitem` and NOT a `menuitemradio`, which is the whole difference the download made: the
+    // rows above are a choice of who answers, and this one is an action. Asserted by role rather
+    // than by looks, because the role is what tells somebody arrowing through the menu that
+    // pressing Enter here DOES something instead of selecting something.
+    const absent = within(missing).getByRole("menuitem", {
+      name: /^Llama 3\.2 3B/,
+    });
+    expect(absent.getAttribute("aria-disabled")).toBeNull();
+    expect(within(absent).getByText(/not downloaded/i)).toBeDefined();
+  });
+
+  it("asks twice before spending gigabytes on a model this machine does not have", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
+    const started = () =>
+      daemon.apiFetch.mock.calls.filter(
+        (call) => call[0] === "/assistant/local-model/pull" && call[1]?.method === "POST",
+      );
+    // The clock is driven by hand for the dwell below. Fixed rather than advancing, so the gap
+    // between two clicks is this test's decision and not the machine's speed.
+    const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+
+    // One click arms the row and downloads NOTHING. A model is gigabytes over somebody's
+    // connection, and an interlock a stray click gets past is not an interlock.
+    fireEvent.click(row());
+    expect(
+      within(missing).getByRole("menuitem", { name: /click again to download/i }),
+    ).toBeDefined();
+    expect(started()).toHaveLength(0);
+
+    // The second half of a double-click, landing inside the dwell. Ignored — and still armed,
+    // because disarming would punish the reflex and make the row feel broken.
+    fireEvent.click(row());
+    expect(started()).toHaveLength(0);
+    expect(
+      within(missing).getByRole("menuitem", { name: /click again to download/i }),
+    ).toBeDefined();
+
+    // A deliberate second click, once the dwell has passed. This one downloads.
+    now.mockReturnValue(10_000 + 500);
+    fireEvent.click(row());
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/local-model/pull", {
+        method: "POST",
+        // The choice id and not the label: the id is what the daemon checks against its own
+        // catalogue and what it hands Ollama.
+        body: JSON.stringify({ model: "llama3.2:3b" }),
+      });
+    });
+    now.mockRestore();
+  });
+
+  it("refuses to download a model larger than this machine, and says both numbers", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [] },
+        {},
+        // llama3.3:70b against 15.8 GB of RAM, both read from the real thing.
+        { bytes: 42_520_000_000, memory: 15_800_000_000, fit: "too_big" },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
+
+    // BOTH numbers, not just the verdict. "42.5 GB, and this machine has 15.8" is something a
+    // person can act on — a smaller quantisation, another model, more memory — while a bare
+    // "too big" is a wall with no door in it.
+    await waitFor(() => {
+      expect(within(row()).getByText(/42\.5 GB/)).toBeDefined();
+    });
+    expect(within(row()).getByText(/15\.8 GB/)).toBeDefined();
+
+    // And it cannot be started. The interlock is not the guard here: arming a row that can never
+    // run would offer a second click that does nothing, which is worse than a row that says why.
+    expect(row().getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(row());
+    expect(
+      daemon.apiFetch.mock.calls.filter(
+        (call) => call[0] === "/assistant/local-model/pull" && call[1]?.method === "POST",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("shows what a model that fits weighs, and still lets it be downloaded", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEveryRoute(
+        [chatSummary({ chat_id: "c-1" })],
+        { "c-1": [] },
+        {},
+        // qwen3:8b, 5.23 GB, on the same machine — the case this whole feature exists to say yes to.
+        { bytes: 5_230_000_000, memory: 15_800_000_000, fit: "comfortable" },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
+
+    await waitFor(() => {
+      expect(within(row()).getByText(/5\.2 GB/)).toBeDefined();
+    });
+    // A model that fits gets no editorial. The size is the whole message: saying "this will work"
+    // under every row that works is noise somebody learns to stop reading, which is how they miss
+    // the one row that says something else.
+    expect(within(row()).queryByText(/this machine has/i)).toBeNull();
+    expect(row().getAttribute("aria-disabled")).toBeNull();
+
+    fireEvent.click(row());
+    expect(
+      within(missing).getByRole("menuitem", { name: /click again to download/i }),
+    ).toBeDefined();
   });
 
   it("says something true above a turn that moved to the hosted model, rather than the local model's words", async () => {
