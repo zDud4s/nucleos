@@ -120,7 +120,7 @@ describe("adding a project", () => {
 
     // And it lands on the project it just made.
     await waitFor(() =>
-      expect(rendered.router.state.location.pathname).toBe("/projects/nucleos/estado"),
+      expect(rendered.router.state.location.pathname).toBe("/projects/nucleos/state"),
     );
   });
 

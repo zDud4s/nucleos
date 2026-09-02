@@ -9,7 +9,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { MapaCanvas } from "./MapaCanvas";
+import { MapCanvas } from "./MapCanvas";
 import { createAppQueryClient } from "../app/queryClient";
 import type {
   Anchored,
@@ -85,7 +85,7 @@ function draw(
 ) {
   return render(
     <QueryClientProvider client={createAppQueryClient()}>
-      <MapaCanvas
+      <MapCanvas
         projectId="alpha"
         modules={modules}
         imports={imports}
@@ -122,7 +122,7 @@ const wideProject = (() => {
   return { modules, imports };
 })();
 
-describe("MapaCanvas", () => {
+describe("MapCanvas", () => {
   it("draws the whole project as a matrix rather than as boxes and arrows", () => {
     // Four dependencies a file is past where any layered drawing reads, and the first version of
     // this screen drew one anyway: 73% of its edges crossed a box they had nothing to do with.
@@ -378,7 +378,7 @@ async function openFirstFile() {
   await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalled());
 }
 
-describe("MapaCanvas — one file's own declarations", () => {
+describe("MapCanvas — one file's own declarations", () => {
   it("asks the route that answers about a single file, and only once one is opened", async () => {
     // The whole-project answer already walks the tree and reads three tables. Carrying every
     // file's items on it would multiply the largest answer the daemon sends by the size of the
@@ -466,7 +466,7 @@ const claim = (over: Partial<Anchored> = {}): Anchored => ({
 
 const withClaims = (decisions: Anchored[]): Junction => ({ ...emptyJunction, decisions });
 
-describe("MapaCanvas — what was asked for", () => {
+describe("MapCanvas — what was asked for", () => {
   it("marks a file no approved decision names, where the file is listed", () => {
     // §5.1's pile, in place rather than in a panel somewhere else. Derived, and the title says so:
     // nothing here is the owner's word.

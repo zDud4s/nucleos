@@ -80,7 +80,7 @@ export function NewProject() {
         </Step>
 
         {found.data === undefined ? null : (
-          <Found found={found.data} onDone={(id) => void navigate({ to: `/projects/${id}/estado` })} />
+          <Found found={found.data} onDone={(id) => void navigate({ to: `/projects/${id}/state` })} />
         )}
       </div>
     </>

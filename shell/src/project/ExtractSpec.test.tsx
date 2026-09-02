@@ -11,7 +11,7 @@ vi.mock("../data/client", async (original) => ({
 
 import { ApiRefusal } from "../data/client";
 import { renderWithQuery } from "../test/harness";
-import { ExtrairSpec } from "./ExtrairSpec";
+import { ExtractSpec } from "./ExtractSpec";
 
 const MAP = "2026-08-24-mapa-do-projeto-design";
 const WORKSPACE = "2026-08-22-workspace-de-projeto-design";
@@ -51,7 +51,7 @@ function openExtractor(overrides: Partial<MapState> = {}) {
   const state: MapState = { specs: [MAP, WORKSPACE], refusal: null, hold: false, ...overrides };
   daemon.apiFetch.mockReset();
   daemon.apiFetch.mockImplementation(mapFetch(state));
-  const rendered = renderWithQuery(<ExtrairSpec projectId="nucleos" />);
+  const rendered = renderWithQuery(<ExtractSpec projectId="nucleos" />);
   return { state, rendered };
 }
 

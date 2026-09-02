@@ -29,7 +29,7 @@ import { Teach } from "../ui";
  * reader is exactly right.
  */
 
-export interface ModeCodigoProps {
+export interface ModeCodeProps {
   projectId: string;
   /** The run being reviewed, from the route so a slot on the State mode can link straight to it. */
   run: number | null;
@@ -38,7 +38,7 @@ export interface ModeCodigoProps {
 
 type View = "diff" | "file" | "blame";
 
-export function ModeCodigo({ projectId, run, onPickRun }: ModeCodigoProps) {
+export function ModeCode({ projectId, run, onPickRun }: ModeCodeProps) {
   const concurrency = useConcurrency();
   const [path, setPath] = useState("");
   const [view, setView] = useState<View>("diff");

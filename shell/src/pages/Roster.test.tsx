@@ -183,7 +183,7 @@ describe("the roster", () => {
     */
     const table = await screen.findByRole("table");
     const link = within(table).getByRole("link", { name: "nucleos" });
-    expect(link.getAttribute("href")).toContain("/projects/nucleos/estado");
+    expect(link.getAttribute("href")).toContain("/projects/nucleos/state");
     expect(rendered.router.state.location.pathname).toBe("/projects");
   });
 

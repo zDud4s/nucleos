@@ -33,13 +33,13 @@ import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } fr
  * and there is a test that renders both states and compares the set of panels.
  */
 
-export interface ModeEstadoProps {
+export interface ModeStateProps {
   projectId: string;
   /** Has the roster answered at all? Before it has, nothing here is a measurement. */
   answered: boolean;
 }
 
-export function ModeEstado({ projectId, answered }: ModeEstadoProps) {
+export function ModeState({ projectId, answered }: ModeStateProps) {
   const projects = useProjects();
   const killSwitch = useKillSwitch();
   const budget = useBudget();

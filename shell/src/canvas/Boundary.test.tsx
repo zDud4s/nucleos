@@ -8,7 +8,7 @@ import type { ForeignFile, MapImport, MapModule, Seam } from "../data/project-ma
 /**
  * The seam, on its own, because it is no longer the picture's header.
  *
- * These moved out of `MapaCanvas.test.tsx` unchanged in what they assert. They were always about
+ * These moved out of `MapCanvas.test.tsx` unchanged in what they assert. They were always about
  * what this reading could not see rather than about the drawing, and they now render the component
  * that says it — which is also what stops them passing because some *other* part of the map
  * happened to print the same word.

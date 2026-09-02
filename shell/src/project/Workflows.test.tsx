@@ -63,7 +63,7 @@ describe("the workflows mode", () => {
 
     empty.rendered.unmount();
 
-    await renderApp({ initialPath: "/projects/nucleos/estado" });
+    await renderApp({ initialPath: "/projects/nucleos/state" });
     const panel = within(await screen.findByRole("region", { name: "Workflow" }));
     fireEvent.click(await panel.findByRole("button", { name: "why?" }));
     expect(panel.getByText(NO_WORKFLOW_MEANS, { exact: false })).toBeTruthy();

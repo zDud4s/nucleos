@@ -2,14 +2,14 @@
 import { useState } from "react";
 import { useProjectMap, useProjectSpecs, type ProjectMap } from "../data/project-map";
 import { Boundary } from "../canvas/Boundary";
-import { MapaCanvas } from "../canvas/MapaCanvas";
+import { MapCanvas } from "../canvas/MapCanvas";
 import { declaredCoverage } from "../canvas/map-model";
 import { drawableLinks } from "../canvas/map-graphs";
-import { Carimbos } from "./Carimbos";
-import { ExtrairSpec } from "./ExtrairSpec";
-import { Juncao } from "./Juncao";
-import { MapaPorAprovar } from "./MapaPorAprovar";
-import { Triagem } from "./Triagem";
+import { StampsPanel } from "./StampsPanel";
+import { ExtractSpec } from "./ExtractSpec";
+import { JunctionPanel } from "./JunctionPanel";
+import { DecisionsWaiting } from "./DecisionsWaiting";
+import { TriagePanel } from "./TriagePanel";
 
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
@@ -56,7 +56,7 @@ import { Triagem } from "./Triagem";
  * disagree about a project whose folder moved between them.
  */
 
-export interface ModeMapaProps {
+export interface ModeMapProps {
   projectId: string;
 }
 
@@ -72,10 +72,10 @@ const VIEW_LABEL: Record<MapView, string> = {
   specs: "Specs",
 };
 
-export function ModeMapa({ projectId }: ModeMapaProps) {
+export function ModeMap({ projectId }: ModeMapProps) {
   const map = useProjectMap(projectId);
   /*
-    Read here for the number on one door, and by `ExtrairSpec` for the picker behind it. Two
+    Read here for the number on one door, and by `ExtractSpec` for the picker behind it. Two
     readers of one query and not two queries: React Query answers both out of the same cache entry,
     so the number on the door and the list behind it cannot disagree.
   */
@@ -110,8 +110,8 @@ export function ModeMapa({ projectId }: ModeMapaProps) {
           works on a project whose folder has moved.
         */
         <div className="flex flex-col gap-8">
-          <ExtrairSpec projectId={projectId} />
-          <MapaPorAprovar projectId={projectId} />
+          <ExtractSpec projectId={projectId} />
+          <DecisionsWaiting projectId={projectId} />
         </div>
       ) : map.isError ? (
         <p className="text-sm text-text-faint">
@@ -136,7 +136,7 @@ export function ModeMapa({ projectId }: ModeMapaProps) {
 /**
  * The row of doors, and the number on each.
  *
- * **A zero is drawn only where a zero was measured.** `Juncao` spends a paragraph refusing to draw
+ * **A zero is drawn only where a zero was measured.** `JunctionPanel` spends a paragraph refusing to draw
  * a grid of zeros on a project with no approved decision — *"a row of `0`s reads as a measurement,
  * and here nothing has been measured"* — and a chip reading `Junction 0` is that same claim in
  * less space and with more authority. So until one decision is approved, those three doors carry
@@ -319,7 +319,7 @@ function Derived({
       asked only once a reader opens something, so the cost lands on the click.
     */
     return (
-      <MapaCanvas
+      <MapCanvas
         projectId={projectId}
         modules={modules}
         imports={imports}
@@ -330,7 +330,7 @@ function Derived({
   }
 
   if (view === "junction") {
-    return <Juncao junction={junction} projectId={projectId} />;
+    return <JunctionPanel junction={junction} projectId={projectId} />;
   }
 
   if (view === "stamps") {
@@ -339,7 +339,7 @@ function Derived({
       flattened, which is why this panel has no query of its own.
     */
     return (
-      <Carimbos
+      <StampsPanel
         projectId={projectId}
         junction={junction}
         standings={standings}
@@ -356,7 +356,7 @@ function Derived({
     own, because *sempre acessível* has to survive this map failing to read a folder.
   */
   return (
-    <Triagem
+    <TriagePanel
       projectId={projectId}
       junction={junction}
       triage={triage}

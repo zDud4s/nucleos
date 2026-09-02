@@ -22,7 +22,7 @@ import { useOrphanCheck, useRecordAnchor } from "../data/project-map";
  * §7.1* from *as §7.1 explains*, which is why {@link Answer} says **named** everywhere and never
  * *implemented*.
  */
-export function Orfa({ projectId, row }: { projectId: string; row: Anchored }) {
+export function OrphanCheck({ projectId, row }: { projectId: string; row: Anchored }) {
   const ask = useOrphanCheck(projectId);
   const answer = ask.data;
 

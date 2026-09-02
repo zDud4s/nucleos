@@ -17,7 +17,7 @@ import {
 } from "../test/harness";
 import { ApiRefusal } from "../data/client";
 import type { ProjectReadings } from "../data/project-readings";
-import { ModeEstado } from "./ModeEstado";
+import { ModeState } from "./ModeState";
 import { normaliseMode } from "./Workspace";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -47,7 +47,7 @@ async function openWorkspace(options: {
   // The whole app, through the real router: a route that is missing from the
   // real tree is missing here too, so this proves the mode resolves as well as
   // what it renders.
-  return renderApp({ initialPath: `/projects/nucleos/${options.mode ?? "estado"}` });
+  return renderApp({ initialPath: `/projects/nucleos/${options.mode ?? "state"}` });
 }
 
 /** A project with one run holding a slot, and a dozen changed files under it. */
@@ -65,7 +65,7 @@ function reviewState(): DaemonState {
 }
 
 /** Mount the app over a state a test built for itself. */
-async function openState(state: DaemonState, path = "/projects/nucleos/estado") {
+async function openState(state: DaemonState, path = "/projects/nucleos/state") {
   daemon.apiFetch.mockImplementation(daemonFetch(state));
   daemon.apiText.mockImplementation(daemonText(state));
   daemon.probeHealth.mockResolvedValue(true);
@@ -91,10 +91,26 @@ function panelsOf2(container: HTMLElement): string[] {
 
 describe("normaliseMode", () => {
   it("takes the four modes as themselves", () => {
-    expect(normaliseMode("estado")).toBe("estado");
-    expect(normaliseMode("mapa")).toBe("mapa");
-    expect(normaliseMode("codigo")).toBe("codigo");
+    expect(normaliseMode("state")).toBe("state");
+    expect(normaliseMode("map")).toBe("map");
+    expect(normaliseMode("code")).toBe("code");
     expect(normaliseMode("workflows")).toBe("workflows");
+  });
+
+  /**
+   * The migration window, and the reason it is a test rather than a comment.
+   *
+   * These three were the route until 2026-09-02. Renaming a URL is not renaming
+   * an identifier — the old one is in somebody's bookmark and in the scrollback
+   * of whatever they pasted it into, and neither is in this repository to be
+   * updated. Falling through to the default would be the quiet version of the
+   * failure: `/projects/x/mapa` would answer 200 with the wrong mode, which
+   * reads as the app having forgotten where you were.
+   */
+  it("still answers the three Portuguese segments it used to be", () => {
+    expect(normaliseMode("estado")).toBe("state");
+    expect(normaliseMode("mapa")).toBe("map");
+    expect(normaliseMode("codigo")).toBe("code");
   });
 
   /**
@@ -102,9 +118,9 @@ describe("normaliseMode", () => {
    * a string, anybody can type one, and a typo in a path is not a missing page.
    */
   it("lands on State for anything else, including nothing at all", () => {
-    expect(normaliseMode("rules")).toBe("estado");
-    expect(normaliseMode("")).toBe("estado");
-    expect(normaliseMode(undefined)).toBe("estado");
+    expect(normaliseMode("rules")).toBe("state");
+    expect(normaliseMode("")).toBe("state");
+    expect(normaliseMode(undefined)).toBe("state");
   });
 });
 
@@ -152,7 +168,28 @@ describe("the project workspace", () => {
 
     // Quiet is drawn, and it is drawn by the tone rather than by taking anything away.
     expect(code.className).not.toBe(screen.getByRole("link", { name: "Map" }).className);
-    expect(code.getAttribute("href")).toBe("/projects/nucleos/codigo");
+    expect(code.getAttribute("href")).toBe("/projects/nucleos/code");
+  });
+
+  /**
+   * The migration window through the real router, which is the half
+   * {@link normaliseMode}'s own test cannot reach.
+   *
+   * A kept link has to arrive at the mode it meant AND find the tabs pointing
+   * somewhere new, because that second half is what makes the window closeable:
+   * nothing here rewrites the address, so an old URL corrects itself the first
+   * time somebody clicks anything. Without the tabs emitting the new segment
+   * this would be a permanent alias wearing a deprecation's clothes.
+   */
+  it("answers a kept Portuguese link, and hands back English tabs", async () => {
+    await openWorkspace({ mode: "codigo" });
+
+    const code = await screen.findByRole("link", { name: "Code" });
+    expect(code.getAttribute("aria-current")).toBe("page");
+    expect(code.getAttribute("href")).toContain("/projects/nucleos/code");
+    expect(screen.getByRole("link", { name: "State" }).getAttribute("href")).toContain(
+      "/projects/nucleos/state",
+    );
   });
 
   /**
@@ -261,7 +298,7 @@ describe("the project workspace", () => {
     // gate, so by the time it paints the roster has already answered and this
     // state is over. Mounting the mode directly is the only way to see it.
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
-    const { container } = renderWithQuery(<ModeEstado projectId="nucleos" answered={false} />);
+    const { container } = renderWithQuery(<ModeState projectId="nucleos" answered={false} />);
 
     const leading = container.querySelector('section[aria-label="Leading"]');
     expect(leading?.textContent).toBe("Reading nucleos…");
@@ -356,7 +393,7 @@ describe("the project workspace", () => {
     });
     daemon.apiFetch.mockImplementation(daemonFetch(state));
     daemon.probeHealth.mockResolvedValue(true);
-    await renderApp({ initialPath: "/projects/nucleos/estado" });
+    await renderApp({ initialPath: "/projects/nucleos/state" });
 
     expect(await screen.findByText("trunk")).toBeTruthy();
     // Where work lands is named as a place, not reported as being level with itself.
@@ -378,7 +415,7 @@ describe("the project workspace", () => {
     daemon.apiFetch.mockImplementation(daemonFetch(state));
     daemon.apiText.mockImplementation(daemonText(state));
     daemon.probeHealth.mockResolvedValue(true);
-    await renderApp({ initialPath: "/projects/nucleos/codigo?run=41" });
+    await renderApp({ initialPath: "/projects/nucleos/code?run=41" });
 
     expect(await screen.findByText("core/src/http.rs")).toBeTruthy();
     /*
@@ -402,10 +439,10 @@ describe("the project workspace", () => {
     daemon.apiFetch.mockImplementation(daemonFetch(state));
     daemon.apiText.mockImplementation(daemonText(state));
     daemon.probeHealth.mockResolvedValue(true);
-    await renderApp({ initialPath: "/projects/nucleos/estado" });
+    await renderApp({ initialPath: "/projects/nucleos/state" });
 
     const link = await screen.findByRole("link", { name: "Review run 41" });
-    expect(link.getAttribute("href")).toContain("/projects/nucleos/codigo");
+    expect(link.getAttribute("href")).toContain("/projects/nucleos/code");
     expect(link.getAttribute("href")).toContain("run=41");
   });
 
@@ -420,14 +457,14 @@ describe("the project workspace", () => {
     daemon.apiFetch.mockImplementation(daemonFetch(state));
     daemon.apiText.mockImplementation(daemonText(state));
     daemon.probeHealth.mockResolvedValue(true);
-    await renderApp({ initialPath: "/projects/nucleos/codigo?run=41" });
+    await renderApp({ initialPath: "/projects/nucleos/code?run=41" });
 
     expect(await screen.findByText(/no recorded branch point/)).toBeTruthy();
     expect(screen.queryByText(/changed nothing/)).toBeNull();
   });
 
   it("offers no review when nothing holds a worktree here", async () => {
-    await openWorkspace({ mode: "codigo" });
+    await openWorkspace({ mode: "code" });
     expect(await screen.findByText(/Nothing to review in nucleos/)).toBeTruthy();
   });
 
@@ -522,7 +559,7 @@ describe("the project workspace", () => {
     });
     daemon.apiText.mockImplementation(daemonText(state));
     daemon.probeHealth.mockResolvedValue(true);
-    await renderApp({ initialPath: "/projects/nucleos/mapa" });
+    await renderApp({ initialPath: "/projects/nucleos/map" });
 
     // Was `/declaring nothing they implement/`, which this mode no longer says: that count is the
     // junction's `unclaimed` now, and the headline reports what it alone knows.

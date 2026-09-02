@@ -971,8 +971,8 @@ export function useDecideMapLine(projectId: string) {
   });
 }
 
-/** What {@link useCarimbar} sends: the line, the owner's verdict on it, and whatever they wrote. */
-export interface CarimbarInput {
+/** What {@link useGiveStamp} sends: the line, the owner's verdict on it, and whatever they wrote. */
+export interface GiveStampInput {
   decisionId: number;
   verdict: Verdict;
   /**
@@ -1017,10 +1017,10 @@ export interface CarimbarInput {
  * all. That the map key is a *prefix* of the pile's, and so drags it along, is a shape of
  * `keys.projects` and not an intention here — the intention is one line, and it is written as one.
  */
-export function useCarimbar(projectId: string) {
+export function useGiveStamp(projectId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ decisionId, verdict, note }: CarimbarInput) =>
+    mutationFn: ({ decisionId, verdict, note }: GiveStampInput) =>
       apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/map/stamps`, {
         method: "POST",
         body: JSON.stringify({ decision_id: decisionId, verdict, note }),

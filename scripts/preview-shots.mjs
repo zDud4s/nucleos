@@ -361,28 +361,28 @@ const SHOTS_TO_TAKE = [
   ["28-inspect-no-folder", { path: "/projects/charlie/inspect/browse" }],
   ["29-inspect-nothing-runs", { path: "/projects/delta/inspect/rules" }],
 
-  /* The Codigo mode's empty state, which is where both doors into the inspector
+  /* The Code mode's empty state, which is where both doors into the inspector
      are drawn — and the only place in the app that opens it. */
-  ["30-codigo-doors", { path: "/projects/alpha/codigo" }],
+  ["30-code-doors", { path: "/projects/alpha/code" }],
 
-  /* The Estado mode, which is the densest collection of bordered ghost buttons
+  /* The State mode, which is the densest collection of bordered ghost buttons
      in the app: `edit` on each owned file, `declare a command`, the three mode
      switches, both ceiling steppers and `no ceiling`. Every one of them was a
      white slab with an unreadable word in it until `base.css` gave `button` a
      transparent background — a defect no test could see and a picture cannot
      miss. Both themes, because the fault only looked like a fault in one. */
-  ["31-estado-controls", { path: "/projects/alpha/estado" }],
-  ["32-estado-controls-light", { path: "/projects/alpha/estado", theme: "light" }],
+  ["31-state-controls", { path: "/projects/alpha/state" }],
+  ["32-state-controls-light", { path: "/projects/alpha/state", theme: "light" }],
 
   /* The map, over a project the size of the real one — 245 modules and about
      nine hundred imports. Every complaint this page has ever drawn is a
      complaint about scale, so a fixture that fits comfortably would photograph
      a screen nobody is looking at. */
-  ["33-map-matrix", { path: "/projects/alpha/mapa" }],
+  ["33-map-matrix", { path: "/projects/alpha/map" }],
   /* One level down, which is the state the rail exists for: the list of
      communities stays put, the open one is marked, and every sibling is one
      click away rather than three. */
-  ["34-map-community", { path: "/projects/alpha/mapa", press: "council" }],
+  ["34-map-community", { path: "/projects/alpha/map", press: "council" }],
 
   /* The fourth mode, so the workspace can be looked at as the set of four it
      actually is rather than one page at a time. */
@@ -403,13 +403,13 @@ const SHOTS_TO_TAKE = [
      lost and why the button is off, which is the pair worth a picture. */
   [
     "40-delete-folder",
-    { path: "/projects/alpha/estado", press: "delete this folder…" },
+    { path: "/projects/alpha/state", press: "delete this folder…" },
   ],
 
   /* A door that is not the picture, which is what the row of views exists for:
      the junction reached without scrolling a matrix, and the seam still above
      it — the one thing §16.5 says a view may not take with it. */
-  ["36-map-junction", { path: "/projects/alpha/mapa", press: "Junction" }],
+  ["36-map-junction", { path: "/projects/alpha/map", press: "Junction" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));

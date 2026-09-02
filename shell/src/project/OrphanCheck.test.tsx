@@ -12,7 +12,7 @@ vi.mock("../data/client", async (original) => ({
 import { ApiRefusal } from "../data/client";
 import type { Anchored, Loss, Orphan } from "../data/project-map";
 import { renderWithQuery } from "../test/harness";
-import { Orfa } from "./Orfa";
+import { OrphanCheck } from "./OrphanCheck";
 
 /** One approved decision nothing in the project names — the only row this control appears on. */
 function anchored(overrides: Partial<Anchored> = {}): Anchored {
@@ -46,7 +46,7 @@ function loss(overrides: Partial<Loss> = {}): Loss {
 }
 
 function open(row: Anchored = anchored()) {
-  return renderWithQuery(<Orfa projectId="alpha" row={row} />);
+  return renderWithQuery(<OrphanCheck projectId="alpha" row={row} />);
 }
 
 function press() {
@@ -175,14 +175,14 @@ describe("whether a decision with no code lost the comment that anchored it", ()
   it("says plainly when the row should not have been asked about", async () => {
     daemon.apiFetch.mockResolvedValue({
       state: "still_named",
-      paths: ["shell/src/project/ModeMapa.tsx"],
+      paths: ["shell/src/project/ModeMap.tsx"],
     } satisfies Orphan);
 
     open();
     press();
 
     const said = await screen.findByText(/names it right now/i);
-    expect(said.textContent).toContain("shell/src/project/ModeMapa.tsx");
+    expect(said.textContent).toContain("shell/src/project/ModeMap.tsx");
   });
 
   /**

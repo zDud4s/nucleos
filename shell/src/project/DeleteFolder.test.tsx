@@ -33,7 +33,7 @@ async function openEstado(overrides: Partial<DaemonState> = {}) {
   daemon.apiFetch.mockImplementation(daemonFetch(state));
   daemon.apiText.mockImplementation(daemonText(state));
   daemon.probeHealth.mockResolvedValue(true);
-  const rendered = await renderApp({ initialPath: "/projects/nucleos/estado" });
+  const rendered = await renderApp({ initialPath: "/projects/nucleos/state" });
   return { state, rendered };
 }
 

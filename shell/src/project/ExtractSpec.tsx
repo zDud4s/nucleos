@@ -19,12 +19,12 @@ import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map
  * has a sentence for that refusal, because a generic failure would hide the single property that
  * makes the choice worth offering.
  *
- * Separate from {@link MapaPorAprovar} because these are two jobs: choosing what to read is not
+ * Separate from {@link DecisionsWaiting} because these are two jobs: choosing what to read is not
  * answering what came back, and one file owning a picker, a brain, a mutation, a list and six
  * buttons would be the junk drawer this workspace is built against.
  */
 
-export interface ExtrairSpecProps {
+export interface ExtractSpecProps {
   projectId: string;
 }
 
@@ -51,7 +51,7 @@ const BRAIN_MEANING: Record<Brain, string> = {
   local: "The local brain reads it through the model on this machine. Nothing leaves and nothing is billed — and where no such model is set up, the núcleo refuses rather than quietly reading it in the cloud instead.",
 };
 
-export function ExtrairSpec({ projectId }: ExtrairSpecProps) {
+export function ExtractSpec({ projectId }: ExtractSpecProps) {
   const specs = useProjectSpecs(projectId);
   const extract = useExtractSpec(projectId);
   const [chosen, setChosen] = useState<string | null>(null);
@@ -223,7 +223,7 @@ export function ExtrairSpec({ projectId }: ExtrairSpecProps) {
  *
  * The route refuses with a bare status and no name of its own, so these switch on `status` rather
  * than on `code` — the derived code for a 503 is `unavailable`, which is the floor under a name and
- * not a name. The same reading `ModeCodigo`'s own refusal note takes.
+ * not a name. The same reading `ModeCode`'s own refusal note takes.
  */
 function Failed({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {

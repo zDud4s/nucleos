@@ -11,12 +11,12 @@ import {
   type Watch,
 } from "../data/project-map";
 import { RelativeTime } from "../ui";
-import { Carimbar } from "./Carimbar";
+import { GiveStamp } from "./GiveStamp";
 
 /**
  * The stamps: what you said about each decision, and what became of it.
  *
- * The other axis. `Juncao` says what can be known without anybody looking; this says what the
+ * The other axis. `JunctionPanel` says what can be known without anybody looking; this says what the
  * owner looked at and whether it is still true, and §5 forbids the two collapsing into one —
  * *"achatá-las numa só punha o triador e o dono a falar pela mesma boca"*. They sit side by side
  * and never merge into a state, a colour or a figure.
@@ -34,12 +34,12 @@ import { Carimbar } from "./Carimbar";
  * nothing at all; and the pile nobody has looked at needs an afternoon that §10 refuses to demand.
  *
  * **This is one of the two surfaces in this mode with buttons, and it was the only one for a
- * slice.** `Juncao` has none deliberately — a second place to accept without reading is the failure
+ * slice.** `JunctionPanel` has none deliberately — a second place to accept without reading is the failure
  * this mode replaces — but stamping is the owner's act and §6 gives it to nobody else, so it has to
- * happen somewhere. `Triagem` is the second, and it is not a second way to accept without reading:
+ * happen somewhere. `TriagePanel` is the second, and it is not a second way to accept without reading:
  * it draws the rows §5.3 takes OUT of this panel's debt because the triager put them in front of
  * the owner, and a flag with no verdict on it would be a nag with no answer. Both use the same
- * three-verdict control from `Carimbar.tsx`, because §5.2 has three verdicts and a fourth would be
+ * three-verdict control from `GiveStamp.tsx`, because §5.2 has three verdicts and a fourth would be
  * this map made quieter.
  * **Every row carries them, including the piles where nothing is asking to be stamped.** Three of
  * the six describe verdicts that are already given and whose repair is not a verdict at all, and
@@ -55,7 +55,7 @@ import { Carimbar } from "./Carimbar";
  * and not about the code — and there is no green here for it to end up sharing.
  */
 
-export interface CarimbosProps {
+export interface StampsPanelProps {
   projectId: string;
   /** The decisions themselves, in the order the núcleo joined them. */
   junction: Junction;
@@ -91,7 +91,7 @@ export interface CarimbosProps {
 /**
  * How many rows of a pile are drawn before it is summarised.
  *
- * The same number `Juncao` uses, and deliberately its own constant rather than a shared one: these
+ * The same number `JunctionPanel` uses, and deliberately its own constant rather than a shared one: these
  * are two panels over two different piles, and the day one of them wants a different cap the other
  * must not move with it. Whatever is cut is counted out loud beside it — the number never leaves
  * the screen, only the rows do.
@@ -116,7 +116,7 @@ interface Stood<S extends Standing = Standing> {
 /** A decision the owner called done. Narrowed, so the piles below can read `watch` without a guard. */
 type Green = Stood<Extract<Standing, { state: "settled" }>>;
 
-export function Carimbos({
+export function StampsPanel({
   projectId,
   junction,
   standings,
@@ -124,7 +124,7 @@ export function Carimbos({
   triage,
   triageCounts,
   gitWouldNotAnswer,
-}: CarimbosProps) {
+}: StampsPanelProps) {
   /*
     `String(id)` and not `id`. The núcleo sends a `BTreeMap<i64, _>` and JSON object keys are
     strings, so a numeric lookup here reads `undefined` for every row on screen while typechecking
@@ -375,7 +375,7 @@ function OnYourDesk({
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
             <Why why={standing.why} />
-            <Carimbar projectId={projectId} row={row} />
+            <GiveStamp projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>
@@ -477,7 +477,7 @@ function PartWay({
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
             <p className="max-w-prose text-sm text-text">{standing.note}</p>
-            <Carimbar projectId={projectId} row={row} />
+            <GiveStamp projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>
@@ -546,7 +546,7 @@ function Withdrawn({
                   {standing.note === null ? null : (
                     <p className="max-w-prose text-sm text-text">{standing.note}</p>
                   )}
-                  <Carimbar projectId={projectId} row={row} />
+                  <GiveStamp projectId={projectId} row={row} />
                 </Line>
               ))}
             </ul>
@@ -644,7 +644,7 @@ function Silence({
       <ul aria-label={label} className="flex flex-col gap-2">
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
-            <Carimbar projectId={projectId} row={row} />
+            <GiveStamp projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>
@@ -704,7 +704,7 @@ function Guessed({
           <ul aria-label="Greens over a guessed anchor" className="flex flex-col gap-2">
             {shown.map(({ row, standing }) => (
               <Line key={row.decision_id} row={row} at={standing.stamped_at} paths={row.modules}>
-                <Carimbar projectId={projectId} row={row} />
+                <GiveStamp projectId={projectId} row={row} />
               </Line>
             ))}
           </ul>
@@ -772,7 +772,7 @@ function NeverLooked({
       <ul aria-label="Decisions nobody has stamped" className="flex flex-col gap-2">
         {shown.map(({ row }) => (
           <Line key={row.decision_id} row={row} at={null}>
-            <Carimbar projectId={projectId} row={row} />
+            <GiveStamp projectId={projectId} row={row} />
           </Line>
         ))}
       </ul>

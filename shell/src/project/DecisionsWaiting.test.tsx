@@ -12,7 +12,7 @@ vi.mock("../data/client", async (original) => ({
 import { ApiRefusal } from "../data/client";
 import type { MapDecision } from "../data/project-map";
 import { renderWithQuery } from "../test/harness";
-import { MapaPorAprovar } from "./MapaPorAprovar";
+import { DecisionsWaiting } from "./DecisionsWaiting";
 
 function decision(overrides: Partial<MapDecision> = {}): MapDecision {
   return {
@@ -62,7 +62,7 @@ function openPile(overrides: Partial<PileState> = {}) {
   const state: PileState = { decisions: [decision()], refusal: null, answered: [], ...overrides };
   daemon.apiFetch.mockReset();
   daemon.apiFetch.mockImplementation(pileFetch(state));
-  const rendered = renderWithQuery(<MapaPorAprovar projectId="nucleos" />);
+  const rendered = renderWithQuery(<DecisionsWaiting projectId="nucleos" />);
   return { state, rendered };
 }
 

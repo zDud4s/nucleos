@@ -10,7 +10,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { ModeMapa } from "./ModeMapa";
+import { ModeMap } from "./ModeMap";
 import { createAppQueryClient } from "../app/queryClient";
 import type { ProjectMap } from "../data/project-map";
 
@@ -84,7 +84,7 @@ function open(map: ProjectMap | Error, specs: string[] = ["2026-08-24-mapa-do-pr
   });
   return render(
     <QueryClientProvider client={createAppQueryClient()}>
-      <ModeMapa projectId="alpha" />
+      <ModeMap projectId="alpha" />
     </QueryClientProvider>,
   );
 }
@@ -140,7 +140,7 @@ describe("the map as five doors", () => {
 
 describe("the number on a door", () => {
   /**
-   * `Juncao` refuses to draw a grid of zeros on a project with nothing approved — "a row of `0`s
+   * `JunctionPanel` refuses to draw a grid of zeros on a project with nothing approved — "a row of `0`s
    * reads as a measurement, and here nothing has been measured". A chip saying `Junction 0` is
    * that same claim in less space, so it says nothing instead.
    */

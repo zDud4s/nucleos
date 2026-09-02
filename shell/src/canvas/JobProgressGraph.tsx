@@ -16,7 +16,7 @@ import { buildProgress, type Lifecycle, type ProgressNode } from "./job-progress
  * React Flow canvas; a second one nested in a node of the first fights it for wheel and drag
  * events and ships a second copy of its machinery for a graph that is usually under ten boxes.
  * `layered.ts` already ranks, orders and routes -- with crossing minimisation and stable output --
- * and `MapaCanvas` already draws its result by hand.
+ * and `MapCanvas` already draws its result by hand.
  *
  * The layout is memoised on the shape rather than on the statuses. The panel repolls every three
  * seconds, and a graph that relaid itself on every tick would move under the cursor of somebody
