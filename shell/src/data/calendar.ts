@@ -84,21 +84,37 @@ export function useCalendarEvents(from: string, to: string) {
   });
 }
 
-/** Whether this machine currently reads as busy. */
+/**
+ * Whether this machine currently reads as busy.
+ *
+ * `POLL.slow`, alongside the events, because design §6.14 pairs the two at
+ * 30 s. This ran at `POLL.fast` (3 s) — ten times the cadence the design asked
+ * for, and quietly doing a second job: the page's `now` was a bare `new Date()`
+ * at render, so this poll was what advanced the clock. `useMinuteClock` owns
+ * that now, which is what made slowing this down safe rather than a regression.
+ */
 export function useBusy() {
   return useQuery({
     queryKey: keys.calendar.busy,
     queryFn: () => apiFetch<BusyView>("/calendar/busy"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.slow,
   });
 }
 
-/** The calendar's own configuration. Read-only from this page. */
+/**
+ * The calendar's own configuration. Read-only from this page.
+ *
+ * **No `refetchInterval`** — design §6.14 says config is read once, and working
+ * hours do not change while a window is open. It polled at 30 s, which is how
+ * one route came to be read twice a minute under two cache keys: `data/system.ts`
+ * declared a second `useCalendarConfig` for the System page, against the same
+ * `/calendar/config`, with a different key and no poll. It re-exports this one
+ * now, so there is a single entry again.
+ */
 export function useCalendarConfig() {
   return useQuery({
     queryKey: keys.calendar.config,
     queryFn: () => apiFetch<CalendarConfigView>("/calendar/config"),
-    refetchInterval: POLL.slow,
   });
 }
 
@@ -237,4 +253,67 @@ export function dayHours(day: Date): DayHours {
   const [start, end] = dayBounds(day);
   const hours = hoursInSpan(start, end);
   return { hours, short: hours < 24, long: hours > 24 };
+}
+
+/**
+ * `getDay()`'s order, which is Sunday-first and is NOT the grid's order.
+ *
+ * The grid is Monday-first (`monthMatrix`), so the two are deliberately kept
+ * apart: this table indexes what `Date` gives, and the grid does its own
+ * rotation. Sharing one array between them is how a calendar ends up drawing
+ * Saturday's wash on Sunday.
+ */
+const WEEKDAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+
+/**
+ * Whether the daemon counts this local day as one you work.
+ *
+ * Matched on the first three letters, lower-cased: the núcleo writes `"mon"`,
+ * but `"Mon"` and `"monday"` are the two spellings a config file grows on its
+ * own, and a weekday that silently stops matching greys out the wrong column
+ * without ever erroring.
+ *
+ * **A day is working until the config says otherwise.** An absent or empty
+ * `working_weekdays` means every day is ordinary, never that every day is
+ * dimmed — a calendar that greys out the whole month because a config has not
+ * arrived is reporting a fault it does not have.
+ */
+export function isWorkingDay(day: Date, config: CalendarConfigView | undefined): boolean {
+  if (config === undefined || config.working_weekdays.length === 0) return true;
+  const key = WEEKDAY_KEYS[day.getDay()];
+  return config.working_weekdays.some((named) => named.trim().slice(0, 3).toLowerCase() === key);
+}
+
+/**
+ * The instants this day's working hours occupy, or `null` when it has none.
+ *
+ * Built as two local `Date`s on that day rather than as an offset from
+ * midnight, so the pair survives a transition: on a 23-hour day the span from
+ * 09:00 to 18:00 is still nine hours of wall clock, and it is the day AROUND
+ * it that is short. Handing these to `placeInDay` against the same day's
+ * bounds is what puts the wash in the right place without a second piece of
+ * arithmetic that could disagree with the events drawn over it.
+ *
+ * `null` for a non-working day and for hours that will not parse — the wash is
+ * a reading, and a reading nobody can compute is better absent than guessed.
+ */
+export function workingSpan(
+  day: Date,
+  config: CalendarConfigView | undefined,
+): [Date, Date] | null {
+  if (config === undefined || !isWorkingDay(day, config)) return null;
+  const from = atClock(day, config.working_hours_start);
+  const to = atClock(day, config.working_hours_end);
+  if (from === null || to === null || to.getTime() <= from.getTime()) return null;
+  return [from, to];
+}
+
+/** `"09:00"` on a given day, as an instant. `null` for anything that is not `HH:MM`. */
+function atClock(day: Date, clock: string): Date | null {
+  const parsed = /^(\d{1,2}):(\d{2})/.exec(clock.trim());
+  if (parsed === null) return null;
+  const hour = Number(parsed[1]);
+  const minute = Number(parsed[2]);
+  if (hour > 23 || minute > 59) return null;
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate(), hour, minute);
 }

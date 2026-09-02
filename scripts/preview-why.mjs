@@ -17,6 +17,7 @@ import { randomInt } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ownUntilExit } from "./leave-nothing-behind.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHELL = join(ROOT, "shell");
@@ -88,13 +89,20 @@ const chromium = spawn(browser, [
   "--disable-gpu",
   "about:blank",
 ]);
+/* Everything below can fail. None of it can leave the browser or its profile behind. */
+ownUntilExit(chromium, profile);
 
 async function debuggerUrl() {
   const portFile = join(profile, "DevToolsActivePort");
   for (let attempt = 0; attempt < 120; attempt++) {
     if (existsSync(portFile)) {
-      const [port] = readFileSync(portFile, "utf8").split("\n");
       try {
+        /*
+          The read belongs inside the `try`. The file exists for a moment before
+          it can be read, and the EBUSY from reading it too early used to escape
+          this loop and fail the run — a red that said nothing about the app.
+        */
+        const [port] = readFileSync(portFile, "utf8").split("\n");
         const response = await fetch(`http://127.0.0.1:${port.trim()}/json/version`);
         return (await response.json()).webSocketDebuggerUrl;
       } catch {
@@ -166,6 +174,5 @@ for (const line of said.slice(0, 40)) console.log("  " + line.split("\n").slice(
 console.log("\n=== what the page rendered ===");
 console.log(text.result.value);
 
-chromium.kill();
 server.close();
 process.exit(0);

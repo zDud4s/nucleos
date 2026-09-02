@@ -31,6 +31,7 @@ import { randomInt } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ownUntilExit } from "./leave-nothing-behind.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHELL = join(ROOT, "shell");
@@ -145,13 +146,20 @@ const chromium = spawn(browser, [
   `--window-size=${WIDTH},${HEIGHT}`,
   "about:blank",
 ]);
+/* Everything below can fail. None of it can leave the browser or its profile behind. */
+ownUntilExit(chromium, profile);
 
 async function debuggerUrl() {
   const portFile = join(profile, "DevToolsActivePort");
   for (let attempt = 0; attempt < 120; attempt++) {
     if (existsSync(portFile)) {
-      const [port] = readFileSync(portFile, "utf8").split("\n");
       try {
+        /*
+          The read belongs inside the `try`. The file exists for a moment before
+          it can be read, and the EBUSY from reading it too early used to escape
+          this loop and fail the run — a red that said nothing about the app.
+        */
+        const [port] = readFileSync(portFile, "utf8").split("\n");
         const response = await fetch(`http://127.0.0.1:${port.trim()}/json/version`);
         return (await response.json()).webSocketDebuggerUrl;
       } catch {
@@ -229,7 +237,7 @@ await mkdir(SHOTS, { recursive: true });
  * that reads well above the fold and falls apart below it is exactly the defect
  * a viewport-sized screenshot hides.
  */
-async function shoot(name, { path, tab, press, theme = "dark" }) {
+async function shoot(name, { path, tab, press, drag, theme = "dark" }) {
   await send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-color-scheme", value: theme }],
   }, sessionId);
@@ -241,6 +249,9 @@ async function shoot(name, { path, tab, press, theme = "dark" }) {
     /* The label of a button to click once the page has settled — how a surface
        that opens from a control gets photographed at all. See `preview/main.tsx`. */
     ...(press === undefined ? {} : { press }),
+    /* The title of an occurrence to pick up and hold. A drag is a state the
+       page enters, and everything it turns on exists only while it lasts. */
+    ...(drag === undefined ? {} : { drag }),
   });
   await send("Page.navigate", { url: `${origin}/preview.html?${query}` }, sessionId);
 
@@ -410,6 +421,38 @@ const SHOTS_TO_TAKE = [
      the junction reached without scrolling a matrix, and the seam still above
      it — the one thing §16.5 says a view may not take with it. */
   ["36-map-junction", { path: "/projects/alpha/map", press: "Junction" }],
+
+  /* The calendar. Its month, view and selected day come out of the URL, so
+     these are reloads rather than clicks the harness has to fake — the same
+     move the inspector made, and the only way the week of a clock change is
+     reachable at all.
+
+     The clock is pinned in `preview/main.tsx` to the week the fixtures live
+     in. Without that a calendar photographs a different month every day and
+     two shots can never be compared. */
+  ["50-calendar-month", { path: "/calendar?on=2026-08-24" }],
+  ["51-calendar-month-light", { path: "/calendar?on=2026-08-24", theme: "light" }],
+  /* Tuesday the 25th: three meetings genuinely overlapping at ten in the
+     morning, which is the only thing that exercises the lane arithmetic — and
+     the one shape the month grid cannot draw at all. */
+  ["52-calendar-week", { path: "/calendar?view=week&on=2026-08-25" }],
+  ["53-calendar-week-light", { path: "/calendar?view=week&on=2026-08-25", theme: "light" }],
+  /* Lisbon's 23-hour day. Six columns of 24 bands and one of 23, with the
+     badge in its heading that says why. If the compression reads as a
+     rendering fault rather than as the fact it is, this is the picture that
+     will say so. */
+  ["54-calendar-dst-week", { path: "/calendar?view=week&on=2026-03-29" }],
+  /* A month with nothing in it, which must read as an empty calendar and not
+     as a page that failed to load — the state every grid gets wrong first. */
+  ["55-calendar-empty", { path: "/calendar?on=2027-02-15" }],
+  ["56-calendar-empty-light", { path: "/calendar?on=2027-02-15", theme: "light" }],
+  /* Mid-drag, which is the only state where the drop targets exist at all —
+     and the one thing about dragging no test can judge: whether the dashed
+     "this would take it" reads as a different thing from the solid selection
+     ring, and whether thirty-odd outlined cells at once is legible or a mess. */
+  ["57-calendar-dragging", { path: "/calendar?on=2026-08-24", drag: "Reconcile the ledger" }],
+  ["58-calendar-dragging-light", { path: "/calendar?on=2026-08-24", drag: "Reconcile the ledger", theme: "light" }],
+  ["59-calendar-week-dragging", { path: "/calendar?view=week&on=2026-08-25", drag: "Design review" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));
@@ -423,6 +466,5 @@ for (const [name, options] of wanted) {
 console.log("\npreview: " + wanted.length + " shots in " + SHOTS);
 if (!clean) console.log("preview: at least one page threw — see the lines above");
 
-chromium.kill();
 server.close();
 process.exit(0);

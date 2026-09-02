@@ -775,7 +775,22 @@ export function daemonText(state: DaemonState): (path: string) => Promise<string
 }
 
 export interface HarnessResult extends RenderResult {
-  router: { state: { location: { pathname: string } } };
+  /**
+   * Enough of the router for a test to assert where the app ended up.
+   *
+   * `search` alongside `pathname`, because for some pages the location is not
+   * only a path: `/calendar` carries its view and its selected day there, and
+   * `/feed` and `/runs` carry their filters. A test that could only see the
+   * pathname could not tell a page that keeps its URL honest from one that
+   * quietly stops updating it.
+   *
+   * `unknown` and not a record, because that is what the router itself says
+   * here: this tree is built without the app's `validateSearch`, so nothing
+   * has promised a shape. A test narrows it to the fields it is asserting on,
+   * which is a one-line cast from `unknown` rather than a claim layered over a
+   * type that disagrees.
+   */
+  router: { state: { location: { pathname: string; search: unknown } } };
   queryClient: QueryClient;
 }
 

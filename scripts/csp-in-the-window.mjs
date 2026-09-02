@@ -92,11 +92,12 @@
  * Usage: node scripts/csp-in-the-window.mjs
  */
 import { spawn } from "node:child_process";
-import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ownUntilExit } from "./leave-nothing-behind.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHELL = join(REPO, "shell");
@@ -169,14 +170,17 @@ console.log("            built " + statSync(EXE).mtime.toISOString() + "\n");
 /* ---------------------------------------------------------------- the window */
 
 const app = spawn(EXE, [], { stdio: "ignore" });
+/*
+  Owned rather than stopped at the end. Every `die()` below used to leave the
+  window running, and `app.kill()` would not have been enough even where it was
+  called: the WebView2 processes are the application's children, so killing only
+  the root orphans them under a name nobody can tell from the system's own.
+*/
+ownUntilExit(app, scratch);
 let appAlive = true;
 app.on("exit", () => {
   appAlive = false;
 });
-
-function stop() {
-  if (appAlive) app.kill();
-}
 
 async function attach() {
   const deadline = Date.now() + ATTACH_TIMEOUT;
@@ -204,8 +208,6 @@ let page;
 try {
   page = await attach();
 } catch (error) {
-  stop();
-  await rm(scratch, { recursive: true, force: true }).catch(() => {});
   die(error.message);
 }
 console.log("ok   attached");
@@ -304,7 +306,6 @@ async function waitForMount() {
 }
 
 if (!(await waitForMount())) {
-  stop();
   die("the application never rendered anything into #root within " + MOUNT_TIMEOUT / 1000 + "s");
 }
 // A moment past first paint: the shell's own queries land after it, and a refusal caused by one of
@@ -494,8 +495,6 @@ if (routeViolations.length === 0) {
 /* ------------------------------------------------------------------ the end */
 
 socket.close();
-stop();
-await rm(scratch, { recursive: true, force: true }).catch(() => {});
 
 if (failed) {
   console.error("\ncsp window: FAILED. What ships is not what the gate measured.");

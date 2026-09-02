@@ -43,11 +43,12 @@
 import { createServer } from "node:http";
 import { randomInt } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, mkdtemp } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, extname, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ownUntilExit } from "./leave-nothing-behind.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHELL = join(REPO, "shell");
@@ -198,13 +199,20 @@ const chromium = spawn(browser, [
   "--window-size=1280,900",
   "about:blank",
 ]);
+/* Everything below can fail. None of it can leave the browser or its profile behind. */
+ownUntilExit(chromium, profile);
 
 async function debuggerUrl() {
   const portFile = join(profile, "DevToolsActivePort");
   for (let attempt = 0; attempt < 120; attempt++) {
     if (existsSync(portFile)) {
-      const [port] = readFileSync(portFile, "utf8").split("\n");
       try {
+        /*
+          The read belongs inside the `try`. The file exists for a moment before
+          it can be read, and the EBUSY from reading it too early used to escape
+          this loop and fail the gate — a red that said nothing about the app.
+        */
+        const [port] = readFileSync(portFile, "utf8").split("\n");
         const response = await fetch(`http://127.0.0.1:${port.trim()}/json/version`);
         return (await response.json()).webSocketDebuggerUrl;
       } catch {
@@ -372,9 +380,7 @@ if (sawElement && sawAttribute) {
 }
 
 socket.close();
-chromium.kill();
 server.close();
-await rm(profile, { recursive: true, force: true }).catch(() => {});
 
 if (failed) {
   console.error(

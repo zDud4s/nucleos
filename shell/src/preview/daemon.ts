@@ -6,6 +6,8 @@ import type {
   InspectMatch,
   ProjectRules,
 } from "../data/projects";
+import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
+import type { PendingNotification } from "../data/feed";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, ProjectSummary } from "../data/system";
@@ -30,7 +32,7 @@ import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "..
 
 const DAY = 86_400_000;
 /** Fixed, because a screenshot taken twice should be the same screenshot. */
-const NOW = Date.parse("2026-08-24T09:41:00Z");
+export const NOW = Date.parse("2026-08-24T09:41:00Z");
 
 function ago(ms: number): string {
   return new Date(NOW - ms).toISOString();
@@ -926,6 +928,161 @@ const MATCHES: InspectMatch[] = [
   },
 ];
 
+/* --------------------------------------------------------------- calendar -- */
+
+/**
+ * A month with something to look at in it.
+ *
+ * **The dates are absolute and pinned to {@link NOW}'s week**, and the harness
+ * freezes the clock to match (`preview/main.tsx`). A calendar drawn against a
+ * real clock photographs a different month every day, which makes two shots
+ * impossible to compare and makes "is this right?" unanswerable.
+ *
+ * Deliberately awkward, like the rest of this file. There is a day carrying
+ * more than three occurrences, so the `+n more` count is in the picture; a
+ * morning with three genuinely overlapping meetings, which is the only thing
+ * that exercises the lane arithmetic; a proposal, which has a tone of its own;
+ * an occurrence an exception has MOVED, whose `occurrence_local` is therefore
+ * a different day from where it draws; and a Saturday with something on it, so
+ * a non-working day is not photographed empty and therefore unstyled.
+ */
+function occurrence(
+  eventId: number,
+  title: string,
+  local: string,
+  minutes: number,
+  extra: { source?: string; movedTo?: string } = {},
+): EventOccurrence {
+  /*
+    The fixture's zone is UTC+1 — August in Lisbon, which is the machine this
+    app runs on. Written as an explicit offset rather than through a `Date`
+    built from the local string, so the fixture states what the daemon would
+    send instead of re-deriving it with the same arithmetic the page uses.
+  */
+  const at = `${extra.movedTo ?? local}+01:00`;
+  const starts = new Date(at);
+  return {
+    event_id: eventId,
+    title,
+    source: extra.source ?? "human",
+    // The ORIGINAL local start, which SURVIVES a move and is the identity.
+    occurrence_local: local,
+    starts_at: starts.toISOString(),
+    ends_at: new Date(starts.getTime() + minutes * 60_000).toISOString(),
+  };
+}
+
+export const CALENDAR: EventOccurrence[] = [
+  /* Monday: an ordinary day. */
+  occurrence(1, "Standup", "2026-08-24T09:30:00", 15),
+  occurrence(2, "Reconcile the ledger", "2026-08-24T11:00:00", 90),
+  occurrence(3, "Call with the accountant", "2026-08-24T16:00:00", 45),
+
+  /* Tuesday: three at once — the case the month cannot draw and the week can. */
+  occurrence(4, "Design review", "2026-08-25T10:00:00", 60),
+  occurrence(5, "Interview — backend", "2026-08-25T10:15:00", 45),
+  occurrence(6, "Vendor call", "2026-08-25T10:30:00", 30),
+  occurrence(7, "Retro", "2026-08-25T15:00:00", 60),
+
+  /* Wednesday: more than three, so the month has to count the rest. */
+  occurrence(8, "Standup", "2026-08-26T09:30:00", 15),
+  occurrence(9, "Pairing on the migration", "2026-08-26T10:00:00", 120),
+  occurrence(10, "Lunch with the Vendas team", "2026-08-26T13:00:00", 60),
+  occurrence(11, "Security review", "2026-08-26T15:00:00", 60),
+  occurrence(12, "Write up the quarter", "2026-08-26T17:00:00", 45),
+
+  /* Thursday: a proposal nobody has approved, and a title long enough to be cut. */
+  occurrence(13, "Draft the reply to the auditor's third question", "2026-08-27T09:00:00", 30),
+  occurrence(14, "Quarterly planning", "2026-08-27T14:00:00", 120, { source: "proposal" }),
+
+  /* Friday: an occurrence an exception moved here from Thursday. */
+  occurrence(15, "Moved: budget sign-off", "2026-08-27T11:00:00", 60, {
+    movedTo: "2026-08-28T11:00:00",
+  }),
+
+  /* Saturday, so a non-working day is not photographed empty. */
+  occurrence(16, "Football", "2026-08-29T10:00:00", 90),
+
+  /* The week before and the week after, so the month is not one busy row. */
+  occurrence(17, "Standup", "2026-08-17T09:30:00", 15),
+  occurrence(18, "One-to-one", "2026-08-18T14:00:00", 30),
+  occurrence(19, "Board pack due", "2026-08-31T09:00:00", 60),
+  occurrence(20, "Standup", "2026-09-01T09:30:00", 15),
+];
+
+/**
+ * The week of a clock change, so the 23-hour column can be photographed.
+ *
+ * Lisbon jumps 01:00 WET to 02:00 WEST on 29 March 2026. The offsets here are
+ * therefore `+00:00` on the Saturday and `+01:00` on the Sunday — written out
+ * rather than computed, because the whole point of the shot is to check that
+ * the page reaches the same conclusion by itself.
+ */
+export const CALENDAR_DST: EventOccurrence[] = [
+  {
+    event_id: 30,
+    title: "Late one",
+    source: "human",
+    occurrence_local: "2026-03-28T23:00:00",
+    starts_at: "2026-03-28T23:00:00Z",
+    ends_at: "2026-03-29T00:00:00Z",
+  },
+  {
+    event_id: 31,
+    title: "Morning after the clocks",
+    source: "human",
+    occurrence_local: "2026-03-29T10:00:00",
+    starts_at: "2026-03-29T09:00:00Z",
+    ends_at: "2026-03-29T10:00:00Z",
+  },
+  {
+    event_id: 32,
+    title: "Brunch",
+    source: "human",
+    occurrence_local: "2026-03-29T11:30:00",
+    starts_at: "2026-03-29T10:30:00Z",
+    ends_at: "2026-03-29T12:00:00Z",
+  },
+];
+
+/** Working hours and weekdays, which the grid draws as a wash and a dimming. */
+export const CALENDAR_CONFIG: CalendarConfigView = {
+  default_tz: "Europe/Lisbon",
+  working_hours_start: "09:00",
+  working_hours_end: "18:00",
+  working_weekdays: ["mon", "tue", "wed", "thu", "fri"],
+};
+
+/**
+ * What the calendar held back, and what it later let through.
+ *
+ * Both lists non-empty, because the panel keeps them apart and a preview with
+ * only one of them photographs half a component.
+ */
+export const HELD: PendingNotification[] = [
+  {
+    id: 1,
+    kind: "email_arrived",
+    summary: "The accountant replied about the Q3 reconciliation.",
+    queued_at: ago(22 * 60_000),
+    delivered_at: null,
+  },
+  {
+    id: 2,
+    kind: "run_finished",
+    summary: "nucleos/job-24 finished — the gate passed on the third attempt.",
+    queued_at: ago(41 * 60_000),
+    delivered_at: null,
+  },
+  {
+    id: 3,
+    kind: "proposal_raised",
+    summary: "Marketing wants to put a quarterly planning block in the calendar.",
+    queued_at: ago(3 * 3_600_000),
+    delivered_at: ago(2 * 3_600_000),
+  },
+];
+
 /* ---------------------------------------------------------------- the map -- */
 
 /**
@@ -1206,6 +1363,31 @@ export function answer(path: string, init?: RequestInit): unknown {
     if (reader === "ls") return TREE[query.get("path") ?? ""] ?? [];
     return query.get("q") === null ? [] : MATCHES;
   }
+
+  /*
+    The calendar's three reads. `events` is the only one that carries a window,
+    and it is answered by FILTERING rather than by returning the whole fixture:
+    the page asks for the six weeks it draws, and a fake that ignored `from`
+    and `to` would photograph a March event in the August grid — which is
+    precisely the class of defect the DST shot exists to catch.
+
+    Filtered on `starts_at`, and not on `occurrence_local`, because that is
+    what `recurrence.rs`'s `expand` does — the fixture's moved occurrence is in
+    the answer for the week it was moved TO, and the page is expected to draw
+    it there.
+  */
+  if (route === "/calendar/events") {
+    const from = Date.parse(query.get("from") ?? "");
+    const to = Date.parse(query.get("to") ?? "");
+    if (Number.isNaN(from) || Number.isNaN(to)) return [];
+    return [...CALENDAR, ...CALENDAR_DST].filter((occurrence) => {
+      const starts = Date.parse(occurrence.starts_at);
+      return Date.parse(occurrence.ends_at) > from && starts < to;
+    });
+  }
+  if (path === "/calendar/busy") return { busy: true };
+  if (path === "/calendar/config") return CALENDAR_CONFIG;
+  if (path === "/notifications/pending") return HELD;
 
   /*
     The four readings the State mode leads with — and the reason that mode
