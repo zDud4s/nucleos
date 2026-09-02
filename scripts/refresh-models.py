@@ -17,6 +17,17 @@ Each half reads a source its own vendor publishes, and neither needs a key:
   codex   `~/.codex/models_cache.json`, which the Codex CLI writes and refreshes itself. Local and
           free, and it carries each model's own reasoning levels the same way.
 
+  openrouter
+          `GET /api/v1/models`, public and keyless. This half is the OTHER SHAPE and the difference
+          is the point: it does not choose, it CHECKS. The endpoint serves 423 models and no filter
+          makes a menu of them — "supports tools, 100k+ of context, not free" still leaves 322 — so
+          WHICH hosted models the picker offers stays a person's choice, written here by hand. What
+          a person cannot do is re-read 423 entries to notice that one of theirs stopped existing.
+          So the file is its own allowlist: every `brain: openrouter` row already in it is looked
+          up, its label refreshed from the catalogue's own name, and an id that is GONE is reported
+          along with the surviving ids nearest to it. Adding a hosted model is writing its id and
+          running this — the rest fills itself in.
+
 Sources considered and rejected for the Claude half, so nobody re-treads them: `~/.claude` holds no
 catalogue; `stats-cache.json` is models USED and goes stale; the CLI binary contains every model it
 has ever known — `claude-instant-1` included — so names read out of it are history, not
@@ -27,7 +38,11 @@ What the docs cannot say is what YOUR plan may reach. They list what exists; ent
 separate question no public source answers, so a model on the menu can still be refused at spawn.
 
 Usage:
-    python scripts/refresh-models.py [--dry-run] [--only claude|codex] [--limit N] [--legacy]
+    python scripts/refresh-models.py [--dry-run] [--only claude|codex|openrouter] [--limit N]
+                                     [--legacy]
+
+Exit status is 1 when any half could not be refreshed OR when a hosted id no longer exists, so a
+scheduled run reports the stale menu rather than only printing about it.
 
 The daemon re-reads the file per request, so nothing needs restarting for a refresh to take.
 """
@@ -38,6 +53,7 @@ import argparse
 import json
 import os
 import pathlib
+import difflib
 import re
 import sys
 import urllib.error
@@ -50,6 +66,35 @@ CODEX_CACHE = pathlib.Path.home() / ".codex" / "models_cache.json"
 DOCS = "https://platform.claude.com/docs/en"
 MODELS_DOC = f"{DOCS}/about-claude/models/overview.md"
 EFFORT_DOC = f"{DOCS}/build-with-claude/effort.md"
+
+# The same endpoint `capabilities.rs::discover_openrouter` already reads at runtime for a model's
+# context window. Public: no key, no account, no rate limit worth a retry.
+OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
+
+# What `--suggest` narrows to when nobody names a category. Every category OpenRouter serves holds
+# 19 or 20 models, and this is the one this app is for; the others (`roleplay`, `legal`, `finance`,
+# `health`, and seven more) are a keystroke away for anyone who wants them.
+DEFAULT_CATEGORY = "programming"
+
+# Appended to every hosted label. The vendor is already in the model's name; what the row has to
+# say, in a menu that also lists models the local CLI spawns, is WHERE this one runs.
+HOSTED_SUFFIX = " (OpenRouter)"
+
+# Weakest to strongest, which is the order `efforts` is documented in and the order the picker
+# draws. OpenRouter serves seven words, listed strongest-first and per model: the daemon's own
+# `config::EFFORT_LEVELS` plus `minimal` and `none`. Those two are fine to write when the time
+# comes — `is_effort_level` checks the UNION of what this file declares, not that constant.
+EFFORT_LADDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+# Where the hosted wire stands, and the ONE line to change when it moves.
+#
+# `openrouter.rs::exchange` builds its request body from `model`, `messages` and — when there are
+# any — `tools`. There is no `reasoning` key and no `effort`. Meanwhile `efforts` on a choice is
+# exactly what the picker draws its dial from (`Chats.tsx`), so filling these rows in from the
+# catalogue would put a slider on screen that turns and reaches nothing. That is a worse answer
+# than no slider, so the levels are read and REPORTED on every run and written by none of them.
+# The day `exchange` learns to send one, this flips and the answer is already in hand.
+HOSTED_TAKES_EFFORT = False
 
 # Invitation-only (Project Glasswing). It appears in the effort page's supported list, so it would
 # otherwise be picked up as a model with a dial — and put on a menu nobody here can select from.
@@ -74,6 +119,16 @@ BANNER = f"""# ─────────────────────�
 # do mais fraco para o mais forte; vazio quer dizer que não tem mostrador. `runner` diz qual CLI o
 # corre, e o daemon mostra só os do CLI com que foi arrancado — por isso as duas listas podem viver
 # aqui lado a lado.
+#
+# As linhas `brain: openrouter` são as alojadas, e a escolha de QUAIS é de quem escreve o ficheiro:
+# o catálogo do OpenRouter serve mais de quatrocentos modelos e nenhum filtro faz um menu deles. O
+# script não as inventa — verifica-as. Confirma que o `id` ainda existe (e grita, com os ids vivos
+# mais parecidos, quando deixou de existir) e refaz o `label` a partir do nome do próprio catálogo.
+# Para acrescentar um modelo alojado basta a linha com o `id`; o resto preenche-se na próxima
+# passagem. Sem `runner` de propósito: chegam-se por HTTP, não são lançados por CLI nenhum, e por
+# isso não são filtradas pelo `active_runner()` — aparecem no menu seja qual for a CLI que corre.
+# `efforts` fica como está: o `openrouter.rs::exchange` manda `model`, `messages` e `tools` e mais
+# nada, portanto um mostrador escrito aqui rodava sem chegar ao fio.
 # ─────────────────────────────────────────────────────────────"""
 
 
@@ -265,7 +320,211 @@ def codex_models() -> list[dict] | None:
     ]
 
 
+# ----------------------------------------------------------------------- openrouter --
+
+
+def openrouter_catalogue() -> dict[str, dict] | None:
+    """Every model OpenRouter currently serves, keyed by id. `None` on any failure, having said why.
+
+    `None` and an empty dict are deliberately not the same answer. Every caller of this treats
+    `None` as "leave the hosted rows exactly as they are", so a catalogue that came back readable
+    but EMPTY must not reach them as a fact — it would mark every id on the menu as dead in one
+    pass, which is the loudest possible way to be wrong about a network hiccup.
+    """
+    text = fetch(OPENROUTER_MODELS)
+    if text is None:
+        fail("the hosted half is unchanged")
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        fail(f"the OpenRouter catalogue did not parse ({error}) — the hosted half is unchanged")
+        return None
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    served = {
+        entry["id"]: entry
+        for entry in (entries or [])
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry["id"]
+    }
+    if not served:
+        fail("the OpenRouter catalogue named no models — the hosted half is unchanged")
+        return None
+    return served
+
+
+def openrouter_efforts(entry: dict) -> list[str]:
+    """PURE: the levels THAT model takes, weakest-first. Empty when the catalogue does not say.
+
+    Three shapes mean three different things and only the last one answers this question:
+    `reasoning: null` is a model that does not reason, `reasoning: {"mandatory": false}` with no
+    levels is one that reasons and publishes no vocabulary (`anthropic/claude-sonnet-4.5` is one
+    today), and `supported_efforts` is the vocabulary itself — strongest-first, which is the
+    opposite of this file's contract.
+
+    Filtered THROUGH the ladder rather than sorted by it: a word this repo has never seen has no
+    place on a slider, and putting it at a guessed magnitude is worse than leaving it off.
+    """
+    published = ((entry.get("reasoning") or {}).get("supported_efforts")) or []
+    return [level for level in EFFORT_LADDER if level in published]
+
+
+def nearest_surviving(gone: str, served: dict[str, dict]) -> list[str]:
+    """PURE: ids that still exist and look like the one that does not, closest first.
+
+    "It is gone" is only half an answer. The usual cause is a version bump under the same author,
+    so the replacement is a few characters from the name that died — and naming it turns a
+    complaint into something somebody can act on without opening a browser. Same author first,
+    because the whole catalogue would happily rank another vendor's near-namesake above the real
+    heir; the whole catalogue is the fallback, because an author gets renamed too.
+    """
+    author = gone.split("/")[0]
+    same = [model_id for model_id in served if model_id.split("/")[0] == author]
+    close = difflib.get_close_matches(gone, same, n=3, cutoff=0.5)
+    return close or difflib.get_close_matches(gone, list(served), n=3, cutoff=0.6)
+
+
+def openrouter_category(category: str) -> list[dict] | None:
+    """OpenRouter's own shortlist for one category, in the order it ranks them. `None` on failure.
+
+    A LIST and not a dict, because the order is the answer: this endpoint is the only thing between
+    a person and 423 models, and it is somebody at OpenRouter having decided which twenty are worth
+    a look. Nothing here can reproduce that judgement, and every mechanical stand-in tried for it
+    failed — `supports tools, 100k+ of context, not free` leaves 322, and `order=top-weekly` is
+    accepted and returns the identical order, so there is no popularity signal to sort on.
+
+    Note it cannot be combined with `supported_parameters`: sending both is a 400 from the server,
+    which is why `worth_offering` does that half here.
+    """
+    text = fetch(f"{OPENROUTER_MODELS}?category={category}")
+    if text is None:
+        fail(f"no suggestions for '{category}'")
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        fail(f"the '{category}' shortlist did not parse ({error})")
+        return None
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not entries:
+        fail(f"'{category}' named no models — is it a category OpenRouter has?")
+        return None
+    return [entry for entry in entries if isinstance(entry, dict) and entry.get("id")]
+
+
+def worth_offering(entry: dict) -> bool:
+    """PURE: whether a catalogue entry belongs on a menu a person has to read.
+
+    Two rules, and both are about entries that would FAIL rather than merely disappoint:
+
+    `:` marks a variant of a model whose plain id is already on the same shortlist. `:free` is
+    rate-limited hard enough to die in the middle of a turn, and `:batch` is an asynchronous
+    endpoint that does not answer a chat request at all — offering either is offering the same
+    model twice, once in a form that breaks.
+
+    `tools` because the assistant loop IS a tool loop: `openrouter.rs::exchange` sends a `tools`
+    array, and a model that ignores it can describe the work but never do any of it. That is not a
+    weaker model on the menu, it is a model that cannot do the one thing this app is for.
+    """
+    if ":" in entry.get("id", ""):
+        return False
+    return "tools" in (entry.get("supported_parameters") or [])
+
+
+def suggest(entries: list[dict], already: set[str]) -> list[dict]:
+    """PURE: the shortlist worth offering, minus what the file already has, as rows in its shape.
+
+    Rows and not prose, so what is printed is what gets pasted — `render_row` writes them in the
+    file's own format, and a suggestion that has to be retyped is a suggestion with a typo in it.
+    """
+    return [
+        {
+            "id": entry["id"],
+            "label": hosted_label(entry, entry["id"]),
+            "brain": "openrouter",
+            # Empty for the same reason every hosted row's is: see `HOSTED_TAKES_EFFORT`.
+            "efforts": [],
+        }
+        for entry in entries
+        if worth_offering(entry) and entry["id"] not in already
+    ]
+
+
+def hosted_label(entry: dict, fallback: str) -> str:
+    """`Anthropic: Claude Sonnet 4.5` -> `Claude Sonnet 4.5 (OpenRouter)`.
+
+    The vendor prefix goes because the model's own name carries it — `Claude Sonnet 4.5` in a menu
+    is not ambiguous about who made it — and the suffix comes because that is the fact the row
+    exists to state. Bounded at 30 characters so a colon in the middle of a long name is not read
+    as a prefix; the longest real one is `Thinking Machines`, and 27 of the 423 names have none.
+    """
+    name = (entry.get("name") or "").strip()
+    if not name:
+        return fallback
+    return re.sub(r"^[^:]{1,30}:\s*", "", name) + HOSTED_SUFFIX
+
+
+def refresh_hosted(rows: list[dict], served: dict[str, dict]) -> tuple[list[dict], list[str]]:
+    """PURE: each hand-written hosted row against the live catalogue.
+
+    Returns the rows to write and the problems to shout about. A row whose id is GONE is KEPT, and
+    that is the load-bearing decision: `.ai/nucleos-models.yaml` is gitignored, so a row this
+    script quietly deleted would leave no diff, no history and nothing at all to notice — the exact
+    silent staleness the script exists to prevent, committed by the script itself. Dropping a
+    person's configuration is also not a refresher's call to make. It says so instead, and `main`
+    turns any problem into a non-zero exit.
+    """
+    written: list[dict] = []
+    problems: list[str] = []
+    for row in rows:
+        entry = served.get(row["id"])
+        if entry is None:
+            heirs = nearest_surviving(row["id"], served)
+            suggestion = f" — nearest surviving: {', '.join(heirs)}" if heirs else ""
+            problems.append(
+                f"{row['id']} is no longer served by OpenRouter{suggestion}. It is still on the "
+                "menu, and a turn that picks it will die at the first request."
+            )
+            written.append(dict(row))
+            continue
+        fresh = dict(row)
+        fresh["label"] = hosted_label(entry, row.get("label", row["id"]))
+        if HOSTED_TAKES_EFFORT:
+            fresh["efforts"] = openrouter_efforts(entry)
+        written.append(fresh)
+    return written, problems
+
+
 # --------------------------------------------------------------------------- writing --
+
+
+def surviving(kept: list[dict], runner: str) -> list[dict]:
+    """The rows a half keeps when it could not be refreshed, or was not asked to be."""
+    return [
+        choice
+        for choice in kept
+        # Absent `runner` has always meant `claude`, matching the daemon's own default.
+        if (choice.get("runner") or "claude") == runner
+        # ...but only among the CLOUD rows, which are the only ones the CLI halves refresh. A
+        # `brain: openrouter` row carries no runner (it is reached over HTTP, not spawned as
+        # either CLI), so without this it would be bucketed as `claude` and re-emitted by
+        # `render` with a `runner:` it never had.
+        and choice.get("brain", "cloud") == "cloud"
+    ]
+
+
+def hosted_rows(kept: list[dict]) -> list[dict]:
+    """The rows the OpenRouter half checks: somebody's choice of which hosted models to offer."""
+    return [choice for choice in kept if choice.get("brain") == "openrouter"]
+
+
+def other_rows(kept: list[dict]) -> list[dict]:
+    """Everything else — no half here reads it, so no half here may rewrite it.
+
+    Empty today. It is the door for a `brain` this script has never heard of: carrying an unknown
+    row through untouched costs nothing, and dropping one would delete configuration on every run
+    for the crime of being newer than this file.
+    """
+    return [choice for choice in kept if choice.get("brain", "cloud") not in ("cloud", "openrouter")]
 
 
 def existing_choices(text: str) -> list[dict]:
@@ -280,22 +539,28 @@ def existing_choices(text: str) -> list[dict]:
     return choices if isinstance(choices, list) else []
 
 
+def render_row(choice: dict) -> str:
+    """One model, flow-style, because that is what a person scanning this file wants.
+
+    Its own function so `--suggest` can print a line that is byte-identical to the one a refresh
+    would write. A suggestion somebody has to retype is a suggestion with a typo in it.
+    """
+    efforts = ", ".join(choice.get("efforts") or [])
+    # OMITTED rather than written empty when there is none: a hosted row has no runner, and
+    # `runner: None` — which is what an f-string makes of Python's `None` — is read back by YAML
+    # as the STRING "None", a runner the daemon does not know. `config.rs` falls unknown names
+    # to `claude`, so the row would then be filtered off the menu by `active_runner()` on any
+    # machine running Codex, for a value nobody wrote.
+    runner = f", runner: {choice['runner']}" if choice.get("runner") else ""
+    return (
+        f"  - {{ id: {json.dumps(choice['id'])}, label: {json.dumps(choice['label'])}, "
+        f"brain: {choice['brain']}{runner}, efforts: [{efforts}] }}"
+    )
+
+
 def render(choices: list[dict]) -> str:
-    """One model per line, flow-style, because that is what a person scanning this file wants."""
-    lines = [BANNER, f"{KEY}:"]
-    for choice in choices:
-        efforts = ", ".join(choice.get("efforts") or [])
-        # OMITTED rather than written empty when there is none: a hosted row has no runner, and
-        # `runner: None` — which is what an f-string makes of Python's `None` — is read back by YAML
-        # as the STRING "None", a runner the daemon does not know. `config.rs` falls unknown names
-        # to `claude`, so the row would then be filtered off the menu by `active_runner()` on any
-        # machine running Codex, for a value nobody wrote.
-        runner = f", runner: {choice['runner']}" if choice.get("runner") else ""
-        lines.append(
-            f"  - {{ id: {json.dumps(choice['id'])}, label: {json.dumps(choice['label'])}, "
-            f"brain: {choice['brain']}{runner}, efforts: [{efforts}] }}"
-        )
-    return "\n".join(lines)
+    """The whole block: the banner this script owns, the key, and one line per model."""
+    return "\n".join([BANNER, f"{KEY}:", *(render_row(choice) for choice in choices)])
 
 
 def splice(text: str, block: str) -> str:
@@ -332,8 +597,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the block, write nothing")
     parser.add_argument(
         "--only",
-        choices=["claude", "codex"],
-        help="refresh one half and leave the other exactly as it is",
+        choices=["claude", "codex", "openrouter"],
+        help="refresh one half and leave the others exactly as they are",
     )
     parser.add_argument(
         "--legacy",
@@ -348,6 +613,16 @@ def main() -> int:
         help="keep at most N models per CLI, strongest first (0 = all). Useful with --legacy, "
         "which is a long menu; the trim is printed rather than done silently",
     )
+    parser.add_argument(
+        "--suggest",
+        nargs="?",
+        const=DEFAULT_CATEGORY,
+        metavar="CATEGORY",
+        help="print the hosted models OpenRouter shortlists for a category (default: "
+        f"{DEFAULT_CATEGORY}) as lines ready to paste, and write NOTHING. Which hosted models "
+        "the picker offers stays a person's choice; this only narrows what that choice is made "
+        "from, since the full catalogue is 400+ models and no filter makes a menu of it",
+    )
     args = parser.parse_args()
 
     if not CONFIG.exists():
@@ -356,28 +631,23 @@ def main() -> int:
     text = CONFIG.read_text(encoding="utf-8")
     kept = existing_choices(text)
 
-    def surviving(runner: str) -> list[dict]:
-        return [
-            choice
-            for choice in kept
-            # Absent `runner` has always meant `claude`, matching the daemon's own default.
-            if (choice.get("runner") or "claude") == runner
-            # ...but only among the CLOUD rows, which are the only ones this script refreshes. A
-            # `brain: openrouter` row carries no runner (it is reached over HTTP, not spawned as
-            # either CLI), so without this it would be bucketed as `claude` and re-emitted by
-            # `render` with a `runner:` it never had.
-            and choice.get("brain", "cloud") == "cloud"
-        ]
-
-    def hand_written() -> list[dict]:
-        """The rows this script does not own: anything that is not a cloud CLI model.
-
-        This block is documented in the file as being written by this script, and it is — for the
-        CLI models it reads from the vendors. The hosted (`brain: openrouter`) rows are somebody's
-        deliberate choice of which models the picker offers, and nothing here can regenerate them,
-        so a refresh that dropped them would silently delete configuration every time it ran.
-        """
-        return [choice for choice in kept if choice.get("brain", "cloud") != "cloud"]
+    if args.suggest:
+        entries = openrouter_category(args.suggest)
+        if entries is None:
+            return 1
+        rows = suggest(entries, {choice.get("id") for choice in kept})
+        offered = len([entry for entry in entries if worth_offering(entry)])
+        print(
+            f"openrouter: {len(entries)} shortlisted for '{args.suggest}', {offered} worth "
+            f"offering, {len(rows)} not already in the file"
+        )
+        if not rows:
+            print("nothing to add — the file already has every one of them")
+            return 0
+        print("\nPaste any of these among the `brain: openrouter` rows:\n")
+        for row in rows:
+            print(render_row(row))
+        return 0
 
     refreshed: list[dict] = []
     complained = False
@@ -388,12 +658,12 @@ def main() -> int:
     )
     for runner, read in sources:
         if args.only is not None and args.only != runner:
-            refreshed += surviving(runner)
+            refreshed += surviving(kept, runner)
             continue
         found = read()
         if found is None:
             complained = True
-            survivors = surviving(runner)
+            survivors = surviving(kept, runner)
             # A half that could not be refreshed keeps what the file already had. When the file had
             # nothing, the daemon's own shipped list stands in — otherwise this script would turn
             # "could not reach the API" into "this daemon offers one model", which is a worse lie
@@ -425,16 +695,39 @@ def main() -> int:
             print(f"  {choice['id']:<28} {choice['label']:<22} efforts={choice['efforts']}")
         refreshed += found
 
-    if not refreshed:
-        fail("nothing to write — neither half could be read and the file names none")
-        return 1
-
-    # Carried through untouched, after the cloud models, because the menu is written in the order
-    # the window offers it and the CLI's own models are what a person reaches for most.
-    hosted = hand_written()
-    if hosted:
-        print(f"kept {len(hosted)} hand-written row(s) this script does not refresh")
+    # After the cloud models, because the menu is written in the order the window offers it and the
+    # CLI's own models are what a person reaches for most.
+    hosted = hosted_rows(kept)
+    if hosted and (args.only is None or args.only == "openrouter"):
+        served = openrouter_catalogue()
+        if served is None:
+            complained = True
+        else:
+            hosted, problems = refresh_hosted(hosted, served)
+            print(f"openrouter: {len(hosted)} hand-written row(s) against {len(served)} served")
+            for choice in hosted:
+                entry = served.get(choice["id"])
+                # The levels the catalogue publishes, printed on every pass and written on none —
+                # see `HOSTED_TAKES_EFFORT`. Printing them is what keeps that gap visible instead
+                # of leaving it as a comment nobody re-reads.
+                levels = openrouter_efforts(entry) if entry else []
+                dial = f"offers efforts={levels}" if levels else ""
+                mark = " " if entry else "!"
+                print(f"  {mark}{choice['id']:<34} {choice['label']:<30} {dial}".rstrip())
+            for problem in problems:
+                fail(problem)
+            complained = complained or bool(problems)
     refreshed += hosted
+
+    # Untouched, and last: no half here can read them, so no half here may rewrite them.
+    unknown = other_rows(kept)
+    if unknown:
+        print(f"kept {len(unknown)} row(s) of a kind this script does not refresh")
+    refreshed += unknown
+
+    if not refreshed:
+        fail("nothing to write — no half could be read and the file names none")
+        return 1
 
     block = render(refreshed)
     if args.dry_run:
