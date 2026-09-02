@@ -522,6 +522,78 @@ describe("System - budget", () => {
     >;
     expect(secondBody.limit_usd).toBe(0);
   });
+
+  it.each(["abc", "Infinity"])(
+    "refuses to save when a ceiling box holds text that is not a number (%s)",
+    async (garbage) => {
+      const world = systemWorld({
+        budget: {
+          limit_usd: 5,
+          period: "daily",
+          hourly_limit_usd: null,
+          per_run_reserve_usd: 0.25,
+          time_cost_per_hour_usd: 0.1,
+          window_spend_usd: 1.2,
+          hourly_spend_usd: 0.05,
+          paused: false,
+          reason: null,
+        },
+      });
+      daemon.apiFetch.mockImplementation(systemFetch(world));
+
+      await renderSystem();
+
+      const windowInput = await screen.findByLabelText("Window limit (USD, blank = no ceiling)");
+      fireEvent.change(windowInput, { target: { value: garbage } });
+
+      fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
+      await afterDwell();
+      fireEvent.click(screen.getByRole("button", { name: "Send these five fields to the daemon" }));
+
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toMatch(/the window limit/);
+
+      const calls = daemon.apiFetch.mock.calls.filter(
+        ([path, init]) => path === "/autopilot/budget" && (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  it("names the hourly limit when that is the box that will not parse", async () => {
+    const world = systemWorld({
+      budget: {
+        limit_usd: 5,
+        period: "daily",
+        hourly_limit_usd: null,
+        per_run_reserve_usd: 0.25,
+        time_cost_per_hour_usd: 0.1,
+        window_spend_usd: 1.2,
+        hourly_spend_usd: 0.05,
+        paused: false,
+        reason: null,
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystem();
+
+    const hourlyInput = await screen.findByLabelText("Hourly limit (USD, blank = no ceiling)");
+    fireEvent.change(hourlyInput, { target: { value: "abc" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
+    await afterDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Send these five fields to the daemon" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/the hourly limit/);
+    expect(alert.textContent).not.toMatch(/the window limit/);
+
+    const calls = daemon.apiFetch.mock.calls.filter(
+      ([path, init]) => path === "/autopilot/budget" && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(calls).toHaveLength(0);
+  });
 });
 
 /* ----------------------------------------------------------------- backups -- */
