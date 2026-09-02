@@ -255,6 +255,32 @@
   color: var(--text);
 }
 
+/* A control that has to be on every row of a table and must not compete with
+   the readings in those rows. Borderless and faint at rest, underlined on
+   hover: findable by anybody looking for it, invisible to anybody scanning the
+   column beside it.
+
+   Its own variant rather than `link`, and the difference is not decoration.
+   `link` spends the identity accent because what it does IS navigation — the
+   same colour as the wordmark and the focus ring, which the design gives to
+   nothing that is a state or an action. The roster's `remove` is an action, and
+   four of them in accent down the right edge were the loudest thing on a page
+   whose whole job is to say which project needs somebody. */
+.ui-button-quiet {
+  padding: 0;
+  background: none;
+  border-color: transparent;
+  color: var(--text-faint);
+  font-weight: var(--weight-regular);
+}
+
+.ui-button-quiet:hover:not(:disabled) {
+  border-color: transparent;
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
 /* Direction, as a glyph rather than as a colour — it reads the same to someone
    who cannot separate the hues, and it survives being placed on any variant. */
 .ui-button-go::before {

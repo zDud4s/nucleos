@@ -38,12 +38,18 @@ function fine(id: string, overrides: Partial<ProjectSummary> = {}): ProjectSumma
   });
 }
 
-/** The rows, top to bottom, by the name in each row's header cell. */
+/**
+ * The rows, top to bottom, by the project each header cell links to.
+ *
+ * The link and not the cell's text: the header also carries the mode badge now, so a row for a
+ * project that is acting reads `alphaactive` as raw text.
+ */
 function order(): string[] {
   return screen
     .getAllByRole("row")
     .slice(1) // the header
-    .map((row) => within(row).getAllByRole("rowheader")[0].textContent ?? "");
+    .map((row) => within(row).getAllByRole("rowheader")[0])
+    .map((cell) => within(cell).getAllByRole("link")[0].textContent ?? "");
 }
 
 describe("the roster", () => {
@@ -66,19 +72,46 @@ describe("the roster", () => {
   });
 
   /**
-   * A column of twenty-four identical badges teaches an eye to skip the column that holds the one
-   * that is not. `shadow` is the default state of this app, so it is written plainly and only what
-   * departs from it is coloured.
+   * **The rule the table wrote down for itself and applied to half a column.**
+   *
+   * *A column of identical badges is a column of noise* is why `Mode` drew the word `shadow` in
+   * grey rather than as a badge. With twenty-four of twenty-five saying shadow, the whole column
+   * was the noise — so the mode stops being a column and becomes a mark on the name, drawn only
+   * when it departs from the default. `shadow` is not written anywhere: it is what the absence of a
+   * mark means, and a page that says the default out loud twenty-four times has said nothing.
    */
-  it("badges the mode only when it is not the shadow everything else is", async () => {
+  it("marks the mode on the name, and only when it is not the shadow everything else is", async () => {
     await openRoster([fine("quiet"), fine("acting", { mode: "active" })]);
 
     await screen.findByRole("table");
-    const shadowRow = screen.getByRole("rowheader", { name: "quiet" }).closest("tr") as HTMLElement;
-    const activeRow = screen.getByRole("rowheader", { name: "acting" }).closest("tr") as HTMLElement;
+    expect(screen.queryByRole("columnheader", { name: "Mode" })).toBeNull();
+    expect(screen.queryByText("shadow")).toBeNull();
 
-    expect(within(shadowRow).getByText("shadow").className).not.toContain("ui-badge");
+    // Beside the name, inside the row's own header cell — a fact about the project, not a column.
+    const activeRow = screen.getByRole("rowheader", { name: /acting/ });
     expect(within(activeRow).getByText("active").className).toContain("ui-badge");
+  });
+
+  /**
+   * **Two columns left because they are already somewhere better.**
+   *
+   * The shadow-exit bar and the ceiling are both drawn in the project's own Settings panel, with
+   * room for the sentence that makes them mean something. Here they were jargon in a narrow column,
+   * blank three times out of four, and neither answers the question this page exists to answer.
+   */
+  it("keeps the four readings that decide whether a project needs somebody, and no others", async () => {
+    await openRoster([fine("nucleos", { wip_limit: 2, classes_ready: 2, classes_total: 5 })]);
+
+    await screen.findByRole("table");
+    expect(screen.getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "Project",
+      "Waiting",
+      "Gate",
+      "Folder",
+      // The way out has no heading worth reading; the column exists for the control in it.
+      "Leaving",
+    ]);
+    expect(screen.queryByText("2/5")).toBeNull();
   });
 
   /**
@@ -109,6 +142,30 @@ describe("the roster", () => {
     const emptyRow = screen.getByRole("rowheader", { name: "empty" }).closest("tr") as HTMLElement;
     expect(within(emptyRow).getByText("not named")).toBeTruthy();
     expect(within(emptyRow).queryByText("gone")).toBeNull();
+  });
+
+  /**
+   * **And a folder nobody named is only a fault while the project is meant to be doing something.**
+   *
+   * The same claim `rankOf` makes about the order, made here about the colour: a badge on a
+   * dormant project would go on shouting exactly what the ordering stopped shouting. The words do
+   * not change — `not named` either way, because it is still true — and a folder that has *gone*
+   * stays a fault whatever the mode, since something moved a directory that was named.
+   */
+  it("does not colour a switched-off project's absent folder as a fault", async () => {
+    await openRoster([
+      project({ project_id: "asleep", mode: "off", project_root: null, root_exists: null }),
+      project({ project_id: "unfinished", mode: "shadow", project_root: null, root_exists: null }),
+      project({ project_id: "moved", mode: "off", project_root: "C:/x", root_exists: false }),
+    ]);
+
+    await screen.findByRole("table");
+    const row = (name: string) =>
+      within(screen.getByRole("rowheader", { name: new RegExp(name) }).closest("tr") as HTMLElement);
+
+    expect(row("asleep").getByText("not named").className).not.toContain("ui-badge");
+    expect(row("unfinished").getByText("not named").className).toContain("ui-badge");
+    expect(row("moved").getByText("gone").className).toContain("ui-badge-danger");
   });
 
   /**

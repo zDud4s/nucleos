@@ -25,11 +25,23 @@ import { RemoveProject } from "./RemoveProject";
  * answers *how are they all doing* and the workspace answers *what is happening in this one*,
  * which is why a row leads to `estado` and not back into a file tree.
  *
- * **The columns are the readings that differ between projects**, and nothing that does not. The
- * mode is here because one row in twenty-five says `active` and that is worth finding; it is drawn
- * as a badge only when it is not the shadow everything else is, because a column of identical
- * badges is a column of noise. What is waiting, what the gate last said and whether the folder is
- * still there are the three that decide whether a project needs somebody today.
+ * **The columns are the readings that differ between projects**, and nothing that does not — four
+ * of them, down from seven, because fourteen of the twenty-four cells that were not a name said
+ * nothing at all. What is waiting, what the gate last said and whether the folder is still there
+ * are the three that decide whether a project needs somebody today, and nothing else on the page
+ * answered that question.
+ *
+ * The table had already written the rule down and half-applied it: *a column of identical badges is
+ * a column of noise*, so `Mode` drew the word `shadow` in grey. With twenty-four of twenty-five
+ * saying shadow, the whole column was that — so the mode stops being a column and becomes a mark on
+ * the name, drawn only when it departs from the default. `Folder` had exactly the same problem —
+ * `ok`, three times out of four — and keeps its column because the other two states are the reason
+ * the column exists.
+ *
+ * **Two columns left for a reason stronger than being empty: they are already somewhere better.**
+ * The shadow-exit bar and the ceiling are both drawn in the project's own Settings panel, with room
+ * for the sentence that makes them mean something. Here they were jargon in a narrow column, blank
+ * three times out of four, and neither answers *does this one need me today*.
  *
  * **And a project can leave.** One could be added and none could go, so this page only ever grew: a
  * folder somebody moved, a repository they finished with, a project added to try something once —
@@ -86,7 +98,7 @@ function RosterError({ error }: { error: unknown }) {
 /* --------------------------------------------------------------- the table -- */
 
 /** How many columns a row spans, for the panel that opens underneath one. */
-const COLUMNS = 8;
+const COLUMNS = 5;
 
 function Table({ rows }: { rows: ProjectSummary[] }) {
   /*
@@ -102,13 +114,18 @@ function Table({ rows }: { rows: ProjectSummary[] }) {
         <thead>
           <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-text-faint">
             <th className="px-3 py-2 font-medium">Project</th>
-            <th className="px-3 py-2 font-medium">Mode</th>
             <th className="px-3 py-2 text-right font-medium">Waiting</th>
             <th className="px-3 py-2 font-medium">Gate</th>
             <th className="px-3 py-2 font-medium">Folder</th>
-            <th className="px-3 py-2 font-medium">Shadow bar</th>
-            <th className="px-3 py-2 text-right font-medium">Ceiling</th>
-            <th className="px-3 py-2 text-right font-medium">
+            {/*
+              The slack goes here, and that is a reading decision rather than a layout one. Four
+              columns in a full-width table get spread evenly, which put half a screen between a
+              project's name and the number waiting on it — the eye had to travel further to read
+              four facts than it did to read seven. Everything that answers *does this need me*
+              packs at the left where it can be read in one movement, and the way out sits at the
+              far margin, which is also where it is hardest to hit by accident.
+            */}
+            <th className="w-full px-3 py-2 text-right font-medium">
               <span className="sr-only">Leaving</span>
             </th>
           </tr>
@@ -154,26 +171,26 @@ function Row({
             question somebody arrives with. The inspector this page used to open into is a different
             question, reached from inside the Código mode.
           */}
-          <Link
-            className="underline underline-offset-2"
-            to="/projects/$projectId/$view"
-            params={{ projectId: project.project_id, view: "estado" }}
-          >
-            {project.project_id}
-          </Link>
+          <span className="inline-flex items-baseline gap-2">
+            <Link
+              className="underline underline-offset-2"
+              to="/projects/$projectId/$view"
+              params={{ projectId: project.project_id, view: "estado" }}
+            >
+              {project.project_id}
+            </Link>
+            {/*
+              The mode, as a mark on the name rather than a column of its own. The table already
+              wrote this rule down for one case — a column of identical badges is a column of
+              noise, so `shadow` was drawn in grey — and with twenty-four of twenty-five saying
+              shadow the whole column was that. What is left is what departs from the default,
+              beside the name it is a fact about.
+            */}
+            {project.mode !== "shadow" && (
+              <Badge tone={project.mode === "active" ? "active" : "off"}>{project.mode}</Badge>
+            )}
+          </span>
         </th>
-
-        <td className="px-3 py-2">
-          {/*
-            Only when it is not the shadow that everything else is. Twenty-four identical badges
-            teach an eye to skip the column that holds the one that is not.
-          */}
-          {project.mode === "shadow" ? (
-            <span className="text-text-faint">shadow</span>
-          ) : (
-            <Badge tone={project.mode === "active" ? "active" : "off"}>{project.mode}</Badge>
-          )}
-        </td>
 
         <td className="px-3 py-2 text-right tabular-nums">
           {project.open_proposals === 0 ? (
@@ -193,41 +210,8 @@ function Row({
           <GateCell gate={gate} at={project.last_gate_at ?? null} />
         </td>
 
-        <td className="px-3 py-2">
-          <FolderCell folder={folder} root={project.project_root} />
-        </td>
-
-        <td className="px-3 py-2 tabular-nums">
-          {/*
-            The shadow-exit bar, which is what says whether this project could be trusted to act. Not
-            drawn for a project already acting: it is the criterion for a decision that has been
-            taken, and repeating it there reads as if the promotion could still be refused.
-          */}
-          {project.mode === "active" ? (
-            <Nothing />
-          ) : project.classes_total === 0 ? (
-            <span className="text-text-faint" title="nothing has been exercised yet">
-              —
-            </span>
-          ) : (
-            <span className={project.promotable ? "text-tone-active-fg" : undefined}>
-              {project.classes_ready}/{project.classes_total}
-            </span>
-          )}
-        </td>
-
-        <td className="px-3 py-2 text-right tabular-nums">
-          {project.wip_limit === null ? (
-            <span className="text-text-faint" title="no ceiling — the brake is off">
-              off
-            </span>
-          ) : project.queue_full ? (
-            <Badge tone="paused" title="new work is being deferred until something is reviewed">
-              {project.wip_limit} full
-            </Badge>
-          ) : (
-            project.wip_limit
-          )}
+        <td className="px-3 py-2 whitespace-nowrap">
+          <FolderCell folder={folder} root={project.project_root} off={project.mode === "off"} />
         </td>
 
         <td className="px-3 py-2 text-right">
@@ -237,7 +221,7 @@ function Row({
             button: nothing on a disk moves, and colouring it as destruction would make the act that
             IS destruction, inside the project, have nothing louder left to be.
           */}
-          <Button variant="link" aria-expanded={leaving} onClick={() => onLeaving(!leaving)}>
+          <Button variant="quiet" aria-expanded={leaving} onClick={() => onLeaving(!leaving)}>
             {leaving ? "keep" : "remove"}
           </Button>
         </td>
@@ -293,11 +277,38 @@ const FOLDER_WORD: Record<Folder, string> = {
   unset: "not named",
 };
 
-function FolderCell({ folder, root }: { folder: Folder; root: string | null }) {
+/**
+ * Where the project's folder is, and how loudly to say it.
+ *
+ * `off` is not decoration on that second question, it is the whole of it. A project nobody has
+ * pointed anywhere is a real gap while the project is meant to be doing something, and is simply
+ * what switched off looks like otherwise — `rankOf` already stopped treating the two alike, and a
+ * badge here on a dormant project would go on shouting the thing the order stopped shouting. Said
+ * either way, in the same words; coloured only when it is a fault.
+ *
+ * A folder that is *gone* stays a fault whatever the mode: it was named, something moved it, and
+ * that is a fact about a disk rather than about the autopilot.
+ */
+function FolderCell({
+  folder,
+  root,
+  off,
+}: {
+  folder: Folder;
+  root: string | null;
+  off: boolean;
+}) {
   if (folder === "ok") {
     return (
       <span className="text-text-faint" title={root ?? undefined}>
         ok
+      </span>
+    );
+  }
+  if (folder === "unset" && off) {
+    return (
+      <span className="text-text-faint" title="this project is switched off and has no folder">
+        not named
       </span>
     );
   }

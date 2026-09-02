@@ -140,7 +140,7 @@ export function RemoveProject({ projectId, projectRoot, onDone, onCancel }: Remo
         >
           {removal.isPending ? "removing…" : forget ? "remove and forget" : "remove"}
         </Button>
-        <Button variant="link" onClick={onCancel}>
+        <Button variant="quiet" onClick={onCancel}>
           cancel
         </Button>
       </div>
