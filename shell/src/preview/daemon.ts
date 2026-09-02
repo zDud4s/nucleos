@@ -1208,8 +1208,8 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
 
   /*
-    The four readings the Estado mode leads with — and the reason that mode
-    could not be photographed at all. `ModeEstado` reads
+    The four readings the State mode leads with — and the reason that mode
+    could not be photographed at all. `ModeState` reads
     `readings.data.efficiency.median_total_tokens`, so the empty-list default
     threw before a single control was drawn and the whole page came back as the
     boundary's apology. Same failure as `/concurrency` above, one route along.
