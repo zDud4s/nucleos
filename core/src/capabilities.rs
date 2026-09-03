@@ -2317,4 +2317,93 @@ mod tests {
             "a plausible amount of RAM, got {memory}"
         );
     }
+
+    // ---------------------------------------------------------------------------------------
+    // L. That this crate can speak HTTPS at all
+    // ---------------------------------------------------------------------------------------
+    //
+    // Every other fixture in this file is an `axum` listener on `http://127.0.0.1:<port>`, and a
+    // loopback stub never needs TLS. So 3339 tests passed over a crate whose `reqwest` was built
+    // `default-features = false, features = ["json"]` — no `native-tls`, no `rustls`, nothing at
+    // all in `Cargo.lock` — and which therefore could not complete a single `https://` request.
+    //
+    // It mattered to exactly the two constants that are not loopback: `openrouter::
+    // OPENROUTER_BASE_URL` and `OLLAMA_REGISTRY_URL`. The hosted assistant route had never
+    // successfully made a request in its life, and nobody noticed because using it needs a key
+    // nobody on this machine had. Found by pointing the size route at the real registry and
+    // reading the error instead of the verdict.
+    //
+    // The lesson is the shape of the cover rather than the missing feature: a stub that is easy to
+    // write is a stub that answers a different question than production asks.
+
+    /// The guard, and it is a COMPILE-time one on purpose.
+    ///
+    /// `Client::builder().build()` succeeds perfectly well with no TLS backend — the failure
+    /// appears only on the first `https://` request, at runtime, inside whatever feature happened
+    /// to need one. `use_native_tls` exists only while the feature does, so deleting it from
+    /// `Cargo.toml` breaks the BUILD instead of one route months later. That is the whole value
+    /// here; the assertion below is almost incidental to it.
+    #[test]
+    fn the_crate_is_built_with_a_tls_backend_and_stops_compiling_without_one() {
+        let client = reqwest::Client::builder().use_native_tls().build();
+        assert!(
+            client.is_ok(),
+            "a client with the native TLS backend must build: {client:?}"
+        );
+    }
+
+    /// The registry, for real, over TLS. Keyless.
+    ///
+    /// `#[ignore]`d because it needs the internet, exactly as its siblings in section F need a
+    /// running Ollama — and NOT because it is optional. This is the test whose absence let the
+    /// crate ship unable to speak HTTPS, so it earns a run by hand after any change to the client
+    /// builders or to `reqwest`'s feature list:
+    ///
+    ///   cargo test -p nucleos-core -- --ignored --nocapture capabilities::tests::the_real_registry
+    ///
+    /// The size is asserted as a RANGE rather than a number: `qwen3:8b` was 5.23 GB when this was
+    /// written, and a re-quantised upload would move it — which is the registry doing its job, not
+    /// this crate breaking.
+    #[tokio::test]
+    #[ignore = "needs the internet: reaches the real Ollama registry over TLS"]
+    async fn the_real_registry_answers_over_tls_what_a_model_weighs() {
+        let size = registry_model_size(&reqwest::Client::new(), OLLAMA_REGISTRY_URL, "qwen3:8b")
+            .await
+            .expect("the public registry must answer a manifest for a model it serves");
+
+        assert!(
+            (3_000_000_000..12_000_000_000).contains(&size),
+            "qwen3:8b should weigh a few gigabytes, got {size}"
+        );
+    }
+
+    /// The hosted route's own catalogue read, for real, over TLS. Also keyless.
+    ///
+    /// `discover_openrouter` takes no key — `GET {base}/models` is public — so the one part of the
+    /// hosted route that can be exercised without an account is exercised here. That is the point:
+    /// the route was unreachable for a reason that had nothing to do with credentials, and this is
+    /// the cheapest test that would have said so.
+    #[tokio::test]
+    #[ignore = "needs the internet: reaches the real OpenRouter catalogue over TLS"]
+    async fn the_real_openrouter_catalogue_is_readable_over_tls() {
+        let declared = discover_openrouter(
+            &reqwest::Client::new(),
+            crate::openrouter::OPENROUTER_BASE_URL,
+            "anthropic/claude-sonnet-4.5",
+            8_000,
+        )
+        .await;
+
+        assert_eq!(
+            declared.context,
+            Ok(()),
+            "a model with a million-token window must satisfy an 8k requirement — an Err here is \
+             the catalogue not having been read at all, which is exactly what a missing TLS \
+             backend looks like from the outside"
+        );
+        assert!(
+            declared.tools,
+            "the live catalogue lists `tools` among this model's supported parameters"
+        );
+    }
 }

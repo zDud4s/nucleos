@@ -14,7 +14,20 @@ croner = "3.0.1"
 directories = "6.0.0"
 keyring = { version = "4.1.5", features = ["windows-native-keyring-store"] }
 rand = "0.10.2"
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# `native-tls` is NOT optional and must not be trimmed as an unused feature. Without a TLS backend
+# `reqwest` builds fine and every `https://` request fails at runtime with "error sending request
+# for url" — which is how this crate shipped for months unable to reach either of its two non-loopback
+# hosts (`openrouter::OPENROUTER_BASE_URL`, `capabilities::OLLAMA_REGISTRY_URL`). The hosted assistant
+# route had never completed a request; 3339 tests missed it because every fixture is an `axum`
+# listener on plain `http://127.0.0.1`. `capabilities::tests::
+# the_crate_is_built_with_a_tls_backend_and_stops_compiling_without_one` is the guard, and it fails
+# to COMPILE if this line loses the feature.
+#
+# `native-tls` and not `rustls-tls`: this is a Windows desktop app, so TLS goes through schannel and
+# the machine's own certificate store. That means it trusts what the user's machine already trusts —
+# a corporate root, an inspecting proxy — where a bundled `rustls` root set would refuse those and
+# present as "the internet is broken" on exactly the machines least able to debug it.
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

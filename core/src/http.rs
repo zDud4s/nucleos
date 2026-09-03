@@ -8577,6 +8577,28 @@ fn pull_readout(pull: &Pull) -> serde_json::Value {
 /// wedged Ollama cannot hold up a menu, and a whole-request timeout of a couple of seconds would
 /// abort every download that was working. A pull runs for minutes by design. The connect timeout
 /// stays short, because failing to DIAL is still a fast failure and the person is watching.
+/// The client the model REGISTRY is read over, built once and shared.
+///
+/// Also emphatically not `ollama_tags_client()`, and this one is a correction rather than a
+/// precaution: the size route shipped reusing that client, which is built for a localhost probe
+/// with a two-second whole-request budget. `registry.ollama.ai` is across the internet and behind
+/// a TLS handshake. It measured 0.37s from this machine so two seconds was not actually the bug —
+/// the bug was the missing TLS backend, and this reuse was simply wrong for a reason that would
+/// have surfaced later, on a slower connection, as a size that was sometimes unknown.
+///
+/// Ten seconds, and a short connect timeout for the same reason the pull client keeps one: failing
+/// to dial is a fast failure, and somebody is looking at the row while it happens.
+fn model_registry_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("HTTP client for the model registry (check TLS and proxy environment)")
+    })
+}
+
 fn ollama_pull_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -8633,7 +8655,7 @@ fn size_readout(model: &str, bytes: Option<u64>, memory: Option<u64>) -> serde_j
 /// to know what is being refused, not how it was determined.
 async fn known_too_big(model: &str) -> bool {
     let Ok(bytes) = crate::capabilities::registry_model_size(
-        ollama_tags_client(),
+        model_registry_client(),
         crate::capabilities::OLLAMA_REGISTRY_URL,
         model,
     )
@@ -8669,7 +8691,7 @@ async fn get_local_model_size(
     }
     let memory = crate::capabilities::total_memory_bytes();
     match crate::capabilities::registry_model_size(
-        ollama_tags_client(),
+        model_registry_client(),
         crate::capabilities::OLLAMA_REGISTRY_URL,
         &query.model,
     )
