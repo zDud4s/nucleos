@@ -44,6 +44,9 @@ const PROJECT_SCOPED: &[&str] = &[
     "jobs",
     "map_decisions",
     "project_commands",
+    "project_github_ops",
+    "project_land_targets",
+    "project_shell_rules",
     "project_slots",
     "proposals",
     "refinements",
@@ -728,10 +731,28 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
+            // The three tables §alcada-por-projecto added. At the SQL level on purpose — this test
+            // is about the shared `DELETE FROM {table} WHERE project_id = ?` loop, not about
+            // `project_policy`'s functions, which have no reason to exist yet by the time this runs.
+            sqlx::query("INSERT INTO project_shell_rules (project_id, prefix, verdict, created_at) VALUES (?, 'bash scripts/gates.sh', 'allow', '2026-01-01T00:00:00Z')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO project_github_ops (project_id, op_kind, created_at) VALUES (?, 'run_list', '2026-01-01T00:00:00Z')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO project_land_targets (project_id, branch, created_at) VALUES (?, 'master', '2026-01-01T00:00:00Z')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
 
         let removed = remove(&pool, "alpha", true).await.unwrap();
-        assert!(matches!(removed, Removed::Done { forgotten } if forgotten == 2));
+        assert!(matches!(removed, Removed::Done { forgotten } if forgotten == 5));
 
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE project_id = 'alpha'")
             .fetch_one(&pool)
@@ -739,14 +760,63 @@ mod tests {
             .unwrap();
         assert_eq!(runs, 0);
 
+        let shell_rules: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_shell_rules WHERE project_id = 'alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(shell_rules, 0);
+
+        let github_ops: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_github_ops WHERE project_id = 'alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(github_ops, 0);
+
+        let land_targets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_land_targets WHERE project_id = 'alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(land_targets, 0);
+
         // The other project is untouched, which is the property a `WHERE project_id = ?` written
-        // twenty-seven times has to get right twenty-seven times.
+        // thirty times has to get right thirty times.
         let theirs: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE project_id = 'bravo'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(theirs, 1);
+
+        let their_shell_rules: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_shell_rules WHERE project_id = 'bravo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(their_shell_rules, 1);
+
+        let their_github_ops: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_github_ops WHERE project_id = 'bravo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(their_github_ops, 1);
+
+        let their_land_targets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_land_targets WHERE project_id = 'bravo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(their_land_targets, 1);
+
         assert!(on_roster(&pool, "bravo").await);
     }
 
