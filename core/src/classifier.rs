@@ -1234,10 +1234,14 @@ fn find_executes_or_writes(command: &str) -> bool {
         .any(|token| EXECUTES_OR_WRITES.contains(&token))
 }
 
-fn matches_command_prefix(command: &str, prefixes: &[&str]) -> bool {
-    prefixes
-        .iter()
-        .any(|prefix| command == *prefix || command.starts_with(&format!("{prefix} ")))
+/// `pub(crate)` for `project_policy::ShellRules`, which measures a project's declared prefixes with
+/// the same rule the compiled list uses. Generic over the element so `&[&str]` and `&[String]` are
+/// the same call — two functions here is how the two lists would drift.
+pub(crate) fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S]) -> bool {
+    prefixes.iter().any(|prefix| {
+        let prefix = prefix.as_ref();
+        command == prefix || command.starts_with(&format!("{prefix} "))
+    })
 }
 
 fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {

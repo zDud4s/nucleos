@@ -68,6 +68,7 @@ mod process_tree;
 mod project_commands;
 mod project_exit;
 mod project_map;
+mod project_policy;
 mod project_readings;
 mod proposals;
 mod recurrence;
