@@ -431,28 +431,93 @@ pub async fn compute_merge(
     )
     .await?;
     if !merge.succeeded() {
+        // **The conflicted index is read HERE, before the abort**, because the abort is what
+        // destroys it and both of the questions below are asked of it: whether anything conflicted
+        // at all, and whether the two sides of what did conflict even agree about line endings. One
+        // line per stage, `<mode> SP <sha> SP <stage> TAB <path>`.
+        let unmerged = match git(&integration, &["ls-files", "--unmerged"], deadline).await {
+            Ok(listed) if listed.succeeded() => Some(listed.stdout),
+            // Could not look. Neither of the two things it decides can be decided, and both fall
+            // back to what this arm did before either of them existed: escalate, and say only what
+            // git said.
+            _ => None,
+        };
+        let note = match unmerged.as_deref() {
+            Some(listing) => endings_note(&integration, listing, source, target, deadline).await,
+            None => String::new(),
+        };
         // Best-effort: the next operation resets this worktree anyway, and a failure to abort must
         // not replace the conflict — the conflict is what the caller needs to read.
         let _ = git(&integration, &["merge", "--abort"], deadline).await;
+
+        // **A merge that never started is not a conflict, and confusing the two costs an agent.**
+        // Every non-zero exit used to arrive as `Escalated`, and escalating is a promise that a
+        // resolution can be minted for the row — so "not something we can merge" got one. Measured:
+        // request 91 on this repository asked to merge a branch named `feat`, which does not exist
+        // here. Git printed `merge: feat - not something we can merge`, the row escalated,
+        // `resolver.rs` minted run 900436 for it inside the minute, and that run failed three
+        // seconds later with nothing staged to resolve. What the row asks now is for a person to
+        // look at a conflict that never existed, and it cannot even be retried: its
+        // `resolution_run_id` is spent.
+        //
+        // Two signals, because either alone has a failure mode. The empty unmerged index is the
+        // authority; the absence of the word git prints for a conflict guards the shape nobody has
+        // met yet — a conflict that somehow left no stage entries would otherwise be demoted to a
+        // failure and lose the resolver it deserves.
+        if unmerged
+            .as_deref()
+            .is_some_and(|listing| listing.trim().is_empty())
+            && !merge.output_tail.contains("CONFLICT")
+        {
+            return Err(Outcome::Failed {
+                reason: format!(
+                    "merging {source} into {target} did not happen at all: git refused the merge \
+                     before starting it, and nothing anywhere is left conflicted. It is the \
+                     request that is wrong rather than the branches — most often a name no branch \
+                     has — and what git printed says which."
+                ),
+                exit_code: merge.exit_code,
+                output_tail: merge.output_tail.clone(),
+            });
+        }
+
         // **The reason names the owner, because the asker's instinct is to fix it.** An agent that
         // has just finished work and is told "merging failed" will reach for the conflict, and it
         // is the one thing here that is not its to reach for: the merge happened in an integration
         // worktree it does not have, was aborted, and left nothing conflicted anywhere. There is no
         // conflicted state in its copy to resolve — only the temptation to manufacture one.
         //
-        // What IS the asker's is the other direction, and the message says so rather than leaving
-        // it to be guessed: bringing the target INTO its branch is an ordinary queue operation, and
-        // resolving there is resolving in its own worktree, on its own branch, where it belongs.
+        // **What it must NOT do is send them at the other direction, which is what it used to.** It
+        // told the asker to bring the target into its own branch, resolve there, and ask again —
+        // and that is unactionable twice over. If A into B conflicts then B into A is the same
+        // conflict, so the reverse merge meets the same wall; and every `git merge` from a session
+        // is taken over by the queue and computed HERE, in the same integration worktree, and
+        // aborted the same way. So the advice named a remedy that could not be performed, and the
+        // asker who tries it gets a second escalation naming the first one's inverse. Measured: it
+        // cost one session two hours and three escalated rows before it built the two-parent commit
+        // by hand — the very thing `verify_resolution` says a resolver arrives already holding.
+        //
+        // What it says instead is what actually happens, because a resolution IS started for them:
+        // `resolver.rs` picks this row up within a minute and hands the conflict to an agent in a
+        // worktree of its own, staged, with MERGE_HEAD set. Nothing here is the asker's to do.
         return Err(Outcome::Escalated {
             reason: format!(
                 "merging {source} into {target} conflicts, so nothing was published and no copy \
                  was left conflicted. This is the queue's to carry and not yours to fix from \
-                 here — the merge ran in an integration worktree you do not have. To clear it, \
-                 bring {target} into {source} in your own worktree (an ordinary queue operation), \
-                 resolve it there, and ask again."
+                 here — the merge ran in an integration worktree you do not have, and there is no \
+                 conflicted state in your copy to resolve. What happens next is not yours to start \
+                 either: a resolution is minted for this row within a minute, in a worktree of its \
+                 own with the conflict already staged, and if one cannot be started then this row \
+                 is what asks a person to look. Do not re-run the merge, and do not merge the \
+                 other direction to get at the conflict — it is the same conflict, and it is \
+                 computed here too."
             ),
             exit_code: merge.exit_code,
-            output_tail: merge.output_tail.clone(),
+            // The note rides with git's own output rather than with the reason, because the tail is
+            // the half that reaches the reader who can act on it: `resolver.rs` hands it to the
+            // resolution agent as "git's own account of the conflict", and the row shows it to
+            // whoever asked. Empty unless there is something to say.
+            output_tail: format!("{}{note}", merge.output_tail),
         });
     }
 
@@ -462,6 +527,178 @@ pub async fn compute_merge(
         new,
         output_tail: merge.output_tail,
     })
+}
+
+/// What a conflict's two sides do about line endings, when they do not do the same thing.
+///
+/// **This is the one thing about a conflict that reading the conflict cannot tell you.** Sides that
+/// disagree about endings have no aligned line anywhere, so a three-way merge produces one conflict
+/// running from the first line to the last whatever the real change was, and the markers then carry
+/// no information at all. Measured, at length: `shell/src/preview/daemon.ts` conflicted end to end
+/// on a merge whose actual change was three lines. One session spent most of a day on it and two
+/// resolution agents were defeated by it before the cause was found, and the cause was one byte — a
+/// NUL in the file, which makes git classify it as binary, which means the `core.autocrlf` filter
+/// never ran on it, which left its blob CRLF while every sibling in the checkout was LF.
+///
+/// The queue holds both blobs at the moment it gives up, and nobody downstream of it does. So it
+/// says what they are, in the tail the row keeps and the resolution prompt quotes.
+///
+/// Silent unless the sides actually differ, because a note that appears every time means nothing.
+/// Silent too when a side is binary in earnest and the endings are merely not identical: newline
+/// counts in a PNG are an accident of its bytes, and reporting them would be noise inside an
+/// escalation. The escape from that guard is two PURE and opposite answers — all CRLF against all
+/// LF — which is what a text file with a NUL in it looks like and what random bytes essentially
+/// never do.
+async fn endings_note(
+    repo: &Path,
+    unmerged: &str,
+    source: &str,
+    target: &str,
+    deadline: std::time::Instant,
+) -> String {
+    let mut said = Vec::new();
+    for (path, ours, theirs) in sides(unmerged).into_iter().take(INSPECTED_PATHS) {
+        // A path with only one side is a delete/modify conflict: there is no second set of endings
+        // to disagree with.
+        let (Some(ours), Some(theirs)) = (ours, theirs) else {
+            continue;
+        };
+        let (Some(ours), Some(theirs)) = (
+            blob(repo, &ours, deadline).await,
+            blob(repo, &theirs, deadline).await,
+        ) else {
+            continue;
+        };
+        let (mine, yours) = (Endings::of(&ours), Endings::of(&theirs));
+        if mine == yours || mine == Endings::Absent || yours == Endings::Absent {
+            continue;
+        }
+        let opposites = matches!(
+            (mine, yours),
+            (Endings::Crlf, Endings::Lf) | (Endings::Lf, Endings::Crlf)
+        );
+        let nul = match (ours.contains('\0'), theirs.contains('\0')) {
+            (true, true) => Some("both sides contain".to_owned()),
+            (true, false) => Some(format!("{target}'s side contains")),
+            (false, true) => Some(format!("{source}'s side contains")),
+            (false, false) => None,
+        };
+        if nul.is_some() && !opposites {
+            continue;
+        }
+        let mut line = format!(
+            "  {path}: {target} has {}, {source} has {}",
+            mine.spelled(),
+            yours.spelled()
+        );
+        if let Some(who) = nul {
+            // Named because it is the cause and it is invisible. A file with a NUL in it is binary
+            // to git: no end-of-line filter has ever run on it, and that is how one file in a
+            // checkout comes to keep endings that none of its siblings have.
+            line.push_str(&format!(
+                " — and {who} a NUL byte, which is usually why: git classifies a file with a NUL \
+                 in it as binary, so no end-of-line filter has ever run on it"
+            ));
+        }
+        said.push(line);
+    }
+    if said.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nthe queue's note, computed from the two sides while the conflict still existed:\n{}\n\
+         a file whose sides disagree about line endings has no line that aligns, so the merge \
+         conflicts from its first line to its last however small the real change is. Normalise one \
+         side before reading the markers — until then they say nothing about the change.\n",
+        said.join("\n")
+    )
+}
+
+/// Two `cat-file` calls per conflicted path and no more than this many paths: the note is a hint
+/// offered on the way past, not an audit, and a merge that conflicts in fifty files must not spend a
+/// hundred processes proving it. The shape this catches — a whole checkout's endings against a
+/// branch's — is visible in the first file of any conflict it caused.
+const INSPECTED_PATHS: usize = 8;
+
+/// One conflicted path and the blobs the two sides brought to it. Stage 2 is the target's, because
+/// the integration worktree is detached on the target and the source is what was merged in; stage 3
+/// is the source's. Stage 1 is the base, and the base is not a side.
+///
+/// Order is first-seen, so the note reads in the order git listed the conflict.
+fn sides(unmerged: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let mut paths: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    for line in unmerged.lines() {
+        let Some((entry, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut fields = entry.split_whitespace();
+        let (Some(_mode), Some(sha), Some(stage)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if paths.iter().all(|(known, _, _)| known != path) {
+            paths.push((path.to_owned(), None, None));
+        }
+        let slot = paths
+            .iter_mut()
+            .find(|(known, _, _)| known == path)
+            .expect("the path was just ensured to be present");
+        match stage {
+            "2" => slot.1 = Some(sha.to_owned()),
+            "3" => slot.2 = Some(sha.to_owned()),
+            _ => {}
+        }
+    }
+    paths
+}
+
+/// A blob's bytes, as far as they can be carried in a `String`.
+///
+/// Lossy decoding is what `run_git` does with every command's output, and it is harmless for the one
+/// question asked here: an invalid sequence becomes a replacement character without adding or
+/// removing a `\n`, `\r` or NUL, so the counting below is unaffected. `None` means the answer could
+/// not be had, which the caller treats as nothing to say rather than as an error — this whole path
+/// is a courtesy on top of an escalation that is happening either way.
+async fn blob(repo: &Path, sha: &str, deadline: std::time::Instant) -> Option<String> {
+    match git(repo, &["cat-file", "blob", sha], deadline).await {
+        Ok(shown) if shown.succeeded() => Some(shown.stdout),
+        _ => None,
+    }
+}
+
+/// How a blob ends its lines, as far as the blob alone can say.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Endings {
+    /// No line ending at all: one line, or an empty file. Nothing to disagree about.
+    Absent,
+    Lf,
+    Crlf,
+    Mixed,
+}
+
+impl Endings {
+    fn of(blob: &str) -> Self {
+        let breaks = blob.matches('\n').count();
+        if breaks == 0 {
+            return Self::Absent;
+        }
+        // Every CRLF contains an LF, so this can never exceed `breaks` — the equality below is a
+        // real "all of them" and not an accident of counting two different things.
+        match blob.matches("\r\n").count() {
+            0 => Self::Lf,
+            carriages if carriages == breaks => Self::Crlf,
+            _ => Self::Mixed,
+        }
+    }
+
+    fn spelled(self) -> &'static str {
+        match self {
+            Self::Absent => "no line endings",
+            Self::Lf => "LF",
+            Self::Crlf => "CRLF",
+            Self::Mixed => "a mixture of CRLF and LF",
+        }
+    }
 }
 
 /// One git command, given whatever is left of the operation's budget.
@@ -2966,8 +3203,16 @@ pub(crate) mod tests {
                     "the reason must say there is nothing to resolve: {reason}"
                 );
                 assert!(
-                    reason.contains("in your own worktree"),
-                    "a refusal that names no alternative sends the asker looking: {reason}"
+                    reason.contains("a resolution is minted"),
+                    "a refusal that does not say what happens next sends the asker looking: {reason}"
+                );
+                // The alternative this used to name was unactionable in BOTH directions — the
+                // reverse merge is the same conflict, and a session's `git merge` is computed here
+                // and aborted here just the same. Naming it cost a session two hours and three
+                // escalated rows. Pinned as an absence, because the sentence read as helpful.
+                assert!(
+                    !reason.contains("in your own worktree"),
+                    "the reason must not prescribe a merge the queue computes the same way: {reason}"
                 );
             }
             other => panic!("a conflict is an Escalated, got {other:?}"),
@@ -2978,6 +3223,300 @@ pub(crate) mod tests {
             std::fs::read_to_string(repo.join("seed.txt")).expect("read"),
             "ours\n",
             "the user's file is byte-identical"
+        );
+    }
+
+    /// **A merge git refused to start is not a conflict**, and the two used to arrive the same way.
+    ///
+    /// Escalating is a promise that a resolution can be minted, so the promise was made for a
+    /// branch name that does not exist. Measured: request 91 on this repository, `merge feat into
+    /// feat/calendario`, printed `merge: feat - not something we can merge`, escalated, was given
+    /// resolution run 900436 within the minute, and that run failed three seconds later with
+    /// nothing staged. The row is now permanently asking a person to look at a conflict that never
+    /// existed.
+    #[tokio::test]
+    async fn a_merge_git_refused_to_start_is_a_failure_and_not_a_conflict() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-nosuch-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        let outcome = compute_merge(&repo, "feat", "master", deadline())
+            .await
+            .expect_err("a name no branch has cannot produce a merge");
+
+        match outcome {
+            Outcome::Failed {
+                reason,
+                output_tail,
+                ..
+            } => {
+                assert!(
+                    output_tail.contains("not something we can merge"),
+                    "the row must carry what git said: {output_tail}"
+                );
+                assert!(
+                    reason.contains("did not happen at all"),
+                    "the reason must not read as a conflict: {reason}"
+                );
+                assert!(
+                    reason.contains("the request that is wrong"),
+                    "the reason must send the asker at the request rather than at the branches: \
+                     {reason}"
+                );
+            }
+            // The specific wrong answer this test exists for. `Escalated` here mints an agent for a
+            // worktree that will have nothing staged in it.
+            other => panic!("a merge that never started must not escalate, got {other:?}"),
+        }
+    }
+
+    /// A repository whose two sides of one file disagree about line endings, which is what makes a
+    /// three-line change conflict from the first line to the last.
+    ///
+    /// `nul` puts a NUL byte in every version of the file, which is the measured shape rather than a
+    /// contrived one: a NUL makes git classify the file as binary, no end-of-line filter ever runs
+    /// on it, and its blob keeps whatever endings it was written with while every sibling in the
+    /// checkout is normalised.
+    fn repo_with_endings_that_disagree(prefix: &str, nul: bool) -> (tempfile::TempDir, PathBuf) {
+        let (container, repo) = init_contained_repo(prefix);
+        let byte = if nul { "\0" } else { "" };
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("branch"), OsStr::new("-M"), OsStr::new("master")]
+        ));
+        std::fs::write(repo.join("f.ts"), format!("one\ntwo{byte}\nthree\nfour\n")).expect("write");
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("base")]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        // The branch changes one line and keeps the endings it was given.
+        std::fs::write(
+            repo.join("f.ts"),
+            format!("one\ntwo{byte} CHANGED\nthree\nfour\n"),
+        )
+        .expect("write");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-am"),
+                OsStr::new("branch")
+            ]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        // The target's copy was rewritten with CRLF at some point — a Windows editor, a tool, a
+        // checkout that filtered what it should not have. Every line now differs from the base's,
+        // so it overlaps whatever the branch did.
+        std::fs::write(
+            repo.join("f.ts"),
+            format!("one\r\ntwo{byte}\r\nthree\r\nfour CHANGED\r\n"),
+        )
+        .expect("write");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("crlf")]
+        ));
+        (container, repo)
+    }
+
+    /// **The diagnostic that cost a day.** A conflict covering a whole file says nothing about why,
+    /// and the reason is not in the markers: it is in the two blobs, which the queue is holding and
+    /// nobody downstream is. So it says so where both readers look — the row, and the tail the
+    /// resolution prompt quotes as git's own account.
+    #[tokio::test]
+    async fn a_conflict_whose_sides_disagree_about_line_endings_says_so() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_endings_that_disagree("nucleos-gitexec-eol-", false);
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        let outcome = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect_err("sides that share no line ending cannot merge");
+
+        match outcome {
+            Outcome::Escalated { output_tail, .. } => {
+                assert!(
+                    output_tail.contains("f.ts: master has CRLF, feat/x has LF"),
+                    "the note must name the file and which side has which: {output_tail}"
+                );
+                assert!(
+                    output_tail.contains("Normalise one side"),
+                    "a diagnosis without the one thing to do about it is half a note: {output_tail}"
+                );
+                assert!(
+                    !output_tail.contains("NUL"),
+                    "there is no NUL in this file, and a cause named where there is none sends the \
+                     reader hunting for it: {output_tail}"
+                );
+                assert!(
+                    output_tail.contains("CONFLICT"),
+                    "the note is added to what git said, not instead of it: {output_tail}"
+                );
+            }
+            other => panic!("a conflict is an Escalated, got {other:?}"),
+        }
+    }
+
+    /// The byte behind the endings, named — because it is the cause, it is invisible, and it is the
+    /// half nobody guesses.
+    ///
+    /// This is the measured case rather than a constructed one: `shell/src/preview/daemon.ts` held a
+    /// NUL, so git classified it as binary, so `core.autocrlf` never touched it, so its blob stayed
+    /// CRLF while every sibling was LF, so a three-line change conflicted end to end. Two
+    /// resolution agents were defeated by it before the byte was found.
+    #[tokio::test]
+    async fn the_nul_byte_behind_the_endings_is_named_when_there_is_one() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_endings_that_disagree("nucleos-gitexec-eol-nul-", true);
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        let outcome = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect_err("sides that share no line ending cannot merge");
+
+        match outcome {
+            Outcome::Escalated { output_tail, .. } => {
+                assert!(
+                    output_tail.contains("f.ts: master has CRLF, feat/x has LF"),
+                    "the endings are still the finding: {output_tail}"
+                );
+                assert!(
+                    output_tail.contains("both sides contain a NUL byte"),
+                    "the cause has to be named, or the reader normalises the file and never learns \
+                     why it drifted: {output_tail}"
+                );
+            }
+            other => panic!("a conflict is an Escalated, got {other:?}"),
+        }
+    }
+
+    /// A file that is binary in earnest gets no note, and the guard is not decoration: newline
+    /// counts inside a PNG are an accident of its bytes, and an escalation is the wrong place to
+    /// print an accident. The escape for a text file with a NUL in it is that its two answers are
+    /// PURE and opposite — all CRLF against all LF — which random bytes essentially never are.
+    #[tokio::test]
+    async fn a_conflict_in_a_file_that_is_binary_in_earnest_gets_no_endings_note() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-binary-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("branch"), OsStr::new("-M"), OsStr::new("master")]
+        ));
+        std::fs::write(repo.join("f.bin"), b"\0seed\n").expect("write");
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("base")]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        // Not a line ending in sight that means anything: one side happens to hold a CR before one
+        // of its newlines, the other does not.
+        std::fs::write(repo.join("f.bin"), b"\0a\nb\nc\n").expect("write");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-am"),
+                OsStr::new("theirs")
+            ]
+        ));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("master")]
+        ));
+        std::fs::write(repo.join("f.bin"), b"\0a\r\nb\n").expect("write");
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("ours")]
+        ));
+
+        let outcome = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect_err("two different binaries cannot be merged");
+
+        match outcome {
+            Outcome::Escalated { output_tail, .. } => assert!(
+                !output_tail.contains("the queue's note"),
+                "a note about the line endings of a binary file is noise inside an escalation: \
+                 {output_tail}"
+            ),
+            other => panic!("a binary conflict is still a conflict, got {other:?}"),
+        }
+    }
+
+    /// The classification, alone, because the interesting answers are the ones no fixture is
+    /// convenient for.
+    #[test]
+    fn how_a_blob_ends_its_lines_is_read_out_of_the_blob() {
+        assert_eq!(Endings::of("one\r\ntwo\r\n"), Endings::Crlf);
+        assert_eq!(Endings::of("one\ntwo\n"), Endings::Lf);
+        assert_eq!(Endings::of("one\r\ntwo\n"), Endings::Mixed);
+        assert_eq!(
+            Endings::of("one line and no ending"),
+            Endings::Absent,
+            "a file with nothing to disagree about must not be reported as disagreeing"
+        );
+        assert_eq!(Endings::of(""), Endings::Absent);
+        // A lone CR is deliberately not counted. Nothing in this decade writes them, and treating
+        // one as an ending would classify a file by a stray byte in the middle of a line.
+        assert_eq!(Endings::of("one\rtwo\n"), Endings::Lf);
+    }
+
+    /// The listing is parsed on the TAB, not on whitespace, because a path with a space in it is
+    /// exactly what a naive split loses — and it loses it silently, by reading the path's first word
+    /// as the whole path.
+    #[test]
+    fn the_two_sides_of_a_conflict_are_read_out_of_the_index_listing() {
+        let listing = "100644 aaa 1\tf.ts\n\
+                       100644 bbb 2\tf.ts\n\
+                       100644 ccc 3\tf.ts\n\
+                       100644 ddd 1\tgone.txt\n\
+                       100644 eee 2\tgone.txt\n\
+                       100644 fff 2\tsrc/two words.ts\n\
+                       100644 ggg 3\tsrc/two words.ts\n";
+
+        assert_eq!(
+            sides(listing),
+            vec![
+                (
+                    "f.ts".to_owned(),
+                    Some("bbb".to_owned()),
+                    Some("ccc".to_owned())
+                ),
+                // A delete/modify conflict: one side and the base, so there is no second set of
+                // endings to compare and the caller must skip it rather than compare with nothing.
+                ("gone.txt".to_owned(), Some("eee".to_owned()), None),
+                (
+                    "src/two words.ts".to_owned(),
+                    Some("fff".to_owned()),
+                    Some("ggg".to_owned())
+                ),
+            ]
         );
     }
 
