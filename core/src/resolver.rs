@@ -24,14 +24,19 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Looks for conflicts to resolve, forever. Spawned once by `main.rs`.
 ///
-/// Two passes on one tick, and they are separate because they are about different rows at different
-/// moments: one starts a resolution, the other says what an already-published one cost. Sharing a
-/// tick is all they share — the second runs even when the first has been stopped, which is deliberate
-/// and argued at `record_discards`.
+/// Three passes on one tick, and they are separate because they are about different rows at
+/// different moments: one stops a resolution nobody needs any more, one starts a resolution, and
+/// one says what an already-published one cost. Sharing a tick is all they share — the last runs
+/// even when the others have been stopped, which is deliberate and argued at `record_discards`.
+///
+/// Stopping comes before starting, and the order is the point rather than a preference: a tick that
+/// minted before it cancelled would be a tick that could spend on a project already at its ceiling
+/// because of work that is about to be cancelled for being pointless.
 pub async fn run_resolution_loop(state: AppState) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         interval.tick().await;
+        cancel_settled(&state).await;
         launch_once(&state).await;
         record_discards(&state.pool).await;
     }
@@ -82,9 +87,12 @@ struct Candidate {
 /// by `resolution_run_id IS NULL` above; what this adds is only that two never run at once.
 ///
 /// **The fifth is a conflict that has stopped being one, and it is the commonest case in practice.**
-/// The escalation tells the asker what to do about it — bring the target into your branch, resolve
-/// there, ask again — and when they do, the merge lands and the old escalated row stays behind. It
-/// is terminal, so nothing tidies it, and to this loop it still reads as an unattempted conflict.
+/// Somebody settles the merge another way — by hand, or with the target brought in first, or by the
+/// resolution this loop minted landing under its own branch name — and the old escalated row stays
+/// behind. It is terminal, so nothing tidies it, and to this loop it still reads as an unattempted
+/// conflict. It was commoner still while the escalation itself advised the asker to merge the other
+/// direction and ask again: that advice is gone (`git_exec::compute_merge` names the resolution
+/// instead), and the row it leaves behind is not.
 /// Watched three times on this repository in one evening: request 28 settled by 29, request 33
 /// settled by 34, each leaving bait. Once it started an agent that resolved a conflict which had
 /// already been settled another way, and that resolution's landing would have reopened what the
@@ -95,8 +103,12 @@ struct Candidate {
 /// conflicted afterwards, which is the ordinary way a conflict appears at all.
 ///
 /// It does not cover the same thing happening while a resolution is already RUNNING; that one needs
-/// a live run cancelled rather than a row skipped, and it is named here rather than left to be
-/// rediscovered.
+/// a live run cancelled rather than a row skipped. It was named here as missing for exactly as long
+/// as it took to be rediscovered with a bill attached — `cancel_settled` is now that case, and it
+/// asks the settlement question in exactly these words so that a change to one is visibly a change
+/// to both. What the two do not share is which runs count as live, and `settled_resolutions` argues
+/// that difference where it is made: skipping is right for a resolution paused at
+/// `awaiting_approval`, and stopping one is not.
 ///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
@@ -129,6 +141,127 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
     )
     .fetch_optional(pool)
     .await
+}
+
+/// A running resolution whose conflict has stopped being one.
+#[derive(sqlx::FromRow)]
+struct Settled {
+    request_id: i64,
+    project_id: String,
+    run_id: i64,
+    /// The later `succeeded` request that settled the same operation — named in the feed, because
+    /// "cancelled" without it reads as the daemon changing its mind.
+    settled_id: i64,
+}
+
+/// Every running resolution whose conflict a later request has already settled.
+///
+/// **`running`, and not `next_conflict`'s pair of live statuses**, and the difference is not an
+/// oversight in either place. That filter asks "is an attempt under way", and a resolution paused at
+/// `awaiting_approval` is one, so it must not be handed to a second agent. This one asks "is there
+/// something here to stop", and a paused run is not: `finalize_termination`'s status write is a
+/// compare-and-set on `running`, so calling it for a paused run would abort the task and leave the
+/// row saying `awaiting_approval` with its proposal still pending — stranded, holding its project's
+/// slot, and reachable by nothing afterwards, because `reconcile_stranded_approvals` heals such a
+/// row only at startup and only once its proposal has stopped being pending. That is a worse ending
+/// than leaving it paused, where at least a person can still answer it. A paused agent is also not
+/// spending anything, and spending is what this pass exists to stop.
+///
+/// Ending one properly means rejecting the proposal and closing the run in the same transaction,
+/// which is `proposals`' to offer and is not offered yet.
+///
+/// Separated from `cancel_settled` for the reason `next_conflict` is separated from `launch_once`:
+/// it is the part that decides which agents get stopped, and it should not need a run runner to
+/// prove. The caller does the stopping.
+async fn settled_resolutions(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Settled>> {
+    sqlx::query_as(
+        "SELECT conflict.id AS request_id,
+                conflict.project_id AS project_id,
+                conflict.resolution_run_id AS run_id,
+                (SELECT MIN(s.id)
+                   FROM vcs_requests AS s
+                  WHERE s.project_id = conflict.project_id
+                    AND s.args = conflict.args
+                    AND s.status = 'succeeded'
+                    AND s.id > conflict.id) AS settled_id
+           FROM vcs_requests AS conflict
+           JOIN runs ON runs.id = conflict.resolution_run_id
+          WHERE runs.status = 'running'
+            AND EXISTS (
+                SELECT 1
+                  FROM vcs_requests AS s
+                 WHERE s.project_id = conflict.project_id
+                   AND s.args = conflict.args
+                   AND s.status = 'succeeded'
+                   AND s.id > conflict.id
+            )
+          ORDER BY conflict.id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Stops resolutions whose conflict somebody else has already settled.
+///
+/// **`next_conflict`'s fifth condition, for a run instead of a row, and it was named there as
+/// missing.** That filter skips an escalation once a later request has succeeded on the same
+/// operation, and its own comment says what it does not cover: "the same thing happening while a
+/// resolution is already RUNNING; that one needs a live run cancelled rather than a row skipped".
+/// This is that. A row skipped costs nothing; a run left alive costs an agent, a concurrency slot,
+/// and money, for a conflict that no longer exists.
+///
+/// **Measured, and the bill is why this exists rather than staying a note.** Requests 79 and 80
+/// escalated and each got a resolution. Both conflicts were then settled by hand and landed as
+/// request 85 — so from that moment the two agents were working on a merge that had already
+/// happened. Nothing stopped them. They were resumed once each the following morning, spent $3.01
+/// between them, and escalated again as requests 87 and 88, naming their own resolution branches
+/// against a master that had contained the answer for thirteen hours. One of them was watched
+/// rediscovering, with a `grep` for duplicate shot numbers, a collision the hand resolution had
+/// already fixed.
+///
+/// **`args` is the comparison, exactly as in `next_conflict`**: it is the stored JSON, so comparing
+/// it compares source and target and nothing else. And `settled.id > conflict.id`, because a merge
+/// that succeeded BEFORE this conflict is a different event — the branches moved on and conflicted
+/// afterwards, which is the ordinary way a conflict comes to exist at all.
+///
+/// A run whose handle has gone answers `false` and is left alone rather than logged about every
+/// minute: its row is stuck `running` with nothing to abort, which is `reconcile_orphaned_runs`'s
+/// to fix at the next start and not this pass's to shout about.
+async fn cancel_settled(state: &AppState) {
+    let settled = match settled_resolutions(&state.pool).await {
+        Ok(rows) => rows,
+        // Best-effort like every other polling loop here: a failed poll is the next tick's problem.
+        Err(error) => {
+            tracing::warn!(%error, "resolver: could not look for resolutions to stop");
+            return;
+        }
+    };
+
+    for row in settled {
+        if !crate::runs::finalize_termination(state, row.run_id, "cancelled").await {
+            continue;
+        }
+        tracing::info!(
+            vcs_request_id = row.request_id,
+            run_id = row.run_id,
+            settled_by = row.settled_id,
+            "resolver: cancelled a resolution whose conflict was settled another way"
+        );
+        // Said where the person who asked for the merge is already looking, and it names the
+        // request that settled it: a resolution that simply stops reads as the daemon giving up on
+        // something, which is the opposite of what happened.
+        let _ = crate::feed::append(
+            &state.pool,
+            Some(row.project_id.as_str()),
+            "vcs_resolution_cancelled",
+            &format!(
+                "stopped resolving vcs request {}: request {} already settled the same merge",
+                row.request_id, row.settled_id
+            ),
+            Some(row.run_id),
+        )
+        .await;
+    }
 }
 
 /// Starts at most one resolution, and returns the run it started.
@@ -589,6 +722,35 @@ mod tests {
         id
     }
 
+    /// Links an escalation to the run resolving it, which is what `launch_once` does the moment it
+    /// mints one. The column is the only thing that says a resolution is under way at all.
+    async fn resolving(pool: &sqlx::SqlitePool, request: i64, run: i64) {
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = ? WHERE id = ?")
+            .bind(run)
+            .bind(request)
+            .execute(pool)
+            .await
+            .expect("link the conflict to its resolution");
+    }
+
+    /// The same merge, published — by whoever got there. Admitted through the real INSERT like every
+    /// other row here, then given the ending it is being tested for.
+    async fn succeeded_merge_of(
+        pool: &sqlx::SqlitePool,
+        source: &str,
+        from_resolution: bool,
+    ) -> i64 {
+        let id = escalated_merge_of(pool, source, from_resolution).await;
+        sqlx::query(
+            "UPDATE vcs_requests SET status = 'succeeded', result_sha = 'abc' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("publish it");
+        id
+    }
+
     /// The three exclusions, each of which prevents a different runaway.
     #[tokio::test]
     async fn only_a_conflict_that_nobody_has_attempted_is_picked_up() {
@@ -726,10 +888,9 @@ mod tests {
         );
     }
 
-    /// **The conflict that stopped being one**, which is what the escalation's own advice produces:
-    /// it tells the asker to bring the target into their branch, resolve it there and ask again, and
-    /// when they do the merge lands and the escalated row stays behind. Terminal, so nothing tidies
-    /// it, and to the loop it still reads as work nobody has looked at.
+    /// **The conflict that stopped being one.** Somebody lands the merge another way and the
+    /// escalated row stays behind: terminal, so nothing tidies it, and to the loop it still reads as
+    /// work nobody has looked at.
     ///
     /// Watched three times in one evening on this repository. Once it minted an agent that resolved a
     /// conflict already settled by another route, and that resolution's landing would have reopened
@@ -744,8 +905,8 @@ mod tests {
             "until the merge lands some other way, it is a conflict like any other"
         );
 
-        // The asker takes the advice the escalation gave: they merge the target into their branch,
-        // resolve it there, and ask again. This time it goes through.
+        // Somebody settles it another way — by hand, or with the target brought in first — and asks
+        // again. This time it goes through.
         let settled = escalated_merge(&pool, false).await;
         sqlx::query(
             "UPDATE vcs_requests SET status = 'succeeded', result_sha = 'abc' WHERE id = ?",
@@ -759,6 +920,107 @@ mod tests {
             next_conflict(&pool).await.unwrap().is_none(),
             "request {settled} published this merge, so {escalated} is a conflict that no longer \
              exists — an agent started on it resolves what somebody has already decided"
+        );
+    }
+
+    /// **`next_conflict`'s fifth condition, asked about a run instead of a row.** A row skipped costs
+    /// nothing; an agent left working on a merge that has already happened costs a concurrency slot,
+    /// an hour and money — $3.01 across requests 87 and 88, over a conflict that had been settled
+    /// the previous evening.
+    #[tokio::test]
+    async fn a_live_resolution_whose_conflict_was_settled_elsewhere_is_named_for_stopping() {
+        let pool = test_pool().await;
+        let conflict = escalated_merge_of(&pool, "feat/settled", false).await;
+        insert_run(&pool, 41, "running").await;
+        resolving(&pool, conflict, 41).await;
+
+        assert!(
+            settled_resolutions(&pool)
+                .await
+                .expect("the query should run")
+                .is_empty(),
+            "until the merge is published the agent is doing the only thing that will publish it"
+        );
+
+        let settled = succeeded_merge_of(&pool, "feat/settled", false).await;
+
+        let named = settled_resolutions(&pool)
+            .await
+            .expect("the query should run");
+        assert_eq!(
+            named
+                .iter()
+                .map(|it| (it.request_id, it.run_id, it.settled_id))
+                .collect::<Vec<_>>(),
+            vec![(conflict, 41, settled)],
+            // The third of the three is not bookkeeping: it is what the feed line says. A
+            // resolution that simply stops reads as the daemon giving up on the conflict, which is
+            // the opposite of what happened to it.
+            "the row, the run to stop, and the request that settled it"
+        );
+    }
+
+    /// The four ways a live resolution is left alone. Each of them, got wrong, kills an agent that
+    /// is doing the work.
+    #[tokio::test]
+    async fn a_resolution_is_stopped_only_by_a_later_settlement_of_its_own_conflict() {
+        let pool = test_pool().await;
+
+        // One: another merge succeeding says nothing about this one. `args` is the stored JSON, so
+        // comparing it compares source and target and nothing else.
+        let other_pair = escalated_merge_of(&pool, "feat/other-pair", false).await;
+        insert_run(&pool, 51, "running").await;
+        resolving(&pool, other_pair, 51).await;
+        succeeded_merge_of(&pool, "feat/somebody-else", false).await;
+
+        // Two: a merge that succeeded EARLIER is a different event. The branches moved on and
+        // conflicted afterwards, which is the ordinary way a conflict comes to exist at all — and
+        // an agent stopped by it would be stopped by the very landing that caused its conflict.
+        succeeded_merge_of(&pool, "feat/again", false).await;
+        let again = escalated_merge_of(&pool, "feat/again", false).await;
+        insert_run(&pool, 52, "running").await;
+        resolving(&pool, again, 52).await;
+
+        // Three: the run has already ended, so there is nothing to stop and nothing to say about
+        // it. Without this the pass would try to cancel every resolution that ever finished, every
+        // minute, for as long as the row exists.
+        let finished = escalated_merge_of(&pool, "feat/finished", false).await;
+        insert_run(&pool, 53, "completed").await;
+        resolving(&pool, finished, 53).await;
+        succeeded_merge_of(&pool, "feat/finished", false).await;
+
+        // Four: **a resolution's own landing must not stop the resolution.** It publishes the branch
+        // it worked in — `nucleos/run-54`, not the source it merged — so the operation it settles is
+        // not the one it was minted for, and comparing `args` is what keeps those two apart. Pinned
+        // because a comparison loosened to the project would cancel every resolution at the moment
+        // it succeeded, which looks like the daemon killing its own work.
+        let live = escalated_merge_of(&pool, "feat/live", false).await;
+        insert_run(&pool, 54, "running").await;
+        resolving(&pool, live, 54).await;
+        succeeded_merge_of(&pool, "nucleos/run-54", true).await;
+
+        // Five: a resolution paused for approval is left alone, and this one is a boundary rather
+        // than an exclusion. `finalize_termination` writes its status only over `running`, so
+        // stopping a paused run here would abort its task and leave the row `awaiting_approval`
+        // with a pending proposal — holding a slot, healed by nothing until a startup pass that
+        // wants the proposal gone first. Paused, it costs nothing and a person can still answer it.
+        let paused = escalated_merge_of(&pool, "feat/paused", false).await;
+        insert_run(&pool, 55, "awaiting_approval").await;
+        resolving(&pool, paused, 55).await;
+        succeeded_merge_of(&pool, "feat/paused", false).await;
+
+        let named: Vec<i64> = settled_resolutions(&pool)
+            .await
+            .expect("the query should run")
+            .iter()
+            .map(|it| it.request_id)
+            .collect();
+        assert!(
+            named.is_empty(),
+            "nothing here is this pass's to stop — a different pair ({other_pair}), a success \
+             that predates the conflict ({again}), a run that has already ended ({finished}), a \
+             resolution's own landing ({live}) and a run paused for approval ({paused}) — yet \
+             these were named: {named:?}"
         );
     }
 

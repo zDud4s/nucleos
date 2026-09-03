@@ -3027,6 +3027,23 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
+    // The conflict follows its resolver, for the same reason as the three above and in the same
+    // shape. Left pointing at the run marked `superseded`, the resolution stops reading as live:
+    // `resolver.rs`'s "two never run at once" brake is a join through this column onto a live run,
+    // so it stops seeing this one and a second agent can be minted for the same two branches — and
+    // anything that cancels a resolution whose conflict has since been settled cannot reach the run
+    // actually doing the work.
+    //
+    // Measured on this repository. Requests 79 and 80 escalated, each got a resolution, and both
+    // conflicts were then settled another way and landed as request 85. Both resolutions had been
+    // resumed once, so both were linked to rows reading `superseded`; they carried on for another
+    // thirteen hours and $3.01 between them before escalating again as 87 and 88, over a conflict
+    // that had stopped existing the previous evening.
+    sqlx::query("UPDATE vcs_requests SET resolution_run_id = ? WHERE resolution_run_id = ?")
+        .bind(resume_id)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
     // One row either way, and it carries both keys because the two columns answer different
     // questions about it.
     //
@@ -6058,6 +6075,66 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             "the resume re-recorded the tree instead of taking the row over"
         );
     }
+
+    /// **The conflict follows its resolver across the resume**, like the tree, the slot and the job
+    /// items above it.
+    ///
+    /// `vcs_requests.resolution_run_id` is what says a resolution is live. `resolver.rs` joins
+    /// through it onto a run to keep two agents off one conflict, and joins through it again to stop
+    /// one whose conflict somebody has settled another way. Left pointing at the predecessor — which
+    /// this transaction has just marked `superseded` — both joins miss the run that is actually
+    /// doing the work: a second agent can be minted for the same two branches, and nothing can reach
+    /// the first.
+    ///
+    /// Measured. Requests 79 and 80 each got a resolution and each resolution was resumed once, so
+    /// both ended up linked to rows reading `superseded`. Their conflicts were then settled by hand
+    /// and landed as request 85; the two agents carried on for another thirteen hours and $3.01
+    /// between them before escalating again as requests 87 and 88, over a conflict that had stopped
+    /// existing the previous evening.
+    #[tokio::test]
+    async fn a_resumed_resolution_keeps_the_conflict_it_was_minted_for() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (original_run_id, proposal_id, _worktree_path) =
+            seed_resumable_action_approval(&state, Some("sess-resolution")).await;
+
+        // The escalated merge this run was minted to resolve, admitted through the real INSERT.
+        let request = crate::vcs::submit(
+            &state.pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj", "C:/repos/proj", "proj"),
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Shell,
+        )
+        .await
+        .expect("admit the merge");
+        sqlx::query(
+            "UPDATE vcs_requests SET status = 'escalated', resolution_run_id = ? WHERE id = ?",
+        )
+        .bind(original_run_id)
+        .bind(request)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            linked,
+            Some(resume_id),
+            "the conflict still points at run {original_run_id}, which this resume marked \
+             superseded — the resolution reads as dead while its agent is working"
+        );
+    }
+
 
     /// A context handoff carries the slot across, like the approval resume above it.
     ///
