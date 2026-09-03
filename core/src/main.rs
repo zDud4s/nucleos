@@ -284,6 +284,24 @@ fn render_pressure(report: &serde_json::Value) -> String {
     out
 }
 
+/// The branch a `--land` names, when it names one: the argument straight after the flag.
+///
+/// A function rather than four lines inside the block, because it is the only part of `--land`
+/// that can be wrong in a way the compiler cannot see, and `main.rs` has no other way to test a
+/// command-line shape.
+///
+/// `nucleos-core --land` has to keep meaning exactly what it has always meant, so an absent
+/// argument is `None` rather than an error. And a session that wrote `--land --something` meant
+/// the flag: an argument that itself looks like one is not a branch name, and treating it as one
+/// would send a typo to the daemon as a landing target.
+fn land_target_from(args: &[String]) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == "--land")
+        .and_then(|at| args.get(at + 1))
+        .filter(|value| !value.starts_with('-'))
+        .cloned()
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--print-token") {
@@ -322,7 +340,15 @@ async fn main() {
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let body = serde_json::json!({ "cwd": cwd }).to_string();
+        let args: Vec<String> = std::env::args().collect();
+        let target = land_target_from(&args);
+        // Omitted rather than sent as an explicit `null` when there is none, so a bare `--land`
+        // puts on the wire the same body every caller put there before the field existed.
+        let body = match &target {
+            Some(target) => serde_json::json!({ "cwd": cwd, "target": target }),
+            None => serde_json::json!({ "cwd": cwd }),
+        }
+        .to_string();
         let response = reqwest::Client::new()
             .post(format!("{}/vcs/land", daemon_client::daemon_url()))
             .bearer_auth(token)
@@ -1556,5 +1582,64 @@ mod tests {
             drawn.contains("split_speciality, trim_prompt"),
             "os dois veredictos, e nao so o primeiro: {drawn}"
         );
+    }
+
+    /// `nucleos-core --land` on its own is what almost every session types, and it has to keep
+    /// meaning what it has always meant. An argument that is not there is not an error.
+    #[test]
+    fn a_land_with_nothing_after_it_names_no_target() {
+        let args = ["nucleos-core".to_owned(), "--land".to_owned()];
+        assert_eq!(land_target_from(&args), None);
+    }
+
+    /// The branch is the argument straight after the flag, and what follows it is not this
+    /// function's business.
+    #[test]
+    fn a_land_takes_the_branch_that_follows_it() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "release".to_owned(),
+            "--verbose".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), Some("release".to_owned()));
+    }
+
+    /// The same when the branch ends the command line, which is how it is actually typed. The
+    /// `get(at + 1)` is what keeps this from being an index past the end.
+    #[test]
+    fn a_land_takes_a_branch_that_ends_the_command_line() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "release".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), Some("release".to_owned()));
+    }
+
+    /// A session that wrote `--land --something` meant the flag. Reading the next flag as a
+    /// branch name would send a typo to the daemon as a landing target, and the daemon would
+    /// refuse it with a message about a branch nobody ever asked for.
+    #[test]
+    fn a_land_followed_by_another_flag_names_no_target() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "--verbose".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), None);
+    }
+
+    /// And a command line with no `--land` at all has no target to find, however many other
+    /// arguments it carries.
+    #[test]
+    fn a_command_line_without_land_names_no_target() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--pressao".to_owned(),
+            "--equipa".to_owned(),
+            "NucleOS".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), None);
     }
 }

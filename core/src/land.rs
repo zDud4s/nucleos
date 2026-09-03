@@ -10,22 +10,21 @@
 //! before its number. Getting this wrong costs a reader the wrong document, so it is spelled out
 //! rather than left to be inferred.
 //!
-//! The dono asked for one thing
-//! in his own words — *"a responsabilidade do bom merge sem conflitos ser de um módulo
-//! específico"* — after watching the queue land on a tree nobody chose roughly ten times. Two
-//! defects composed to cause it: the target used to be read off the main checkout's HEAD
-//! (`http.rs`, before this module existed), and a checkout parked on the wrong branch silently
+//! The dono asked for one thing in his own words — *"a responsabilidade do bom merge sem conflitos
+//! ser de um módulo específico"* — after watching the queue land on a tree nobody chose roughly
+//! ten times. Two defects composed to cause it: the target used to be read off the main checkout's
+//! HEAD (`http.rs`, before this module existed), and a checkout parked on the wrong branch silently
 //! redirected every landing there. This module exists so that answer has exactly one home.
 //!
 //! **What is this module's, and what stays where it already was.** `vcs.rs` still decides WHEN an
 //! admitted request runs — exclusivity, ordering, retrying a merge whose target moved underneath
 //! it (decision #4, `vcs::drain_once`). `git_exec.rs` still decides HOW a merge is computed and
 //! published. This module decides WHAT a landing's `Op::Merge` names — which branch is the
-//! project's integration branch, whether a caller may name a different destination for one
-//! landing, and whether a source is worth submitting at all — and it is the
-//! only site in the core that builds a landing's `Op::Merge`. `resolver.rs` keeps starting
-//! resolutions on its own schedule; what this module adds is linking a resolution's landing back to
-//! the escalation it answers, at the moment that landing is admitted.
+//! project's integration branch, whether a caller may name a different destination for one landing,
+//! and whether a source is worth submitting at all — and it is the only site in the core that
+//! builds a landing's `Op::Merge`. `resolver.rs` keeps starting resolutions on its own schedule;
+//! what this module adds is linking a resolution's landing back to the escalation it answers, at
+//! the moment that landing is admitted.
 
 use std::path::Path;
 use std::time::Instant;
@@ -131,7 +130,7 @@ pub async fn integration_branch(
         if !exists {
             return Err(format!(
                 "{project_id}'s integration branch is set to {branch}, and refs/heads/{branch} \
-                 does not exist — nothing lands until it is corrected"
+                 does not exist — nothing lands by default until it is corrected"
             ));
         }
         return Branch::new(&branch);

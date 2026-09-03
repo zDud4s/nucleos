@@ -6916,6 +6916,11 @@ struct LandBody {
     /// Anywhere inside the worktree that is asking. Resolved to its root, so a session standing
     /// in a subdirectory asks the same question as one standing at the top.
     cwd: String,
+    /// The branch this landing is for, when the caller named one. `None` — every caller until
+    /// 2026-09-03 — means the project's integration branch, and that has to keep being what an
+    /// absent field means: `--land` alone is the spelling almost every session uses.
+    #[serde(default)]
+    target: Option<String>,
 }
 
 /// "I am finished — take this branch." The one request a worktree could not previously express.
@@ -6940,11 +6945,12 @@ struct LandBody {
 /// publishing and the row records `failed` with git's own output. A request that can no longer land
 /// says so and stops, which is the behaviour wanted rather than a new mechanism.
 ///
-/// The target is `land::integration_branch` — declared once per project and never read off any
-/// worktree's HEAD. This handler no longer decides that, or anything else about what the landing
-/// means: it resolves *who is asking* (a `cwd`, turned into a worktree root, a branch and a
-/// repository) and hands the rest to `land.rs`. Design decision #8 — the ~60 lines this used to
-/// carry moved to the module that now owns them.
+/// The target is `land::integration_branch` — declared once per project — unless the caller named
+/// one this project admits, and in neither case is it read off any worktree's HEAD, which is the
+/// defect `land.rs` exists to prevent. This handler no longer decides that, or anything else about
+/// what the landing means: it resolves *who is asking* (a `cwd`, turned into a worktree root, a
+/// branch and a repository) and hands the rest to `land.rs`. Design decision #8 — the ~60 lines
+/// this used to carry moved to the module that now owns them.
 async fn land_worktree(
     State(state): State<AppState>,
     Json(body): Json<LandBody>,
@@ -6983,7 +6989,7 @@ async fn land_worktree(
         &repo,
         std::path::Path::new(repo.root()),
         source.trim(),
-        None,
+        body.target.as_deref(),
         deadline,
     )
     .await
@@ -12129,6 +12135,7 @@ mod tests {
             State(state.clone()),
             Json(LandBody {
                 cwd: worktree.to_string_lossy().into_owned(),
+                target: None,
             }),
         )
         .await
@@ -12157,12 +12164,120 @@ mod tests {
             State(state),
             Json(LandBody {
                 cwd: repo.to_string_lossy().into_owned(),
+                target: None,
             }),
         )
         .await
         .expect_err("the main checkout has nothing to land");
         assert_eq!(refused.0, StatusCode::CONFLICT);
         assert!(refused.1.contains("already on trunk"), "{}", refused.1);
+    }
+
+    /// The other half of the same decision: a landing may name where it goes, and the name only
+    /// reaches the queue through this field. `release` is declared for the project alongside the
+    /// `trunk` the test above landed on, so the queued row has to name `release` — the destination
+    /// the caller asked for, not the one an absent field would have meant.
+    ///
+    /// The refusal is asserted in the same test because it is the same decision seen from the
+    /// other side: a name the project does not admit is turned away here, before any merge is
+    /// computed, and it has to say what the project DOES take. A session cannot read
+    /// `project_land_targets`, so the refusal is the only place it can learn that.
+    #[tokio::test]
+    async fn a_named_target_reaches_the_queued_row_and_an_undeclared_one_is_refused() {
+        let (state, _db) = file_test_state().await;
+        let container = crate::git_exec::tests::space_free_tempdir("http-land-named-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        // Same shape as the test above — the main checkout stands on `trunk` and stays there —
+        // with one addition: `release`, a second destination this project admits.
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
+        assert!(git_in(&repo, &["branch", "release"]));
+        assert!(git_in(&repo, &["branch", "feature"]));
+        let worktree = container.path().join("wt");
+        assert!(git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "feature"
+            ]
+        ));
+        // Decision #3 again: without a commit of its own, `feature` is an ancestor of `release`
+        // and the landing is refused before this test reaches what it means to assert.
+        std::fs::write(worktree.join("feature.txt"), "from the branch\n").unwrap();
+        assert!(git_in(&worktree, &["add", "-A"]));
+        assert!(git_in(&worktree, &["commit", "-m", "feature"]));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
+             VALUES ('alpha', 'active', ?, 'trunk')",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        crate::project_policy::declare_land_target(&state.pool, "alpha", "release")
+            .await
+            .unwrap();
+
+        let landed = land_worktree(
+            State(state.clone()),
+            Json(LandBody {
+                cwd: worktree.to_string_lossy().into_owned(),
+                target: Some("release".to_owned()),
+            }),
+        )
+        .await
+        .expect("a target the project declared, on a branch that exists, is admissible");
+        assert_eq!(landed.0.status, "queued");
+
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(landed.0.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let op: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(op["op"], "merge");
+        assert_eq!(
+            op["source"], "feature",
+            "the worktree's own branch is still what lands"
+        );
+        assert_eq!(
+            op["target"], "release",
+            "the named target is what the row carries, not the integration branch"
+        );
+
+        let refused = land_worktree(
+            State(state),
+            Json(LandBody {
+                cwd: worktree.to_string_lossy().into_owned(),
+                target: Some("nope".to_owned()),
+            }),
+        )
+        .await
+        .expect_err("a branch the project never declared is not a landing target");
+        assert_eq!(refused.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            refused.1.contains("nope"),
+            "the refusal names what was asked for: {}",
+            refused.1
+        );
+        assert!(
+            refused.1.contains("release") && refused.1.contains("trunk"),
+            "and what the project does take instead: {}",
+            refused.1
+        );
+    }
+
+    /// Every caller that existed before the target did sends a body with no `target` at all, and
+    /// an absent field has to keep meaning the project's integration branch. `#[serde(default)]`
+    /// is the whole of that guarantee, and nothing else in this file would notice if it were
+    /// dropped.
+    #[test]
+    fn a_land_body_without_a_target_still_deserializes() {
+        let body: LandBody = serde_json::from_str(r#"{"cwd":"C:\\somewhere"}"#).unwrap();
+        assert_eq!(body.target, None);
     }
 
     fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
