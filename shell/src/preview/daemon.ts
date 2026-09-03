@@ -1177,7 +1177,16 @@ function generatedMap(): ProjectMap {
   const seen = new Set<string>();
   const add = (from: string, to: string) => {
     if (from === to) return;
-    const key = `${from} ${to}`;
+    /*
+      Separated by a character no module path can contain, and written as the
+      ESCAPE rather than as the byte. A raw NUL anywhere in a source file makes
+      git, grep and `file` classify the whole file as binary: the byte that used
+      to be here is why `refactor/nomes-em-ingles` missed a mention in this file
+      and needed a commit of its own to find it, and why a merge of this file
+      reported as one conflict from line 1 to the end. The string this builds is
+      identical either way.
+    */
+    const key = `${from}\0${to}`;
     if (seen.has(key)) return;
     seen.add(key);
     imports.push({ from, to });
