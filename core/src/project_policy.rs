@@ -29,6 +29,8 @@
 // being exercised has to say so rather than hide behind this line.
 #![cfg_attr(not(test), allow(dead_code))]
 
+use sqlx::SqlitePool;
+
 /// What a shell rule says about the prefix it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,6 +84,210 @@ impl ShellRules {
     }
 }
 
+/// Both lists, split by verdict. `Err` when the table could not be read — see the module doc:
+/// yielding an empty `deny` would lose a refusal somebody wrote down, so this one cannot fail soft.
+pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRules, String> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT prefix, verdict FROM project_shell_rules WHERE project_id = ? ORDER BY prefix",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("could not read {project_id}'s shell rules: {error}"))?;
+
+    let mut rules = ShellRules::default();
+    for (prefix, verdict) in rows {
+        match Verdict::from_db_str(&verdict) {
+            Some(Verdict::Allow) => rules.allow.push(prefix),
+            Some(Verdict::Deny) => rules.deny.push(prefix),
+            // The migration's `CHECK (verdict IN ('allow', 'deny'))` should make this arm
+            // unreachable -- but "should" is not "cannot": schema drift, an out-of-band write, or a
+            // future migration loosening the constraint could still put an unrecognised word here.
+            // Dropping the row, as this used to do, is the PERMISSIVE answer: it silently discards a
+            // row that might have been exactly the refusal somebody wrote down. This module's own
+            // header says every read here fails toward refusal, so a prefix nobody can read the
+            // verdict of is one this module DENIES, not one it forgets.
+            None => {
+                tracing::warn!(%prefix, %verdict, project_id, "shell rule: unreadable verdict; denied");
+                rules.deny.push(prefix);
+            }
+        }
+    }
+    Ok(rules)
+}
+
+/// Declares a rule, or changes the verdict of one already declared.
+///
+/// `ON CONFLICT (project_id, prefix)` — the pair the unique index names — because the IDENTITY of a
+/// rule is the prefix it names. Without it, changing your mind about a verdict would leave BOTH
+/// answers in the table and the reader would pick one of them.
+pub async fn declare_shell_rule(
+    pool: &SqlitePool,
+    project_id: &str,
+    prefix: &str,
+    verdict: Verdict,
+    note: Option<&str>,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO project_shell_rules (project_id, prefix, verdict, note, created_at)
+         VALUES (?, ?, ?, ?, datetime('now'))
+         ON CONFLICT (project_id, prefix)
+         DO UPDATE SET verdict = excluded.verdict, note = excluded.note",
+    )
+    .bind(project_id)
+    .bind(prefix.trim())
+    .bind(verdict.as_db_str())
+    .bind(note)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("could not declare {prefix} for {project_id}: {error}"))
+}
+
+/// Undeclares one rule, leaving the rest of the project's shell list untouched. The `WHERE` names
+/// exactly the pair `declare_shell_rule`'s `ON CONFLICT` would have matched — the identity of a rule
+/// is the prefix, and only that row goes.
+///
+/// Trims for the same reason `declare_shell_rule` does: forget must compare against the same key
+/// declare wrote, or a padded argument matches zero rows and this still returns `Ok(())` — a no-op
+/// wearing the same face as a real delete.
+pub async fn forget_shell_rule(
+    pool: &SqlitePool,
+    project_id: &str,
+    prefix: &str,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM project_shell_rules WHERE project_id = ? AND prefix = ?")
+        .bind(project_id)
+        .bind(prefix.trim())
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("could not forget {prefix} for {project_id}: {error}"))
+}
+
+/// The GitHub operations this project runs without asking. `Vec` and not `Result`, unlike
+/// `shell_rules`: an unreadable list here yields nothing, which WITHHOLDS autonomy. That is the
+/// safe direction, and it is the one `narrow` already takes about a malformed entry.
+pub async fn github_ops(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT op_kind FROM project_github_ops WHERE project_id = ? ORDER BY op_kind",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, project_id, "github ops: unreadable; this project stays autonomous in nothing");
+        Vec::new()
+    })
+}
+
+/// Grants one GitHub operation without asking, in this project. Unlike `declare_shell_rule`, there
+/// is no verdict or note attached to an op — presence in the table IS the grant, and the pair the
+/// unique index names is still the identity, so a repeat declaration finds a row already saying
+/// what it came to say. `DO NOTHING` leaves that row, and its original `created_at`, exactly as it
+/// was; `DO UPDATE` would quietly turn the column from "when this was declared" into "when it was
+/// last redeclared", which nothing reads today but would mislead whoever adds a "declared since"
+/// column later and takes the name at face value.
+pub async fn declare_github_op(
+    pool: &SqlitePool,
+    project_id: &str,
+    op_kind: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO project_github_ops (project_id, op_kind, created_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT (project_id, op_kind)
+         DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(op_kind.trim())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("could not declare {op_kind} for {project_id}: {error}"))
+}
+
+/// Withdraws one operation from the project's autonomous set. After this it goes back to asking —
+/// the safe direction, and the only one a forget can take here.
+///
+/// Trims like `declare_github_op` does, so the two agree on what a key is — the same asymmetry that
+/// would leave `forget_shell_rule` matching zero rows applies here too.
+pub async fn forget_github_op(
+    pool: &SqlitePool,
+    project_id: &str,
+    op_kind: &str,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM project_github_ops WHERE project_id = ? AND op_kind = ?")
+        .bind(project_id)
+        .bind(op_kind.trim())
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("could not forget {op_kind} for {project_id}: {error}"))
+}
+
+/// The branches a `--land` may target in this project, besides `integration_branch` — which is
+/// always admissible, table empty or not, and so never has a row of its own here. `Vec` and not
+/// `Result`, for the same reason as `github_ops`: an unreadable table must not open a landing spot
+/// this project never earned.
+pub async fn land_targets(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT branch FROM project_land_targets WHERE project_id = ? ORDER BY branch",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, project_id, "land targets: unreadable; this project lands nowhere extra");
+        Vec::new()
+    })
+}
+
+/// Opens one more landing target for this project. Unlike `declare_shell_rule`, there is no verdict
+/// or note attached to a target — presence in the table IS the grant, and the pair the unique index
+/// names is still the identity, so a repeat declaration finds a row already saying what it came to
+/// say. `DO NOTHING` leaves that row, and its original `created_at`, exactly as it was; `DO UPDATE`
+/// would quietly turn the column from "when this was declared" into "when it was last redeclared",
+/// which nothing reads today but would mislead whoever adds a "declared since" column later and
+/// takes the name at face value.
+pub async fn declare_land_target(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO project_land_targets (project_id, branch, created_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT (project_id, branch)
+         DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(branch.trim())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("could not declare {branch} for {project_id}: {error}"))
+}
+
+/// Closes one landing target. `integration_branch` needs no row to stay admissible, so this can
+/// never take away the one destination every project already has.
+///
+/// Trims like `declare_land_target` does, for the same reason as the other two `forget_*`
+/// functions: declare and forget must agree on what a key is.
+pub async fn forget_land_target(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM project_land_targets WHERE project_id = ? AND branch = ?")
+        .bind(project_id)
+        .bind(branch.trim())
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("could not forget {branch} for {project_id}: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,10 +329,10 @@ mod tests {
         assert!(rules.denies("npm ci") && !rules.allows("npm ci"));
     }
 
-    /// The pair is a round trip, and anything else is `None`. `shell_rules` leans on that `None`
-    /// to DROP a malformed row rather than guess at it, so it is the safety property and not a
-    /// formality. The migration's `CHECK (verdict IN ('allow', 'deny'))` should stop such a row
-    /// ever being written; this is what happens to one that exists anyway.
+    /// The pair is a round trip, and anything else is `None`. `shell_rules` leans on that `None` to
+    /// DENY a malformed row rather than guess at it or discard it, so it is the safety property and
+    /// not a formality. The migration's `CHECK (verdict IN ('allow', 'deny'))` should stop such a
+    /// row ever being written; this is what happens to one that exists anyway.
     ///
     /// It is also what keeps `#![cfg_attr(not(test), allow(dead_code))]` honest: that attribute
     /// leaves the lint live under `cfg(test)`, so an item no test touches is still flagged. Without
@@ -155,5 +361,174 @@ mod tests {
         assert!(!rules.allows("ls"));
         assert!(!rules.denies("ls"));
         assert!(rules.is_empty());
+    }
+
+    /* ---------------------------------------------------------------- db -- */
+
+    async fn pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn a_declared_rule_comes_back_on_its_own_side() {
+        let pool = pool().await;
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            "bash scripts/gates.sh",
+            Verdict::Allow,
+            None,
+        )
+        .await
+        .unwrap();
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            "git push",
+            Verdict::Deny,
+            Some("never from a worktree"),
+        )
+        .await
+        .unwrap();
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(rules.allow, vec!["bash scripts/gates.sh".to_owned()]);
+        assert_eq!(rules.deny, vec!["git push".to_owned()]);
+
+        // And forgetting one takes only that one. Without this call `forget_shell_rule` is the
+        // single one of the nine that no test touches, which under the module's
+        // `#![cfg_attr(not(test), allow(dead_code))]` leaves it dead in the TEST build and turns
+        // `clippy -D warnings` red -- that attribute covers the non-test build only.
+        forget_shell_rule(&pool, "alpha", "git push").await.unwrap();
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert!(rules.deny.is_empty());
+        assert_eq!(rules.allow, vec!["bash scripts/gates.sh".to_owned()]);
+
+        // Declare and forget must agree on what a key IS. `declare_shell_rule` trims before
+        // binding, so a forget that does not would compare a padded string against the trimmed
+        // stored value, match zero rows, and still return `Ok(())` -- indistinguishable from a real
+        // delete. That is the worst shape of this bug: the caller believes a refusal was lifted and
+        // it was not.
+        declare_shell_rule(&pool, "alpha", "cargo run", Verdict::Allow, None)
+            .await
+            .unwrap();
+        forget_shell_rule(&pool, "alpha", "  cargo run  ")
+            .await
+            .unwrap();
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert!(!rules.allow.contains(&"cargo run".to_owned()));
+    }
+
+    /// The identity is (project, prefix): declaring the same prefix again EDITS it. Otherwise
+    /// changing your mind about a verdict leaves both answers in the table and the reader picks one.
+    #[tokio::test]
+    async fn declaring_the_same_prefix_again_changes_its_verdict() {
+        let pool = pool().await;
+        declare_shell_rule(&pool, "alpha", "git push", Verdict::Allow, None)
+            .await
+            .unwrap();
+        declare_shell_rule(&pool, "alpha", "git push", Verdict::Deny, None)
+            .await
+            .unwrap();
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert!(rules.allow.is_empty());
+        assert_eq!(rules.deny, vec!["git push".to_owned()]);
+    }
+
+    /// One project's rules are not another's, in ANY of the three tables. Stated as a test because
+    /// the `project_id` is a bind parameter and a missing `WHERE` is the cheapest possible way to
+    /// leak a whole machine's policy — all three tables share the same shape, and nothing pins
+    /// `github_ops`'s and `land_targets`'s own `WHERE` beyond this.
+    #[tokio::test]
+    async fn one_projects_rules_do_not_reach_another() {
+        let pool = pool().await;
+        declare_shell_rule(&pool, "alpha", "cargo run", Verdict::Allow, None)
+            .await
+            .unwrap();
+        declare_github_op(&pool, "alpha", "run_list").await.unwrap();
+        declare_land_target(&pool, "alpha", "master").await.unwrap();
+
+        assert!(shell_rules(&pool, "beta").await.unwrap().is_empty());
+        assert!(github_ops(&pool, "beta").await.is_empty());
+        assert!(land_targets(&pool, "beta").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_project_that_declared_nothing_reads_empty_everywhere() {
+        let pool = pool().await;
+        assert!(shell_rules(&pool, "alpha").await.unwrap().is_empty());
+        assert!(github_ops(&pool, "alpha").await.is_empty());
+        assert!(land_targets(&pool, "alpha").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_ops_and_land_targets_round_trip_and_forget() {
+        let pool = pool().await;
+        declare_github_op(&pool, "alpha", "run_list").await.unwrap();
+        // Declared twice on purpose: `declare_github_op`'s `ON CONFLICT ... DO NOTHING` must make
+        // this a no-op, not a second row or a constraint error. Without this line a regression to a
+        // bare `INSERT` would only surface as `UNIQUE constraint failed`, and nothing here would
+        // catch it.
+        declare_github_op(&pool, "alpha", "run_list").await.unwrap();
+        declare_github_op(&pool, "alpha", "pr_comment")
+            .await
+            .unwrap();
+        assert_eq!(
+            github_ops(&pool, "alpha").await,
+            vec!["pr_comment".to_owned(), "run_list".to_owned()]
+        );
+        forget_github_op(&pool, "alpha", "run_list").await.unwrap();
+        assert_eq!(
+            github_ops(&pool, "alpha").await,
+            vec!["pr_comment".to_owned()]
+        );
+
+        declare_land_target(&pool, "alpha", "master").await.unwrap();
+        // Same idempotency check as `run_list` above, for `declare_land_target`'s own `DO NOTHING`.
+        declare_land_target(&pool, "alpha", "master").await.unwrap();
+        assert_eq!(
+            land_targets(&pool, "alpha").await,
+            vec!["master".to_owned()]
+        );
+        forget_land_target(&pool, "alpha", "master").await.unwrap();
+        assert!(land_targets(&pool, "alpha").await.is_empty());
+    }
+
+    /// `shell_rules`' `None` arm and this module's header both lean on the migration's `CHECK`s
+    /// actually holding — pins that claim. Raw `sqlx::query`, not `declare_shell_rule`: the point is
+    /// the database's own guarantee, not the Rust wrapper that happens to already normalise input
+    /// before it would ever reach a `CHECK`.
+    #[tokio::test]
+    async fn the_check_constraints_reject_what_they_say_they_reject() {
+        let pool = pool().await;
+
+        let wrong_case = sqlx::query(
+            "INSERT INTO project_shell_rules (project_id, prefix, verdict, created_at)
+             VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind("alpha")
+        .bind("git push")
+        .bind("Allow")
+        .execute(&pool)
+        .await;
+        assert!(wrong_case.is_err());
+
+        let empty_prefix = sqlx::query(
+            "INSERT INTO project_shell_rules (project_id, prefix, verdict, created_at)
+             VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind("alpha")
+        .bind("")
+        .bind("allow")
+        .execute(&pool)
+        .await;
+        assert!(empty_prefix.is_err());
     }
 }
