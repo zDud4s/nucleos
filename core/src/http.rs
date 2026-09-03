@@ -6983,6 +6983,7 @@ async fn land_worktree(
         &repo,
         std::path::Path::new(repo.root()),
         source.trim(),
+        None,
         deadline,
     )
     .await

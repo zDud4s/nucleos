@@ -151,7 +151,58 @@ async fn derive_integration_branch(
     ))
 }
 
-/// Admits a landing: `source`, into whatever `integration_branch` answers for `repo`.
+/// The branch THIS landing is for.
+///
+/// **Decision #2, and it is the guard that lets decision #1 exist at all.** This module was written
+/// because the target used to be *inferred* from a checkout's HEAD and the queue landed on a branch
+/// nobody chose about ten times. An argument is not that defect — inferred is not the same as said
+/// — but a typo that happens to name a real branch would be, so a named target has to be admitted
+/// before it is anything else.
+///
+/// The integration branch is admissible whether or not the table names it. An empty table has to
+/// mean "only the usual place"; reading it as "nowhere" would break every project that never opens
+/// the page.
+async fn resolve_target(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    project_root: &Path,
+    requested: Option<&str>,
+    deadline: Instant,
+) -> Result<Branch, String> {
+    let declared = integration_branch(pool, project_id, project_root, deadline).await?;
+
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(declared);
+    };
+    if requested == declared.as_str() {
+        return Ok(declared);
+    }
+
+    let mut admitted = crate::project_policy::land_targets(pool, project_id).await;
+    if !admitted.iter().any(|branch| branch == requested) {
+        admitted.push(declared.as_str().to_owned());
+        admitted.sort();
+        admitted.dedup();
+        return Err(format!(
+            "{requested} is not a landing target {project_id} admits — it admits {}",
+            admitted.join(", ")
+        ));
+    }
+
+    // Confirmed against the repository for `integration_branch`'s own reason: a branch declared and
+    // then deleted is a misconfigured project, not a project with no target, and refusing it by
+    // name beats failing three git commands deep inside a merge.
+    if !crate::git_exec::branch_exists(project_root, requested, deadline).await? {
+        return Err(format!(
+            "{project_id} admits {requested} as a landing target and refs/heads/{requested} does \
+             not exist"
+        ));
+    }
+    Branch::new(requested)
+}
+
+/// Admits a landing: `source`, into `requested_target` when the caller named one the project
+/// admits, and otherwise into whatever `integration_branch` answers for `repo`.
 ///
 /// **The only site in the core that builds a landing's `Op::Merge`.** `http.rs`'s route hands this
 /// a `cwd` already resolved to a branch and a repository; this decides whether that branch is
@@ -171,12 +222,19 @@ pub async fn submit(
     repo: &ResolvedRepo,
     project_root: &Path,
     source: &str,
+    requested_target: Option<&str>,
     deadline: Instant,
 ) -> Result<i64, LandRefusal> {
     let source = Branch::new(source).map_err(LandRefusal::Refused)?;
-    let target = integration_branch(pool, repo.project_id(), project_root, deadline)
-        .await
-        .map_err(LandRefusal::Refused)?;
+    let target = resolve_target(
+        pool,
+        repo.project_id(),
+        project_root,
+        requested_target,
+        deadline,
+    )
+    .await
+    .map_err(LandRefusal::Refused)?;
 
     if source.as_str() == target.as_str() {
         return Err(LandRefusal::AlreadyOnTarget(format!(
@@ -373,7 +431,7 @@ mod tests {
         let feat_sha = sha_of(&repo, "feat/x");
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect("a checkout parked elsewhere must not stop feat/x landing on master");
 
@@ -422,7 +480,7 @@ mod tests {
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let refusal = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let refusal = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect_err("feat/x is already part of master — there is nothing left to land");
 
@@ -466,6 +524,134 @@ mod tests {
         assert!(refusal.contains("alpha"), "{refusal}");
     }
 
+    /// Decision #2. A named target has to be admitted before it is anything else -- and the
+    /// refusal NAMES what would have been admitted, because a caller who has to open the app to
+    /// find out has lost the reason this command exists.
+    #[tokio::test]
+    async fn a_target_outside_the_admitted_list_is_refused_by_name() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-target-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        // No `release` branch is created, and none is needed: admission is answered before
+        // `branch_exists` is ever reached. A test that created one would be asserting about a
+        // branch the code never looks at.
+        let refusal = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(refusal, LandRefusal::Refused(_)));
+        assert!(
+            refusal.message().contains("release"),
+            "{}",
+            refusal.message()
+        );
+        assert!(
+            refusal.message().contains("master"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// The integration branch is admissible without being in the table. An empty table means
+    /// "only the usual place", never "nowhere".
+    #[tokio::test]
+    async fn the_integration_branch_is_admitted_without_being_declared() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-declared-", "chore/other");
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        submit(&pool, &repo_id, &repo, "feat/x", Some("master"), deadline())
+            .await
+            .expect("naming the integration branch explicitly must be admitted");
+    }
+
+    /// A target the project admits but git no longer has is refused HERE, not three git commands
+    /// into a merge -- the same rule `integration_branch` already applies to a stale column.
+    #[tokio::test]
+    async fn an_admitted_target_whose_branch_is_gone_is_refused() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-gone-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+            .await
+            .unwrap();
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        let refusal = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(refusal, LandRefusal::Refused(_)));
+        assert!(
+            refusal.message().contains("refs/heads/release"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// Decision #1's negative half, and the one that keeps the old defect from returning by another
+    /// door: naming a target for one landing must not redeclare the project's default.
+    #[tokio::test]
+    async fn an_explicit_target_does_not_rewrite_the_integration_branch() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-nowrite-", "chore/other");
+        assert!(git_in(&repo, &["branch", "release", "master"]));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+            .await
+            .unwrap();
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .expect("an admitted target that exists must be submitted");
+
+        let after: Option<String> = sqlx::query_scalar(
+            "SELECT integration_branch FROM autopilot_state WHERE project_id = ?",
+        )
+        .bind("alpha")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after.as_deref(),
+            Some("master"),
+            "naming a target for one landing must not redeclare the project's default"
+        );
+    }
+
     /// Decision #6: a merge the project's gate refuses is `Failed`, never `Escalated` — nothing
     /// here is a conflict, and a red gate must not mint a resolver agent to "fix" someone else's
     /// worktree. Pinned structurally: an escalated row is the only kind `resolver.rs` ever picks
@@ -492,7 +678,7 @@ mod tests {
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect("a red gate is discovered at execution, not at submission");
 
@@ -533,7 +719,7 @@ mod tests {
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
 
         // The conflict, exactly as an ordinary landing meets it.
-        let original = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let original = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect("an ordinary landing is admitted; the conflict is discovered at execution");
         assert!(
@@ -570,7 +756,7 @@ mod tests {
         assert!(git_in(&repo, &["commit", "--no-edit"]));
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
 
-        let resolution = submit(&pool, &repo_id, &repo, "nucleos/run-42", deadline())
+        let resolution = submit(&pool, &repo_id, &repo, "nucleos/run-42", None, deadline())
             .await
             .expect("a verified resolution is admitted");
         assert_ne!(
@@ -649,7 +835,7 @@ mod tests {
             .await
             .expect("break admission so the resolution cannot be admitted");
 
-        let refusal = submit(&pool, &repo_id, &repo, "nucleos/run-77", deadline())
+        let refusal = submit(&pool, &repo_id, &repo, "nucleos/run-77", None, deadline())
             .await
             .expect_err("admission is broken on purpose — the resolution cannot land");
 
