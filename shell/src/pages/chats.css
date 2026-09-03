@@ -865,6 +865,23 @@
   padding: var(--space-3);
 }
 
+/* A heading INSIDE the model menu, one level under its own "Which model answers"
+   title — four of them, one per route. Quieter and smaller than that title on
+   purpose: the menu has one subject and these are its divisions, so headings
+   drawn with the same weight would read as four menus stacked. The space goes on
+   the heading's top rather than on the group, so the first section sits tight
+   under the title and only the ones after it are pushed apart. */
+.chats-meta-menu-section {
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+}
+
+.chats-meta-menu-section:first-of-type {
+  margin-top: 0;
+}
+
 /* Archiving, which is menu CONTENT and never a menu item — a `DropdownMenuItem`
    closes on the first select and would collapse the two-click interlock into
    one irreversible press. It shared a rule with the brain picker until that

@@ -381,6 +381,17 @@ pub fn build_router(state: AppState) -> Router {
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
         .route("/assistant/local-model", get(get_local_model))
+        // Fetching one this machine does not have, and watching it arrive. Under the route above
+        // rather than beside it because it is the same subject — what this machine can answer with
+        // — and a person reading the table should see the two together.
+        .route(
+            "/assistant/local-model/pull",
+            get(get_local_model_pull).post(post_local_model_pull),
+        )
+        // What it weighs, and whether this machine can carry it. Beside the pull because it is the
+        // question asked immediately before one — and the one the pull itself asks to decide
+        // whether to refuse.
+        .route("/assistant/local-model/size", get(get_local_model_size))
         .route("/assistant/ide-sessions", get(list_ide_sessions))
         // The conversation behind one of them. A GET on the session itself rather than a
         // `/messages` under it: what a session IS, to anything outside this daemon, is what was
@@ -8493,6 +8504,283 @@ async fn get_local_model(State(state): State<AppState>) -> Json<serde_json::Valu
     // to touch beyond the `AppState` literal.
     let available = state.assistants.serves(crate::chats::Brain::Local).is_ok();
     Json(serde_json::json!({ "available": available }))
+}
+
+/// One download of a local model: what it is, where it has got to, and how it ended.
+///
+/// `outcome` is `None` while it runs, and that single field is what "in flight" means here — there
+/// is no separate flag, because two ways to say the same thing is two ways for them to disagree.
+/// A finished pull is KEPT rather than cleared: the window polls, and clearing on completion would
+/// mean the poll that arrives one tick after a successful download finds nothing and cannot tell
+/// "it worked" from "nothing ever happened".
+#[derive(Clone)]
+struct Pull {
+    model: String,
+    /// Ollama's own word for what it is doing, carried through untranslated —
+    /// `capabilities::PullProgress` explains why.
+    status: String,
+    completed: u64,
+    total: u64,
+    outcome: Option<Result<(), String>>,
+}
+
+/// The one download this machine is doing, or the last one it did.
+///
+/// A process-global rather than a field on `AppState`, for the reason `sidecar::SIDECARS` and
+/// `assistant::LIVE_CHATS` are: this is not per-request state that a handler was handed, it is a
+/// fact about the machine — there is one Ollama on it, one disk, and at most one download being
+/// watched. It also sits beside `OLLAMA_TAGS_CLIENT`, which is a static in this module for exactly
+/// the same argument.
+///
+/// **One at a time, deliberately.** Two multi-gigabyte downloads sharing one disk finish later than
+/// the same two in sequence, and the window has one progress bar; a second request while one runs
+/// is refused rather than queued, because a queue nobody can see or cancel is worse than a refusal
+/// somebody can retry.
+///
+/// The one way this can wedge: a task that panicked between its last progress frame and writing its
+/// outcome would leave `outcome: None` forever, and every later pull would be refused until the
+/// daemon restarts. What it runs has no panic path — `pull_local_model` returns its failures — and
+/// the alternative (keeping the `JoinHandle` to ask `is_finished`) costs this type its `Clone` and
+/// the readout its pure test, which is a worse trade for a case that needs a bug to reach.
+static LOCAL_PULL: std::sync::LazyLock<std::sync::Mutex<Option<Pull>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// PURE: a pull -> what the window is told about it.
+///
+/// `percent` is `null` and not `0` when nothing has said how big the download is. Every pull opens
+/// on `pulling manifest`, which carries no counts, and a bar sitting at 0% says a download is
+/// stuck — which one that has not started measuring itself is not.
+///
+/// `state` collapses to three words because three is what a window can draw. `done` and `failed`
+/// stay apart, though both mean "not running": collapsing them would either swallow the reason a
+/// download failed or leave a spinner up after one that worked.
+fn pull_readout(pull: &Pull) -> serde_json::Value {
+    serde_json::json!({
+        "model": pull.model,
+        "state": match &pull.outcome {
+            None => "running",
+            Some(Ok(())) => "done",
+            Some(Err(_)) => "failed",
+        },
+        "status": pull.status,
+        "percent": (pull.total > 0).then(|| pull.completed * 100 / pull.total),
+        "error": match &pull.outcome {
+            Some(Err(reason)) => serde_json::Value::String(reason.clone()),
+            _ => serde_json::Value::Null,
+        },
+    })
+}
+
+/// The client a download runs on, built once and shared.
+///
+/// Emphatically NOT `ollama_tags_client()`: that one is built with `OLLAMA_TAGS_TIMEOUT` so a
+/// wedged Ollama cannot hold up a menu, and a whole-request timeout of a couple of seconds would
+/// abort every download that was working. A pull runs for minutes by design. The connect timeout
+/// stays short, because failing to DIAL is still a fast failure and the person is watching.
+fn ollama_pull_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("HTTP client for the /api/pull stream (check TLS and proxy environment)")
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct PullRequest {
+    /// A choice id from `GET /assistant/models`, and checked against that list — see the handler.
+    model: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SizeQuery {
+    model: String,
+}
+
+/// PURE: what the window draws under a model this machine does not have yet.
+///
+/// Both numbers travel, not just the verdict. "17.4 GB, and this machine has 15.8" is something a
+/// person can act on — a smaller quantisation, a different model, more memory — while a bare
+/// `too_big` is a wall with no door in it. `null` rather than `0` on either side for the reason
+/// `capabilities::interpret_manifest` returns `None`: a zero is a real number that grades as the
+/// most permissive verdict there is, which is the last thing a failed read should produce.
+fn size_readout(model: &str, bytes: Option<u64>, memory: Option<u64>) -> serde_json::Value {
+    let fit = crate::capabilities::model_fit(bytes.unwrap_or(0), memory.unwrap_or(0));
+    serde_json::json!({
+        "model": model,
+        "bytes": bytes,
+        "memory": memory,
+        "fit": match fit {
+            crate::capabilities::Fit::Comfortable => "comfortable",
+            crate::capabilities::Fit::Tight => "tight",
+            crate::capabilities::Fit::TooBig => "too_big",
+            crate::capabilities::Fit::Unknown => "unknown",
+        },
+        "error": serde_json::Value::Null,
+    })
+}
+
+/// Whether this daemon KNOWS a model will not run here — never merely suspects it.
+///
+/// The name says `known` because the answer is asymmetric and the asymmetry is the whole point.
+/// `true` requires two successful reads: a size the registry gave and a memory figure Windows gave.
+/// Every other outcome is `false` — an unreachable registry, a manifest that did not parse, a
+/// machine that could not be measured — because refusing on a failure to MEASURE would hand a third
+/// party on the far side of the internet the power to switch downloads off on this machine.
+///
+/// Its own function rather than a condition inline: the caller is a guard clause whose reader wants
+/// to know what is being refused, not how it was determined.
+async fn known_too_big(model: &str) -> bool {
+    let Ok(bytes) = crate::capabilities::registry_model_size(
+        ollama_tags_client(),
+        crate::capabilities::OLLAMA_REGISTRY_URL,
+        model,
+    )
+    .await
+    else {
+        return false;
+    };
+    let Some(memory) = crate::capabilities::total_memory_bytes() else {
+        return false;
+    };
+    crate::capabilities::model_fit(bytes, memory) == crate::capabilities::Fit::TooBig
+}
+
+/// What a model weighs, and whether this machine can carry it.
+///
+/// Answers the question the download confirmation needs and cannot ask any other way: the local
+/// `/api/tags` knows the size of models already here, which is the case already settled. This reads
+/// the public registry — no key, no account — over the same short-timeout client the `/api/tags`
+/// probes use, because like them it runs to decorate a menu somebody is looking at.
+///
+/// Two failures, answered differently on purpose. A name `registry_path` refuses is a `400`: it can
+/// never work and will not start working on its own. A registry that could not be reached is a
+/// `200` carrying `unknown`, because it is transient and a picker that broke whenever a third party
+/// on the far side of the internet was slow would be a feature that breaks the app it decorates.
+///
+/// Reachable by the control token and an admin key alone — it is in no scope table, and
+/// `auth::the_pull_routes_are_out_of_an_agents_reach` is where that is held.
+async fn get_local_model_size(
+    Query(query): Query<SizeQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if crate::capabilities::registry_path(&query.model).is_none() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "unknown_model"));
+    }
+    let memory = crate::capabilities::total_memory_bytes();
+    match crate::capabilities::registry_model_size(
+        ollama_tags_client(),
+        crate::capabilities::OLLAMA_REGISTRY_URL,
+        &query.model,
+    )
+    .await
+    {
+        Ok(bytes) => Ok(Json(size_readout(&query.model, Some(bytes), memory))),
+        Err(reason) => {
+            let mut readout = size_readout(&query.model, None, memory);
+            readout["error"] = serde_json::Value::String(reason);
+            Ok(Json(readout))
+        }
+    }
+}
+
+/// Fetch a local model this machine does not have yet.
+///
+/// Answers `202` the moment the download starts rather than when it finishes, because it finishes
+/// in minutes and no HTTP client on either end would wait. The body is the same readout `GET` on
+/// this path returns, so the window has a first frame to draw without waiting for its own first
+/// poll.
+///
+/// **`menu()` is the allowlist, not the request body.** This is the one route in this file that
+/// makes the machine fetch gigabytes from a name somebody sent, so the name has to be one that was
+/// already written into `.ai/nucleos-models.yaml` or that Ollama already has. Refused with the same
+/// `400` a model the catalogue does not offer gets from `patch_chat`, and for the same reason:
+/// it is the person's name that is wrong, not this daemon's state.
+///
+/// Reachable by the control token and an admin key alone — it is in no scope table, and
+/// `auth::the_pull_routes_are_out_of_an_agents_reach` is where that is held.
+async fn post_local_model_pull(
+    Json(body): Json<PullRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let (_, choices) = menu().await;
+    if !choices
+        .iter()
+        .any(|choice| choice.brain == "local" && choice.id == body.model)
+    {
+        return Err(refusal(StatusCode::BAD_REQUEST, "unknown_model"));
+    }
+
+    // Refused BEFORE the download rather than discovered after it. A model larger than this machine
+    // does not become runnable by arriving, so the gigabytes would be spent to prove a thing the
+    // registry will say in one small request.
+    //
+    // Fails OPEN, and that asymmetry is deliberate: only a size this daemon actually read and
+    // actually graded `TooBig` stops anything. An unreachable registry, a manifest it could not
+    // parse, a machine whose memory it could not measure — all of those proceed, because refusing
+    // on a failure to measure would make a third party on the far side of the internet able to
+    // switch off downloads here.
+    if known_too_big(&body.model).await {
+        return Err(refusal(StatusCode::BAD_REQUEST, "model_too_big"));
+    }
+
+    let started = {
+        // The whole check-and-claim under one lock, so two requests arriving together cannot both
+        // find the slot free. Nothing is awaited inside it.
+        let mut slot = LOCAL_PULL
+            .lock()
+            .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "pull_state_poisoned"))?;
+        if slot.as_ref().is_some_and(|pull| pull.outcome.is_none()) {
+            return Err(refusal(StatusCode::CONFLICT, "pull_in_flight"));
+        }
+        let started = Pull {
+            model: body.model.clone(),
+            status: "starting".to_owned(),
+            completed: 0,
+            total: 0,
+            outcome: None,
+        };
+        *slot = Some(started.clone());
+        started
+    };
+
+    let model = body.model;
+    tokio::spawn(async move {
+        let outcome = crate::capabilities::pull_local_model(
+            ollama_pull_client(),
+            crate::runner::OLLAMA_BASE_URL,
+            &model,
+            |frame| {
+                if let Ok(mut slot) = LOCAL_PULL.lock()
+                    && let Some(pull) = slot.as_mut()
+                {
+                    pull.status = frame.status;
+                    pull.completed = frame.completed;
+                    pull.total = frame.total;
+                }
+            },
+        )
+        .await;
+        if let Ok(mut slot) = LOCAL_PULL.lock()
+            && let Some(pull) = slot.as_mut()
+        {
+            pull.outcome = Some(outcome);
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(pull_readout(&started))))
+}
+
+/// How the download is going.
+///
+/// `204` when this daemon has not been asked to fetch anything since it started — the same way
+/// `get_assistant_live` above answers a turn nothing is writing. It is emphatically not "the
+/// download failed": a window that read it as one would put an error up on every fresh install.
+async fn get_local_model_pull() -> Result<Json<serde_json::Value>, StatusCode> {
+    let slot = LOCAL_PULL
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pull = slot.as_ref().ok_or(StatusCode::NO_CONTENT)?;
+    Ok(Json(pull_readout(pull)))
 }
 
 /// The conversations the app opened, most recently active first.
@@ -20396,6 +20684,217 @@ mod tests {
             crate::config::EFFORT_LEVELS.len()
         );
         assert!(body["configured"].is_string());
+    }
+
+    /// `installed` reaches the wire, and reads `null` wherever the question is meaningless.
+    ///
+    /// The other half — `true` for a model this machine has, `false` for one it does not — is
+    /// pinned by `config.rs`'s `a_local_row_is_marked_by_whether_this_machine_has_it` and NOT here,
+    /// and that is a limit rather than a preference: `models_config()` resolves to
+    /// `core/.ai/nucleos-models.yaml` under `cargo test`, a path that does not exist, so a unit
+    /// test here is served the built-in defaults and those name no local model at all. What this
+    /// test can prove is the half that travels: the route serves the field, and a route that is not
+    /// `local` reports it as `null` rather than as a `false` that would put "not installed" on most
+    /// of the menu — the same argument `AssistantChoice::tools` makes for never guessing `false`.
+    #[tokio::test]
+    async fn the_menu_reports_installed_for_local_rows_and_nothing_else() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/models", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let choices = body["choices"].as_array().unwrap();
+        assert!(!choices.is_empty(), "the picker was handed an empty menu");
+        for choice in choices {
+            assert!(
+                choice.get("installed").is_some(),
+                "every choice carries the field, so the window never has to tell absent from \
+                 unanswered: {choice}"
+            );
+            if choice["brain"] != "local" {
+                assert!(
+                    choice["installed"].is_null(),
+                    "only a local model is pulled or not; a {} row claimed otherwise: {choice}",
+                    choice["brain"]
+                );
+            }
+        }
+    }
+
+    /// The same allowlist the picker is served decides what may be downloaded.
+    ///
+    /// A pull is the one route in this file that makes this machine fetch gigabytes from a name in
+    /// a request body, and the catalogue is what keeps that name from being anybody's to choose:
+    /// `menu()` is read here, not `body.model`, so the only models this daemon can be made to
+    /// download are the ones somebody already wrote into `.ai/nucleos-models.yaml` or that Ollama
+    /// already has.
+    ///
+    /// The accept path is deliberately not tested here, and the reason is the one
+    /// `the_menu_reports_installed_for_local_rows_and_nothing_else` above gives: `models_config()`
+    /// resolves to `core/.ai/nucleos-models.yaml` under `cargo test`, which does not exist, so the
+    /// menu a unit test is served names no local model to accept. What CAN be proved here is the
+    /// half that matters for safety — a name the menu does not carry is refused before any network
+    /// call is made — and it is proved with a name that is real on a real machine (`llama3.2:3b`)
+    /// rather than a nonsense string, so the test would still fail if the check were dropped.
+    #[tokio::test]
+    async fn a_pull_is_refused_for_a_model_the_menu_does_not_name() {
+        let state = test_state().await;
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/assistant/local-model/pull",
+            Some(serde_json::json!({ "model": "llama3.2:3b" })),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a name the catalogue does not offer must not start a download: {body}"
+        );
+        assert_eq!(body["refusal"], "unknown_model");
+    }
+
+    /// The three states a watcher has to tell apart, and the wire word for each.
+    ///
+    /// PURE, on the readout rather than through the route, and deliberately so: the pull itself
+    /// lives in a process-global (`LOCAL_PULL`), and a test that drove the route would leave a
+    /// finished download in it for whichever test ran next. The shape is what the window reads, so
+    /// the shape is what is pinned.
+    ///
+    /// `done` and `failed` are both "not running", and a window that collapsed them would either
+    /// swallow the reason a download failed or leave a spinner up after a successful one.
+    #[test]
+    fn a_pull_readout_says_which_of_the_three_states_it_is_in() {
+        let running = Pull {
+            model: "qwen3.5:4b".to_owned(),
+            status: "pulling 8934".to_owned(),
+            completed: 50,
+            total: 100,
+            outcome: None,
+        };
+        let readout = pull_readout(&running);
+        assert_eq!(readout["state"], "running");
+        assert_eq!(readout["model"], "qwen3.5:4b");
+        assert_eq!(readout["percent"], 50);
+        assert!(readout["error"].is_null());
+
+        let done = Pull {
+            outcome: Some(Ok(())),
+            ..running.clone()
+        };
+        assert_eq!(pull_readout(&done)["state"], "done");
+        assert!(pull_readout(&done)["error"].is_null());
+
+        let failed = Pull {
+            outcome: Some(Err("pull model manifest: file does not exist".to_owned())),
+            ..running.clone()
+        };
+        assert_eq!(pull_readout(&failed)["state"], "failed");
+        assert_eq!(
+            pull_readout(&failed)["error"],
+            "pull model manifest: file does not exist",
+            "the reason Ollama gave must reach the window, not a status word standing in for it"
+        );
+    }
+
+    /// A download that has not said how big it is reports no percentage at all.
+    ///
+    /// Every pull opens with `pulling manifest`, which carries no counts, and `completed / 0` is
+    /// not a number. `null` and not `0`: a bar sitting at 0% says the download is stuck, and a
+    /// download that has not started measuring itself is not stuck.
+    #[test]
+    fn a_pull_with_no_total_reports_no_percentage_rather_than_zero() {
+        let opening = Pull {
+            model: "qwen3.5:4b".to_owned(),
+            status: "pulling manifest".to_owned(),
+            completed: 0,
+            total: 0,
+            outcome: None,
+        };
+
+        let readout = pull_readout(&opening);
+
+        assert!(
+            readout["percent"].is_null(),
+            "a download with nothing to measure against must say so: {readout}"
+        );
+        assert_eq!(
+            readout["status"], "pulling manifest",
+            "Ollama's own word for what it is doing is what fills the gap a percentage leaves"
+        );
+    }
+
+    /// The readout the window draws under a model it does not have yet.
+    ///
+    /// `bytes` and `memory` are both carried rather than only the verdict, because "17.4 GB, and
+    /// this machine has 15.8" is an answer somebody can act on — buy memory, pick a smaller
+    /// quantisation — while a bare `too_big` is a wall.
+    #[test]
+    fn a_size_readout_carries_both_numbers_and_not_only_the_verdict() {
+        let readout = size_readout("gemma3:27b", Some(17_400_000_000), Some(15_800_000_000));
+
+        assert_eq!(readout["model"], "gemma3:27b");
+        assert_eq!(readout["bytes"], 17_400_000_000_u64);
+        assert_eq!(readout["memory"], 15_800_000_000_u64);
+        assert_eq!(readout["fit"], "too_big");
+        assert!(readout["error"].is_null());
+    }
+
+    /// A size nobody could read is `unknown`, and `unknown` never blocks anything.
+    ///
+    /// The registry is a third party on the far side of the internet, and a menu that refused
+    /// downloads whenever it was unreachable would be a feature that breaks the app it decorates.
+    #[test]
+    fn an_unreadable_size_is_unknown_rather_than_a_refusal() {
+        let readout = size_readout("qwen3:8b", None, Some(15_800_000_000));
+
+        assert_eq!(readout["fit"], "unknown");
+        assert!(
+            readout["bytes"].is_null(),
+            "no number is null, never a zero that would grade as `fits`"
+        );
+
+        let unmeasured = size_readout("qwen3:8b", Some(5_230_000_000), None);
+        assert_eq!(
+            unmeasured["fit"], "unknown",
+            "a machine this daemon could not measure grades nothing"
+        );
+    }
+
+    /// The three verdicts reach the wire as the words the window switches on.
+    #[test]
+    fn every_verdict_has_a_name_the_window_can_read() {
+        let machine = Some(15_800_000_000);
+        assert_eq!(
+            size_readout("a", Some(5_230_000_000), machine)["fit"],
+            "comfortable"
+        );
+        assert_eq!(
+            size_readout("a", Some(11_000_000_000), machine)["fit"],
+            "tight"
+        );
+        assert_eq!(
+            size_readout("a", Some(17_400_000_000), machine)["fit"],
+            "too_big"
+        );
+    }
+
+    /// A name the registry path builder refuses is the caller's bug, and answered as one.
+    ///
+    /// Distinct on purpose from an unreachable registry, which is a 200 carrying `unknown`: that
+    /// one is transient and the menu should degrade around it, while this one is a name that can
+    /// never work and will not start working on its own.
+    #[tokio::test]
+    async fn a_malformed_model_name_is_refused_rather_than_reported_as_unknown() {
+        let outcome = get_local_model_size(Query(SizeQuery {
+            model: "../../etc/passwd".to_owned(),
+        }))
+        .await;
+
+        let (status, _) = outcome.expect_err("a name that cannot be a model is a bad request");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// The catalogue is the allowlist. Not because an unknown name is dangerous — it becomes one

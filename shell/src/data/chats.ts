@@ -472,6 +472,16 @@ export interface ModelChoice {
    * introspects. Treating absent as `false` would mark almost the whole menu.
    */
   tools?: boolean | null;
+  /**
+   * Whether this machine has this LOCAL model pulled. Absent or `null` wherever the question does
+   * not apply, which is every route but `local`: a cloud model runs in somebody else's data centre
+   * and a hosted one is fetched over HTTP, so neither is downloaded or not.
+   *
+   * Unlike `tools` above, `false` here is not a warning — it is an ordinary, actionable state. A
+   * local model the daemon lists and this machine has yet to download is exactly the row somebody
+   * wants to see, because seeing it is how they learn it can be had.
+   */
+  installed?: boolean | null;
 }
 
 /** `GET /assistant/models` — the menu, and what an unpinned conversation runs on. */
@@ -686,6 +696,125 @@ export function useLocalModel() {
   return useQuery({
     queryKey: keys.chats.localModel,
     queryFn: () => apiFetch<{ available: boolean }>("/assistant/local-model"),
+  });
+}
+
+/** `GET /assistant/local-model/pull` — one download of a local model, as it goes. */
+export interface LocalPull {
+  model: string;
+  /**
+   * `done` and `failed` are both "not running" and stay apart, because a window that
+   * collapsed them would either swallow the reason a download failed or leave a
+   * spinner up after one that worked.
+   */
+  state: "running" | "done" | "failed";
+  /** Ollama's own word for what it is doing — `pulling manifest`, `success`. */
+  status: string;
+  /**
+   * `null` until something has said how big the download is, which is the whole of
+   * the opening frame. Not `0`: a bar sitting at zero says a download is stuck, and
+   * one that has not started measuring itself is not.
+   */
+  percent: number | null;
+  /** What Ollama said, on `failed`, and `null` otherwise. */
+  error: string | null;
+}
+
+/**
+ * How a download of a local model is going, or `null` if this daemon has not been
+ * asked to fetch anything since it started.
+ *
+ * `null` and not `undefined`: the daemon answers `204` there, which {@link apiFetch}
+ * turns into `undefined`, and react-query treats an `undefined` result as a query
+ * that failed to produce data. It is mapped here rather than at every reader.
+ *
+ * Polled only while something is running. `POLL.fast` is the cadence for "the state
+ * of the machine right now", which is what a download in progress is; a settled
+ * result does not move again until somebody starts another one, and that somebody
+ * goes through {@link usePullLocalModel}, which invalidates this.
+ */
+export function useLocalPull() {
+  return useQuery({
+    queryKey: keys.chats.localPull,
+    queryFn: async ({ client }) => {
+      const before = client.getQueryData<LocalPull | null>(keys.chats.localPull);
+      const pull = (await apiFetch<LocalPull | undefined>("/assistant/local-model/pull")) ?? null;
+      // The one moment the menu became wrong: a model it listed as missing is now
+      // on the disk. Fired on the TRANSITION and not on every read of a finished
+      // download, so a page opened long after the fact does not refetch the
+      // catalogue for news it already has.
+      if (pull?.state === "done" && before?.state === "running") {
+        void client.invalidateQueries({ queryKey: keys.chats.models });
+      }
+      return pull;
+    },
+    refetchInterval: (query) => (query.state.data?.state === "running" ? POLL.fast : false),
+  });
+}
+
+/**
+ * What a model weighs, and whether this machine can carry it.
+ *
+ * `fit` is four-valued and `unknown` is not a failure to handle away: the size
+ * comes from a public registry on the far side of the internet, and a window that
+ * turned "could not ask" into "will not run" would refuse a working model every
+ * time the network hiccuped. Everything downstream treats `unknown` as permission,
+ * not as a verdict.
+ *
+ * `enabled` is what keeps this from being asked for every row in the menu. Only a
+ * model this machine does NOT have has an unanswered question here — for one it
+ * already has, the size is on disk and the download button is not there.
+ *
+ * No `refetchInterval`: a model's size and this machine's memory do not move. This
+ * is the settled one of the three local-model queries.
+ */
+export interface LocalSize {
+  model: string;
+  /** `null` when the registry could not be read. Never `0`, which would grade as "fits". */
+  bytes: number | null;
+  /** This machine's physical RAM. `null` when it could not be measured. */
+  memory: number | null;
+  fit: "comfortable" | "tight" | "too_big" | "unknown";
+  /** Why the size is unknown, when it is. Never shown as an error banner. */
+  error: string | null;
+}
+
+export function useLocalSize(model: string | null) {
+  return useQuery({
+    queryKey: keys.chats.localSize(model ?? ""),
+    queryFn: () =>
+      apiFetch<LocalSize>(`/assistant/local-model/size?model=${encodeURIComponent(model!)}`),
+    enabled: model !== null,
+    staleTime: Infinity,
+  });
+}
+
+/**
+ * Fetch a local model this machine does not have.
+ *
+ * The daemon answers the moment the download STARTS, not when it finishes — it
+ * finishes in minutes — so the answer is the first frame of progress and never a
+ * completion. What tells somebody it is done is {@link useLocalPull}.
+ *
+ * `retry: false`, like every mutation here: a refusal is semantic — the catalogue
+ * does not name that model, or a download is already running — and asking twice
+ * gets the same answer. The models query is invalidated on success only when the
+ * download itself completes, which this hook cannot know; the reader that polls is
+ * what refreshes the menu, so a model that has just arrived stops being marked as
+ * missing.
+ */
+export function usePullLocalModel() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (model: string) =>
+      apiFetch<LocalPull>("/assistant/local-model/pull", {
+        method: "POST",
+        body: JSON.stringify({ model }),
+      }),
+    retry: false,
+    onSuccess: (pull) => {
+      queryClient.setQueryData(keys.chats.localPull, pull);
+    },
   });
 }
 

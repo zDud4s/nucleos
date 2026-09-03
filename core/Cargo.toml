@@ -47,6 +47,10 @@ url = "2.5"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_JobObjects",
+    # `capabilities::total_memory_bytes` only, for `GlobalMemoryStatusEx` — one call, so the model
+    # picker can say whether a download will actually run on this machine before it spends the
+    # gigabytes proving it won't. A feature on a crate already here, not a new tree.
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

@@ -151,6 +151,9 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
     run "usage: split"    . "$py" scripts/test-usage-split.py
     run "usage: statusline" . "$py" scripts/test-statusline-context.py
+    # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
+    # runs green on a machine with no route to OpenRouter at all.
+    run "models: refresh"   . "$py" scripts/test-refresh-models.py
   fi
 fi
 
