@@ -326,33 +326,6 @@ pub async fn set_permission_mode(
     Ok(())
 }
 
-/// Whether this conversation plans without acting.
-///
-/// An adapter over `permission_mode_of` rather than a second reader of the dead `plan_only`
-/// column: from `0129` the mode is the only place this fact lives, and two readers of two columns
-/// is how they come to disagree. Both this and `set_plan_only` go away with the selector that
-/// replaces the checkbox; until then they keep every existing caller honest against the new
-/// column.
-pub async fn plans_only(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
-    permission_mode_of(pool, chat_id)
-        .await
-        .map(|mode| mode == PermissionMode::Plan)
-}
-
-/// Puts a conversation into planning, or takes it out.
-///
-/// Out of planning is `Auto`, which is the column default and what every conversation that never
-/// touched the checkbox already holds. The checkbox cannot express the other three rungs, so this
-/// cannot silently move a conversation off one of them: nothing can put it on one yet.
-pub async fn set_plan_only(pool: &SqlitePool, chat_id: &str, planning: bool) -> sqlx::Result<()> {
-    let mode = if planning {
-        PermissionMode::Plan
-    } else {
-        PermissionMode::Auto
-    };
-    set_permission_mode(pool, chat_id, mode).await
-}
-
 /// Everything a conversation says about HOW its next turn should run.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Answering {
@@ -1684,32 +1657,6 @@ mod tests {
         assert_eq!(PermissionMode::from_wire("Plan"), PermissionMode::Auto);
         assert_eq!(
             permission_mode_of(&pool, "no-such-chat").await.unwrap(),
-            PermissionMode::Auto
-        );
-    }
-
-    /// The checkbox keeps meaning exactly what it meant, now that the mode is where the fact lives.
-    ///
-    /// Both directions, because the adapter has to be able to take a conversation OFF planning as
-    /// well as put it on, and off is `Auto` rather than some third state.
-    #[tokio::test]
-    async fn the_planning_adapter_still_reads_and_writes_the_same_two_states() {
-        let pool = test_pool().await;
-        let id = create(&pool, Brain::Cloud, None).await.unwrap();
-
-        assert!(!plans_only(&pool, &id).await.unwrap());
-
-        set_plan_only(&pool, &id, true).await.unwrap();
-        assert!(plans_only(&pool, &id).await.unwrap());
-        assert_eq!(
-            permission_mode_of(&pool, &id).await.unwrap(),
-            PermissionMode::Plan
-        );
-
-        set_plan_only(&pool, &id, false).await.unwrap();
-        assert!(!plans_only(&pool, &id).await.unwrap());
-        assert_eq!(
-            permission_mode_of(&pool, &id).await.unwrap(),
             PermissionMode::Auto
         );
     }

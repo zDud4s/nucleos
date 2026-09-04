@@ -8741,11 +8741,15 @@ struct ChatProjectOut {
     /// read a stranger's text. Offering an id the daemon has refused would be sending somebody
     /// somewhere it will not go.
     session: Option<String>,
-    /// Whether this conversation plans without acting.
+    /// What this conversation may do without being asked.
     ///
     /// Beside the tools and not beside the title, because it is the same question in the other
     /// direction: one says what this conversation CAN do, the other says what it will choose not to.
-    planning: bool,
+    ///
+    /// The remembered position of the selector — what the NEXT message runs under. Never the
+    /// snapshot on the run, which is a different fact with a different lifetime: that one says what
+    /// a turn already in flight started with, and nothing in the window reads it.
+    permission_mode: crate::chats::PermissionMode,
     /// Whether a turn here would actually get Bash, Read and Write.
     ///
     /// Not the same fact as having a directory, which is why both travel. `tool_policy_for` wants
@@ -8776,15 +8780,15 @@ async fn read_chat_project(
     let session = crate::assistant::get_session(&state.pool, &chat_id)
         .await
         .unwrap_or(None);
-    let planning = crate::chats::plans_only(&state.pool, &chat_id)
+    let permission_mode = crate::chats::permission_mode_of(&state.pool, &chat_id)
         .await
-        .unwrap_or(false);
+        .unwrap_or(crate::chats::PermissionMode::Auto);
 
     let Some(cwd) = opened_in else {
         return Ok(Json(ChatProjectOut {
             cwd: None,
             session,
-            planning,
+            permission_mode,
             tools: false,
         }));
     };
@@ -8811,7 +8815,7 @@ async fn read_chat_project(
     Ok(Json(ChatProjectOut {
         cwd: Some(cwd),
         session,
-        planning,
+        permission_mode,
         tools,
     }))
 }
@@ -10636,11 +10640,16 @@ where
 struct PatchChatRequest {
     title: Option<String>,
     brain: Option<String>,
-    /// Whether this conversation plans without acting.
+    /// What this conversation may do without being asked, from here on.
     ///
-    /// The one mode a person reaches for before letting an agent touch a codebase, and the only
-    /// kind of run in this daemon that could not be put in it.
-    plan_only: Option<bool>,
+    /// Five rungs where there used to be a checkbox with two states. The old `plan_only` field is
+    /// gone rather than kept as an alias: the only client of this API is this application's own
+    /// window, and an alias would be a second way to say one thing, maintained for nobody.
+    ///
+    /// A spelling outside the five fails the whole request rather than falling to a default. The
+    /// reader's "unknown reads as auto" rule exists for rows written before the column did, and
+    /// applying it to a request would let a typo quietly widen what a conversation may do.
+    permission_mode: Option<crate::chats::PermissionMode>,
     /// The project this conversation is about, as an absolute path to a directory.
     ///
     /// The only way a conversation opened in the window ever gets tools: `tool_policy_for` grants
@@ -10782,7 +10791,7 @@ async fn patch_chat(
         || body.model.is_some()
         || body.effort.is_some()
         || body.cwd.is_some()
-        || body.plan_only.is_some())
+        || body.permission_mode.is_some())
         && crate::assistant::is_busy(&chat_id)
     {
         return Err(StatusCode::CONFLICT.into());
@@ -10977,11 +10986,11 @@ async fn patch_chat(
             })?;
     }
 
-    if let Some(planning) = body.plan_only {
-        crate::chats::set_plan_only(&state.pool, &chat_id, planning)
+    if let Some(permission_mode) = body.permission_mode {
+        crate::chats::set_permission_mode(&state.pool, &chat_id, permission_mode)
             .await
             .map_err(|error| {
-                tracing::warn!(%error, "changing whether a conversation plans failed");
+                tracing::warn!(%error, "changing what a conversation may do without asking failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }

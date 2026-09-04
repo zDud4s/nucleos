@@ -169,14 +169,28 @@ export interface ChatProject {
    */
   session: string | null;
   /**
-   * Whether this conversation plans without acting.
+   * What this conversation may do without being asked.
    *
    * Beside the tools and not beside the title, because it is the same question
    * in the other direction: one says what this conversation CAN do, the other
    * what it will choose not to.
    */
-  planning: boolean;
+  permission_mode: PermissionMode;
 }
+
+/**
+ * The five rungs a conversation can stand on, spelled as the daemon spells them.
+ *
+ * `manual` asks before anything changes; `accept_edits` adds the edits;
+ * `plan` answers with a plan; `auto` runs what the rules allow and asks about
+ * the rest; `bypass` asks about nothing but a delete inside the project.
+ */
+export type PermissionMode =
+  | "manual"
+  | "accept_edits"
+  | "plan"
+  | "auto"
+  | "bypass";
 
 /** A conversation already had in the IDE that this daemon could continue. */
 export interface IdeSession {
@@ -1291,22 +1305,23 @@ export function useSetChatProject(chatId: string) {
 }
 
 /**
- * Put this conversation into planning, or take it out.
+ * Move this conversation to another rung.
  *
  * A state and not a per-turn choice, because that is the shape the gesture has:
  * somebody says "plan this", reads it, then says "go". Two turns, one decision,
- * held between them.
+ * held between them. The turn that is already running keeps the rung it started
+ * on — the daemon snapshots it — so this always means the NEXT message.
  *
- * The project read is invalidated because it carries the flag, and the chat list
+ * The project read is invalidated because it carries the rung, and the chat list
  * because a conversation that will not act is a different thing to be looking at.
  */
-export function useSetPlanning(chatId: string) {
+export function useSetPermissionMode(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (planning: boolean) =>
+    mutationFn: (mode: PermissionMode) =>
       apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
         method: "PATCH",
-        body: JSON.stringify({ plan_only: planning }),
+        body: JSON.stringify({ permission_mode: mode }),
       }),
     retry: false,
     onSettled: () => {

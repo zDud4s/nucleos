@@ -6921,9 +6921,13 @@ mod tests {
         let mut state = test_state().await;
         state.runner = fake.clone();
         let _root = rooted_chat(&state, "planning-chat").await;
-        crate::chats::set_plan_only(&state.pool, "planning-chat", true)
-            .await
-            .unwrap();
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "planning-chat",
+            crate::chats::PermissionMode::Plan,
+        )
+        .await
+        .unwrap();
 
         let id = send_message(&state, "planning-chat", "como farias isto?", Origin::Shell)
             .await
@@ -7074,9 +7078,13 @@ mod tests {
             .unwrap();
         settled_turn(&state.pool, first).await;
 
-        crate::chats::set_plan_only(&state.pool, "mind-changed", true)
-            .await
-            .unwrap();
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "mind-changed",
+            crate::chats::PermissionMode::Plan,
+        )
+        .await
+        .unwrap();
         let second = send_message(&state, "mind-changed", "afinal planeia", Origin::Shell)
             .await
             .unwrap();

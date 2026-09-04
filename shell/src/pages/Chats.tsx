@@ -62,7 +62,7 @@ import {
   useIdeConversation,
   useIdeSessions,
   useSetChatProject,
-  useSetPlanning,
+  useSetPermissionMode,
   useWireChatTools,
   useWireIdeSessionTools,
   useAnswerAsk,
@@ -87,6 +87,7 @@ import {
   useStopTurn,
   type Attachment,
   type ChatSummary,
+  type PermissionMode,
   type Subagent,
   useClearContext,
   useDeniableTools,
@@ -1699,41 +1700,121 @@ function Project({ chatId }: { chatId: string }) {
 }
 
 /**
- * Whether this conversation plans without acting.
+ * The five rungs, in the order the CLI's own picker shows them.
  *
- * `--permission-mode plan` is what the daemon launches with, and it has always been able to — every
- * kind of run in this house could be put in planning except the kind a person is watching, which is
- * the one where it matters most. It is the mode you reach for before letting an agent near a
- * codebase.
- *
- * A state on the conversation rather than a choice per message: somebody says "plan this", reads
- * it, then says "go". Making it per-message would turn one decision into a thing to remember every
- * time.
- *
- * **It is not "changes nothing", and this said so until it was measured.** A planning turn still
- * reaches for tools — `Glob`, `Read`, and a `Write` that RAN, which the daemon's gate saw and the
- * transcript recorded. What it wrote was its own plan, as a document in the working directory;
- * what it did not do was the work. The label says that now, because a control promising more than
- * the mode delivers is worse than no control.
+ * `needsTools` is which of them a conversation with no tools cannot stand on. `plan` is a flag the
+ * CLI is launched with, so it means something whatever the conversation can reach; `auto` is the
+ * neutral state and is what every conversation already has. The other three are entirely about what
+ * the hook lets through, and a conversation whose turns get no `Bash`, `Read` or `Write` has nothing
+ * for them to be about.
  */
-function Planning({ chatId }: { chatId: string }) {
+const PERMISSION_RUNGS: {
+  mode: PermissionMode;
+  label: string;
+  why: string;
+  needsTools: boolean;
+}[] = [
+  {
+    mode: "manual",
+    label: "Manual",
+    why: "asks before every edit and every command that changes something",
+    needsTools: true,
+  },
+  {
+    mode: "accept_edits",
+    label: "Edit automatically",
+    why: "edits without asking, and asks about everything else",
+    needsTools: true,
+  },
+  {
+    mode: "plan",
+    label: "Plan",
+    why: "answers with a plan — it may still write the plan down",
+    needsTools: false,
+  },
+  {
+    mode: "auto",
+    label: "Auto",
+    why: "runs what the rules recognise; a local judge may answer for the rest",
+    needsTools: false,
+  },
+  {
+    mode: "bypass",
+    label: "Bypass permissions",
+    why: "asks about nothing except a delete inside the project",
+    needsTools: true,
+  },
+];
+
+/**
+ * What this conversation may do without being asked.
+ *
+ * A checkbox stood here and could say one thing — plan, or don't — while the CLI underneath had a
+ * whole ladder. This is that ladder, on the conversation rather than per message: somebody says
+ * "plan this", reads it, then says "go". Making it per-message would turn one decision into a thing
+ * to remember every time.
+ *
+ * **`plan` is not "changes nothing", and this said so until it was measured.** A planning turn still
+ * reaches for tools — `Glob`, `Read`, and a `Write` that RAN, which the daemon's gate saw and the
+ * transcript recorded. What it wrote was its own plan, as a document in the working directory; what
+ * it did not do was the work. The line says that, because a control promising more than the mode
+ * delivers is worse than no control.
+ *
+ * **The menu opens whatever the conversation can reach.** Greying the whole control would leave
+ * somebody looking at a disabled thing with no way to find out why; the rows that cannot be chosen
+ * say which of the two reasons applies, and one of them — an unwired hook — is a button away in the
+ * panel above.
+ */
+function PermissionMenu({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
-  const set = useSetPlanning(chatId);
-  const planning = project.data?.planning ?? false;
+  const set = useSetPermissionMode(chatId);
+  const mode = project.data?.permission_mode ?? "auto";
+  const tools = project.data?.tools ?? false;
+  /* Two different absences, and only one of them is actionable — which is why `cwd` travels beside
+     `tools` at all. */
+  const barred =
+    project.data?.cwd == null
+      ? "this conversation has no project directory"
+      : "the classifier hook is not wired in this project";
+  const shown =
+    PERMISSION_RUNGS.find((rung) => rung.mode === mode)?.label ?? "Auto";
 
   return (
-    <label
-      className="chats-planning"
-      title="answer with a plan instead of doing the work — it may still write the plan down"
-    >
-      <input
-        type="checkbox"
-        checked={planning}
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        className="chats-tool"
+        /* Spelled out: the visible text is a mode's NAME, and a control whose whole accessible name
+           is "Manual" announces a fact rather than something you can press. */
+        aria-label={`Permissions: ${shown} — change what this conversation may do without asking`}
         disabled={project.data === undefined || set.isPending}
-        onChange={(event) => set.mutate(event.target.checked)}
-      />
-      Plan only
-    </label>
+      >
+        {shown}
+        <ChevronDown className="chats-tool-caret" aria-hidden="true" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="chats-meta-menu">
+        <DropdownMenuLabel>What it may do without asking</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={mode}
+          onValueChange={(picked) => set.mutate(picked as PermissionMode)}
+        >
+          {PERMISSION_RUNGS.map((rung) => {
+            const unreachable = rung.needsTools && !tools;
+            return (
+              <DropdownMenuRadioItem
+                key={rung.mode}
+                value={rung.mode}
+                disabled={unreachable}
+              >
+                {rung.label}
+                <span className="chats-tool-why">
+                  {unreachable ? barred : rung.why}
+                </span>
+              </DropdownMenuRadioItem>
+            );
+          })}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -3460,6 +3541,12 @@ function ChangedRefusal({ error }: { error: unknown }) {
  * Urgent on purpose. A turn is held while this stands and the daemon refuses on its own after about
  * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
  * where the next thing would have appeared rather than tucked away somewhere tidy.
+ *
+ * **On `auto` a question can now answer itself, and it is drawn anyway.** A local judge races the
+ * person inside the same window, so a question the judge approves appears and disappears in a couple
+ * of seconds. Holding the render back until the judge has had its say would hide that — and an
+ * automatic approval nobody ever sees is exactly the cost this feature is supposed to keep visible.
+ * The flicker is the judge's work, shown.
  */
 function Asking({ asks, chatId }: { asks: Ask[]; chatId: string }) {
   const answer = useAnswerAsk(chatId);
@@ -5156,7 +5243,7 @@ function Composer({
               effort={chat.effort}
             />
           )}
-          <Planning chatId={chatId} />
+          <PermissionMenu chatId={chatId} />
           <HandsFreeToggle voice={voice} />
           <span className="chats-composer-gap" />
           <button
