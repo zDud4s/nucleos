@@ -48,11 +48,15 @@ pub struct ClassTally {
 /// decisions can be told apart after the fact. `policy_digest` is the CONFIGURATION, and it exists
 /// because from version 10 the code stopped being the whole answer: part of the policy is
 /// `.ai/github.yaml`, which is gitignored and travels with nobody, so two machines on the same
-/// version can decide one `gh` line differently.
+/// version can decide one `gh` line differently. Since `Policy::for_project`, part of it is also
+/// `project_github_ops` — so two PROJECTS on one machine can too, and the digest is what tells those
+/// two rows apart.
 ///
 /// The digest is passed in rather than read here, because this function does no I/O beyond its own
-/// INSERT and the policy is `AppState`'s — the same one `classify` was handed for this very
-/// decision, which is what keeps the row describing the answer it actually recorded.
+/// INSERT and the caller holds the EFFECTIVE policy — the same value `classify` was handed for this
+/// very decision, which is what keeps the row describing the answer it actually recorded. It used to
+/// say "`AppState`'s", and that stopped being the whole of it when the policy became per-project:
+/// what the row needs is the one that decided, not the one the daemon started with.
 pub async fn record_decision(
     pool: &SqlitePool,
     run_id: i64,

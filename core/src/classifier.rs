@@ -414,16 +414,25 @@ pub fn only_reads(tool_name: &str) -> bool {
 /// made the signature carry weight, and a fourth argument is exactly where somebody would otherwise
 /// reach for a file read.
 ///
-/// **The contract of `policy`: BORROWED, ALREADY NARROWED, and it does no I/O.** It is built once at
-/// startup from `.ai/github.yaml` intersected with `github.rs`'s compiled ceilings, and all three
-/// production callers must be handed the SAME one - `hooks.rs` twice and `runs.rs` once. A caller
-/// left holding an empty policy while the others hold a real one would make the hook and the resume
-/// disagree about one command line, which is the divergence the paragraph above exists to make
-/// impossible.
+/// **The contract of `policy`: BORROWED, ALREADY NARROWED, and it does no I/O.** It is
+/// `.ai/github.yaml` intersected with `github.rs`'s compiled ceilings, and all three production
+/// callers must be handed the policy of the SAME PROJECT - `hooks.rs` twice and `runs.rs` once. A
+/// caller left holding an empty policy while the others hold a real one would make the hook and the
+/// resume disagree about one command line, which is the divergence the paragraph above exists to
+/// make impossible.
 ///
-/// It is the only argument whose value comes from a file a person edits, and it can only ever turn a
-/// `pending_approval` into an `allow` for a read this file would otherwise not recognise. It cannot
-/// lift a `deny`, cannot reach the approval list, and is consulted last.
+/// **"The same one" used to be literally true and no longer is, which is a change in what this
+/// argument costs to get right.** `Policy::for_project` lays a project's `project_github_ops` rows
+/// over that machine default, at decision time and uncached, so what arrives here is built for this
+/// decision and thrown away after. It is therefore the same KIND of argument `rules` is - a table
+/// read twice at two moments - and the two now stand or fall together. The bound is written out
+/// where the second read happens, in `runs.rs`, and it is tighter than `rules`': the GitHub list has
+/// no `deny`, so the only reachable drift records `github-read` where a person approved an
+/// `unrecognized`, and a grant for a class that is allowed anyway buys nothing.
+///
+/// Its value comes from a file a person edits AND from a table a person edits, and it can only ever
+/// turn a `pending_approval` into an `allow` for a read this file would otherwise not recognise. It
+/// cannot lift a `deny`, cannot reach the approval list, and is consulted last.
 ///
 /// **The contract of `rules`: BORROWED, and the purity paragraph above is the whole reason it is an
 /// argument rather than a read performed in here.** A project's two shell lists live in a table a
@@ -435,9 +444,12 @@ pub fn only_reads(tool_name: &str) -> bool {
 /// There is no caller that loads them once for both. `hooks.rs` reads at decision time; `runs.rs`
 /// reads again, separately, when the approval is granted — two reads at two moments, exactly the
 /// thing the old sentence named as the danger and presented as avoided. Moving the read OUT of here
-/// relocated it; it did not remove it. `policy` genuinely is one value shared by all three callers,
-/// because it is built once at startup and cannot change; `rules` cannot make that claim, and Task 8
-/// is about to put write routes in front of the table.
+/// relocated it; it did not remove it.
+///
+/// This paragraph went on to say that `policy` was different — one value shared by all three
+/// callers, built once at startup and unable to change. That stopped being true with
+/// `Policy::for_project`, and the contract paragraph above now says so where a reader meets the
+/// argument rather than here, four paragraphs later.
 ///
 /// What makes the difference acceptable is bounded, and worth having written down rather than
 /// re-derived:
@@ -448,6 +460,11 @@ pub fn only_reads(tool_name: &str) -> bool {
 ///   and `hooks.rs` gates the grant lookup on the rules having been read at all.
 /// - The rules can only move a command between `unrecognized` and `project-declared`/`project-denied`,
 ///   so drift cannot silently turn one GRANTABLE class into another.
+/// - The project's GitHub list, the one that arrives through `policy`, can only move a command
+///   between `unrecognized` and `github-read` — and `github-read` comes with an `allow`, so a grant
+///   scoped to it authorizes a class that needed no grant. That direction is the only one reachable:
+///   a WITHDRAWN operation cannot drift here at all, because the hook answered the command with an
+///   allow and minted no proposal for a resume to re-derive.
 ///
 /// The read stays at decision time and uncached regardless — a cached refusal is one that goes on
 /// being lifted for as long as the cache lives. The consequence to know is that declaring a rule
@@ -764,7 +781,10 @@ fn classify_shell_command(
         return classification(
             "allow",
             "github-read",
-            "structural GitHub reads on the owner's autonomy list are allowed",
+            // "an autonomy list" and not "the owner's": since `Policy::for_project` there are two
+            // authors of that list, the machine's file and the project's own declarations, and the
+            // sentence a person reads should not name only one of them.
+            "structural GitHub reads on an autonomy list are allowed",
         );
     }
     if touches_vcs {
@@ -785,9 +805,10 @@ fn classify_shell_command(
 enum Segment {
     ReadLocal,
     VcsLocal,
-    /// A `gh` read the OWNER put on the autonomy list. The only variant whose membership is decided
-    /// outside this file, which is why it is named rather than folded into `ReadLocal`: a scoreboard
-    /// that could not tell the two apart could not tell a compiled policy from an edited one.
+    /// A `gh` read on an autonomy list — the owner's `.ai/github.yaml`, or this project's own
+    /// declared operations, which `Policy::for_project` lays over it. Membership is decided outside
+    /// this file, which is why it is named rather than folded into `ReadLocal`: a scoreboard that
+    /// could not tell the two apart could not tell a compiled policy from an edited one.
     GithubRead,
     /// A command this file has NO opinion about, in work the owner asked for, that nonetheless
     /// names at least one path and names nothing outside the workspace.

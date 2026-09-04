@@ -537,11 +537,11 @@ impl Op {
     /// Every operation: the union decision #4 puts one list of names over. `gh_forms` derives the
     /// map from this, and the partition test holds the two halves apart with it.
     ///
-    /// It stopped being test-only when the map arrived, and the allow stays anyway: the bin build
-    /// reaches this only through `op_kind_of_gh_command`, which is itself waiting for its caller.
-    /// `clippy --all-targets` computes dead code per target, so the day that caller lands is the day
-    /// both allows can go.
-    #[allow(dead_code)]
+    /// It stopped being test-only when the map arrived, and it carried an `#[allow(dead_code)]` for
+    /// one more commit because the bin build reached it only through `op_kind_of_gh_command`, which
+    /// was itself waiting for its caller. That caller is `Policy::read_is_autonomous`, and it landed
+    /// with `Policy::for_project`; the allow came off with the map's own, exactly as the sentence
+    /// here promised it would.
     pub fn all() -> Vec<Self> {
         ReadOp::all()
             .into_iter()
@@ -1228,10 +1228,10 @@ fn gh_forms() -> &'static [GhForm] {
 /// outside `READ_CEILING` — by absence, with nothing here to keep in step with a list of exclusions.
 /// It is the argument `READ_CEILING`'s own doc makes for itself, inherited.
 ///
-/// Called from nowhere yet. The map is the piece `Policy::for_project` needs before one list of
-/// names can answer both doors, and it lands ahead of it so the test that proves it stays separable
-/// from the change that consumes it.
-#[allow(dead_code)]
+/// **`Policy::read_is_autonomous` is the caller**, and it asks this only after its own refused-flag
+/// check has already run. That order is not incidental: a name from this map is not a grant, and the
+/// guard below is narrower than the constant it reads — see that function's doc for the half of
+/// `REFUSED_READ_FLAGS` this one deliberately does not cover.
 pub fn op_kind_of_gh_command(command: &str) -> Option<&'static str> {
     let words = crate::classifier::shell_words(command);
     let (program, arguments) = words.split_first()?;
@@ -1343,22 +1343,120 @@ fn word_is_flag(word: &str, flag: &str) -> bool {
 // two vocabularies really did become one, and until then this comment is a plan and not an
 // achievement.
 
+/// PURE: the widest policy this codebase can construct — both compiled ceilings, entire.
+///
+/// It exists so that "inside the ceiling" is asked in exactly the way production asks it, of the
+/// same two functions, rather than by a second comparison somebody would have to keep in step.
+fn ceiling_policy() -> Policy {
+    Policy::from_config(&crate::config::GithubConfig {
+        enabled: true,
+        autonomous_reads: READ_CEILING
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect(),
+        autonomous_actions: ACTION_CEILING
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect(),
+    })
+}
+
+/// PURE: the READ operations a project may declare, by name.
+///
+/// **Derived, never written out.** The kinds come off `ReadOp::all()` through `kind()`, and
+/// admissibility is asked of `ceiling_policy` — the same question production asks of the owner's
+/// file. A hand-written list would be a second spelling of a set that already exists, and a second
+/// spelling is how a set drifts.
+///
+/// Matched on the COMMAND each operation builds and not on its kind, because `READ_CEILING` is
+/// written in `gh` prefixes and this half has to be asked in its own vocabulary. That is also what
+/// excludes `run_logs`, whose argv carries `--log`: `REFUSED_READ_FLAGS` refuses it here exactly as
+/// it refuses the same flag typed into Bash. `pr_view` is excluded the same way and just as
+/// deliberately — `READ_CEILING`'s own doc refuses it in words.
+///
+/// Built once, for `gh_forms`' reason: its caller is the decision path.
+fn declarable_read_ops() -> &'static [&'static str] {
+    static KINDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KINDS.get_or_init(|| {
+        let ceiling = ceiling_policy();
+        ReadOp::all()
+            .iter()
+            .filter(|operation| {
+                ceiling.read_is_autonomous(&format!("gh {}", operation.argv().join(" ")))
+            })
+            .map(|operation| operation.kind())
+            .collect()
+    })
+}
+
+/// PURE: the ACTIONS a project may declare, by name.
+///
+/// `api_read` is outside `ACTION_CEILING`, so it is outside this, so a project cannot declare it —
+/// the ceiling holding across a route that did not exist when it was written.
+fn declarable_act_ops() -> &'static [&'static str] {
+    static KINDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KINDS.get_or_init(|| {
+        let ceiling = ceiling_policy();
+        ActOp::all()
+            .iter()
+            .filter(|operation| ceiling.action_is_autonomous(operation.kind()))
+            .map(|operation| operation.kind())
+            .collect()
+    })
+}
+
+/// Every operation kind a project may declare, reads first and actions after.
+///
+/// One list, because decision #4 gives the owner one list of NAMES. Two halves underneath, because
+/// decision #5 keeps the partition in the TYPES and each door may only ever be answered by its own
+/// half: `Policy::for_project` narrows against this list and then splits on `declarable_read_ops`,
+/// so both decisions are honoured, in that order, by construction rather than by a check anyone
+/// could forget.
+pub fn declarable_ops() -> Vec<&'static str> {
+    declarable_read_ops()
+        .iter()
+        .chain(declarable_act_ops())
+        .copied()
+        .collect()
+}
+
 /// What runs without asking.
 ///
-/// Built once at startup from `.ai/github.yaml` and then immutable: it does no I/O after
-/// construction, which is what lets `classifier::classify` take it by reference and stay pure. There
-/// is deliberately no hot reload — a policy a run could reload is a policy a run could change in the
-/// middle of itself.
+/// Built from `.ai/github.yaml` at startup as the MACHINE default, and immutable once built — it
+/// does no I/O after construction, which is what lets `classifier::classify` take it by reference
+/// and stay pure. There is deliberately no hot reload: a policy a run could reload is a policy a run
+/// could change in the middle of itself.
 ///
-/// **Both lists are intersections with a compiled ceiling, and never unions with one.** The file
-/// chooses inside what the code fixes. `.ai/` is gitignored and travels with nobody, so it is
-/// per-developer configuration no review ever sees; one line in it may not be the only thing between
-/// an autonomous run and `gh api -X DELETE`.
+/// **A project's own policy is a second value, not a mutation of this one.** `for_project` reads
+/// `project_github_ops` and returns a NEW `Policy` with the project's operations laid over the
+/// machine default; the value handed to a decision is built for that decision and thrown away
+/// after. The immutability above survives intact — what changed is that there is now more than one
+/// of these, and §4.4 of `.ai/specs/2026-09-03-alcada-por-projecto-design.md` is where that was
+/// decided and where the "read at the moment of the decision, with no cache" rule is argued.
+///
+/// **Every list here is an intersection with a compiled ceiling, and never a union with one.**
+/// Configuration chooses inside what the code fixes, and a project's table is configuration exactly
+/// as the file is. `.ai/` is gitignored and travels with nobody; a row in a database travels with
+/// nobody either. Neither may be the only thing between an autonomous run and `gh api -X DELETE`.
 ///
 /// It answers WHETHER, never HOW: `execute` builds the argv and this type never sees one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
+    /// The machine's autonomous reads, as `gh` PREFIXES, narrowed to `READ_CEILING`.
     reads: Vec<String>,
+    /// This project's autonomous reads, as operation NAMES, narrowed to `declarable_read_ops`.
+    ///
+    /// A second field and not more entries in `reads`, because the two are different vocabularies
+    /// answering the same question — which is §1.2's whole complaint — and a name is the one of the
+    /// two that can tell `run_status` from `run_logs`. `op_kind_of_gh_command` is what turns a
+    /// command line into something this list can be asked about.
+    ///
+    /// It holds only READS. An action's name never reaches it, so `gh pr comment` cannot come
+    /// through the reading door on the strength of a project having declared `pr_comment` for the
+    /// typed one.
+    read_ops: Vec<String>,
+    /// Autonomous actions, by kind, narrowed to `ACTION_CEILING`. The machine's and the project's
+    /// in ONE list, because for actions the two vocabularies already agree: both are kinds.
     actions: Vec<String>,
     digest: String,
 }
@@ -1369,8 +1467,9 @@ impl Policy {
     pub fn empty() -> Self {
         Self {
             reads: Vec::new(),
+            read_ops: Vec::new(),
             actions: Vec::new(),
-            digest: digest_of(&[], &[]),
+            digest: digest_of(&[], &[], &[]),
         }
     }
 
@@ -1383,16 +1482,103 @@ impl Policy {
     ///
     /// `enabled: false` collapses both lists rather than being carried as a third state. What this
     /// type answers is "does it run without asking", and a pillar the owner switched off answers no
-    /// to that in exactly the way an empty list does.
+    /// to that in exactly the way an empty list does. A project's rows must not undo that, and they
+    /// cannot: `GithubRuntime::policy_for_project` is the door the daemon uses and it is where the
+    /// switch is read, because by the time a `Policy` exists the two states are the same value.
+    ///
+    /// **This is the MACHINE default and it is unchanged by the per-project work.** It declares no
+    /// `read_ops` — that field is a project's alone — so a machine with no projects, or a run with
+    /// no project, classifies exactly as it did before `for_project` existed.
     pub fn from_config(config: &crate::config::GithubConfig) -> Self {
         if !config.enabled {
             return Self::empty();
         }
         let reads = narrow(&config.autonomous_reads, READ_CEILING, "read");
         let actions = narrow(&config.autonomous_actions, ACTION_CEILING, "action");
-        let digest = digest_of(&reads, &actions);
+        let digest = digest_of(&reads, &[], &actions);
         Self {
             reads,
+            read_ops: Vec::new(),
+            actions,
+            digest,
+        }
+    }
+
+    /// This project's policy: the machine default with the project's declared operations laid over
+    /// it.
+    ///
+    /// **It ADDS to the machine default; it does not replace it**, and the argument is the table's
+    /// own vocabulary. `project_github_ops` holds only operations somebody switched ON — there is no
+    /// `deny` here and no room for one, because presence in the table IS the grant. A list that can
+    /// only say yes cannot say "and take that other one away", so reading it as a REPLACEMENT would
+    /// hand it a power it has no words for: withdrawing a machine-wide grant would happen as a side
+    /// effect of declaring something unrelated, and the owner would have no way to write the
+    /// opposite down. The shell rules can replace, and that is precisely why they carry a `deny`.
+    ///
+    /// The empty case then needs no special rule, which is the second half of the argument. Under a
+    /// union, a project that declared nothing IS the machine default, and this returns a value equal
+    /// to the one it was called on — the non-regression the shell-rules side answered with "empty
+    /// means today's behaviour", arrived at here as a consequence instead of as an exception. Read
+    /// as a replacement it would have to be an exception, and an exception at zero rows is a cliff
+    /// at one: declare a single operation and every machine-wide grant would vanish unannounced.
+    ///
+    /// **Narrowed on the way out, though `POST /projects/{id}/github-ops` already validated on the
+    /// way in.** Two writes the route never saw can reach that table: a row stored before a ceiling
+    /// was narrowed, and a row written out of band. The shell-rules side made this argument for its
+    /// own fold and it is the stronger one here, because the cost is not a dead rule but a live
+    /// grant — `api_read` in a row would otherwise name `gh api -X DELETE` through the map and run
+    /// it unasked. The read side is the side that decides, so the read side checks.
+    ///
+    /// A row outside the ceiling is dropped with a warning and the rest stay valid, which is
+    /// `narrow`'s rule and §6 of the design restating it: one bad line is a mistake, not a reason to
+    /// discard the good ones.
+    ///
+    /// **The acting half of the overlay reaches nothing yet, and that is worth knowing before
+    /// reading it as live.** `action_is_autonomous` has exactly one production caller — `submit`,
+    /// which reads `runtime.policy`, the machine default. `POST /github/requests` is the only way
+    /// into `submit`, its body is `{op}` and nothing else, and `github_caller_is_allowed` admits only
+    /// the control token and an Admin key — so there is no project on that path, and no run id to
+    /// resolve one from either. Naming the project in the body would make it a CLAIM the caller
+    /// makes about itself, which is the shape `pretooluse_decision` had to take apart: a caller free
+    /// to name any project could borrow that project's grants. That is a decision the design did not
+    /// take and this is not the place to take it.
+    ///
+    /// Merged anyway, and deliberately. The route accepts action kinds, the table stores them, and
+    /// `digest` has to say what the effective policy IS rather than what happens to be consulted; on
+    /// the day `submit` is handed a project, nothing here changes. Until then a project's declared
+    /// ACTIONS are recorded and inert, while its declared READS are live through Bash.
+    pub async fn for_project(&self, pool: &sqlx::SqlitePool, project_id: &str) -> Self {
+        // The SWALLOWING reader, and this is the consumer it was written for. An unreadable table
+        // yields no operations, an empty overlay is the machine default, and that is strictly FEWER
+        // operations running unasked — the safe direction here. It is the opposite of the shell
+        // `deny`, where an empty list would lose a refusal somebody wrote down and the `Result`
+        // reader is the only honest one; `project_policy` carries both halves for exactly this
+        // reason, and picking the wrong one is how a database hiccup becomes a permission.
+        let declared = crate::project_policy::github_ops(pool, project_id).await;
+        // One narrowing against the whole declarable set, so a row that is in neither half warns
+        // once and by name...
+        let kept = narrow(&declared, &declarable_ops(), "project operation");
+        // ...and then the partition decision #5 keeps in the types, applied here so that each door
+        // holds only what it may answer for.
+        //
+        // **A `partition` and not two intersections, and that is only exact because of the line
+        // above.** `declarable_ops` IS the two halves concatenated, and the halves are disjoint
+        // because `ReadOp` and `ActOp` are — `read_ops_and_act_ops_partition_op` is the test that
+        // says so — so after `narrow`, "not a read" and "an action" are the same set. Take `narrow`
+        // away and they stop being: `api_read` would fall into the acting half and be autonomous
+        // there. That is the one ceiling check, deliberately in one place, and this is the sentence
+        // that says what depends on it.
+        let (read_ops, acted): (Vec<String>, Vec<String>) = kept
+            .into_iter()
+            .partition(|kind| declarable_read_ops().contains(&kind.as_str()));
+        let mut actions = self.actions.clone();
+        actions.extend(acted);
+        actions.sort();
+        actions.dedup();
+        let digest = digest_of(&self.reads, &read_ops, &actions);
+        Self {
+            reads: self.reads.clone(),
+            read_ops,
             actions,
             digest,
         }
@@ -1430,12 +1616,21 @@ impl Policy {
     /// A refused flag is matched by `word_is_flag`, which is that rule and lives beside the map that
     /// also needs it — see its own doc for why one rule may not have two spellings here.
     ///
-    /// **This decides the list and the flags and nothing else.** Whether the line is a single
+    /// **This decides the lists and the flags and nothing else.** Whether the line is a single
     /// command at all, whether it redirects, whether it hides a second command behind a separator —
     /// those are `classifier.rs`'s guards, applied before this is ever consulted, and this function
     /// would be wrong to be read as covering them.
+    ///
+    /// **Two doors, one flag check, and the ORDER is the whole safety argument.** The machine's list
+    /// is asked by prefix and the project's by name, but `REFUSED_READ_FLAGS` runs before either and
+    /// binds both. `op_kind_of_gh_command` has a refused-flag guard of its own and it is not this
+    /// one: it covers the flags that change WHICH operation a line is, so that `--log-failed` cannot
+    /// be named `run_status`. The rest of the constant — `--limit` above all — bounds HOW MUCH a
+    /// stranger gets to say, and `ReadOp::effect` leans on it by name: `PrList` is graded `ReadsOwn`
+    /// because a stranger reaches it through thirty short fields and no further. A name from the map
+    /// is not a grant, and a mapped name allowed to skip this check would take the grading with it.
     pub fn read_is_autonomous(&self, command: &str) -> bool {
-        if self.reads.is_empty() {
+        if self.reads.is_empty() && self.read_ops.is_empty() {
             return false;
         }
         let words = crate::classifier::shell_words(command);
@@ -1447,13 +1642,33 @@ impl Policy {
             return false;
         }
         let normalized = words.join(" ").to_ascii_lowercase();
-        self.reads
+        if self
+            .reads
             .iter()
             .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
+        {
+            return true;
+        }
+        // The named door. `read_ops` holds no action, so this cannot answer for one however the line
+        // is spelled — see the field's own doc.
+        //
+        // Skipped outright when there is no name to ask about, which is EVERY machine policy — and
+        // that is a cost and not only a tidiness. This runs per segment of every shell line a hook
+        // sees, and `op_kind_of_gh_command` tokenizes the segment a second time before it can even
+        // tell that the program is not `gh`. A daemon whose projects declared nothing goes on paying
+        // exactly what it paid before this field existed.
+        if self.read_ops.is_empty() {
+            return false;
+        }
+        op_kind_of_gh_command(command).is_some_and(|kind| self.read_ops.iter().any(|op| op == kind))
     }
 
     /// Whether an operation of this `kind()` is executed without asking. Everything else becomes a
     /// proposal a person approves, and the turn carries on either way.
+    ///
+    /// One list for both authors: an action the machine granted and an action the project declared
+    /// are the same sentence in the same vocabulary, so `for_project` merges rather than adding a
+    /// second field. The reading half could not do that, and its field says why.
     pub fn action_is_autonomous(&self, kind: &str) -> bool {
         self.actions.iter().any(|allowed| allowed == kind)
     }
@@ -1534,10 +1749,31 @@ impl GithubRuntime {
             policy: Policy::from_config(config),
         }
     }
+
+    /// The policy a decision about THIS project is taken under: the machine default with the
+    /// project's declared operations laid over it.
+    ///
+    /// **The door the daemon uses, and the one place the switch is read.** `Policy::for_project`
+    /// does the layering and knows nothing about `enabled`, because by the time a `Policy` exists a
+    /// switched-off pillar and an empty pair of lists are the same value — `from_config` collapses
+    /// one into the other on purpose. Layering onto that collapsed value would let a project's row
+    /// turn back on a pillar the owner switched off, which is the one thing `enabled: false` is for.
+    /// Kept here rather than at the call sites so that neither `hooks.rs` nor `runs.rs` has to
+    /// remember it.
+    pub async fn policy_for_project(&self, pool: &sqlx::SqlitePool, project_id: &str) -> Policy {
+        if !self.enabled {
+            return Policy::empty();
+        }
+        self.policy.for_project(pool, project_id).await
+    }
 }
 
 /// PURE: one list intersected with its ceiling, sorted and deduplicated, warning about each entry it
 /// had to drop.
+///
+/// Written for the owner's file and used unchanged for a project's rows, which is why the warning
+/// says "config" rather than "file": a row in `project_github_ops` is configuration too, and it
+/// reaches this by the same route and for the same reason.
 fn narrow(asked: &[String], ceiling: &[&str], what: &str) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     for entry in asked {
@@ -1573,12 +1809,22 @@ fn narrow(asked: &[String], ceiling: &[&str], what: &str) -> Vec<String> {
 /// break the scoreboard — which is the whole reason `§7` asked for it normalized before hashed. A
 /// switched-off pillar and an empty pair of lists hash alike, and they should: they are the same
 /// effective policy.
-fn digest_of(reads: &[String], actions: &[String]) -> String {
-    let text = format!(
+///
+/// **`read_ops` is written only when there IS one, and that conditional is the same sentence again
+/// rather than a special case.** A project that declared nothing has the machine's effective policy,
+/// so it must carry the machine's label; appending an empty field instead would renumber every
+/// digest ever recorded, and `shadow::shadow_readiness` would then warn that one action class spans
+/// two policies on machines where nothing changed. A project's declared ACTIONS need no such care —
+/// they merge into `actions`, so they move the digest through a field that was always written.
+fn digest_of(reads: &[String], read_ops: &[String], actions: &[String]) -> String {
+    let mut text = format!(
         "v1\nreads={}\nactions={}",
         reads.join(","),
         actions.join(",")
     );
+    if !read_ops.is_empty() {
+        text.push_str(&format!("\nread_ops={}", read_ops.join(",")));
+    }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
         hash ^= u64::from(byte);
@@ -3037,11 +3283,20 @@ mod tests {
     /// the reading side too, because an operation refused as an action and admitted as a command
     /// would be the same capability through the other door.
     ///
-    /// `Policy` has exactly two constructors — `empty` and `from_config` — and only the second can
-    /// be told anything. That is why this is a complete enumeration rather than a sample, and why
-    /// adding a third constructor is a change that has to come back here.
-    #[test]
-    fn api_read_is_never_autonomous_by_any_route_that_can_ask_for_it() {
+    /// `Policy` has three constructors — `empty`, `from_config` and `for_project` — and only the
+    /// last two can be told anything. That is why this is a complete enumeration rather than a
+    /// sample, and why adding a fourth constructor is a change that has to come back here.
+    ///
+    /// **Route three is the one this chunk added, and it is the sharpest of the three.** A row in
+    /// `project_github_ops` reaches `read_is_autonomous` through `op_kind_of_gh_command`, and that
+    /// map DOES name `gh api …` — `ApiRead`'s argv is `api -- …`, so the form matches and the answer
+    /// is `Some("api_read")`. Nothing about the map refuses it. What refuses it is `for_project`
+    /// narrowing the stored rows against `declarable_ops` on the way OUT, which is the whole reason
+    /// the read side narrows at all when the write route already validated: this row is written
+    /// straight into the table below, exactly as an out-of-band write or a pre-ceiling row would
+    /// arrive, and without that narrowing `gh api -X DELETE` would run in Bash unasked.
+    #[tokio::test]
+    async fn api_read_is_never_autonomous_by_any_route_that_can_ask_for_it() {
         // Route one: the owner's `.ai/github.yaml`, asking for it in both lists and asking beside
         // entries the ceilings DO admit — so a narrowing that dropped the whole file would satisfy
         // this by accident and the kept entries prove it did not.
@@ -3074,7 +3329,34 @@ mod tests {
                 .contains(&"pr_create".to_owned())
         );
 
-        for policy in [Policy::empty(), Policy::default(), owner, widest] {
+        // Route three: a project's own table, written straight past the route that validates it, and
+        // laid over the two widest machine policies there are.
+        let pool = test_pool().await;
+        for kind in ["api_read", "run_list", "pr_create"] {
+            sqlx::query(
+                "INSERT INTO project_github_ops (project_id, op_kind, created_at)
+                 VALUES ('alpha', ?, datetime('now'))",
+            )
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let declared = widest.for_project(&pool, "alpha").await;
+        let declared_over_nothing = Policy::empty().for_project(&pool, "alpha").await;
+        // The kept rows prove the narrowing dropped one entry and not the whole table, the way the
+        // owner's route above proves it.
+        assert!(declared_over_nothing.read_is_autonomous("gh run list -R owner/name"));
+        assert!(declared_over_nothing.action_is_autonomous("pr_create"));
+
+        for policy in [
+            Policy::empty(),
+            Policy::default(),
+            owner,
+            widest,
+            declared,
+            declared_over_nothing,
+        ] {
             assert!(
                 !policy.action_is_autonomous("api_read"),
                 "api_read is never an autonomous action"
@@ -3088,7 +3370,248 @@ mod tests {
             .argv();
             assert!(!policy.read_is_autonomous(&format!("gh {}", argv.join(" "))));
             assert!(!policy.read_is_autonomous("gh api repos/owner/name"));
+            // The line the map WOULD name `api_read`, spelled the way it would cost the most.
+            assert!(!policy.read_is_autonomous("gh api -X DELETE repos/owner/name"));
         }
+        // Said once, outside the loop, because it is a fact about the map rather than about any
+        // policy: the map names this line, and the name is not a grant.
+        assert_eq!(
+            op_kind_of_gh_command("gh api repos/owner/name"),
+            Some("api_read"),
+            "the map names it; the ceiling is what refuses it"
+        );
+    }
+
+    /// The non-regression, proved rather than argued: a project that declared nothing IS the machine
+    /// default, value for value.
+    ///
+    /// Equality over the whole `Policy` and not over its answers, which is the stronger claim and
+    /// the cheaper one to keep: it covers the two lists, the third list this chunk added, and the
+    /// `digest` — the last of which labels rows in a live scoreboard, so an overlay that renumbered
+    /// it would tell `shadow::shadow_readiness` that one action class spans two policies on a
+    /// machine where nothing changed.
+    ///
+    /// Asked of a machine default with entries as well as of an empty one, because the interesting
+    /// direction is the one where there is something to lose.
+    #[tokio::test]
+    async fn a_project_that_declared_nothing_is_the_machine_default_exactly() {
+        let pool = test_pool().await;
+        let owner = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n\
+             autonomous_actions:\n  - pr_comment\n",
+        ));
+        for machine in [Policy::empty(), Policy::default(), owner] {
+            let for_project = machine.for_project(&pool, "alpha").await;
+            assert_eq!(
+                for_project, machine,
+                "a project with no rows is the machine default and not a copy of it"
+            );
+            assert_eq!(for_project.digest(), machine.digest());
+        }
+    }
+
+    /// The widening half, and the reason any of this exists: an operation this project declared runs
+    /// without asking HERE and nowhere else.
+    ///
+    /// The machine default is empty throughout, so nothing but the project's own row can be
+    /// producing the `true` — which is what makes this the test a `for_project` that ignored its
+    /// rows would fail.
+    #[tokio::test]
+    async fn a_declared_operation_runs_without_asking_in_this_project_and_in_no_other() {
+        let pool = test_pool().await;
+        crate::project_policy::declare_github_op(&pool, "alpha", "run_list")
+            .await
+            .unwrap();
+        crate::project_policy::declare_github_op(&pool, "alpha", "pr_comment")
+            .await
+            .unwrap();
+
+        let machine = Policy::empty();
+        let alpha = machine.for_project(&pool, "alpha").await;
+        let beta = machine.for_project(&pool, "beta").await;
+
+        assert!(alpha.read_is_autonomous("gh run list -R owner/name"));
+        assert!(alpha.action_is_autonomous("pr_comment"));
+
+        assert!(!beta.read_is_autonomous("gh run list -R owner/name"));
+        assert!(!beta.action_is_autonomous("pr_comment"));
+        assert!(!machine.read_is_autonomous("gh run list -R owner/name"));
+        assert!(!machine.action_is_autonomous("pr_comment"));
+
+        // A different effective policy gets a different label, which is the one property `digest`
+        // has to have.
+        assert_ne!(alpha.digest(), machine.digest());
+        assert_eq!(beta.digest(), machine.digest());
+    }
+
+    /// It ADDS to the machine default; it does not replace it. A project that declares one operation
+    /// keeps every grant the owner's file already gave the machine.
+    #[tokio::test]
+    async fn a_projects_declaration_adds_to_the_machine_default_and_never_replaces_it() {
+        let pool = test_pool().await;
+        crate::project_policy::declare_github_op(&pool, "alpha", "pr_list")
+            .await
+            .unwrap();
+
+        let machine = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n\
+             autonomous_actions:\n  - pr_comment\n",
+        ));
+        let alpha = machine.for_project(&pool, "alpha").await;
+
+        // The project's own row, granted.
+        assert!(alpha.read_is_autonomous("gh pr list -R owner/name"));
+        // And the machine's two, still standing. Under a replacement reading both of these would be
+        // false, and the owner would have had no way to write down that they wanted them kept.
+        assert!(alpha.read_is_autonomous("gh run list -R owner/name"));
+        assert!(alpha.action_is_autonomous("pr_comment"));
+    }
+
+    /// The ceiling is a ceiling on the way OUT of the table too.
+    ///
+    /// Every row here is one `POST /projects/{id}/github-ops` would refuse, written straight into
+    /// the table the way a row stored before a ceiling narrowed — or written out of band — would
+    /// arrive. `run_logs` and `pr_view` are the interesting pair: both are real `ReadOp`s the map
+    /// names, so nothing about the naming refuses them, and `pr_view` shares no flag with anything —
+    /// it is outside `READ_CEILING` and that alone is what stops it.
+    #[tokio::test]
+    async fn a_row_outside_the_ceiling_grants_nothing_however_it_got_there() {
+        let pool = test_pool().await;
+        for kind in ["run_logs", "pr_view", "issue_view", "pr_diff", "api_read"] {
+            sqlx::query(
+                "INSERT INTO project_github_ops (project_id, op_kind, created_at)
+                 VALUES ('alpha', ?, datetime('now'))",
+            )
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let alpha = Policy::empty().for_project(&pool, "alpha").await;
+
+        for command in [
+            "gh run view --log 1 -R owner/name",
+            "gh pr view 7 -R owner/name",
+            "gh issue view 7 -R owner/name",
+            "gh pr diff 7 -R owner/name",
+            "gh api repos/owner/name",
+        ] {
+            assert!(
+                !alpha.read_is_autonomous(command),
+                "{command:?} is outside the ceiling whatever the table says"
+            );
+        }
+        // And the whole overlay is inert, digest included: five refused rows are no rows.
+        assert_eq!(alpha, Policy::empty());
+    }
+
+    /// A declared ACTION does not open the reading door in Bash.
+    ///
+    /// Decision #5 keeps the partition in the types, and this is what it buys once one list of names
+    /// governs both doors: `op_kind_of_gh_command` names `gh pr comment` perfectly well, and the
+    /// project declared `pr_comment`, so the only thing between that line and running unattended is
+    /// `read_ops` holding no action.
+    ///
+    /// It is the twin of a sentence the machine's own square already measures — "no action is ever
+    /// autonomous in Bash", in `the_map_names_an_operation_and_does_not_yet_make_the_two_doors_agree`
+    /// — asked of the door that did not exist when that was written. There it holds by ARITHMETIC,
+    /// because no `ACTION_CEILING` kind has a `READ_CEILING` prefix; here the prefixes are gone and
+    /// only the partition is left holding it up.
+    #[tokio::test]
+    async fn a_declared_action_never_becomes_an_autonomous_bash_line() {
+        let pool = test_pool().await;
+        for kind in declarable_act_ops() {
+            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+                .await
+                .unwrap();
+        }
+        let alpha = Policy::empty().for_project(&pool, "alpha").await;
+
+        for op in ActOp::all() {
+            let line = format!("gh {}", op.argv().join(" "));
+            assert!(
+                !alpha.read_is_autonomous(&line),
+                "{line:?} acts, and no declaration makes an action an autonomous read"
+            );
+        }
+        // The one that would hurt most, spelled by hand so the assertion survives a change to
+        // `PrComment`'s argv.
+        assert!(!alpha.read_is_autonomous("gh pr comment 7 --body hello -R owner/name"));
+        // ...while the typed door answers yes, which is what makes the line above a partition and
+        // not an accident of spelling.
+        assert!(alpha.action_is_autonomous("pr_comment"));
+    }
+
+    /// **A name from the map is not a grant.** The refused flags bind the named door exactly as they
+    /// bind the prefix one, and they run BEFORE it.
+    ///
+    /// `--log` and `--log-failed` are the flags that change WHICH operation a line is, and the map
+    /// has its own guard for those. The rest of `REFUSED_READ_FLAGS` is a different job: `--json`
+    /// and `--jq` change the SHAPE of what comes back, and `--limit` bounds HOW MUCH — `ReadOp::
+    /// effect` grades `PrList` as `ReadsOwn` precisely because a stranger reaches it through thirty
+    /// short fields and no further. A mapped name allowed past this check would take that grading
+    /// with it, and `gh pr list --limit 1000` would be a thousand stranger-chosen titles in a call
+    /// that marks nothing.
+    #[tokio::test]
+    async fn a_declared_name_does_not_survive_a_flag_that_changes_what_comes_back() {
+        let pool = test_pool().await;
+        for kind in ["run_status", "pr_list", "run_list"] {
+            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+                .await
+                .unwrap();
+        }
+        let alpha = Policy::empty().for_project(&pool, "alpha").await;
+
+        // The plain forms run, or there would be nothing to take away below.
+        assert!(alpha.read_is_autonomous("gh run view 1 -R owner/name"));
+        assert!(alpha.read_is_autonomous("gh pr list -R owner/name"));
+
+        for refused in [
+            "gh run view --log 1 -R owner/name",
+            "gh run view --log-failed 1 -R owner/name",
+            "gh pr list --limit 1000 -R owner/name",
+            "gh pr list -L 1000 -R owner/name",
+            "gh pr list --json body -R owner/name",
+            "gh pr list --jq .[] -R owner/name",
+            "gh run list --search in:body -R owner/name",
+        ] {
+            assert!(
+                !alpha.read_is_autonomous(refused),
+                "{refused:?} carries a flag that changes what comes back"
+            );
+        }
+    }
+
+    /// A pillar the owner switched off stays off, whatever a project declared.
+    ///
+    /// `Policy::from_config` collapses a disabled pillar to `empty()`, so by the time a `Policy`
+    /// exists "switched off" and "granted nothing" are the same value and the layering cannot tell
+    /// them apart. `GithubRuntime::policy_for_project` is where the switch is read, and this is the
+    /// test that says so — layering onto the collapsed value directly, as the second half shows,
+    /// would hand a row the pillar's own off switch.
+    #[tokio::test]
+    async fn a_switched_off_pillar_stays_off_whatever_the_project_declared() {
+        let pool = test_pool().await;
+        crate::project_policy::declare_github_op(&pool, "alpha", "run_list")
+            .await
+            .unwrap();
+
+        let off = GithubRuntime {
+            enabled: false,
+            ..GithubRuntime::default()
+        };
+        let policy = off.policy_for_project(&pool, "alpha").await;
+        assert_eq!(policy, Policy::empty());
+        assert!(!policy.read_is_autonomous("gh run list -R owner/name"));
+
+        // The same project, the same row, through a pillar that is on.
+        let on = GithubRuntime::default();
+        assert!(
+            on.policy_for_project(&pool, "alpha")
+                .await
+                .read_is_autonomous("gh run list -R owner/name"),
+            "the row is a real grant; the switch is what withheld it above"
+        );
     }
 
     /// `pr_create` is inside the ceiling; every other route to it is unchanged.
@@ -3185,11 +3708,16 @@ mod tests {
     /// no action is ever autonomous in Bash because no `ACTION_CEILING` kind has a `READ_CEILING`
     /// prefix.
     ///
-    /// Deliberately not fixed here. Task 14 gives `Policy` the single list this map is the other
-    /// half of, and decision #6 — the comment below the map — is where the gap finally closes. This
-    /// test is what will fail, correctly and loudly, on the day either lands.
-    #[test]
-    fn the_map_names_an_operation_and_does_not_yet_make_the_two_doors_agree() {
+    /// **`Policy::for_project` has since landed and this test did not fail, which is the fact worth
+    /// recording rather than the promise it replaces.** The paragraph here said the single list
+    /// would be what closed the gap. It is not, and the second half below measures why: the project
+    /// list widens the BASH door by name, and `submit` — the typed door — reads `runtime.policy`,
+    /// the machine default, because `POST /github/requests` carries no project. So a project that
+    /// declares every operation it may declare disagrees with the typed door about exactly the same
+    /// eleven. Decision #6 remains the only thing that closes it, and the second arm is what will
+    /// fail, correctly and loudly, on the day the typed door learns which project it is acting for.
+    #[tokio::test]
+    async fn the_map_names_an_operation_and_does_not_yet_make_the_two_doors_agree() {
         let widest = Policy::from_config(&crate::config::GithubConfig {
             enabled: true,
             autonomous_reads: READ_CEILING
@@ -3243,6 +3771,33 @@ mod tests {
                 "issue_close",
             ],
             "eleven of sixteen, and `api_read` agrees only because both doors refuse it"
+        );
+
+        // And the same square again, for a project that declared everything it MAY declare — the
+        // widest per-project policy there is, laid over the widest machine one. Same eleven, because
+        // `for_project` reaches only the Bash door.
+        let pool = test_pool().await;
+        for kind in declarable_ops() {
+            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+                .await
+                .unwrap();
+        }
+        let declared = widest.for_project(&pool, "alpha").await;
+        let typed_for_project = |op: &Op| match op {
+            // `submit` reads `runtime.policy` and never this value, which is the whole point of the
+            // paragraph above: written as `widest` deliberately, so that wiring `submit` to the
+            // project changes what this line has to say.
+            Op::Read(_) => true,
+            Op::Act(act) => widest.action_is_autonomous(act.kind()),
+        };
+        let still_disagreeing: Vec<&str> = operations
+            .iter()
+            .filter(|op| typed_for_project(op) != declared.read_is_autonomous(&gh_line(op)))
+            .map(Op::kind)
+            .collect();
+        assert_eq!(
+            still_disagreeing, disagreeing,
+            "declaring everything a project may declare moves the Bash door and not the typed one"
         );
     }
 

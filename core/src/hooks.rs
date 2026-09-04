@@ -324,6 +324,42 @@ async fn shell_rules_of(state: &AppState, project_id: Option<&str>) -> ProjectRu
     }
 }
 
+/// The GitHub policy this decision is taken under: the machine default from `.ai/github.yaml` with
+/// the project's declared operations laid over it, read at decision time and never cached.
+///
+/// The sentence `shell_rules_of` makes, about the other table, and §4.4 of
+/// `.ai/specs/2026-09-03-alcada-por-projecto-design.md` is where it was decided for both. The run's
+/// project comes off the row that already named it — one more column on a query that already ran —
+/// and never off `vcs::project_for_worktree`, which spawns a `git rev-parse` in front of a person's
+/// keystrokes.
+///
+/// **A failed read costs autonomy and can cost nothing else, which is why the SWALLOWING reader is
+/// the right one here and there is no `ProjectRules::Unreadable` shape to go with it.**
+/// `project_policy::github_ops` turns an unreadable table into an empty `Vec`; an empty overlay is
+/// the machine default, because `for_project` adds rather than replaces. So the worst a database
+/// hiccup can do is withhold operations the project declared — fewer things running unasked, never
+/// more, and nothing that was written down is lost in a direction that grants. The shell rules run
+/// the other way: an unreadable list is an unreadable `deny`, and losing THAT would be an allow, so
+/// that side needs the `Result` reader and the downgrade. `project_policy` carries both halves for
+/// exactly this reason and this is the consumer the swallowing one was written for.
+///
+/// Borrowed when there is nothing to lay over. A run with no project has no rows, so the machine
+/// default is the whole answer and not a stand-in for one.
+async fn github_policy_of<'a>(
+    state: &'a AppState,
+    project_id: Option<&str>,
+) -> std::borrow::Cow<'a, crate::github::Policy> {
+    match project_id {
+        Some(project_id) => std::borrow::Cow::Owned(
+            state
+                .github
+                .policy_for_project(&state.pool, project_id)
+                .await,
+        ),
+        None => std::borrow::Cow::Borrowed(&state.github.policy),
+    }
+}
+
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -489,16 +525,26 @@ pub async fn pretooluse_decision(
     // could matter. `classifier::reads_shell_rules` is the same list the classifier's own branch
     // uses, so the filter cannot drift away from what it filters; see `shell_rules_of` for why a
     // read nobody would consult is still worth not taking.
-    let rules = if classifier::reads_shell_rules(&payload.tool_name) {
-        shell_rules_of(&state, project_id.as_deref()).await
+    //
+    // The GitHub policy comes from the same place under the same gate, and the gate fits it exactly:
+    // `classify` consults `policy` only in `classify_segment`, which is reached only for the two
+    // shell tools `reads_shell_rules` names. A `Read` cannot be a `gh` line.
+    let (rules, policy) = if classifier::reads_shell_rules(&payload.tool_name) {
+        (
+            shell_rules_of(&state, project_id.as_deref()).await,
+            github_policy_of(&state, project_id.as_deref()).await,
+        )
     } else {
-        ProjectRules::none()
+        (
+            ProjectRules::none(),
+            std::borrow::Cow::Borrowed(&state.github.policy),
+        )
     };
     let classification = rules.downgrade_if_unreadable(classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         cwd.as_deref().map(Path::new),
-        &state.github.policy,
+        policy.as_ref(),
         rules.declared(),
         unrecognized_policy_for(&state.pool, run_id, &mode).await,
     ));
@@ -514,6 +560,11 @@ pub async fn pretooluse_decision(
         // Gated on the run being in flight, which is what the mode lookup above used to guarantee
         // implicitly. A scoreboard is a record of decisions taken over live runs; a stray call
         // naming a finished run is not one of those.
+        //
+        // The digest is the EFFECTIVE policy's — the project's, where there is one — because the row
+        // records a decision and this is the policy the decision was taken under. Recording the
+        // machine's label beside a verdict a project's declaration produced would put the wrong
+        // configuration on the evidence, which is the one thing this column exists to prevent.
         if is_in_flight
             && let Err(error) = shadow::record_decision(
                 &state.pool,
@@ -521,7 +572,7 @@ pub async fn pretooluse_decision(
                 &payload.tool_name,
                 &payload.tool_input,
                 &classification,
-                state.github.policy.digest(),
+                policy.digest(),
             )
             .await
         {
@@ -555,7 +606,7 @@ pub async fn pretooluse_decision(
             &payload.tool_name,
             &payload.tool_input,
             &classification,
-            state.github.policy.digest(),
+            policy.digest(),
         )
         .await
     {
@@ -1103,16 +1154,26 @@ async fn rooted_decision(
     //
     // Filtered like the sibling call, and for the same reason: an unreadable list parks everything,
     // so a read no tool call could consult is a read whose failure costs more than the read itself.
-    let rules = if crate::classifier::reads_shell_rules(&payload.tool_name) {
-        shell_rules_of(state, project_id).await
+    // The GitHub policy rides the same gate, as it does there.
+    let (rules, policy) = if crate::classifier::reads_shell_rules(&payload.tool_name) {
+        (
+            shell_rules_of(state, project_id).await,
+            github_policy_of(state, project_id).await,
+        )
     } else {
-        ProjectRules::none()
+        (
+            ProjectRules::none(),
+            std::borrow::Cow::Borrowed(&state.github.policy),
+        )
     };
     let classification = rules.downgrade_if_unreadable(crate::classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         Some(Path::new(root)),
-        &state.github.policy,
+        // The project's declared operations reach a conversation too. A rooted turn is the owner
+        // working on the project the turn is about, and what that project may do on its own remote
+        // does not change because somebody is watching.
+        policy.as_ref(),
         // A project's `deny` means "never run this here", and a conversation is not an exemption:
         // the owner sitting in front of this turn is the person who wrote the list down.
         rules.declared(),
@@ -3172,6 +3233,89 @@ mod tests {
 
         let decision = decide(&app, &asking(no_project)).await;
         assert_eq!(decision.decision, "pending_approval");
+    }
+
+    /// The GitHub half of the same wiring: the policy a decision is taken under is the project's,
+    /// not the daemon's.
+    ///
+    /// `test_state` ships `GithubRuntime::default()`, whose policy is autonomous in NOTHING — so the
+    /// `allow` below cannot be coming from `.ai/github.yaml`, and the two runs differ in exactly one
+    /// column again. Hand `classify` `state.github.policy` here instead of the layered one and this
+    /// is the test that says so; the constructor could be perfect and the feature would still be
+    /// unreachable, which is the failure this chunk has already fixed twice.
+    ///
+    /// The command carries no refused flag on purpose. `gh run list --limit 5` would park whatever
+    /// the project declared, and a test that could not tell that apart from a broken call site would
+    /// be no test at all.
+    #[tokio::test]
+    async fn an_operation_the_project_declared_reaches_github_where_a_run_with_no_project_parks() {
+        let state = test_state().await;
+        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+            .await
+            .unwrap();
+
+        let declared = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        let no_project = in_flight_run(&state, "real", None, None, None).await;
+        let app = test_router(state.clone());
+
+        let asking = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"gh run list -R owner/name"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking(declared)).await;
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(
+            decision.reason,
+            "structural GitHub reads on an autonomy list are allowed"
+        );
+
+        let decision = decide(&app, &asking(no_project)).await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        // A project that declared nothing is not a project that declared this: same daemon, same
+        // command, and the answer goes back to what it was before the row existed.
+        let other = in_flight_run(&state, "real", Some("beta"), None, None).await;
+        let decision = decide(&app, &asking(other)).await;
+        assert_eq!(decision.decision, "pending_approval");
+    }
+
+    /// A declared read is still bound by the flags. The project said `run_status`; the map names
+    /// `gh run view --log-failed` `run_status` too, until its guard reads `REFUSED_READ_FLAGS` — and
+    /// what comes back is a failed step's log, which is a stranger's words.
+    ///
+    /// Here rather than only in `github.rs` because this is the door an agent actually types into,
+    /// and the question is whether a project's declaration reaches it carrying its bounds.
+    #[tokio::test]
+    async fn a_declared_read_that_asks_for_a_strangers_words_parks_anyway() {
+        let state = test_state().await;
+        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_status")
+            .await
+            .unwrap();
+
+        let run_id = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        let app = test_router(state.clone());
+
+        let asking = |command: &str| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"{command}"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking("gh run view 1 -R owner/name")).await;
+        assert_eq!(decision.decision, "allow");
+
+        for refused in [
+            "gh run view --log 1 -R owner/name",
+            "gh run view --log-failed 1 -R owner/name",
+        ] {
+            let decision = decide(&app, &asking(refused)).await;
+            assert_eq!(
+                decision.decision, "pending_approval",
+                "{refused:?} returns log text and asks a person"
+            );
+        }
     }
 
     /// The refusal direction. `ls -la` is a command the compiled list allows outright, so a project

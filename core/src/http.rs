@@ -6336,58 +6336,25 @@ async fn delete_project_shell_rule(
 /// Every operation kind a project may declare: the ops this núcleo can actually build, narrowed to
 /// what the two compiled ceilings admit.
 ///
-/// **Derived, never written out.** The kinds come off `ReadOp::all()` and `ActOp::all()` through
-/// `kind()`, and admissibility is asked of a `Policy` built from `READ_CEILING` and
-/// `ACTION_CEILING` themselves — the same two questions production asks of the owner's file. A
-/// hand-written list here would be a second spelling of a set that already exists in three places,
-/// and a second spelling is how a set drifts.
+/// **The derivation lives in `github.rs` and this is its name here**, because the WRITE side is no
+/// longer its only reader: `Policy::for_project` narrows a project's stored rows against the same
+/// set at decision time, for the rows this route never saw — one written before a ceiling moved, or
+/// written out of band. Two spellings of that set is how the two sides would come to disagree about
+/// which is which, and the disagreement would be silent in the direction that grants.
 ///
-/// Two consequences worth stating, because both look like bugs and are not:
+/// Two consequences worth stating here, because both look like bugs at this route and are not:
 ///
 /// - **`api_read` is refused.** It is deliberately outside `ACTION_CEILING` — not even
 ///   `.ai/github.yaml` can turn it on — so it is outside this too. A project able to declare it
 ///   would be a way round the ceiling wearing a different route.
-/// - **`run_logs` is refused, and it is a `ReadOp` whose prefix the ceiling admits.** See the
-///   paragraph below: the flag it carries is what refuses it.
+/// - **`run_logs` is refused, and it is a `ReadOp` whose prefix the ceiling admits.** Its argv
+///   carries `--log`, which is in `REFUSED_READ_FLAGS`; `declarable_read_ops` says why in full.
 ///
 /// `workflow_list` used to be a third: in `READ_CEILING` and undeclarable, because no `ReadOp` built
 /// it. `ReadOp::WorkflowList` made it declarable with nothing here edited, which is what "derived,
 /// never written out" was supposed to buy.
-///
-/// The reads are matched on the command each op builds rather than on its kind, because
-/// `READ_CEILING` is written in `gh` prefixes and `ACTION_CEILING` in kinds — two vocabularies, and
-/// this asks each of them in its own. It is also what excludes `run_logs`: its argv carries `--log`,
-/// which is in `REFUSED_READ_FLAGS`, so `read_is_autonomous` refuses it exactly as it refuses the
-/// same flag typed into a Bash call.
 fn declarable_github_ops() -> Vec<&'static str> {
-    let ceiling = crate::github::Policy::from_config(&crate::config::GithubConfig {
-        enabled: true,
-        autonomous_reads: crate::github::READ_CEILING
-            .iter()
-            .map(|entry| (*entry).to_owned())
-            .collect(),
-        autonomous_actions: crate::github::ACTION_CEILING
-            .iter()
-            .map(|entry| (*entry).to_owned())
-            .collect(),
-    });
-
-    let reads = crate::github::ReadOp::all();
-    let actions = crate::github::ActOp::all();
-    let mut kinds: Vec<&'static str> = reads
-        .iter()
-        .filter(|operation| {
-            ceiling.read_is_autonomous(&format!("gh {}", operation.argv().join(" ")))
-        })
-        .map(|operation| operation.kind())
-        .collect();
-    kinds.extend(
-        actions
-            .iter()
-            .filter(|operation| ceiling.action_is_autonomous(operation.kind()))
-            .map(|operation| operation.kind()),
-    );
-    kinds
+    crate::github::declarable_ops()
 }
 
 /// What the GitHub manager may do on this project's remote without asking.

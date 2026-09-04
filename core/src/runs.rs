@@ -2879,14 +2879,25 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // empty rule set while the hook classified under the project's — would answer differently about
     // the identical command line, which is the drift the paragraph above rules out.
     //
-    // **The two are not the same KIND of argument, and reading them as one would be believing a
-    // guarantee this code does not have.** The policy is built once at startup and handed to all
-    // three of `classify`'s production callers unchanged, so "the same one" is literally true of it.
-    // The rules are a table read TWICE — once by the hook when the command was attempted, once here
-    // when the approval is granted — and a prefix declared between those two moments makes the two
-    // reads differ. Nobody loads them once for both; there is no such caller. `classifier.rs`'s
-    // contract paragraph for `rules` carries the three-point argument for why that is bounded and
-    // acceptable, and the read deliberately stays uncached.
+    // **BOTH are now a table read TWICE, and the paragraph that stood here said otherwise.** It read:
+    // "the policy is built once at startup and handed to all three of `classify`'s production callers
+    // unchanged, so 'the same one' is literally true of it". That was true until
+    // `Policy::for_project` landed. The policy handed to a decision is now the machine default with
+    // this project's `project_github_ops` rows laid over it, read at decision time and uncached
+    // (design §4.4) — so it is read once by the hook when the command was attempted and once here
+    // when the approval is granted, exactly as the shell rules are, and an operation declared between
+    // those two moments makes the two reads differ. Nobody loads either of them once for both; there
+    // is no such caller. The read deliberately stays uncached.
+    //
+    // **And this half's drift is bounded more tightly than the shell rules', which is worth working
+    // out rather than inheriting.** `classifier.rs`'s contract paragraph for `rules` carries the
+    // three-point argument for that side. Here there is only one direction to have: the list has no
+    // `deny`, so a declaration between the two moments moves the class from `unrecognized` to
+    // `github-read` and a withdrawal cannot be reached at all — the hook ANSWERED `github-read` with
+    // an allow, so no proposal was minted and there is no resume to drift. The one reachable case
+    // therefore records `github-read` where the person approved an `unrecognized`, and a
+    // `github-read` grant authorizes a class that is allowed without any grant. It buys nothing,
+    // which is narrower than what they agreed to and never wider.
     //
     // The project is `wt_project_id`, off the worktree this resume is going back into, and it IS
     // the project the hook read off the paused run's own row. Checked rather than assumed, because
@@ -2914,6 +2925,20 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // Derived even when the action was queued instead of authorized. The row is excluded from
     // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
     // no class would be a row that could not say what was taken over.
+
+    // This project's policy, and not the machine's. The hook classified the attempt under it, so the
+    // label recorded for the approval has to come from the same place — the whole argument above,
+    // applied to the input that used to be the one input this caller could take for granted.
+    //
+    // No `match` on this one, and the asymmetry with the line below is deliberate rather than an
+    // oversight: `github_ops` swallows an unreadable table into an empty overlay, which is the
+    // machine default, which is the widest thing this can wrongly be — and the direction of that
+    // error is a class recorded as `unrecognized` where the project had earned `github-read`. That
+    // is a NARROWER grant than the person approved, which is the side of the line a label may err on.
+    let policy = state
+        .github
+        .policy_for_project(&state.pool, &wt_project_id)
+        .await;
     let action_class = match crate::project_policy::shell_rules(&state.pool, &wt_project_id).await {
         Ok(rules) => proposal
             .tool_input
@@ -2924,7 +2949,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
                     &tool_name,
                     &input,
                     Some(std::path::Path::new(&wt_path)),
-                    &state.github.policy,
+                    &policy,
                     &rules,
                     // Labelling an action a person has just approved, not deciding one. The strict
                     // reading keeps the recorded class the same as the one that was shown to them.
@@ -5929,6 +5954,39 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 .await
                 .unwrap();
         assert_eq!(recorded.as_deref(), Some("project-declared"));
+    }
+
+    /// The same sentence about the other table: the class this resume records is derived under the
+    /// project's own GitHub policy, and not under the daemon's.
+    ///
+    /// `test_state_with_runner` ships `GithubRuntime::default()`, autonomous in nothing, so
+    /// `github-read` can only have come from the declared operation — and if it did not, the class
+    /// would be `unrecognized`, which is a DIFFERENT grant from the one the person was shown. That
+    /// is the drift the re-derivation exists to rule out, arriving through the input that used to be
+    /// the one input this caller could take for granted.
+    ///
+    /// A `gh` line and not a git one, for `a_resume_records_the_class_this_projects_rules_give`'s
+    /// reason: the queue cannot perform it, so the approval authorizes the run and a class is
+    /// recorded at all.
+    #[tokio::test]
+    async fn a_resume_records_the_class_this_projects_github_ops_give() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "gh run list -R owner/name").await;
+        crate::project_policy::declare_github_op(&state.pool, "proj", "run_list")
+            .await
+            .unwrap();
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT action_class FROM action_grants WHERE run_id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.as_deref(), Some("github-read"));
     }
 
     /// And rules that cannot be read are recorded as NO class, which is what this path already does
