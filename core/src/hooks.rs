@@ -186,6 +186,180 @@ fn deny_with(reason: &str) -> Decision {
     }
 }
 
+/// A run's project shell rules as they reached the decision — the case where they could not be read
+/// included.
+///
+/// That second case is why this is a type and not a bare `ShellRules`. `classify` takes its rules by
+/// reference and has no vocabulary for "I could not read them": handed an empty pair it answers
+/// exactly as it would for a project that declared nothing, and for a project that declared a
+/// `deny` that is the wrong answer in the one direction that costs something.
+enum ProjectRules {
+    /// What the project declared — and an empty pair when there was no project to ask, or when the
+    /// call is one no rule could reach. Both of those are the whole truth rather than a stand-in.
+    Declared(crate::project_policy::ShellRules),
+    /// The table would not answer. Carries NO lists, because a state that held both "unreadable"
+    /// and a set of rules would be a state nothing can act on — and the struct this replaces could
+    /// represent it.
+    Unreadable,
+}
+
+/// The empty pair `declared()` hands back when there is nothing to hand back.
+///
+/// A `static` because that method returns a reference; `Vec::new()` is a `const fn`, so this costs
+/// no allocation and no initialisation.
+///
+/// **And a `const` will not do, which is the half that is easy to try and undo.** A `const` is
+/// inlined as a value at each use site, so `&NO_SHELL_RULES` borrows a temporary; that temporary
+/// lives for `'static` only if rvalue static promotion applies, and promotion refuses any type with
+/// drop glue. `ShellRules` holds two `Vec`s, so it has drop glue, so the borrow is a local and
+/// `declared()` stops compiling with `E0515: cannot return value referencing temporary value`. The
+/// `static` has one address with the program's lifetime and nothing to promote.
+static NO_SHELL_RULES: crate::project_policy::ShellRules = crate::project_policy::ShellRules {
+    allow: Vec::new(),
+    deny: Vec::new(),
+};
+
+impl ProjectRules {
+    /// Nothing declared and nothing failed: a run with no project, or a tool call whose verdict the
+    /// rules could not change anyway. Distinct from `Unreadable` in exactly the way that matters —
+    /// there is nothing here that needs repairing afterwards.
+    fn none() -> Self {
+        Self::Declared(crate::project_policy::ShellRules::default())
+    }
+
+    fn declared(&self) -> &crate::project_policy::ShellRules {
+        match self {
+            Self::Declared(rules) => rules,
+            // Classified under an empty pair and repaired afterwards: `downgrade_if_unreadable` is
+            // the other half of this answer, and neither half is right on its own.
+            Self::Unreadable => &NO_SHELL_RULES,
+        }
+    }
+
+    /// Whether the project's refusals are actually in hand.
+    ///
+    /// Read by the grant lookup as well as by the downgrade, which is why it is a question and not
+    /// a private field test: an authorization taken out earlier is not a key to a refusal nobody
+    /// can read.
+    fn were_read(&self) -> bool {
+        matches!(self, Self::Declared(_))
+    }
+
+    /// Repairs the one answer an empty stand-in could have got wrong.
+    ///
+    /// An unreadable list is an unreadable `deny`, and a refusal nobody can read must not be spent
+    /// as a free pass — so a command that came back `allow` costs an approval prompt instead. The
+    /// direction is `shell_rules`' own: it returns a `Result` precisely so that this cannot be read
+    /// as "the project denied nothing".
+    ///
+    /// **Only the `allow` is touched, and that is what stops this doing harm of its own.** A `deny`
+    /// downgraded to `pending_approval` would turn a refusal into something a person can approve,
+    /// which is the very defect that put a project's `deny` ahead of the approval list one layer
+    /// down. An existing `pending_approval` is already the answer this gives.
+    ///
+    /// **The class is left exactly as the classifier named it, and that is only safe because the
+    /// grant lookup is gated on `were_read`.** A class is a fact about the COMMAND — `read-local`,
+    /// `vcs-local` — where this is a fact about a database read, so a class invented here would put
+    /// a row on the scoreboard naming an error rather than an action. But preserving the real class
+    /// does not by itself avoid the problem it avoids for an invented one; it only narrows it from
+    /// "everything" to "everything of that class", and `read-local` is the widest class there is.
+    ///
+    /// This method is the first thing in the codebase to emit a `pending_approval` carrying an
+    /// allow-only class, which is what puts `read-local` and its siblings within reach of the grant
+    /// table at all: every other producer of those classes answers `allow`, and the grant check
+    /// only runs for a `pending_approval`. Measured before the gate went in — an outage, one prior
+    /// approval of class `read-local`, and `ls -la` came back
+    /// `("allow", "approved authorization for the read-local action class")` under a project that
+    /// denies `ls`. The gate at the grant lookup is what makes the paragraph above true rather than
+    /// nearly true; the two belong together and neither is correct alone.
+    fn downgrade_if_unreadable(
+        &self,
+        classification: classifier::Classification,
+    ) -> classifier::Classification {
+        if self.were_read() || classification.decision.decision != "allow" {
+            return classification;
+        }
+        let reason = "this project's shell rules could not be read, and a refusal nobody can read \
+                      is not a permission"
+            .to_owned();
+        classifier::Classification {
+            decision: Decision {
+                decision: "pending_approval".to_owned(),
+                reason: reason.clone(),
+            },
+            action_class: classification.action_class,
+            reason,
+        }
+    }
+}
+
+/// The project's two shell lists, read at decision time and never cached: a prefix declared a minute
+/// ago has to bind the command attempted now, and a cached refusal is one that goes on being lifted
+/// for as long as the cache lives.
+///
+/// **No project is not a failed read.** A run whose row names no project has no project `deny` that
+/// could be lost, so an empty pair is the whole truth there rather than a stand-in for something
+/// missing — which is why only the `Err` arm answers `Unreadable`.
+///
+/// **Asked only about a call whose verdict the rules could reach**, which is `classifier` question
+/// `reads_shell_rules` and the caller's job rather than this function's. Not for the cost of the
+/// read — it is an index scan of one project's prefixes, nothing like the git subprocesses
+/// `session_git_decision` warns about — but for the cost of its FAILURE: `Unreadable` turns every
+/// `allow` into an approval prompt, and a transient `SQLITE_BUSY` that parked a run on its next
+/// `Read` would be this chunk's own autonomy loss arriving through a different door.
+async fn shell_rules_of(state: &AppState, project_id: Option<&str>) -> ProjectRules {
+    let Some(project_id) = project_id else {
+        return ProjectRules::none();
+    };
+    match crate::project_policy::shell_rules(&state.pool, project_id).await {
+        Ok(declared) => ProjectRules::Declared(declared),
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                %error,
+                "pretooluse-decision: could not read this project's shell rules — an allow costs an approval instead"
+            );
+            ProjectRules::Unreadable
+        }
+    }
+}
+
+/// The GitHub policy this decision is taken under: the machine default from `.ai/github.yaml` with
+/// the project's declared operations laid over it, read at decision time and never cached.
+///
+/// The sentence `shell_rules_of` makes, about the other table, and §4.4 of
+/// `.ai/specs/2026-09-03-alcada-por-projecto-design.md` is where it was decided for both. The run's
+/// project comes off the row that already named it — one more column on a query that already ran —
+/// and never off `vcs::project_for_worktree`, which spawns a `git rev-parse` in front of a person's
+/// keystrokes.
+///
+/// **A failed read costs autonomy and can cost nothing else, which is why the SWALLOWING reader is
+/// the right one here and there is no `ProjectRules::Unreadable` shape to go with it.**
+/// `project_policy::github_ops` turns an unreadable table into an empty `Vec`; an empty overlay is
+/// the machine default, because `for_project` adds rather than replaces. So the worst a database
+/// hiccup can do is withhold operations the project declared — fewer things running unasked, never
+/// more, and nothing that was written down is lost in a direction that grants. The shell rules run
+/// the other way: an unreadable list is an unreadable `deny`, and losing THAT would be an allow, so
+/// that side needs the `Result` reader and the downgrade. `project_policy` carries both halves for
+/// exactly this reason and this is the consumer the swallowing one was written for.
+///
+/// Borrowed when there is nothing to lay over. A run with no project has no rows, so the machine
+/// default is the whole answer and not a stand-in for one.
+async fn github_policy_of<'a>(
+    state: &'a AppState,
+    project_id: Option<&str>,
+) -> std::borrow::Cow<'a, crate::github::Policy> {
+    match project_id {
+        Some(project_id) => std::borrow::Cow::Owned(
+            state
+                .github
+                .policy_for_project(&state.pool, project_id)
+                .await,
+        ),
+        None => std::borrow::Cow::Borrowed(&state.github.policy),
+    }
+}
+
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -234,33 +408,41 @@ pub async fn pretooluse_decision(
     // tool the pillar exists to keep away from a stranger's text. `cwd` stays behind the in-flight
     // check: it only feeds the classifier's path sensitivity, which is meaningful for a run that is
     // actually executing.
-    let (cwd, mode) = match sqlx::query_as::<_, (Option<String>, String)>(
-        "SELECT cwd, mode FROM runs WHERE id = ?",
-    )
-    .bind(run_id)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(Some((cwd, mode))) => (is_in_flight.then_some(cwd).flatten(), mode),
-        Ok(None) => (None, "real".to_owned()),
-        // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
-        // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
-        // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
-        // the run may well be a triage or shadow run whose barrier we would be stepping over, and
-        // the pool this reads through is shared with feed appends and run-status writes, so
-        // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
-        Err(error) => {
-            tracing::warn!(
-                run_id = run_id,
-                %error,
-                "pretooluse-decision: failed to resolve the run's mode — failing closed"
-            );
-            return Json(Decision {
-                decision: "deny".to_owned(),
-                reason: "could not resolve the run's mode — failing closed".to_owned(),
-            });
-        }
-    };
+    //
+    // `project_id` sits with `mode` and NOT with `cwd`, for the same sentence: a project's two shell
+    // lists say what may run at all, not where a path may point, and a run that has left
+    // `run_handles` is precisely when losing that project's `deny` would cost the most. One more
+    // column on a query that already ran, so the reach costs nothing.
+    let (cwd, mode, project_id) =
+        match sqlx::query_as::<_, (Option<String>, String, Option<String>)>(
+            "SELECT cwd, mode, project_id FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(Some((cwd, mode, project_id))) => {
+                (is_in_flight.then_some(cwd).flatten(), mode, project_id)
+            }
+            Ok(None) => (None, "real".to_owned(), None),
+            // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
+            // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
+            // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
+            // the run may well be a triage or shadow run whose barrier we would be stepping over, and
+            // the pool this reads through is shared with feed appends and run-status writes, so
+            // SQLITE_BUSY under contention is an ordinary event rather than a theoretical one.
+            Err(error) => {
+                tracing::warn!(
+                    run_id = run_id,
+                    %error,
+                    "pretooluse-decision: failed to resolve the run's mode — failing closed"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not resolve the run's mode — failing closed".to_owned(),
+                });
+            }
+        };
 
     // Barrier 2 of spec §5.5. A triage run is launched with no tools at all (barrier 1), so a tool
     // call arriving here means barrier 1 is not in force — which is the entire reason this branch
@@ -304,7 +486,7 @@ pub async fn pretooluse_decision(
         // and the branch below would deny every one of those calls — leaving it holding tools it can
         // never use, which is worse than not having them.
         if let Some(root) = rooted_turn(&state, run_id).await {
-            return rooted_decision(&state, &payload, &root).await;
+            return rooted_decision(&state, &payload, &root, project_id.as_deref()).await;
         }
         return assistant_decision(&state, &payload).await;
     }
@@ -339,13 +521,33 @@ pub async fn pretooluse_decision(
         return team_decision(&state, &payload).await;
     }
 
-    let classification = classifier::classify(
+    // The run's own project, off the row that already named it — and asked for only when the answer
+    // could matter. `classifier::reads_shell_rules` is the same list the classifier's own branch
+    // uses, so the filter cannot drift away from what it filters; see `shell_rules_of` for why a
+    // read nobody would consult is still worth not taking.
+    //
+    // The GitHub policy comes from the same place under the same gate, and the gate fits it exactly:
+    // `classify` consults `policy` only in `classify_segment`, which is reached only for the two
+    // shell tools `reads_shell_rules` names. A `Read` cannot be a `gh` line.
+    let (rules, policy) = if classifier::reads_shell_rules(&payload.tool_name) {
+        (
+            shell_rules_of(&state, project_id.as_deref()).await,
+            github_policy_of(&state, project_id.as_deref()).await,
+        )
+    } else {
+        (
+            ProjectRules::none(),
+            std::borrow::Cow::Borrowed(&state.github.policy),
+        )
+    };
+    let classification = rules.downgrade_if_unreadable(classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         cwd.as_deref().map(Path::new),
-        &state.github.policy,
+        policy.as_ref(),
+        rules.declared(),
         unrecognized_policy_for(&state.pool, run_id, &mode).await,
-    );
+    ));
     tracing::info!(
         tool_name = %payload.tool_name,
         decision = %classification.decision.decision,
@@ -358,6 +560,11 @@ pub async fn pretooluse_decision(
         // Gated on the run being in flight, which is what the mode lookup above used to guarantee
         // implicitly. A scoreboard is a record of decisions taken over live runs; a stray call
         // naming a finished run is not one of those.
+        //
+        // The digest is the EFFECTIVE policy's — the project's, where there is one — because the row
+        // records a decision and this is the policy the decision was taken under. Recording the
+        // machine's label beside a verdict a project's declaration produced would put the wrong
+        // configuration on the evidence, which is the one thing this column exists to prevent.
         if is_in_flight
             && let Err(error) = shadow::record_decision(
                 &state.pool,
@@ -365,7 +572,7 @@ pub async fn pretooluse_decision(
                 &payload.tool_name,
                 &payload.tool_input,
                 &classification,
-                state.github.policy.digest(),
+                policy.digest(),
             )
             .await
         {
@@ -399,7 +606,7 @@ pub async fn pretooluse_decision(
             &payload.tool_name,
             &payload.tool_input,
             &classification,
-            state.github.policy.digest(),
+            policy.digest(),
         )
         .await
     {
@@ -466,42 +673,60 @@ pub async fn pretooluse_decision(
             }
         }
 
-        match crate::proposals::grant_covers_class(&state.pool, run_id, classification.action_class)
+        // **Not while the project's refusals are unreadable.** A grant is an authorization derived
+        // from a decision about a command, and it outlives that decision by the whole length of the
+        // resume run; while the list that decided it cannot be read, there is no way to know the
+        // decision still stands. Without this gate `downgrade_if_unreadable` is defeated for the
+        // rest of the run by one earlier approval: it hands the grant lookup a `pending_approval`
+        // carrying an allow-only class, and `read-local` covers `ls`, `cat`, `git status` and
+        // `cargo test` between them. Measured — an outage, one grant of class `read-local`, and
+        // `ls -la` came back `allow` under a project that denies `ls`.
+        //
+        // `matching_queued_request` above is deliberately NOT gated. It answers a run that is
+        // retrying something the queue already took over, which is a fact about a request that
+        // exists and is true whatever the project's list says — and its answer is a refusal.
+        if rules.were_read() {
+            match crate::proposals::grant_covers_class(
+                &state.pool,
+                run_id,
+                classification.action_class,
+            )
             .await
-        {
-            Ok(true) => {
-                tracing::info!(
-                    run_id = run_id,
-                    tool = %payload.tool_name,
-                    action_class = classification.action_class,
-                    "pretooluse-decision: a grant covers this action class — authorizing the action"
-                );
-                let _ = crate::feed::append(
-                    &state.pool,
-                    None,
-                    "action_authorized",
-                    &format!(
-                        "authorized approved {} action for run {}",
-                        payload.tool_name, run_id
-                    ),
-                    Some(run_id),
-                )
-                .await;
-                return Json(Decision {
-                    decision: "allow".to_owned(),
-                    reason: format!(
-                        "approved authorization for the {} action class",
-                        classification.action_class
-                    ),
-                });
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(
-                    run_id = run_id,
-                    %error,
-                    "pretooluse-decision: grant lookup failed; falling back to the classifier decision"
-                );
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        run_id = run_id,
+                        tool = %payload.tool_name,
+                        action_class = classification.action_class,
+                        "pretooluse-decision: a grant covers this action class — authorizing the action"
+                    );
+                    let _ = crate::feed::append(
+                        &state.pool,
+                        None,
+                        "action_authorized",
+                        &format!(
+                            "authorized approved {} action for run {}",
+                            payload.tool_name, run_id
+                        ),
+                        Some(run_id),
+                    )
+                    .await;
+                    return Json(Decision {
+                        decision: "allow".to_owned(),
+                        reason: format!(
+                            "approved authorization for the {} action class",
+                            classification.action_class
+                        ),
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = run_id,
+                        %error,
+                        "pretooluse-decision: grant lookup failed; falling back to the classifier decision"
+                    );
+                }
             }
         }
     }
@@ -911,6 +1136,7 @@ async fn rooted_decision(
     state: &AppState,
     payload: &PreToolUsePayload,
     root: &str,
+    project_id: Option<&str>,
 ) -> Json<Decision> {
     // Corrected in the handler before this is called, so it is the turn that is actually running
     // rather than the one a living process was spawned for.
@@ -919,15 +1145,42 @@ async fn rooted_decision(
         return assistant_decision(state, payload).await;
     }
 
-    let classification = crate::classifier::classify(
+    // The project comes down from the caller, off the same `runs` row that gave it `mode` — NOT out
+    // of `vcs::project_for_worktree(root)`, which would be the obvious way to get it from `root` and
+    // is the wrong one here. That function spawns a `git rev-parse` and canonicalises every roster
+    // row on each call, and a hook runs in front of every single tool call; the comment on
+    // `session_git_decision` makes the same point about its neighbour — this path would be spending
+    // git subprocesses on a person's keystrokes. The row already knows.
+    //
+    // Filtered like the sibling call, and for the same reason: an unreadable list parks everything,
+    // so a read no tool call could consult is a read whose failure costs more than the read itself.
+    // The GitHub policy rides the same gate, as it does there.
+    let (rules, policy) = if crate::classifier::reads_shell_rules(&payload.tool_name) {
+        (
+            shell_rules_of(state, project_id).await,
+            github_policy_of(state, project_id).await,
+        )
+    } else {
+        (
+            ProjectRules::none(),
+            std::borrow::Cow::Borrowed(&state.github.policy),
+        )
+    };
+    let classification = rules.downgrade_if_unreadable(crate::classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         Some(Path::new(root)),
-        &state.github.policy,
+        // The project's declared operations reach a conversation too. A rooted turn is the owner
+        // working on the project the turn is about, and what that project may do on its own remote
+        // does not change because somebody is watching.
+        policy.as_ref(),
+        // A project's `deny` means "never run this here", and a conversation is not an exemption:
+        // the owner sitting in front of this turn is the person who wrote the list down.
+        rules.declared(),
         // A rooted turn is a conversation. Somebody asked for it AND is sitting in front of it, so
         // a park costs them ten seconds and buys the strict reading.
         crate::classifier::Unrecognized::AsksAPerson,
-    );
+    ));
     if classification.decision.decision == "deny" {
         return Json(Decision {
             decision: "deny".to_owned(),
@@ -2928,6 +3181,7 @@ mod tests {
             &tool_input,
             None,
             &crate::github::Policy::empty(),
+            &crate::project_policy::ShellRules::default(),
             classifier::Unrecognized::AsksAPerson,
         );
         assert_eq!(classification.action_class, "unrecognized");
@@ -2939,6 +3193,397 @@ mod tests {
         )
         .await;
         assert_eq!(decision.decision, "pending_approval");
+    }
+
+    /// **The night this whole chunk exists to stop losing.** A run of a project that declared
+    /// `bash scripts/gates.sh` runs it; the identical command, from a run belonging to no project,
+    /// parks at 2am waiting for somebody who is asleep.
+    ///
+    /// Both runs are in flight and differ in exactly one column — `runs.project_id` — so nothing
+    /// but the project's own list can account for the two answers.
+    #[tokio::test]
+    async fn a_prefix_the_project_declared_runs_where_a_run_with_no_project_parks() {
+        let state = test_state().await;
+        crate::project_policy::declare_shell_rule(
+            &state.pool,
+            "alpha",
+            "bash scripts/gates.sh",
+            crate::project_policy::Verdict::Allow,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let declared = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        let no_project = in_flight_run(&state, "real", None, None, None).await;
+        let app = test_router(state.clone());
+
+        let asking = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"bash scripts/gates.sh core"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking(declared)).await;
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(
+            decision.reason,
+            "a prefix this project declared runs without asking"
+        );
+
+        let decision = decide(&app, &asking(no_project)).await;
+        assert_eq!(decision.decision, "pending_approval");
+    }
+
+    /// The GitHub half of the same wiring: the policy a decision is taken under is the project's,
+    /// not the daemon's.
+    ///
+    /// `test_state` ships `GithubRuntime::default()`, whose policy is autonomous in NOTHING — so the
+    /// `allow` below cannot be coming from `.ai/github.yaml`, and the two runs differ in exactly one
+    /// column again. Hand `classify` `state.github.policy` here instead of the layered one and this
+    /// is the test that says so; the constructor could be perfect and the feature would still be
+    /// unreachable, which is the failure this chunk has already fixed twice.
+    ///
+    /// The command carries no refused flag on purpose. `gh run list --limit 5` would park whatever
+    /// the project declared, and a test that could not tell that apart from a broken call site would
+    /// be no test at all.
+    #[tokio::test]
+    async fn an_operation_the_project_declared_reaches_github_where_a_run_with_no_project_parks() {
+        let state = test_state().await;
+        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+            .await
+            .unwrap();
+
+        let declared = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        let no_project = in_flight_run(&state, "real", None, None, None).await;
+        let app = test_router(state.clone());
+
+        let asking = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"gh run list -R owner/name"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking(declared)).await;
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(
+            decision.reason,
+            "structural GitHub reads on an autonomy list are allowed"
+        );
+
+        let decision = decide(&app, &asking(no_project)).await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        // A project that declared nothing is not a project that declared this: same daemon, same
+        // command, and the answer goes back to what it was before the row existed.
+        let other = in_flight_run(&state, "real", Some("beta"), None, None).await;
+        let decision = decide(&app, &asking(other)).await;
+        assert_eq!(decision.decision, "pending_approval");
+    }
+
+    /// A declared read is still bound by the flags. The project said `run_status`; the map names
+    /// `gh run view --log-failed` `run_status` too, until its guard reads `REFUSED_READ_FLAGS` — and
+    /// what comes back is a failed step's log, which is a stranger's words.
+    ///
+    /// Here rather than only in `github.rs` because this is the door an agent actually types into,
+    /// and the question is whether a project's declaration reaches it carrying its bounds.
+    #[tokio::test]
+    async fn a_declared_read_that_asks_for_a_strangers_words_parks_anyway() {
+        let state = test_state().await;
+        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_status")
+            .await
+            .unwrap();
+
+        let run_id = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        let app = test_router(state.clone());
+
+        let asking = |command: &str| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"{command}"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking("gh run view 1 -R owner/name")).await;
+        assert_eq!(decision.decision, "allow");
+
+        for refused in [
+            "gh run view --log 1 -R owner/name",
+            "gh run view --log-failed 1 -R owner/name",
+        ] {
+            let decision = decide(&app, &asking(refused)).await;
+            assert_eq!(
+                decision.decision, "pending_approval",
+                "{refused:?} returns log text and asks a person"
+            );
+        }
+    }
+
+    /// The refusal direction. `ls -la` is a command the compiled list allows outright, so a project
+    /// that denies `ls` is overriding a permission rather than filling a gap — the half of this
+    /// feature that can only ever take something away.
+    ///
+    /// The last three lines are why `project_id` is NOT gated behind `is_in_flight` the way `cwd`
+    /// is: the refusal has to hold for a run that has left `run_handles` too, which is the moment
+    /// losing a project's `deny` would cost the most.
+    #[tokio::test]
+    async fn a_projects_refusal_overrides_a_compiled_permission() {
+        let state = test_state().await;
+        crate::project_policy::declare_shell_rule(
+            &state.pool,
+            "alpha",
+            "ls",
+            crate::project_policy::Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let refusing = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        let silent = in_flight_run(&state, "real", Some("beta"), None, None).await;
+        let app = test_router(state.clone());
+
+        let asking = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"ls -la"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking(refusing)).await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "this project denies this command");
+
+        // A project that declared nothing is not a project that forbade everything.
+        let decision = decide(&app, &asking(silent)).await;
+        assert_eq!(decision.decision, "allow");
+
+        state.run_handles.lock().unwrap().remove(&refusing);
+        let decision = decide(&app, &asking(refusing)).await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "this project denies this command");
+    }
+
+    /// A `deny` list nobody can read must not be spent as a free pass.
+    ///
+    /// The read is forced to fail by dropping the table out from under it, which is the only honest
+    /// way to produce that error from outside `project_policy`: `shell_rules` returns `Err` for a
+    /// database that will not answer, and a pool shared with feed appends and run-status writes
+    /// makes SQLITE_BUSY an ordinary event rather than a theoretical one.
+    ///
+    /// `ls -la` is an `allow` the compiled list gives on its own, and this project may well have
+    /// denied `ls` — nobody can say, so it costs an approval prompt. `rm -rf` is a compiled `deny`,
+    /// and the downgrade has to leave it exactly where it is: turning a refusal into a prompt is
+    /// offering somebody the chance to approve the very thing that was refused.
+    #[tokio::test]
+    async fn rules_that_cannot_be_read_cost_an_approval_and_never_an_allow() {
+        let state = test_state().await;
+        let asking_allow = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        let asking_deny = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        sqlx::query("DROP TABLE project_shell_rules")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{asking_allow},"tool_name":"Bash","tool_input":{{"command":"ls -la"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(decision.decision, "pending_approval");
+
+        let decision = decide(
+            &app,
+            &format!(
+                r#"{{"run_id":{asking_deny},"tool_name":"Bash","tool_input":{{"command":"rm -rf /tmp/x"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "destructive deletion commands are denied");
+    }
+
+    /// **An approval taken out earlier is not a key to a refusal nobody can read.**
+    ///
+    /// `downgrade_if_unreadable` is the first thing in this codebase to answer `pending_approval`
+    /// carrying an allow-only class, and that is what puts `read-local` in front of the grant
+    /// lookup at all — every other producer of that class answers `allow`, and the grant table is
+    /// only consulted for a `pending_approval`. Ungated, one earlier approval would buy the rest of
+    /// the run every `ls`, `cat`, `git status` and `cargo test` it liked, for as long as the table
+    /// stayed unreadable, and the downgrade's own reason string would be false on its face.
+    ///
+    /// The grant is minted BEFORE the table goes, which is the only way this is reachable at all:
+    /// `resume_approved_run` records no class when its own read fails, so one unbroken outage mints
+    /// nothing. An intermittent `SQLITE_BUSY` — which this file already calls an ordinary event
+    /// rather than a theoretical one — is exactly the pattern that arrives here.
+    ///
+    /// The last assertion is what makes this about the gate rather than about an expired grant: the
+    /// grant is still live at the moment the command is refused, and still covers the class.
+    #[tokio::test]
+    async fn a_grant_does_not_survive_rules_that_cannot_be_read() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("read-local"), 1)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+        let asking = format!(
+            r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"ls -la"}}}}"#
+        );
+
+        // While the table answers, the command simply runs and the grant is never reached.
+        assert_eq!(decide(&app, &asking).await.decision, "allow");
+
+        sqlx::query("DROP TABLE project_shell_rules")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(decide(&app, &asking).await.decision, "pending_approval");
+        assert!(
+            proposals::grant_covers_class(&state.pool, run_id, "read-local")
+                .await
+                .unwrap(),
+            "the grant was live and covered the class — the gate is what refused, not an expiry"
+        );
+    }
+
+    /// **An outage on a table these calls never consult must not stop them.**
+    ///
+    /// `classify` reads the rules in exactly one place, `classify_shell_command`, and every branch
+    /// above it returns first — so for a `Read`, a `Grep`, a `Glob` or a subagent the project's two
+    /// lists cannot change the verdict at all. Loading them anyway made the FAILURE of that read
+    /// rewrite the answer: a transient `SQLITE_BUSY` parked a run on its next file read, which is
+    /// this chunk's own autonomy loss arriving through a different door. It fails closed, so it was
+    /// never a safety hole; it is a night lost the same way.
+    ///
+    /// The filter is `classifier::reads_shell_rules`, which is the same list the classifier's own
+    /// branch is written from, so this cannot become a call that skips a load the classifier then
+    /// needs.
+    #[tokio::test]
+    async fn an_outage_on_the_rules_never_parks_a_call_they_could_not_reach() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "real", Some("alpha"), None, None).await;
+        sqlx::query("DROP TABLE project_shell_rules")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        for (tool, input) in [
+            ("Read", serde_json::json!({"file_path": "src/main.rs"})),
+            ("Grep", serde_json::json!({"pattern": "fn main"})),
+            ("Glob", serde_json::json!({"pattern": "**/*.rs"})),
+            ("Task", serde_json::json!({"prompt": "look something up"})),
+        ] {
+            let decision = decide(
+                &app,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "tool_name": tool,
+                    "tool_input": input,
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(decision.decision, "allow", "{tool}");
+        }
+    }
+
+    /// A conversation is not an exemption from what the project wrote down. The rooted branch
+    /// returns before the sibling classifier call, so it needs its own wiring and its own test —
+    /// severing it (passing `None` for the project) left every other test in this file green.
+    ///
+    /// The pair is the assertion: the same command, in the same kind of turn, refused for the
+    /// project that denied it and allowed for the one that did not.
+    #[tokio::test]
+    async fn a_rooted_turn_is_bound_by_its_projects_refusals() {
+        let state = test_state().await;
+        crate::project_policy::declare_shell_rule(
+            &state.pool,
+            "alpha",
+            "ls",
+            crate::project_policy::Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let refusing = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        sqlx::query("UPDATE runs SET project_id = 'alpha' WHERE id = ?")
+            .bind(refusing)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let silent = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        let app = test_router(state.clone());
+
+        let asking = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"ls -la"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking(refusing)).await;
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, "this project denies this command");
+
+        assert_eq!(decide(&app, &asking(silent)).await.decision, "allow");
+    }
+
+    /// The GitHub half of the same sentence, on the same branch, and it was pinned by NOTHING until
+    /// this test.
+    ///
+    /// `rooted_decision` returns before the sibling classifier call, so it carries its own copy of
+    /// the wiring — and reverting its `policy` argument to `state.github.policy` left this whole file
+    /// green at `96 passed; 0 failed`. The twin above exists because severing the SHELL rules left
+    /// every other test green; the identical hole sat open beside it for the policy, opened by the
+    /// very commit that wrote the paragraph justifying the wiring. A constructor can be perfect and
+    /// the feature still unreachable, and that is the failure this chunk has now fixed three times.
+    ///
+    /// The pair is the assertion, as it is above. `test_state` ships `GithubRuntime::default()`,
+    /// autonomous in nothing, so the `allow` can only be the project's own row — and the turn naming
+    /// no project asks a person about the identical line.
+    ///
+    /// `asking` and not `pending_approval`, because this branch never parks: a conversation has
+    /// somebody sitting in front of it, so an unrecognised line goes back to them as a question.
+    #[tokio::test]
+    async fn a_rooted_turn_reaches_github_through_its_projects_declared_operations() {
+        let state = test_state().await;
+        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+            .await
+            .unwrap();
+
+        let declared = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        sqlx::query("UPDATE runs SET project_id = 'alpha' WHERE id = ?")
+            .bind(declared)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let no_project = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        let app = test_router(state.clone());
+
+        let asking = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"gh run list -R owner/name"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking(declared)).await;
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(
+            decision.reason,
+            "structural GitHub reads on an autonomy list are allowed"
+        );
+
+        assert_eq!(decide(&app, &asking(no_project)).await.decision, "asking");
+
+        // And the flags still bind here. A rooted turn is the owner working on their own project,
+        // not an exemption from what `--log-failed` brings back.
+        let refused = format!(
+            r#"{{"run_id":{declared},"tool_name":"Bash","tool_input":{{"command":"gh run view --log-failed 1 -R owner/name"}}}}"#
+        );
+        assert_eq!(decide(&app, &refused).await.decision, "asking");
     }
 
     #[tokio::test]

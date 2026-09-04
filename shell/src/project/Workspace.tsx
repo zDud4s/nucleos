@@ -7,6 +7,7 @@ import { ModeState } from "./ModeState";
 import { ModeMap } from "./ModeMap";
 import { ModeCode } from "./ModeCode";
 import { ModeWorkflows } from "./ModeWorkflows";
+import { ModeGithub } from "./ModeGithub";
 
 /**
  * One project, as a place rather than as a row.
@@ -19,18 +20,27 @@ import { ModeWorkflows } from "./ModeWorkflows";
  * here it is *this worktree has been busy for 41 minutes*, which is a fact that
  * either blocks you or frees you.
  *
- * Four modes and not seven tabs, because the four have genuinely different
- * shapes — a dense grid of panels, a graph of the repository, three columns
- * with a tree that persists, a graph of one workflow. Seven tabs would have
- * been seven variations on one grid, which is a second sidebar wearing a
- * disguise. The rule was never the count: a mode earns its place by having a
- * shape and a subject of its own, which is why Map and Workflows can both be
- * graphs without being the same mode — one draws the project, the other draws
- * one pipeline installed in it.
+ * Five modes and not seven tabs, because each has a genuinely different shape —
+ * a dense grid of panels, a graph of the repository, three columns with a tree
+ * that persists, a graph of one workflow, four sections read top to bottom.
+ * Seven tabs would have been seven variations on one grid, which is a second
+ * sidebar wearing a disguise. The rule was never the count: a mode earns its
+ * place by having a shape and a subject of its own, which is why Map and
+ * Workflows can both be graphs without being the same mode — one draws the
+ * project, the other draws one pipeline installed in it.
+ *
+ * **GitHub is the fifth, and it is held to that same rule rather than excused
+ * from it.** Its subject is this project's *authority* — three tables deciding
+ * what its autonomous runs may do — which is nothing the other four are about:
+ * State reads what has happened, Map reads what is in the folder, Code reads a
+ * run's checkout, Workflows reads an installed bundle. And its shape is its
+ * own: a column of four declarations, each with its own form, which is neither
+ * a grid nor a graph. Folding it into State's Settings panel would have put a
+ * live autonomy control among the preferences.
  */
 
-/** The four modes, in the order the tabs read. */
-const MODES = ["state", "map", "code", "workflows"] as const;
+/** The five modes, in the order the tabs read. */
+const MODES = ["state", "map", "code", "workflows", "github"] as const;
 export type ProjectMode = (typeof MODES)[number];
 
 const MODE_LABEL: Record<ProjectMode, string> = {
@@ -38,6 +48,7 @@ const MODE_LABEL: Record<ProjectMode, string> = {
   map: "Map",
   code: "Code",
   workflows: "Workflows",
+  github: "GitHub",
 };
 
 /**
@@ -67,7 +78,7 @@ const RENAMED: Record<string, ProjectMode> = {
 };
 
 /**
- * A `$view` parameter as one of the four, or as one of the three it used to be.
+ * A `$view` parameter as one of the five, or as one of the three it used to be.
  *
  * Falls back to `state` rather than 404ing, which is the rule the inspector this
  * replaces already followed: a route parameter is a string, anybody can type
@@ -89,12 +100,14 @@ interface Holding {
 /**
  * How much the two conditional modes are holding.
  *
- * **Two of the four are doors rather than places.** Code reads a *run's* worktree and Workflows
+ * **Two of the five are doors rather than places.** Code reads a *run's* worktree and Workflows
  * reads an installed bundle, and on most projects most of the time there is neither — so a strip
- * of four equal tabs sends somebody through a click onto a page whose whole content explains why
- * it is empty, and after the third time they stop pressing either. State and Map are never in
- * here: both are true of a project the moment it exists, so a number beside them would be
- * measuring the project rather than saying whether the tab has anything in it.
+ * of equal tabs sends somebody through a click onto a page whose whole content explains why
+ * it is empty, and after the third time they stop pressing either. State, Map and GitHub are never
+ * in here: all three are true of a project the moment it exists, so a number beside them would be
+ * measuring the project rather than saying whether the tab has anything in it. GitHub in
+ * particular would be numbered *zero* on every project that has declared nothing, which is the
+ * project whose owner most needs to open it.
  *
  * **A number and not a mark, because a number is what was measured.** `0` here is a real answer —
  * the daemon said how many runs hold a worktree in this project and the answer was none — and this
@@ -235,6 +248,7 @@ export function Workspace() {
         />
       ) : null}
       {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
+      {mode === "github" ? <ModeGithub projectId={projectId} /> : null}
     </div>
   );
 }

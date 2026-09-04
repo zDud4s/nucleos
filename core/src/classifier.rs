@@ -414,21 +414,73 @@ pub fn only_reads(tool_name: &str) -> bool {
 /// made the signature carry weight, and a fourth argument is exactly where somebody would otherwise
 /// reach for a file read.
 ///
-/// **The contract of `policy`: BORROWED, ALREADY NARROWED, and it does no I/O.** It is built once at
-/// startup from `.ai/github.yaml` intersected with `github.rs`'s compiled ceilings, and all three
-/// production callers must be handed the SAME one - `hooks.rs` twice and `runs.rs` once. A caller
-/// left holding an empty policy while the others hold a real one would make the hook and the resume
-/// disagree about one command line, which is the divergence the paragraph above exists to make
-/// impossible.
+/// **The contract of `policy`: BORROWED, ALREADY NARROWED, and it does no I/O.** It is
+/// `.ai/github.yaml` intersected with `github.rs`'s compiled ceilings, and all three production
+/// callers must be handed the policy of the SAME PROJECT - `hooks.rs` twice and `runs.rs` once. A
+/// caller left holding an empty policy while the others hold a real one would make the hook and the
+/// resume disagree about one command line, which is the divergence the paragraph above exists to
+/// make impossible.
 ///
-/// It is the only argument whose value comes from a file a person edits, and it can only ever turn a
-/// `pending_approval` into an `allow` for a read this file would otherwise not recognise. It cannot
-/// lift a `deny`, cannot reach the approval list, and is consulted last.
+/// **"The same one" used to be literally true and no longer is, which is a change in what this
+/// argument costs to get right.** `Policy::for_project` lays a project's `project_github_ops` rows
+/// over that machine default, at decision time and uncached, so what arrives here is built for this
+/// decision and thrown away after. It is therefore the same KIND of argument `rules` is - a table
+/// read twice at two moments - and the two now stand or fall together. The bound is written out
+/// where the second read happens, in `runs.rs`, and it is tighter than `rules`': the GitHub list has
+/// no `deny`, so the only reachable drift records `github-read` where a person approved an
+/// `unrecognized`, and a grant for a class that is allowed anyway buys nothing.
+///
+/// Its value comes from a file a person edits AND from a table a person edits, and it can only ever
+/// turn a `pending_approval` into an `allow` for a read this file would otherwise not recognise. It
+/// cannot lift a `deny`, cannot reach the approval list, and is consulted last.
+///
+/// **The contract of `rules`: BORROWED, and the purity paragraph above is the whole reason it is an
+/// argument rather than a read performed in here.** A project's two shell lists live in a table a
+/// person edits while the daemon is running, and a read taken inside this function would make this
+/// function impure — which is the property `runs.rs` leans on when it re-derives a class rather than
+/// carrying one.
+///
+/// **It does NOT mean the two callers hold the same lists, and this paragraph used to claim it did.**
+/// There is no caller that loads them once for both. `hooks.rs` reads at decision time; `runs.rs`
+/// reads again, separately, when the approval is granted — two reads at two moments, exactly the
+/// thing the old sentence named as the danger and presented as avoided. Moving the read OUT of here
+/// relocated it; it did not remove it.
+///
+/// This paragraph went on to say that `policy` was different — one value shared by all three
+/// callers, built once at startup and unable to change. That stopped being true with
+/// `Policy::for_project`, and the contract paragraph above now says so where a reader meets the
+/// argument rather than here, four paragraphs later.
+///
+/// What makes the difference acceptable is bounded, and worth having written down rather than
+/// re-derived:
+///
+/// - A class that arrives with `deny` — `project-denied`, `destructive` — can never reach a grant:
+///   `hooks.rs` only consults the grant table for a `pending_approval`.
+/// - A class that arrives with `allow` reaches it only through `ProjectRules::downgrade_if_unreadable`,
+///   and `hooks.rs` gates the grant lookup on the rules having been read at all.
+/// - The rules can only move a command between `unrecognized` and `project-declared`/`project-denied`,
+///   so drift cannot silently turn one GRANTABLE class into another.
+/// - The project's GitHub list, the one that arrives through `policy`, can only move a command
+///   between `unrecognized` and `github-read` — and `github-read` comes with an `allow`, so a grant
+///   scoped to it authorizes a class that needed no grant. That direction is the only one reachable:
+///   a WITHDRAWN operation cannot drift here at all, because the hook answered the command with an
+///   allow and minted no proposal for a resume to re-derive.
+///
+/// The read stays at decision time and uncached regardless — a cached refusal is one that goes on
+/// being lifted for as long as the cache lives. The consequence to know is that declaring a rule
+/// while a proposal sits pending changes the class recorded on the grant that approval mints.
+///
+/// Its reach is deliberately lopsided, and the asymmetry is the feature. `deny` refuses outright and
+/// beats a compiled permission, because a refusal somebody wrote down is the one thing this must
+/// never quietly lose. `allow` only widens what this file would have ASKED about: it cannot lift a
+/// compiled `deny`, cannot clear a shape guard, and cannot reach the approval list. Deny wins over
+/// allow.
 pub fn classify(
     tool_name: &str,
     tool_input: &Value,
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
+    rules: &crate::project_policy::ShellRules,
     unrecognized: Unrecognized,
 ) -> Classification {
     if WRITE_TOOLS.contains(&tool_name) && writes_outside_cwd(tool_input, cwd) {
@@ -499,7 +551,7 @@ pub fn classify(
     // touching the first. Sharing the label made that impossible to express, and the two tests that
     // caught the attempt (`a_jobs_replan_node_gives_up_instead_of_parking_the_job` and its review
     // twin) are the ones to keep in mind: they park a job node on a `for` loop, which is a COMMAND.
-    if !matches!(tool_name, "Bash" | "PowerShell") {
+    if !reads_shell_rules(tool_name) {
         return classification(
             "pending_approval",
             "unrecognized-tool",
@@ -514,15 +566,37 @@ pub fn classify(
             .unwrap_or(""),
         cwd,
         policy,
+        rules,
         shell_for(tool_name),
         unrecognized,
     )
+}
+
+/// PURE: whether a project's declared shell rules can change this tool's verdict at all.
+///
+/// `classify` consults `rules` in exactly one place — `classify_shell_command`, reached only for
+/// these two tool names — and every branch above returns first: `WRITE_TOOLS`, `READ_LOCAL_TOOLS`,
+/// `SUBAGENT_TOOLS` and the unrecognized-tool answer are all decided without the rules ever being
+/// looked at.
+///
+/// It exists so a caller can decide whether to LOAD them, which is a question `hooks.rs` has to ask
+/// for a reason its own comments give twice: a hook runs in front of every tool call. The read is
+/// cheap; the cost is its failure, which turns every `allow` into an approval prompt — so a
+/// `SQLITE_BUSY` on a table no `Read` could ever consult would park a run on its next file read.
+///
+/// The list is written ONCE and used by both the branch and the callers, for the reason
+/// `matches_command_prefix` and `only_reads` are shared: two spellings of the same list is how they
+/// come to disagree, and here they would disagree silently — the caller skipping a load the
+/// classifier then needed.
+pub fn reads_shell_rules(tool_name: &str) -> bool {
+    matches!(tool_name, "Bash" | "PowerShell")
 }
 
 fn classify_shell_command(
     command: &str,
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
+    rules: &crate::project_policy::ShellRules,
     shell: crate::command_reader::Shell,
     unrecognized: Unrecognized,
 ) -> Classification {
@@ -537,6 +611,63 @@ fn classify_shell_command(
             "destructive",
             "destructive deletion commands are denied",
         );
+    }
+
+    // A project's refusal outranks an approval PROMPT, and this is the position that makes that
+    // true rather than nearly true. `APPROVAL_COMMAND_PATTERNS` matches the whole line just below,
+    // and `command_reader::read` refuses an unreadable line below that; from underneath either of
+    // them a project's `deny` came back `pending_approval`, which is a prompt a person can approve -
+    // and approving it runs the very line the project wrote down as denied. Measured, not feared:
+    // with `git push` denied, `git push origin main` answered
+    // `("pending_approval", "push-merge-deploy")`, and with `curl` denied, `curl $(whoami)` answered
+    // `("pending_approval", "unrecognized")`.
+    //
+    // It is the same defect the old segment pre-pass was written for one layer down, and the same
+    // sentence answers it: A REFUSAL MUST NOT DEPEND ON WHERE IN A LINE IT APPEARS. That pre-pass
+    // used to sit just above the segment loop below, which is where a reader of the spec will look
+    // for it; it is here now because only here does it also outrank the two guards above that loop.
+    //
+    // BELOW the compiled refusals on purpose. Those are also `deny`, so nothing is lost by letting
+    // them answer first, and they answer with a narrower class - `rm -rf /` is worth recording as
+    // `destructive` rather than as whatever the project happened to have written down.
+    // `a_compiled_refusal_keeps_its_own_class` is what holds this block underneath them.
+    //
+    // **`command_reader::segments`, not `read`, and that is the whole of the second fix.** The two
+    // entry points answer different questions, and `segments`' own doc draws the line: `read` is for
+    // a caller deciding whether to ALLOW, so a line it cannot parse must stop it; `segments` is for
+    // a caller asking whether a line CONTAINS something, where a line that cannot be parsed in full
+    // is the one most worth scanning anyway. This pass is asking the second question. Built on
+    // `read` it was anchored at position 0 for anything unreadable, so `curl $(whoami)` was refused
+    // and `ls && curl $(whoami)`, `FOO=1 curl $(whoami)` and `ls; curl http://x &` were not - the
+    // very "depends on where in the line it appears" this block exists to end.
+    //
+    // `segments` walks with `parens: true` where `read` uses `parens: false`, so its cut set is a
+    // strict superset and it can only ever over-deny: `curl $(whoami)` comes back as
+    // `["curl $", "whoami"]`, and `curl $` still matches the prefix `curl`. Over-denying is the safe
+    // direction for a refusal, and the same direction `has_destructive_flags` already accepts. The
+    // only miss it could produce is a declared prefix that spans a parenthesis, which is not a
+    // prefix anybody can write.
+    //
+    // A known residual, seen and not fixed: `bash <<EOF\ncurl http://x\nEOF` under `deny = curl`
+    // stays `pending_approval`. Neither reading reaches it, because the walk deliberately skips
+    // heredoc bodies - see `command_reader.rs`, which argues that case on its own terms. It is a
+    // prompt rather than a silent allow, so it fails in the direction that wakes somebody.
+    //
+    // The empty-list guard is the non-regression, and it is structural rather than argued: a
+    // project that declared no refusals cannot enter this block at all, so it cannot change a
+    // verdict here. Short-circuiting on it also means the second walk of the line is paid only by a
+    // project that has refusals - and it is a string scan with no I/O.
+    //
+    // Both sides of every comparison are folded by `normalize_command`; `project_policy::fold_prefix`
+    // is what guarantees that for the prefix, and says why a prefix that skipped the fold was a
+    // refusal that silently allowed.
+    if !rules.deny.is_empty()
+        && (rules.denies(&normalized)
+            || crate::command_reader::segments(command, shell)
+                .iter()
+                .any(|piece| rules.denies(&normalize_command(&strip_fd_duplications(piece)))))
+    {
+        return classification("deny", "project-denied", "this project denies this command");
     }
 
     if matches_any_phrase(&normalized, APPROVAL_COMMAND_PATTERNS) {
@@ -581,8 +712,9 @@ fn classify_shell_command(
     let mut touches_vcs = false;
     let mut touches_github = false;
     let mut confined = false;
+    let mut declared = false;
     for segment in segments {
-        match classify_segment(segment, cwd, policy, unrecognized) {
+        match classify_segment(segment, cwd, policy, rules, unrecognized) {
             Segment::Unrecognized => {
                 return classification(
                     "pending_approval",
@@ -593,6 +725,7 @@ fn classify_shell_command(
             Segment::VcsLocal => touches_vcs = true,
             Segment::GithubRead => touches_github = true,
             Segment::Confined => confined = true,
+            Segment::ProjectAllowed => declared = true,
             Segment::ReadLocal => {}
         }
     }
@@ -610,6 +743,33 @@ fn classify_shell_command(
         );
     }
 
+    // Second, behind `confined-to-workspace` and ahead of `github-read`, and the position is an
+    // argument in the same currency as the two either side of it.
+    //
+    // `confined` stays in front because it remains the weakest claim any allow in this file rests
+    // on: allowed by where it points, with NOBODY having named it. This one was named - by the
+    // project, in its own list - and being named is a stronger footing than pointing at the right
+    // directory, so it cannot displace the weaker fact from the top.
+    //
+    // Ahead of `github-read` because of what these classes are FOR. This class and that one share
+    // the single property that earns either of them a name of its own - membership decided outside
+    // this file, in something a person edits - and of the two, this is the one edited to widen what
+    // a machine may do unattended. A line that is both would rather be read as "this project
+    // declared it" than as "it reached GitHub", because on a scoreboard about autonomy the first is
+    // where a review has to start.
+    //
+    // A judgement, not a theorem, and the case for the other order is worth writing down:
+    // `github-read` records a line that LEFT THE MACHINE, and that is the argument `github-read`
+    // itself makes for sitting ahead of `vcs-local` a few lines below. Whoever swaps these two
+    // should do it on purpose, having read both halves.
+    if declared {
+        return classification(
+            "allow",
+            "project-declared",
+            "a prefix this project declared runs without asking",
+        );
+    }
+
     // The strongest of the three classes the line earned. A line that stages a commit is a line that
     // stages a commit, whatever it also did on the way, and the scoreboard reads this.
     //
@@ -621,7 +781,10 @@ fn classify_shell_command(
         return classification(
             "allow",
             "github-read",
-            "structural GitHub reads on the owner's autonomy list are allowed",
+            // "an autonomy list" and not "the owner's": since `Policy::for_project` there are two
+            // authors of that list, the machine's file and the project's own declarations, and the
+            // sentence a person reads should not name only one of them.
+            "structural GitHub reads on an autonomy list are allowed",
         );
     }
     if touches_vcs {
@@ -642,9 +805,10 @@ fn classify_shell_command(
 enum Segment {
     ReadLocal,
     VcsLocal,
-    /// A `gh` read the OWNER put on the autonomy list. The only variant whose membership is decided
-    /// outside this file, which is why it is named rather than folded into `ReadLocal`: a scoreboard
-    /// that could not tell the two apart could not tell a compiled policy from an edited one.
+    /// A `gh` read on an autonomy list — the owner's `.ai/github.yaml`, or this project's own
+    /// declared operations, which `Policy::for_project` lays over it. Membership is decided outside
+    /// this file, which is why it is named rather than folded into `ReadLocal`: a scoreboard that
+    /// could not tell the two apart could not tell a compiled policy from an edited one.
     GithubRead,
     /// A command this file has NO opinion about, in work the owner asked for, that nonetheless
     /// names at least one path and names nothing outside the workspace.
@@ -653,6 +817,13 @@ enum Segment {
     /// most: everything else in this enum was recognised by something, and this was allowed on the
     /// strength of where it points rather than of what it is.
     Confined,
+    /// A segment allowed because THIS PROJECT declared its prefix, not because this file recognised
+    /// it.
+    ///
+    /// Its own variant for exactly the reason `GithubRead` gives for being one: its membership is
+    /// decided outside this file, and a scoreboard that could not tell it from `ReadLocal` could
+    /// not tell a compiled policy from an edited one.
+    ProjectAllowed,
     Unrecognized,
 }
 
@@ -689,6 +860,7 @@ fn classify_segment(
     segment: &str,
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
+    rules: &crate::project_policy::ShellRules,
     unrecognized: Unrecognized,
 ) -> Segment {
     // Redirection is a property of ONE command, which is why it is judged here rather than over the
@@ -718,10 +890,19 @@ fn classify_segment(
     if is_safe_command(&normalized) {
         return Segment::ReadLocal;
     }
-    // Consulted LAST, and only after the same shape guards every other read has to clear. Everything
-    // above is a judgement this file makes on its own; this is the one place where a line in a
-    // gitignored YAML changes an answer, so it gets the narrowest reach there is - it can turn a
-    // `pending_approval` into an `allow` and it can do nothing else.
+    // Decision #3's widening half. After every compiled permission, so it only ever changes the
+    // answer for a command this file had no opinion about; after `shell_form_is_readable`, so a
+    // declared prefix clears the same shape guards a compiled entry does. The compiled REFUSALS are
+    // not re-checked here because they already returned `deny` at the line level, before any
+    // segment was read - the destructive guard runs at `classify_shell_command`'s top.
+    if shell_form_is_readable(&normalized) && rules.allows(&normalized) {
+        return Segment::ProjectAllowed;
+    }
+    // Consulted after every compiled list and after the same shape guards every other read has to
+    // clear. Of the two answers here that are decided outside this file - this and the project's own
+    // list just above - this is the one where a line in a gitignored YAML changes an answer, so it
+    // gets the narrowest reach there is - it can turn a `pending_approval` into an `allow` and it
+    // can do nothing else.
     //
     // `policy` reads the RAW segment while the guards read the normalized one, and the split is
     // deliberate for the reason `lands_inside_the_workspace` gives about `cd` targets:
@@ -967,7 +1148,38 @@ fn strip_fd_duplications(command: &str) -> String {
     stripped
 }
 
-fn normalize_command(command: &str) -> String {
+/// PURE: the one form every command and every declared prefix is compared in — runs of whitespace
+/// collapsed to a single ASCII space, both ends trimmed, ASCII letters folded to lower case.
+///
+/// It does THAT and nothing else: no quote handling, no path work, no token rewriting, no
+/// tokenization. Worth writing down now that it is `pub(crate)`, because `project_policy` pushes a
+/// person's declared prefix through it — and a fold with a surprise in it would be a surprise
+/// applied to a refusal.
+///
+/// The case fold is `to_ascii_lowercase`, not `to_lowercase`, so a non-ASCII capital survives it.
+/// **Identical treatment of both sides is NOT what makes that safe**, and the sentence that used to
+/// stand here said it was. Identical treatment only makes the two sides agree on what the fold IS;
+/// what a deny list actually needs is that two spellings the operating system treats as the same
+/// command fold to the same string. Measured: `deny = "çurl"` against `ÇURL http://x` comes back
+/// `("pending_approval", "unrecognized")`, with both sides through this exact function.
+///
+/// It stays as it is for three reasons, and the first is the one that carries the other two:
+///
+/// 1. **A non-ASCII program name is not in the threat model.** Every program this daemon runs and
+///    every entry on the compiled lists is ASCII; `çurl` is not a spelling of a program that exists.
+/// 2. **`to_lowercase` would not close it either.** On Windows the case-insensitivity that makes
+///    two spellings the same command comes from NTFS's uppercase table, not from Unicode simple
+///    casing, and the two are not the same map — so the wider fold buys a different set of misses
+///    rather than no misses.
+/// 3. **Widening it would change the COMPILED path**, which is much larger than the declared one.
+///    This feeds `matches_any_phrase(DESTRUCTIVE_COMMAND_PATTERNS)`, `has_destructive_flags`,
+///    `APPROVAL_COMMAND_PATTERNS`, `is_safe_command` and `shell_form_is_readable` — and
+///    `to_lowercase` can change a string's byte LENGTH (`İ` becomes `i` + U+0307), which is exactly
+///    the shape of change that can move a `starts_with` or a `contains` verdict.
+///
+/// Exposed rather than reimplemented for a reason that survives all three: a second spelling of
+/// "fold" is how the two sides would come to disagree about what the fold even is.
+pub(crate) fn normalize_command(command: &str) -> String {
     command
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -1113,7 +1325,23 @@ fn is_safe_command(command: &str) -> bool {
 /// Every clause only ever REFUSES, so an overlap between them costs a redundant check and a gap
 /// costs an allowed `-exec` - which is why `find_executes_or_writes` sits beside the two flag guards
 /// rather than inside them.
-fn shell_form_is_readable(command: &str) -> bool {
+///
+/// Visible to the crate because `POST /projects/{id}/shell-rules` asks it of a prefix somebody is
+/// about to WRITE DOWN rather than of a command about to run — and asks the same function the
+/// decision asks, so the two cannot come to disagree about which prefixes are worth having.
+///
+/// **That route asks it of an `allow` and never of a `deny`, and this doc is the place the
+/// asymmetry has to be right.** These guards sit above `rules.allows` in `classify_segment`, so an
+/// `allow` of a shape refused here could never fire and storing one leaves the owner holding a
+/// permission that does nothing. They sit above NOTHING on the deny side: `classify_shell_command`
+/// consults `rules.denies` at the line level, before the segment loop is entered at all, so a
+/// project's refusal of `tail -f`, `sort -o`, `find . -exec` or `curl … | sh` is enforced — and
+/// those are exactly the shapes this function refuses, which is exactly why they are worth
+/// refusing. A route that guarded the deny side would decline to store the refusals most worth
+/// writing down, and would tell the owner they could never be enforced while the engine enforced
+/// them. Migration `0128` puts it in one line: "Do lado `deny` não há nada a validar — uma recusa a
+/// mais nunca deixou correr nada."
+pub(crate) fn shell_form_is_readable(command: &str) -> bool {
     !has_shell_control(command)
         && !command.split_whitespace().any(|token| token == "--fix")
         && !writes_an_output_file(command)
@@ -1234,10 +1462,14 @@ fn find_executes_or_writes(command: &str) -> bool {
         .any(|token| EXECUTES_OR_WRITES.contains(&token))
 }
 
-fn matches_command_prefix(command: &str, prefixes: &[&str]) -> bool {
-    prefixes
-        .iter()
-        .any(|prefix| command == *prefix || command.starts_with(&format!("{prefix} ")))
+/// `pub(crate)` for `project_policy::ShellRules`, which measures a project's declared prefixes with
+/// the same rule the compiled list uses. Generic over the element so `&[&str]` and `&[String]` are
+/// the same call — two functions here is how the two lists would drift.
+pub(crate) fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S]) -> bool {
+    prefixes.iter().any(|prefix| {
+        let prefix = prefix.as_ref();
+        command == prefix || command.starts_with(&format!("{prefix} "))
+    })
 }
 
 fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>) -> bool {
@@ -1500,6 +1732,11 @@ mod tests {
     /// it answered before the argument existed. Rewriting ninety-odd call sites by hand would have
     /// been ninety chances to change a verdict while claiming to preserve one.
     ///
+    /// It forwards EMPTY project rules for the same reason and buys the same thing twice: every
+    /// assertion reached through it is also an assertion that a project which declared nothing
+    /// changes no verdict anywhere. `a_project_that_declared_nothing_changes_no_verdict` says that
+    /// out loud in concrete pairs; this shim is what makes it true of the whole module.
+    ///
     /// A test that wants a real policy calls `classify_under` below and says so; one that wants
     /// the confinement widening calls `classify_asked_for` and says so.
     fn classify(
@@ -1512,6 +1749,7 @@ mod tests {
             tool_input,
             cwd,
             &crate::github::Policy::empty(),
+            &crate::project_policy::ShellRules::default(),
             Unrecognized::AsksAPerson,
         )
     }
@@ -1523,6 +1761,7 @@ mod tests {
             &json!({ "command": command }),
             None,
             policy,
+            &crate::project_policy::ShellRules::default(),
             Unrecognized::AsksAPerson,
         )
     }
@@ -1539,7 +1778,30 @@ mod tests {
             &json!({ "command": command }),
             cwd,
             &crate::github::Policy::empty(),
+            &crate::project_policy::ShellRules::default(),
             Unrecognized::MayBeConfined,
+        )
+    }
+
+    fn shell_rules(allow: &[&str], deny: &[&str]) -> crate::project_policy::ShellRules {
+        crate::project_policy::ShellRules {
+            allow: allow.iter().map(|entry| (*entry).to_owned()).collect(),
+            deny: deny.iter().map(|entry| (*entry).to_owned()).collect(),
+        }
+    }
+
+    /// The shape for the tests that are about a project's own two lists.
+    fn classify_with_rules(
+        rules: &crate::project_policy::ShellRules,
+        command: &str,
+    ) -> Classification {
+        super::classify(
+            "Bash",
+            &json!({ "command": command }),
+            None,
+            &crate::github::Policy::empty(),
+            rules,
+            Unrecognized::AsksAPerson,
         )
     }
 
@@ -3795,6 +4057,330 @@ mod tests {
                 classify_under(&policy, command).decision.decision,
                 "pending_approval",
                 "{command}"
+            );
+        }
+    }
+
+    /// Decision #3's whole point, and the night that was being lost: a prefix the project declared
+    /// runs where the compiled list would have parked the run waiting for a person.
+    ///
+    /// Its own action class rather than `read-local`, for the reason `Segment::GithubRead`'s doc
+    /// already gives about itself: a scoreboard that could not tell the two apart could not tell a
+    /// compiled policy from an edited one.
+    #[test]
+    fn a_project_allow_turns_an_approval_prompt_into_an_allow() {
+        let declared = shell_rules(&["bash scripts/gates.sh"], &[]);
+        assert_classification(
+            classify_with_rules(&Default::default(), "bash scripts/gates.sh all"),
+            "pending_approval",
+            "unrecognized",
+        );
+        assert_classification(
+            classify_with_rules(&declared, "bash scripts/gates.sh all"),
+            "allow",
+            "project-declared",
+        );
+    }
+
+    /// A project's `allow` widens what this file would have ASKED about. It never lifts a compiled
+    /// refusal - `rm` on the allow list leaves `rm -rf /` exactly as denied as it was.
+    #[test]
+    fn a_project_allow_never_lifts_a_compiled_denial() {
+        let declared = shell_rules(&["rm", "find"], &[]);
+        assert_classification(
+            classify_with_rules(&declared, "rm -rf /"),
+            "deny",
+            "destructive",
+        );
+        assert_classification(
+            classify_with_rules(&declared, "find . -delete"),
+            "deny",
+            "destructive",
+        );
+    }
+
+    /// And never lifts the shape guards. Command substitution is the case that reads as the scary
+    /// one, because it hides INSIDE an argument: `ls $(rm -rf ~)` is an `rm`, and `ls` on the allow
+    /// list must not make it an `ls`.
+    ///
+    /// Which guard actually stops which was MEASURED here rather than assumed, by deleting
+    /// `shell_form_is_readable` from the allow check and watching what survived: the two
+    /// substitution spellings did, because `command_reader::read` refuses `$(` and a backtick over
+    /// the whole raw line and never reaches a segment at all. `ls --output=stolen.txt` is the only
+    /// one of the three that pins `shell_form_is_readable` itself, and it is why that conjunct is in
+    /// the allow check. All three stay: a test for a guard should fail if the layer BELOW it is the
+    /// one that quietly moved.
+    #[test]
+    fn a_project_allow_never_lifts_the_shape_guards() {
+        let declared = shell_rules(&["ls"], &[]);
+        for command in ["ls $(rm -rf ~)", "ls `rm -rf ~`", "ls --output=stolen.txt"] {
+            let got = classify_with_rules(&declared, command);
+            assert_ne!(
+                got.decision.decision, "allow",
+                "{command} was allowed by a project prefix"
+            );
+        }
+    }
+
+    /// `deny` beats a compiled permission. `ls` is read-local for every other project on the
+    /// machine and refused for this one.
+    #[test]
+    fn a_project_deny_beats_a_compiled_permission() {
+        let declared = shell_rules(&[], &["ls"]);
+        assert_classification(
+            classify_with_rules(&declared, "ls -la"),
+            "deny",
+            "project-denied",
+        );
+    }
+
+    /// A project's refusal outranks a prompt a person could approve. `git push` is on
+    /// `APPROVAL_COMMAND_PATTERNS`, which is matched over the WHOLE line above where the project's
+    /// lists used to be consulted - so a project that had written `git push` down as denied was
+    /// answered `pending_approval`, and a person approving that prompt ran the push. A refusal that
+    /// a click undoes is not a refusal.
+    ///
+    /// The three spellings are three different paths to the same block: the bare prefix, the prefix
+    /// with arguments after it, and the prefix behind a separator - which only the per-segment arm
+    /// can see, because the whole line does not start with it.
+    ///
+    /// The no-rules baseline is asserted in the same test, as
+    /// `a_project_allow_turns_an_approval_prompt_into_an_allow` does, so the before and the after
+    /// are read together rather than one being taken on trust.
+    #[test]
+    fn a_project_deny_outranks_an_approval_prompt() {
+        let declared = shell_rules(&[], &["git push"]);
+        for command in ["git push", "git push origin main", "ls && git push"] {
+            assert_classification(
+                classify_with_rules(&Default::default(), command),
+                "pending_approval",
+                "push-merge-deploy",
+            );
+            assert_classification(
+                classify_with_rules(&declared, command),
+                "deny",
+                "project-denied",
+            );
+        }
+    }
+
+    /// The other layer the refusal had to climb above. `command_reader` returns `Unreadable` for a
+    /// line it cannot cut into a sequence - command substitution and a background `&` are the two
+    /// spellings here - and that return is also a `pending_approval` a person can approve, which
+    /// would run the `curl` this project denied.
+    ///
+    /// **Not front-anchored, and that is the point of the list.** Matching the whole normalized
+    /// line only ever sees a denied command that starts it. Every case below except the first has
+    /// something in front of the `curl` — an assignment, another command, a separator — and each of
+    /// those was `pending_approval` while this pass was built on `command_reader::read`, because an
+    /// unreadable line yields no segments to walk and the whole-line match is anchored at position
+    /// zero. `command_reader::segments` is the reading that never refuses, so the pieces exist to be
+    /// walked even here, and the refusal stops depending on where in the line it appears.
+    #[test]
+    fn a_project_deny_reaches_a_line_the_reader_cannot_segment() {
+        let declared = shell_rules(&[], &["curl"]);
+        for command in [
+            "curl $(whoami)",
+            "FOO=1 curl $(whoami)",
+            "ls && curl $(whoami)",
+            "ls; curl http://x &",
+            "ls && curl http://x &",
+            "echo `date` && curl http://x",
+            "FOO=1 curl http://x &",
+        ] {
+            assert_classification(
+                classify_with_rules(&Default::default(), command),
+                "pending_approval",
+                "unrecognized",
+            );
+            assert_classification(
+                classify_with_rules(&declared, command),
+                "deny",
+                "project-denied",
+            );
+        }
+    }
+
+    /// A refusal a project wrote down in capitals is still a refusal, and so is one typed with two
+    /// spaces in it.
+    ///
+    /// This is the shape every fixture in this module was missing. `normalize_command` folds the
+    /// COMMAND to lower case and collapses its whitespace; nothing folded the PREFIX, so the list
+    /// was case-insensitive about the thing it judged and case-sensitive about the judgement.
+    /// `deny = "LS"` measured `("allow", "read-local")` on `ls -la` — an agent running, with no
+    /// prompt and nothing in the log, the command the project had written down as refused.
+    ///
+    /// `Remove-Item` is here because it is not a contrived spelling: this daemon ships a
+    /// `PowerShell` tool and PascalCase is the canonical cmdlet form, so the natural way to write
+    /// that refusal was the way that did not work.
+    ///
+    /// The fold that fixes it lives in `project_policy` — at the table's edge and in the comparison
+    /// itself; see `fold_prefix`.
+    #[test]
+    fn a_deny_prefix_in_capitals_is_still_a_refusal() {
+        for (prefix, command) in [
+            ("LS", "ls -la"),
+            ("Cargo Test", "cargo test"),
+            ("Git Diff", "git diff"),
+            ("Remove-Item", "remove-item x"),
+            // Two spaces where the command has one. Same failure, different fold.
+            ("npm  ci", "npm ci"),
+            // And the ends, which is what the old `trim` on the write path used to carry alone.
+            ("  git push  ", "git push origin main"),
+        ] {
+            assert_classification(
+                classify_with_rules(&shell_rules(&[], &[prefix]), command),
+                "deny",
+                "project-denied",
+            );
+        }
+    }
+
+    /// The same fold reaches `allow`, and this is a real widening rather than a tidy-up: an
+    /// uppercase allow prefix used to be silently inert. It failed CLOSED — the command merely
+    /// waited for a person — which is the only reason this half was never noticed, and it is why
+    /// fixing both halves at once is still an improvement in both directions.
+    #[test]
+    fn an_allow_prefix_in_capitals_is_honoured_too() {
+        assert_classification(
+            classify_with_rules(
+                &shell_rules(&["BASH  scripts/gates.sh"], &[]),
+                "bash scripts/gates.sh all",
+            ),
+            "allow",
+            "project-declared",
+        );
+    }
+
+    /// Deny still beats allow when a project spelled both in capitals: both sides reach the
+    /// comparison through the identical fold, and the refusal is consulted ahead of the segment
+    /// loop where the permission is decided.
+    ///
+    /// **The `npm ci` pair is what makes that a claim about precedence rather than about the deny
+    /// alone.** `rules.denies` answers at the LINE level and returns before `classify_segment` is
+    /// ever reached, so the first assertion cannot tell a live allow from an inert one — with only
+    /// it standing here, removing the fold from the allow side of `ShellRules`'s comparison left
+    /// this test green. The third assertion is the same allow on the same command with the refusal
+    /// taken away: it allows there, so in the second it was a permission that LOST rather than one
+    /// that was never read.
+    ///
+    /// `npm ci` and not `ls` for that, because `ls` is on the compiled safe list and would come
+    /// back `read-local` whatever the project declared. Nothing compiled recognises `npm ci`, so
+    /// `project-declared` can only have come from the project's own list.
+    #[test]
+    fn a_folded_deny_still_beats_a_folded_allow() {
+        assert_classification(
+            classify_with_rules(&shell_rules(&["LS"], &["Ls -la"]), "ls -la"),
+            "deny",
+            "project-denied",
+        );
+        assert_classification(
+            classify_with_rules(&shell_rules(&["NPM  CI"], &["Npm ci"]), "npm ci"),
+            "deny",
+            "project-denied",
+        );
+        assert_classification(
+            classify_with_rules(&shell_rules(&["NPM  CI"], &[]), "npm ci"),
+            "allow",
+            "project-declared",
+        );
+    }
+
+    /// What holds the project block BELOW the compiled refusals. Both answers are `deny`, so a
+    /// project cannot lose a refusal by being second - but it can lose the better NAME for one, and
+    /// the scoreboard reads names. `rm -rf /` under a project that denied `rm` is still worth
+    /// recording as `destructive`, because that is a fact about the command rather than about this
+    /// project's list.
+    ///
+    /// Without this test the position is defended only by a comment, and a comment does not fail.
+    #[test]
+    fn a_compiled_refusal_keeps_its_own_class() {
+        let declared = shell_rules(&[], &["rm"]);
+        assert_classification(
+            classify_with_rules(&declared, "rm -rf /"),
+            "deny",
+            "destructive",
+        );
+    }
+
+    /// The hole the first draft of this plan had. The segment loop returns on the FIRST
+    /// unrecognized segment, so a denial that lived in that loop would never be reached here - and
+    /// `pending_approval` is a prompt a person can approve, which would run the denied segment too.
+    ///
+    /// **The denied prefix must be on NEITHER compiled whole-line list**, or this test proves
+    /// nothing. `git push` was the first choice and was wrong: it is in
+    /// `APPROVAL_COMMAND_PATTERNS`, which is matched against the whole line before the line is ever
+    /// cut into segments - so the answer would have been `("pending_approval", "push-merge-deploy")`
+    /// whatever the pre-pass did. `npm ci` reaches segmentation because nothing compiled
+    /// recognises it.
+    #[test]
+    fn a_denied_segment_after_an_unrecognized_one_still_denies() {
+        let declared = shell_rules(&[], &["npm ci"]);
+        assert_classification(
+            classify_with_rules(&declared, "some_unknown_program && npm ci"),
+            "deny",
+            "project-denied",
+        );
+    }
+
+    /// The second hole. `lands_inside_the_workspace` returns `ReadLocal` before the command name is
+    /// ever normalized, so a denial placed after that line is unreachable for anything pointing
+    /// into the worktree.
+    ///
+    /// **The cwd is the whole test.** `lands_inside_the_workspace` answers `false` the moment there
+    /// is no cwd to be inside OF, so the `None` case below cannot reach the line this test is named
+    /// after: with no workspace, `mkdir subdir` is merely unrecognised, and a denial misplaced after
+    /// `normalized` would still catch it and this test would pass while proving nothing. The second
+    /// case supplies a workspace, which is what puts `mkdir subdir` through the early `ReadLocal`
+    /// return and makes the misplacement visible. Both are kept: one says a denial survives with no
+    /// workspace, the other says it survives the shortcut a workspace opens.
+    #[test]
+    fn a_project_deny_reaches_a_command_that_lands_inside_the_workspace() {
+        let declared = shell_rules(&[], &["mkdir"]);
+        assert_classification(
+            classify_with_rules(&declared, "mkdir subdir"),
+            "deny",
+            "project-denied",
+        );
+        assert_classification(
+            super::classify(
+                "Bash",
+                &json!({ "command": "mkdir subdir" }),
+                Some(Path::new(r"C:\work\repo")),
+                &crate::github::Policy::empty(),
+                &declared,
+                Unrecognized::AsksAPerson,
+            ),
+            "deny",
+            "project-denied",
+        );
+    }
+
+    /// A project that declared NOTHING answers exactly what this file answered before it could be
+    /// taught anything. The broad guarantee is not here: it is the ninety-odd assertions in the rest
+    /// of this module, every one of which reaches `super::classify` through a shim that now forwards
+    /// `ShellRules::default()`, so every one of them is also an assertion that two empty lists left
+    /// its verdict alone. What is here is that guarantee said OUT LOUD, in concrete pairs, one
+    /// command for each answer the aggregation and the two whole-line guards can return - because a
+    /// change that quietly moved a class would leave ninety tests still passing about something
+    /// else, and none of them naming the answer that was lost.
+    ///
+    /// The pairs were measured against this file as it stood before the parameter existed, not
+    /// predicted from reading it.
+    #[test]
+    fn a_project_that_declared_nothing_changes_no_verdict() {
+        let nothing = crate::project_policy::ShellRules::default();
+        for (command, decision, action_class) in [
+            ("ls", "allow", "read-local"),
+            ("cargo test", "allow", "read-local"),
+            ("git status", "allow", "read-local"),
+            ("bash scripts/gates.sh", "pending_approval", "unrecognized"),
+            ("rm -rf /", "deny", "destructive"),
+        ] {
+            assert_classification(
+                classify_with_rules(&nothing, command),
+                decision,
+                action_class,
             );
         }
     }

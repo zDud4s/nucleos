@@ -2336,6 +2336,220 @@ mod tests {
         ));
     }
 
+    /// The reach a project declares for itself is the owner's, and nobody else's.
+    ///
+    /// These nine routes are the only way into the three tables `project_policy.rs` holds: what a
+    /// project's worktrees may run unattended, what the GitHub manager may do on its remote, and
+    /// where a landing may be sent. **They are a live autonomy control, not a configuration edit.**
+    /// The hook reads those tables per decision and caches nothing, so a single `allow` row written
+    /// through `POST /projects/{id}/shell-rules` binds the very next tool call of every in-flight
+    /// run of that project — no restart, no second confirmation, and no moment at which a person is
+    /// shown what widened. A key that could write one is a key that can rewrite its own alçada,
+    /// which is a strictly larger power than anything a scoped key is sold as buying.
+    ///
+    /// Asserted as membership rather than through a request, like `POST /projects/{id}/write` and
+    /// `POST /projects/{id}/commands` above and for the same reason: `permits` is default-deny, so
+    /// these routes are safe TODAY by being in no table. What that does not survive is somebody
+    /// filing the three GETs beside the `/projects/{id}/…` reads that share their URL prefix, which
+    /// would read as tidying up rather than as a decision. This is the test that says no.
+    ///
+    /// **The three scopes below are not decoration, and `Scope::Run` alone would prove nothing.**
+    /// That arm consults no table at all — it is a fixed `match` over two routes — so it would go on
+    /// passing with all nine of these in every table. `ApiTokenLevel::ReadOnly` and
+    /// `ApiTokenLevel::RunCreating` are the two that actually read `READ_ONLY_ROUTES`, which is
+    /// where a tidying hand would put them.
+    #[test]
+    fn a_projects_declared_reach_is_in_no_scope_table() {
+        const DECLARED_REACH: &[(Method, &str)] = &[
+            (Method::GET, "/projects/{id}/shell-rules"),
+            (Method::POST, "/projects/{id}/shell-rules"),
+            (Method::DELETE, "/projects/{id}/shell-rules"),
+            (Method::GET, "/projects/{id}/github-ops"),
+            (Method::POST, "/projects/{id}/github-ops"),
+            (Method::DELETE, "/projects/{id}/github-ops"),
+            (Method::GET, "/projects/{id}/land-targets"),
+            (Method::POST, "/projects/{id}/land-targets"),
+            (Method::DELETE, "/projects/{id}/land-targets"),
+        ];
+
+        for (method, pattern) in DECLARED_REACH {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, method, pattern),
+                "{method} {pattern} decides what a project's runs may do unattended and must stay \
+                 out of every scope table"
+            );
+        }
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            for (method, pattern) in DECLARED_REACH {
+                let path = pattern.replace("{id}", "7");
+                assert!(
+                    !permits(&scope, method, &path),
+                    "{scope:?} must not reach {method} {path}"
+                );
+            }
+        }
+
+        // The reads beside them stay reads. A boundary a reader cannot see is a boundary nobody can
+        // argue with, and seeing it is not permission to cross it.
+        assert!(permits(
+            &Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            &Method::GET,
+            "/projects/7/readings"
+        ));
+    }
+
+    /// Which repository a project points at is in no scope table, and this is the closest call of
+    /// the three.
+    ///
+    /// `GET /projects/{id}/github-repo` turns a project id into `owner/name`. It is not a secret —
+    /// it is written in the repository's own `.git/config` — but it does disclose WHICH repository a
+    /// registered project is, which is one sentence away from the class the nine routes above are
+    /// excluded under.
+    ///
+    /// **The honest case for the other answer, first, because it is a strong one.** The
+    /// confidentiality delta of this route is *zero*. A `ReadOnly` key already holds
+    /// `GET /projects/{id}/cat`, `inspect::cat` has no `.git` exclusion — only `grep`'s tree walk
+    /// carries `SKIP_DIRS` — and `.git/config` is a path of `Normal` components that resolves inside
+    /// the root, so `cat?path=.git/config` hands the same holder the same `origin` URL verbatim
+    /// today. `GET /projects` even hands it the root to aim at. On the reasoning `worktree` and
+    /// `blame` are listed under — *the holder can already read it, so withholding protects nothing* —
+    /// this route belongs in the table, and that reading is written down here so the next reader
+    /// weighs it rather than rediscovering it and assuming it was missed.
+    ///
+    /// **What settles it is that the disclosure is not the question.** Since the delta is zero,
+    /// nothing is protected either way, and the decision falls to whether the grant has a use. It
+    /// has none, and this route's own shape says so more sharply than the catalogue's does: it
+    /// exists to name the repository that `POST /github/requests` will be sent, and that route is
+    /// out of both tables because it LEAVES THE MACHINE. A key that may not reach GitHub has no use
+    /// for the address of the repository to reach. Its only caller is the page, which holds
+    /// `Scope::Control`; the three declaration routes it is drawn beside are themselves in no table,
+    /// so a key that cannot read what a project has declared about its remote has no use for the
+    /// remote's name either. Between a grant with a use and a grant without one, this table's own
+    /// header decides it: it is deliberately not "every GET".
+    ///
+    /// **And it is why the route exists at all rather than riding on a read the page already
+    /// makes.** `ProjectSummary` and `GET /projects/{id}/branches` were both candidates and both are
+    /// in `READ_ONLY_ROUTES` — joining either would have made this grant by accident, as a side
+    /// effect of saving a round trip. The placement decision and this one are the same decision.
+    ///
+    /// Membership rather than a request, like the nine and the catalogue: `permits` is default-deny,
+    /// so this is safe today by being nowhere, and what that does not survive is somebody filing it
+    /// beside the `/projects/{id}/…` reads it shares a prefix with — on exactly the `cat` reasoning
+    /// above, which is true and is not the point. That is the edit this test refuses.
+    #[test]
+    fn the_repository_a_project_points_at_is_in_no_scope_table() {
+        const REPO: &str = "/projects/{id}/github-repo";
+
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &Method::GET, REPO)
+                && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, REPO)
+                && !route_is_listed(TEAM_ROUTES, &Method::GET, REPO)
+                && !route_is_listed(EMAIL_ROUTES, &Method::GET, REPO)
+                && !route_is_listed(COUNCIL_ROUTES, &Method::GET, REPO),
+            "this names the repository a call that leaves the machine would be sent, and no scoped \
+             key may make that call"
+        );
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::GET, "/projects/7/github-repo"),
+                "{scope:?} must not reach GET /projects/7/github-repo"
+            );
+        }
+
+        // And the two that act for the person do reach it, which is the half that makes the
+        // exclusion a boundary rather than a route nobody can open.
+        for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+            assert!(
+                permits(&scope, &Method::GET, "/projects/7/github-repo"),
+                "{scope:?} opens the page this fact is for"
+            );
+        }
+
+        // The neighbour it must not be filed beside, asserted rather than described: `github-ops` is
+        // the other half of this page's reading of a project's remote, and it is out of every table
+        // too. The day one of them is listed, they stop being a pair.
+        assert!(!permits(
+            &Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            &Method::GET,
+            "/projects/7/github-ops"
+        ));
+    }
+
+    /// The catalogue of DECLARABLE operations is in no scope table either, and the reason is not
+    /// the one its nine neighbours have.
+    ///
+    /// `GET /github/declarable-ops` is a read of compiled constants. It takes no project id, it
+    /// touches no database, and its answer is a function of the binary — two callers on the same
+    /// build get the same bytes. So the argument the nine are excluded under does NOT transfer:
+    /// nothing here decides what a project's runs may do unattended, and nothing here discloses one
+    /// project's configuration, one repository, or one secret. On confidentiality alone this could
+    /// be filed beside `/fleet/exclusions`, which is listed as describing the shape of the fleet
+    /// while changing none of it. That is the honest case for the other answer, and it is written
+    /// down so the next reader weighs it rather than rediscovering it.
+    ///
+    /// What settles it is that the grant would buy nobody anything. The caller this route was added
+    /// for is the app, which holds `Scope::Control` and never consults these tables; no scoped key
+    /// has asked for it. And its only use is the nine routes above, every one of which a scoped key
+    /// is refused — a key that cannot read what a project HAS declared has no use for the list of
+    /// what MAY be declared, while what the list does give a holder is the exact vocabulary to aim
+    /// at those routes with. Between a grant with a use and a grant without one, this table's own
+    /// header decides it: it is deliberately not "every GET", because adding a route must not
+    /// silently disclose it to every read-only key. `GET /vcs/requests/{id}/wait` is excluded on the
+    /// same least-privilege reading, and `GET /assistant/tools` — compiled constants served for a
+    /// picker, which is this route's twin in every respect — is in no table today.
+    ///
+    /// Membership rather than a request, like the nine: `permits` is default-deny, so this is safe
+    /// today by being nowhere, and what that does not survive is somebody filing a GET of constants
+    /// in `READ_ONLY_ROUTES` because it plainly discloses nothing. That is the edit this test
+    /// refuses, and the paragraph above is the argument it refuses it with.
+    #[test]
+    fn the_declarable_ops_catalogue_is_in_no_scope_table() {
+        const CATALOGUE: &str = "/github/declarable-ops";
+
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(TEAM_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(EMAIL_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(COUNCIL_ROUTES, &Method::GET, CATALOGUE),
+            "the catalogue explains routes no scoped key may reach, so no scoped key needs it"
+        );
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::GET, CATALOGUE),
+                "{scope:?} must not reach GET {CATALOGUE}"
+            );
+        }
+
+        // And the two that act for the person do reach it, which is the half that makes the
+        // exclusion a boundary rather than a route nobody can open.
+        for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+            assert!(
+                permits(&scope, &Method::GET, CATALOGUE),
+                "{scope:?} opens the page these constants are for"
+            );
+        }
+    }
+
     /// A project's workflows are the owner's, to read and to change.
     ///
     /// Six routes, all out of every table, and the reads are the half worth arguing for. A

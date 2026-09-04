@@ -174,6 +174,26 @@ export const keys = {
     /** What this project can be asked to do to itself, and what each of them last said. */
     commands: (projectId: string) => ["projects", projectId, "commands"] as const,
     /**
+     * The reach this project declares for itself — three lists, three keys.
+     *
+     * Three and not one, because they are three tables answering three questions and a page may
+     * well show one of them without the others. Under the roster prefix like everything else about
+     * a project, which is what lets a declaration write invalidate all three by naming `all` —
+     * these are neighbours often edited in the same sitting.
+     */
+    shellRules: (projectId: string) => ["projects", projectId, "shell-rules"] as const,
+    githubOps: (projectId: string) => ["projects", projectId, "github-ops"] as const,
+    landTargets: (projectId: string) => ["projects", projectId, "land-targets"] as const,
+    /**
+     * Which repository on GitHub this project is — `GET /projects/{id}/github-repo`.
+     *
+     * Under the project prefix and beside the three above, because it is a fact about THIS project
+     * and not about the machine: it is read off the project's own root. It is not one of the three
+     * declarations — nothing declares it, git does — which is why it is its own key rather than a
+     * field of one of theirs.
+     */
+    githubRepo: (projectId: string) => ["projects", projectId, "github-repo"] as const,
+    /**
      * Which workflows this project uses, measured against the library right now.
      *
      * Under the project prefix and NOT under `keys.workflows` below, because it is a fact about
@@ -229,6 +249,30 @@ export const keys = {
   workflows: {
     all: ["workflows"] as const,
     library: ["workflows", "library"] as const,
+  },
+
+  /**
+   * What any project MAY declare about GitHub — `GET /github/declarable-ops`.
+   *
+   * Its own root, and pointedly NOT under `projects`, for `workflows` above's reason carried one
+   * step further: this is not merely shared between projects, it is the same answer for all of them
+   * and cannot change while the daemon runs. It is derived from two ceilings compiled into the
+   * binary, so a declaration write — which invalidates `keys.projects.all` — must not throw it away.
+   */
+  github: {
+    all: ["github"] as const,
+    declarableOps: ["github", "declarable-ops"] as const,
+    /**
+     * What one listing read said about one repository — `POST /github/requests`.
+     *
+     * **Keyed by the repository and not by the project**, which is the whole reason it is here
+     * rather than under `projects`. The answer is a fact about a repository on GitHub, so two
+     * projects rooted at two worktrees of the same repository ask one question and share one
+     * answer — and, more to the point, a declaration write invalidating `keys.projects.all` must
+     * not throw away a listing that cost a network call and cannot have changed because somebody
+     * ticked a checkbox.
+     */
+    listing: (op: string, repo: string) => ["github", "listing", op, repo] as const,
   },
 
   /**

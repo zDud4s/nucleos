@@ -206,11 +206,13 @@ struct BrowserHandoffParams {
 /// right wire shape and the wrong prompt.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct GithubReadParams {
-    /// One of: run_list, pr_list, run_status, run_logs, pr_view, issue_view.
+    /// One of: run_list, pr_list, workflow_list, run_status, run_logs, pr_view, issue_view,
+    /// pr_diff, pr_thread, checks_for_ref.
     operation: String,
     /// The repository, as owner/name.
     repo: String,
-    /// A run id for run_status and run_logs, a number for pr_view and issue_view. The two listings
+    /// A run id for run_status and run_logs, a pull request number for pr_view, pr_diff and
+    /// pr_thread, an issue number for issue_view, a ref for checks_for_ref. The three listings
     /// take none.
     id: Option<String>,
 }
@@ -1126,11 +1128,19 @@ impl NucleosTools {
     }
 
     #[tool(
+        // The two halves of this sentence are a SAFETY CLAIM made to the model, and they are
+        // hand-written where the grading they describe is not. `the_github_read_description_grades_
+        // every_operation_the_way_the_code_does` is what holds them together: it splits this string
+        // on "cost the turn nothing" and "MARK the turn" and requires each half to be exactly the
+        // kinds `ReadOp::effect` puts there. Two consequences for whoever edits this string — keep
+        // those two phrases, and do not write a COUNT ("the six that…"), which is a claim the test
+        // cannot check and the next variant would make false.
         description = "Read something from GitHub through NucleOS. Structural reads — run_list, \
-                       pr_list, run_status — cost the turn nothing. The three that return text \
-                       somebody else wrote — pr_view, issue_view, run_logs — MARK the turn, and \
-                       every acting tool is refused for the rest of it, this one included. That is \
-                       deliberate: read the prose when you need the prose, and do the acting first."
+                       pr_list, workflow_list, run_status — cost the turn nothing. The reads that \
+                       return text somebody else wrote — pr_view, issue_view, run_logs, pr_diff, \
+                       pr_thread, checks_for_ref — MARK the turn, and every acting tool is \
+                       refused for the rest of it, this one included. That is deliberate: read the \
+                       prose when you need the prose, and do the acting first."
     )]
     async fn github_read(
         &self,
@@ -2889,6 +2899,91 @@ mod tests {
     /// Asked of the ROUTER, so a description added tomorrow is covered without anybody remembering
     /// this test exists. That is the same reason `every_registered_tool_is_classified` reads the
     /// router rather than a list.
+    /// The one description that makes a claim the code can check, checked.
+    ///
+    /// `github_read`'s description sorts the operations into a half that "cost the turn nothing" and
+    /// a half that "MARK the turn". That is not a summary, it is a SAFETY CLAIM delivered to the
+    /// caller: a `ReadsUntrusted` read left in the free half tells a model it can read a stranger's
+    /// diff and go on acting. The model never sees `ReadOp::effect`; this sentence is the whole of
+    /// what it knows. So the sentence is held to the grading, in a file whose `declarable_github_ops`
+    /// neighbour is headed "Derived, never written out" — this one cannot be derived, because it is
+    /// prose, so it is pinned instead.
+    ///
+    /// Both model-facing lists are covered, and they are two different surfaces: the description is
+    /// what the model reads when choosing a tool, and `properties.operation.description` is what it
+    /// reads when filling the argument in. Either one going stale is its own wrong answer.
+    ///
+    /// Matched on the tokens carrying an underscore, which in these two strings are exactly the
+    /// operation kinds. That buys a SET comparison rather than a `contains` sweep: a kind in the
+    /// wrong half fails, a kind in neither fails, a kind nobody graded fails, and a withdrawn name
+    /// left behind fails — where `contains` would have passed the last two.
+    #[test]
+    fn the_github_read_description_grades_every_operation_the_way_the_code_does() {
+        let tool = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == "github_read")
+            .expect("github_read is registered on the router");
+        let description = tool
+            .description
+            .clone()
+            .expect("github_read carries a description")
+            .to_string();
+
+        // The kinds this string mentions, in one stretch of it.
+        fn kinds_named_in(half: &str) -> Vec<String> {
+            let mut found: Vec<String> = half
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .filter(|word| word.contains('_'))
+                .map(str::to_owned)
+                .collect();
+            found.sort_unstable();
+            found.dedup();
+            found
+        }
+
+        fn kinds_graded(effect: ToolEffect) -> Vec<String> {
+            let mut kinds: Vec<String> = crate::github::ReadOp::all()
+                .iter()
+                .filter(|operation| operation.effect() == effect)
+                .map(|operation| operation.kind().to_owned())
+                .collect();
+            kinds.sort_unstable();
+            kinds
+        }
+
+        let (free, rest) = description
+            .split_once("cost the turn nothing")
+            .expect("the description has to promise one half costs the turn nothing");
+        let (marked, _) = rest
+            .split_once("MARK the turn")
+            .expect("the description has to promise the other half marks the turn");
+
+        assert_eq!(
+            kinds_named_in(free),
+            kinds_graded(ToolEffect::ReadsOwn),
+            "the half the description calls free must be exactly the ReadsOwn reads"
+        );
+        assert_eq!(
+            kinds_named_in(marked),
+            kinds_graded(ToolEffect::ReadsUntrusted),
+            "the half the description says MARKS the turn must be exactly the ReadsUntrusted reads"
+        );
+
+        // And the argument's own description, which is the other place a kind is written by hand.
+        let operation = tool.input_schema["properties"]["operation"]["description"]
+            .as_str()
+            .expect("the operation argument is described to the model");
+        let mut every = kinds_graded(ToolEffect::ReadsOwn);
+        every.extend(kinds_graded(ToolEffect::ReadsUntrusted));
+        every.sort_unstable();
+        assert_eq!(
+            kinds_named_in(operation),
+            every,
+            "the operation argument must offer exactly the reads that exist"
+        );
+    }
+
     #[test]
     fn no_tool_description_carries_the_marks_of_a_botched_line_join() {
         for tool in NucleosTools::tool_router().list_all() {
@@ -4023,7 +4118,14 @@ mod tests {
     async fn pr_view_marks_the_turn_and_run_status_does_not() {
         let pool = test_pool().await;
 
-        for operation in ["pr_view", "issue_view", "run_logs"] {
+        for operation in [
+            "pr_view",
+            "issue_view",
+            "run_logs",
+            "pr_diff",
+            "pr_thread",
+            "checks_for_ref",
+        ] {
             assert_eq!(
                 effect_of_call(
                     &pool,
@@ -4037,7 +4139,7 @@ mod tests {
             );
         }
 
-        for operation in ["run_status", "run_list", "pr_list"] {
+        for operation in ["run_status", "run_list", "pr_list", "workflow_list"] {
             assert_eq!(
                 effect_of_call(
                     &pool,

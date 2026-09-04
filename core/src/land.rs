@@ -1,24 +1,35 @@
 //! The owner of the main tree: which branch a project's landings merge into, and whether a given
 //! landing may be admitted at all.
 //!
-//! Design: `.ai/specs/2026-08-27-dono-da-arvore-principal-design.md`. The dono asked for one thing
-//! in his own words — *"a responsabilidade do bom merge sem conflitos ser de um módulo
-//! específico"* — after watching the queue land on a tree nobody chose roughly ten times. Two
-//! defects composed to cause it: the target used to be read off the main checkout's HEAD
-//! (`http.rs`, before this module existed), and a checkout parked on the wrong branch silently
+//! Design: `.ai/specs/2026-08-27-dono-da-arvore-principal-design.md`, and — for a landing that
+//! names its own destination — `.ai/specs/2026-09-03-alcada-por-projecto-design.md` §4.1.
+//!
+//! **The two documents number their decisions separately, and both have a decision #2.** An
+//! unqualified "decision #N" anywhere in this file is the 2026-08-27 design's, which is the
+//! numbering the module was written against; a citation of the alçada design says "alçada §4.1"
+//! before its number. Getting this wrong costs a reader the wrong document, so it is spelled out
+//! rather than left to be inferred.
+//!
+//! The dono asked for one thing in his own words — *"a responsabilidade do bom merge sem conflitos
+//! ser de um módulo específico"* — after watching the queue land on a tree nobody chose roughly
+//! ten times. Two defects composed to cause it: the target used to be read off the main checkout's
+//! HEAD (`http.rs`, before this module existed), and a checkout parked on the wrong branch silently
 //! redirected every landing there. This module exists so that answer has exactly one home.
 //!
 //! **What is this module's, and what stays where it already was.** `vcs.rs` still decides WHEN an
 //! admitted request runs — exclusivity, ordering, retrying a merge whose target moved underneath
 //! it (decision #4, `vcs::drain_once`). `git_exec.rs` still decides HOW a merge is computed and
 //! published. This module decides WHAT a landing's `Op::Merge` names — which branch is the
-//! project's integration branch, and whether a source is worth submitting at all — and it is the
-//! only site in the core that builds a landing's `Op::Merge`. `resolver.rs` keeps starting
-//! resolutions on its own schedule; what this module adds is linking a resolution's landing back to
-//! the escalation it answers, at the moment that landing is admitted.
+//! project's integration branch, whether a caller may name a different destination for one landing,
+//! and whether a source is worth submitting at all — and it is the only site in the core that
+//! builds a landing's `Op::Merge`. `resolver.rs` keeps starting resolutions on its own schedule;
+//! what this module adds is linking a resolution's landing back to the escalation it answers, at
+//! the moment that landing is admitted.
 
 use std::path::Path;
 use std::time::Instant;
+
+use serde::Serialize;
 
 use crate::vcs::{Branch, Op, Origin, ResolvedRepo};
 
@@ -31,10 +42,16 @@ const RESOLUTION_FAILED_KIND: &str = "land_resolution_failed";
 ///
 /// Four arms rather than one string because `http.rs` answers them with different status codes: a
 /// worktree already standing on the target is a conflict with itself, a source with nothing new to
-/// bring is the same in spirit, an integration branch that cannot be resolved is the caller's
-/// project misconfigured, and an admission that failed after passing every check is this daemon's
-/// own database. `land.rs` stays free of `axum` either way — the mapping to a status code is
-/// `http.rs`'s to make, not this module's to import a web framework in order to state.
+/// bring is the same in spirit, a target that cannot be resolved is something the caller has to
+/// change before anything lands, and an admission that failed after passing every check is this
+/// daemon's own database. `land.rs` stays free of `axum` either way — the mapping to a status code
+/// is `http.rs`'s to make, not this module's to import a web framework in order to state.
+///
+/// **`Refused` covers two kinds of thing, and the split does not separate them.** A project whose
+/// integration branch is misconfigured and a caller who typed a target the project does not admit
+/// both land here. The 422 `http.rs` answers with is right for both — one says "fix your project",
+/// the other "fix your argument", and neither is this daemon's fault — but a fifth arm was not
+/// added for the second, because nothing downstream would do anything different with it.
 #[derive(Debug)]
 pub enum LandRefusal {
     /// The worktree is already standing on the integration branch. Refused rather than admitted as
@@ -45,8 +62,11 @@ pub enum LandRefusal {
     /// in. Refused before a row is written, not during execution — a queued row is a promise to
     /// whoever is waiting on it, and "there was nothing to land" is not a promise worth making.
     NothingToLand(String),
-    /// The integration branch could not be resolved — decision #2's refusal (a declared branch that
-    /// no longer exists, or nothing to derive one from), or a database read that failed on the way.
+    /// The landing has no target it may use. Three causes, and after the alçada design the last
+    /// two are the common ones: the integration branch could not be resolved — decision #2's
+    /// refusal (a declared branch that no longer exists, or nothing to derive one from), or a
+    /// database read that failed on the way; the caller named a target this project does not
+    /// admit (alçada §4.1, decision #2); or the named target is admitted and its branch is gone.
     Refused(String),
     /// Every check passed and the queue still would not admit the request.
     NotAdmitted(String),
@@ -66,7 +86,9 @@ impl LandRefusal {
 /// The branch a project's landings merge into — declared once, in `autopilot_state.integration_branch`,
 /// and never read off any worktree's HEAD.
 ///
-/// **This is decision #2, in full, and the sentence that matters is the negative one: nothing here
+/// **This is the 2026-08-27 design's decision #2 in full** — the alçada design has a decision #2
+/// of its own, about a target a caller may NAME, which is `resolve_target`'s and not this
+/// function's — **and the sentence that matters is the negative one: nothing here
 /// ever runs `current_branch` on the project's main checkout.** That read is the exact line the
 /// design's defect 1 traces to (`http.rs`, before this module existed) — a checkout parked on a
 /// feature branch used to redirect every landing in the project to it. Answering from a column
@@ -78,7 +100,10 @@ impl LandRefusal {
 /// 1. **A value is recorded.** Confirmed against the repository — `refs/heads/<branch>` has to
 ///    still exist — because a branch renamed or deleted out from under a stale column is a
 ///    misconfigured project, not a project with no integration branch, and the two get different
-///    answers. Refused by name rather than failing three git commands deep inside a merge.
+///    answers. Refused by name rather than failing three git commands deep inside a merge. One
+///    exception, documented on `resolve_target` rather than here because it is that function's
+///    choice: a landing that NAMES an admitted target which exists never reaches this function at
+///    all, so "nothing lands" is really "nothing lands by default".
 /// 2. **Nothing is recorded.** Derived once — `origin/HEAD`, else a local `master`, else a local
 ///    `main`, else refused — and the derivation is written back so every landing after the first
 ///    reads a column instead of asking git again. A project that is already healthy derives
@@ -107,7 +132,7 @@ pub async fn integration_branch(
         if !exists {
             return Err(format!(
                 "{project_id}'s integration branch is set to {branch}, and refs/heads/{branch} \
-                 does not exist — nothing lands until it is corrected"
+                 does not exist — nothing lands by default until it is corrected"
             ));
         }
         return Branch::new(&branch);
@@ -151,7 +176,208 @@ async fn derive_integration_branch(
     ))
 }
 
-/// Admits a landing: `source`, into whatever `integration_branch` answers for `repo`.
+/// Where a landing with no argument would go, for somebody reading rather than landing.
+///
+/// **Four arms because a page that showed a branch name and called it admissible would be wrong in
+/// three of them**, and the wrongness is invisible: a name on screen looks equally true whether the
+/// column declared it, whether the ref still exists, and whether anything recorded it at all.
+///
+/// This is the answer `inspect::Branches::integration` is NOT. That field is
+/// `current_branch(project_root)` — whatever the main checkout happens to be parked on — and its own
+/// doc says so, naming this module's existence as the reason it may not be used for this. A project
+/// whose clone is sitting on a feature branch would otherwise have the page name that branch, caption
+/// it "always admissible", and be contradicted by `resolve_target` refusing it by name. That is
+/// decision #2's defect wearing a different coat, and it is the whole reason this function exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum IntegrationBranch {
+    /// The column holds a branch and `refs/heads/<branch>` is there. Admissible, full stop.
+    Declared { branch: String },
+    /// The column holds a branch and the ref is gone.
+    ///
+    /// Its own arm rather than folded into [`IntegrationBranch::Unknown`], because
+    /// [`integration_branch`] treats it as a misconfigured project and not as a project without one
+    /// — *"nothing lands by default until it is corrected"* — and a reader can only correct what they
+    /// can see the name of. Nothing lands here by default and the branch is still worth showing.
+    Stale { branch: String },
+    /// Nothing is recorded, and this is what the first landing would derive and write down.
+    ///
+    /// A project that has never landed is the ordinary case, not a broken one: `--land` with no
+    /// argument works today and lands exactly here. Reporting `null` for it would be a fresh
+    /// falsehood in the other direction — this is where the work goes, it simply has not been
+    /// written down yet, and this arm says both halves.
+    Derived { branch: String },
+    /// There is no answer, and this is the daemon's own sentence for why.
+    ///
+    /// Both ways of having none: a project with no folder to ask git about, and a repository with no
+    /// `origin/HEAD` and no local `master` or `main` to derive from. They are one arm because the
+    /// page's response to each is the same — there is nothing to name and nothing to caption — while
+    /// the sentence that differs travels in `why`.
+    Unknown { why: String },
+}
+
+/// [`integration_branch`], read rather than decided — **and it does not write.**
+///
+/// **The one difference from [`integration_branch`], and it is the reason there are two.** That one
+/// records a derived default as a side effect, so that every landing after the first reads a column
+/// instead of asking git. It is right for a landing to do that and wrong for a GET: a project that
+/// has never landed follows `origin/HEAD`, and a route that pinned the column would freeze it to
+/// whatever `origin/HEAD` said at the moment somebody opened a page. That is decision #2's defect
+/// once more — a landing target settled by something other than a declaration — with "a page was
+/// opened" standing in for "a checkout was parked". A display must not decide what it is displaying.
+///
+/// **Both functions derive through [`derive_integration_branch`] and neither has its own copy**, so
+/// the branch this reports and the branch a landing takes cannot come apart. What a reader is told
+/// would happen is what happens.
+///
+/// `Err` is the database failing and nothing else; every answer the filesystem or git can give is an
+/// arm of [`IntegrationBranch`].
+pub async fn integration_branch_reading(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    deadline: Instant,
+) -> Result<IntegrationBranch, String> {
+    let recorded: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT integration_branch FROM autopilot_state WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("could not read {project_id}'s integration branch: {error}"))?
+    .flatten();
+    let recorded = recorded.filter(|value| !value.trim().is_empty());
+
+    let root = crate::inspect::project_root(pool, project_id)
+        .await
+        .map_err(|error| format!("could not read {project_id}'s root: {error}"))?;
+    let Some(root) = root.filter(|root| Path::new(root).is_dir()) else {
+        // A project switched off has had its root cleared, and one whose folder moved has a root
+        // pointing nowhere. Neither can be asked about a ref — but a column that still holds a name
+        // is worth reporting, since it is what a landing would use once the folder is back.
+        return Ok(match recorded {
+            Some(branch) => IntegrationBranch::Stale { branch },
+            None => IntegrationBranch::Unknown {
+                why: format!(
+                    "{project_id} has no folder on this machine, so there is nothing to read a \
+                     branch from"
+                ),
+            },
+        });
+    };
+    let root = Path::new(&root);
+
+    if let Some(branch) = recorded {
+        return Ok(
+            match crate::git_exec::branch_exists(root, &branch, deadline).await {
+                Ok(true) => IntegrationBranch::Declared { branch },
+                // A ref git says is absent and a git that would not answer are both "this name will
+                // not do", which is what `integration_branch` refuses on. The name is kept either
+                // way, because it is the thing somebody has to go and correct.
+                Ok(false) | Err(_) => IntegrationBranch::Stale { branch },
+            },
+        );
+    }
+
+    Ok(match derive_integration_branch(root, deadline).await {
+        Ok(branch) => IntegrationBranch::Derived { branch },
+        Err(why) => IntegrationBranch::Unknown { why },
+    })
+}
+
+/// The branch THIS landing is for.
+///
+/// **Alçada §4.1, decision #2, and it is the guard that lets that design's decision #1 exist at
+/// all.** This module was written because the target used to be *inferred* from a checkout's HEAD
+/// and the queue landed on a branch nobody chose about ten times. An argument is not that defect —
+/// inferred is not the same as said — but a typo that happens to name a real branch would be, so a
+/// named target has to be admitted before it is anything else.
+///
+/// The integration branch is admissible whether or not the table names it. An empty table has to
+/// mean "only the usual place"; reading it as "nowhere" would break every project that never opens
+/// the page.
+///
+/// **The order below is load-bearing, and it is the table BEFORE `integration_branch`.** A named
+/// target that the project admits is answered without ever asking what the default would have
+/// been, because the default is not part of that question — and asking anyway made a project whose
+/// default cannot be derived (no `origin/HEAD`, no local `master` or `main`) refuse `--land
+/// release` for a reason with nothing to do with what was asked. It also spends one to three `git`
+/// spawns per landing on an answer the success path throws away. `declared` is needed for exactly
+/// three things, all of them off that path: the `None` default, the "you named the default"
+/// shortcut, and naming the alternatives in a refusal.
+///
+/// **The trade that order buys, stated rather than left to be found.** A project whose *recorded*
+/// integration branch has since been deleted can now still land on a declared target that exists,
+/// where before this function every landing was refused until the column was corrected. That is
+/// the right answer — you asked for `X`, the project admits `X`, and `X` exists — but it does
+/// weaken `integration_branch`'s "nothing lands until it is corrected" to "nothing lands *by
+/// default* until it is corrected".
+///
+/// **What the refusal can and cannot claim.** `land_targets` swallows a read failure into an empty
+/// `Vec` and a `tracing::warn!` — failing toward refusing, which is the direction this house wants
+/// and which `project_policy` chose deliberately. The cost is that a database hiccup is
+/// indistinguishable here from a project that declared nothing, so the message says what was
+/// *recorded* rather than what the project *admits*: on that one bad day the branch really is
+/// admitted and this function cannot know it, and a refusal that overstates its own certainty is
+/// worse than one that names its evidence.
+async fn resolve_target(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    project_root: &Path,
+    requested: Option<&str>,
+    deadline: Instant,
+) -> Result<Branch, String> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return integration_branch(pool, project_id, project_root, deadline).await;
+    };
+
+    let recorded = crate::project_policy::land_targets(pool, project_id).await;
+    if recorded.iter().any(|branch| branch == requested) {
+        // Validated BEFORE it reaches git, because `declare_land_target` trims a branch name but
+        // does not check it: a name `Branch::new` rejects would otherwise be told it does not
+        // exist, which sends the caller looking for a missing branch when the problem is the name
+        // — and spawns a git process to reach that wrong conclusion.
+        let requested = Branch::new(requested)?;
+
+        // Confirmed against the repository for `integration_branch`'s own reason: a branch declared
+        // and then deleted is a misconfigured project, not a project with no target, and refusing
+        // it by name beats failing three git commands deep inside a merge. Wrapped like its sibling
+        // above, because a bare deadline error names neither the project nor the branch nor which
+        // of this module's two `branch_exists` calls produced it.
+        let exists = crate::git_exec::branch_exists(project_root, requested.as_str(), deadline)
+            .await
+            .map_err(|reason| {
+                format!(
+                    "could not confirm {project_id}'s landing target {} still exists: {reason}",
+                    requested.as_str()
+                )
+            })?;
+        if !exists {
+            return Err(format!(
+                "{project_id} admits {branch} as a landing target, but refs/heads/{branch} does \
+                 not exist — create it or withdraw the target",
+                branch = requested.as_str()
+            ));
+        }
+        return Ok(requested);
+    }
+
+    let declared = integration_branch(pool, project_id, project_root, deadline).await?;
+    if requested == declared.as_str() {
+        return Ok(declared);
+    }
+
+    let mut alternatives = recorded;
+    alternatives.push(declared.as_str().to_owned());
+    alternatives.sort();
+    alternatives.dedup();
+    Err(format!(
+        "{requested} is not among the landing targets recorded for {project_id} — those are: {}",
+        alternatives.join(", ")
+    ))
+}
+
+/// Admits a landing: `source`, into `requested_target` when the caller named one the project
+/// admits, and otherwise into whatever `integration_branch` answers for `repo`.
 ///
 /// **The only site in the core that builds a landing's `Op::Merge`.** `http.rs`'s route hands this
 /// a `cwd` already resolved to a branch and a repository; this decides whether that branch is
@@ -171,12 +397,19 @@ pub async fn submit(
     repo: &ResolvedRepo,
     project_root: &Path,
     source: &str,
+    requested_target: Option<&str>,
     deadline: Instant,
 ) -> Result<i64, LandRefusal> {
     let source = Branch::new(source).map_err(LandRefusal::Refused)?;
-    let target = integration_branch(pool, repo.project_id(), project_root, deadline)
-        .await
-        .map_err(LandRefusal::Refused)?;
+    let target = resolve_target(
+        pool,
+        repo.project_id(),
+        project_root,
+        requested_target,
+        deadline,
+    )
+    .await
+    .map_err(LandRefusal::Refused)?;
 
     if source.as_str() == target.as_str() {
         return Err(LandRefusal::AlreadyOnTarget(format!(
@@ -373,7 +606,7 @@ mod tests {
         let feat_sha = sha_of(&repo, "feat/x");
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect("a checkout parked elsewhere must not stop feat/x landing on master");
 
@@ -407,6 +640,143 @@ mod tests {
         );
     }
 
+    /// **The same regression as the test above, read instead of landed.**
+    ///
+    /// The panel at `/projects/{id}/github` reported this branch from
+    /// `inspect::Branches::integration` — `current_branch(project_root)` — and captioned it *"always
+    /// admissible"*. With the main checkout parked on `chore/other` that named a branch
+    /// `resolve_target` refuses by name, while the branch that IS admissible appeared nowhere. A
+    /// landing being right is not enough if the page that reports on landings is wrong: the owner
+    /// reads the page.
+    ///
+    /// Both halves are asserted, because the first alone would pass on a reading that named both.
+    #[tokio::test]
+    async fn a_reading_names_the_declared_branch_and_never_the_parked_checkout() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-reading-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+
+        // What the old source of this answer would have said, measured rather than assumed.
+        assert_eq!(
+            crate::git_exec::current_branch(&repo, deadline())
+                .await
+                .ok(),
+            Some("chore/other".to_owned()),
+            "the fixture has to have the checkout parked, or this test proves nothing"
+        );
+
+        assert_eq!(
+            integration_branch_reading(&pool, "alpha", deadline())
+                .await
+                .expect("the roster row is there"),
+            IntegrationBranch::Declared {
+                branch: "master".to_owned()
+            }
+        );
+    }
+
+    /// **A read does not write, and this is the difference between the two functions.**
+    ///
+    /// [`integration_branch`] records a derived default so that every landing after the first reads
+    /// a column. That is right for a landing and wrong for a GET: `GET /projects/{id}/land-targets`
+    /// is opened by looking at a page, and a project that has never landed follows `origin/HEAD`
+    /// until something pins it. A page that pinned it would settle a landing target by a means that
+    /// is not a declaration — decision #2's defect with "a page was opened" in place of "a checkout
+    /// was parked".
+    ///
+    /// So: reading derives the same answer and leaves the column alone; landing writes it. Both
+    /// derive through `derive_integration_branch`, so the branch reported and the branch taken
+    /// cannot come apart — which is the other half of why this is safe.
+    #[tokio::test]
+    async fn reading_the_integration_branch_derives_without_recording_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-noswrite-", "chore/other");
+        seed_project(&pool, "alpha", &repo, None).await;
+
+        let recorded = || {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT integration_branch FROM autopilot_state WHERE project_id = 'alpha'",
+            )
+            .fetch_one(&pool)
+        };
+
+        assert_eq!(
+            integration_branch_reading(&pool, "alpha", deadline())
+                .await
+                .expect("the roster row is there"),
+            IntegrationBranch::Derived {
+                branch: "master".to_owned()
+            },
+            "a project that has never landed still lands somewhere, and this is where"
+        );
+        assert_eq!(
+            recorded().await.unwrap(),
+            None,
+            "reading must leave the column exactly as it found it"
+        );
+
+        // And the landing path does record it, which is what makes the pair a decision rather than
+        // an inconsistency.
+        integration_branch(&pool, "alpha", &repo, deadline())
+            .await
+            .expect("master is derivable here");
+        assert_eq!(recorded().await.unwrap(), Some("master".to_owned()));
+    }
+
+    /// A column naming a branch git cannot find is a misconfigured project, not one without a
+    /// default — and the name is what somebody has to go and correct, so it is kept.
+    ///
+    /// [`integration_branch`] refuses this case in words: *"nothing lands by default until it is
+    /// corrected"*. The reading says the same thing in a shape a page can caption, which is the
+    /// point of the arm existing at all: a branch name on screen is a claim, and this arm is where
+    /// the claim must not be "always admissible".
+    #[tokio::test]
+    async fn a_declared_branch_whose_ref_is_gone_is_named_and_not_called_admissible() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-stale-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("release/gone")).await;
+
+        assert_eq!(
+            integration_branch_reading(&pool, "alpha", deadline())
+                .await
+                .expect("the roster row is there"),
+            IntegrationBranch::Stale {
+                branch: "release/gone".to_owned()
+            }
+        );
+
+        // The landing path refuses the same project, which is the behaviour the arm is describing.
+        assert!(
+            integration_branch(&pool, "alpha", &repo, deadline())
+                .await
+                .is_err(),
+            "a page must not caption a branch admissible that a landing would refuse"
+        );
+    }
+
+    /// A project with no folder has nothing to be asked, and says so in the daemon's own words.
+    #[tokio::test]
+    async fn a_project_with_no_folder_has_no_integration_branch_to_name() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('off', 'off', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed a project switched off");
+
+        let read = integration_branch_reading(&pool, "off", deadline())
+            .await
+            .expect("the roster row is there");
+        let IntegrationBranch::Unknown { why } = read else {
+            panic!("a project with no folder cannot name a branch, got {read:?}");
+        };
+        assert!(why.contains("no folder"), "{why}");
+    }
+
     /// Decision #3: a source already inside the target is refused before a row is written at all —
     /// a queued row is a promise, and "there was nothing to land" is not one worth making.
     #[tokio::test]
@@ -422,7 +792,7 @@ mod tests {
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let refusal = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let refusal = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect_err("feat/x is already part of master — there is nothing left to land");
 
@@ -466,6 +836,234 @@ mod tests {
         assert!(refusal.contains("alpha"), "{refusal}");
     }
 
+    /// Alçada §4.1, decision #2. A named target has to be admitted before it is anything else --
+    /// and the refusal NAMES what would have been admitted, because a caller who has to open the
+    /// app to find out has lost the reason this command exists.
+    #[tokio::test]
+    async fn a_target_outside_the_admitted_list_is_refused_by_name() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-target-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        // No `release` branch is created, and none is needed: admission is answered before
+        // `branch_exists` is ever reached. A test that created one would be asserting about a
+        // branch the code never looks at.
+        let refusal = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(refusal, LandRefusal::Refused(_)));
+        assert!(
+            refusal.message().contains("release"),
+            "{}",
+            refusal.message()
+        );
+        assert!(
+            refusal.message().contains("master"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// Alçada §4.1: the integration branch is admissible without being in the table. An empty
+    /// table means "only the usual place", never "nowhere".
+    #[tokio::test]
+    async fn the_integration_branch_is_admitted_without_being_declared() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-declared-", "chore/other");
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        submit(&pool, &repo_id, &repo, "feat/x", Some("master"), deadline())
+            .await
+            .expect("naming the integration branch explicitly must be admitted");
+    }
+
+    /// **Why `resolve_target` reads the table before it asks what the default would have been.**
+    /// This project's branch is `trunk`: no `origin/HEAD`, no local `master`, no local `main`, so
+    /// `derive_integration_branch` has nothing to derive from and refuses. That refusal has nothing
+    /// to do with the question asked — `release` is declared, `refs/heads/release` exists — and a
+    /// caller who names an admitted target should never be handed it. Consulting
+    /// `integration_branch` first made this landing fail with "there is nothing to derive an
+    /// integration branch from"; the order is what fixes it, so the order needs a test.
+    #[tokio::test]
+    async fn an_admitted_target_lands_in_a_project_with_no_derivable_default() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-land-trunk-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        assert!(git_in(&repo, &["branch", "-M", "trunk"]));
+        assert!(git_in(&repo, &["branch", "release", "trunk"]));
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "feat/x"]));
+        std::fs::write(repo.join("feature.txt"), "from the branch\n").expect("write");
+        assert!(git_in(&repo, &["add", "-A"]));
+        assert!(git_in(&repo, &["commit", "-m", "feature"]));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+            .await
+            .unwrap();
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        let id = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .expect("an admitted target that exists must not need a derivable default to land");
+
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(args.contains(r#""target":"release""#), "{args}");
+    }
+
+    /// Alçada §4.1: a target the project admits but git no longer has is refused HERE, not three
+    /// git commands into a merge -- the same rule `integration_branch` already applies to a stale
+    /// column.
+    #[tokio::test]
+    async fn an_admitted_target_whose_branch_is_gone_is_refused() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-gone-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+            .await
+            .unwrap();
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        let refusal = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(refusal, LandRefusal::Refused(_)));
+        assert!(
+            refusal.message().contains("refs/heads/release"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// **The test that pins the feature itself, rather than one of its refusals.** Every other test
+    /// here asserts about a message, or about a column that is supposed not to move; a
+    /// `resolve_target` that validated the argument and then returned the integration branch anyway
+    /// — the exact defect this module exists to prevent, arriving by the new door — would pass all
+    /// of them. This one reads the queued row back and asks where the merge actually goes.
+    #[tokio::test]
+    async fn an_admitted_target_is_what_the_queued_row_merges_into() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-pinned-", "chore/other");
+        assert!(git_in(&repo, &["branch", "release", "master"]));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+            .await
+            .unwrap();
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        let id = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .expect("an admitted target that exists must be submitted");
+
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let op: serde_json::Value = serde_json::from_str(&args).expect("the queue stores JSON");
+        assert_eq!(
+            op["target"], "release",
+            "the row has to merge into the branch the caller named, not the project's default: \
+             {args}"
+        );
+        assert_eq!(op["source"], "feat/x", "{args}");
+    }
+
+    /// Alçada §4.1's last line — decision #1's negative half, and the one that keeps the old defect
+    /// from returning by another door: naming a target for one landing must not declare the
+    /// project's default.
+    ///
+    /// **Seeded with no integration branch on purpose.** With a column already set, this test would
+    /// be a tautology — `integration_branch` would only read back what `seed_project` wrote, and no
+    /// code path could have failed it. `NULL` is the case where a write genuinely exists: the
+    /// derive-and-record path in `integration_branch` is the one thing in this module that ever
+    /// puts a value in that column, so a still-`NULL` column afterwards is proof the named target
+    /// never went near it.
+    #[tokio::test]
+    async fn an_explicit_target_does_not_rewrite_the_integration_branch() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-nowrite-", "chore/other");
+        assert!(git_in(&repo, &["branch", "release", "master"]));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+            .await
+            .unwrap();
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("release"),
+            deadline(),
+        )
+        .await
+        .expect("an admitted target that exists must be submitted");
+
+        let after: Option<String> = sqlx::query_scalar(
+            "SELECT integration_branch FROM autopilot_state WHERE project_id = ?",
+        )
+        .bind("alpha")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after, None,
+            "naming a target for one landing must not declare the project's default — this project \
+             still has none"
+        );
+    }
+
     /// Decision #6: a merge the project's gate refuses is `Failed`, never `Escalated` — nothing
     /// here is a conflict, and a red gate must not mint a resolver agent to "fix" someone else's
     /// worktree. Pinned structurally: an escalated row is the only kind `resolver.rs` ever picks
@@ -492,7 +1090,7 @@ mod tests {
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect("a red gate is discovered at execution, not at submission");
 
@@ -533,7 +1131,7 @@ mod tests {
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
 
         // The conflict, exactly as an ordinary landing meets it.
-        let original = submit(&pool, &repo_id, &repo, "feat/x", deadline())
+        let original = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
             .await
             .expect("an ordinary landing is admitted; the conflict is discovered at execution");
         assert!(
@@ -570,7 +1168,7 @@ mod tests {
         assert!(git_in(&repo, &["commit", "--no-edit"]));
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
 
-        let resolution = submit(&pool, &repo_id, &repo, "nucleos/run-42", deadline())
+        let resolution = submit(&pool, &repo_id, &repo, "nucleos/run-42", None, deadline())
             .await
             .expect("a verified resolution is admitted");
         assert_ne!(
@@ -649,7 +1247,7 @@ mod tests {
             .await
             .expect("break admission so the resolution cannot be admitted");
 
-        let refusal = submit(&pool, &repo_id, &repo, "nucleos/run-77", deadline())
+        let refusal = submit(&pool, &repo_id, &repo, "nucleos/run-77", None, deadline())
             .await
             .expect_err("admission is broken on purpose — the resolution cannot land");
 

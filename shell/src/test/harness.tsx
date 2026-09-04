@@ -19,6 +19,14 @@ import type { Changed, Worktree } from "../data/project-code";
 import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
 import type { ProjectFolder, ProjectRecord } from "../data/projects";
+import type {
+  DeclarableOp,
+  IntegrationBranch,
+  ShellRule,
+  Verdict,
+} from "../data/project-policy";
+import { foldPrefix } from "../data/project-policy";
+import type { ListingRead, ProjectRepo, ReadOutcome } from "../data/project-github";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
@@ -218,6 +226,79 @@ export interface DaemonState {
   folderDeleted: { projectId: string; forgetHistory: boolean }[];
   /** What `DELETE /projects/{id}/folder` refuses with, or `null` to accept. */
   folderRefusal: { status: number; code: string; detail: string } | null;
+  /**
+   * The three lists a project declares about itself, and the catalogue the second is picked from.
+   *
+   * Whole rows for the shell rules, because the note and the day a prefix was first declared are on
+   * the row and a fake serving two lists of prefixes could not carry either — which is the shape the
+   * route deliberately stopped having.
+   *
+   * `declarableOps` is machine-wide and takes no project id: the set is compiled into the daemon by
+   * intersecting the operations it can build with two ceilings, so it is the same answer for every
+   * project. The `declarable: false` entries are the half worth keeping in a default — an operation
+   * outside the ceilings is not missing, it exists and nothing on any screen can turn it on, and a
+   * page has to be able to draw that.
+   */
+  shellRules: ShellRule[];
+  githubOps: string[];
+  landTargets: string[];
+  /**
+   * Where a landing with no argument goes — the other half of `GET /projects/{id}/land-targets`.
+   *
+   * **Its own field and NOT derived from `branches.integration`**, which is the distinction the
+   * route exists to draw: that one is the branch the main checkout is parked on, and a fake that
+   * answered this from it would reproduce in the test harness the exact confusion the núcleo now
+   * refuses to make. A test that wants them to disagree — a clone sitting on a feature branch while
+   * the project declares `master` — sets both, and that is the case worth having.
+   */
+  landIntegration: IntegrationBranch;
+  declarableOps: DeclarableOp[];
+  /** What every declaration WRITE refuses with, or `null` to accept. */
+  policyRefusal: { status: number; code: string; detail: string } | null;
+  /**
+   * What the three declaration READS refuse with, or `null` to answer.
+   *
+   * **Its own field, and its absence is why a bug shipped.** `policyRefusal` covers the writes only,
+   * so nothing here could make a GET fail — and the page's three sections guarded on
+   * `data === undefined`, which with `retry: false` meant a refused read showed the loading line for
+   * ever. A state the fake cannot produce is a state no test can forbid.
+   */
+  policyReadRefusal: { status: number; code: string; detail: string } | null;
+  /** Every declaration the shell sent, in order, as it sent it. */
+  policyWrites: { path: string; method: string; body: Record<string, unknown> | null }[];
+  /**
+   * Which repository on GitHub this project is — `GET /projects/{id}/github-repo`.
+   *
+   * The whole union and not a string, because five of its six arms are the reasons a project has no
+   * repository and each one is a different sentence on the page. `null` is the sixth answer, which
+   * is the only refusal this route makes: a project the roster has never heard of.
+   *
+   * The default is the ordinary case, a project pointed at a GitHub repository, because every
+   * assertion about the two listings below needs one before it can begin.
+   */
+  githubRepo: ProjectRepo | null;
+  /**
+   * What `gh` said, per listing operation — `POST /github/requests`.
+   *
+   * Keyed by the operation, because the page asks two and shows them separately, and a fake that
+   * answered both with one payload could not tell a test which panel it was looking at.
+   *
+   * The defaults are a listing each, because that is the state the section exists for. `exit_code`
+   * is on the row rather than assumed: a non-zero exit arrives as a 200 from this route — `gh` ran
+   * and GitHub said no — and the page draws that differently from a refusal, so it has to be
+   * reachable without one.
+   */
+  githubListings: Record<ListingRead, ReadOutcome>;
+  /**
+   * What `POST /github/requests` refuses with, or `null` to answer.
+   *
+   * The half of this route worth testing hardest. §5.1 asks for no token and no `gh` to be
+   * *explained and not blank*, and those are a 403 and a 503 that only a fake can produce — no
+   * arrangement of the other fields reaches them.
+   */
+  githubReadRefusal: { status: number; code: string; detail: string } | null;
+  /** Every read the shell sent, in order, as the operation it named. */
+  githubReads: { op: string; repo: string }[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -287,6 +368,63 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     },
     folderDeleted: [],
     folderRefusal: null,
+    shellRules: [],
+    githubOps: [],
+    landTargets: [],
+    // Declared and present, which is the healthy project. `branches.integration` above defaults to
+    // `master` too and that agreement is a coincidence of the fixtures, never a rule — the test
+    // that matters sets them apart.
+    landIntegration: { state: "declared", branch: "master" },
+    /*
+      A stand-in and not a copy of the real catalogue: that one is derived in `github.rs` by
+      intersecting the built operations with two compiled ceilings, and a second spelling of it here
+      would be exactly the drift `GET /github/declarable-ops` exists to end. `api_read` is in it by
+      name because it is the standing example of the `false` case.
+    */
+    declarableOps: [
+      { kind: "pr_list", half: "read", declarable: true },
+      { kind: "run_list", half: "read", declarable: true },
+      { kind: "run_logs", half: "read", declarable: false },
+      { kind: "pr_comment", half: "action", declarable: true },
+      { kind: "api_read", half: "action", declarable: false },
+    ],
+    policyRefusal: null,
+    policyReadRefusal: null,
+    policyWrites: [],
+    githubRepo: {
+      state: "known",
+      repo: "duarte/nucleos",
+      remote: "git@github.com:duarte/nucleos.git",
+    },
+    githubListings: {
+      pr_list: readOutcome("pr_list", "#41\tthe queue lands\tfeat/land\tabout 2 hours ago"),
+      run_list: readOutcome("run_list", "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s"),
+    },
+    githubReadRefusal: null,
+    githubReads: [],
+    ...overrides,
+  };
+}
+
+/**
+ * One `gh` invocation's answer, with the fields a test does not care about filled in.
+ *
+ * `stdout` is a tab-separated line because that is what `gh pr list` actually prints — the typed
+ * reads refuse `--json`, so the daemon hands back the CLI's own table and the page renders it. A
+ * fixture shaped like JSON would be testing a wire shape this route cannot produce.
+ */
+export function readOutcome(
+  operation: string,
+  stdout: string,
+  overrides: Partial<ReadOutcome> = {},
+): ReadOutcome {
+  return {
+    status: "ran",
+    operation,
+    exit_code: 0,
+    stdout,
+    // stdout then stderr, which for a successful listing is just stdout again.
+    output_tail: stdout,
     ...overrides,
   };
 }
@@ -489,6 +627,27 @@ export function proposal(overrides: Partial<Proposal> = {}): Proposal {
 }
 
 /**
+ * The day a shell rule this fake stores was first declared.
+ *
+ * A fixed day rather than "now", and one that is plainly not today, because the caption beside a
+ * rule says `declared` and never `edited`: a test that could not tell the two apart could not catch
+ * a page that re-dated a rule when its verdict was flipped.
+ *
+ * The daemon's own spelling — `datetime('now')`, UTC, space-separated, and NOT RFC 3339.
+ */
+export const DECLARED_ON = "2026-03-14 09:41:00";
+
+/** `ORDER BY prefix`, which is the order the route serves its rows in. */
+function byPrefix(left: ShellRule, right: ShellRule): number {
+  return left.prefix < right.prefix ? -1 : left.prefix > right.prefix ? 1 : 0;
+}
+
+/** One declared shell rule, whole, with the fields a test does not care about filled in. */
+export function shellRule(overrides: Partial<ShellRule> = {}): ShellRule {
+  return { prefix: "npm ci", verdict: "allow", note: null, created_at: DECLARED_ON, ...overrides };
+}
+
+/**
  * A stand-in for the núcleo's JSON routes, over mutable state.
  *
  * A responder rather than a pile of `mockResolvedValueOnce`: the shell polls,
@@ -497,7 +656,110 @@ export function proposal(overrides: Partial<Proposal> = {}): Proposal {
  */
 export function daemonFetch(state: DaemonState): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
+    /*
+      The declaration routes, all ten, in one block at the very top.
+
+      Ahead of everything else because the bare `DELETE /projects/{id}` further down matches any
+      path under `/projects/`, and a `DELETE .../shell-rules` falling into it would delete the
+      PROJECT — a fake that removed the row a test is watching while reporting success is the worst
+      kind of green.
+
+      Stateful, because the assertion that matters is a write and then a read: a 204 proves the
+      request was well formed, and what is under test is whether the list the shell shows afterwards
+      is the list the daemon is now enforcing.
+    */
+    const policy = /^\/projects\/([^/]+)\/(shell-rules|github-ops|land-targets)$/.exec(path);
+    if (path === "/github/declarable-ops") return state.declarableOps;
+    if (policy !== null) {
+      const method = init?.method ?? "GET";
+      const table = policy[2];
+      const body =
+        typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+
+      if (method === "GET") {
+        if (state.policyReadRefusal !== null) {
+          const { status, code, detail } = state.policyReadRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        if (table === "shell-rules") return [...state.shellRules].sort(byPrefix);
+        if (table === "github-ops") return [...state.githubOps].sort();
+        // Two halves, because one route owns both: where a landing goes by default, and the extra
+        // places it may be sent. The default is never in `targets` — it is admissible with no row,
+        // so a fake that listed it would make it look closeable.
+        return { integration: state.landIntegration, targets: [...state.landTargets].sort() };
+      }
+
+      state.policyWrites.push({ path, method, body });
+      if (state.policyRefusal !== null) {
+        const { status, code, detail } = state.policyRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+
+      if (table === "shell-rules") {
+        // The núcleo folds on the way in, so the fake does too: a prefix is identified by its
+        // folded spelling and by nothing else.
+        const prefix = foldPrefix(String(body?.prefix ?? ""));
+        if (method === "DELETE") {
+          state.shellRules = state.shellRules.filter((rule) => rule.prefix !== prefix);
+          return undefined;
+        }
+        const already = state.shellRules.find((rule) => rule.prefix === prefix);
+        const written: ShellRule = {
+          prefix,
+          verdict: body?.verdict as Verdict,
+          // `note = excluded.note`, and NOT a merge — whatever arrived is now the note, `null`
+          // included. That is the trap the `Note` union exists to make a caller choose out loud.
+          note: (body?.note as string | null | undefined) ?? null,
+          // Absent from the `DO UPDATE` in the núcleo, so a redeclaration keeps the day the prefix
+          // was first written down.
+          created_at: already?.created_at ?? DECLARED_ON,
+        };
+        state.shellRules = [
+          ...state.shellRules.filter((rule) => rule.prefix !== prefix),
+          written,
+        ];
+        return undefined;
+      }
+
+      if (table === "github-ops") {
+        const kind = String(body?.op_kind ?? "");
+        state.githubOps =
+          method === "DELETE"
+            ? state.githubOps.filter((op) => op !== kind)
+            : [...state.githubOps.filter((op) => op !== kind), kind];
+        return undefined;
+      }
+
+      const branch = String(body?.branch ?? "");
+      state.landTargets =
+        method === "DELETE"
+          ? state.landTargets.filter((target) => target !== branch)
+          : [...state.landTargets.filter((target) => target !== branch), branch];
+      return undefined;
+    }
+
     if (init?.method === "POST") {
+      /*
+        The one door both GitHub tools come through, first inside this block because it is the only
+        POST here that is a READ — everything below records a write, and a listing that fell into
+        one of those would be recorded as a change the shell never made.
+
+        Recorded and answered rather than applied to state: nothing on this machine changes when
+        `gh pr list` runs, so there is no row for a refetch to read back. What a test asserts is
+        WHICH operation was sent and against which repository, because that is the mapping this
+        section exists to prove — the repository must be the one the daemon named and never one the
+        page worked out for itself.
+      */
+      if (path === "/github/requests" && typeof init.body === "string") {
+        const sent = JSON.parse(init.body) as { op: { op: ListingRead; repo: string } };
+        state.githubReads.push({ op: sent.op.op, repo: sent.op.repo });
+        if (state.githubReadRefusal !== null) {
+          const { status, code, detail } = state.githubReadRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        return state.githubListings[sent.op.op];
+      }
+
       // The one write the shell can make from the frame. Applied to the state so
       // that the refetch after the mutation reads back what was written.
       if (path === "/autopilot/kill" && typeof init.body === "string") {
@@ -680,6 +942,15 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         throw new ApiRefusal(404, "not_found", "no project by that name");
       }
       return state.record;
+    }
+    // Ahead of `/branches` and the rest only by convention; it collides with none of them. `null`
+    // is the 404 the route makes for a project the roster does not have, and it is the one answer
+    // here that is an error rather than a state — the other five arrive as a 200.
+    if (path.startsWith("/projects/") && path.endsWith("/github-repo")) {
+      if (state.githubRepo === null) {
+        throw new ApiRefusal(404, "not_found", "no project by that name");
+      }
+      return state.githubRepo;
     }
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;

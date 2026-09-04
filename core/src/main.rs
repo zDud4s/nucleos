@@ -68,6 +68,7 @@ mod process_tree;
 mod project_commands;
 mod project_exit;
 mod project_map;
+mod project_policy;
 mod project_readings;
 mod proposals;
 mod recurrence;
@@ -283,6 +284,51 @@ fn render_pressure(report: &serde_json::Value) -> String {
     out
 }
 
+/// Which spellings of `--land` exist — one predicate, called by both the guard in `main` and the
+/// parser below, because **the guard and the parser must agree on this and once did not.** The
+/// guard matched `--land` exactly, so `--land=release` fell past it, past every other flag block,
+/// and into daemon startup: the person asked to land and got a server, with no message and no
+/// exit code. Two copies of the answer are what allowed that; one they both call cannot drift.
+fn is_land_flag(arg: &str) -> bool {
+    arg == "--land" || arg.starts_with("--land=")
+}
+
+/// The branch a `--land` names, when it names one: `--land <branch>` or `--land=<branch>`.
+///
+/// A function rather than four lines inside the block, because it is the only part of `--land`
+/// that can be wrong in a way the compiler cannot see, and `main.rs` has no other way to test a
+/// command-line shape.
+///
+/// **Both forms are honoured rather than one of them refused.** `--land=release` has exactly one
+/// reading, and turning away a form that cannot be misunderstood is worse than answering it — the
+/// same two lines either way.
+///
+/// `nucleos-core --land` has to keep meaning exactly what it has always meant, so an absent
+/// argument is `None` rather than an error. A session that wrote `--land --something` meant the
+/// flag: an argument that itself looks like one is not a branch name, and treating it as one would
+/// send a typo to the daemon as a landing target. Trimmed before that decision because the daemon
+/// trims before its own — ` --verbose` reaches here as one argument when a shell kept the space,
+/// and the two ends must not disagree about whether it is a branch.
+///
+/// **The two empty forms are answered differently, on purpose.** `--land=` carries no value at
+/// all, so there is nothing to send and it is `None`. `--land ""` carries one, and it goes as it
+/// was typed: `land::resolve_target` reads an empty target as the project's integration branch, so
+/// the ends already agree, and a refusal invented here would be a second opinion nobody asked for.
+/// Both land in the same place.
+///
+/// **The first spelling wins when a command line carries more than one**, whichever form it is:
+/// that is the one the person typed as the command, and a second is a mistake rather than an
+/// override.
+fn land_target_from(args: &[String]) -> Option<String> {
+    let at = args.iter().position(|arg| is_land_flag(arg))?;
+    if let Some(value) = args[at].strip_prefix("--land=") {
+        return Some(value.to_owned()).filter(|value| !value.trim().is_empty());
+    }
+    args.get(at + 1)
+        .filter(|value| !value.trim().starts_with('-'))
+        .cloned()
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--print-token") {
@@ -310,7 +356,7 @@ async fn main() {
     // It asks; it does not wait. The queue decides when, and the ticket is how to follow it —
     // printing the id and returning is the honest shape for a request whose whole point is that
     // somebody else schedules it.
-    if std::env::args().any(|a| a == "--land") {
+    if std::env::args().any(|a| is_land_flag(&a)) {
         let token = match secrets::load_secret(TOKEN_KEY) {
             Ok(Some(token)) => token,
             _ => {
@@ -321,7 +367,15 @@ async fn main() {
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let body = serde_json::json!({ "cwd": cwd }).to_string();
+        let args: Vec<String> = std::env::args().collect();
+        let target = land_target_from(&args);
+        // Omitted rather than sent as an explicit `null` when there is none, so a bare `--land`
+        // puts on the wire the same body every caller put there before the field existed.
+        let body = match &target {
+            Some(target) => serde_json::json!({ "cwd": cwd, "target": target }),
+            None => serde_json::json!({ "cwd": cwd }),
+        }
+        .to_string();
         let response = reqwest::Client::new()
             .post(format!("{}/vcs/land", daemon_client::daemon_url()))
             .bearer_auth(token)
@@ -1555,5 +1609,142 @@ mod tests {
             drawn.contains("split_speciality, trim_prompt"),
             "os dois veredictos, e nao so o primeiro: {drawn}"
         );
+    }
+
+    /// `nucleos-core --land` on its own is what almost every session types, and it has to keep
+    /// meaning what it has always meant. An argument that is not there is not an error.
+    #[test]
+    fn a_land_with_nothing_after_it_names_no_target() {
+        let args = ["nucleos-core".to_owned(), "--land".to_owned()];
+        assert_eq!(land_target_from(&args), None);
+    }
+
+    /// The branch is the argument straight after the flag, and what follows it is not this
+    /// function's business.
+    #[test]
+    fn a_land_takes_the_branch_that_follows_it() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "release".to_owned(),
+            "--verbose".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), Some("release".to_owned()));
+    }
+
+    /// The same when the branch ends the command line, which is how it is actually typed. The
+    /// `get(at + 1)` is what keeps this from being an index past the end.
+    #[test]
+    fn a_land_takes_a_branch_that_ends_the_command_line() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "release".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), Some("release".to_owned()));
+    }
+
+    /// A session that wrote `--land --something` meant the flag. Reading the next flag as a
+    /// branch name would send a typo to the daemon as a landing target, and the daemon would
+    /// refuse it with a message about a branch nobody ever asked for.
+    #[test]
+    fn a_land_followed_by_another_flag_names_no_target() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "--verbose".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), None);
+    }
+
+    /// And a command line with no `--land` at all has no target to find, however many other
+    /// arguments it carries.
+    #[test]
+    fn a_command_line_without_land_names_no_target() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--pressao".to_owned(),
+            "--equipa".to_owned(),
+            "NucleOS".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), None);
+    }
+
+    /// `--land=release` is the form that used to fall past the guard and start a daemon. It reads
+    /// as the same request the space-separated form does, because that is the only thing a person
+    /// who typed it can have meant.
+    #[test]
+    fn a_land_joined_by_an_equals_names_the_branch_after_it() {
+        let args = ["nucleos-core".to_owned(), "--land=release".to_owned()];
+        assert_eq!(land_target_from(&args), Some("release".to_owned()));
+    }
+
+    /// The two empty forms, and the asymmetry between them is the deliberate answer rather than an
+    /// oversight: `--land=` carries no value to send, while `--land ""` carries one and goes as it
+    /// was typed — the daemon reads an empty target as the integration branch, which is where a
+    /// bare `--land` was going anyway.
+    #[test]
+    fn an_empty_equals_names_no_target_and_an_empty_argument_travels_as_typed() {
+        let joined = ["nucleos-core".to_owned(), "--land=".to_owned()];
+        assert_eq!(land_target_from(&joined), None);
+
+        let separate = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            String::new(),
+        ];
+        assert_eq!(land_target_from(&separate), Some(String::new()));
+    }
+
+    /// One `--land` is what anybody types, so the answer to two of them is worth pinning rather
+    /// than leaving to whichever way the scan happens to run: the FIRST spelling is the command,
+    /// and a second one is a mistake rather than an override. It holds across the two forms, which
+    /// is the half a separate scan for `--land=` would have got wrong.
+    #[test]
+    fn the_first_land_wins_whichever_form_the_others_take() {
+        let separated = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "trunk".to_owned(),
+            "--land".to_owned(),
+            "release".to_owned(),
+        ];
+        assert_eq!(land_target_from(&separated), Some("trunk".to_owned()));
+
+        let separated_then_joined = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            "trunk".to_owned(),
+            "--land=release".to_owned(),
+        ];
+        assert_eq!(
+            land_target_from(&separated_then_joined),
+            Some("trunk".to_owned())
+        );
+
+        let joined_then_separated = [
+            "nucleos-core".to_owned(),
+            "--land=release".to_owned(),
+            "--land".to_owned(),
+            "trunk".to_owned(),
+        ];
+        assert_eq!(
+            land_target_from(&joined_then_separated),
+            Some("release".to_owned())
+        );
+    }
+
+    /// A shell that kept the space in `--land " --verbose"` hands this one argument that is a flag
+    /// wearing a space. The daemon trims before it decides what a target is, so this has to trim
+    /// before it decides what a flag is — otherwise the CLI calls it a branch and the daemon calls
+    /// it a flag, and the two ends of one argument disagree.
+    #[test]
+    fn an_argument_a_shell_padded_with_a_space_is_still_a_flag() {
+        let args = [
+            "nucleos-core".to_owned(),
+            "--land".to_owned(),
+            " --verbose".to_owned(),
+        ];
+        assert_eq!(land_target_from(&args), None);
     }
 }

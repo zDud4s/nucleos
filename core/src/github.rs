@@ -46,6 +46,12 @@ pub enum ReadOp {
     PrList {
         repo: Repo,
     },
+    /// `gh workflow list`. It existed in `READ_CEILING` before it existed here, which made the
+    /// ceiling grant a prefix no typed operation could build — and `declarable_github_ops` refused
+    /// it for exactly that reason. The variant is what closes the gap; the ceiling is unchanged.
+    WorkflowList {
+        repo: Repo,
+    },
     /// Returns the body of a PR — text somebody wrote. `ReadsUntrusted`, and this is why the effect
     /// is per operation and not per tool.
     PrView {
@@ -59,6 +65,46 @@ pub enum ReadOp {
     RunLogs {
         repo: Repo,
         id: RunId,
+    },
+    /// The patch a pull request proposes, as `gh pr diff` gives it: every changed line, written by
+    /// whoever opened the pull request, which anyone with a GitHub account may do.
+    ///
+    /// **It was called `pr_files` for one commit, and the name was the defect.** A caller's whole
+    /// interface to this operation is the kind string — the model reading the tool description never
+    /// sees this paragraph — and `pr_files` promises a list of names. What arrives is unbounded
+    /// attacker-authored text, clipped to the LAST 256 KiB by `clip`, so a hostile pull request can
+    /// sit its payload at the tail and push everything before it out of the window. A name that
+    /// under-describes its own blast radius is worse here than anywhere else in this enum, because
+    /// the thing it under-describes is the injection channel.
+    PrDiff {
+        repo: Repo,
+        number: PrNumber,
+    },
+    /// The comment thread on a pull request. `PrView` returns the description its author wrote; this
+    /// returns everything everybody else wrote underneath it, which is a wider door into the turn
+    /// and not a narrower one.
+    ///
+    /// **`pr_thread` and not `pr_comments`, and the reason is a refusal message rather than a
+    /// compare.** Every kind comparison in this module is `==`, so the plural was mechanically safe
+    /// beside `ActOp::PrComment`; what it was not safe from is a person. `POST
+    /// /projects/{id}/github-ops` refuses an undeclarable kind by listing the declarable ones, so
+    /// somebody reaching for this READ was refused and handed a list whose nearest entry was
+    /// `pr_comment` — the operation that POSTS under the owner's name, and that runs without asking
+    /// the moment it is declared. A refusal that nudges across the partition is worse than no
+    /// refusal, and the fix belongs in the name and not in the message.
+    PrThread {
+        repo: Repo,
+        number: PrNumber,
+    },
+    /// The checks reported against a ref, as `gh pr checks` gives them: a name, a state and a link
+    /// per check.
+    ///
+    /// `Branch` for the ref, the same type and the same field spelling `ActOp::WorkflowRun` uses —
+    /// this is `gh`'s argv either way, and a second type for the same guard is how the two come to
+    /// disagree.
+    ChecksForRef {
+        repo: Repo,
+        r#ref: Branch,
     },
 }
 
@@ -144,9 +190,13 @@ impl ReadOp {
             ReadOp::RunList { .. } => "run_list",
             ReadOp::RunStatus { .. } => "run_status",
             ReadOp::PrList { .. } => "pr_list",
+            ReadOp::WorkflowList { .. } => "workflow_list",
             ReadOp::PrView { .. } => "pr_view",
             ReadOp::IssueView { .. } => "issue_view",
             ReadOp::RunLogs { .. } => "run_logs",
+            ReadOp::PrDiff { .. } => "pr_diff",
+            ReadOp::PrThread { .. } => "pr_thread",
+            ReadOp::ChecksForRef { .. } => "checks_for_ref",
         }
     }
 
@@ -155,14 +205,60 @@ impl ReadOp {
     /// Structure — a status, a conclusion, a list of workflow names — is `ReadsOwn`. Prose somebody
     /// wrote is `ReadsUntrusted`, and it burns the turn's right to act, which is the trade the
     /// design accepts on purpose.
+    ///
+    /// "Structure" and "prose" are the shorthand and not the rule. Three of the four `ReadsOwn`
+    /// reads do carry stranger-chosen words; what keeps them on that side is how few and how
+    /// short-shaped, and the first comment in the body is where that is set out. Grade a new
+    /// variant against that comment, never against this sentence.
     pub fn effect(&self) -> ToolEffect {
         match self {
-            ReadOp::RunList { .. } | ReadOp::RunStatus { .. } | ReadOp::PrList { .. } => {
-                ToolEffect::ReadsOwn
-            }
-            ReadOp::PrView { .. } | ReadOp::IssueView { .. } | ReadOp::RunLogs { .. } => {
-                ToolEffect::ReadsUntrusted
-            }
+            // **`ReadsOwn` here does NOT mean "no stranger wrote any of this".** Saying it did would
+            // be the most convenient rule to state and it is false, so it is worth killing before
+            // somebody grades a seventh read by it. `gh pr list` returns titles, author logins and
+            // head branch names chosen by anybody with a GitHub account; `gh run list` and `gh run
+            // view` show a run's display title, which for a `pull_request`-triggered run IS the pull
+            // request's title. Three of these four already carry a stranger's words. This same file
+            // says so 800 lines down, in the sentence that refuses `--limit`: `gh pr list` is called
+            // "an injection channel" there, in those words.
+            //
+            // What actually separates the two arms is how much of a stranger's text can arrive and
+            // in what shape. `ReadsOwn` is a deliberate, narrow tolerance: a stranger reaches these
+            // four only through short fixed-shape fields — one title, one login, one branch name per
+            // row — in a listing whose row count `gh` caps at thirty and which `REFUSED_READ_FLAGS`
+            // refuses to let a caller raise. That cap is not a performance detail, it is half of
+            // this grading, which is why `--limit` and its `-L` spelling are refused rather than
+            // capped. `WorkflowList` is the one with no tolerance to spend: workflow files live on
+            // the repository's own branches, so it is committer-authored outright.
+            ReadOp::RunList { .. }
+            | ReadOp::RunStatus { .. }
+            | ReadOp::PrList { .. }
+            | ReadOp::WorkflowList { .. } => ToolEffect::ReadsOwn,
+            // And the arm below is where that tolerance is gone. Not because the output is long, or
+            // free-form, or unparsed — `RunList` is all three — but because a stranger authors it
+            // WHOLE and at a length nothing bounds: a patch, a thread, a check's summary. There is
+            // no fixed-shape field to point at and no row cap to lean on, so the only honest answer
+            // is that the turn has read somebody else's words.
+            //
+            // `ChecksForRef` is the one that looks structural and is not, and the mechanism is worth
+            // getting right because the obvious version of it is wrong. It is NOT that a fork's
+            // workflow file runs: for `pull_request` events GitHub takes the workflow from the BASE
+            // ref, which is the whole point of that event. It is that a check's name, its summary
+            // and its details URL are free text written by whatever produced the check — any GitHub
+            // App holding `checks:write` on the repository, and any workflow running on a same-repo
+            // pull request branch. The states are GitHub's; the prose beside them is not.
+            //
+            // What the grading costs, so that it is chosen and not stumbled into: the turn is
+            // latched. `effect_of_call` reads this through `effect_of_kind`, the answer comes back
+            // fenced by `fence_untrusted`, and `permitted_after_untrusted` refuses every `Acts` tool
+            // for the rest of the turn — `github_act` included, and on the cloud path as well as the
+            // local one. A run that reads the diff cannot then comment on the pull request. That is
+            // the trade, and for text a stranger chose it is the right way round.
+            ReadOp::PrView { .. }
+            | ReadOp::IssueView { .. }
+            | ReadOp::RunLogs { .. }
+            | ReadOp::PrDiff { .. }
+            | ReadOp::PrThread { .. }
+            | ReadOp::ChecksForRef { .. } => ToolEffect::ReadsUntrusted,
         }
     }
 
@@ -173,6 +269,7 @@ impl ReadOp {
                 argv(&["run", "view"], [repo_flag(repo)], &[id.as_str()])
             }
             ReadOp::PrList { repo } => argv(&["pr", "list"], [repo_flag(repo)], &[]),
+            ReadOp::WorkflowList { repo } => argv(&["workflow", "list"], [repo_flag(repo)], &[]),
             ReadOp::PrView { repo, number } => {
                 argv(&["pr", "view"], [repo_flag(repo)], &[number.as_str()])
             }
@@ -184,6 +281,19 @@ impl ReadOp {
                 [repo_flag(repo), "--log".to_owned()],
                 &[id.as_str()],
             ),
+            ReadOp::PrDiff { repo, number } => {
+                argv(&["pr", "diff"], [repo_flag(repo)], &[number.as_str()])
+            }
+            // `--comments` is a boolean this module writes, like `--log` above: it carries no caller
+            // value, so it may be a bare flag ahead of the terminator.
+            ReadOp::PrThread { repo, number } => argv(
+                &["pr", "view"],
+                [repo_flag(repo), "--comments".to_owned()],
+                &[number.as_str()],
+            ),
+            ReadOp::ChecksForRef { repo, r#ref } => {
+                argv(&["pr", "checks"], [repo_flag(repo)], &[r#ref.as_str()])
+            }
         }
     }
 
@@ -206,6 +316,7 @@ impl ReadOp {
                 id: RunId::new("1").expect("the sample run id is valid"),
             },
             ReadOp::PrList { repo: repo.clone() },
+            ReadOp::WorkflowList { repo: repo.clone() },
             ReadOp::PrView {
                 repo: repo.clone(),
                 number: PrNumber::new("1").expect("the sample pr number is valid"),
@@ -215,8 +326,20 @@ impl ReadOp {
                 number: IssueNumber::new("1").expect("the sample issue number is valid"),
             },
             ReadOp::RunLogs {
-                repo,
+                repo: repo.clone(),
                 id: RunId::new("1").expect("the sample run id is valid"),
+            },
+            ReadOp::PrDiff {
+                repo: repo.clone(),
+                number: PrNumber::new("1").expect("the sample pr number is valid"),
+            },
+            ReadOp::PrThread {
+                repo: repo.clone(),
+                number: PrNumber::new("1").expect("the sample pr number is valid"),
+            },
+            ReadOp::ChecksForRef {
+                repo,
+                r#ref: Branch::new("main").expect("the sample ref is valid"),
             },
         ];
         for operation in &every {
@@ -224,9 +347,13 @@ impl ReadOp {
                 ReadOp::RunList { .. }
                 | ReadOp::RunStatus { .. }
                 | ReadOp::PrList { .. }
+                | ReadOp::WorkflowList { .. }
                 | ReadOp::PrView { .. }
                 | ReadOp::IssueView { .. }
-                | ReadOp::RunLogs { .. } => {}
+                | ReadOp::RunLogs { .. }
+                | ReadOp::PrDiff { .. }
+                | ReadOp::PrThread { .. }
+                | ReadOp::ChecksForRef { .. } => {}
             }
         }
         every
@@ -407,10 +534,14 @@ impl Op {
         }
     }
 
-    /// Every operation, for the partition test. Test-only, and said so rather than left to be
-    /// discovered: `clippy --all-targets` computes dead code per target, so an item the tests alone
-    /// use is dead in the bin build.
-    #[allow(dead_code)]
+    /// Every operation: the union decision #4 puts one list of names over. `gh_forms` derives the
+    /// map from this, and the partition test holds the two halves apart with it.
+    ///
+    /// It stopped being test-only when the map arrived, and it carried an `#[allow(dead_code)]` for
+    /// one more commit because the bin build reached it only through `op_kind_of_gh_command`, which
+    /// was itself waiting for its caller. That caller is `Policy::read_is_autonomous`, and it landed
+    /// with `Policy::for_project`; the allow came off with the map's own, exactly as the sentence
+    /// here promised it would.
     pub fn all() -> Vec<Self> {
         ReadOp::all()
             .into_iter()
@@ -430,9 +561,14 @@ impl Op {
 pub struct ReadRequest {
     pub operation: String,
     pub repo: String,
-    /// A run id for `run_status` and `run_logs`, a number for `pr_view` and `issue_view`, and
-    /// nothing at all for the two listings. One field rather than three, because the model reading
-    /// this has to fill in one thing and choosing which name it is called by is not that thing.
+    /// A run id for `run_status` and `run_logs`, a pull request number for `pr_view`, `pr_diff` and
+    /// `pr_thread`, an issue number for `issue_view`, a REF for `checks_for_ref`, and nothing at
+    /// all for the three listings. One field rather than five, because the model reading this has to
+    /// fill in one thing and choosing which name it is called by is not that thing.
+    ///
+    /// `checks_for_ref` is the arm where the name fits worst and the field still earns its keep: the
+    /// alternative is a second optional string that is empty for every other operation, which is how
+    /// a caller ends up filling in neither.
     pub id: Option<String>,
 }
 
@@ -476,6 +612,7 @@ impl ReadOp {
         match operation.as_str() {
             "run_list" => Ok(ReadOp::RunList { repo }),
             "pr_list" => Ok(ReadOp::PrList { repo }),
+            "workflow_list" => Ok(ReadOp::WorkflowList { repo }),
             "run_status" => Ok(ReadOp::RunStatus {
                 repo,
                 id: RunId::new(&required(id, "run_status", "run id")?)?,
@@ -491,6 +628,21 @@ impl ReadOp {
             "issue_view" => Ok(ReadOp::IssueView {
                 repo,
                 number: IssueNumber::new(&required(id, "issue_view", "issue number")?)?,
+            }),
+            "pr_diff" => Ok(ReadOp::PrDiff {
+                repo,
+                number: PrNumber::new(&required(id, "pr_diff", "pull request number")?)?,
+            }),
+            "pr_thread" => Ok(ReadOp::PrThread {
+                repo,
+                number: PrNumber::new(&required(id, "pr_thread", "pull request number")?)?,
+            }),
+            // The one operation whose `id` is not a number. The field is still `id`, because the
+            // flat parameters exist to give the model ONE thing to fill in — the doc on that field
+            // is where the difference is said, not in a second field nobody would know to use.
+            "checks_for_ref" => Ok(ReadOp::ChecksForRef {
+                repo,
+                r#ref: Branch::new(&required(id, "checks_for_ref", "ref")?)?,
             }),
             // Every acting operation is named here rather than falling into the unknown arm, because
             // a caller told "unknown operation: pr_comment" would think it had misspelled something.
@@ -690,6 +842,156 @@ impl Repo {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// PURE: the repository a git remote URL names, when the remote is one of GitHub's.
+    ///
+    /// **The single spelling of this translation, and that is the whole reason it is a function.**
+    /// `GET /projects/detect` already reads a folder's `origin` and reports the URL verbatim; this
+    /// is the step after it, and a second copy of it somewhere else is how the wizard and this route
+    /// would come to disagree about which repository a project is — a disagreement neither side
+    /// could see, because both would be reporting a plausible `owner/name`.
+    ///
+    /// `None` for every remote this cannot read, and the caller must not flatten that into an
+    /// error: a project on GitLab, a remote that is a folder on a disk, and a `github.com` URL that
+    /// names no repository are all ordinary things for a project to have. What they have in common
+    /// is that `gh` has nothing to be pointed at, which is the only fact this answers.
+    ///
+    /// **`github.com` and nothing else.** An Enterprise host is a real deployment and it is not this
+    /// one: `gh` here is the daemon's, configured for the public host, so admitting
+    /// `github.example.com` would produce a repository the CLI would then fail to reach with a
+    /// message about a host nobody named. Narrow and said out loud beats wide and wrong.
+    pub fn from_remote_url(url: &str) -> Option<Self> {
+        const GITHUB_HOST: &str = "github.com";
+
+        let url = url.trim();
+        let (authority, path) = match url.split_once("://") {
+            // `https://github.com/owner/name.git`, `ssh://git@github.com/owner/name`.
+            Some((_, rest)) => rest.split_once('/')?,
+            // The scp-like spelling git writes for `git@github.com:owner/name.git`: no scheme, and
+            // the path hangs off a colon rather than a slash. Split before any `@` is stripped, so
+            // that a path containing one cannot be mistaken for userinfo.
+            None => url.split_once(':')?,
+        };
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let host = host.split_once(':').map_or(host, |(host, _)| host);
+        if !host.eq_ignore_ascii_case(GITHUB_HOST) {
+            return None;
+        }
+
+        let path = path.trim_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        // Still `Repo::new` that decides, exactly as everywhere else in this module: this function
+        // finds the candidate, and the type is what admits it. A remote whose path is `owner` or
+        // `owner/name/extra` is refused here for the same reason a caller naming one would be.
+        Repo::new(path).ok()
+    }
+}
+
+/// Which repository a registered project's `origin` points at, or why there is no answer.
+///
+/// **Every arm but the first is an ordinary state and none of them is an error**, which is why this
+/// is a value and not a `Result`. A typed read carries a `Repo`, and until this landed nothing in
+/// the daemon could produce one for a project — so a page asking "what is happening on this
+/// project's remote" had to either guess or say nothing. The arms are separate because the sentence
+/// a person needs is different in each: a project switched `off` has had its root cleared and wants
+/// a mode change, a root that is gone wants a folder, a repository with no `origin` wants a remote
+/// added, and a project on GitLab wants nothing at all — it is simply not a question this app
+/// answers, and saying so is the honest end of it.
+///
+/// It is `map_orphan::Orphan`'s discipline applied to a smaller question: *I looked and there is
+/// none* and *I could not look* must never arrive as the same word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProjectRepo {
+    /// `origin` is a GitHub repository, and this is it.
+    ///
+    /// Carries the URL as well as the slug because they are two different facts and the page shows
+    /// both: the slug is what a read is sent, and the URL is what somebody checks it against when
+    /// the slug is not the repository they expected.
+    Known { repo: Repo, remote: String },
+    /// The project is on the roster with no folder named.
+    ///
+    /// The state a project in `off` mode is in — `set_project_mode` clears the root — so this is not
+    /// a broken row, it is the ordinary shape of a project nobody is running.
+    NoRoot,
+    /// A folder is named and it is not there.
+    ///
+    /// Distinct from [`ProjectRepo::NoRoot`] for the reason `map_orphan` keeps `Unreadable` apart
+    /// from `NoRepository`: the advice differs completely. One asks somebody to point the project
+    /// somewhere; the other says the place it points has moved or been deleted.
+    RootMissing { root: String },
+    /// The folder is there and git does not keep anything in it.
+    ///
+    /// `set_project_mode` only insists on a repository for `active`, so a registered project that is
+    /// not a checkout is a state this daemon deliberately allows.
+    NotARepository { root: String },
+    /// A repository with no `origin`.
+    ///
+    /// A local-only project is a project — `origin_and_head` says so about the folder a wizard is
+    /// looking at, and it stays true of one already on the roster.
+    NoRemote { root: String },
+    /// There is an `origin` and it is not a GitHub repository.
+    ///
+    /// Carries the URL, because the whole content of this answer is *this is where your project
+    /// points and it is not somewhere `gh` can be sent*, and that sentence is unreadable without it.
+    NotGithub { remote: String },
+}
+
+/// Which repository a project's `origin` points at.
+///
+/// **The one production path from a project id to a `Repo`.** `vcs::resolve_repo` answers the
+/// neighbouring question — which lock on this machine a project shares — and returns a folder; this
+/// answers which repository on GitHub it is, and the two must not be confused for each other.
+///
+/// The remote is read with [`crate::git_exec::origin_and_head`], which is the reader
+/// `GET /projects/detect` already uses. Its `head` is thrown away here and that is deliberate: one
+/// reader of `origin` in this daemon rather than two, and the cost of the second local `git log` is
+/// smaller than the cost of the two readers eventually disagreeing.
+///
+/// `Ok(None)` is a project the roster has never heard of, and `Err` is the database failing.
+/// Everything else the filesystem or git can say is an arm of [`ProjectRepo`].
+pub async fn project_repo(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<ProjectRepo>, sqlx::Error> {
+    // Asked separately from the root, because `project_root` cannot tell a project that has no
+    // folder from one the roster does not hold — both are `None` — and those are a 200 and a 404.
+    let known: Option<String> =
+        sqlx::query_scalar("SELECT project_id FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
+    if known.is_none() {
+        return Ok(None);
+    }
+
+    let Some(root) = crate::inspect::project_root(pool, project_id).await? else {
+        return Ok(Some(ProjectRepo::NoRoot));
+    };
+
+    let path = std::path::PathBuf::from(&root);
+    if !path.is_dir() {
+        return Ok(Some(ProjectRepo::RootMissing { root }));
+    }
+    // `.exists()` and not `.is_dir()`: in a linked worktree `.git` is a FILE pointing at the real
+    // one, and a check that insisted on a directory would report every worktree as not a
+    // repository. `detect::inspect_folder` decides `is_git` the same way.
+    if !path.join(".git").exists() {
+        return Ok(Some(ProjectRepo::NotARepository { root }));
+    }
+
+    let (remote, _head) = crate::git_exec::origin_and_head(&path, deadline).await;
+    let Some(remote) = remote else {
+        return Ok(Some(ProjectRepo::NoRemote { root }));
+    };
+
+    Ok(Some(match Repo::from_remote_url(&remote) {
+        Some(repo) => ProjectRepo::Known { repo, remote },
+        None => ProjectRepo::NotGithub { remote },
+    }))
 }
 
 /// A branch name this module is willing to put on a `gh` command line.
@@ -880,10 +1182,32 @@ pub const READ_CEILING: &[&str] = &[
 
 /// The `ActOp` kinds eligible for autonomy. `api_read` is outside it and stays outside.
 ///
-/// `pr_create` is outside too, and for its own reason rather than `api_read`'s: opening a pull request
-/// publishes a title and a body under the owner's name to people who will read them as the owner's
-/// words. That is not undoable by closing it.
-pub const ACTION_CEILING: &[&str] = &["workflow_run", "run_rerun", "pr_comment", "issue_close"];
+/// **`pr_create` is inside, and it publishes to somebody else's server, which is worth saying
+/// plainly rather than leaving to be noticed.** It puts a title and a body under the owner's name
+/// where people will read them as the owner's words, and closing the pull request afterwards does
+/// not unsend that. What makes it admissible anyway is the shape of what it creates: a pull request
+/// is a PROPOSAL addressed to a human, and it merges nothing. The repository is in exactly the state
+/// it was in a moment before, and the next step belongs to a reviewer who has to press something.
+/// That is the same bargain `pr_comment` and `issue_close` already made — public, attributable,
+/// bounded — and `pr_create` is not a larger one for being longer.
+///
+/// It was outside this list while the reasoning stopped at "publishes under the owner's name". That
+/// sentence is true and is also true of `pr_comment`, which was inside; the ceiling was drawing a
+/// line the two sides of which it could not tell apart.
+///
+/// `api_read` is refused by a different test and never by that one. It is not "an action that goes
+/// further" — it is an arbitrary REST call, so its blast radius is not bounded by its name and no
+/// paragraph here can describe what it does. `gh api` deletes a repository with the verb it reads an
+/// issue with. Every other entry here names one operation whose worst case can be written down;
+/// that is the property the list is selecting for, and `api_read` is the one variant that cannot
+/// have it.
+pub const ACTION_CEILING: &[&str] = &[
+    "workflow_run",
+    "run_rerun",
+    "pr_create",
+    "pr_comment",
+    "issue_close",
+];
 
 /// Flags that take autonomy away from a prefix that had it.
 ///
@@ -902,7 +1226,9 @@ pub const ACTION_CEILING: &[&str] = &["workflow_run", "run_rerun", "pr_comment",
 ///   injection channel, HOW MANY is the payload. `gh pr list --limit 1000` is a thousand
 ///   stranger-chosen titles in a call that marks nothing, against `gh`'s default of thirty.
 ///   Refusing the flag rather than capping it is deliberate — a cap would mean reading a flag's
-///   VALUE, and this comparison reads tokens.
+///   VALUE, and this comparison reads tokens. **`ReadOp::effect` leans on this entry**: `PrList` is
+///   `ReadsOwn` because a stranger reaches it through thirty short fields and no further, so the
+///   day `--limit` stops being refused is the day that grading stops being true.
 ///
 /// **Every entry has two spellings and the second one does not remember itself.** `-q`, `-t` and
 /// `-L` are the short forms of `--jq`, `--template` and `--limit`, and `-L` was added a review after
@@ -921,22 +1247,421 @@ pub const REFUSED_READ_FLAGS: &[&str] = &[
     "--limit",
 ];
 
+/// One row of the map below: what a `gh` command line has to say in order to BE one operation.
+///
+/// Neither field is written here. Both are read off the operation's own `argv()` — see `gh_forms`.
+#[derive(Debug)]
+struct GhForm {
+    kind: &'static str,
+    /// The literal subcommand words, in order: `["run", "view"]`. This module's, never a caller's.
+    subcommand: Vec<String>,
+    /// The valueless flags this module writes for THIS operation and not for the one it shares a
+    /// subcommand with — the `--log` that makes `gh run view` mean `run_logs`. Empty for most rows.
+    switches: Vec<String>,
+}
+
+impl GhForm {
+    /// PURE: whether the words AFTER `gh` ask for this operation.
+    ///
+    /// The subcommand is compared case-insensitively and the switches are not. That is not an
+    /// inconsistency but the same split `read_is_autonomous` already makes, for the reason it gives:
+    /// it lowercases before comparing a prefix and reads RAW tokens for the flags, because `-L` is
+    /// `gh`'s short `--limit` while `-l` is its short `--label`. Two functions asked to agree about
+    /// one command line had better fold case in the same places.
+    ///
+    /// **A switch this row does not name does not stop the row from matching.** `gh pr list --state
+    /// open` is `pr_list` here, and so is `gh pr list --json body`: this step asks only which
+    /// operation the words describe. Whether that naming SURVIVES a flag which changes what comes
+    /// back is a second question, and `op_kind_of_gh_command` is where it is asked.
+    fn matches(&self, arguments: &[String]) -> bool {
+        let Some(rest) = arguments.get(self.subcommand.len()..) else {
+            return false;
+        };
+        if !self
+            .subcommand
+            .iter()
+            .zip(arguments)
+            .all(|(part, word)| word.eq_ignore_ascii_case(part))
+        {
+            return false;
+        }
+        // Everything past `--` is a positional, so a `--log` sitting there is a run id and not a
+        // flag. `read_is_autonomous` deliberately does NOT stop at the terminator — for a REFUSAL,
+        // reading the whole line is the conservative direction — and the two are the right way
+        // round: a refusal should err towards no, and this should err towards the truth about which
+        // operation was asked for.
+        let flags: Vec<&String> = rest
+            .iter()
+            .take_while(|word| word.as_str() != "--")
+            .collect();
+        self.switches
+            .iter()
+            .all(|switch| flags.iter().any(|word| word_is_flag(word, switch)))
+    }
+}
+
+/// PURE: the map, derived from the operations instead of written out beside them.
+///
+/// **Two rules turn an argv into a form, and each is an invariant this file already tests.** A word
+/// before the terminator that does not begin with `-` is a subcommand word, because `argv` builds
+/// every argv as subcommand, then flags, then `--`, then positionals — which
+/// `the_terminator_appears_exactly_where_a_positional_does` holds it to. A flag token carrying no
+/// `=` is one of this module's own booleans and therefore says WHICH operation this is; a
+/// `--flag=value` carries a caller's string and says nothing, because every operation's `--repo=`
+/// looks alike. That second rule is the one sentence of this map not read off the data, and
+/// `no_caller_value_reaches_argv_where_it_could_act_as_a_flag` is what keeps it true — that test
+/// even spells out the same two booleans, as the list this function computes instead.
+///
+/// **Built once.** Nothing calls it yet, but its first caller is the classifier's path, which runs
+/// for every Bash tool call a run makes — and rebuilding sixteen argvs per command line would be a
+/// cost with nothing bought by it. The function is pure and the operations do not change while the
+/// process lives, which is the whole precondition a `OnceLock` needs.
+fn gh_forms() -> &'static [GhForm] {
+    static FORMS: std::sync::OnceLock<Vec<GhForm>> = std::sync::OnceLock::new();
+    FORMS.get_or_init(|| {
+        Op::all()
+            .iter()
+            .map(|op| {
+                let mut subcommand = Vec::new();
+                let mut switches = Vec::new();
+                for word in op.argv() {
+                    if word == "--" {
+                        break;
+                    }
+                    match (word.starts_with('-'), word.contains('=')) {
+                        (true, false) => switches.push(word),
+                        (true, true) => {}
+                        (false, _) => subcommand.push(word),
+                    }
+                }
+                GhForm {
+                    kind: op.kind(),
+                    subcommand,
+                    switches,
+                }
+            })
+            .collect()
+    })
+}
+
+/// PURE: which operation a `gh` command line asks for, or `None` for a line no operation builds.
+///
+/// **This is the map decision #4 moves into the code** —
+/// `.ai/specs/2026-09-03-alcada-por-projecto-design.md`, §1.2 for the defect and §2 for the
+/// decision. The pillar has two doors and each was governed in its own vocabulary: `ACTION_CEILING`
+/// and `action_is_autonomous` speak operation KINDS, `READ_CEILING` and `read_is_autonomous` speak
+/// `gh` PREFIXES. Two vocabularies for one question is how the two doors came to answer it
+/// differently, and the design measured what that costs an owner: a `.ai/github.yaml` without `gh
+/// run view` stops an agent that types it into Bash and hands the same agent the same bytes through
+/// `github_read {op: run_status}`. One list of NAMES can govern both doors only if something can say
+/// which name a command line spells. This says it.
+///
+/// **It is not a prefix table, and `gh run view` is the reason.** That one subcommand serves two
+/// operations this module grades apart — `run_status` is `ReadsOwn`, `run_logs` is `ReadsUntrusted`
+/// — and what separates them is a flag, `--log`, which is why the flag sits in `REFUSED_READ_FLAGS`
+/// and why `declarable_github_ops` refuses `run_logs` while admitting the prefix it shares. `gh pr
+/// view` is the same shape a second time, `pr_view` against `pr_thread`, separated by `--comments`.
+/// Two of them is what makes the pair a rule rather than an exception, and a prefix table would have
+/// to pick one of each pair and be wrong about the other.
+///
+/// **And `gh run view` serves a THIRD spelling, which is why the derivation alone is not enough.**
+/// `--log-failed` returns the log of a failed step — a stranger's words — and no `ReadOp` builds it,
+/// so no form names it and nothing in `gh_forms` can see it. Left there, this map would answer
+/// `run_status` to a line that returns log text: a `ReadsOwn` operation, inside `READ_CEILING`, and
+/// one a project may declare. The guard below is what closes that, and it reads
+/// `REFUSED_READ_FLAGS` rather than growing a list of its own — that constant is already the
+/// module's curated answer to "which flags change the KIND of thing that comes back", in its own
+/// words, and a second list would be a second thing to keep in step.
+///
+/// **An allowlist, and by construction rather than by a second table.** `ReadOp` and `ActOp` are
+/// closed sets, so `gh auth token` and `gh secret list` fall outside this map the way they fall
+/// outside `READ_CEILING` — by absence, with nothing here to keep in step with a list of exclusions.
+/// It is the argument `READ_CEILING`'s own doc makes for itself, inherited.
+///
+/// **`Policy::read_is_autonomous` is the caller**, and it asks this only after its own refused-flag
+/// check has already run. That order is not incidental: a name from this map is not a grant, and the
+/// guard below is narrower than the constant it reads — see that function's doc for the half of
+/// `REFUSED_READ_FLAGS` this one deliberately does not cover.
+pub fn op_kind_of_gh_command(command: &str) -> Option<&'static str> {
+    let words = crate::classifier::shell_words(command);
+    let (program, arguments) = words.split_first()?;
+    if !program.eq_ignore_ascii_case("gh") {
+        return None;
+    }
+    let mut matched: Vec<&GhForm> = gh_forms()
+        .iter()
+        .filter(|form| form.matches(arguments))
+        .collect();
+    // Longest subcommand first, then the most switches accounted for: `gh run view --log 1` matches
+    // both rows of the pair, and the row that named `--log` is the row that meant it.
+    matched.sort_by_key(|form| (form.subcommand.len(), form.switches.len()));
+    let best = matched.pop()?;
+    let rank = (best.subcommand.len(), best.switches.len());
+    if matched
+        .last()
+        .is_some_and(|next| (next.subcommand.len(), next.switches.len()) == rank)
+    {
+        // Two operations one line could equally be. There are none today — that is what
+        // `no_two_operations_wear_the_same_gh_form` says — and on the day there is one, a guess is a
+        // worse answer than no answer: whoever calls this map is deciding autonomy with it.
+        return None;
+    }
+    // The same rule one place further: a flag that changes WHAT COMES BACK changes which operation
+    // this is, and a line carrying one the winning form does not itself name is a line this map
+    // cannot honestly name either. `--log-failed` is the case that needs it and the case the
+    // derivation could never find — see the third paragraph above.
+    //
+    // The form's OWN switches are exempt, and that exemption is what keeps `run_logs` nameable by
+    // the very flag that defines it: `--log` is in `REFUSED_READ_FLAGS` because a PREFIX could not
+    // say "`gh run view` without it", which is the problem a name does not have.
+    //
+    // Scanned across the whole line, terminator and all, where `matches` deliberately stops short of
+    // it. The two directions are each right for their own question: naming an operation should err
+    // towards the truth about which one it is, and refusing to name one should err towards no.
+    let carries_a_flag_of_another_operation = REFUSED_READ_FLAGS.iter().any(|flag| {
+        !best.switches.iter().any(|switch| switch == flag)
+            && arguments.iter().any(|word| word_is_flag(word, flag))
+    });
+    if carries_a_flag_of_another_operation {
+        return None;
+    }
+    Some(best.kind)
+}
+
+/// PURE: whether this word is `flag`, in either spelling pflag accepts for it.
+///
+/// One function because it is one rule, and it is held in two places that have to agree about the
+/// same command line: `read_is_autonomous` reads it to take autonomy away and `GhForm` reads it to
+/// tell two operations apart. Equality alone would let `--json=body` through, which is one character
+/// of difference between an implementation that works and one that looks like it does — and a second
+/// copy of that character is exactly how the two would come to disagree.
+fn word_is_flag(word: &str, flag: &str) -> bool {
+    word == flag || word.starts_with(&format!("{flag}="))
+}
+
+// **Where the map is going: `gh` in Bash stops being autonomous, and `REFUSED_READ_FLAGS` goes with
+// it.** Decision #6 of `.ai/specs/2026-09-03-alcada-por-projecto-design.md`, written down here as
+// the destination and deliberately not taken.
+//
+// **It is not a refusal.** A `gh` line an agent needs can still be ASKED for: it becomes a
+// `pending_approval` like every other command this house has no opinion about, and a person
+// answers. What ends is the line running with nobody asked, on the strength of a prefix.
+//
+// **`REFUSED_READ_FLAGS` ends with it, because a typed operation has no flags.** That constant
+// exists for exactly one reason, and its own doc says so: a prefix cannot spell "`gh run view`
+// without `--log`", so the flags had to be refused beside the prefix. A NAME spells it —
+// `run_status` and `run_logs` are two entries and the caller picks one — and there is no `--json`
+// for a caller to reach for, because `ReadRequest` has three fields and not one of them is a flag.
+// The paragraph in that constant about short forms that do not remember themselves is a paragraph
+// about a failure mode the typed door does not have.
+//
+// **What has to be true first**, so that whoever reads this can tell whether the moment has arrived
+// instead of deciding that it has:
+//
+// - **The typed read door has to consult the list.** Today it does not — `submit` runs every read
+//   without asking anything, which its own doc states on purpose — so closing Bash now would WIDEN
+//   autonomy rather than narrow it: everything Bash refuses would simply be typed instead, and the
+//   owner's file would go from half an effect to none. This is the first condition and not one
+//   among several.
+// - **The catalogue has to cover what people actually type.** Not "cover `READ_CEILING`" — it
+//   already does, and `every_read_ceiling_prefix_is_built_by_a_real_operation` is what says so. The
+//   evidence lives on the other side: runs that stop and wait for a person on a `gh` line
+//   `op_kind_of_gh_command` cannot name. While those keep arriving the catalogue is short, and the
+//   answer is one more `ReadOp` — the way `WorkflowList`, `PrDiff`, `PrThread` and `ChecksForRef`
+//   each were, one measured gap at a time.
+// - **The tests above have to be measuring something other than themselves.**
+//   `one_name_picks_out_the_same_operation_at_both_doors` feeds the map the lines the operations
+//   build, so it can never discover a line nobody typed. It proves the map is faithful to the
+//   catalogue and says nothing about whether the catalogue is wide enough, and it is that second
+//   question this step turns on. A green suite is not the signal.
+//
+// **And until that day, a name from the map is not a grant.** The paragraph above about
+// `REFUSED_READ_FLAGS` ending is true of the DESTINATION and false of every state before it.
+// `Policy::for_project` consumes the map while the Bash door is still open, and in that interim a
+// caller still holds a `gh` line with flags on it — `read_is_autonomous`'s flag check runs AFTER the
+// map and not instead of it. The map's own refused-flag guard covers the flags that change which
+// operation a line is; the rest of that constant, `--limit` above all, is a bound on HOW MUCH a
+// stranger gets to say, and `ReadOp::effect` leans on it by name. Whoever reads this comment while
+// implementing the interim step is the person likeliest to delete the only guard there is.
+//
+// The day all three hold, the change is small and almost entirely deletion: `READ_CEILING` and
+// `REFUSED_READ_FLAGS` go, `read_is_autonomous` goes with them, and `classifier.rs::Segment::
+// GithubRead` has nothing left to classify. **The map above goes too**, and that is not a loss but
+// the shape of the thing: it exists to read a `gh` command line, and after this step no `gh`
+// command line is being read for autonomy — which is also why its refused-flag guard may not
+// outlive the constant it consults. That the step is a deletion is the point. It is the proof the
+// two vocabularies really did become one, and until then this comment is a plan and not an
+// achievement.
+
+/// PURE: the widest policy this codebase can construct — both compiled ceilings, entire.
+///
+/// It exists so that "inside the ceiling" is asked in exactly the way production asks it, of the
+/// same two functions, rather than by a second comparison somebody would have to keep in step.
+fn ceiling_policy() -> Policy {
+    Policy::from_config(&crate::config::GithubConfig {
+        enabled: true,
+        autonomous_reads: READ_CEILING
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect(),
+        autonomous_actions: ACTION_CEILING
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect(),
+    })
+}
+
+/// PURE: the READ operations a project may declare, by name.
+///
+/// **Derived, never written out.** The kinds come off `ReadOp::all()` through `kind()`, and
+/// admissibility is asked of `ceiling_policy` — the same question production asks of the owner's
+/// file. A hand-written list would be a second spelling of a set that already exists, and a second
+/// spelling is how a set drifts.
+///
+/// Matched on the COMMAND each operation builds and not on its kind, because `READ_CEILING` is
+/// written in `gh` prefixes and this half has to be asked in its own vocabulary. That is also what
+/// excludes `run_logs`, whose argv carries `--log`: `REFUSED_READ_FLAGS` refuses it here exactly as
+/// it refuses the same flag typed into Bash. `pr_view` is excluded the same way and just as
+/// deliberately — `READ_CEILING`'s own doc refuses it in words.
+///
+/// Built once, for `gh_forms`' reason: its caller is the decision path.
+fn declarable_read_ops() -> &'static [&'static str] {
+    static KINDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KINDS.get_or_init(|| {
+        let ceiling = ceiling_policy();
+        ReadOp::all()
+            .iter()
+            .filter(|operation| {
+                ceiling.read_is_autonomous(&format!("gh {}", operation.argv().join(" ")))
+            })
+            .map(|operation| operation.kind())
+            .collect()
+    })
+}
+
+/// PURE: the ACTIONS a project may declare, by name.
+///
+/// `api_read` is outside `ACTION_CEILING`, so it is outside this, so a project cannot declare it —
+/// the ceiling holding across a route that did not exist when it was written.
+fn declarable_act_ops() -> &'static [&'static str] {
+    static KINDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KINDS.get_or_init(|| {
+        let ceiling = ceiling_policy();
+        ActOp::all()
+            .iter()
+            .filter(|operation| ceiling.action_is_autonomous(operation.kind()))
+            .map(|operation| operation.kind())
+            .collect()
+    })
+}
+
+/// Every operation kind a project may declare, reads first and actions after.
+///
+/// One list, because decision #4 gives the owner one list of NAMES. Two halves underneath, because
+/// decision #5 keeps the partition in the TYPES and each door may only ever be answered by its own
+/// half: `Policy::for_project` narrows against this list and then splits on `declarable_read_ops`,
+/// so both decisions are honoured, in that order, by construction rather than by a check anyone
+/// could forget.
+pub fn declarable_ops() -> Vec<&'static str> {
+    declarable_read_ops()
+        .iter()
+        .chain(declarable_act_ops())
+        .copied()
+        .collect()
+}
+
+/// Where one operation stands against the ceilings.
+///
+/// `declarable` is the same question `declarable_ops` answers and asked of the same two functions —
+/// this is not a second derivation, it is that one carrying the operations it says no to as well as
+/// the ones it says yes to.
+pub struct OpStanding {
+    /// The typed name, as `op_kind` is written in `project_github_ops` and in the POST body.
+    pub kind: &'static str,
+    /// Which door this operation goes through — `"read"` or `"action"`, the two words
+    /// `config::GithubConfig` already uses for its own two lists.
+    ///
+    /// It is here because the two halves are not the same promise once declared, and only the
+    /// núcleo knows which is which. A declared READ binds the very next decision:
+    /// `Policy::for_project` splits the stored rows on `declarable_read_ops`, and the reading half
+    /// is already consulted through the Bash door. A declared ACTION is recorded and inert until a
+    /// later step wires it. A surface that could not tell them apart would either have to hardcode
+    /// the names — the drift this whole function exists to end — or promise an owner their declared
+    /// action is in force.
+    pub half: &'static str,
+    /// Whether a project may declare it. `false` is a fact about this build and not a state
+    /// anything can change: it means the compiled ceilings do not admit the operation, so no route,
+    /// no file and no owner can turn it on.
+    pub declarable: bool,
+}
+
+/// PURE: every operation this núcleo can build, and whether a project may declare each one.
+///
+/// **The ones it says NO to are the reason this exists.** `declarable_ops` is the set a POST
+/// accepts, and until this function that set reached the wire only inside an `undeclarable_op`
+/// refusal — so a surface offering a picker had to hardcode the list and drift from the ceilings in
+/// silence, or discover it by POSTing something invalid. Serving only the admitted names would have
+/// fixed the picker and left the other half unsayable: `api_read` is outside `ACTION_CEILING` and
+/// cannot be switched on by anybody, and that is a FACT to state rather than a control to draw. A
+/// checkbox that did nothing would be a lie about who decides.
+///
+/// Reads first and actions after, which is `Op::all`'s order and `declarable_ops`' — one list, in
+/// the order decision #5 keeps the partition in.
+///
+/// Not memoised, unlike the two halves it consults: its only caller is a route a person opens a
+/// page against, where `declarable_ops`' caller is the decision path.
+pub fn every_op() -> Vec<OpStanding> {
+    let declarable = declarable_ops();
+    Op::all()
+        .iter()
+        .map(|operation| OpStanding {
+            kind: operation.kind(),
+            half: match operation {
+                Op::Read(_) => "read",
+                Op::Act(_) => "action",
+            },
+            declarable: declarable.contains(&operation.kind()),
+        })
+        .collect()
+}
+
 /// What runs without asking.
 ///
-/// Built once at startup from `.ai/github.yaml` and then immutable: it does no I/O after
-/// construction, which is what lets `classifier::classify` take it by reference and stay pure. There
-/// is deliberately no hot reload — a policy a run could reload is a policy a run could change in the
-/// middle of itself.
+/// Built from `.ai/github.yaml` at startup as the MACHINE default, and immutable once built — it
+/// does no I/O after construction, which is what lets `classifier::classify` take it by reference
+/// and stay pure. There is deliberately no hot reload: a policy a run could reload is a policy a run
+/// could change in the middle of itself.
 ///
-/// **Both lists are intersections with a compiled ceiling, and never unions with one.** The file
-/// chooses inside what the code fixes. `.ai/` is gitignored and travels with nobody, so it is
-/// per-developer configuration no review ever sees; one line in it may not be the only thing between
-/// an autonomous run and `gh api -X DELETE`.
+/// **A project's own policy is a second value, not a mutation of this one.** `for_project` reads
+/// `project_github_ops` and returns a NEW `Policy` with the project's operations laid over the
+/// machine default; the value handed to a decision is built for that decision and thrown away
+/// after. The immutability above survives intact — what changed is that there is now more than one
+/// of these, and §4.4 of `.ai/specs/2026-09-03-alcada-por-projecto-design.md` is where that was
+/// decided and where the "read at the moment of the decision, with no cache" rule is argued.
+///
+/// **Every list here is an intersection with a compiled ceiling, and never a union with one.**
+/// Configuration chooses inside what the code fixes, and a project's table is configuration exactly
+/// as the file is. `.ai/` is gitignored and travels with nobody; a row in a database travels with
+/// nobody either. Neither may be the only thing between an autonomous run and `gh api -X DELETE`.
 ///
 /// It answers WHETHER, never HOW: `execute` builds the argv and this type never sees one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
+    /// The machine's autonomous reads, as `gh` PREFIXES, narrowed to `READ_CEILING`.
     reads: Vec<String>,
+    /// This project's autonomous reads, as operation NAMES, narrowed to `declarable_read_ops`.
+    ///
+    /// A second field and not more entries in `reads`, because the two are different vocabularies
+    /// answering the same question — which is §1.2's whole complaint — and a name is the one of the
+    /// two that can tell `run_status` from `run_logs`. `op_kind_of_gh_command` is what turns a
+    /// command line into something this list can be asked about.
+    ///
+    /// It holds only READS. An action's name never reaches it, so `gh pr comment` cannot come
+    /// through the reading door on the strength of a project having declared `pr_comment` for the
+    /// typed one.
+    read_ops: Vec<String>,
+    /// Autonomous actions, by kind, narrowed to `ACTION_CEILING`. The machine's and the project's
+    /// in ONE list, because for actions the two vocabularies already agree: both are kinds.
     actions: Vec<String>,
     digest: String,
 }
@@ -947,8 +1672,9 @@ impl Policy {
     pub fn empty() -> Self {
         Self {
             reads: Vec::new(),
+            read_ops: Vec::new(),
             actions: Vec::new(),
-            digest: digest_of(&[], &[]),
+            digest: digest_of(&[], &[], &[]),
         }
     }
 
@@ -961,16 +1687,117 @@ impl Policy {
     ///
     /// `enabled: false` collapses both lists rather than being carried as a third state. What this
     /// type answers is "does it run without asking", and a pillar the owner switched off answers no
-    /// to that in exactly the way an empty list does.
+    /// to that in exactly the way an empty list does. A project's rows must not undo that, and they
+    /// cannot: `GithubRuntime::policy_for_project` is the door the daemon uses and it is where the
+    /// switch is read, because by the time a `Policy` exists the two states are the same value.
+    ///
+    /// **This is the MACHINE default and it is unchanged by the per-project work.** It declares no
+    /// `read_ops` — that field is a project's alone — so a machine with no projects, or a run with
+    /// no project, classifies exactly as it did before `for_project` existed.
     pub fn from_config(config: &crate::config::GithubConfig) -> Self {
         if !config.enabled {
             return Self::empty();
         }
         let reads = narrow(&config.autonomous_reads, READ_CEILING, "read");
         let actions = narrow(&config.autonomous_actions, ACTION_CEILING, "action");
-        let digest = digest_of(&reads, &actions);
+        let digest = digest_of(&reads, &[], &actions);
         Self {
             reads,
+            read_ops: Vec::new(),
+            actions,
+            digest,
+        }
+    }
+
+    /// This project's policy: the machine default with the project's declared operations laid over
+    /// it.
+    ///
+    /// **It ADDS to the machine default; it does not replace it**, and the argument is the table's
+    /// own vocabulary. `project_github_ops` holds only operations somebody switched ON — there is no
+    /// `deny` here and no room for one, because presence in the table IS the grant. A list that can
+    /// only say yes cannot say "and take that other one away", so reading it as a REPLACEMENT would
+    /// hand it a power it has no words for: withdrawing a machine-wide grant would happen as a side
+    /// effect of declaring something unrelated, and the owner would have no way to write the
+    /// opposite down. The shell rules can replace, and that is precisely why they carry a `deny`.
+    ///
+    /// The empty case then needs no special rule, which is the second half of the argument. Under a
+    /// union, a project that declared nothing IS the machine default, and this returns a value equal
+    /// to the one it was called on — the non-regression the shell-rules side answered with "empty
+    /// means today's behaviour", arrived at here as a consequence instead of as an exception. Read
+    /// as a replacement it would have to be an exception, and an exception at zero rows is a cliff
+    /// at one: declare a single operation and every machine-wide grant would vanish unannounced.
+    ///
+    /// **Narrowed on the way out, though `POST /projects/{id}/github-ops` already validated on the
+    /// way in.** Two writes the route never saw can reach that table: a row stored before a ceiling
+    /// was narrowed, and a row written out of band. The shell-rules side made this argument for its
+    /// own fold and it is the stronger one here, because the cost is not a dead rule but a live
+    /// grant — `api_read` in a row would otherwise name `gh api -X DELETE` through the map and run
+    /// it unasked. The read side is the side that decides, so the read side checks.
+    ///
+    /// A row outside the ceiling is dropped with a warning and the rest stay valid, which is
+    /// `narrow`'s rule and §6 of the design restating it: one bad line is a mistake, not a reason to
+    /// discard the good ones.
+    ///
+    /// **The acting half of the overlay reaches nothing yet, and that is worth knowing before
+    /// reading it as live.** `action_is_autonomous` has exactly one production caller — `submit`,
+    /// which reads `runtime.policy`, the machine default. `POST /github/requests` is the only way
+    /// into `submit`, its body is `{op}` and nothing else, and `github_caller_is_allowed` admits only
+    /// the control token and an Admin key — so there is no project on that path, and no run id to
+    /// resolve one from either. Naming the project in the body would make it a CLAIM the caller
+    /// makes about itself, which is the shape `pretooluse_decision` had to take apart: a caller free
+    /// to name any project could borrow that project's grants. That is a decision the design did not
+    /// take and this is not the place to take it.
+    ///
+    /// Merged anyway, and deliberately. The route accepts action kinds, the table stores them, and
+    /// `digest` has to say what the effective policy IS rather than what happens to be consulted; on
+    /// the day `submit` is handed a project, nothing here changes. Until then a project's declared
+    /// ACTIONS are recorded and inert, while its declared READS are live through Bash.
+    ///
+    /// **One visible consequence of merging them, so nobody has to discover it from a graph.** A
+    /// declared action moves the digest — `actions` is always hashed — while changing no verdict
+    /// anywhere, so declaring `pr_create` fragments that project's shadow sample for a grant that
+    /// does nothing yet. It is the honest answer rather than a bug: the configuration genuinely did
+    /// change, and a digest that hid the change would be lying about which policy a row was recorded
+    /// under the moment `submit` learns its project. The cost is bounded to
+    /// `shadow_readiness` counting one more distinct digest for that project.
+    ///
+    /// **PRIVATE, and that is the `enabled` hole closed by construction rather than by comment.**
+    /// `GithubRuntime::policy_for_project` is the only way in, and it is where the switch is read;
+    /// a `pub` constructor here would let a caller outside this module lay a project's rows straight
+    /// onto a policy that a switched-off pillar had already collapsed to `empty()`, which is the one
+    /// thing `enabled: false` exists to prevent. The tests below still reach it, being in-module.
+    async fn for_project(&self, pool: &sqlx::SqlitePool, project_id: &str) -> Self {
+        // The SWALLOWING reader, and this is the consumer it was written for. An unreadable table
+        // yields no operations, an empty overlay is the machine default, and that is strictly FEWER
+        // operations running unasked — the safe direction here. It is the opposite of the shell
+        // `deny`, where an empty list would lose a refusal somebody wrote down and the `Result`
+        // reader is the only honest one; `project_policy` carries both halves for exactly this
+        // reason, and picking the wrong one is how a database hiccup becomes a permission.
+        let declared = crate::project_policy::github_ops(pool, project_id).await;
+        // One narrowing against the whole declarable set, so a row that is in neither half warns
+        // once and by name...
+        let kept = narrow(&declared, &declarable_ops(), "project operation");
+        // ...and then the partition decision #5 keeps in the types, applied here so that each door
+        // holds only what it may answer for.
+        //
+        // **A `partition` and not two intersections, and that is only exact because of the line
+        // above.** `declarable_ops` IS the two halves concatenated, and the halves are disjoint
+        // because `ReadOp` and `ActOp` are — `read_ops_and_act_ops_partition_op` is the test that
+        // says so — so after `narrow`, "not a read" and "an action" are the same set. Take `narrow`
+        // away and they stop being: `api_read` would fall into the acting half and be autonomous
+        // there. That is the one ceiling check, deliberately in one place, and this is the sentence
+        // that says what depends on it.
+        let (read_ops, acted): (Vec<String>, Vec<String>) = kept
+            .into_iter()
+            .partition(|kind| declarable_read_ops().contains(&kind.as_str()));
+        let mut actions = self.actions.clone();
+        actions.extend(acted);
+        actions.sort();
+        actions.dedup();
+        let digest = digest_of(&self.reads, &read_ops, &actions);
+        Self {
+            reads: self.reads.clone(),
+            read_ops,
             actions,
             digest,
         }
@@ -1005,34 +1832,62 @@ impl Policy {
     /// second one that would drift from it. Quotes are stripped by it, so
     /// `--search 'in:body x'` is two tokens and the flag is seen.
     ///
-    /// A refused flag is matched as `tok == flag || tok.starts_with("{flag}=")`. Equality alone
-    /// would let `--json=body` through, and that is one character of difference between an
-    /// implementation that works and one that looks like it does.
+    /// A refused flag is matched by `word_is_flag`, which is that rule and lives beside the map that
+    /// also needs it — see its own doc for why one rule may not have two spellings here.
     ///
-    /// **This decides the list and the flags and nothing else.** Whether the line is a single
+    /// **This decides the lists and the flags and nothing else.** Whether the line is a single
     /// command at all, whether it redirects, whether it hides a second command behind a separator —
     /// those are `classifier.rs`'s guards, applied before this is ever consulted, and this function
     /// would be wrong to be read as covering them.
+    ///
+    /// **Two doors, one flag check, and the ORDER is the whole safety argument.** The machine's list
+    /// is asked by prefix and the project's by name, but `REFUSED_READ_FLAGS` runs before either and
+    /// binds both. `op_kind_of_gh_command` has a refused-flag guard of its own and it is not this
+    /// one: it covers the flags that change WHICH operation a line is, so that `--log-failed` cannot
+    /// be named `run_status`. The rest of the constant — `--limit` above all — bounds HOW MUCH a
+    /// stranger gets to say, and `ReadOp::effect` leans on it by name: `PrList` is graded `ReadsOwn`
+    /// because a stranger reaches it through thirty short fields and no further. A name from the map
+    /// is not a grant, and a mapped name allowed to skip this check would take the grading with it.
     pub fn read_is_autonomous(&self, command: &str) -> bool {
-        if self.reads.is_empty() {
+        if self.reads.is_empty() && self.read_ops.is_empty() {
             return false;
         }
         let words = crate::classifier::shell_words(command);
         if words.iter().any(|word| {
             REFUSED_READ_FLAGS
                 .iter()
-                .any(|flag| word == flag || word.starts_with(&format!("{flag}=")))
+                .any(|flag| word_is_flag(word, flag))
         }) {
             return false;
         }
         let normalized = words.join(" ").to_ascii_lowercase();
-        self.reads
+        if self
+            .reads
             .iter()
             .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
+        {
+            return true;
+        }
+        // The named door. `read_ops` holds no action, so this cannot answer for one however the line
+        // is spelled — see the field's own doc.
+        //
+        // Skipped outright when there is no name to ask about, which is EVERY machine policy — and
+        // that is a cost and not only a tidiness. This runs per segment of every shell line a hook
+        // sees, and `op_kind_of_gh_command` tokenizes the segment a second time before it can even
+        // tell that the program is not `gh`. A daemon whose projects declared nothing goes on paying
+        // exactly what it paid before this field existed.
+        if self.read_ops.is_empty() {
+            return false;
+        }
+        op_kind_of_gh_command(command).is_some_and(|kind| self.read_ops.iter().any(|op| op == kind))
     }
 
     /// Whether an operation of this `kind()` is executed without asking. Everything else becomes a
     /// proposal a person approves, and the turn carries on either way.
+    ///
+    /// One list for both authors: an action the machine granted and an action the project declared
+    /// are the same sentence in the same vocabulary, so `for_project` merges rather than adding a
+    /// second field. The reading half could not do that, and its field says why.
     pub fn action_is_autonomous(&self, kind: &str) -> bool {
         self.actions.iter().any(|allowed| allowed == kind)
     }
@@ -1113,10 +1968,31 @@ impl GithubRuntime {
             policy: Policy::from_config(config),
         }
     }
+
+    /// The policy a decision about THIS project is taken under: the machine default with the
+    /// project's declared operations laid over it.
+    ///
+    /// **The door the daemon uses, and the one place the switch is read.** `Policy::for_project`
+    /// does the layering and knows nothing about `enabled`, because by the time a `Policy` exists a
+    /// switched-off pillar and an empty pair of lists are the same value — `from_config` collapses
+    /// one into the other on purpose. Layering onto that collapsed value would let a project's row
+    /// turn back on a pillar the owner switched off, which is the one thing `enabled: false` is for.
+    /// Kept here rather than at the call sites so that neither `hooks.rs` nor `runs.rs` has to
+    /// remember it.
+    pub async fn policy_for_project(&self, pool: &sqlx::SqlitePool, project_id: &str) -> Policy {
+        if !self.enabled {
+            return Policy::empty();
+        }
+        self.policy.for_project(pool, project_id).await
+    }
 }
 
 /// PURE: one list intersected with its ceiling, sorted and deduplicated, warning about each entry it
 /// had to drop.
+///
+/// Written for the owner's file and used unchanged for a project's rows, which is why the warning
+/// says "config" rather than "file": a row in `project_github_ops` is configuration too, and it
+/// reaches this by the same route and for the same reason.
 fn narrow(asked: &[String], ceiling: &[&str], what: &str) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     for entry in asked {
@@ -1152,12 +2028,22 @@ fn narrow(asked: &[String], ceiling: &[&str], what: &str) -> Vec<String> {
 /// break the scoreboard — which is the whole reason `§7` asked for it normalized before hashed. A
 /// switched-off pillar and an empty pair of lists hash alike, and they should: they are the same
 /// effective policy.
-fn digest_of(reads: &[String], actions: &[String]) -> String {
-    let text = format!(
+///
+/// **`read_ops` is written only when there IS one, and that conditional is the same sentence again
+/// rather than a special case.** A project that declared nothing has the machine's effective policy,
+/// so it must carry the machine's label; appending an empty field instead would renumber every
+/// digest ever recorded, and `shadow::shadow_readiness` would then warn that one action class spans
+/// two policies on machines where nothing changed. A project's declared ACTIONS need no such care —
+/// they merge into `actions`, so they move the digest through a field that was always written.
+fn digest_of(reads: &[String], read_ops: &[String], actions: &[String]) -> String {
+    let mut text = format!(
         "v1\nreads={}\nactions={}",
         reads.join(","),
         actions.join(",")
     );
+    if !read_ops.is_empty() {
+        text.push_str(&format!("\nread_ops={}", read_ops.join(",")));
+    }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
         hash ^= u64::from(byte);
@@ -1901,16 +2787,139 @@ mod tests {
         }
     }
 
-    /// The three reads that carry a stranger's prose are marked, and the three that carry structure
-    /// are not. Getting this backwards is the whole failure the per-operation effect exists to stop.
+    /// The six reads that carry a stranger's words are marked, and the four that carry structure are
+    /// not. Getting this backwards is the whole failure the per-operation effect exists to stop.
+    ///
+    /// The list is written out here rather than derived, and the duplication is the point: `effect`
+    /// is one `match` and a test that read it back would agree with whatever that `match` said. A
+    /// new variant defaults to `ReadsOwn` in the `_` arm below, so an author who grades a stranger's
+    /// text as structure fails here and reads the grading again.
     #[test]
     fn prose_is_untrusted_and_structure_is_not() {
         for op in ReadOp::all() {
             let expected = match op.kind() {
-                "pr_view" | "issue_view" | "run_logs" => ToolEffect::ReadsUntrusted,
+                "pr_view" | "issue_view" | "run_logs" | "pr_diff" | "pr_thread"
+                | "checks_for_ref" => ToolEffect::ReadsUntrusted,
                 _ => ToolEffect::ReadsOwn,
             };
             assert_eq!(op.effect(), expected, "{}", op.kind());
+        }
+    }
+
+    /// The three reads added for a stranger's words, each in the shape its grading claims.
+    ///
+    /// It asserts the argv as well as the effect, because the grading is a claim ABOUT the argv: a
+    /// `pr_diff` that had quietly become `gh pr view` would still say `ReadsUntrusted` and would no
+    /// longer be reading a diff. And it asserts the effect through `effect_of_kind`, which is the
+    /// route `mcp_tools::effect_of_call` actually takes — the one that latches the turn.
+    #[test]
+    fn the_three_reads_that_carry_a_strangers_words_say_so() {
+        let number = PrNumber::new("42").expect("42 is a pull request number");
+        let expected: [(ReadOp, Vec<&str>); 3] = [
+            (
+                ReadOp::PrDiff {
+                    repo: repo(),
+                    number: number.clone(),
+                },
+                vec!["pr", "diff", "--repo=owner/name", "--", "42"],
+            ),
+            (
+                ReadOp::PrThread {
+                    repo: repo(),
+                    number,
+                },
+                vec!["pr", "view", "--repo=owner/name", "--comments", "--", "42"],
+            ),
+            (
+                ReadOp::ChecksForRef {
+                    repo: repo(),
+                    r#ref: Branch::new("main").expect("main is a ref"),
+                },
+                vec!["pr", "checks", "--repo=owner/name", "--", "main"],
+            ),
+        ];
+
+        for (op, argv) in expected {
+            assert_eq!(op.argv(), argv, "{}", op.kind());
+            assert_eq!(op.effect(), ToolEffect::ReadsUntrusted, "{}", op.kind());
+            assert_eq!(
+                ReadOp::effect_of_kind(op.kind()),
+                Some(ToolEffect::ReadsUntrusted),
+                "{} has to be untrusted on the route effect_of_call takes",
+                op.kind()
+            );
+            // A read is a read: the partition does not bend for the grading.
+            assert!(!ActOp::all().iter().any(|act| act.kind() == op.kind()));
+        }
+
+        // Reading the thread and posting to it are different operations on different sides of the
+        // partition, and each tool sends the other's kind to the right place rather than answering
+        // "unknown operation". This is what the names `pr_thread` and `pr_comment` are for; it was
+        // `pr_comments` and `pr_comment` for one commit, which is one letter to carry a boundary on.
+        assert!(
+            ReadOp::from_request(ReadRequest {
+                operation: "pr_comment".to_owned(),
+                repo: "owner/name".to_owned(),
+                id: Some("42".to_owned()),
+            })
+            .expect_err("pr_comment acts")
+            .contains("github_act"),
+            "posting a comment is sent to the acting tool"
+        );
+        assert!(
+            ActOp::from_request(ActRequest {
+                operation: "pr_thread".to_owned(),
+                repo: Some("owner/name".to_owned()),
+                id: Some("42".to_owned()),
+                ..ActRequest::default()
+            })
+            .expect_err("pr_thread only reads")
+            .contains("github_read"),
+            "reading the thread is sent to the reading tool"
+        );
+
+        // And the two withdrawn names are gone rather than aliased. An operation that answered to
+        // its old string would be the rename undone in the one place a caller can reach.
+        for withdrawn in ["pr_files", "pr_comments"] {
+            assert!(
+                ReadOp::from_request(ReadRequest {
+                    operation: withdrawn.to_owned(),
+                    repo: "owner/name".to_owned(),
+                    id: Some("42".to_owned()),
+                })
+                .expect_err("a withdrawn name is not an operation")
+                .contains("unknown read operation"),
+                "{withdrawn} may not still resolve"
+            );
+        }
+    }
+
+    /// None of the three is declarable, and that is the decision rather than an oversight.
+    ///
+    /// `READ_CEILING` is what a project may be granted, and it holds only reads of structural shape
+    /// — the constant's own doc refuses `gh pr view` in those words. These three return a stranger's
+    /// text by definition, so admitting them would contradict the sentence that admits anything at
+    /// all. They are reachable the way `pr_view` and `issue_view` are: a run asks for one, gets it,
+    /// and pays the turn's right to act for it.
+    #[test]
+    fn a_stranger_carrying_read_is_reachable_and_not_declarable() {
+        let widest = Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: READ_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            autonomous_actions: Vec::new(),
+        });
+        for op in ReadOp::all()
+            .into_iter()
+            .filter(|op| op.effect() == ToolEffect::ReadsUntrusted)
+        {
+            assert!(
+                !widest.read_is_autonomous(&format!("gh {}", op.argv().join(" "))),
+                "{} returns a stranger's words and may not be autonomous",
+                op.kind()
+            );
         }
     }
 
@@ -1927,8 +2936,14 @@ mod tests {
 
     /// Every caller value is either behind `--` or inside a `--flag=value`. Nothing this module
     /// builds hands `gh` a bare `--flag value` pair carrying a caller's string.
+    ///
+    /// The exceptions are the module's own BOOLEANS, and that is the whole rule they satisfy: a flag
+    /// that takes no value cannot be followed by a caller's string, so it consumes nothing and can
+    /// stand bare. Named one by one rather than waved through by a prefix check — the day a flag
+    /// that DOES take a value is added, the failure should be here and not in a shell.
     #[test]
     fn no_caller_value_reaches_argv_where_it_could_act_as_a_flag() {
+        const OUR_OWN_BOOLEANS: &[&str] = &["--log", "--comments"];
         for op in Op::all() {
             let argv = op.argv();
             let terminator = argv.iter().position(|part| part == "--");
@@ -1939,7 +2954,7 @@ mod tests {
                 assert!(
                     !part.starts_with("--")
                         || part.contains('=')
-                        || part == "--log"
+                        || OUR_OWN_BOOLEANS.contains(&part.as_str())
                         || part == "--",
                     "{} puts {part} on the command line as a bare flag",
                     op.kind()
@@ -2006,6 +3021,69 @@ mod tests {
         assert!(WorkflowName::new("CI Build").is_ok());
         assert!(Body::new("a body\nwith lines").is_ok());
         assert!(Body::new("a body with a \u{1b} in it").is_err());
+    }
+
+    /// Every spelling git writes for a GitHub `origin` reaches the same `owner/name`.
+    ///
+    /// Written as a table because the spellings are the whole content of the function: `git clone`
+    /// over HTTPS, the scp-like form `git@github.com:owner/name.git` that an SSH clone leaves
+    /// behind, the explicit `ssh://` form, and each of those with and without the `.git` suffix a
+    /// trailing slash. A parser that handled three of the four would send `pr_list` at the wrong
+    /// repository for a fourth of this house's checkouts and no error would say so.
+    #[test]
+    fn every_spelling_of_a_github_remote_names_the_same_repository() {
+        for url in [
+            "https://github.com/owner/name.git",
+            "https://github.com/owner/name",
+            "https://github.com/owner/name/",
+            "https://user@github.com/owner/name.git",
+            "git@github.com:owner/name.git",
+            "git@github.com:owner/name",
+            "ssh://git@github.com/owner/name.git",
+            "git://github.com/owner/name.git",
+            "  https://github.com/owner/name.git  ",
+            // The host is a name and not a case, which is what `eq_ignore_ascii_case` is for.
+            "https://GitHub.com/owner/name.git",
+        ] {
+            assert_eq!(
+                Repo::from_remote_url(url).map(|repo| repo.as_str().to_owned()),
+                Some("owner/name".to_owned()),
+                "{url} names owner/name"
+            );
+        }
+    }
+
+    /// A remote this cannot read is `None`, and the list is the reason the caller may not turn that
+    /// into an error.
+    ///
+    /// Each of these is an ordinary thing for a project to have. What the caller does with `None` is
+    /// say which repository it is NOT — `ProjectRepo::NotGithub` carries the URL for exactly that —
+    /// and a function that refused instead would make a project on GitLab look broken.
+    #[test]
+    fn a_remote_that_is_not_a_github_repository_names_nothing() {
+        for url in [
+            "https://gitlab.com/owner/name.git",
+            "git@gitlab.com:owner/name.git",
+            // An Enterprise host is a real deployment and it is not the one this `gh` is pointed at.
+            "https://github.example.com/owner/name.git",
+            "https://notgithub.com/owner/name.git",
+            // A local remote — a folder, or a Windows drive letter that a naive `:` split would read
+            // as a host.
+            "C:/Projects/nucleos",
+            "/srv/git/name.git",
+            // GitHub, naming no repository or naming too much of one. `Repo::new` decides, here as
+            // everywhere.
+            "https://github.com/owner",
+            "https://github.com/owner/name/tree/master",
+            "https://github.com",
+            "",
+        ] {
+            assert_eq!(
+                Repo::from_remote_url(url),
+                None,
+                "{url} names no repository"
+            );
+        }
     }
 
     /// The validating `Deserialize` is what covers the raw route, and this is the case that proves
@@ -2190,6 +3268,65 @@ mod tests {
         assert_ne!(base.digest(), different.digest());
         assert_ne!(base.digest(), Policy::empty().digest());
         assert_eq!(base.digest().len(), 16);
+    }
+
+    /// **The digest's OUTPUT, pinned to literals, because what it labels is already on disk.**
+    ///
+    /// Every other assertion about this function is RELATIVE — two policies hash alike, or they do
+    /// not — and every one of them survives a change to `digest_of` itself, because both sides move
+    /// together. `a_project_that_declared_nothing_is_the_machine_default_exactly` cannot help either,
+    /// for exactly that reason: it compares `for_project`'s answer against the machine's, and a
+    /// rewrite moves the pair. So the property that actually matters here had nothing holding it.
+    ///
+    /// That property is not internal consistency. `policy_digest` is a column in
+    /// `shadow_decisions`, written on every governed tool call, and rows carrying these strings
+    /// exist in live databases. A change that renumbers them orphans the history: `shadow_readiness`
+    /// COUNTS distinct digests per action class, so the same class would suddenly be reported as
+    /// spanning two policies on a machine where nobody changed anything, and
+    /// `READINESS_MIN_REVIEWED` would restart ten reviews of progress toward promotion.
+    ///
+    /// **The third assertion is the one that guards the conditional in `digest_of`.** Drop the
+    /// `if !read_ops.is_empty()` and an empty overlay starts hashing `\nread_ops=` — the machine
+    /// default's own label changes, and so does every row already recorded under it. The fourth
+    /// pins the other half: when there IS a name, the suffix is written, so two genuinely different
+    /// effective policies still get different labels.
+    ///
+    /// Literals rather than a recomputation, deliberately. A test that recomputed FNV-1a here would
+    /// agree with whatever `digest_of` did, which is the failure mode this exists to close.
+    #[tokio::test]
+    async fn the_digest_of_a_known_policy_is_a_known_string() {
+        let pool = test_pool().await;
+
+        // `v1\nreads=\nactions=` — the label a machine with no autonomy has always carried.
+        assert_eq!(Policy::empty().digest(), "ef64af62014226ae");
+
+        let machine = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n\
+             autonomous_actions:\n  - pr_comment\n",
+        ));
+        // `v1\nreads=gh run list\nactions=pr_comment`
+        assert_eq!(machine.digest(), "9cef55bb486b8280");
+
+        // A project that declared nothing carries the machine's own byte, and that is the claim
+        // about rows already written rather than a claim about two values in this process.
+        assert_eq!(
+            machine.for_project(&pool, "alpha").await.digest(),
+            "9cef55bb486b8280"
+        );
+        assert_eq!(
+            Policy::empty().for_project(&pool, "alpha").await.digest(),
+            "ef64af62014226ae"
+        );
+
+        // And a project that declared something gets a label of its own, suffix and all:
+        // `v1\nreads=gh run list\nactions=pr_comment\nread_ops=pr_list`
+        crate::project_policy::declare_github_op(&pool, "alpha", "pr_list")
+            .await
+            .unwrap();
+        assert_eq!(
+            machine.for_project(&pool, "alpha").await.digest(),
+            "edcfd3d2f1212aab"
+        );
     }
 
     /// Four failures, four different places to go looking. Collapsing any two of them costs
@@ -2476,6 +3613,722 @@ mod tests {
         assert!(
             !ACTION_CEILING.contains(&"api_read"),
             "`api_read` is never eligible for autonomy"
+        );
+    }
+
+    /// Decision #7 as behaviour, and not as a constant that happens to lack a word.
+    ///
+    /// The assertion above says `ACTION_CEILING` does not contain the string `api_read`. That is
+    /// worth having and it is not the claim: the claim is that a `Policy` TOLD to allow `api_read`
+    /// by every route that can build one still refuses. So this asks each route in turn, and asks
+    /// the reading side too, because an operation refused as an action and admitted as a command
+    /// would be the same capability through the other door.
+    ///
+    /// `Policy` has three constructors — `empty`, `from_config` and `for_project` — and only the
+    /// last two can be told anything. That is why this is a complete enumeration rather than a
+    /// sample, and why adding a fourth constructor is a change that has to come back here.
+    ///
+    /// **Route three is the one this chunk added, and it is the sharpest of the three.** A row in
+    /// `project_github_ops` reaches `read_is_autonomous` through `op_kind_of_gh_command`, and that
+    /// map DOES name `gh api …` — `ApiRead`'s argv is `api -- …`, so the form matches and the answer
+    /// is `Some("api_read")`. Nothing about the map refuses it. What refuses it is `for_project`
+    /// narrowing the stored rows against `declarable_ops` on the way OUT, which is the whole reason
+    /// the read side narrows at all when the write route already validated: this row is written
+    /// straight into the table below, exactly as an out-of-band write or a pre-ceiling row would
+    /// arrive, and without that narrowing `gh api -X DELETE` would run in Bash unasked.
+    #[tokio::test]
+    async fn api_read_is_never_autonomous_by_any_route_that_can_ask_for_it() {
+        // Route one: the owner's `.ai/github.yaml`, asking for it in both lists and asking beside
+        // entries the ceilings DO admit — so a narrowing that dropped the whole file would satisfy
+        // this by accident and the kept entries prove it did not.
+        let owner = policy_from(Some(
+            "autonomous_reads:\n  - gh api\n  - gh run list\n\
+             autonomous_actions:\n  - api_read\n  - pr_create\n",
+        ));
+        assert_eq!(owner.autonomous_actions(), ["pr_create"]);
+        assert_eq!(owner.autonomous_reads(), ["gh run list"]);
+
+        // Route two: a `GithubConfig` built in code from the ceilings themselves — the widest policy
+        // this codebase can construct, and the one `http::declarable_github_ops` asks in order to
+        // decide what a project may put in `project_github_ops`. A project cannot declare what this
+        // policy refuses, so refusing here is what keeps the per-project table from becoming the
+        // ceiling with a different door on it.
+        let widest = Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: READ_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            autonomous_actions: ACTION_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+        });
+        assert!(
+            widest
+                .autonomous_actions()
+                .contains(&"pr_create".to_owned())
+        );
+
+        // Route three: a project's own table, written straight past the route that validates it, and
+        // laid over the two widest machine policies there are.
+        let pool = test_pool().await;
+        for kind in ["api_read", "run_list", "pr_create"] {
+            sqlx::query(
+                "INSERT INTO project_github_ops (project_id, op_kind, created_at)
+                 VALUES ('alpha', ?, datetime('now'))",
+            )
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let declared = widest.for_project(&pool, "alpha").await;
+        let declared_over_nothing = Policy::empty().for_project(&pool, "alpha").await;
+        // The kept rows prove the narrowing dropped one entry and not the whole table, the way the
+        // owner's route above proves it.
+        assert!(declared_over_nothing.read_is_autonomous("gh run list -R owner/name"));
+        assert!(declared_over_nothing.action_is_autonomous("pr_create"));
+
+        for policy in [
+            Policy::empty(),
+            Policy::default(),
+            owner,
+            widest,
+            declared,
+            declared_over_nothing,
+        ] {
+            assert!(
+                !policy.action_is_autonomous("api_read"),
+                "api_read is never an autonomous action"
+            );
+            // And not through the reading side either: the argv `ApiRead` actually builds matches no
+            // `READ_CEILING` prefix, so `gh api` is refused as a command exactly as it is refused as
+            // an operation.
+            let argv = ActOp::ApiRead {
+                args: vec!["repos/owner/name".to_owned()],
+            }
+            .argv();
+            assert!(!policy.read_is_autonomous(&format!("gh {}", argv.join(" "))));
+            assert!(!policy.read_is_autonomous("gh api repos/owner/name"));
+            // The line the map WOULD name `api_read`, spelled the way it would cost the most.
+            assert!(!policy.read_is_autonomous("gh api -X DELETE repos/owner/name"));
+        }
+        // Said once, outside the loop, because it is a fact about the map rather than about any
+        // policy: the map names this line, and the name is not a grant.
+        assert_eq!(
+            op_kind_of_gh_command("gh api repos/owner/name"),
+            Some("api_read"),
+            "the map names it; the ceiling is what refuses it"
+        );
+    }
+
+    /// The non-regression, proved rather than argued: a project that declared nothing IS the machine
+    /// default, value for value.
+    ///
+    /// Equality over the whole `Policy` and not over its answers, which is the stronger claim and
+    /// the cheaper one to keep: it covers the two lists, the third list this chunk added, and the
+    /// `digest` — the last of which labels rows in a live scoreboard, so an overlay that renumbered
+    /// it would tell `shadow::shadow_readiness` that one action class spans two policies on a
+    /// machine where nothing changed.
+    ///
+    /// Asked of a machine default with entries as well as of an empty one, because the interesting
+    /// direction is the one where there is something to lose.
+    #[tokio::test]
+    async fn a_project_that_declared_nothing_is_the_machine_default_exactly() {
+        let pool = test_pool().await;
+        let owner = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n\
+             autonomous_actions:\n  - pr_comment\n",
+        ));
+        for machine in [Policy::empty(), Policy::default(), owner] {
+            let for_project = machine.for_project(&pool, "alpha").await;
+            assert_eq!(
+                for_project, machine,
+                "a project with no rows is the machine default and not a copy of it"
+            );
+            assert_eq!(for_project.digest(), machine.digest());
+        }
+    }
+
+    /// The widening half, and the reason any of this exists: an operation this project declared runs
+    /// without asking HERE and nowhere else.
+    ///
+    /// The machine default is empty throughout, so nothing but the project's own row can be
+    /// producing the `true` — which is what makes this the test a `for_project` that ignored its
+    /// rows would fail.
+    #[tokio::test]
+    async fn a_declared_operation_runs_without_asking_in_this_project_and_in_no_other() {
+        let pool = test_pool().await;
+        crate::project_policy::declare_github_op(&pool, "alpha", "run_list")
+            .await
+            .unwrap();
+        crate::project_policy::declare_github_op(&pool, "alpha", "pr_comment")
+            .await
+            .unwrap();
+
+        let machine = Policy::empty();
+        let alpha = machine.for_project(&pool, "alpha").await;
+        let beta = machine.for_project(&pool, "beta").await;
+
+        assert!(alpha.read_is_autonomous("gh run list -R owner/name"));
+        assert!(alpha.action_is_autonomous("pr_comment"));
+
+        assert!(!beta.read_is_autonomous("gh run list -R owner/name"));
+        assert!(!beta.action_is_autonomous("pr_comment"));
+        assert!(!machine.read_is_autonomous("gh run list -R owner/name"));
+        assert!(!machine.action_is_autonomous("pr_comment"));
+
+        // A different effective policy gets a different label, which is the one property `digest`
+        // has to have.
+        assert_ne!(alpha.digest(), machine.digest());
+        assert_eq!(beta.digest(), machine.digest());
+    }
+
+    /// It ADDS to the machine default; it does not replace it. A project that declares one operation
+    /// keeps every grant the owner's file already gave the machine.
+    #[tokio::test]
+    async fn a_projects_declaration_adds_to_the_machine_default_and_never_replaces_it() {
+        let pool = test_pool().await;
+        crate::project_policy::declare_github_op(&pool, "alpha", "pr_list")
+            .await
+            .unwrap();
+
+        let machine = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n\
+             autonomous_actions:\n  - pr_comment\n",
+        ));
+        let alpha = machine.for_project(&pool, "alpha").await;
+
+        // The project's own row, granted.
+        assert!(alpha.read_is_autonomous("gh pr list -R owner/name"));
+        // And the machine's two, still standing. Under a replacement reading both of these would be
+        // false, and the owner would have had no way to write down that they wanted them kept.
+        assert!(alpha.read_is_autonomous("gh run list -R owner/name"));
+        assert!(alpha.action_is_autonomous("pr_comment"));
+    }
+
+    /// The ceiling is a ceiling on the way OUT of the table too.
+    ///
+    /// Every row here is one `POST /projects/{id}/github-ops` would refuse, written straight into
+    /// the table the way a row stored before a ceiling narrowed — or written out of band — would
+    /// arrive. `run_logs` and `pr_view` are the interesting pair: both are real `ReadOp`s the map
+    /// names, so nothing about the naming refuses them, and `pr_view` shares no flag with anything —
+    /// it is outside `READ_CEILING` and that alone is what stops it.
+    #[tokio::test]
+    async fn a_row_outside_the_ceiling_grants_nothing_however_it_got_there() {
+        let pool = test_pool().await;
+        for kind in ["run_logs", "pr_view", "issue_view", "pr_diff", "api_read"] {
+            sqlx::query(
+                "INSERT INTO project_github_ops (project_id, op_kind, created_at)
+                 VALUES ('alpha', ?, datetime('now'))",
+            )
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let alpha = Policy::empty().for_project(&pool, "alpha").await;
+
+        for command in [
+            "gh run view --log 1 -R owner/name",
+            "gh pr view 7 -R owner/name",
+            "gh issue view 7 -R owner/name",
+            "gh pr diff 7 -R owner/name",
+            "gh api repos/owner/name",
+        ] {
+            assert!(
+                !alpha.read_is_autonomous(command),
+                "{command:?} is outside the ceiling whatever the table says"
+            );
+        }
+        // And the whole overlay is inert, digest included: five refused rows are no rows.
+        assert_eq!(alpha, Policy::empty());
+    }
+
+    /// A declared ACTION does not open the reading door in Bash.
+    ///
+    /// Decision #5 keeps the partition in the types, and this is what it buys once one list of names
+    /// governs both doors: `op_kind_of_gh_command` names `gh pr comment` perfectly well, and the
+    /// project declared `pr_comment`, so the only thing between that line and running unattended is
+    /// `read_ops` holding no action.
+    ///
+    /// It is the twin of a sentence the machine's own square already measures — "no action is ever
+    /// autonomous in Bash", in `the_map_names_an_operation_and_does_not_yet_make_the_two_doors_agree`
+    /// — asked of the door that did not exist when that was written. There it holds by ARITHMETIC,
+    /// because no `ACTION_CEILING` kind has a `READ_CEILING` prefix; here the prefixes are gone and
+    /// only the partition is left holding it up.
+    #[tokio::test]
+    async fn a_declared_action_never_becomes_an_autonomous_bash_line() {
+        let pool = test_pool().await;
+        for kind in declarable_act_ops() {
+            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+                .await
+                .unwrap();
+        }
+        let alpha = Policy::empty().for_project(&pool, "alpha").await;
+
+        for op in ActOp::all() {
+            let line = format!("gh {}", op.argv().join(" "));
+            assert!(
+                !alpha.read_is_autonomous(&line),
+                "{line:?} acts, and no declaration makes an action an autonomous read"
+            );
+        }
+        // The one that would hurt most, spelled by hand so the assertion survives a change to
+        // `PrComment`'s argv.
+        assert!(!alpha.read_is_autonomous("gh pr comment 7 --body hello -R owner/name"));
+        // ...while the typed door answers yes, which is what makes the line above a partition and
+        // not an accident of spelling.
+        assert!(alpha.action_is_autonomous("pr_comment"));
+    }
+
+    /// **A name from the map is not a grant.** The refused flags bind the named door exactly as they
+    /// bind the prefix one, and they run BEFORE it.
+    ///
+    /// `--log` and `--log-failed` are the flags that change WHICH operation a line is, and the map
+    /// has its own guard for those. The rest of `REFUSED_READ_FLAGS` is a different job: `--json`
+    /// and `--jq` change the SHAPE of what comes back, and `--limit` bounds HOW MUCH — `ReadOp::
+    /// effect` grades `PrList` as `ReadsOwn` precisely because a stranger reaches it through thirty
+    /// short fields and no further. A mapped name allowed past this check would take that grading
+    /// with it, and `gh pr list --limit 1000` would be a thousand stranger-chosen titles in a call
+    /// that marks nothing.
+    #[tokio::test]
+    async fn a_declared_name_does_not_survive_a_flag_that_changes_what_comes_back() {
+        let pool = test_pool().await;
+        for kind in ["run_status", "pr_list", "run_list"] {
+            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+                .await
+                .unwrap();
+        }
+        let alpha = Policy::empty().for_project(&pool, "alpha").await;
+
+        // The plain forms run, or there would be nothing to take away below.
+        assert!(alpha.read_is_autonomous("gh run view 1 -R owner/name"));
+        assert!(alpha.read_is_autonomous("gh pr list -R owner/name"));
+
+        for refused in [
+            "gh run view --log 1 -R owner/name",
+            "gh run view --log-failed 1 -R owner/name",
+            "gh pr list --limit 1000 -R owner/name",
+            "gh pr list -L 1000 -R owner/name",
+            "gh pr list --json body -R owner/name",
+            "gh pr list --jq .[] -R owner/name",
+            "gh run list --search in:body -R owner/name",
+        ] {
+            assert!(
+                !alpha.read_is_autonomous(refused),
+                "{refused:?} carries a flag that changes what comes back"
+            );
+        }
+    }
+
+    /// A pillar the owner switched off stays off, whatever a project declared.
+    ///
+    /// `Policy::from_config` collapses a disabled pillar to `empty()`, so by the time a `Policy`
+    /// exists "switched off" and "granted nothing" are the same value and the layering cannot tell
+    /// them apart. `GithubRuntime::policy_for_project` is where the switch is read, and this is the
+    /// test that says so — layering onto the collapsed value directly, as the second half shows,
+    /// would hand a row the pillar's own off switch.
+    #[tokio::test]
+    async fn a_switched_off_pillar_stays_off_whatever_the_project_declared() {
+        let pool = test_pool().await;
+        crate::project_policy::declare_github_op(&pool, "alpha", "run_list")
+            .await
+            .unwrap();
+
+        let off = GithubRuntime {
+            enabled: false,
+            ..GithubRuntime::default()
+        };
+        let policy = off.policy_for_project(&pool, "alpha").await;
+        assert_eq!(policy, Policy::empty());
+        assert!(!policy.read_is_autonomous("gh run list -R owner/name"));
+
+        // The same project, the same row, through a pillar that is on.
+        let on = GithubRuntime::default();
+        assert!(
+            on.policy_for_project(&pool, "alpha")
+                .await
+                .read_is_autonomous("gh run list -R owner/name"),
+            "the row is a real grant; the switch is what withheld it above"
+        );
+    }
+
+    /// `pr_create` is inside the ceiling; every other route to it is unchanged.
+    ///
+    /// A pull request is a proposal a human still has to act on, which is what puts it beside
+    /// `pr_comment` rather than beside `api_read`. The file may still narrow it away, and the test
+    /// says so: the ceiling decides what MAY be autonomous and the owner decides what is.
+    #[test]
+    fn opening_a_pull_request_is_inside_the_ceiling_and_still_the_owners_choice() {
+        assert!(ACTION_CEILING.contains(&"pr_create"));
+
+        let asked = policy_from(Some("autonomous_actions:\n  - pr_create\n"));
+        assert!(asked.action_is_autonomous("pr_create"));
+
+        let did_not_ask = policy_from(Some("autonomous_actions:\n  - pr_comment\n"));
+        assert!(
+            !did_not_ask.action_is_autonomous("pr_create"),
+            "a ceiling entry the file does not name grants nothing"
+        );
+    }
+
+    /// The reading ceiling holds to the operations too, and it is the half that had drifted.
+    ///
+    /// `gh workflow list` sat in `READ_CEILING` with no `ReadOp` building it, which is the mirror of
+    /// the failure the test above guards against: a prefix that grants a capability the typed path
+    /// cannot ask for is a line the owner reads as a permission and that permits nothing. The
+    /// direction is ceiling to operation and not the reverse — a `ReadOp` outside the ceiling is
+    /// ordinary (`pr_view` is one, deliberately), a ceiling entry outside the operations is not.
+    #[test]
+    fn every_read_ceiling_prefix_is_built_by_a_real_operation() {
+        let commands: Vec<String> = ReadOp::all()
+            .iter()
+            .map(|op| format!("gh {}", op.argv().join(" ")))
+            .collect();
+        for prefix in READ_CEILING {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.starts_with(&format!("{prefix} "))),
+                "{prefix} is in the ceiling and no ReadOp builds it"
+            );
+        }
+    }
+
+    /// The `gh` line an operation builds, as somebody would have typed it into Bash.
+    fn gh_line(op: &Op) -> String {
+        format!("gh {}", op.argv().join(" "))
+    }
+
+    /// **Decision #4's test, and the only one that would catch the map drifting from the
+    /// operations.**
+    ///
+    /// One list of NAMES can govern both doors only if a name picks out the SAME operation in each
+    /// vocabulary. So: enable exactly one kind, then ask about every operation twice — once the way
+    /// the typed door asks (is this the kind that is enabled?) and once the way the Bash door would
+    /// have to ask it (does the map name this command line as the kind that is enabled?). The two
+    /// answers have to be the same, for all sixteen operations, sixteen times over.
+    ///
+    /// **What makes this more than a tautology is the pair `gh run view` serves.** A map that named
+    /// both halves `run_status` would answer yes to `run_logs`'s command line while the typed door
+    /// said no, and one cell of this square is where that shows up; `gh pr view` is the same trap a
+    /// second time. It is written as a loop and not as a list of cases on purpose — a case per
+    /// operation is a second place to forget the eleventh operation, which is the drift the whole
+    /// decision exists to stop.
+    ///
+    /// **What it does NOT prove is that the two doors behave alike today.** They do not, and the
+    /// test below measures by how much. This proves the map, which is the piece that was missing.
+    #[test]
+    fn one_name_picks_out_the_same_operation_at_both_doors() {
+        let operations = Op::all();
+        for enabled in operations.iter().map(Op::kind) {
+            for op in &operations {
+                let line = gh_line(op);
+                let typed_door = op.kind() == enabled;
+                let bash_door = op_kind_of_gh_command(&line) == Some(enabled);
+                assert_eq!(
+                    typed_door,
+                    bash_door,
+                    "with {enabled} enabled, the typed door says {typed_door} about {} and the map \
+                     reads {line:?} as {:?}",
+                    op.kind(),
+                    op_kind_of_gh_command(&line)
+                );
+            }
+        }
+    }
+
+    /// What the map does not do, measured rather than promised.
+    ///
+    /// The map names an operation; it does not change who runs it. Under the WIDEST policy a
+    /// `.ai/github.yaml` can express — both ceilings, whole — the two doors still answer differently
+    /// about eleven of the sixteen operations, and this pins which eleven. Reads run typed whatever
+    /// the list says (`submit`: *«A READ never files a proposal, and that is not an omission»*), and
+    /// no action is ever autonomous in Bash because no `ACTION_CEILING` kind has a `READ_CEILING`
+    /// prefix.
+    ///
+    /// **`Policy::for_project` has since landed and this test did not fail, which is the fact worth
+    /// recording rather than the promise it replaces.** The paragraph here said the single list
+    /// would be what closed the gap. It is not, and the second half below measures why: the project
+    /// list widens the BASH door by name, and `submit` — the typed door — reads `runtime.policy`,
+    /// the machine default, because `POST /github/requests` carries no project. So a project that
+    /// declares every operation it may declare disagrees with the typed door about exactly the same
+    /// eleven. Decision #6 remains the only thing that closes it.
+    ///
+    /// **And the second arm is a REMINDER, not a tripwire — which this paragraph, of all paragraphs,
+    /// must not get wrong twice.** It was written closing with "what will fail, correctly and loudly,
+    /// on the day the typed door learns which project it is acting for", which is the same species of
+    /// promise the paragraph exists to retract. It will not fail then: the closure below hardcodes
+    /// `widest.action_is_autonomous(...)` and never calls `submit`, so wiring `submit` to a project
+    /// changes nothing here until somebody edits that closure. What the arm does is state today's
+    /// measurement where whoever does that wiring will be standing, with a comment inside the closure
+    /// telling them which line to change. That is worth having and it is not a guard.
+    #[tokio::test]
+    async fn the_map_names_an_operation_and_does_not_yet_make_the_two_doors_agree() {
+        let widest = Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: READ_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            autonomous_actions: ACTION_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+        });
+        let operations = Op::all();
+
+        let in_bash: Vec<&str> = operations
+            .iter()
+            .filter(|op| widest.read_is_autonomous(&gh_line(op)))
+            .map(Op::kind)
+            .collect();
+        assert_eq!(
+            in_bash,
+            ["run_list", "run_status", "pr_list", "workflow_list"],
+            "the Bash door is the four structural reads and nothing else"
+        );
+
+        // The typed door, for the same sixteen, as `submit` decides it.
+        let typed = |op: &Op| match op {
+            Op::Read(_) => true,
+            Op::Act(act) => widest.action_is_autonomous(act.kind()),
+        };
+        let disagreeing: Vec<&str> = operations
+            .iter()
+            .filter(|op| typed(op) != widest.read_is_autonomous(&gh_line(op)))
+            .map(Op::kind)
+            .collect();
+        assert_eq!(
+            disagreeing,
+            [
+                // Reads the ceiling refuses because they carry a stranger's words, and `run_logs`,
+                // which the ceiling would admit by prefix and `--log` takes back.
+                "pr_view",
+                "issue_view",
+                "run_logs",
+                "pr_diff",
+                "pr_thread",
+                "checks_for_ref",
+                // Every action inside `ACTION_CEILING`: autonomous typed, never autonomous in Bash.
+                "workflow_run",
+                "run_rerun",
+                "pr_create",
+                "pr_comment",
+                "issue_close",
+            ],
+            "eleven of sixteen, and `api_read` agrees only because both doors refuse it"
+        );
+
+        // And the same square again, for a project that declared everything it MAY declare — the
+        // widest per-project policy there is, laid over the widest machine one. Same eleven, because
+        // `for_project` reaches only the Bash door.
+        let pool = test_pool().await;
+        for kind in declarable_ops() {
+            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+                .await
+                .unwrap();
+        }
+        let declared = widest.for_project(&pool, "alpha").await;
+        let typed_for_project = |op: &Op| match op {
+            // **THIS is the line to change when `submit` learns which project it is acting for**,
+            // and nothing will fail to tell you so — the header says why that is a reminder and not
+            // a guard. `widest` is written deliberately, because `submit` reads `runtime.policy` and
+            // never a project's: swap it for `declared` on that day and the assertion below is the
+            // measurement of how much the gap actually closed.
+            Op::Read(_) => true,
+            Op::Act(act) => widest.action_is_autonomous(act.kind()),
+        };
+        let still_disagreeing: Vec<&str> = operations
+            .iter()
+            .filter(|op| typed_for_project(op) != declared.read_is_autonomous(&gh_line(op)))
+            .map(Op::kind)
+            .collect();
+        assert_eq!(
+            still_disagreeing, disagreeing,
+            "declaring everything a project may declare moves the Bash door and not the typed one"
+        );
+    }
+
+    /// The pair that makes the map a map and not a prefix table, asked the way a person types it.
+    #[test]
+    fn one_subcommand_two_operations_and_a_flag_between_them() {
+        assert_eq!(op_kind_of_gh_command("gh run view 123"), Some("run_status"));
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --log 123"),
+            Some("run_logs")
+        );
+        // The flag after the positional, which is where a person actually puts it.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view 123 --log"),
+            Some("run_logs")
+        );
+        // pflag's other spelling for a boolean — the one `REFUSED_READ_FLAGS` had to learn too.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view 123 --log=true"),
+            Some("run_logs")
+        );
+        assert_eq!(op_kind_of_gh_command("gh pr view 7"), Some("pr_view"));
+        assert_eq!(
+            op_kind_of_gh_command("gh pr view --comments 7"),
+            Some("pr_thread")
+        );
+
+        // A flag carrying a caller's value names nothing and takes nothing away, in either spelling.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view -R owner/name 123"),
+            Some("run_status")
+        );
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --repo=owner/name 123"),
+            Some("run_status")
+        );
+        // Case-sensitive about the flag, exactly as `read_is_autonomous` is, and for its reason:
+        // `gh` would not read `--LOG` as `--log` either.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --LOG 123"),
+            Some("run_status")
+        );
+        // Past the terminator it is a positional and not a flag.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view -- 123"),
+            Some("run_status")
+        );
+    }
+
+    /// The map is an allowlist because the operations are a closed set, so everything else is
+    /// nameless — including the four reads `READ_CEILING`'s doc refuses by name.
+    #[test]
+    fn a_command_no_operation_builds_has_no_name() {
+        for command in [
+            "gh auth token",
+            "gh auth status",
+            "gh secret list",
+            "gh variable list",
+            "gh run download 1",
+            // The whole-word compare `read_is_autonomous` needs a prefix rule for.
+            "gh run listen",
+            "gh runlist",
+            "gh",
+            "git status",
+            "",
+        ] {
+            assert_eq!(op_kind_of_gh_command(command), None, "{command:?}");
+        }
+    }
+
+    /// **A flag that changes what comes back changes which operation it is.**
+    ///
+    /// `--log-failed` is the case the derivation cannot reach: no `ReadOp` builds it, so no form
+    /// names it, and without the guard `gh run view --log-failed 1` is named `run_status` — a
+    /// `ReadsOwn` operation, inside `READ_CEILING`, and one a project may declare — while returning
+    /// the log of a failed step, which is a stranger's words. The map would be a prefix table with
+    /// respect to exactly the spelling its own doc says a prefix table gets wrong.
+    ///
+    /// `REFUSED_READ_FLAGS` already holds that knowledge, under its own heading: *«The first seven
+    /// change the KIND of thing that comes back»*. So the map reads that list rather than growing a
+    /// second one, and answers `None` — the same rule the tie-break applies, one place further. A
+    /// guess is a worse answer than no answer when the caller is deciding autonomy with it.
+    ///
+    /// The test above covers `gh auth token` and `gh secret list` and not one flag-bearing line,
+    /// which is why this gap was untested as well as unhandled.
+    #[test]
+    fn a_flag_that_changes_what_comes_back_takes_the_name_away() {
+        for command in [
+            // The one that motivated the guard, in all three spellings a person reaches for.
+            "gh run view --log-failed 1",
+            "gh run view 1 --log-failed",
+            "gh run view --log-failed=true 1",
+            // The rest of the constant, on the prefixes the ceiling does admit.
+            "gh run view --jq .jobs 1",
+            "gh pr list --json body",
+            "gh pr list --limit 1000",
+            "gh pr list -L 1000",
+            "gh pr list --search in:body secret",
+            "gh pr list -t {{.body}}",
+        ] {
+            assert_eq!(op_kind_of_gh_command(command), None, "{command:?}");
+        }
+
+        // The flag an operation NAMES is the flag that names it. `--log` is on that constant too,
+        // and `run_logs` is the row that exists to carry it — the exemption is what keeps a refusal
+        // written for prefixes from eating the operation a name can spell.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --log 1"),
+            Some("run_logs")
+        );
+        // `--comments` is not on the constant at all, so the other pair is untouched.
+        assert_eq!(
+            op_kind_of_gh_command("gh pr view --comments 7"),
+            Some("pr_thread")
+        );
+        // A flag that only chooses WHICH takes nothing away, and `-l` is `--label` while `-L` is
+        // `--limit`: the case sensitivity `read_is_autonomous` keeps, kept here for the same reason.
+        for (command, kind) in [
+            ("gh pr list --state open", "pr_list"),
+            ("gh pr list --author octocat", "pr_list"),
+            ("gh pr list -l bug", "pr_list"),
+            ("gh run list --branch main", "run_list"),
+        ] {
+            assert_eq!(op_kind_of_gh_command(command), Some(kind), "{command:?}");
+        }
+    }
+
+    /// What makes "the most switches accounted for" a safe way to break a tie: inside one
+    /// subcommand no two operations carry the same number of switches, so the winner is never a coin
+    /// toss.
+    ///
+    /// **It rules out one tie and not every tie, and the difference is worth stating rather than
+    /// implied.** `matches` needs the subcommand to be a PREFIX of the line, so two forms whose
+    /// subcommands are of different lengths — a hypothetical `gh api` beside a `gh api graphql` —
+    /// can both match, and this loop walks past that pair on the `continue`. That case is safe
+    /// without being asserted here: the sort's first key is the subcommand's length, so the more
+    /// specific form wins, which is the answer anybody would want. What would NOT be safe is two
+    /// forms of the same shape, and that is the tie this rules out.
+    #[test]
+    fn no_two_operations_wear_the_same_gh_form() {
+        let forms = gh_forms();
+        assert_eq!(forms.len(), Op::all().len(), "one form per operation");
+        for (index, one) in forms.iter().enumerate() {
+            for other in &forms[index + 1..] {
+                if one.subcommand != other.subcommand {
+                    continue;
+                }
+                assert_ne!(
+                    one.switches.len(),
+                    other.switches.len(),
+                    "{} and {} share `gh {}` and nothing tells them apart",
+                    one.kind,
+                    other.kind,
+                    one.subcommand.join(" ")
+                );
+            }
+        }
+    }
+
+    /// The operation the ceiling had been granting to nobody: structural, and matching its prefix.
+    #[test]
+    fn workflow_list_is_a_structural_read_the_ceiling_already_admitted() {
+        let op = ReadOp::WorkflowList { repo: repo() };
+        assert_eq!(op.kind(), "workflow_list");
+        assert_eq!(op.effect(), ToolEffect::ReadsOwn);
+        assert_eq!(op.argv(), vec!["workflow", "list", "--repo=owner/name"]);
+
+        // The prefix was always there; what is new is that a typed operation reaches it.
+        assert!(READ_CEILING.contains(&"gh workflow list"));
+        let policy = policy_from(Some("autonomous_reads:\n  - gh workflow list\n"));
+        assert!(policy.read_is_autonomous(&format!("gh {}", op.argv().join(" "))));
+
+        // And it is buildable from the flat parameters, or the tool could not ask for it.
+        assert_eq!(
+            ReadOp::from_request(ReadRequest {
+                operation: "workflow_list".to_owned(),
+                repo: "owner/name".to_owned(),
+                id: None,
+            }),
+            Ok(op)
         );
     }
 }
