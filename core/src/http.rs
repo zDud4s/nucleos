@@ -611,6 +611,29 @@ pub fn build_router(state: AppState) -> Router {
         // The partition between reading and acting is held by the parameter TYPES at the tool
         // boundary, never by the transport, which takes an `Op` and executes it.
         .route("/github/requests", post(submit_github_request))
+        // The catalogue `POST /projects/{id}/github-ops` validates against, read out loud.
+        //
+        // **Machine-wide, so it hangs off no project, and the path says so.** The set is
+        // `github::declarable_ops` — the operations this binary can build, intersected with two
+        // compiled ceilings — and it is the same answer for every project on the roster. Under
+        // `/projects/{id}/…` it would be a route whose `{id}` changed nothing about the response,
+        // which is the shape that teaches a caller the set is per-project when it is per-BUILD.
+        // `/github` because that is the noun: it sits beside `/github/requests` for the same reason
+        // `/workflows/library` sits apart from a project's pins — one is the house's, the other is
+        // this project's use of it.
+        //
+        // **In no scope table either, and NOT for `/github/requests`' reason.** That one is
+        // admin-only because it leaves the machine; this reaches nothing and discloses no project's
+        // configuration, no repository and no secret — the response is a function of the binary, so
+        // two callers on the same version get the same bytes. What keeps it out is that the grant
+        // would buy nobody anything: the page that needs it is the shell, which holds the control
+        // token, and the nine routes it exists to explain are themselves in no table. A key that
+        // cannot read what a project HAS declared has no use for the list of what MAY be declared —
+        // and handing it that list is a map of exactly which capability names to try. An unneeded
+        // grant is one more thing to be wrong about later, which is `GET /vcs/requests/{id}/wait`'s
+        // argument for its own absence. `the_declarable_ops_catalogue_is_in_no_scope_table` says it
+        // where somebody tidying `auth.rs` will read it.
+        .route("/github/declarable-ops", get(get_declarable_github_ops))
         .route("/worktrees/{run_id}/release", post(post_worktree_release))
         .route("/shadow-decisions", get(get_unreviewed_shadow_decisions))
         .route("/shadow-decisions/{id}/verdict", post(post_shadow_verdict))
@@ -6131,34 +6154,75 @@ fn within_length(
     Ok(())
 }
 
-/// One project's shell list, split by verdict exactly as `project_policy::ShellRules` holds it.
+/// One declared shell rule, whole.
 ///
 /// A `View` and not a fourth `ProjectRules`. There are already two: the struct above, which answers
 /// `GET /projects/{id}/rules` about `.ai/autopilot.yaml`, and `hooks::ProjectRules`, which is an
 /// enum about whether the table could be read at all. A third spelling of that name would tell a
 /// reader nothing about which of the three they are holding.
 ///
-/// The prefixes come back FOLDED, because that is how `shell_rules` returns them and how they are
+/// **A ROW per rule, and not the two lists of prefixes this route used to serve.** The two shapes
+/// carry the same facts and only one of them survives a rule travelling alone, which is the whole
+/// argument:
+///
+/// - The note was the reason to change anything, and it cannot ride on a `Vec<String>`. Migration
+///   `0128` calls that column "a única defesa contra uma lista que daqui a seis meses ninguém sabe
+///   justificar", and a defence that can only be written is no defence.
+/// - A rule's verdict belongs ON the rule. In `{allow: [...], deny: [...]}` the verdict lives in the
+///   CONTAINER, so the moment a page hands one rule to an edit form the verdict falls off — and
+///   `POST /projects/{id}/shell-rules` rewrites BOTH `verdict` and `note` from what it is sent. That
+///   is the same loss this change exists to close, one field over. Served as rows, what comes back
+///   from the GET is field-for-field what the POST takes, and re-declaring is changing one of them.
+/// - The split stays legible because every row says which side it is on, which is strictly more
+///   than the old shape said: it named the sides once, at the top, and a page still had to
+///   re-associate every prefix with the list it came out of before it could draw anything. Grouping
+///   by `verdict` is what the page does instead, and `deny` beating `allow` is a sentence it can now
+///   write next to a rule rather than next to a heading.
+///
+/// The prefixes come back FOLDED, because that is how the table stores them and how they are
 /// enforced. Serving the typed spelling would show an owner a `Remove-Item` the classifier knows as
 /// `remove-item`, which is the very lie `project_policy::fold_prefix` exists to stop.
+///
+/// **`created_at` is served, and it is not padding.** The note says WHY a rule is there; this says
+/// WHEN, and the column's stated purpose is a list nobody can justify *six months from now* — which
+/// is a claim about time. A list where every rule looks equally fresh has to be re-read whole; one
+/// that carries dates can be triaged by age, and the oldest rules are the ones whose author has
+/// most likely left. It costs nothing: same row, `NOT NULL`, already written. Note for whoever
+/// draws it — this is when the prefix was FIRST declared and NOT when it was last edited, because
+/// `declare_shell_rule`'s `DO UPDATE` deliberately leaves the column alone; labelling it "last
+/// changed" would be a caption the daemon never agreed to.
 #[derive(serde::Serialize)]
-struct ShellRulesView {
-    allow: Vec<String>,
-    deny: Vec<String>,
+struct ShellRuleView {
+    prefix: String,
+    verdict: crate::project_policy::Verdict,
+    /// `null` for a rule declared with no justification — an absent note and not an absent field,
+    /// so a page can tell "nobody said why" from a shape it failed to parse.
+    note: Option<String>,
+    created_at: String,
 }
 
 /// What this project's worktrees may run without asking, and what they may never run.
+///
+/// Ordered by prefix, which is `declared_shell_rules`' `ORDER BY` and not this handler's arithmetic
+/// — the verdict is on every row, so any grouping a page wants is a filter it can do itself.
 async fn get_project_shell_rules(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<ShellRulesView>, StatusCode> {
-    crate::project_policy::shell_rules(&state.pool, &id)
+) -> Result<Json<Vec<ShellRuleView>>, StatusCode> {
+    crate::project_policy::declared_shell_rules(&state.pool, &id)
         .await
         .map(|rules| {
-            Json(ShellRulesView {
-                allow: rules.allow,
-                deny: rules.deny,
-            })
+            Json(
+                rules
+                    .into_iter()
+                    .map(|rule| ShellRuleView {
+                        prefix: rule.prefix,
+                        verdict: rule.verdict,
+                        note: rule.note,
+                        created_at: rule.created_at,
+                    })
+                    .collect(),
+            )
         })
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading a project's shell rules failed");
@@ -6355,6 +6419,51 @@ async fn delete_project_shell_rule(
 /// never written out" was supposed to buy.
 fn declarable_github_ops() -> Vec<&'static str> {
     crate::github::declarable_ops()
+}
+
+/// One GitHub operation this núcleo can build, and where it stands against the ceilings.
+///
+/// **Every operation with a flag, and not the admitted names alone.** Two lists of strings, or one
+/// list of the declarable, would have fixed a picker and left the other half unsayable — and the
+/// half that cannot be said is the one that matters. `api_read` is outside `ACTION_CEILING`: no
+/// route, no `.ai/github.yaml` and no owner can turn it on. A page that only knew the admitted names
+/// would either omit it, which quietly claims this núcleo cannot do it at all, or draw a control for
+/// it — and a checkbox that cannot be switched on is a lie about who decides. `declarable: false` is
+/// how an operation gets drawn as a FACT: it exists, it is refused here, and nothing on this screen
+/// is the thing that would change that.
+///
+/// Rows for `ShellRuleView`'s reason, restated because the two shapes landed together: a row that
+/// travels alone keeps its facts, and a name lifted out of a `declarable` list into a form has
+/// already forgotten which list it came from.
+#[derive(serde::Serialize)]
+struct DeclarableOpView {
+    kind: &'static str,
+    half: &'static str,
+    declarable: bool,
+}
+
+/// Every GitHub operation kind, and whether a project may declare it.
+///
+/// **The route exists because this set had one way out and it was a refusal.** `post_project_github_op`
+/// validates against `declarable_github_ops`, and until now the only place that set reached the wire
+/// was inside `undeclarable_op`'s `detail` — so a caller building a picker had to hardcode the list,
+/// which drifts from the ceilings in silence, or discover it by POSTing something invalid. Neither
+/// is a way to read a constant.
+///
+/// No project id and no roster check, because there is nothing project-shaped to check: the answer
+/// is compiled in. It cannot fail, which is why it returns `Json` and not `Result` — the one route
+/// in this family with no database under it.
+async fn get_declarable_github_ops() -> Json<Vec<DeclarableOpView>> {
+    Json(
+        crate::github::every_op()
+            .into_iter()
+            .map(|standing| DeclarableOpView {
+                kind: standing.kind,
+                half: standing.half,
+                declarable: standing.declarable,
+            })
+            .collect(),
+    )
 }
 
 /// What the GitHub manager may do on this project's remote without asking.
@@ -19805,6 +19914,22 @@ mod tests {
         )
     }
 
+    /// The prefixes on one side of a project's shell list, out of the ROWS `GET /shell-rules` serves.
+    ///
+    /// The route serves a row per rule rather than two lists of prefixes — `ShellRuleView` argues
+    /// why. Every assertion below that only ever cared *which side a prefix landed on* still asks
+    /// exactly that, through here, instead of thirteen restatements of the wire shape. The tests
+    /// that are about the shape itself read the fields directly.
+    fn prefixes_on<'a>(listed: &'a serde_json::Value, verdict: &str) -> Vec<&'a str> {
+        listed
+            .as_array()
+            .expect("the shell rules route serves an array of rules")
+            .iter()
+            .filter(|rule| rule["verdict"] == verdict)
+            .map(|rule| rule["prefix"].as_str().expect("every rule names a prefix"))
+            .collect()
+    }
+
     /// Declared, listed on its own side, and withdrawn — with the fold visible in what comes back.
     ///
     /// The prefixes are typed mixed-case and double-spaced on purpose. What the route serves is what
@@ -19838,11 +19963,8 @@ mod tests {
         let (status, listed) =
             reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            listed["allow"],
-            serde_json::json!(["bash scripts/gates.sh"])
-        );
-        assert_eq!(listed["deny"], serde_json::json!(["remove-item -recurse"]));
+        assert_eq!(prefixes_on(&listed, "allow"), ["bash scripts/gates.sh"]);
+        assert_eq!(prefixes_on(&listed, "deny"), ["remove-item -recurse"]);
 
         // Declared again with the OTHER verdict, which has to MOVE the prefix from one list to the
         // other: the identity of a rule is the prefix it names, so changing your mind is an EDIT.
@@ -19869,14 +19991,13 @@ mod tests {
 
         let (_, listed) =
             reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
-        assert_eq!(
-            listed["allow"],
-            serde_json::json!([]),
+        assert!(
+            prefixes_on(&listed, "allow").is_empty(),
             "a redeclared prefix has to LEAVE the side it was on, not sit on both"
         );
         assert_eq!(
-            listed["deny"],
-            serde_json::json!(["bash scripts/gates.sh", "remove-item -recurse"])
+            prefixes_on(&listed, "deny"),
+            ["bash scripts/gates.sh", "remove-item -recurse"]
         );
 
         // Withdrawn under a THIRD spelling of the same rule, which is the only way to show that the
@@ -19893,8 +20014,8 @@ mod tests {
 
         let (_, listed) =
             reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
-        assert_eq!(listed["allow"], serde_json::json!([]));
-        assert_eq!(listed["deny"], serde_json::json!(["bash scripts/gates.sh"]));
+        assert!(prefixes_on(&listed, "allow").is_empty());
+        assert_eq!(prefixes_on(&listed, "deny"), ["bash scripts/gates.sh"]);
 
         // And withdrawing it a second time is a 404, not a 204. A 204 over a delete that matched
         // nothing is the daemon agreeing a rule is gone while it goes on deciding.
@@ -19907,6 +20028,115 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(refused["refusal"], "no_such_rule");
+    }
+
+    /// **The note comes back off the GET, and so does the day the rule was declared.**
+    ///
+    /// `POST` has always taken a `note`; the GET served two lists of prefixes, so the column
+    /// migration `0128` calls "a única defesa contra uma lista que daqui a seis meses ninguém sabe
+    /// justificar" could be written and never read. A defence nobody can read defends nothing — and
+    /// it left a trap with no way out of it from a client: `declare_shell_rule` rewrites the note on
+    /// every declaration, so an editor changing a verdict must send the existing note back, and had
+    /// no route to fetch it from.
+    ///
+    /// **`created_at` is asserted across a redeclaration, and that is the assertion worth having.**
+    /// The seeded row carries a date nothing that runs today could produce, so a `DO UPDATE` that
+    /// touched the column would be caught — where two writes a second apart would agree either way
+    /// and pin nothing. What it pins is the caption: this is when the prefix was FIRST declared, and
+    /// a page labelling it "last changed" would be inventing a fact the daemon does not hold.
+    #[tokio::test]
+    async fn a_rules_note_and_the_day_it_was_declared_come_back() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        // Raw SQL rather than the route, for the `created_at` half: the column is written by
+        // `datetime('now')` and only a value from outside today can show that a redeclaration
+        // leaves it alone.
+        sqlx::query(
+            "INSERT INTO project_shell_rules (project_id, prefix, verdict, note, created_at)
+             VALUES ('alpha', 'cargo fmt', 'allow', 'formatting cannot break anything',
+                     '2020-01-01 00:00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // A second rule declared through the route with NO note at all, because "nobody said why"
+        // is a real state of the column and has to be distinguishable from a shape a page could not
+        // parse.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "git push", "verdict": "deny" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rules = listed.as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+
+        // `ORDER BY prefix`, so `cargo fmt` is first. The row is asserted whole: the four fields
+        // together are what makes a rule editable without losing anything, and asserting the note
+        // alone would pass a shape that had dropped the verdict.
+        assert_eq!(
+            rules[0],
+            serde_json::json!({
+                "prefix": "cargo fmt",
+                "verdict": "allow",
+                "note": "formatting cannot break anything",
+                "created_at": "2020-01-01 00:00:00",
+            }),
+            "the note is the reason this route serves rows; without it the column is write-only"
+        );
+        assert_eq!(
+            rules[1]["prefix"],
+            serde_json::json!("git push"),
+            "{listed}"
+        );
+        assert_eq!(
+            rules[1]["note"],
+            serde_json::Value::Null,
+            "a rule declared with no justification says so with `null`, not by omitting the field"
+        );
+        assert!(
+            !rules[1]["created_at"].as_str().unwrap().is_empty(),
+            "every row carries the day it was declared: {listed}"
+        );
+
+        // Re-verdicted with the note sent back, which is the operation the missing GET made
+        // impossible to do correctly.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({
+                "prefix": "Cargo  Fmt",
+                "verdict": "deny",
+                "note": "formatting cannot break anything",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        let rules = listed.as_array().unwrap();
+        assert_eq!(rules[0]["verdict"], serde_json::json!("deny"));
+        assert_eq!(
+            rules[0]["note"],
+            serde_json::json!("formatting cannot break anything"),
+            "the note a caller read off the GET and sent back has to survive the edit"
+        );
+        assert_eq!(
+            rules[0]["created_at"],
+            serde_json::json!("2020-01-01 00:00:00"),
+            "`DO UPDATE` sets `verdict` and `note` and nothing else: this column is when the \
+             prefix was first declared, not when it was last touched"
+        );
     }
 
     /// An `allow` the classifier's shape guards would never consult is refused HERE, and the
@@ -19955,8 +20185,8 @@ mod tests {
 
         // Nothing was stored by any of the five.
         let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
-        assert_eq!(listed["allow"], serde_json::json!([]));
-        assert_eq!(listed["deny"], serde_json::json!([]));
+        assert!(prefixes_on(&listed, "allow").is_empty());
+        assert!(prefixes_on(&listed, "deny").is_empty());
     }
 
     /// **The same shapes, declared as `deny`, are stored — and the engine enforces them.**
@@ -20068,6 +20298,88 @@ mod tests {
                 "{excluded} must not be declarable"
             );
         }
+    }
+
+    /// **The set that used to reach the wire only inside a refusal now has a route, and it carries
+    /// the operations it says no to as well.**
+    ///
+    /// Before this, a page building a picker had two options and both were wrong: hardcode the
+    /// names, which drifts from the compiled ceilings in silence and in the direction that offers
+    /// something the daemon refuses, or POST something invalid and read the list out of
+    /// `undeclarable_op`'s prose.
+    ///
+    /// **The `declarable: true` half is asserted as an EXACT set against `declarable_github_ops`**,
+    /// which is the assertion that bites. Serving one extra kind as declarable — `api_read`, say,
+    /// which no route and no owner's file can turn on — would put a control on screen for something
+    /// outside `ACTION_CEILING`, and a `contains` check would let it through.
+    ///
+    /// The `declarable: false` half is asserted by name because it is the reason the route serves
+    /// every operation rather than the admitted ones alone: an operation outside the ceiling has to
+    /// be showable as a FACT — it exists, it is refused, and nothing on that screen decides it.
+    #[tokio::test]
+    async fn the_declarable_ops_route_carries_the_ceilings_verdict_on_every_operation() {
+        let state = test_state().await;
+
+        let (status, listed) = reach_request(state, "GET", "/github/declarable-ops", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let served = listed.as_array().unwrap();
+
+        // Every operation this núcleo can build is here — the catalogue is `Op::all`, not the
+        // admitted subset of it.
+        let mut names: Vec<&str> = served
+            .iter()
+            .map(|op| op["kind"].as_str().unwrap())
+            .collect();
+        let mut every: Vec<&str> = crate::github::Op::all()
+            .iter()
+            .map(|op| op.kind())
+            .collect();
+        names.sort_unstable();
+        every.sort_unstable();
+        assert_eq!(names, every, "the catalogue has to name every operation");
+
+        let mut admitted: Vec<&str> = served
+            .iter()
+            .filter(|op| op["declarable"] == serde_json::json!(true))
+            .map(|op| op["kind"].as_str().unwrap())
+            .collect();
+        admitted.sort_unstable();
+        let mut expected = declarable_github_ops();
+        expected.sort_unstable();
+        assert_eq!(
+            admitted, expected,
+            "what this route calls declarable must be exactly what the POST accepts, or the \
+             picker offers something the daemon refuses"
+        );
+
+        // The four the ceilings exclude, each present and each flagged false. `api_read` is outside
+        // `ACTION_CEILING` entirely; the other three lose in `READ_CEILING`, `run_logs` on the
+        // `--log` its argv carries and the two `view`s by never being in the ceiling at all.
+        for excluded in ["api_read", "run_logs", "pr_view", "issue_view"] {
+            let row = served
+                .iter()
+                .find(|op| op["kind"] == serde_json::json!(excluded))
+                .unwrap_or_else(|| panic!("{excluded} has to be SHOWN, as a fact: {listed}"));
+            assert_eq!(row["declarable"], serde_json::json!(false), "{excluded}");
+        }
+
+        // Which door each goes through, because the two are not the same promise once declared: a
+        // declared read binds the very next decision, a declared action is stored and inert. It is
+        // asserted on one of each, and on the pair most likely to be confused — `api_read` reads
+        // and is an ACTION, `run_logs` is a read that is not declarable.
+        let half = |kind: &str| -> String {
+            served
+                .iter()
+                .find(|op| op["kind"] == serde_json::json!(kind))
+                .unwrap()["half"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(half("api_read"), "action");
+        assert_eq!(half("run_logs"), "read");
+        assert_eq!(half("pr_comment"), "action");
+        assert_eq!(half("run_list"), "read");
     }
 
     /// The ceiling entry that granted nothing now grants an operation, and the route in accepts it.
@@ -20307,8 +20619,8 @@ mod tests {
 
         // Nothing was written under the typo'd id.
         let (_, listed) = reach_request(state, "GET", "/projects/ghost/shell-rules", None).await;
-        assert_eq!(listed["allow"], serde_json::json!([]));
-        assert_eq!(listed["deny"], serde_json::json!([]));
+        assert!(prefixes_on(&listed, "allow").is_empty());
+        assert!(prefixes_on(&listed, "deny").is_empty());
     }
 
     /// A project that is merely switched OFF still declares its reach.
@@ -20338,7 +20650,7 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
-        assert_eq!(listed["allow"], serde_json::json!(["cargo run"]));
+        assert_eq!(prefixes_on(&listed, "allow"), ["cargo run"]);
     }
 
     /// An unreadable table never reports a declared row as "never declared".
@@ -20573,7 +20885,7 @@ mod tests {
         }
 
         let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
-        assert_eq!(listed["allow"], serde_json::json!([]));
+        assert!(prefixes_on(&listed, "allow").is_empty());
     }
 
     /// One project's declared reach is not another's, through the routes as well as in the table.
@@ -20610,8 +20922,8 @@ mod tests {
 
         let (_, rules) =
             reach_request(state.clone(), "GET", "/projects/beta/shell-rules", None).await;
-        assert_eq!(rules["allow"], serde_json::json!([]));
-        assert_eq!(rules["deny"], serde_json::json!([]));
+        assert!(prefixes_on(&rules, "allow").is_empty());
+        assert!(prefixes_on(&rules, "deny").is_empty());
         let (_, ops) = reach_request(state.clone(), "GET", "/projects/beta/github-ops", None).await;
         assert_eq!(ops, serde_json::json!([]));
         let (_, targets) = reach_request(state, "GET", "/projects/beta/land-targets", None).await;

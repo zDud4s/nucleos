@@ -2407,6 +2407,67 @@ mod tests {
         ));
     }
 
+    /// The catalogue of DECLARABLE operations is in no scope table either, and the reason is not
+    /// the one its nine neighbours have.
+    ///
+    /// `GET /github/declarable-ops` is a read of compiled constants. It takes no project id, it
+    /// touches no database, and its answer is a function of the binary — two callers on the same
+    /// build get the same bytes. So the argument the nine are excluded under does NOT transfer:
+    /// nothing here decides what a project's runs may do unattended, and nothing here discloses one
+    /// project's configuration, one repository, or one secret. On confidentiality alone this could
+    /// be filed beside `/fleet/exclusions`, which is listed as describing the shape of the fleet
+    /// while changing none of it. That is the honest case for the other answer, and it is written
+    /// down so the next reader weighs it rather than rediscovering it.
+    ///
+    /// What settles it is that the grant would buy nobody anything. The caller this route was added
+    /// for is the app, which holds `Scope::Control` and never consults these tables; no scoped key
+    /// has asked for it. And its only use is the nine routes above, every one of which a scoped key
+    /// is refused — a key that cannot read what a project HAS declared has no use for the list of
+    /// what MAY be declared, while what the list does give a holder is the exact vocabulary to aim
+    /// at those routes with. Between a grant with a use and a grant without one, this table's own
+    /// header decides it: it is deliberately not "every GET", because adding a route must not
+    /// silently disclose it to every read-only key. `GET /vcs/requests/{id}/wait` is excluded on the
+    /// same least-privilege reading, and `GET /assistant/tools` — compiled constants served for a
+    /// picker, which is this route's twin in every respect — is in no table today.
+    ///
+    /// Membership rather than a request, like the nine: `permits` is default-deny, so this is safe
+    /// today by being nowhere, and what that does not survive is somebody filing a GET of constants
+    /// in `READ_ONLY_ROUTES` because it plainly discloses nothing. That is the edit this test
+    /// refuses, and the paragraph above is the argument it refuses it with.
+    #[test]
+    fn the_declarable_ops_catalogue_is_in_no_scope_table() {
+        const CATALOGUE: &str = "/github/declarable-ops";
+
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(TEAM_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(EMAIL_ROUTES, &Method::GET, CATALOGUE)
+                && !route_is_listed(COUNCIL_ROUTES, &Method::GET, CATALOGUE),
+            "the catalogue explains routes no scoped key may reach, so no scoped key needs it"
+        );
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::GET, CATALOGUE),
+                "{scope:?} must not reach GET {CATALOGUE}"
+            );
+        }
+
+        // And the two that act for the person do reach it, which is the half that makes the
+        // exclusion a boundary rather than a route nobody can open.
+        for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+            assert!(
+                permits(&scope, &Method::GET, CATALOGUE),
+                "{scope:?} opens the page these constants are for"
+            );
+        }
+    }
+
     /// A project's workflows are the owner's, to read and to change.
     ///
     /// Six routes, all out of every table, and the reads are the half worth arguing for. A

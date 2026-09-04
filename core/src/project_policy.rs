@@ -121,26 +121,60 @@ impl ShellRules {
     }
 }
 
-/// Both lists, split by verdict. `Err` when the table could not be read — see the module doc:
-/// yielding an empty `deny` would lose a refusal somebody wrote down, so this one cannot fail soft.
-pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRules, String> {
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT prefix, verdict FROM project_shell_rules WHERE project_id = ? ORDER BY prefix",
+/// One shell rule as the table actually holds it: the two columns the classifier reads, and the two
+/// it never asks about.
+///
+/// `note` and `created_at` are for a PERSON and never for a decision, which is why the deciding path
+/// has its own smaller shape. Migration `0128` calls the note "a única defesa contra uma lista que
+/// daqui a seis meses ninguém sabe justificar" — a defence that only ever went INTO the table is no
+/// defence, and this struct is the way back out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredShellRule {
+    pub prefix: String,
+    pub verdict: Verdict,
+    /// Why, in the words of whoever declared it. `None` is a rule with no justification, which is a
+    /// state the column really has and not a read failure.
+    pub note: Option<String>,
+    /// When this prefix was FIRST declared, in `datetime('now')`'s spelling.
+    ///
+    /// **Not "last changed", and the difference is `declare_shell_rule`'s doing.** Its `DO UPDATE`
+    /// sets `verdict` and `note` and deliberately leaves this column alone, so a rule whose verdict
+    /// was flipped this morning still carries the day somebody wrote it down. `declare_github_op`
+    /// argues the same point about its own copy of this column, for the same later reader.
+    pub created_at: String,
+}
+
+/// Every rule this project has declared, whole — the DISPLAY half of `shell_rules`.
+///
+/// **One query and one reading of `verdict` for both halves.** `shell_rules` is a fold over this
+/// function rather than a second `SELECT`, because the two answer about the same rows and the one
+/// row where they could disagree is the one that matters most: a `verdict` word neither can parse.
+/// A second statement with its own `match` is how the list an owner is shown comes to say `allow`
+/// while their runs are being refused — silently, and about precisely the row nobody vetted.
+///
+/// `Err` when the table could not be read, for the module header's reason: yielding an empty `deny`
+/// would lose a refusal somebody wrote down, so this read cannot fail soft in either of its uses.
+pub async fn declared_shell_rules(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> Result<Vec<DeclaredShellRule>, String> {
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+        "SELECT prefix, verdict, note, created_at FROM project_shell_rules
+         WHERE project_id = ? ORDER BY prefix",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await
     .map_err(|error| format!("could not read {project_id}'s shell rules: {error}"))?;
 
-    let mut rules = ShellRules::default();
-    for (prefix, verdict) in rows {
-        // Folded before the match rather than in each arm, so no arm can be added later that
-        // forgets to. The unreadable-verdict arm below needs it as much as the other two: the row
-        // it pushes onto `deny` is precisely the one nobody vetted.
+    let mut declared = Vec::with_capacity(rows.len());
+    for (prefix, verdict, note, created_at) in rows {
+        // Folded before the verdict is read rather than after, so no later branch can be added that
+        // forgets to. The unreadable-verdict arm below needs the fold as much as the two real
+        // verdicts do: the row it turns into a `deny` is precisely the one nobody vetted.
         let prefix = fold_prefix(&prefix);
-        match Verdict::from_db_str(&verdict) {
-            Some(Verdict::Allow) => rules.allow.push(prefix),
-            Some(Verdict::Deny) => rules.deny.push(prefix),
+        let verdict = match Verdict::from_db_str(&verdict) {
+            Some(verdict) => verdict,
             // The migration's `CHECK (verdict IN ('allow', 'deny'))` should make this arm
             // unreachable -- but "should" is not "cannot": schema drift, an out-of-band write, or a
             // future migration loosening the constraint could still put an unrecognised word here.
@@ -150,8 +184,30 @@ pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRul
             // verdict of is one this module DENIES, not one it forgets.
             None => {
                 tracing::warn!(%prefix, %verdict, project_id, "shell rule: unreadable verdict; denied");
-                rules.deny.push(prefix);
+                Verdict::Deny
             }
+        };
+        declared.push(DeclaredShellRule {
+            prefix,
+            verdict,
+            note,
+            created_at,
+        });
+    }
+    Ok(declared)
+}
+
+/// Both lists, split by verdict — the DECIDING half, and the only shape `classifier` is given.
+///
+/// The two extra columns are dropped here rather than never fetched, and the cost is a `String` per
+/// rule per decision over a list of a handful of rows. What it buys is the paragraph above: the
+/// picture and the decision cannot disagree, because there is nothing for them to disagree with.
+pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRules, String> {
+    let mut rules = ShellRules::default();
+    for rule in declared_shell_rules(pool, project_id).await? {
+        match rule.verdict {
+            Verdict::Allow => rules.allow.push(rule.prefix),
+            Verdict::Deny => rules.deny.push(rule.prefix),
         }
     }
     Ok(rules)
@@ -596,6 +652,50 @@ mod tests {
         // And the folded list judges the command the unfolded one could not.
         assert!(rules.denies("remove-item -recurse x"));
         assert!(rules.allows("bash scripts/gates.sh all"));
+    }
+
+    /// The two halves of one read, held to the same answer about the same rows.
+    ///
+    /// `declared_shell_rules` carries the note and the day; `shell_rules` is a fold over it. What
+    /// this pins is that the fold is a projection and not a second query: the same prefix, folded
+    /// the same way, on the same side. A display read that folded differently — or not at all —
+    /// would show an owner a `Remove-Item` while their runs are judged against `remove-item`, which
+    /// is `fold_prefix`'s bug wearing the display half's clothes.
+    #[tokio::test]
+    async fn the_display_read_and_the_deciding_read_say_the_same_thing_about_a_rule() {
+        let pool = pool().await;
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            "Remove-Item  -Recurse",
+            Verdict::Deny,
+            Some("nothing here deletes recursively"),
+        )
+        .await
+        .unwrap();
+        declare_shell_rule(&pool, "alpha", "npm ci", Verdict::Allow, None)
+            .await
+            .unwrap();
+
+        let declared = declared_shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(declared.len(), 2);
+        // `ORDER BY prefix`, over the folded spelling — the only one stored.
+        assert_eq!(declared[0].prefix, "npm ci");
+        assert_eq!(declared[0].verdict, Verdict::Allow);
+        // A rule declared without one, and the absence is a state rather than a failure.
+        assert_eq!(declared[0].note, None);
+        assert!(!declared[0].created_at.is_empty());
+        assert_eq!(declared[1].prefix, "remove-item -recurse");
+        assert_eq!(declared[1].verdict, Verdict::Deny);
+        assert_eq!(
+            declared[1].note.as_deref(),
+            Some("nothing here deletes recursively"),
+            "the note is the whole reason this read exists beside the other one"
+        );
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(rules.allow, vec!["npm ci".to_owned()]);
+        assert_eq!(rules.deny, vec!["remove-item -recurse".to_owned()]);
     }
 
     /// The identity is (project, prefix): declaring the same prefix again EDITS it. Otherwise

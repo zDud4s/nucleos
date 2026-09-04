@@ -4,18 +4,20 @@ import { keys } from "./keys";
 
 /**
  * The three lists a project declares about itself: what its worktrees may run without asking, what
- * the GitHub manager may do on its remote, and where a landing may be sent.
+ * the GitHub manager may do on its remote, and where a landing may be sent. And, because a form
+ * offering a choice has to know what the choices are, the machine-wide catalogue of what MAY be
+ * declared of the second one.
  *
  * **Not `project-commands.ts`.** That one holds commands somebody presses a button to run — `gate`,
  * `fmt`, `typecheck`. Nothing here is ever executed. These are permissions, and the two modules
  * share a first word and nothing else. `core/src/project_policy.rs` makes the same distinction in
  * the same words, and this is the shell's half of it.
  *
- * Nine routes, read off `core/src/http.rs` rather than inferred from the names:
+ * Ten routes, read off `core/src/http.rs` rather than inferred from the names:
  *
  * | what                          | route                                     |
  * |-------------------------------|-------------------------------------------|
- * | the two shell lists           | `GET /projects/{id}/shell-rules`          |
+ * | this project's shell rules    | `GET /projects/{id}/shell-rules`          |
  * | declare or re-verdict one     | `POST /projects/{id}/shell-rules`         |
  * | withdraw one                  | `DELETE /projects/{id}/shell-rules`       |
  * | the autonomous GitHub ops     | `GET /projects/{id}/github-ops`           |
@@ -24,6 +26,12 @@ import { keys } from "./keys";
  * | the extra landing targets     | `GET /projects/{id}/land-targets`         |
  * | open one                      | `POST /projects/{id}/land-targets`        |
  * | close one                     | `DELETE /projects/{id}/land-targets`      |
+ * | what MAY be declared          | `GET /github/declarable-ops`              |
+ *
+ * **The tenth hangs off no project, and that is a fact about the answer rather than about the URL.**
+ * The declarable set is compiled into the daemon — two ceilings intersected with the operations it
+ * can build — so it is the same for every project on the roster and changes only when the daemon is
+ * rebuilt. A route under `/projects/{id}/…` would have taken an id that changed nothing.
  *
  * **The three DELETEs carry what they delete in the BODY.** A shell prefix contains spaces, slashes
  * and dots and is not a safe path segment; the other two follow it rather than splitting one shape
@@ -53,10 +61,71 @@ import { keys } from "./keys";
  */
 export type Verdict = "allow" | "deny";
 
-/** One project's shell list, already split by verdict — `ShellRulesView` in `core/src/http.rs`. */
-export interface ShellRules {
-  allow: string[];
-  deny: string[];
+/**
+ * One declared shell rule, whole — `ShellRuleView` in `core/src/http.rs`.
+ *
+ * **A row and not two lists of prefixes, and the difference is the note.** The route used to serve
+ * `{ allow: string[], deny: string[] }`, which could carry no note at all — so the column migration
+ * `0128` calls "a única defesa contra uma lista que daqui a seis meses ninguém sabe justificar" was
+ * write-only, and {@link Note}'s trap had no exit: an editor flipping a verdict has to resend the
+ * existing justification and had no way to fetch it.
+ *
+ * The verdict rides on the rule for the same reason. In the old shape it lived in the CONTAINER, so
+ * the moment a page handed one rule to a form the verdict fell off — and the POST rewrites both
+ * fields from what it is sent. What comes back here is field-for-field what {@link useDeclareShellRule}
+ * takes, so re-declaring is changing one field of a row you are already holding.
+ *
+ * The allow/deny split is not lost by this: it is on every row instead of being named once at the
+ * top, and grouping by `verdict` is a filter. `deny` beats `allow` in the classifier — see
+ * {@link Verdict} — which is now a sentence a page can put beside a rule rather than beside a heading.
+ */
+export interface ShellRule {
+  /** FOLDED, as stored and as enforced — see {@link foldPrefix}. */
+  prefix: string;
+  verdict: Verdict;
+  /** `null` for a rule nobody justified. An absent justification, never an absent field. */
+  note: string | null;
+  /**
+   * When this prefix was FIRST declared, in the daemon's `datetime('now')` spelling —
+   * `2026-09-04 13:07:18`, UTC, space-separated and NOT RFC 3339. `new Date(…)` will not parse it
+   * portably; treat it as the daemon's text unless you convert it deliberately.
+   *
+   * **Not "last changed".** `declare_shell_rule`'s `ON CONFLICT DO UPDATE` sets `verdict` and `note`
+   * and deliberately leaves this column alone, so a rule re-verdicted this morning still carries the
+   * day somebody wrote it down. A caption saying "edited" would be inventing a fact the daemon does
+   * not hold.
+   */
+  created_at: string;
+}
+
+/**
+ * Which door a GitHub operation goes through, and it is not cosmetic.
+ *
+ * A declared `read` binds the very next decision: `Policy::for_project` splits a project's stored
+ * rows on the reading half, and that half is already consulted through the Bash door. A declared
+ * `action` is recorded and INERT — the route answers 204 just the same, and a later step wires it.
+ * A page that drew the two identically would be promising an owner their declared action is in
+ * force. See {@link useDeclareGithubOp}, which says the same thing at the write.
+ */
+export type OpHalf = "read" | "action";
+
+/**
+ * One GitHub operation this daemon can build — `DeclarableOpView` in `core/src/http.rs`.
+ *
+ * A row per operation for {@link ShellRule}'s reason, and the two landed together: a row that
+ * travels alone keeps its facts, where a name lifted out of an "admitted" list into a form has
+ * already forgotten which list it came from.
+ */
+export interface DeclarableOp {
+  /** The typed name, as `op_kind` goes over the wire — `run_list`, `pr_comment`. */
+  kind: string;
+  half: OpHalf;
+  /**
+   * Whether a project may declare it. `false` is a fact about the build and not a state anything on
+   * screen can change: the compiled ceilings do not admit it, so no route, no file and no owner can
+   * turn it on.
+   */
+  declarable: boolean;
 }
 
 /**
@@ -76,10 +145,11 @@ export interface ShellRules {
  * too easy to read as "unchanged", which is the one thing the route cannot do. There are two
  * operations and this type has two members, so the compiler asks which one you meant.
  *
- * **What it still cannot do.** `GET /projects/{id}/shell-rules` serves two lists of prefixes and no
- * notes — the note is write-only through HTTP today — so nothing here can fetch the existing note
- * to send back for you. Preserving one means the page must hold the note it is editing in its own
- * form state. Until the GET carries notes, that half is a discipline and not a guarantee.
+ * **And the note to resend is now fetchable.** {@link ShellRule} carries it, so preserving a
+ * justification through a verdict change is reading it off the row you are already showing — see
+ * {@link declaredRule} — and sending it back as `{ write: … }`. It was a discipline while the GET
+ * served prefixes only; it is an operation now. The type still asks, because a row whose `note` is
+ * `null` maps onto `{ erase: true }` and nothing else, and erasing is a thing somebody may mean.
  */
 export type Note =
   /** Store this justification, replacing whatever the rule carried before. */
@@ -111,6 +181,9 @@ function noteField(note: Note): string | null {
 /**
  * What this project's worktrees may run without asking, and what they may never run.
  *
+ * One row per rule, ordered by prefix, each carrying its own verdict — {@link ShellRule} argues why
+ * that rather than two lists of prefixes. Grouping them for the screen is a filter over `verdict`.
+ *
  * **The prefixes come back FOLDED, and that is the point of showing them at all.** The núcleo folds
  * a prefix through `classifier::normalize_command` on the way in and again on the way out, so a
  * rule typed `Remove-Item  -Recurse` is stored and enforced as `remove-item -recurse`. A surface
@@ -120,7 +193,7 @@ export function useProjectShellRules(projectId: string | null) {
   return useQuery({
     queryKey: keys.projects.shellRules(projectId ?? ""),
     queryFn: () =>
-      apiFetch<ShellRules>(`/projects/${encodeURIComponent(projectId ?? "")}/shell-rules`),
+      apiFetch<ShellRule[]>(`/projects/${encodeURIComponent(projectId ?? "")}/shell-rules`),
     enabled: projectId !== null,
   });
 }
@@ -129,10 +202,9 @@ export function useProjectShellRules(projectId: string | null) {
  * What the GitHub manager may do on this project's remote without asking.
  *
  * Operation names — `run_list`, `pr_view` — and not `gh` command lines, because a name is what can
- * tell `run_status` from `run_logs`. There is no route that lists the declarable ones: the set is
- * derived in `github.rs` from two compiled ceilings, and the only place it appears on the wire is
- * inside the `undeclarable_op` refusal, which names what would have been accepted. A page offering
- * a picker has to get its options from somewhere, and today that somewhere is a failed POST.
+ * tell `run_status` from `run_logs`. What this project HAS declared; what it MAY declare is
+ * {@link useDeclarableGithubOps}, and a picker needs both — this one to know which boxes are
+ * ticked, that one to know which boxes exist.
  */
 export function useProjectGithubOps(projectId: string | null) {
   return useQuery({
@@ -140,6 +212,37 @@ export function useProjectGithubOps(projectId: string | null) {
     queryFn: () =>
       apiFetch<string[]>(`/projects/${encodeURIComponent(projectId ?? "")}/github-ops`),
     enabled: projectId !== null,
+  });
+}
+
+/**
+ * Every GitHub operation this daemon can build, and whether a project may declare it —
+ * `GET /github/declarable-ops`.
+ *
+ * **The set used to reach the wire only inside a refusal.** `POST /projects/{id}/github-ops`
+ * validates against it, and until this route the only place it appeared was `undeclarable_op`'s
+ * `detail`. A picker had two options and both were wrong: hardcode the names, which drifts from the
+ * compiled ceilings in silence and in the direction that offers something the daemon refuses, or
+ * discover the list by POSTing something invalid.
+ *
+ * **Every operation, with a flag, and the `false` ones are the reason.** An operation outside the
+ * ceilings — `api_read` is the standing example, and not even `.ai/github.yaml` can turn it on — is
+ * a FACT to show and never a control to draw. Serving only the admitted names would leave a page
+ * two bad choices again: omit it, which claims this daemon cannot do it at all, or draw a checkbox
+ * that cannot be ticked, which is a lie about who decides. `declarable: false` is how it gets drawn
+ * as what it is.
+ *
+ * **Machine-wide, so it takes no project id and is keyed apart from the three lists.** A declaration
+ * write invalidates `keys.projects.all` and must not throw this away — it cannot have changed, and
+ * it cannot change while the daemon is running.
+ *
+ * Not polled, and this one is not even "changes when a person edits it": it changes when the daemon
+ * is rebuilt, which the app finds out about by being restarted alongside it.
+ */
+export function useDeclarableGithubOps() {
+  return useQuery({
+    queryKey: keys.github.declarableOps,
+    queryFn: () => apiFetch<DeclarableOp[]>("/github/declarable-ops"),
   });
 }
 
@@ -194,7 +297,9 @@ function useDeclarationWrite<Input>(mutationFn: (input: Input) => Promise<void>)
  *
  * **Sending a note back is how you keep one.** See {@link Note}: this route rewrites the note on
  * every declaration, so `{ erase: true }` on a rule that carried a justification throws it away.
- * When flipping a verdict, pass `{ write: theNoteYouAreShowing }`.
+ * When flipping a verdict, read the note off the row {@link useProjectShellRules} already handed
+ * you — {@link declaredRule} finds it — and send it back as `{ write: … }`. A row whose `note` is
+ * `null` had none to keep, and `{ erase: true }` is the honest way to say so.
  *
  * Refuses with `kill_switch` (423) for an `allow` while the emergency stop is engaged, and never
  * for a `deny` — a stop that stopped somebody narrowing autonomy would be holding the door open on
@@ -241,7 +346,9 @@ export function useForgetShellRule() {
  * force would be describing a step that has not landed.
  *
  * Gated by the emergency stop, like an `allow`: this widens, immediately. `undeclarable_op` (422)
- * lists the ops the ceilings admit, which is the only place that set reaches the shell.
+ * lists the ops the ceilings admit — which is worth putting on screen verbatim, but is no longer
+ * the only way to learn the set: {@link useDeclarableGithubOps} serves it, so a picker need never
+ * offer something this route will refuse.
  */
 export function useDeclareGithubOp() {
   return useDeclarationWrite(({ projectId, opKind }: { projectId: string; opKind: string }) =>
@@ -325,19 +432,37 @@ export function foldPrefix(prefix: string): string {
 }
 
 /**
- * PURE: which side a typed prefix is already declared on, or `null` for one that is not.
+ * PURE: the rule already declared for a typed prefix, or `null` for one that is not.
  *
  * Folds before it looks, because case is not part of a rule's identity — asking with the typed
  * spelling is how a form would offer to "create" a rule that already exists and then silently
  * overwrite it.
  *
- * `deny` is checked first. The unique index means a prefix can only be on one side, so the order
- * decides nothing today; it is the safe reading of a table that has somehow ended up disagreeing
- * with itself, and the same direction `shell_rules` takes about a verdict it cannot parse.
+ * **The whole row and not just the verdict, because the row is what an edit has to send back.**
+ * `POST /projects/{id}/shell-rules` rewrites `verdict` and `note` from what it is given, so
+ * preserving a justification through a verdict change is reading `note` off what this returns and
+ * sending it as {@link Note}. The row's `note` is `string | null` and `Note` has no `null`, which is
+ * the type asking the one question that matters: a rule that carried no justification is
+ * `{ erase: true }`, deliberately, and never an empty `write`. See {@link Note} for the trap.
+ *
+ * A `deny` is preferred over an `allow` if the list somehow carries both. The unique index means a
+ * prefix can only be on one side, so the choice decides nothing today; it is the safe reading of a
+ * table that has ended up disagreeing with itself, and the same direction `shell_rules` takes about
+ * a verdict it cannot parse.
  */
-export function declaredVerdict(rules: ShellRules, prefix: string): Verdict | null {
+export function declaredRule(rules: ShellRule[], prefix: string): ShellRule | null {
   const folded = foldPrefix(prefix);
-  if (rules.deny.includes(folded)) return "deny";
-  if (rules.allow.includes(folded)) return "allow";
-  return null;
+  const matching = rules.filter((rule) => rule.prefix === folded);
+  return matching.find((rule) => rule.verdict === "deny") ?? matching[0] ?? null;
+}
+
+/**
+ * PURE: which side a typed prefix is already declared on, or `null` for one that is not.
+ *
+ * {@link declaredRule} with the other three fields dropped, for the one caller that genuinely only
+ * asks which side — a form deciding whether it is creating a rule or editing one. Anything about to
+ * WRITE wants the row, because the note is on it.
+ */
+export function declaredVerdict(rules: ShellRule[], prefix: string): Verdict | null {
+  return declaredRule(rules, prefix)?.verdict ?? null;
 }

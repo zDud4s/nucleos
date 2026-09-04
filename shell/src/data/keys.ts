@@ -243,6 +243,19 @@ export const keys = {
   },
 
   /**
+   * What any project MAY declare about GitHub — `GET /github/declarable-ops`.
+   *
+   * Its own root, and pointedly NOT under `projects`, for `workflows` above's reason carried one
+   * step further: this is not merely shared between projects, it is the same answer for all of them
+   * and cannot change while the daemon runs. It is derived from two ceilings compiled into the
+   * binary, so a declaration write — which invalidates `keys.projects.all` — must not throw it away.
+   */
+  github: {
+    all: ["github"] as const,
+    declarableOps: ["github", "declarable-ops"] as const,
+  },
+
+  /**
    * What the agent has been told, and what it asked to be told — `GET
    * /refinements`.
    *

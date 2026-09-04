@@ -1420,6 +1420,61 @@ pub fn declarable_ops() -> Vec<&'static str> {
         .collect()
 }
 
+/// Where one operation stands against the ceilings.
+///
+/// `declarable` is the same question `declarable_ops` answers and asked of the same two functions —
+/// this is not a second derivation, it is that one carrying the operations it says no to as well as
+/// the ones it says yes to.
+pub struct OpStanding {
+    /// The typed name, as `op_kind` is written in `project_github_ops` and in the POST body.
+    pub kind: &'static str,
+    /// Which door this operation goes through — `"read"` or `"action"`, the two words
+    /// `config::GithubConfig` already uses for its own two lists.
+    ///
+    /// It is here because the two halves are not the same promise once declared, and only the
+    /// núcleo knows which is which. A declared READ binds the very next decision:
+    /// `Policy::for_project` splits the stored rows on `declarable_read_ops`, and the reading half
+    /// is already consulted through the Bash door. A declared ACTION is recorded and inert until a
+    /// later step wires it. A surface that could not tell them apart would either have to hardcode
+    /// the names — the drift this whole function exists to end — or promise an owner their declared
+    /// action is in force.
+    pub half: &'static str,
+    /// Whether a project may declare it. `false` is a fact about this build and not a state
+    /// anything can change: it means the compiled ceilings do not admit the operation, so no route,
+    /// no file and no owner can turn it on.
+    pub declarable: bool,
+}
+
+/// PURE: every operation this núcleo can build, and whether a project may declare each one.
+///
+/// **The ones it says NO to are the reason this exists.** `declarable_ops` is the set a POST
+/// accepts, and until this function that set reached the wire only inside an `undeclarable_op`
+/// refusal — so a surface offering a picker had to hardcode the list and drift from the ceilings in
+/// silence, or discover it by POSTing something invalid. Serving only the admitted names would have
+/// fixed the picker and left the other half unsayable: `api_read` is outside `ACTION_CEILING` and
+/// cannot be switched on by anybody, and that is a FACT to state rather than a control to draw. A
+/// checkbox that did nothing would be a lie about who decides.
+///
+/// Reads first and actions after, which is `Op::all`'s order and `declarable_ops`' — one list, in
+/// the order decision #5 keeps the partition in.
+///
+/// Not memoised, unlike the two halves it consults: its only caller is a route a person opens a
+/// page against, where `declarable_ops`' caller is the decision path.
+pub fn every_op() -> Vec<OpStanding> {
+    let declarable = declarable_ops();
+    Op::all()
+        .iter()
+        .map(|operation| OpStanding {
+            kind: operation.kind(),
+            half: match operation {
+                Op::Read(_) => "read",
+                Op::Act(_) => "action",
+            },
+            declarable: declarable.contains(&operation.kind()),
+        })
+        .collect()
+}
+
 /// What runs without asking.
 ///
 /// Built from `.ai/github.yaml` at startup as the MACHINE default, and immutable once built — it

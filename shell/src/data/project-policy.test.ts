@@ -6,8 +6,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "./client";
 import {
+  declaredRule,
   declaredVerdict,
   foldPrefix,
+  useDeclarableGithubOps,
   useDeclareGithubOp,
   useDeclareLandTarget,
   useDeclareShellRule,
@@ -17,8 +19,9 @@ import {
   useProjectGithubOps,
   useProjectLandTargets,
   useProjectShellRules,
+  type DeclarableOp,
+  type ShellRule,
   type ShellRuleDeclaration,
-  type ShellRules,
   type Verdict,
 } from "./project-policy";
 
@@ -39,19 +42,47 @@ vi.mock("./client", async (original) => ({
 type Refusal = InstanceType<typeof ApiRefusal>;
 
 /**
- * The operations this fake's ceilings admit.
+ * What `GET /github/declarable-ops` serves.
  *
- * A stand-in and not a copy: the real set is derived in `github.rs` by intersecting the built
- * operations with two compiled ceilings, and it reaches the shell only inside the `undeclarable_op`
- * refusal. Writing the real one out here would be a second spelling of a set the shell is
- * deliberately not allowed to hold.
+ * A stand-in and not a copy: the real one is derived in `github.rs` by intersecting the built
+ * operations with two compiled ceilings, and writing the real set out here would be a second
+ * spelling of something the shell is deliberately not allowed to hold — which is the very drift the
+ * route exists to end.
+ *
+ * The `declarable: false` rows are the half worth putting in a fixture. An operation outside the
+ * ceilings is not missing: it exists, nothing on any screen can turn it on, and a page has to be
+ * able to draw that as a fact.
  */
-const ADMITTED = ["pr_view", "run_list", "workflow_list"];
+const CATALOGUE: DeclarableOp[] = [
+  { kind: "pr_view", half: "read", declarable: true },
+  { kind: "run_list", half: "read", declarable: true },
+  { kind: "workflow_list", half: "read", declarable: true },
+  { kind: "run_logs", half: "read", declarable: false },
+  { kind: "pr_comment", half: "action", declarable: true },
+  { kind: "api_read", half: "action", declarable: false },
+];
+
+/**
+ * The operations this fake's POST accepts, DERIVED from the catalogue above rather than written
+ * twice — the fake may be a stand-in for the daemon, but it must not be able to disagree with
+ * itself about which of the two answers is right.
+ */
+const ADMITTED = CATALOGUE.filter((operation) => operation.declarable).map(
+  (operation) => operation.kind,
+);
+
+/** The day a rule the fixture declares was written down. Any day that is not today will do. */
+const DECLARED_ON = "2026-03-14 09:41:00";
 
 interface StoredRule {
   verdict: Verdict;
   /** `null` is a rule with no justification, which is a state the table really has. */
   note: string | null;
+  /**
+   * `created_at`, and the fake keeps it through a redeclaration because the daemon does:
+   * `DO UPDATE SET verdict = …, note = …` names two columns and not this one.
+   */
+  created_at: string;
 }
 
 /**
@@ -73,6 +104,10 @@ function fakeDaemon(project = "alpha") {
       typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
     sent.push({ path, method, body });
 
+    // The one route here that names no project: the declarable set is compiled into the daemon, so
+    // it is the same answer whichever project a page is showing.
+    if (path === "/github/declarable-ops") return CATALOGUE;
+
     const route = /^\/projects\/([^/]+)\/(shell-rules|github-ops|land-targets)$/.exec(path);
     if (route === null) throw new Error(`the fake daemon has no route for ${method} ${path}`);
     const [, id, table] = route;
@@ -83,25 +118,27 @@ function fakeDaemon(project = "alpha") {
     if (method !== "GET" && id !== project) {
       throw new ApiRefusal(404, "no_such_project", `this daemon has no project called \`${id}\``);
     }
-    if (id !== project) return table === "shell-rules" ? { allow: [], deny: [] } : [];
+    if (id !== project) return [];
 
     if (table === "shell-rules") {
       if (method === "GET") {
-        const view: ShellRules = { allow: [], deny: [] };
-        // `ORDER BY prefix`, over the folded spelling, which is the only one stored.
-        for (const prefix of [...rules.keys()].sort()) {
-          const stored = rules.get(prefix);
-          if (stored !== undefined) view[stored.verdict].push(prefix);
-        }
-        return view;
+        // `ORDER BY prefix`, over the folded spelling, which is the only one stored. One row per
+        // rule, carrying its own verdict — see `ShellRule` for why that and not two lists.
+        return [...rules.keys()].sort().map((prefix): ShellRule => {
+          const stored = rules.get(prefix) as StoredRule;
+          return { prefix, ...stored };
+        });
       }
       const prefix = foldPrefix(String(body?.prefix ?? ""));
       if (method === "POST") {
         // `note = excluded.note`, and not a merge. Whatever arrived is now the note, `null`
-        // included — which is the trap `Note` exists to make somebody choose out loud.
+        // included — which is the trap `Note` exists to make somebody choose out loud. `created_at`
+        // is not in the `DO UPDATE` at all, so a redeclaration keeps the day the rule was first
+        // written down.
         rules.set(prefix, {
           verdict: body?.verdict as Verdict,
           note: (body?.note as string | null | undefined) ?? null,
+          created_at: rules.get(prefix)?.created_at ?? DECLARED_ON,
         });
         return undefined;
       }
@@ -151,17 +188,8 @@ function fakeDaemon(project = "alpha") {
   return {
     call,
     sent,
-    /**
-     * The note a rule is carrying, read out of the table rather than off the wire.
-     *
-     * There is no other way to ask: `GET /projects/{id}/shell-rules` serves two lists of prefixes
-     * and no notes, so a note is write-only through HTTP. That absence is why the preservation
-     * test below has to reach in here, and why `Note` cannot do better than make the choice
-     * explicit.
-     */
-    noteFor: (prefix: string) => rules.get(foldPrefix(prefix))?.note ?? null,
     declareRule: (prefix: string, verdict: Verdict, note: string | null = null) => {
-      rules.set(foldPrefix(prefix), { verdict, note });
+      rules.set(foldPrefix(prefix), { verdict, note, created_at: DECLARED_ON });
     },
     declareOp: (opKind: string) => ops.add(opKind),
     declareTarget: (branch: string) => targets.add(branch),
@@ -191,21 +219,32 @@ afterEach(() => {
 
 describe("the three reads", () => {
   /**
-   * **Two lists and not one with a verdict on each row**, because that is what the route serves —
-   * and because the two are not mirror images: an `allow` had to pass a shape guard to be stored
-   * and a `deny` did not.
+   * **One row per rule, each carrying its own verdict**, because that is what the route serves —
+   * and because a rule handed to a form has to keep the two fields the POST will rewrite. The
+   * allow/deny split is a filter over `verdict`, and the two sides are still not mirror images: an
+   * `allow` had to pass a shape guard to be stored and a `deny` did not.
    *
    * The prefixes come back FOLDED. The fixture is written in the spelling somebody would type, and
    * what the hook hands over is the spelling the classifier enforces.
    */
-  it("keeps the allow list and the deny list apart, in the spelling the núcleo stores", async () => {
-    fake.declareRule("Remove-Item  -Recurse", "deny");
+  it("serves one row per rule, in the spelling the núcleo stores", async () => {
+    fake.declareRule("Remove-Item  -Recurse", "deny", "never from a worktree");
     fake.declareRule("npm ci", "allow");
 
     const { result } = renderHook(() => useProjectShellRules("alpha"), { wrapper: mount() });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(result.current.data).toEqual({ allow: ["npm ci"], deny: ["remove-item -recurse"] });
+    expect(result.current.data).toEqual([
+      { prefix: "npm ci", verdict: "allow", note: null, created_at: DECLARED_ON },
+      {
+        prefix: "remove-item -recurse",
+        verdict: "deny",
+        note: "never from a worktree",
+        created_at: DECLARED_ON,
+      },
+    ]);
+    // And the split a page draws is a filter, not a shape the route had to hand it pre-sorted.
+    expect(result.current.data?.filter((rule) => rule.verdict === "deny")).toHaveLength(1);
   });
 
   it("reads the github ops as a flat list of operation names", async () => {
@@ -247,7 +286,7 @@ describe("declaring", () => {
       { wrapper: mount() },
     );
     await waitFor(() => expect(result.current.rules.isSuccess).toBe(true));
-    expect(result.current.rules.data).toEqual({ allow: [], deny: [] });
+    expect(result.current.rules.data).toEqual([]);
 
     await act(async () => {
       await result.current.declare.mutateAsync({
@@ -258,7 +297,9 @@ describe("declaring", () => {
       });
     });
 
-    await waitFor(() => expect(result.current.rules.data?.allow).toEqual(["cargo fmt"]));
+    await waitFor(() =>
+      expect(result.current.rules.data?.map((rule) => rule.prefix)).toEqual(["cargo fmt"]),
+    );
   });
 
   /**
@@ -324,13 +365,15 @@ describe("withdrawing", () => {
       () => ({ rules: useProjectShellRules("alpha"), forget: useForgetShellRule() }),
       { wrapper: mount() },
     );
-    await waitFor(() => expect(result.current.rules.data?.allow).toEqual(["npm ci"]));
+    await waitFor(() =>
+      expect(result.current.rules.data?.map((rule) => rule.prefix)).toEqual(["npm ci"]),
+    );
 
     await act(async () => {
       await result.current.forget.mutateAsync({ projectId: "alpha", prefix: "NPM  CI" });
     });
 
-    await waitFor(() => expect(result.current.rules.data).toEqual({ allow: [], deny: [] }));
+    await waitFor(() => expect(result.current.rules.data).toEqual([]));
 
     const remove = fake.sent.find((call) => call.method === "DELETE");
     expect(remove?.path).toBe("/projects/alpha/shell-rules");
@@ -458,27 +501,50 @@ describe("a refusal reaches the caller with its sentence", () => {
 
 describe("the note a rule carries", () => {
   /**
-   * **The trap, pinned.** `declare_shell_rule` is declarative: `note = excluded.note` overwrites,
-   * so a second POST carrying no note writes `NULL` over the justification the rule already had.
-   * An editor flipping a verdict has to send the existing note back with it.
+   * **The whole loop, and it only closes because the GET carries the note.**
    *
-   * The assertion reaches into the fake's table because there is nowhere else to look — the GET
-   * serves prefixes and no notes, so a note cannot be read back over HTTP at all.
+   * `declare_shell_rule` is declarative: `note = excluded.note` overwrites, so a second POST
+   * carrying no note writes `NULL` over the justification the rule already had. An editor flipping
+   * a verdict has to send the existing note back — and while the GET served two lists of prefixes
+   * it had nowhere to read that note from. This test used to reach into the fake's table for
+   * exactly that reason.
+   *
+   * So it asks the daemon, and every value it sends back came out of the answer. Make the GET drop
+   * `note` again and there is nothing to resend, which is the failure the old shape made
+   * unobservable.
    */
-  it("keeps the justification when a verdict is flipped with the note sent back", async () => {
+  it("reads a rule's note back and keeps it through a verdict change", async () => {
     fake.declareRule("remove-item", "deny", "nothing here deletes recursively");
 
-    const { result } = renderHook(() => useDeclareShellRule(), { wrapper: mount() });
+    const { result } = renderHook(
+      () => ({ rules: useProjectShellRules("alpha"), declare: useDeclareShellRule() }),
+      { wrapper: mount() },
+    );
+    await waitFor(() => expect(result.current.rules.isSuccess).toBe(true));
+
+    // Found under the spelling somebody would type, which is what a form has to be able to do.
+    const showing = declaredRule(result.current.rules.data ?? [], "Remove-Item  ");
+    expect(showing?.note).toBe("nothing here deletes recursively");
+
     await act(async () => {
-      await result.current.mutateAsync({
+      await result.current.declare.mutateAsync({
         projectId: "alpha",
-        prefix: "Remove-Item",
+        prefix: showing?.prefix ?? "",
         verdict: "allow",
-        note: { write: "nothing here deletes recursively" },
+        note: { write: showing?.note ?? "" },
       });
     });
 
-    expect(fake.noteFor("remove-item")).toBe("nothing here deletes recursively");
+    await waitFor(() =>
+      expect(result.current.rules.data).toEqual([
+        {
+          prefix: "remove-item",
+          verdict: "allow",
+          note: "nothing here deletes recursively",
+          created_at: DECLARED_ON,
+        },
+      ]),
+    );
   });
 
   /**
@@ -489,9 +555,14 @@ describe("the note a rule carries", () => {
   it("erases the justification only when a caller asks for that in so many words", async () => {
     fake.declareRule("remove-item", "deny", "nothing here deletes recursively");
 
-    const { result } = renderHook(() => useDeclareShellRule(), { wrapper: mount() });
+    const { result } = renderHook(
+      () => ({ rules: useProjectShellRules("alpha"), declare: useDeclareShellRule() }),
+      { wrapper: mount() },
+    );
+    await waitFor(() => expect(result.current.rules.isSuccess).toBe(true));
+
     await act(async () => {
-      await result.current.mutateAsync({
+      await result.current.declare.mutateAsync({
         projectId: "alpha",
         prefix: "Remove-Item",
         verdict: "allow",
@@ -503,7 +574,8 @@ describe("the note a rule carries", () => {
     // same way, and sending it says out loud that the absence was a decision.
     const post = fake.sent.find((call) => call.method === "POST");
     expect(post?.body).toEqual({ prefix: "Remove-Item", verdict: "allow", note: null });
-    expect(fake.noteFor("remove-item")).toBeNull();
+    // And the erasure is visible where the note now is: on the row the GET serves.
+    await waitFor(() => expect(result.current.rules.data?.[0].note).toBeNull());
   });
 
   /**
@@ -541,13 +613,84 @@ describe("the spelling a rule is stored under", () => {
   });
 
   it("finds a rule under the spelling somebody typed, on whichever side it sits", () => {
-    const rules: ShellRules = { allow: ["npm ci"], deny: ["remove-item -recurse"] };
+    const rules: ShellRule[] = [
+      { prefix: "npm ci", verdict: "allow", note: null, created_at: DECLARED_ON },
+      {
+        prefix: "remove-item -recurse",
+        verdict: "deny",
+        note: "never from a worktree",
+        created_at: DECLARED_ON,
+      },
+    ];
 
     expect(declaredVerdict(rules, "NPM  CI")).toBe("allow");
     expect(declaredVerdict(rules, "Remove-Item  -Recurse")).toBe("deny");
     // Undeclared is not a verdict, and a page that read it as one would draw a command nobody has
     // ruled on as permitted.
     expect(declaredVerdict(rules, "cargo build")).toBeNull();
+
+    // **The whole row, because the row is what an edit sends back.** `declaredVerdict` is this with
+    // three fields thrown away; anything about to WRITE wants the note, and a lookup that could
+    // only answer "deny" would send an editor back to the trap `Note` exists to name.
+    expect(declaredRule(rules, "Remove-Item  -Recurse")).toEqual(rules[1]);
+    expect(declaredRule(rules, "cargo build")).toBeNull();
+  });
+});
+
+describe("what a project MAY declare", () => {
+  /**
+   * **The catalogue, and the operations it says NO to.**
+   *
+   * `POST /projects/{id}/github-ops` validates against this set, and until the route existed the
+   * only place it reached the shell was inside an `undeclarable_op` refusal — so a picker had to
+   * hardcode the names and drift from the compiled ceilings in silence, or discover them by sending
+   * something invalid.
+   *
+   * The `declarable: false` rows are asserted by name because they are the reason the route serves
+   * every operation rather than the admitted ones alone. `api_read` is outside `ACTION_CEILING`:
+   * nothing on any screen can turn it on, so it has to be drawable as a fact and never as a control.
+   */
+  it("names every operation, and says which of them the ceilings admit", async () => {
+    const { result } = renderHook(() => useDeclarableGithubOps(), { wrapper: mount() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(CATALOGUE);
+
+    const outside = result.current.data?.filter((operation) => !operation.declarable);
+    expect(outside?.map((operation) => operation.kind)).toEqual(["run_logs", "api_read"]);
+
+    // Which door each goes through, because the two are not the same promise once declared: a
+    // declared read binds the very next decision, a declared action is stored and inert.
+    const half = (kind: string) =>
+      result.current.data?.find((operation) => operation.kind === kind)?.half;
+    expect(half("api_read")).toBe("action");
+    expect(half("run_list")).toBe("read");
+  });
+
+  /** It names no project, so there is nothing to wait for — unlike the three per-project reads. */
+  it("asks without being given a project", async () => {
+    const { result } = renderHook(() => useDeclarableGithubOps(), { wrapper: mount() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/github/declarable-ops");
+  });
+
+  /**
+   * **A page needs both lists and they must not be confused.** This one is what MAY be declared and
+   * is the same for every project; `useProjectGithubOps` is what one project HAS declared. A picker
+   * draws the first and ticks the second.
+   */
+  it("is not the same list as what one project has declared", async () => {
+    fake.declareOp("run_list");
+
+    const { result } = renderHook(
+      () => ({ every: useDeclarableGithubOps(), mine: useProjectGithubOps("alpha") }),
+      { wrapper: mount() },
+    );
+    await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
+
+    expect(result.current.mine.data).toEqual(["run_list"]);
+    expect(result.current.every.data?.length).toBeGreaterThan(1);
   });
 });
 
