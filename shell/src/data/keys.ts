@@ -174,6 +174,17 @@ export const keys = {
     /** What this project can be asked to do to itself, and what each of them last said. */
     commands: (projectId: string) => ["projects", projectId, "commands"] as const,
     /**
+     * The reach this project declares for itself — three lists, three keys.
+     *
+     * Three and not one, because they are three tables answering three questions and a page may
+     * well show one of them without the others. Under the roster prefix like everything else about
+     * a project, which is what lets a declaration write invalidate all three by naming `all` —
+     * these are neighbours often edited in the same sitting.
+     */
+    shellRules: (projectId: string) => ["projects", projectId, "shell-rules"] as const,
+    githubOps: (projectId: string) => ["projects", projectId, "github-ops"] as const,
+    landTargets: (projectId: string) => ["projects", projectId, "land-targets"] as const,
+    /**
      * Which workflows this project uses, measured against the library right now.
      *
      * Under the project prefix and NOT under `keys.workflows` below, because it is a fact about
