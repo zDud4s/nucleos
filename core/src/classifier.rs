@@ -557,6 +557,54 @@ fn classify_shell_command(
         );
     }
 
+    // A project's refusal outranks an approval PROMPT, and this is the position that makes that
+    // true rather than nearly true. `APPROVAL_COMMAND_PATTERNS` matches the whole line just below,
+    // and `command_reader` refuses an unreadable line below that; from underneath either of them a
+    // project's `deny` came back `pending_approval`, which is a prompt a person can approve - and
+    // approving it runs the very line the project wrote down as denied. Measured, not feared: with
+    // `git push` denied, `git push origin main` answered `("pending_approval", "push-merge-deploy")`,
+    // and with `curl` denied, `curl $(whoami)` answered `("pending_approval", "unrecognized")`.
+    //
+    // It is the same defect the segment pass was written for one layer down, and the same sentence
+    // answers it: a refusal must not depend on where in a line it appears. That pass USED to sit
+    // just above the segment loop below, which is where a reader of the spec will look for it; it
+    // is here now because here it also outranks the two guards above the loop, and two places
+    // computing one refusal is two places to keep in step.
+    //
+    // BELOW the compiled refusals on purpose. Those are also `deny`, so nothing is lost by letting
+    // them answer first, and they answer with a narrower class - `rm -rf /` is worth recording as
+    // `destructive` rather than as whatever the project happened to have written down.
+    // `a_compiled_refusal_keeps_its_own_class` is what holds this block underneath them.
+    //
+    // Two arms because neither covers the other. The whole line catches what the reader cannot
+    // segment at all (`curl $(whoami)` is a `curl`, and normalizing the raw line still sees it);
+    // the segments catch a denied command sitting behind a separator (`ls && git push`), which no
+    // prefix match against the whole line would ever see.
+    //
+    // The empty-list guard is the non-regression, and it is structural rather than argued: a
+    // project that declared no refusals cannot enter this block at all, so it cannot change a
+    // verdict here. It also means the second `command_reader::read` is paid only by a project that
+    // has refusals - the read is a string scan with no I/O, and buying this with it is the right
+    // trade. Reading ONCE, higher up, is the version that looks tidier and is wrong: it would move
+    // the `Reading::Unreadable` early return above the approval patterns and relabel lines that
+    // have nothing to do with this feature.
+    //
+    // A reading that is not a `Sequence` deliberately does not return from here. Falling through
+    // leaves every existing verdict for a line the reader cannot read exactly as it was.
+    if !rules.deny.is_empty() {
+        if rules.denies(&normalized) {
+            return classification("deny", "project-denied", "this project denies this command");
+        }
+        if let crate::command_reader::Reading::Sequence(segments) =
+            crate::command_reader::read(command, shell)
+            && segments
+                .iter()
+                .any(|segment| rules.denies(&normalize_command(&strip_fd_duplications(segment))))
+        {
+            return classification("deny", "project-denied", "this project denies this command");
+        }
+    }
+
     if matches_any_phrase(&normalized, APPROVAL_COMMAND_PATTERNS) {
         return classification(
             "pending_approval",
@@ -594,26 +642,6 @@ fn classify_shell_command(
             "unrecognized",
             "unrecognized shell commands and code execution require approval",
         );
-    }
-
-    // Decision #3's refusal half, and it is a pass of its own rather than an arm of the loop below
-    // for two reasons that were both measured rather than guessed.
-    //
-    // The loop RETURNS on the first `Segment::Unrecognized`. A denial living inside it would never
-    // be reached on `unknown_thing && the-denied-thing` - the line would come back
-    // `pending_approval`, which is a prompt a person can approve, and approving it runs the denied
-    // segment along with the rest. A refusal must not depend on where in a line it appears.
-    //
-    // And `classify_segment` returns `ReadLocal` from `lands_inside_the_workspace` before the
-    // command name is normalized at all, so a check placed inside it, after `normalized`, is
-    // unreachable for every `cd`, `mkdir` and `md` pointing into the worktree.
-    //
-    // Ahead of the loop, both problems are gone and `Segment` needs no variant for it.
-    if segments
-        .iter()
-        .any(|segment| rules.denies(&normalize_command(&strip_fd_duplications(segment))))
-    {
-        return classification("deny", "project-denied", "this project denies this command");
     }
 
     let mut touches_vcs = false;
@@ -3987,6 +4015,78 @@ mod tests {
             classify_with_rules(&declared, "ls -la"),
             "deny",
             "project-denied",
+        );
+    }
+
+    /// A project's refusal outranks a prompt a person could approve. `git push` is on
+    /// `APPROVAL_COMMAND_PATTERNS`, which is matched over the WHOLE line above where the project's
+    /// lists used to be consulted - so a project that had written `git push` down as denied was
+    /// answered `pending_approval`, and a person approving that prompt ran the push. A refusal that
+    /// a click undoes is not a refusal.
+    ///
+    /// The three spellings are three different paths to the same block: the bare prefix, the prefix
+    /// with arguments after it, and the prefix behind a separator - which only the per-segment arm
+    /// can see, because the whole line does not start with it.
+    ///
+    /// The no-rules baseline is asserted in the same test, as
+    /// `a_project_allow_turns_an_approval_prompt_into_an_allow` does, so the before and the after
+    /// are read together rather than one being taken on trust.
+    #[test]
+    fn a_project_deny_outranks_an_approval_prompt() {
+        let declared = shell_rules(&[], &["git push"]);
+        for command in ["git push", "git push origin main", "ls && git push"] {
+            assert_classification(
+                classify_with_rules(&Default::default(), command),
+                "pending_approval",
+                "push-merge-deploy",
+            );
+            assert_classification(
+                classify_with_rules(&declared, command),
+                "deny",
+                "project-denied",
+            );
+        }
+    }
+
+    /// The other layer the refusal had to climb above. `command_reader` returns `Unreadable` for a
+    /// line it cannot cut into a sequence - command substitution and a background `&` are the two
+    /// spellings here - and that return is also a `pending_approval` a person can approve, which
+    /// would run the `curl` this project denied.
+    ///
+    /// This is what the whole-line arm exists for, and the only thing that exercises it that the
+    /// per-segment arm cannot: there are no segments to iterate when the reader refused to make
+    /// any. Normalizing the raw line still sees a `curl` at the front of it.
+    #[test]
+    fn a_project_deny_reaches_a_line_the_reader_cannot_segment() {
+        let declared = shell_rules(&[], &["curl"]);
+        for command in ["curl $(whoami)", "curl http://x &"] {
+            assert_classification(
+                classify_with_rules(&Default::default(), command),
+                "pending_approval",
+                "unrecognized",
+            );
+            assert_classification(
+                classify_with_rules(&declared, command),
+                "deny",
+                "project-denied",
+            );
+        }
+    }
+
+    /// What holds the project block BELOW the compiled refusals. Both answers are `deny`, so a
+    /// project cannot lose a refusal by being second - but it can lose the better NAME for one, and
+    /// the scoreboard reads names. `rm -rf /` under a project that denied `rm` is still worth
+    /// recording as `destructive`, because that is a fact about the command rather than about this
+    /// project's list.
+    ///
+    /// Without this test the position is defended only by a comment, and a comment does not fail.
+    #[test]
+    fn a_compiled_refusal_keeps_its_own_class() {
+        let declared = shell_rules(&[], &["rm"]);
+        assert_classification(
+            classify_with_rules(&declared, "rm -rf /"),
+            "deny",
+            "destructive",
         );
     }
 
