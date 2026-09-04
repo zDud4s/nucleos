@@ -286,7 +286,12 @@ function chatsFetch(
       const told = opts.projects?.[chatId];
       if (told !== undefined) return told;
       const row = chats.find((chat) => chat.chat_id === chatId);
-      return { cwd: row?.cwd ?? null, tools: row?.cwd != null, session: null, planning: false };
+      return {
+        cwd: row?.cwd ?? null,
+        tools: row?.cwd != null,
+        session: null,
+        permission_mode: "auto",
+      };
     }
     const wireChat = /^\/assistant\/chats\/([^/?]+)\/tools$/.exec(path);
     if (wireChat !== null && init?.method === "POST") {
@@ -973,6 +978,13 @@ async function openModelMenu(): Promise<void> {
 /** The effort menu, its own control beside the model's rather than a submenu inside it. */
 async function openEffortMenu(): Promise<void> {
   const trigger = await screen.findByRole("button", { name: /^effort:/i });
+  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+  fireEvent.click(trigger);
+}
+
+/** What the conversation may do without asking. Same Radix `pointerdown` rule as its neighbours. */
+async function openPermissionMenu(): Promise<void> {
+  const trigger = await screen.findByRole("button", { name: /^Permissions:/ });
   fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
   fireEvent.click(trigger);
 }
@@ -1910,32 +1922,9 @@ describe("Chats - an empty list", () => {
   });
 });
 
-describe("Chats - planning without acting", () => {
-  // Every kind of run in this daemon could be put in `--permission-mode plan` except the kind a
-  // person is watching — which is the one where it matters most, because it is the mode you reach
-  // for before letting an agent near a codebase.
-  it("can be turned on, and says so to the daemon", async () => {
-    daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1" })], {
-        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
-      }),
-    );
-    await renderChats("/chats/c-1");
-
-    const toggle = await screen.findByLabelText(/plan only/i);
-    expect((toggle as HTMLInputElement).checked).toBe(false);
-
-    fireEvent.click(toggle);
-
-    await waitFor(() => {
-      const sent = daemon.apiFetch.mock.calls.find(
-        (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "PATCH",
-      );
-      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({ plan_only: true });
-    });
-  });
-
-  it("shows a conversation that is already planning as planning", async () => {
+describe("Chats - what it may do without asking", () => {
+  // A checkbox stood here and could say one thing, while the CLI underneath had a whole ladder.
+  it("moves the conversation to a rung, and says so to the daemon", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
@@ -1946,7 +1935,7 @@ describe("Chats - planning without acting", () => {
               cwd: "C:/Projects/nucleos",
               tools: true,
               session: null,
-              planning: true,
+              permission_mode: "auto",
             },
           },
         },
@@ -1954,8 +1943,82 @@ describe("Chats - planning without acting", () => {
     );
     await renderChats("/chats/c-1");
 
-    const toggle = await screen.findByLabelText(/plan only/i);
-    await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true));
+    await openPermissionMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /Manual/ }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "PATCH",
+      );
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({
+        permission_mode: "manual",
+      });
+    });
+  });
+
+  it("shows the rung the conversation is already on", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "plan",
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByRole("button", { name: /^Permissions: Plan/ })).toBeTruthy();
+  });
+
+  // The owner's decision, and the reason the menu opens at all rather than being greyed whole: a
+  // disabled control with no explanation is a dead end, and one of the two reasons — an unwired
+  // hook — is a button away in the panel above.
+  it("offers Plan and Auto without tools, and says why the other three are out of reach", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/fresh-worktree",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    await openPermissionMenu();
+
+    // Radix marks a disabled item both ways; either one alone would be an assertion about the
+    // library rather than about the menu.
+    const reachable = (name: RegExp) => {
+      const row = screen.getByRole("menuitemradio", { name });
+      return (
+        row.getAttribute("aria-disabled") !== "true" && !row.hasAttribute("data-disabled")
+      );
+    };
+
+    expect(reachable(/Plan/)).toBe(true);
+    expect(reachable(/Auto/)).toBe(true);
+    expect(reachable(/Manual/)).toBe(false);
+    expect(reachable(/Edit automatically/)).toBe(false);
+    expect(reachable(/Bypass permissions/)).toBe(false);
+    expect(
+      screen.getAllByText(/the classifier hook is not wired in this project/).length,
+    ).toBeGreaterThan(0);
   });
 });
 
@@ -2138,7 +2201,16 @@ describe("Chats - giving a conversation a project", () => {
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        { projects: { "c-1": { cwd: "C:/Projects/fresh-worktree", tools: false, session: null, planning: false } } },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/fresh-worktree",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+            },
+          },
+        },
       ),
     );
     await renderChats("/chats/c-1");
@@ -2165,7 +2237,12 @@ describe("Chats - giving a conversation a project", () => {
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
         {
           projects: {
-            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: "sess-42", planning: false },
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: "sess-42",
+              permission_mode: "auto",
+            },
           },
         },
       ),
@@ -2183,7 +2260,16 @@ describe("Chats - giving a conversation a project", () => {
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false } } },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "auto",
+            },
+          },
+        },
       ),
     );
     await renderChats("/chats/c-1");
@@ -2197,7 +2283,16 @@ describe("Chats - giving a conversation a project", () => {
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        { projects: { "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false } } },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "auto",
+            },
+          },
+        },
       ),
     );
     await renderChats("/chats/c-1");
@@ -3597,14 +3692,19 @@ describe("stopping a turn", () => {
 /* ------------------------------------------- the quiet header and the finder -- */
 
 describe("Chats - what the header says without being asked", () => {
-  it("names the directory in its line, and leaves the model and plan-only in the box", async () => {
+  it("names the directory in its line, and leaves the model and the permissions in the box", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", brain: "cloud", cwd: "C:/Projects/nucleos" })],
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
         {
           projects: {
-            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: true },
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "plan",
+            },
           },
         },
       ),
@@ -3618,7 +3718,7 @@ describe("Chats - what the header says without being asked", () => {
     // The line above the transcript says where this runs, and stops there.
     expect(await screen.findByText("C:/Projects/nucleos")).toBeDefined();
 
-    // Which model answers, and whether it plans instead of doing, are controls in the
+    // Which model answers, and what it may do without asking, are controls in the
     // composer — beside the words they govern rather than behind a menu at the top of the
     // page. Asserted here, in the test that owns what the header does and does not carry,
     // so that moving either one back up top fails this rather than passing quietly.
@@ -3627,20 +3727,29 @@ describe("Chats - what the header says without being asked", () => {
     expect(
       await screen.findByRole("button", { name: /answered by claude-sonnet-5/i }),
     ).toBeDefined();
-    expect(await screen.findByLabelText(/plan only/i)).toBeDefined();
+    expect(await screen.findByRole("button", { name: /^Permissions: Plan/ })).toBeDefined();
 
     // Archiving is the one thing still behind the menu, and stays shut until asked for.
     expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
   });
 
-  it("says nothing about plan-only while it is off", async () => {
+  // This used to assert that the header said nothing about plan-only while it was off, which was
+  // a fact about a checkbox that no longer exists. The rung is always named now — there is no off
+  // — so what is worth guarding is the other half of the same sentence: the neutral rung is stated
+  // rather than left blank, exactly as the model trigger states a model nobody pinned.
+  it("names the neutral rung rather than leaving the control blank", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
         { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
         {
           projects: {
-            "c-1": { cwd: "C:/Projects/nucleos", tools: true, session: null, planning: false },
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "auto",
+            },
           },
         },
       ),
@@ -3650,7 +3759,7 @@ describe("Chats - what the header says without being asked", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
 
     await screen.findByText("C:/Projects/nucleos");
-    expect(screen.queryByText("plan only")).toBeNull();
+    expect(await screen.findByRole("button", { name: /^Permissions: Auto/ })).toBeDefined();
   });
 });
 

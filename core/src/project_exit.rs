@@ -45,6 +45,11 @@ const PROJECT_SCOPED: &[&str] = &[
     "map_decisions",
     "project_commands",
     "project_github_ops",
+    // Per-project configuration, the same species as its three neighbours here: which brain judges
+    // what the rules did not recognise, on this project. It is history in the sense this list means
+    // — forgetting a project and then adding the folder back must not silently resurrect a judge
+    // somebody configured and has since forgotten choosing.
+    "project_judge",
     "project_land_targets",
     "project_shell_rules",
     "project_slots",

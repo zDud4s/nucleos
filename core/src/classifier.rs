@@ -404,6 +404,21 @@ pub fn only_reads(tool_name: &str) -> bool {
     READ_LOCAL_TOOLS.contains(&tool_name)
 }
 
+/// Whether this tool writes files.
+///
+/// A THIRD question, and it is not either of the two above. `action_class == "read-local"` covers
+/// ordinary in-workspace writes as well as reads — `Edit` and `Write` share that branch, and its own
+/// message says so: "local reads and ordinary file writes are allowed". That is right for approval,
+/// where an ordinary write needs none, and wrong for a permission rung whose whole promise to the
+/// person who chose it is that nothing gets edited without them being asked. So the rung takes the
+/// class and subtracts this.
+///
+/// `only_reads` cannot answer it either, and in the direction that matters: `Bash` is deliberately
+/// outside that list, so a rung built on its negation asks about `ls` and `git status` too.
+pub fn writes_files(tool_name: &str) -> bool {
+    WRITE_TOOLS.contains(&tool_name)
+}
+
 /// PURE: tool name + input (+ cwd) (+ the owner's GitHub policy) in, a verdict out. No I/O, no
 /// database, no knowledge of run state.
 ///
@@ -602,9 +617,29 @@ fn classify_shell_command(
 ) -> Classification {
     let normalized = normalize_command(command);
 
+    // Two refusals where there was one disjunction, and **the target is asked before the shape**.
+    //
+    // The order is load-bearing and the obvious split — the one that preserves the order these
+    // three tests are written in — inverts the property it exists to create. `rm -rf /` matches
+    // `"rm -rf"` in `DESTRUCTIVE_COMMAND_PATTERNS` before anybody looks at where it points, so a
+    // shape-first split labels it `destructive`, and the one caller that treats `destructive` as
+    // lowerable would then be lowering `rm -rf /` to a question somebody can say yes to.
+    //
+    // The two are not the same kind of judgement, which is why they were worth separating at all.
+    // `matches_any_phrase` and `has_destructive_flags` read the TEXT of the line and know nothing
+    // about the machine; `deletes_outside_cwd` folds the delete's targets against the workspace and
+    // answers about a BOUNDARY, the way `outside-workspace` does one screen up. A caller may
+    // reasonably decide the first is its own business and may never decide that about the second.
+    if deletes_outside_cwd(command, cwd) {
+        return classification(
+            "deny",
+            "destructive-outside",
+            "deletions that reach outside the workspace are denied",
+        );
+    }
+
     if matches_any_phrase(&normalized, DESTRUCTIVE_COMMAND_PATTERNS)
         || has_destructive_flags(&normalized)
-        || deletes_outside_cwd(command, cwd)
     {
         return classification(
             "deny",
@@ -1936,10 +1971,13 @@ mod tests {
             r"C:\tools\rm.exe C:\Windows\System32\drivers\etc\hosts",
             "remove-item ../../secrets",
         ] {
+            // `destructive-outside` and not `destructive`: every one of these is denied for where
+            // it points, which is a different judgement from the one about `rm -rf`'s shape, and
+            // the two carry different names so a caller can treat them differently.
             assert_classification(
                 classify("Bash", &json!({ "command": command }), Some(cwd)),
                 "deny",
-                "destructive",
+                "destructive-outside",
             );
         }
 
@@ -2431,6 +2469,7 @@ mod tests {
 
     #[test]
     fn denies_delete_that_traverses_outside_cwd() {
+        // The name said which of the two classes this was always about; now the class does too.
         assert_classification(
             classify(
                 "Bash",
@@ -2438,7 +2477,7 @@ mod tests {
                 Some(Path::new(r"C:\work\repo")),
             ),
             "deny",
-            "destructive",
+            "destructive-outside",
         );
     }
 
@@ -3299,15 +3338,19 @@ mod tests {
     #[test]
     fn splitting_a_line_does_not_soften_deny_or_the_approval_list() {
         let cwd = Path::new(r"C:\work\repo");
-        for command in [
-            "cd core && rm -r -f /important",
-            "cargo test ; rm -rf target",
-            "cd core && rm ../../secrets",
+        // Two classes now, and this table is the most instructive place to see why: the middle line
+        // deletes something INSIDE the workspace and the other two reach outside it. A split that
+        // kept the code's original disjunct order would put `/important` in the same class as
+        // `target`, which is precisely the distinction the split exists to make.
+        for (command, action_class) in [
+            ("cd core && rm -r -f /important", "destructive-outside"),
+            ("cargo test ; rm -rf target", "destructive"),
+            ("cd core && rm ../../secrets", "destructive-outside"),
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), Some(cwd)),
                 "deny",
-                "destructive",
+                action_class,
             );
         }
 

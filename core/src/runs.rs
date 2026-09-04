@@ -1323,7 +1323,7 @@ async fn spawn_handoff_if_needed(
     run_id: i64,
     project_id: Option<String>,
     spawn_cwd: Option<std::path::PathBuf>,
-    plan_only: bool,
+    permission: crate::runner::Permission,
     completion_feed: Option<(String, String)>,
     gate_config: GateConfig,
     max_attempts: u32,
@@ -1356,7 +1356,7 @@ async fn spawn_handoff_if_needed(
         successor.prompt,
         project_id,
         spawn_cwd,
-        plan_only,
+        permission,
         // **NEVER a resume, and NEVER a fork.** Both carry the predecessor's transcript forward,
         // which is the one thing a context handoff exists to avoid: this used to pass
         // `Some(predecessor_session)` with `fork_session = true`, so the successor was launched as
@@ -1410,7 +1410,11 @@ fn spawn_run(
     prompt: String,
     project_id: Option<String>,
     spawn_cwd: Option<std::path::PathBuf>,
-    plan_only: bool,
+    // The whole of "what `--permission-mode` does this run launch with". It used to be this
+    // boolean plus `classifier_governs_tools`, two fields competing for one flag with an ordering
+    // rule holding the safety property up; the choice is made once now, by the caller that knows
+    // what kind of run this is.
+    permission: crate::runner::Permission,
     resume_session_id: Option<String>,
     session_id: String,
     fork_session: bool,
@@ -1482,7 +1486,7 @@ fn spawn_run(
                 images: Vec::new(),
                 env: env.clone(),
                 cwd: spawn_cwd.clone(),
-                plan_only,
+                permission,
                 resume_session_id: resume_session_id.clone(),
                 mcp_config: None,
                 tool_policy,
@@ -1711,7 +1715,7 @@ fn spawn_run(
                             id,
                             project_id.clone(),
                             spawn_cwd.clone(),
-                            plan_only,
+                            permission,
                             completion_feed.clone(),
                             gate_config.clone(),
                             max_attempts,
@@ -1858,7 +1862,7 @@ fn spawn_run(
                             id,
                             project_id.clone(),
                             spawn_cwd.clone(),
-                            plan_only,
+                            permission,
                             completion_feed.clone(),
                             gate_config.clone(),
                             max_attempts,
@@ -2562,6 +2566,17 @@ async fn create_run_with(
     // from where the process starts — asking the project root would answer about a directory this
     // run never enters.
     let governed_by_classifier = classifier_governs_tools(mode, tool_policy, spawn_cwd.as_deref());
+    // Folded HERE, where both facts are in hand, rather than in `cli_args` where they used to be
+    // two fields and an `else if`. A shadow run is planning and stays planning even in a tree that
+    // wires the classifier — which is the old precedence, kept, but now as a value that cannot be
+    // two things at once rather than as an order two writes happen in.
+    let permission = if plan_only {
+        crate::runner::Permission::Plan
+    } else if governed_by_classifier {
+        crate::runner::Permission::Bypass
+    } else {
+        crate::runner::Permission::Default
+    };
     spawn_run(
         state,
         runner,
@@ -2569,7 +2584,7 @@ async fn create_run_with(
         prompt,
         project_id,
         spawn_cwd,
-        plan_only,
+        permission,
         None,
         session_id,
         false,
@@ -3219,6 +3234,20 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
             GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
         }
     };
+    // Asked again against the worktree being resumed rather than inherited, because it is a fresh
+    // launch into a tree that has since been worked in: the run it continues may have rewritten the
+    // very settings file this reads. Re-checking is the conservative direction — a tree that no
+    // longer wires the hook stops getting the classifier's surface.
+    //
+    // Hoisted out of the argument list it used to sit in, because it is now TWO arguments: the rung
+    // the CLI launches on, and the belief the runner is told about. Derived once so they cannot
+    // disagree — a resume that dropped `Bypass` here is the silent regression this fold could most
+    // easily have introduced, in a path nothing else covers.
+    let governed_by_classifier = classifier_governs_tools(
+        "worktree",
+        crate::runner::ToolPolicy::Unrestricted,
+        Some(std::path::Path::new(&wt_path)),
+    );
     spawn_run(
         state,
         state.runner.clone(),
@@ -3226,7 +3255,13 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         prompt,
         Some(wt_project_id),
         Some(std::path::PathBuf::from(&wt_path)),
-        false,
+        // A resume is never planning: it continues approved autopilot work. So the rung is the
+        // classifier's or none at all.
+        if governed_by_classifier {
+            crate::runner::Permission::Bypass
+        } else {
+            crate::runner::Permission::Default
+        },
         Some(session_id.clone()),
         session_id,
         false,
@@ -3258,15 +3293,7 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
         // And the worktree silence deadline, for the same reason: a resume goes straight back into
         // the work its predecessor was doing, which on this workspace means compiling.
         progress_timeout_for_mode(state.progress_timeout, "worktree"),
-        // Asked again against the worktree being resumed rather than inherited, because it is a
-        // fresh launch into a tree that has since been worked in: the run it continues may have
-        // rewritten the very settings file this reads. Re-checking is the conservative direction —
-        // a tree that no longer wires the hook stops getting the classifier's surface.
-        classifier_governs_tools(
-            "worktree",
-            crate::runner::ToolPolicy::Unrestricted,
-            Some(std::path::Path::new(&wt_path)),
-        ),
+        governed_by_classifier,
         // The resume row carries the node's stage forward, so an approved plan node resumes on the
         // plan model rather than dropping back to the runner's own.
         state.runner.model_for_stage(stage.as_deref()),
@@ -4264,7 +4291,7 @@ mod tests {
                 compacted: false,
             })),
             delay: std::sync::Mutex::new(delay),
-            last_plan_only: std::sync::Mutex::new(None),
+            last_permission: std::sync::Mutex::new(None),
             last_cwd: std::sync::Mutex::new(None),
             last_resume: std::sync::Mutex::new(None),
             ..Default::default()
@@ -5592,6 +5619,60 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             held, 1,
             "the resume is running, so the sweep has nothing to collect"
         );
+    }
+
+    /// A resume after approval still launches with the CLI's permission barrier down.
+    ///
+    /// **This is the regression a careless fold would have introduced**, in a path this change
+    /// declares out of scope and therefore would not have been watching. The decision is derived
+    /// TWICE — once in `create_run_inner` and again here, deliberately re-asked rather than
+    /// inherited because the run being continued may have rewritten the very settings file it reads
+    /// — and folding two booleans into one value at only the first site would have quietly cost
+    /// every resumed run its `bypassPermissions`. What that costs is measured and written down at
+    /// `runner.rs`: an autonomous run in this repository that could not execute `cargo --version`,
+    /// 28 turns and $1.47 for zero files touched.
+    ///
+    /// The pair is the test. Without the hook the rung is `Default`, which is the AND in
+    /// `classifier_governs_tools` doing its job: the barrier only stands down where the thing that
+    /// replaces it is verified present.
+    #[tokio::test]
+    async fn a_resume_after_approval_still_launches_with_the_barrier_down() {
+        for (label, wired, expected) in [
+            (
+                "the tree wires the classifier",
+                true,
+                crate::runner::Permission::Bypass,
+            ),
+            (
+                "the tree does not",
+                false,
+                crate::runner::Permission::Default,
+            ),
+        ] {
+            let (state, runner) =
+                test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+            let (proposal_id, _branch, container) =
+                seed_real_worktree_approval(&state, "cargo build").await;
+            if wired {
+                // The tree the resume is launched INTO, which is the one the re-derivation reads —
+                // not the project root, and not the tree the paused run was started in.
+                crate::autopilot::wire_classifier_hook(&container.path().join("repo")).unwrap();
+            }
+
+            resume_approved_run(&state, proposal_id).await.unwrap();
+
+            for _ in 0..100 {
+                if runner.last_permission.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                *runner.last_permission.lock().unwrap(),
+                Some(expected),
+                "{label}"
+            );
+        }
     }
 
     /// **Decision (B).** Approving a merge hands it to the queue; it does not hand the run a pass to
@@ -7167,7 +7248,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             77001,
             None,
             None,
-            false,
+            crate::runner::Permission::Default,
             None,
             GateConfig::NotConfigured,
             1,
@@ -7652,14 +7733,14 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     }
 
     #[tokio::test]
-    async fn create_run_inner_persists_mode_and_threads_plan_only_per_run() {
+    async fn create_run_inner_persists_mode_and_threads_the_rung_per_run() {
         let (state, runner) = test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
 
         let shadow_id = create_run_inner(&state, "shadow".into(), None, None, "shadow", false)
             .await
             .unwrap();
         for _ in 0..20 {
-            if runner.last_plan_only.lock().unwrap().is_some() {
+            if runner.last_permission.lock().unwrap().is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7670,7 +7751,10 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .await
             .unwrap();
         assert_eq!(shadow_mode, "shadow");
-        assert_eq!(*runner.last_plan_only.lock().unwrap(), Some(true));
+        assert_eq!(
+            *runner.last_permission.lock().unwrap(),
+            Some(crate::runner::Permission::Plan)
+        );
         let mut shadow_feed = None;
         for _ in 0..20 {
             let entries = crate::feed::list_feed(&state.pool, None, 50).await.unwrap();
@@ -7689,7 +7773,7 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .await
             .unwrap();
         for _ in 0..20 {
-            if *runner.last_plan_only.lock().unwrap() == Some(false) {
+            if *runner.last_permission.lock().unwrap() == Some(crate::runner::Permission::Default) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7700,7 +7784,10 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             .await
             .unwrap();
         assert_eq!(real_mode, "real");
-        assert_eq!(*runner.last_plan_only.lock().unwrap(), Some(false));
+        assert_eq!(
+            *runner.last_permission.lock().unwrap(),
+            Some(crate::runner::Permission::Default)
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(
             crate::feed::list_feed(&state.pool, None, 50)
@@ -7749,7 +7836,14 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             spawn_cwd.file_name(),
             Some(OsStr::new(&format!("run-{id}")))
         );
-        assert_eq!(*runner.last_plan_only.lock().unwrap(), Some(false));
+        // `Default` and not `Bypass`: the tempdir this run was provisioned into wires no
+        // classifier hook, and `classifier_governs_tools` refuses to stand the barrier down without
+        // one. `only_a_verified_classifier_earns_the_permission_decision` is the test that walks
+        // the other side of that AND.
+        assert_eq!(
+            *runner.last_permission.lock().unwrap(),
+            Some(crate::runner::Permission::Default)
+        );
 
         let run_cwd: String = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
             .bind(id)
@@ -9126,13 +9220,16 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
     /// The invariant, run rather than asserted: the permission DECISION is `true` only where the
     /// classifier that would replace the barrier is verified present.
     ///
-    /// The decision, not the command line — those are two different claims and this test can only
-    /// make the first. `shadow` is `plan_only` (see `create_run_inner`), and `plan_only` outranks
-    /// this flag in `cli_args`, so a shadow run carries the decision and still launches with
-    /// `--permission-mode plan`. That is correct and it is why the pure test
-    /// `runner::tests::plan_only_outranks_the_classifier_permission_surface` exists beside this one:
-    /// together they cover decision → flag → argument, and `worktree` is the only mode where all
-    /// three line up. Confirmed against a live daemon on 2026-07-31, both directions.
+    /// The decision, and — since the fold — the RUNG beside it, which is the second half of the
+    /// same property and the one worth having end-to-end. `shadow` is planning (see
+    /// `create_run_inner`), and planning outranks the classifier when the two are folded into one
+    /// value, so a shadow run in a fully wired tree carries the decision and STILL launches on
+    /// `Permission::Plan`. That is the old `else if`, kept, as something that cannot be two things
+    /// at once; asserting it here is what makes "a shadow run cannot produce `Bypass`" a fact about
+    /// a run this daemon actually started rather than about a struct a test filled in.
+    /// `runner::tests::a_restrained_run_cannot_also_carry_the_standing_down_flag` covers the pure
+    /// half — decision → flag → argument — and `worktree` is the only mode where all three line up.
+    /// Confirmed against a live daemon on 2026-07-31, both directions.
     ///
     /// Three cases, and the second and third are the ones that matter. The same unattended run in a
     /// tree whose `PreToolUse` entry names somebody else's script gets nothing — "a hook exists" is
@@ -9150,22 +9247,31 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         let unwired = space_free_tempdir("nucleos-unwired-");
         wire_someone_elses_hook(unwired.path());
 
-        for (label, dir, mode, expected) in [
-            ("unattended, classifier wired", wired.path(), "shadow", true),
+        for (label, dir, mode, expected, rung) in [
+            (
+                "unattended, classifier wired",
+                wired.path(),
+                "shadow",
+                true,
+                crate::runner::Permission::Plan,
+            ),
             (
                 "unattended, PreToolUse names another script",
                 unwired.path(),
                 "shadow",
                 false,
+                crate::runner::Permission::Plan,
             ),
             (
                 "interactive, classifier wired",
                 wired.path(),
                 "real",
                 false,
+                crate::runner::Permission::Default,
             ),
         ] {
             *runner.last_classifier_governs_tools.lock().unwrap() = None;
+            *runner.last_permission.lock().unwrap() = None;
             let id = create_run_inner(
                 &state,
                 "work".into(),
@@ -9183,6 +9289,14 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
                 *runner.last_classifier_governs_tools.lock().unwrap(),
                 Some(expected),
                 "{label}"
+            );
+            // Both shadow rows expect `Plan`, INCLUDING the wired one whose decision is `true`.
+            // That pair is the whole assertion: the belief survives the fold and the rung is not
+            // widened by it.
+            assert_eq!(
+                *runner.last_permission.lock().unwrap(),
+                Some(rung),
+                "{label}: the rung"
             );
         }
     }

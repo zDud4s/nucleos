@@ -705,8 +705,9 @@
   font-size: var(--text-xs);
 }
 
-/* `.chats-planning` was declared here, next to the project block it used to sit beside. It is a
-   control inside the composer now and shares that family's rule — see `.chats-tool`. */
+/* `.chats-planning` was declared here, next to the project block it used to sit beside. The
+   checkbox it styled is gone entirely: what stands in the composer now is the permission menu, which
+   is a `.chats-tool` like the model and effort menus beside it and needs no rule of its own. */
 
 /* The way back to a terminal, which existed long before anything said so. */
 .chats-project-carry {
@@ -1660,9 +1661,11 @@
 
 /* ------------------------------------------------------------- hands free -- */
 
-/* Sits with the other things you set about a message, and is shaped like them: `.chats-planning`'s
-   proportions, because a toggle that looked different from the toggle beside it would read as
-   belonging to something else. */
+/* Sits with the other things you set about a message, and is shaped like them: the proportions
+   `.chats-planning` used to carry, because a toggle that looked different from the controls beside
+   it would read as belonging to something else. That class is gone; these numbers are what it left
+   behind, and they are kept rather than re-derived so this row does not drift away from its
+   neighbours. */
 .chats-handsfree {
   display: inline-flex;
   align-items: center;

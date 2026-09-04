@@ -51,6 +51,59 @@ impl Brain {
     }
 }
 
+/// How much a conversation is allowed to do without being asked.
+///
+/// Five rungs of one ladder, and the ladder is the CLI's own — `manual` lets reads and
+/// non-mutating commands through and asks about every edit; `accept_edits` adds the edits;
+/// `plan` restrains the model itself; `auto` adds everything the classifier recognises; `bypass`
+/// stops asking about anything except the shape of a destructive command.
+///
+/// This is the POLICY of the conversation, and it is not the same type as the `--permission-mode`
+/// the CLI is launched with: `Manual` and `Auto` differ only inside the hook, and both launch the
+/// CLI the same way. `runner::Permission` is that other question; keeping them apart is what stops
+/// somebody answering one with the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    Manual,
+    AcceptEdits,
+    Plan,
+    Auto,
+    Bypass,
+}
+
+impl PermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::AcceptEdits => "accept_edits",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+            Self::Bypass => "bypass",
+        }
+    }
+
+    /// An unreadable value reads as `Auto`, which is what the row did before the column existed:
+    /// allow what the classifier recognises, ask about the rest.
+    ///
+    /// With `0129`'s CHECK in place only rows older than that migration can reach this fallback —
+    /// a write this application makes can no longer produce a spelling nobody parses. It is kept
+    /// anyway because falling to the behaviour a row already had is safe in this one direction and
+    /// costs a line.
+    ///
+    /// Not `std::str::FromStr`, for the reason `Brain::from_wire` is not either: that trait is for
+    /// parsing that can fail, and this deliberately cannot.
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "manual" => Self::Manual,
+            "accept_edits" => Self::AcceptEdits,
+            "plan" => Self::Plan,
+            "bypass" => Self::Bypass,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// A conversation as the list shows it: the row, plus the two facts the list needs and the row
 /// cannot hold — what was first said, and when something last happened.
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
@@ -240,23 +293,33 @@ pub async fn create(
     Ok(chat_id)
 }
 
-/// Whether this conversation plans without acting.
+/// How much this conversation is allowed to do without being asked.
 ///
 /// Read on the turn path rather than carried on the summary, for the reason `cwd_of` is read there:
 /// it decides what the run is LAUNCHED with, and a value that travelled through the window and back
 /// would be a second copy of it free to disagree.
-pub async fn plans_only(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
-    sqlx::query_scalar::<_, i64>("SELECT plan_only FROM chats WHERE chat_id = ?")
+///
+/// A chat that does not exist reads as `Auto`, the same fallback an unreadable spelling gets.
+pub async fn permission_mode_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<PermissionMode> {
+    sqlx::query_scalar::<_, String>("SELECT permission_mode FROM chats WHERE chat_id = ?")
         .bind(chat_id)
         .fetch_optional(pool)
         .await
-        .map(|found| found.unwrap_or(0) != 0)
+        .map(|found| {
+            found
+                .as_deref()
+                .map_or(PermissionMode::Auto, PermissionMode::from_wire)
+        })
 }
 
-/// Puts a conversation into planning, or takes it out.
-pub async fn set_plan_only(pool: &SqlitePool, chat_id: &str, planning: bool) -> sqlx::Result<()> {
-    sqlx::query("UPDATE chats SET plan_only = ? WHERE chat_id = ?")
-        .bind(i64::from(planning))
+/// Moves a conversation to another rung.
+pub async fn set_permission_mode(
+    pool: &SqlitePool,
+    chat_id: &str,
+    mode: PermissionMode,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET permission_mode = ? WHERE chat_id = ?")
+        .bind(mode.as_str())
         .bind(chat_id)
         .execute(pool)
         .await?;
@@ -1492,6 +1555,172 @@ mod tests {
             answering(&pool, &id).await.unwrap().context_window,
             Some(190_000),
             "a narrower window would compact away what the conversation is already carrying"
+        );
+    }
+    /// Migration `0129`'s data half, which a suite that only ever builds a fresh database cannot
+    /// reach: the whole chain runs against empty tables, so the `UPDATE` could be deleted with
+    /// everything green. It is the one instruction in this migration that runs exactly once, on a
+    /// real database, with no rehearsal — and getting it wrong silently takes every planning
+    /// conversation off planning.
+    #[tokio::test]
+    async fn the_backfill_carries_planning_onto_the_new_column() {
+        let pool = crate::testdb::pool_migrated_through(128).await;
+
+        // The pre-0129 shape: `permission_mode` does not exist yet, which is itself part of the
+        // test — naming it here would fail against the schema these rows are written into.
+        for (id, planning) in [("was-planning", 1), ("was-not", 0)] {
+            sqlx::query(
+                "INSERT INTO chats (chat_id, title, brain, created_at, plan_only)
+                 VALUES (?, NULL, 'cloud', '2026-01-01T00:00:00Z', ?)",
+            )
+            .bind(id)
+            .bind(planning)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        crate::testdb::apply_migrations_after(&pool, 128).await;
+
+        assert_eq!(
+            permission_mode_of(&pool, "was-planning").await.unwrap(),
+            PermissionMode::Plan,
+            "a conversation that was planning must still be planning after the column changed"
+        );
+        assert_eq!(
+            permission_mode_of(&pool, "was-not").await.unwrap(),
+            PermissionMode::Auto,
+            "everything else keeps the column default, which is what a rooted chat already did"
+        );
+    }
+
+    /// The CHECK is now or never on this table: adding one later means rebuilding `chats`, which
+    /// `0123`'s header records as having already gone wrong here once. This is the assertion that
+    /// says it went in.
+    #[tokio::test]
+    async fn the_check_refuses_a_mode_outside_the_five() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+
+        // `dontAsk` is a real spelling — the CLI accepts it — and this application exposes no such
+        // rung. A near-miss is what a typo actually looks like.
+        let refused = sqlx::query("UPDATE chats SET permission_mode = 'dontAsk' WHERE chat_id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await;
+
+        assert!(
+            refused.is_err(),
+            "the column accepted a mode nothing can read"
+        );
+        assert_eq!(
+            permission_mode_of(&pool, &id).await.unwrap(),
+            PermissionMode::Auto,
+            "the refused write must not have moved the row"
+        );
+    }
+
+    /// Every rung survives the round trip through the column, and nothing else does.
+    ///
+    /// The five are asserted together rather than one per test because the property is the SET:
+    /// a spelling that writes and reads back as something else is the failure, and it is only
+    /// visible when the five are compared against each other.
+    #[tokio::test]
+    async fn each_rung_writes_and_reads_back_as_itself() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+
+        for mode in [
+            PermissionMode::Manual,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+        ] {
+            set_permission_mode(&pool, &id, mode).await.unwrap();
+            assert_eq!(permission_mode_of(&pool, &id).await.unwrap(), mode);
+        }
+    }
+
+    /// Unknown falls to `Auto` — the behaviour the row had before the column existed.
+    ///
+    /// With the CHECK in place only rows older than `0129` can reach this, and a chat that does not
+    /// exist is the other way in. Both fall the same way, and the direction matters: falling to a
+    /// NARROWER rung would be safe and falling to a wider one would not, and `Auto` is what a
+    /// rooted conversation has always done.
+    #[tokio::test]
+    async fn an_unreadable_mode_and_a_missing_chat_both_read_as_auto() {
+        let pool = test_pool().await;
+
+        assert_eq!(PermissionMode::from_wire("dontAsk"), PermissionMode::Auto);
+        assert_eq!(PermissionMode::from_wire(""), PermissionMode::Auto);
+        assert_eq!(PermissionMode::from_wire("Plan"), PermissionMode::Auto);
+        assert_eq!(
+            permission_mode_of(&pool, "no-such-chat").await.unwrap(),
+            PermissionMode::Auto
+        );
+    }
+
+    /// `project_judge` has THREE states, not two, and a nullable column is how the rest of this
+    /// codebase says three: no row at all means the daemon's configured route decides; a row with
+    /// `brain` NULL is the explicit refusal to have a judge on this project; a row naming a brain
+    /// picks one. A table that could only say two of those would make "off" and "not configured"
+    /// the same answer, and they are not.
+    ///
+    /// `cloud` is refused by the CHECK, and that is the load-bearing half of this test: a cloud
+    /// judge would launch a CLI whose own tool calls re-enter PreToolUse, which is the single
+    /// configuration that puts reentrancy on a path that has none.
+    #[tokio::test]
+    async fn the_three_states_of_a_project_judge_are_distinguishable() {
+        let pool = test_pool().await;
+
+        for (project, brain) in [("silent", None), ("judged", Some("local"))] {
+            sqlx::query(
+                "INSERT INTO project_judge (project_id, brain, model, created_at)
+                 VALUES (?, ?, NULL, '2026-01-01T00:00:00Z')",
+            )
+            .bind(project)
+            .bind(brain)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        async fn brain_of(pool: &SqlitePool, project: &str) -> Option<Option<String>> {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT brain FROM project_judge WHERE project_id = ?",
+            )
+            .bind(project)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(
+            brain_of(&pool, "unconfigured").await,
+            None,
+            "no row: the daemon's own route decides"
+        );
+        assert_eq!(
+            brain_of(&pool, "silent").await,
+            Some(None),
+            "a row, and no judge on it"
+        );
+        assert_eq!(
+            brain_of(&pool, "judged").await,
+            Some(Some("local".to_owned())),
+            "a row naming a brain"
+        );
+
+        let refused = sqlx::query(
+            "INSERT INTO project_judge (project_id, brain, model, created_at)
+             VALUES ('reentrant', 'cloud', NULL, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            refused.is_err(),
+            "a cloud judge would launch a CLI whose tool calls re-enter the hook that asked"
         );
     }
 }

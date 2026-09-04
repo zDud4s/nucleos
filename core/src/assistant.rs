@@ -99,12 +99,16 @@ struct LiveChat {
     /// so a turn noticing the close has to be able to WAIT briefly for it rather than read whatever
     /// happens to be there.
     stopped_because: tokio::sync::watch::Receiver<Option<String>>,
-    /// Whether the process was started to plan rather than to act, fixed when it was spawned.
+    /// Which rung the process was started on, fixed when it was spawned.
     ///
-    /// `--permission-mode plan` is an argument, so a process started to act cannot be asked to stop
+    /// `--permission-mode` is an argument, so a process started to act cannot be asked to stop
     /// acting — and one started to plan cannot be let loose. Kept so it can be COMPARED, exactly as
     /// `cwd` is: a conversation that changed its mind gets a new process rather than a wrong one.
-    planning: bool,
+    ///
+    /// The whole rung and not a boolean, since `0129`: a conversation can move between five modes,
+    /// and a process spawned on one of them is the wrong process for any of the other four whose
+    /// command line differs.
+    permission: crate::runner::Permission,
     /// Where the process is standing, fixed when it was spawned.
     ///
     /// Kept so it can be COMPARED. A conversation's working directory is resolved per turn — an
@@ -297,7 +301,7 @@ async fn serve_turn(
         // folder wins over the chat's, and a fresh context abandons the session — so a process that no
         // longer matches this turn is not a process this turn may be answered by. It falls through
         // and is dropped, which stops it, and a new one is started to the turn's own shape.
-        let same_ground = live.cwd == request.cwd && live.planning == request.plan_only;
+        let same_ground = live.cwd == request.cwd && live.permission == request.permission;
         let same_conversation = known.is_some() && request.resume_session_id == known;
         if let Some(session_id) = known.filter(|_| same_ground && same_conversation) {
             let _ = session_tx.send(session_id.clone());
@@ -372,7 +376,7 @@ async fn start_live_chat(
     // turn wanting a different directory — or a different mode — can be told this process is the
     // wrong one.
     let started_in = request.cwd.clone();
-    let was_planning = request.plan_only;
+    let was_permission = request.permission;
 
     // stdin IS the channel a later turn arrives on, so a process meant to serve more than one has to
     // take that door whether or not this turn carries anything that could only fit through it.
@@ -463,7 +467,7 @@ async fn start_live_chat(
         session_id: std::sync::Arc::clone(&session_id),
         abort: supervisor.abort_handle(),
         stopped_because,
-        planning: was_planning,
+        permission: was_permission,
         cwd: started_in,
         idle_since: std::time::Instant::now(),
     };
@@ -2458,11 +2462,61 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         let may_live = matches!(tool_policy, crate::runner::ToolPolicy::Unrestricted);
 
         // Read here rather than carried in from the request that started the turn: it is a property
-        // of the conversation at the moment it answers, and somebody who pressed "plan" while
+        // of the conversation at the moment it answers, and somebody who moved the selector while
         // reading the last reply means this turn.
-        let planning = crate::chats::plans_only(&pool, &turn.slot.chat_id)
+        //
+        // `unwrap_or(Auto)` and not a refusal, for the reason the fallback exists at all: `Auto` is
+        // what a rooted conversation has always done, so a row that could not be read behaves the
+        // way it behaved before there was a column. It is the safe direction only downward, which
+        // is why the SNAPSHOT this turn writes cannot use it — see the run's own column.
+        let mode = crate::chats::permission_mode_of(&pool, &turn.slot.chat_id)
             .await
-            .unwrap_or(false);
+            .unwrap_or(crate::chats::PermissionMode::Auto);
+        let permission = crate::runner::Permission::for_chat(mode);
+
+        // The turn's SNAPSHOT, written before anything can observe it.
+        //
+        // The read above is a property of the conversation at this instant. The hook reads the same
+        // fact again, once per tool call, minutes later — so it has to be written somewhere a tool
+        // call can find it, and it cannot be the chat's row: moving the selector while a turn is
+        // running would change the rules underneath a turn already running. That is the whole
+        // reason `runs.permission_mode` exists, and what makes it a snapshot rather than a second
+        // copy free to disagree — written once, here, and never read by the selector.
+        //
+        // **The ORDER gives the invariant for free.** This write, then the `RunRequest`, then the
+        // runner. The CLI process does not exist until this row says what it is running under, so
+        // no tool call of a cloud turn can observe a NULL.
+        //
+        // **A failed write refuses the turn.** It does not fall back to `auto`: somebody who chose
+        // `manual` would silently be handed something WIDER than they asked for, and "unknown reads
+        // as auto" is only safe downward. `mint_chat_token` above fails in the same direction and
+        // for the same reason — of the two ways to be wrong here, only one leaves a run acting with
+        // nobody watching.
+        if let Err(error) = sqlx::query("UPDATE runs SET permission_mode = ? WHERE id = ?")
+            .bind(mode.as_str())
+            .bind(id)
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(
+                run_id = id,
+                chat_id = %turn.slot.chat_id,
+                %error,
+                "could not record this turn's permission mode — refusing the turn rather than running it wider than it was asked for"
+            );
+            let failed = sqlx::query(
+                "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(format!(
+                "could not record this turn's permission mode, so it was refused rather than run under a wider one: {error}"
+            ))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await;
+            crate::runs::warn_on_terminal_write_err(&failed, id, "failed");
+            return;
+        }
 
         // Who answers this turn, and how hard they are asked to think. Read HERE, beside `planning`
         // and for its reason: both are properties of the conversation at the moment it answers, and
@@ -2499,7 +2553,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // because one quietly given a working directory is one whose relative paths
             // moved.
             cwd,
-            plan_only: planning,
+            permission,
             resume_session_id: resume,
             mcp_config: Some(turn.mcp_path.clone()),
             // Decided by `tool_policy_for`, which is where the rule is written out. The
@@ -6242,7 +6296,7 @@ mod tests {
                 // Nothing to stop, but the field is what stops a real one, so it is not optional.
                 abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 stopped_because,
-                planning: false,
+                permission: crate::runner::Permission::Default,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
             },
@@ -6659,7 +6713,7 @@ mod tests {
             prompt: prompt.to_owned(),
             env: Vec::new(),
             cwd: Some(cwd.to_path_buf()),
-            plan_only: false,
+            permission: crate::runner::Permission::Default,
             resume_session_id: resume,
             mcp_config: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
@@ -6749,7 +6803,7 @@ mod tests {
             session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
             abort: running.abort_handle(),
             stopped_because: tokio::sync::watch::channel(None).1,
-            planning: false,
+            permission: crate::runner::Permission::Default,
             cwd: None,
             idle_since: std::time::Instant::now(),
         };
@@ -6855,27 +6909,155 @@ mod tests {
 
     /// A conversation in planning launches a run that cannot act.
     ///
-    /// `plan_only` has existed since the runs pillar was built and every conversation passed
-    /// `false`. `cli_args` turns it into `--permission-mode plan`, written FIRST and in an `else`,
-    /// so a planning run can never also be handed `bypassPermissions` — which is why the one mode a
-    /// person reaches for before letting an agent near a codebase was reachable by every kind of run
-    /// here except the kind a person is watching.
+    /// Planning has existed since the runs pillar was built and every conversation passed `false`.
+    /// `cli_args` turns the rung into `--permission-mode plan`, and since the fold it is one field
+    /// holding one value — so a planning run cannot also be carrying `bypassPermissions`, by
+    /// construction rather than by an ordering rule. It is the one mode a person reaches for before
+    /// letting an agent near a codebase, and it was reachable by every kind of run here except the
+    /// kind a person is watching.
     #[tokio::test]
     async fn a_conversation_in_planning_launches_a_run_that_cannot_act() {
         let fake = std::sync::Arc::new(FakeCommandRunner::default());
         let mut state = test_state().await;
         state.runner = fake.clone();
         let _root = rooted_chat(&state, "planning-chat").await;
-        crate::chats::set_plan_only(&state.pool, "planning-chat", true)
-            .await
-            .unwrap();
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "planning-chat",
+            crate::chats::PermissionMode::Plan,
+        )
+        .await
+        .unwrap();
 
         let id = send_message(&state, "planning-chat", "como farias isto?", Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, id).await;
 
-        assert_eq!(*fake.last_plan_only.lock().unwrap(), Some(true));
+        assert_eq!(
+            *fake.last_permission.lock().unwrap(),
+            Some(crate::runner::Permission::Plan)
+        );
+    }
+
+    /// The row says what this turn was governed by, which is what the hook reads back.
+    ///
+    /// `accept_edits` rather than `plan`, on purpose: `plan` is also a CLI flag, so a test using it
+    /// could pass on the flag alone and say nothing about the column. This rung and `manual` and
+    /// `auto` are invisible on the command line — they live entirely in what the hook lets through
+    /// — so the column is the only place the fact can be.
+    #[tokio::test]
+    async fn a_cloud_turn_records_the_mode_it_started_with() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "recorded").await;
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "recorded",
+            crate::chats::PermissionMode::AcceptEdits,
+        )
+        .await
+        .unwrap();
+
+        let id = send_message(&state, "recorded", "muda isto", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.as_deref(), Some("accept_edits"));
+    }
+
+    /// A turn the local brain answered records NOTHING, and the NULL is the invariant.
+    ///
+    /// `spawn_local_turn` writes its own INSERT four hundred lines from the cloud one, never builds
+    /// a `RunRequest`, and never fires a `PreToolUse` hook — so there are no permissions to govern
+    /// on that path. Filling the column there would be the easiest possible version of this feature
+    /// to write and the one that does nothing: green tests, and `NULL` on every turn that actually
+    /// runs a CLI. `permission_mode IS NULL` means "no CLI was involved", and this is what keeps
+    /// that true.
+    #[tokio::test]
+    async fn a_turn_the_local_brain_answered_records_no_mode_at_all() {
+        let local = AppState {
+            assistants: Arc::new(FixedAssistants(fake_local_assistant("answered here"))),
+            ..test_state().await
+        };
+        crate::chats::set_brain(&local.pool, "a-local-chat", crate::chats::Brain::Local)
+            .await
+            .unwrap();
+        crate::chats::set_permission_mode(
+            &local.pool,
+            "a-local-chat",
+            crate::chats::PermissionMode::Bypass,
+        )
+        .await
+        .unwrap();
+
+        let id = send_message(&local, "a-local-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&local.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            recorded, None,
+            "the conversation says `bypass` and no CLI is being launched, so the run must say \
+             nothing rather than claim a mode nothing will read"
+        );
+    }
+
+    /// A turn whose mode could not be written down is refused, not run under a wider one.
+    ///
+    /// The degrade is only safe downward. Falling back to `auto` here would hand somebody who chose
+    /// `manual` a turn that edits without asking — and it would do it silently, on the one path
+    /// where nothing else would say so. `mint_chat_token` thirty lines above fails in the same
+    /// direction, and this is the same argument.
+    ///
+    /// The write is broken with a trigger because that is the only honest way to fail exactly this
+    /// statement from outside: the column cannot be dropped without rebuilding `runs`, and breaking
+    /// the table wholesale would fail the turn somewhere earlier and prove nothing about this line.
+    #[tokio::test]
+    async fn a_turn_whose_mode_could_not_be_recorded_is_refused_rather_than_widened() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "unrecordable").await;
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "unrecordable",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER no_permission_mode BEFORE UPDATE OF permission_mode ON runs
+             BEGIN SELECT RAISE(ABORT, 'the column will not take a value today'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let id = send_message(&state, "unrecordable", "faz isso", Origin::Shell)
+            .await
+            .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+
+        assert_eq!(status, "failed");
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            0,
+            "the CLI must not have been launched at all — a run that started is a run that acted"
+        );
     }
 
     /// A conversation that changed its mind is not answered by the process it changed it from.
@@ -6896,9 +7078,13 @@ mod tests {
             .unwrap();
         settled_turn(&state.pool, first).await;
 
-        crate::chats::set_plan_only(&state.pool, "mind-changed", true)
-            .await
-            .unwrap();
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "mind-changed",
+            crate::chats::PermissionMode::Plan,
+        )
+        .await
+        .unwrap();
         let second = send_message(&state, "mind-changed", "afinal planeia", Origin::Shell)
             .await
             .unwrap();
@@ -6909,7 +7095,10 @@ mod tests {
             2,
             "the turn was answered by a process started in the other mode"
         );
-        assert_eq!(*fake.last_plan_only.lock().unwrap(), Some(true));
+        assert_eq!(
+            *fake.last_permission.lock().unwrap(),
+            Some(crate::runner::Permission::Plan)
+        );
     }
 
     /// A conversation with no tools keeps no process, and the reason is not caution.

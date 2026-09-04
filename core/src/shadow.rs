@@ -237,6 +237,18 @@ pub const READINESS_MIN_AGREE_PERCENT: i64 = 95;
 const RESTRAINT_EVIDENCE_CLASSES: &[&str] = &[
     "push-merge-deploy",
     "destructive",
+    // Split out of `destructive` when the classifier learned to answer separately about a delete's
+    // TARGET. It is evidence of restraint by exactly the same argument as its sibling, and the
+    // allowlist above says a new class is not evidence until somebody puts it here on purpose.
+    //
+    // What it costs, said out loud because it reads as a bug to whoever meets it cold: `promotable`
+    // requires `classes_ready == classes_total` over the classes a run EXERCISED, so this is one
+    // more class that has to get ready — its own `READINESS_MIN_REVIEWED` reviews at
+    // `READINESS_MIN_AGREE_PERCENT` — and the reviews already won under `destructive` for
+    // out-of-workspace cases do NOT transit. Splitting the class rewinds the promotion clock for
+    // that hazard. Fail-closed, therefore correct, and therefore worth a paragraph rather than a
+    // surprise.
+    "destructive-outside",
     "self-governing-file",
     "outside-workspace",
     "executes-on-next-command",

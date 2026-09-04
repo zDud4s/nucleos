@@ -2991,7 +2991,7 @@ async fn spawn_agent(
         // No working directory, exactly as a council seat has none — which is also why the
         // `PreToolUse` hook may never fire and why the route table has to hold alone.
         cwd: None,
-        plan_only: false,
+        permission: crate::runner::Permission::Default,
         resume_session_id: None,
         mcp_config,
         tool_policy: if with_tools {
