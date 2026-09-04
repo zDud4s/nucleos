@@ -12270,6 +12270,67 @@ mod tests {
         );
     }
 
+    /// `nucleos-core --land ""` sends `Some("")` rather than dropping the field, and the CLI leaves
+    /// it that way on purpose — an empty target is not a refusal, it is the integration branch,
+    /// which is where the bare `--land` was going anyway.
+    ///
+    /// That is an agreement between two modules and it is pinned from BOTH ends: the CLI says it
+    /// sends the empty through, and this says the empty is answered like an absent one. It holds
+    /// only because `land::resolve_target` trims before it decides whether anything was asked for,
+    /// which is a line nothing else here would notice the loss of.
+    #[tokio::test]
+    async fn an_empty_target_is_the_integration_branch_and_not_a_refusal() {
+        let (state, _db) = file_test_state().await;
+        let container = crate::git_exec::tests::space_free_tempdir("http-land-empty-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
+        assert!(git_in(&repo, &["branch", "feature"]));
+        let worktree = container.path().join("wt");
+        assert!(git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "feature"
+            ]
+        ));
+        std::fs::write(worktree.join("feature.txt"), "from the branch\n").unwrap();
+        assert!(git_in(&worktree, &["add", "-A"]));
+        assert!(git_in(&worktree, &["commit", "-m", "feature"]));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
+             VALUES ('alpha', 'active', ?, 'trunk')",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let landed = land_worktree(
+            State(state.clone()),
+            Json(LandBody {
+                cwd: worktree.to_string_lossy().into_owned(),
+                target: Some(String::new()),
+            }),
+        )
+        .await
+        .expect("an empty target is not a target the project has to admit");
+
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(landed.0.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let op: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(
+            op["target"], "trunk",
+            "an empty target means the integration branch, exactly as an absent one does"
+        );
+    }
+
     /// Every caller that existed before the target did sends a body with no `target` at all, and
     /// an absent field has to keep meaning the project's integration branch. `#[serde(default)]`
     /// is the whole of that guarantee, and nothing else in this file would notice if it were
