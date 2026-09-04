@@ -29,6 +29,8 @@
 use std::path::Path;
 use std::time::Instant;
 
+use serde::Serialize;
+
 use crate::vcs::{Branch, Op, Origin, ResolvedRepo};
 
 /// Decision #7's feed kind: a conflict resolution the agent could not produce, or that admission
@@ -172,6 +174,114 @@ async fn derive_integration_branch(
          integration branch from; set one explicitly",
         project_root.display()
     ))
+}
+
+/// Where a landing with no argument would go, for somebody reading rather than landing.
+///
+/// **Four arms because a page that showed a branch name and called it admissible would be wrong in
+/// three of them**, and the wrongness is invisible: a name on screen looks equally true whether the
+/// column declared it, whether the ref still exists, and whether anything recorded it at all.
+///
+/// This is the answer `inspect::Branches::integration` is NOT. That field is
+/// `current_branch(project_root)` — whatever the main checkout happens to be parked on — and its own
+/// doc says so, naming this module's existence as the reason it may not be used for this. A project
+/// whose clone is sitting on a feature branch would otherwise have the page name that branch, caption
+/// it "always admissible", and be contradicted by `resolve_target` refusing it by name. That is
+/// decision #2's defect wearing a different coat, and it is the whole reason this function exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum IntegrationBranch {
+    /// The column holds a branch and `refs/heads/<branch>` is there. Admissible, full stop.
+    Declared { branch: String },
+    /// The column holds a branch and the ref is gone.
+    ///
+    /// Its own arm rather than folded into [`IntegrationBranch::Unknown`], because
+    /// [`integration_branch`] treats it as a misconfigured project and not as a project without one
+    /// — *"nothing lands by default until it is corrected"* — and a reader can only correct what they
+    /// can see the name of. Nothing lands here by default and the branch is still worth showing.
+    Stale { branch: String },
+    /// Nothing is recorded, and this is what the first landing would derive and write down.
+    ///
+    /// A project that has never landed is the ordinary case, not a broken one: `--land` with no
+    /// argument works today and lands exactly here. Reporting `null` for it would be a fresh
+    /// falsehood in the other direction — this is where the work goes, it simply has not been
+    /// written down yet, and this arm says both halves.
+    Derived { branch: String },
+    /// There is no answer, and this is the daemon's own sentence for why.
+    ///
+    /// Both ways of having none: a project with no folder to ask git about, and a repository with no
+    /// `origin/HEAD` and no local `master` or `main` to derive from. They are one arm because the
+    /// page's response to each is the same — there is nothing to name and nothing to caption — while
+    /// the sentence that differs travels in `why`.
+    Unknown { why: String },
+}
+
+/// [`integration_branch`], read rather than decided — **and it does not write.**
+///
+/// **The one difference from [`integration_branch`], and it is the reason there are two.** That one
+/// records a derived default as a side effect, so that every landing after the first reads a column
+/// instead of asking git. It is right for a landing to do that and wrong for a GET: a project that
+/// has never landed follows `origin/HEAD`, and a route that pinned the column would freeze it to
+/// whatever `origin/HEAD` said at the moment somebody opened a page. That is decision #2's defect
+/// once more — a landing target settled by something other than a declaration — with "a page was
+/// opened" standing in for "a checkout was parked". A display must not decide what it is displaying.
+///
+/// **Both functions derive through [`derive_integration_branch`] and neither has its own copy**, so
+/// the branch this reports and the branch a landing takes cannot come apart. What a reader is told
+/// would happen is what happens.
+///
+/// `Err` is the database failing and nothing else; every answer the filesystem or git can give is an
+/// arm of [`IntegrationBranch`].
+pub async fn integration_branch_reading(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    deadline: Instant,
+) -> Result<IntegrationBranch, String> {
+    let recorded: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT integration_branch FROM autopilot_state WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("could not read {project_id}'s integration branch: {error}"))?
+    .flatten();
+    let recorded = recorded.filter(|value| !value.trim().is_empty());
+
+    let root = crate::inspect::project_root(pool, project_id)
+        .await
+        .map_err(|error| format!("could not read {project_id}'s root: {error}"))?;
+    let Some(root) = root.filter(|root| Path::new(root).is_dir()) else {
+        // A project switched off has had its root cleared, and one whose folder moved has a root
+        // pointing nowhere. Neither can be asked about a ref — but a column that still holds a name
+        // is worth reporting, since it is what a landing would use once the folder is back.
+        return Ok(match recorded {
+            Some(branch) => IntegrationBranch::Stale { branch },
+            None => IntegrationBranch::Unknown {
+                why: format!(
+                    "{project_id} has no folder on this machine, so there is nothing to read a \
+                     branch from"
+                ),
+            },
+        });
+    };
+    let root = Path::new(&root);
+
+    if let Some(branch) = recorded {
+        return Ok(
+            match crate::git_exec::branch_exists(root, &branch, deadline).await {
+                Ok(true) => IntegrationBranch::Declared { branch },
+                // A ref git says is absent and a git that would not answer are both "this name will
+                // not do", which is what `integration_branch` refuses on. The name is kept either
+                // way, because it is the thing somebody has to go and correct.
+                Ok(false) | Err(_) => IntegrationBranch::Stale { branch },
+            },
+        );
+    }
+
+    Ok(match derive_integration_branch(root, deadline).await {
+        Ok(branch) => IntegrationBranch::Derived { branch },
+        Err(why) => IntegrationBranch::Unknown { why },
+    })
 }
 
 /// The branch THIS landing is for.
@@ -528,6 +638,143 @@ mod tests {
             "chore/other",
             "the main checkout itself is untouched — landing does not check anything out"
         );
+    }
+
+    /// **The same regression as the test above, read instead of landed.**
+    ///
+    /// The panel at `/projects/{id}/github` reported this branch from
+    /// `inspect::Branches::integration` — `current_branch(project_root)` — and captioned it *"always
+    /// admissible"*. With the main checkout parked on `chore/other` that named a branch
+    /// `resolve_target` refuses by name, while the branch that IS admissible appeared nowhere. A
+    /// landing being right is not enough if the page that reports on landings is wrong: the owner
+    /// reads the page.
+    ///
+    /// Both halves are asserted, because the first alone would pass on a reading that named both.
+    #[tokio::test]
+    async fn a_reading_names_the_declared_branch_and_never_the_parked_checkout() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-reading-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+
+        // What the old source of this answer would have said, measured rather than assumed.
+        assert_eq!(
+            crate::git_exec::current_branch(&repo, deadline())
+                .await
+                .ok(),
+            Some("chore/other".to_owned()),
+            "the fixture has to have the checkout parked, or this test proves nothing"
+        );
+
+        assert_eq!(
+            integration_branch_reading(&pool, "alpha", deadline())
+                .await
+                .expect("the roster row is there"),
+            IntegrationBranch::Declared {
+                branch: "master".to_owned()
+            }
+        );
+    }
+
+    /// **A read does not write, and this is the difference between the two functions.**
+    ///
+    /// [`integration_branch`] records a derived default so that every landing after the first reads
+    /// a column. That is right for a landing and wrong for a GET: `GET /projects/{id}/land-targets`
+    /// is opened by looking at a page, and a project that has never landed follows `origin/HEAD`
+    /// until something pins it. A page that pinned it would settle a landing target by a means that
+    /// is not a declaration — decision #2's defect with "a page was opened" in place of "a checkout
+    /// was parked".
+    ///
+    /// So: reading derives the same answer and leaves the column alone; landing writes it. Both
+    /// derive through `derive_integration_branch`, so the branch reported and the branch taken
+    /// cannot come apart — which is the other half of why this is safe.
+    #[tokio::test]
+    async fn reading_the_integration_branch_derives_without_recording_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-noswrite-", "chore/other");
+        seed_project(&pool, "alpha", &repo, None).await;
+
+        let recorded = || {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT integration_branch FROM autopilot_state WHERE project_id = 'alpha'",
+            )
+            .fetch_one(&pool)
+        };
+
+        assert_eq!(
+            integration_branch_reading(&pool, "alpha", deadline())
+                .await
+                .expect("the roster row is there"),
+            IntegrationBranch::Derived {
+                branch: "master".to_owned()
+            },
+            "a project that has never landed still lands somewhere, and this is where"
+        );
+        assert_eq!(
+            recorded().await.unwrap(),
+            None,
+            "reading must leave the column exactly as it found it"
+        );
+
+        // And the landing path does record it, which is what makes the pair a decision rather than
+        // an inconsistency.
+        integration_branch(&pool, "alpha", &repo, deadline())
+            .await
+            .expect("master is derivable here");
+        assert_eq!(recorded().await.unwrap(), Some("master".to_owned()));
+    }
+
+    /// A column naming a branch git cannot find is a misconfigured project, not one without a
+    /// default — and the name is what somebody has to go and correct, so it is kept.
+    ///
+    /// [`integration_branch`] refuses this case in words: *"nothing lands by default until it is
+    /// corrected"*. The reading says the same thing in a shape a page can caption, which is the
+    /// point of the arm existing at all: a branch name on screen is a claim, and this arm is where
+    /// the claim must not be "always admissible".
+    #[tokio::test]
+    async fn a_declared_branch_whose_ref_is_gone_is_named_and_not_called_admissible() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-stale-", "chore/other");
+        seed_project(&pool, "alpha", &repo, Some("release/gone")).await;
+
+        assert_eq!(
+            integration_branch_reading(&pool, "alpha", deadline())
+                .await
+                .expect("the roster row is there"),
+            IntegrationBranch::Stale {
+                branch: "release/gone".to_owned()
+            }
+        );
+
+        // The landing path refuses the same project, which is the behaviour the arm is describing.
+        assert!(
+            integration_branch(&pool, "alpha", &repo, deadline())
+                .await
+                .is_err(),
+            "a page must not caption a branch admissible that a landing would refuse"
+        );
+    }
+
+    /// A project with no folder has nothing to be asked, and says so in the daemon's own words.
+    #[tokio::test]
+    async fn a_project_with_no_folder_has_no_integration_branch_to_name() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('off', 'off', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed a project switched off");
+
+        let read = integration_branch_reading(&pool, "off", deadline())
+            .await
+            .expect("the roster row is there");
+        let IntegrationBranch::Unknown { why } = read else {
+            panic!("a project with no folder cannot name a branch, got {read:?}");
+        };
+        assert!(why.contains("no folder"), "{why}");
     }
 
     /// Decision #3: a source already inside the target is refused before a row is written at all —

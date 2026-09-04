@@ -21,6 +21,7 @@ import {
   useProjectShellRules,
   type DeclarableOp,
   type ShellRule,
+  type IntegrationBranch,
   type ShellRuleDeclaration,
   type Verdict,
 } from "./project-policy";
@@ -96,6 +97,12 @@ function fakeDaemon(project = "alpha") {
   const rules = new Map<string, StoredRule>();
   const ops = new Set<string>();
   const targets = new Set<string>();
+  /*
+    Where a landing goes with no argument. `declared`, from `autopilot_state.integration_branch` —
+    and pointedly NOT the branch the main checkout is standing on, which is the read `land.rs` exists
+    to have replaced.
+  */
+  let integration: IntegrationBranch = { state: "declared", branch: "master" };
   const sent: { path: string; method: string; body: Record<string, unknown> | null }[] = [];
 
   async function call(path: string, init?: RequestInit): Promise<unknown> {
@@ -169,7 +176,10 @@ function fakeDaemon(project = "alpha") {
       return undefined;
     }
 
-    if (method === "GET") return [...targets].sort();
+    // Two halves, because the route answers both: where a landing goes by default, and the extra
+    // places it may be sent. The default is never in `targets` — it is admissible with no row, so a
+    // fake that listed it there would make it look closeable.
+    if (method === "GET") return { integration, targets: [...targets].sort() };
     const branch = String(body?.branch ?? "");
     if (method === "POST") {
       targets.add(branch);
@@ -193,6 +203,9 @@ function fakeDaemon(project = "alpha") {
     },
     declareOp: (opKind: string) => ops.add(opKind),
     declareTarget: (branch: string) => targets.add(branch),
+    setIntegration: (arm: IntegrationBranch) => {
+      integration = arm;
+    },
   };
 }
 
@@ -263,7 +276,50 @@ describe("the three reads", () => {
     const { result } = renderHook(() => useProjectLandTargets("alpha"), { wrapper: mount() });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(result.current.data).toEqual([]);
+    expect(result.current.data?.targets).toEqual([]);
+  });
+
+  /**
+   * **The default comes from the route that owns landings, and it is not in `targets`.**
+   *
+   * The route used to serve the extra targets alone, and the page filled the default in from
+   * `GET /projects/{id}/branches` — `inspect::Branches::integration`, the branch the main checkout
+   * is *parked on*. That field's own doc in the núcleo says the design creating `land.rs` killed
+   * that read *"precisely because a checkout parked on the wrong branch silently redirected every
+   * landing"*, so the page named a branch `--land` refuses while the admissible one appeared
+   * nowhere.
+   *
+   * Kept out of `targets` deliberately: it is admissible with no row, and a caller that found it in
+   * the list would offer to close a row that does not exist.
+   */
+  it("reads where a landing goes by default, apart from the targets it may name", async () => {
+    fake.declareTarget("release/next");
+
+    const { result } = renderHook(() => useProjectLandTargets("alpha"), { wrapper: mount() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.integration).toEqual({ state: "declared", branch: "master" });
+    expect(result.current.data?.targets).toEqual(["release/next"]);
+  });
+
+  /**
+   * The three arms where naming a branch would not mean it is admissible.
+   *
+   * *Until the value is real the caption must not assert admissibility* — so the data layer has to
+   * carry which of the four cases it is, and not a `string | null` that flattens three of them into
+   * the same nothing.
+   */
+  it("keeps apart the reasons a landing has no admissible default", async () => {
+    for (const arm of [
+      { state: "stale", branch: "gone" } as const,
+      { state: "derived", branch: "master" } as const,
+      { state: "unknown", why: "alpha has no folder on this machine" } as const,
+    ]) {
+      fake.setIntegration(arm);
+      const { result } = renderHook(() => useProjectLandTargets("alpha"), { wrapper: mount() });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.data?.integration).toEqual(arm);
+    }
   });
 
   it("asks nothing at all until there is a project to ask about", () => {
@@ -347,7 +403,7 @@ describe("declaring", () => {
     });
 
     await waitFor(() => expect(result.current.ops.data).toEqual(["run_list"]));
-    expect(result.current.targets.data).toEqual(["release/next"]);
+    expect(result.current.targets.data?.targets).toEqual(["release/next"]);
   });
 });
 
@@ -389,13 +445,13 @@ describe("withdrawing", () => {
       () => ({ targets: useProjectLandTargets("alpha"), forget: useForgetLandTarget() }),
       { wrapper: mount() },
     );
-    await waitFor(() => expect(result.current.targets.data).toEqual(["release/next"]));
+    await waitFor(() => expect(result.current.targets.data?.targets).toEqual(["release/next"]));
 
     await act(async () => {
       await result.current.forget.mutateAsync({ projectId: "alpha", branch: "release/next" });
     });
 
-    await waitFor(() => expect(result.current.targets.data).toEqual([]));
+    await waitFor(() => expect(result.current.targets.data?.targets).toEqual([]));
     expect(fake.sent.find((call) => call.method === "DELETE")?.body).toEqual({
       branch: "release/next",
     });

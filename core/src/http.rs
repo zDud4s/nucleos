@@ -6344,18 +6344,24 @@ async fn post_project_shell_rule(
         ));
     }
 
-    crate::project_policy::declare_shell_rule(
-        &state.pool,
-        &id,
-        prefix,
-        body.verdict,
-        body.note.as_deref(),
-    )
-    .await
-    .map_err(|error| {
-        tracing::warn!(%error, project_id = %id, "declaring a project shell rule failed");
-        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-    })?;
+    // A note of nothing but whitespace is NO note, and it is folded to `NULL` here rather than
+    // stored. The column exists to be "the only defence against a list nobody can justify in six
+    // months", and an empty string is not a justification — it is the same absence spelled a second
+    // way, which would leave two rows that mean one thing and a reader unable to tell "nobody wrote
+    // one" from "somebody wrote nothing". The page renders `null` as "no justification" and an empty
+    // string as a blank space, so the two are already visibly different for no reason.
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+
+    crate::project_policy::declare_shell_rule(&state.pool, &id, prefix, body.verdict, note)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "declaring a project shell rule failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -6657,21 +6663,60 @@ async fn delete_project_github_op(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Where a `--land` may be sent in this project, besides `integration_branch`.
+/// Everywhere a `--land` may be sent in this project: the integration branch, and the extra targets.
+///
+/// **Both halves or neither, because half of this answer is a trap.** The extra targets used to be
+/// served alone, and the page filled the other half in from `GET /projects/{id}/branches` —
+/// `inspect::Branches::integration`, which is `current_branch(project_root)`. Its own doc says what
+/// that costs: it is *"a heuristic for this panel"* kept from before `land.rs` existed, and the
+/// design that created `land.rs` killed that read *"precisely because a checkout parked on the wrong
+/// branch silently redirected every landing"*. So a project whose clone sat on a feature branch had
+/// the page name that branch and caption it admissible, while `land::resolve_target` refused it by
+/// name and the branch that IS admissible appeared nowhere. Serving the pair from the one route that
+/// owns "where a landing may be sent" is what stops the two halves being answered by two different
+/// modules with two different definitions.
+///
+/// **`integration_branch_reading` and NOT `integration_branch`**, and the difference is a write. The
+/// landing path records a derived default so that later landings read a column; doing that here
+/// would let opening a page pin a project's integration branch to whatever `origin/HEAD` said at
+/// that moment. Its own doc carries the argument.
 ///
 /// `try_land_targets` for `get_project_github_ops`' reason: a display must not serve an empty list
 /// out of a database error.
 async fn get_project_land_targets(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<String>>, StatusCode> {
-    crate::project_policy::try_land_targets(&state.pool, &id)
+) -> Result<Json<LandingView>, StatusCode> {
+    let targets = crate::project_policy::try_land_targets(&state.pool, &id)
         .await
-        .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading a project's land targets failed");
             StatusCode::INTERNAL_SERVER_ERROR
-        })
+        })?;
+
+    let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+    let integration = crate::land::integration_branch_reading(&state.pool, &id, deadline)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading a project's integration branch failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(LandingView {
+        integration,
+        targets,
+    }))
+}
+
+/// Where this project's work lands: the default, and the alternatives it admits.
+///
+/// The two are not a list. The integration branch is admissible with no row at all — an empty table
+/// means "only the usual place" and never "nowhere" — so folding it into `targets` would make it
+/// indistinguishable from a declared row, which is the one thing on that panel that can be closed.
+#[derive(Serialize)]
+struct LandingView {
+    integration: crate::land::IntegrationBranch,
+    targets: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -20292,6 +20337,83 @@ mod tests {
         );
     }
 
+    /// A note of nothing is no note, and it is stored as `NULL` rather than as an empty string.
+    ///
+    /// **Two spellings of one absence is a distinction with nothing behind it, and the page can see
+    /// it.** `RuleList` renders `null` as "no justification" and an empty string as a blank space,
+    /// so the two rows would read differently while meaning the same thing — and the column exists
+    /// to be *"a única defesa contra uma lista que daqui a seis meses ninguém sabe justificar"*,
+    /// which an empty string is not. Whitespace goes the same way: a note of three spaces is not a
+    /// justification either.
+    #[tokio::test]
+    async fn a_note_of_nothing_is_stored_as_no_note_at_all() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        for (prefix, note) in [("cargo fmt", ""), ("cargo test", "   ")] {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({
+                    "prefix": prefix,
+                    "verdict": "allow",
+                    "note": note,
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{prefix}");
+        }
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        for rule in listed.as_array().unwrap() {
+            assert_eq!(
+                rule["note"],
+                serde_json::Value::Null,
+                "an empty justification is an ABSENT one: {rule}"
+            );
+        }
+    }
+
+    /// Both halves of "where a landing may be sent" come from the one route that owns the question.
+    ///
+    /// **The integration branch is not in `targets`, and that is the shape doing work.** It is
+    /// admissible with no row — an empty table means "only the usual place" and never "nowhere" — so
+    /// folding it into the list would make it indistinguishable from a declared row, which is the
+    /// one thing on that panel that can be closed.
+    ///
+    /// A project with no folder answers `unknown` rather than refusing: it is on the roster, it has
+    /// landing targets, and it simply has nothing to derive a default from.
+    #[tokio::test]
+    async fn where_a_landing_goes_and_what_else_it_may_name_arrive_together() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/land-targets",
+            Some(serde_json::json!({ "branch": "release/2.0" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, landing) =
+            reach_request(state, "GET", "/projects/alpha/land-targets", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(landing["targets"], serde_json::json!(["release/2.0"]));
+        // `project_on_the_roster` records no folder, so there is nothing to ask git — and the arm
+        // says so in words rather than answering `null`, which a page cannot caption.
+        assert_eq!(landing["integration"]["state"], "unknown");
+        assert!(
+            landing["integration"]["why"]
+                .as_str()
+                .unwrap()
+                .contains("no folder"),
+            "{landing}"
+        );
+    }
+
     /// An `allow` the classifier's shape guards would never consult is refused HERE, and the
     /// refusal says which prefix.
     ///
@@ -20678,7 +20800,7 @@ mod tests {
         let (status, listed) =
             reach_request(state.clone(), "GET", "/projects/alpha/land-targets", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(listed, serde_json::json!(["release/2.0"]));
+        assert_eq!(listed["targets"], serde_json::json!(["release/2.0"]));
 
         // The NAME is checked even though its existence is not, by the same `Branch::new` that
         // `resolve_target` calls before it asks git — so the sentence about a bad name is read by
@@ -20706,7 +20828,7 @@ mod tests {
 
         let (_, listed) =
             reach_request(state.clone(), "GET", "/projects/alpha/land-targets", None).await;
-        assert_eq!(listed, serde_json::json!([]));
+        assert_eq!(listed["targets"], serde_json::json!([]));
 
         let (status, refused) = reach_request(
             state,
@@ -21080,7 +21202,7 @@ mod tests {
         let (_, ops) = reach_request(state.clone(), "GET", "/projects/beta/github-ops", None).await;
         assert_eq!(ops, serde_json::json!([]));
         let (_, targets) = reach_request(state, "GET", "/projects/beta/land-targets", None).await;
-        assert_eq!(targets, serde_json::json!([]));
+        assert_eq!(targets["targets"], serde_json::json!([]));
     }
 
     /// `contact_addresses` has been written on every inbound message since it existed and read by

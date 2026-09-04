@@ -247,16 +247,53 @@ export function useDeclarableGithubOps() {
 }
 
 /**
- * Where a `--land` may be sent in this project, besides its integration branch.
+ * Everywhere a `--land` may be sent in this project — `land::IntegrationBranch`, tagged on `state`.
  *
- * The integration branch is admissible with no row, so it is never in this list — an empty list
+ * **Four arms because a branch name on screen looks equally true in all four**, and in three of them
+ * it is not admissible. A page that rendered a name and captioned it "always admissible" would be
+ * asserting something the núcleo refuses, with nothing on screen to say which case it was in.
+ */
+export type IntegrationBranch =
+  /** The column declares it and the ref is there. Admissible, full stop. */
+  | { state: "declared"; branch: string }
+  /** Declared and the ref is gone, or there is no folder to confirm it in. Nothing lands by default. */
+  | { state: "stale"; branch: string }
+  /** Nothing declared; this is what the first landing would derive and write down. */
+  | { state: "derived"; branch: string }
+  /** No answer, with the daemon's own sentence for why. */
+  | { state: "unknown"; why: string };
+
+/**
+ * Where this project's work lands: the default, and the alternatives it admits —
+ * `GET /projects/{id}/land-targets`.
+ *
+ * The integration branch is admissible with no row, so it is never in `targets` — an empty list
  * means "nowhere but the usual place", not "nowhere".
+ */
+export interface Landing {
+  integration: IntegrationBranch;
+  targets: string[];
+}
+
+/**
+ * Everywhere a `--land` may be sent in this project.
+ *
+ * **Both halves come from here, and the second half is why the shape changed.** The route used to
+ * serve the extra targets alone and the page filled the default in from
+ * `GET /projects/{id}/branches` — which is `inspect::Branches::integration`, the branch the main
+ * checkout is *parked on*. Its own doc in the núcleo says that field is a heuristic kept from before
+ * `land.rs` existed, and that the design creating `land.rs` killed that read *"precisely because a
+ * checkout parked on the wrong branch silently redirected every landing"*. So a project whose clone
+ * sat on a feature branch showed that branch, captioned admissible, while `--land` refused it by
+ * name and the branch that is admissible appeared nowhere on the page.
+ *
+ * One route now answers both halves, because one module owns the question.
  */
 export function useProjectLandTargets(projectId: string | null) {
   return useQuery({
     queryKey: keys.projects.landTargets(projectId ?? ""),
     queryFn: () =>
-      apiFetch<string[]>(`/projects/${encodeURIComponent(projectId ?? "")}/land-targets`),
+      apiFetch<Landing>(`/projects/${encodeURIComponent(projectId ?? "")}/land-targets`),
     enabled: projectId !== null,
   });
 }
@@ -266,9 +303,15 @@ export function useProjectLandTargets(projectId: string | null) {
 /**
  * Every declaration write settles the same way, so it is written once.
  *
- * `keys.projects.all`, as `project-commands.ts` invalidates it: the three lists live under that
- * prefix, and one form can move more than one of them. `onSettled` rather than `onSuccess` because
- * a 404 or a 423 means the picture on screen is wrong either way.
+ * **The three lists by name, and NOT the `keys.projects.all` prefix they share.** It used to be the
+ * prefix, on the argument that the three live under it and one form can move more than one of them —
+ * which was true while they were the only things there. `keys.projects.githubRepo` is under it now,
+ * and that read spawns `git remote get-url` against the project root; a prefix invalidation made
+ * every tick of a checkbox re-run a subprocess for a fact no declaration can change. Naming the
+ * three is also the honest statement of what these writes touch.
+ *
+ * `onSettled` rather than `onSuccess` because a 404 or a 423 means the picture on screen is wrong
+ * either way.
  *
  * `retry: false`, and here it is not merely the house default restated. Every refusal these nine
  * routes give is settled — the stop is engaged, the project is not on the roster, the prefix could
@@ -276,13 +319,24 @@ export function useProjectLandTargets(projectId: string | null) {
  * later. The one thing a retry would change is the record: a POST that half-landed and was sent
  * twice is a second write to a table that governs what an autonomous run may do.
  */
-function useDeclarationWrite<Input>(mutationFn: (input: Input) => Promise<void>) {
+function useDeclarationWrite<Input extends { projectId: string }>(
+  mutationFn: (input: Input) => Promise<void>,
+) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn,
     retry: false,
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    // The constraint is what makes this safe rather than a cast: every declaration write names the
+    // project it is about, so the keys to refresh are computable from the input the caller already
+    // had to supply.
+    onSettled: (_data, _error, { projectId }) => {
+      for (const key of [
+        keys.projects.shellRules(projectId),
+        keys.projects.githubOps(projectId),
+        keys.projects.landTargets(projectId),
+      ]) {
+        void queryClient.invalidateQueries({ queryKey: key });
+      }
     },
   });
 }

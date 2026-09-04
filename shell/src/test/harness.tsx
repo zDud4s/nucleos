@@ -19,7 +19,12 @@ import type { Changed, Worktree } from "../data/project-code";
 import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
 import type { ProjectFolder, ProjectRecord } from "../data/projects";
-import type { DeclarableOp, ShellRule, Verdict } from "../data/project-policy";
+import type {
+  DeclarableOp,
+  IntegrationBranch,
+  ShellRule,
+  Verdict,
+} from "../data/project-policy";
 import { foldPrefix } from "../data/project-policy";
 import type { ListingRead, ProjectRepo, ReadOutcome } from "../data/project-github";
 import type { Branches, Commit } from "../data/project-git";
@@ -237,9 +242,28 @@ export interface DaemonState {
   shellRules: ShellRule[];
   githubOps: string[];
   landTargets: string[];
+  /**
+   * Where a landing with no argument goes — the other half of `GET /projects/{id}/land-targets`.
+   *
+   * **Its own field and NOT derived from `branches.integration`**, which is the distinction the
+   * route exists to draw: that one is the branch the main checkout is parked on, and a fake that
+   * answered this from it would reproduce in the test harness the exact confusion the núcleo now
+   * refuses to make. A test that wants them to disagree — a clone sitting on a feature branch while
+   * the project declares `master` — sets both, and that is the case worth having.
+   */
+  landIntegration: IntegrationBranch;
   declarableOps: DeclarableOp[];
-  /** What every declaration route refuses with, or `null` to accept. */
+  /** What every declaration WRITE refuses with, or `null` to accept. */
   policyRefusal: { status: number; code: string; detail: string } | null;
+  /**
+   * What the three declaration READS refuse with, or `null` to answer.
+   *
+   * **Its own field, and its absence is why a bug shipped.** `policyRefusal` covers the writes only,
+   * so nothing here could make a GET fail — and the page's three sections guarded on
+   * `data === undefined`, which with `retry: false` meant a refused read showed the loading line for
+   * ever. A state the fake cannot produce is a state no test can forbid.
+   */
+  policyReadRefusal: { status: number; code: string; detail: string } | null;
   /** Every declaration the shell sent, in order, as it sent it. */
   policyWrites: { path: string; method: string; body: Record<string, unknown> | null }[];
   /**
@@ -347,6 +371,10 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     shellRules: [],
     githubOps: [],
     landTargets: [],
+    // Declared and present, which is the healthy project. `branches.integration` above defaults to
+    // `master` too and that agreement is a coincidence of the fixtures, never a rule — the test
+    // that matters sets them apart.
+    landIntegration: { state: "declared", branch: "master" },
     /*
       A stand-in and not a copy of the real catalogue: that one is derived in `github.rs` by
       intersecting the built operations with two compiled ceilings, and a second spelling of it here
@@ -361,6 +389,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
       { kind: "api_read", half: "action", declarable: false },
     ],
     policyRefusal: null,
+    policyReadRefusal: null,
     policyWrites: [],
     githubRepo: {
       state: "known",
@@ -648,9 +677,16 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
 
       if (method === "GET") {
+        if (state.policyReadRefusal !== null) {
+          const { status, code, detail } = state.policyReadRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
         if (table === "shell-rules") return [...state.shellRules].sort(byPrefix);
         if (table === "github-ops") return [...state.githubOps].sort();
-        return [...state.landTargets].sort();
+        // Two halves, because one route owns both: where a landing goes by default, and the extra
+        // places it may be sent. The default is never in `targets` — it is admissible with no row,
+        // so a fake that listed it would make it look closeable.
+        return { integration: state.landIntegration, targets: [...state.landTargets].sort() };
       }
 
       state.policyWrites.push({ path, method, body });

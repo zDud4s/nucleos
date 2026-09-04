@@ -116,6 +116,9 @@ export function useProjectRepo(projectId: string | null) {
       apiFetch<ProjectRepo>(`/projects/${encodeURIComponent(projectId ?? "")}/github-repo`),
     enabled: projectId !== null && projectId !== "",
     retry: false,
+    // A project's `origin` does not change while somebody reads a page about it, and this spawns
+    // git — the same reading `useDetect` takes about the wizard's three git commands.
+    refetchOnWindowFocus: false,
   });
 }
 
@@ -149,5 +152,11 @@ export function useGithubListing(op: ListingRead, repo: string | null) {
       }),
     enabled: repo !== null && repo !== "",
     retry: false,
+    // **Load-bearing, not tidiness.** TanStack v5 refetches on window focus by default,
+    // `createAppQueryClient` does not turn it off, and `staleTime` is 0 — so without this every
+    // alt-tab back into a tray app spent two `gh` invocations and two GitHub API calls, which is the
+    // polling this module's header says it does not do, wearing a different trigger. The one gesture
+    // that asks again is the button.
+    refetchOnWindowFocus: false,
   });
 }

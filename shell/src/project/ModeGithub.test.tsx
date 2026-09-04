@@ -1,5 +1,6 @@
 // §spec alcada-por-projecto
 import { describe, expect, it, vi } from "vitest";
+import { focusManager } from "@tanstack/react-query";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import {
   DECLARED_ON,
@@ -65,6 +66,58 @@ describe("what runs on its own", () => {
     expect(within(admitted).getByRole("checkbox")).toBeDefined();
   });
 
+  /**
+   * **A row the project's table holds, captioned as though it did not.**
+   *
+   * `GET /projects/{id}/github-ops` serves the table RAW — `try_github_ops` narrows nothing, and the
+   * route says why — while `delete_project_github_op` deliberately carries no declarability check:
+   * *"withdrawing narrows, and an operation stored before the ceilings moved still has to be
+   * removable."* **That sentence was written for this page**, and the page was not honouring it: a
+   * declared operation outside the ceilings drew the same "nothing on this machine can turn it on"
+   * as an undeclared one, with no control at all, so the owner could neither see the row nor remove
+   * it.
+   *
+   * The authority was never wrong — `Policy::for_project` narrows it away, so the operation does not
+   * run. What was wrong is that the page contradicted the table, and offered no way to make them
+   * agree.
+   */
+  it("lets a declaration outside the ceiling be seen and withdrawn", async () => {
+    const state = open({ githubOps: ["api_read"] });
+
+    const row = await screen.findByRole("listitem", { name: "operation api_read" });
+    expect(row.textContent).toContain("declared here");
+    expect(row.textContent).toMatch(/it does not run/i);
+
+    // Still never a checkbox: the ceilings do not admit it, so there is nothing to re-grant.
+    expect(within(row).queryByRole("checkbox")).toBeNull();
+
+    fireEvent.click(within(row).getByRole("button", { name: "withdraw" }));
+    await waitFor(() => expect(state.githubOps).toEqual([]));
+    expect(state.policyWrites[0]).toMatchObject({
+      method: "DELETE",
+      body: { op_kind: "api_read" },
+    });
+  });
+
+  /**
+   * A kind this build no longer has at all vanished from the page entirely.
+   *
+   * Not the same case as an operation outside the ceilings: those are still in the catalogue, with a
+   * half to file them under. These appear in `mine.data` and in neither half — a renamed operation,
+   * one removed between versions — and a page rendering only from the catalogue dropped them
+   * silently. A row nobody can see is a row nobody can remove, and it stays in the table for ever.
+   */
+  it("shows a declaration this build no longer has, with the one gesture that removes it", async () => {
+    const state = open({ githubOps: ["an_op_this_build_no_longer_has"] });
+
+    const row = await screen.findByRole("listitem", {
+      name: "operation an_op_this_build_no_longer_has",
+    });
+    fireEvent.click(within(row).getByRole("button", { name: "withdraw" }));
+
+    await waitFor(() => expect(state.githubOps).toEqual([]));
+  });
+
   it("ticks the operations this project has declared, and only those", async () => {
     open({ githubOps: ["run_list"] });
 
@@ -101,7 +154,17 @@ describe("what runs on its own", () => {
     const actions = await screen.findByText(/recorded and inert/i);
     expect(actions.textContent).toContain("later step");
 
-    expect(screen.getByText(/consulted at the next decision/i)).toBeDefined();
+    /*
+      And the reads half says the same kind of true thing, which unqualified it did not.
+      `GithubRuntime::policy_for_project` returns `Policy::empty()` outright when the pillar is off —
+      pinned by `a_switched_off_pillar_stays_off_whatever_the_project_declared` — and
+      `post_project_github_op` has no `enabled` check, so a declaration can be made on a machine
+      where nothing will ever consult it. "Consulted at the next decision" was unconditional and the
+      núcleo makes no such promise.
+    */
+    const reads = screen.getByText(/consulted at the next decision/i);
+    expect(reads.textContent).toMatch(/only while the GitHub pillar is on/i);
+    expect(reads.textContent).toContain(".ai/github.yaml");
   });
 });
 
@@ -328,6 +391,71 @@ describe("where the work lands", () => {
 
     await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
   });
+
+  /**
+   * **The branch a landing goes to, not the one the checkout is standing on.**
+   *
+   * This is the defect `land.rs` exists to abolish, reappearing in the page that reports on it. The
+   * panel used to fill this line from `GET /projects/{id}/branches` —
+   * `inspect::Branches::integration`, which is `current_branch(project_root)`, and whose own doc in
+   * the núcleo says the 2026-08-27 design killed that read *"precisely because a checkout parked on
+   * the wrong branch silently redirected every landing"*.
+   *
+   * The case is ordinary: any project whose main clone the owner has checked out onto a feature
+   * branch. Both sentences on the panel were then false in both directions — the branch named is
+   * refused by name (`parked is not among the landing targets recorded for alpha`), and the branch
+   * that IS admissible appeared nowhere.
+   *
+   * So the fixture makes the two disagree on purpose, and the assertion is a pair: the declared
+   * branch is there AND the parked one is absent. Asserting only the first would pass on a panel
+   * that showed both.
+   */
+  it("names the declared integration branch, not the branch the checkout is parked on", async () => {
+    open({
+      branches: { integration: "parked", branches: [], omitted: 0 },
+      landIntegration: { state: "declared", branch: "master" },
+    });
+
+    const always = await screen.findByRole("listitem", {
+      name: "land target the integration branch",
+    });
+    expect(always.textContent).toContain("master");
+    expect(always.textContent).toContain("always admissible");
+    expect(always.textContent).not.toContain("parked");
+  });
+
+  /**
+   * The three arms where a branch name on screen would be a claim the núcleo refuses.
+   *
+   * *"Until the value is real the caption must not assert admissibility."* A declared branch whose
+   * ref is gone, a default nothing has written down yet, and a project with nothing to derive from
+   * are three different sentences — and the first two still name a branch, which is precisely why
+   * they cannot borrow the caption the first arm gets.
+   */
+  it.each([
+    [
+      { state: "stale", branch: "gone" } as const,
+      /nothing lands by default until it is corrected/i,
+      "gone",
+    ],
+    [
+      { state: "derived", branch: "master" } as const,
+      /has not been written down yet/i,
+      "master",
+    ],
+    [{ state: "unknown", why: "alpha has no folder on this machine" } as const, /no folder/i, null],
+  ])("says why a landing has no admissible default when it is %s", async (arm, sentence, named) => {
+    open({ landIntegration: arm });
+
+    const always = await screen.findByRole("listitem", {
+      name: "land target the integration branch",
+    });
+    expect(always.textContent).toMatch(sentence);
+    // The claim that must not be borrowed. A branch is named in two of these three and captioned
+    // admissible in none of them.
+    expect(always.textContent).not.toContain("always admissible");
+    if (named !== null) expect(always.textContent).toContain(named);
+  });
 });
 
 describe("the remote", () => {
@@ -480,13 +608,17 @@ describe("the remote", () => {
   });
 
   /**
-   * A refusal this page has written no advice for still says what the daemon said.
+   * A refusal this page has written no advice for still says **what the daemon said**.
    *
-   * The floor under every other case. `RefusalNote` never renders "request failed" — page copy, then
-   * the shared floor, then the daemon's prose — and a status this section has no advice for must
-   * fall through to that rather than to nothing.
+   * **An alternation here was the bug hiding the bug.** This assertion used to accept either the
+   * daemon's sentence or the shared floor's, so it passed while the page was showing the floor —
+   * `RefusalNote` resolves page copy → floor → daemon prose, so handing it an empty map does not
+   * fall through to the daemon, it falls through to the FLOOR, which is vaguer by construction. A
+   * test that tolerates both outcomes of the thing it is testing is not a test.
+   *
+   * So the daemon's words are required, and the floor's are refused by name.
    */
-  it("explains a refusal it has no advice for", async () => {
+  it("keeps the daemon's own sentence when it has no advice to add", async () => {
     open({
       githubReadRefusal: {
         status: 500,
@@ -496,7 +628,8 @@ describe("the remote", () => {
     });
 
     const section = await remote();
-    expect(section.textContent).toMatch(/did not finish|error of its own/i);
+    expect(section.textContent).toContain("the github task did not finish");
+    expect(section.textContent).not.toContain("error of its own handling this");
   });
 
   /**
@@ -569,6 +702,85 @@ describe("the remote", () => {
 });
 
 describe("the page as a whole", () => {
+  /**
+   * **§5.1's rule applied to the three sections that actually decide authority.**
+   *
+   * *«um painel vazio é indistinguível de um repositório sem PRs»* — and a guard written as
+   * `data === undefined` cannot tell "still loading" from "refused". With `retry: false` (the house
+   * default, argued for at every one of these hooks) the loading line was therefore permanent:
+   * three sections that govern what an autonomous run may do sat reading *"Reading this project's
+   * rules…"* for ever, with nothing on screen admitting anything had gone wrong.
+   *
+   * `try_github_ops` and `try_land_targets` were given a `Result` rather than swallowing to an empty
+   * list precisely so this could be said out loud, and the page was discarding it.
+   *
+   * Asserted as the ABSENCE of the loading line and the presence of a refusal, because a section
+   * that added an explanation *below* a permanent "Reading…" would still be lying about the state.
+   */
+  it("says the three governing sections could not be read, rather than reading for ever", async () => {
+    // The three declaration READS refuse. The catalogue is machine-wide and answers regardless,
+    // which is what makes `mine` the failing half in section 2 — the exact split the page has to
+    // get right, since it can draw neither list without both.
+    open({ policyReadRefusal: { status: 500, code: "internal", detail: "" } });
+
+    for (const label of [
+      "What runs on its own",
+      "What the worktrees may run",
+      "Where the work lands",
+    ]) {
+      const section = await screen.findByRole("region", { name: label });
+      await waitFor(() => expect(section.textContent ?? "").not.toMatch(/Reading/i));
+      expect(section.querySelector(".ui-note-refusal")).not.toBeNull();
+    }
+  });
+
+  /**
+   * Alt-tabbing back into the tray must not spend a pair of GitHub API calls.
+   *
+   * TanStack v5 refetches on window focus by default, `createAppQueryClient` does not turn it off,
+   * and `staleTime` is 0 — so the section that documents itself as *"asked once, never polled"* was
+   * running `gh` twice and `git` once on every focus event. That is polling with a different
+   * trigger, and it contradicts the page's own claim that the button is the only gesture here.
+   */
+  /**
+   * Ticking a checkbox must not re-spawn `git` for a fact no declaration can change.
+   *
+   * The declaration writes used to invalidate the `keys.projects.all` PREFIX, which was right while
+   * the three lists were the only things under it. `keys.projects.githubRepo` is under it now, and
+   * that read runs `git remote get-url` against the project root — so every grant and every
+   * withdrawal cost a subprocess to re-answer which repository the project is.
+   */
+  it("does not re-read the repository when a declaration is written", async () => {
+    open();
+
+    const repoReads = () =>
+      daemon.apiFetch.mock.calls.filter(([path]) => String(path).endsWith("/github-repo")).length;
+    await waitFor(() => expect(repoReads()).toBeGreaterThan(0));
+    const before = repoReads();
+
+    const row = await screen.findByRole("listitem", { name: "operation pr_list" });
+    fireEvent.click(within(row).getByRole("checkbox"));
+    await waitFor(() => expect(screen.getByRole("listitem", { name: "operation pr_list" })).toBeDefined());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(repoReads()).toBe(before);
+  });
+
+  it("does not re-run gh when the window is focused again", async () => {
+    const state = open();
+
+    await waitFor(() => expect(state.githubReads).toHaveLength(2));
+
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+
+    // A refetch would be scheduled synchronously on focus and settle on the next tick; giving it
+    // several is what makes the absence meaningful rather than a race the test happened to win.
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(state.githubReads).toHaveLength(2);
+  });
+
   /**
    * These are a live autonomy control and not a configuration edit.
    *

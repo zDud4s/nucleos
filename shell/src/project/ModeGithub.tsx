@@ -2,7 +2,6 @@
 import { useState } from "react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
-import { useProjectBranches } from "../data/project-git";
 import {
   useGithubListing,
   useProjectRepo,
@@ -331,7 +330,14 @@ function ListingBody({ read }: { read: UseQueryResult<ReadOutcome> }) {
 function sentencesFor(refusal: ApiRefusal): Record<string, string> {
   const said = refusal.detail.trim();
   const advice = ADVICE[refusal.status];
-  return advice === undefined ? {} : { [refusal.code]: said === "" ? advice : `${said} — ${advice}` };
+  // **An empty map would have thrown the daemon's sentence away, which is the opposite of the
+  // intent.** `RefusalNote` falls back page copy → shared floor → daemon prose, so returning nothing
+  // for a status with no advice hands the sentence to the FLOOR, not to the daemon: a 500 read "the
+  // núcleo hit an error of its own handling this" in place of "the github task did not finish". The
+  // daemon's words are always at least as good, so they are always passed on; the advice, when there
+  // is any, is added to them.
+  if (said === "") return advice === undefined ? {} : { [refusal.code]: advice };
+  return { [refusal.code]: advice === undefined ? said : `${said} — ${advice}` };
 }
 
 const ADVICE: Record<number, string> = {
@@ -339,6 +345,39 @@ const ADVICE: Record<number, string> = {
   503: "either the pillar is switched off in .ai/github.yaml or gh is not installed where the daemon can find it; the sentence above says which, and both are fixed and then the daemon restarted",
   504: "GitHub or the network took longer than the núcleo waits; nothing is wrong here that asking again will not settle",
 };
+
+/**
+ * A section whose own read refused, saying so instead of waiting for ever.
+ *
+ * **§5.1's rule applied to the three sections below it, which is where it was missing.** *«um painel
+ * vazio é indistinguível de um repositório sem PRs»* — and a guard written as `data === undefined`
+ * cannot tell "still loading" from "refused", so with `retry: false` (the house default, and argued
+ * for at every one of these hooks) the loading line was permanent. Three sections that decide what
+ * an autonomous run may do sat reading *"Reading this project's rules…"* for ever, which is the same
+ * failure the first section is built to avoid, in the panels where it costs most.
+ *
+ * `try_github_ops` and `try_land_targets` exist so this can be said: both were given a `Result`
+ * rather than swallowing to an empty list, on the argument that to a display `[]` is a positive
+ * claim that nothing is declared. A page that then discarded the error threw away the distinction
+ * they were built for.
+ *
+ * The refusal's own words are shown. These routes refuse with a bare 500 and no body, so
+ * `RefusalNote`'s floor supplies the sentence — which for an unnamed internal error is the true one.
+ */
+function ReadFailed({ read, says }: { read: UseQueryResult<unknown>; says: string }) {
+  if (isApiRefusal(read.error)) {
+    return <RefusalNote refusal={read.error} sentences={{ not_found: NO_SUCH_PROJECT }} />;
+  }
+  return (
+    <Quiet says={`the núcleo did not answer ${says}`}>
+      The daemon is reachable or this window would be showing nothing at all, so this is the one read
+      failing rather than the connection. Nothing here is lost — the tables are the núcleo's, and it
+      is still enforcing them; this is only the picture of them. Reopening the page asks again.
+    </Quiet>
+  );
+}
+
+const NO_SUCH_PROJECT = "the núcleo has no project by this name.";
 
 /* ------------------------------------------------ 2. what runs on its own -- */
 
@@ -369,14 +408,29 @@ function AutonomousOps({ projectId }: { projectId: string }) {
     (declare.isError && isApiRefusal(declare.error) ? declare.error : null) ??
     (forget.isError && isApiRefusal(forget.error) ? forget.error : null);
 
-  if (catalogue.data === undefined || mine.data === undefined) {
+  if (catalogue.isPending || mine.isPending) {
     return <p className="text-sm text-text-faint">Reading what this project may do…</p>;
+  }
+
+  if (catalogue.data === undefined || mine.data === undefined) {
+    // Whichever of the two refused. The catalogue first, because a page that cannot say what MAY be
+    // declared cannot draw this section at all, while a missing `mine` only costs the ticks.
+    return (
+      <ReadFailed
+        read={catalogue.data === undefined ? catalogue : mine}
+        says="what this project may do on its own"
+      />
+    );
   }
 
   const declared = new Set(mine.data);
   const reads = catalogue.data.filter((op) => op.half === "read");
   const actions = catalogue.data.filter((op) => op.half === "action");
   const pending = declare.isPending || forget.isPending;
+  // Declared kinds this build has no operation for. `try_github_ops` serves the table RAW — no
+  // narrowing, deliberately — so these arrive, and rendering only from the catalogue dropped them.
+  const built = new Set(catalogue.data.map((op) => op.kind));
+  const stranded = mine.data.filter((kind) => !built.has(kind)).sort();
 
   function toggle(kind: string, on: boolean) {
     if (on) declare.mutate({ projectId, opKind: kind });
@@ -387,7 +441,17 @@ function AutonomousOps({ projectId }: { projectId: string }) {
     <div className="flex flex-col gap-4">
       <OpHalf
         title="Reads"
-        says="A read declared here is consulted at the next decision: the classifier already asks this list when an agent writes gh in the Bash tool."
+        /*
+          Qualified, because unqualified it was an overstatement on a page whose subject is who
+          decides. `GithubRuntime::policy_for_project` returns `Policy::empty()` outright when the
+          pillar is off — pinned by `a_switched_off_pillar_stays_off_whatever_the_project_declared` —
+          and `post_project_github_op` has no `enabled` check, so an owner can declare reads on a
+          machine where nothing will ever consult them. It errs safe, and it is still a promise the
+          núcleo has not made. The condition is named rather than a fourth read added to this page
+          for one sentence; section 1 already reports the pillar's state the moment anything is asked
+          of it.
+        */
+        says="A read declared here is consulted at the next decision: the classifier already asks this list when an agent writes gh in the Bash tool. It binds only while the GitHub pillar is on — with enabled: false in .ai/github.yaml the núcleo uses an empty policy whatever a project has declared, and nothing on this page overrides that."
         ops={reads}
         declared={declared}
         pending={pending}
@@ -401,6 +465,51 @@ function AutonomousOps({ projectId }: { projectId: string }) {
         pending={pending}
         onToggle={toggle}
       />
+
+      {stranded.length === 0 ? null : (
+        /*
+          Rows this build has no operation for at all.
+
+          Not the same case as an operation outside the ceilings: those are still in the catalogue,
+          with a `half` to file them under and a name this daemon knows. These are names the binary
+          no longer builds — a renamed operation, one removed between versions — so they appear in
+          `mine.data` and in neither half, and the old rendering dropped them silently. A row the
+          owner cannot see is a row they cannot remove, and it stays in the table for ever.
+
+          `delete_project_github_op` takes any kind, which is what makes this block possible: its own
+          doc says withdrawing narrows and an operation stored before the ceilings moved still has to
+          be removable.
+        */
+        <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+          <p className="text-xs uppercase tracking-wide text-text-faint">No longer built</p>
+          <p className="max-w-3xl text-xs text-text-muted">
+            This project's table names operations this daemon does not build. They decide nothing —
+            the núcleo narrows them away before it grants anything — and the rows are still yours to
+            remove.
+          </p>
+          <ul className="flex flex-col gap-1">
+            {stranded.map((kind) => (
+              <li
+                key={kind}
+                aria-label={`operation ${kind}`}
+                className="flex flex-wrap items-baseline gap-2 text-sm"
+              >
+                <span className="rounded-pill border border-border bg-surface-sunken px-2 py-0.5 font-mono text-xs text-text-muted">
+                  {kind}
+                </span>
+                <button
+                  type="button"
+                  disabled={pending}
+                  onClick={() => toggle(kind, false)}
+                  className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
+                >
+                  withdraw
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {refused !== null ? (
         /*
@@ -464,7 +573,7 @@ function OpHalf({
               ) : (
                 <>
                   {/*
-                    A `span` and never a control — the `Settings` chip's argument, applied to an
+                    A `span` and never a checkbox — the `Settings` chip's argument, applied to an
                     operation instead of to a class. The compiled ceilings do not admit this one, so
                     there is nothing for a box to be wired to, and a box that refused would be a lie
                     about who decides.
@@ -473,8 +582,27 @@ function OpHalf({
                     {op.kind}
                   </span>
                   <span className="text-xs text-text-faint">
-                    outside the compiled ceiling — nothing on this machine can turn it on
+                    {declared.has(op.kind) ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}
                   </span>
+                  {/*
+                    The one legal gesture, and only when there is a row to remove.
+                    `delete_project_github_op` has no declarability check, and says why: *"withdrawing
+                    narrows, and an operation stored before the ceilings moved still has to be
+                    removable"*. `GET .../github-ops` serves the raw table for the same reason, so a
+                    row outside the ceilings arrives here on purpose. Drawing it with no control at
+                    all left the owner holding a row they could see was there and could not remove —
+                    and, worse, captioned as though nothing were stored.
+                  */}
+                  {declared.has(op.kind) ? (
+                    <button
+                      type="button"
+                      disabled={pending}
+                      onClick={() => onToggle(op.kind, false)}
+                      className="ml-auto text-xs text-text-faint underline-offset-2 hover:underline disabled:opacity-40"
+                    >
+                      withdraw
+                    </button>
+                  ) : null}
                 </>
               )}
             </li>
@@ -484,6 +612,18 @@ function OpHalf({
     </div>
   );
 }
+
+const OUTSIDE_THE_CEILING = "outside the compiled ceiling — nothing on this machine can turn it on";
+
+/**
+ * The row that used to be a contradiction: stored, and captioned as though it were not.
+ *
+ * `Policy::for_project` narrows it away, so the AUTHORITY is right and this operation does not run —
+ * but the row is in the project's table, the owner cannot see that from the old caption, and the
+ * withdraw is the only thing that makes the table agree with the page again.
+ */
+const OUTSIDE_AND_DECLARED =
+  "declared here, and outside the compiled ceiling — it does not run, and the row is still yours to withdraw";
 
 /* -------------------------------------- 3. what the worktrees may run -- */
 
@@ -508,8 +648,12 @@ function ShellRules({ projectId }: { projectId: string }) {
     (declare.isError && isApiRefusal(declare.error) ? declare.error : null) ??
     (forget.isError && isApiRefusal(forget.error) ? forget.error : null);
 
-  if (rules.data === undefined) {
+  if (rules.isPending) {
     return <p className="text-sm text-text-faint">Reading this project's rules…</p>;
+  }
+
+  if (rules.data === undefined) {
+    return <ReadFailed read={rules} says="what this project's worktrees may run" />;
   }
 
   const rows = rules.data;
@@ -836,10 +980,18 @@ function DeclareRule({
  * branch is often made by the very run that will land into it; whether it exists is
  * `land::resolve_target`'s question, asked at the moment of landing, where the refusal has somebody
  * to tell. What the route checks here is the NAME.
+ *
+ * **The default comes from the route that owns landings, and never from the checkout's HEAD.** This
+ * panel used to read `GET /projects/{id}/branches` for it — `inspect::Branches::integration`, which
+ * is `current_branch(project_root)` — and that field's own doc in the núcleo says the 2026-08-27
+ * design killed that read *"precisely because a checkout parked on the wrong branch silently
+ * redirected every landing"*. Any project whose main clone is checked out onto a feature branch made
+ * both sentences here false in both directions: the branch shown was refused by name, and the branch
+ * that is admissible appeared nowhere. It is the defect `land.rs` exists to abolish, and a page is
+ * not a safe place to reintroduce it.
  */
 function LandTargets({ projectId }: { projectId: string }) {
-  const branches = useProjectBranches(projectId);
-  const targets = useProjectLandTargets(projectId);
+  const landing = useProjectLandTargets(projectId);
   const open = useDeclareLandTarget();
   const close = useForgetLandTarget();
   const [branch, setBranch] = useState("");
@@ -848,11 +1000,15 @@ function LandTargets({ projectId }: { projectId: string }) {
     (open.isError && isApiRefusal(open.error) ? open.error : null) ??
     (close.isError && isApiRefusal(close.error) ? close.error : null);
 
-  if (targets.data === undefined) {
+  if (landing.isPending) {
     return <p className="text-sm text-text-faint">Reading where this project lands…</p>;
   }
 
-  const integration = branches.data?.integration ?? null;
+  if (landing.data === undefined) {
+    return <ReadFailed read={landing} says="where this project's work lands" />;
+  }
+
+  const { integration, targets } = landing.data;
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
@@ -867,26 +1023,22 @@ function LandTargets({ projectId }: { projectId: string }) {
           aria-label="land target the integration branch"
           className="flex flex-wrap items-baseline gap-2 text-sm"
         >
-          {integration === null ? (
-            <span className="text-xs text-text-faint">
-              {branches.data === undefined
-                ? "reading the integration branch…"
-                : "this project is on a detached HEAD, so the daemon has no integration branch to name"}
-            </span>
+          {integration.state === "unknown" ? (
+            <span className="text-xs text-text-faint">{integration.why}</span>
           ) : (
             <>
-              <span className="font-mono text-xs text-text">{integration}</span>
+              <span className="font-mono text-xs text-text">{integration.branch}</span>
               {/*
-                A fact and not a row: the integration branch needs no entry in the table to stay
-                admissible, so there is nothing here to close and no button is offered.
+                Only the `declared` arm gets the claim. A fact and not a row: the integration branch
+                needs no entry in the table to stay admissible, so there is nothing to close and no
+                button is offered — and in the other two arms nothing lands by default at all, so
+                borrowing the caption would assert exactly what the núcleo would refuse.
               */}
-              <span className="text-xs text-text-faint">
-                the integration branch — always admissible, with or without a row
-              </span>
+              <span className="text-xs text-text-faint">{CAPTION[integration.state]}</span>
             </>
           )}
         </li>
-        {targets.data.map((target) => (
+        {targets.map((target) => (
           <li
             key={target}
             aria-label={`land target ${target}`}
@@ -936,6 +1088,23 @@ function LandTargets({ projectId }: { projectId: string }) {
     </div>
   );
 }
+
+/**
+ * What each arm of the default means, in the one line beside the branch name.
+ *
+ * **Only `declared` gets the claim, and that is the point of having three.** A branch name reads as
+ * equally admissible in all three, so the caption is the only thing on screen that separates *this
+ * is where work goes* from *this is what is recorded and it does not resolve* and *this is what
+ * would be derived if anything landed*. `unknown` has no entry because it names no branch — it
+ * renders the daemon's own sentence instead.
+ */
+const CAPTION: Record<"declared" | "stale" | "derived", string> = {
+  declared: "the integration branch — always admissible, with or without a row",
+  stale:
+    "declared as the integration branch, and git cannot find that ref — nothing lands by default until it is corrected",
+  derived:
+    "where a landing would go, derived from the repository. It has not been written down yet, so the first landing records it",
+};
 
 const TARGET_SENTENCES: Record<string, string> = {
   no_such_project: "the núcleo has no project by this name.",
