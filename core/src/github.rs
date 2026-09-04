@@ -842,6 +842,156 @@ impl Repo {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// PURE: the repository a git remote URL names, when the remote is one of GitHub's.
+    ///
+    /// **The single spelling of this translation, and that is the whole reason it is a function.**
+    /// `GET /projects/detect` already reads a folder's `origin` and reports the URL verbatim; this
+    /// is the step after it, and a second copy of it somewhere else is how the wizard and this route
+    /// would come to disagree about which repository a project is — a disagreement neither side
+    /// could see, because both would be reporting a plausible `owner/name`.
+    ///
+    /// `None` for every remote this cannot read, and the caller must not flatten that into an
+    /// error: a project on GitLab, a remote that is a folder on a disk, and a `github.com` URL that
+    /// names no repository are all ordinary things for a project to have. What they have in common
+    /// is that `gh` has nothing to be pointed at, which is the only fact this answers.
+    ///
+    /// **`github.com` and nothing else.** An Enterprise host is a real deployment and it is not this
+    /// one: `gh` here is the daemon's, configured for the public host, so admitting
+    /// `github.example.com` would produce a repository the CLI would then fail to reach with a
+    /// message about a host nobody named. Narrow and said out loud beats wide and wrong.
+    pub fn from_remote_url(url: &str) -> Option<Self> {
+        const GITHUB_HOST: &str = "github.com";
+
+        let url = url.trim();
+        let (authority, path) = match url.split_once("://") {
+            // `https://github.com/owner/name.git`, `ssh://git@github.com/owner/name`.
+            Some((_, rest)) => rest.split_once('/')?,
+            // The scp-like spelling git writes for `git@github.com:owner/name.git`: no scheme, and
+            // the path hangs off a colon rather than a slash. Split before any `@` is stripped, so
+            // that a path containing one cannot be mistaken for userinfo.
+            None => url.split_once(':')?,
+        };
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let host = host.split_once(':').map_or(host, |(host, _)| host);
+        if !host.eq_ignore_ascii_case(GITHUB_HOST) {
+            return None;
+        }
+
+        let path = path.trim_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        // Still `Repo::new` that decides, exactly as everywhere else in this module: this function
+        // finds the candidate, and the type is what admits it. A remote whose path is `owner` or
+        // `owner/name/extra` is refused here for the same reason a caller naming one would be.
+        Repo::new(path).ok()
+    }
+}
+
+/// Which repository a registered project's `origin` points at, or why there is no answer.
+///
+/// **Every arm but the first is an ordinary state and none of them is an error**, which is why this
+/// is a value and not a `Result`. A typed read carries a `Repo`, and until this landed nothing in
+/// the daemon could produce one for a project — so a page asking "what is happening on this
+/// project's remote" had to either guess or say nothing. The arms are separate because the sentence
+/// a person needs is different in each: a project switched `off` has had its root cleared and wants
+/// a mode change, a root that is gone wants a folder, a repository with no `origin` wants a remote
+/// added, and a project on GitLab wants nothing at all — it is simply not a question this app
+/// answers, and saying so is the honest end of it.
+///
+/// It is `map_orphan::Orphan`'s discipline applied to a smaller question: *I looked and there is
+/// none* and *I could not look* must never arrive as the same word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProjectRepo {
+    /// `origin` is a GitHub repository, and this is it.
+    ///
+    /// Carries the URL as well as the slug because they are two different facts and the page shows
+    /// both: the slug is what a read is sent, and the URL is what somebody checks it against when
+    /// the slug is not the repository they expected.
+    Known { repo: Repo, remote: String },
+    /// The project is on the roster with no folder named.
+    ///
+    /// The state a project in `off` mode is in — `set_project_mode` clears the root — so this is not
+    /// a broken row, it is the ordinary shape of a project nobody is running.
+    NoRoot,
+    /// A folder is named and it is not there.
+    ///
+    /// Distinct from [`ProjectRepo::NoRoot`] for the reason `map_orphan` keeps `Unreadable` apart
+    /// from `NoRepository`: the advice differs completely. One asks somebody to point the project
+    /// somewhere; the other says the place it points has moved or been deleted.
+    RootMissing { root: String },
+    /// The folder is there and git does not keep anything in it.
+    ///
+    /// `set_project_mode` only insists on a repository for `active`, so a registered project that is
+    /// not a checkout is a state this daemon deliberately allows.
+    NotARepository { root: String },
+    /// A repository with no `origin`.
+    ///
+    /// A local-only project is a project — `origin_and_head` says so about the folder a wizard is
+    /// looking at, and it stays true of one already on the roster.
+    NoRemote { root: String },
+    /// There is an `origin` and it is not a GitHub repository.
+    ///
+    /// Carries the URL, because the whole content of this answer is *this is where your project
+    /// points and it is not somewhere `gh` can be sent*, and that sentence is unreadable without it.
+    NotGithub { remote: String },
+}
+
+/// Which repository a project's `origin` points at.
+///
+/// **The one production path from a project id to a `Repo`.** `vcs::resolve_repo` answers the
+/// neighbouring question — which lock on this machine a project shares — and returns a folder; this
+/// answers which repository on GitHub it is, and the two must not be confused for each other.
+///
+/// The remote is read with [`crate::git_exec::origin_and_head`], which is the reader
+/// `GET /projects/detect` already uses. Its `head` is thrown away here and that is deliberate: one
+/// reader of `origin` in this daemon rather than two, and the cost of the second local `git log` is
+/// smaller than the cost of the two readers eventually disagreeing.
+///
+/// `Ok(None)` is a project the roster has never heard of, and `Err` is the database failing.
+/// Everything else the filesystem or git can say is an arm of [`ProjectRepo`].
+pub async fn project_repo(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<ProjectRepo>, sqlx::Error> {
+    // Asked separately from the root, because `project_root` cannot tell a project that has no
+    // folder from one the roster does not hold — both are `None` — and those are a 200 and a 404.
+    let known: Option<String> =
+        sqlx::query_scalar("SELECT project_id FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
+    if known.is_none() {
+        return Ok(None);
+    }
+
+    let Some(root) = crate::inspect::project_root(pool, project_id).await? else {
+        return Ok(Some(ProjectRepo::NoRoot));
+    };
+
+    let path = std::path::PathBuf::from(&root);
+    if !path.is_dir() {
+        return Ok(Some(ProjectRepo::RootMissing { root }));
+    }
+    // `.exists()` and not `.is_dir()`: in a linked worktree `.git` is a FILE pointing at the real
+    // one, and a check that insisted on a directory would report every worktree as not a
+    // repository. `detect::inspect_folder` decides `is_git` the same way.
+    if !path.join(".git").exists() {
+        return Ok(Some(ProjectRepo::NotARepository { root }));
+    }
+
+    let (remote, _head) = crate::git_exec::origin_and_head(&path, deadline).await;
+    let Some(remote) = remote else {
+        return Ok(Some(ProjectRepo::NoRemote { root }));
+    };
+
+    Ok(Some(match Repo::from_remote_url(&remote) {
+        Some(repo) => ProjectRepo::Known { repo, remote },
+        None => ProjectRepo::NotGithub { remote },
+    }))
 }
 
 /// A branch name this module is willing to put on a `gh` command line.
@@ -2871,6 +3021,69 @@ mod tests {
         assert!(WorkflowName::new("CI Build").is_ok());
         assert!(Body::new("a body\nwith lines").is_ok());
         assert!(Body::new("a body with a \u{1b} in it").is_err());
+    }
+
+    /// Every spelling git writes for a GitHub `origin` reaches the same `owner/name`.
+    ///
+    /// Written as a table because the spellings are the whole content of the function: `git clone`
+    /// over HTTPS, the scp-like form `git@github.com:owner/name.git` that an SSH clone leaves
+    /// behind, the explicit `ssh://` form, and each of those with and without the `.git` suffix a
+    /// trailing slash. A parser that handled three of the four would send `pr_list` at the wrong
+    /// repository for a fourth of this house's checkouts and no error would say so.
+    #[test]
+    fn every_spelling_of_a_github_remote_names_the_same_repository() {
+        for url in [
+            "https://github.com/owner/name.git",
+            "https://github.com/owner/name",
+            "https://github.com/owner/name/",
+            "https://user@github.com/owner/name.git",
+            "git@github.com:owner/name.git",
+            "git@github.com:owner/name",
+            "ssh://git@github.com/owner/name.git",
+            "git://github.com/owner/name.git",
+            "  https://github.com/owner/name.git  ",
+            // The host is a name and not a case, which is what `eq_ignore_ascii_case` is for.
+            "https://GitHub.com/owner/name.git",
+        ] {
+            assert_eq!(
+                Repo::from_remote_url(url).map(|repo| repo.as_str().to_owned()),
+                Some("owner/name".to_owned()),
+                "{url} names owner/name"
+            );
+        }
+    }
+
+    /// A remote this cannot read is `None`, and the list is the reason the caller may not turn that
+    /// into an error.
+    ///
+    /// Each of these is an ordinary thing for a project to have. What the caller does with `None` is
+    /// say which repository it is NOT — `ProjectRepo::NotGithub` carries the URL for exactly that —
+    /// and a function that refused instead would make a project on GitLab look broken.
+    #[test]
+    fn a_remote_that_is_not_a_github_repository_names_nothing() {
+        for url in [
+            "https://gitlab.com/owner/name.git",
+            "git@gitlab.com:owner/name.git",
+            // An Enterprise host is a real deployment and it is not the one this `gh` is pointed at.
+            "https://github.example.com/owner/name.git",
+            "https://notgithub.com/owner/name.git",
+            // A local remote — a folder, or a Windows drive letter that a naive `:` split would read
+            // as a host.
+            "C:/Projects/nucleos",
+            "/srv/git/name.git",
+            // GitHub, naming no repository or naming too much of one. `Repo::new` decides, here as
+            // everywhere.
+            "https://github.com/owner",
+            "https://github.com/owner/name/tree/master",
+            "https://github.com",
+            "",
+        ] {
+            assert_eq!(
+                Repo::from_remote_url(url),
+                None,
+                "{url} names no repository"
+            );
+        }
     }
 
     /// The validating `Deserialize` is what covers the raw route, and this is the case that proves

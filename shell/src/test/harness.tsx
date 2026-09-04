@@ -21,6 +21,7 @@ import type { Claim } from "../data/project-config";
 import type { ProjectFolder, ProjectRecord } from "../data/projects";
 import type { DeclarableOp, ShellRule, Verdict } from "../data/project-policy";
 import { foldPrefix } from "../data/project-policy";
+import type { ListingRead, ProjectRepo, ReadOutcome } from "../data/project-github";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
@@ -241,6 +242,39 @@ export interface DaemonState {
   policyRefusal: { status: number; code: string; detail: string } | null;
   /** Every declaration the shell sent, in order, as it sent it. */
   policyWrites: { path: string; method: string; body: Record<string, unknown> | null }[];
+  /**
+   * Which repository on GitHub this project is — `GET /projects/{id}/github-repo`.
+   *
+   * The whole union and not a string, because five of its six arms are the reasons a project has no
+   * repository and each one is a different sentence on the page. `null` is the sixth answer, which
+   * is the only refusal this route makes: a project the roster has never heard of.
+   *
+   * The default is the ordinary case, a project pointed at a GitHub repository, because every
+   * assertion about the two listings below needs one before it can begin.
+   */
+  githubRepo: ProjectRepo | null;
+  /**
+   * What `gh` said, per listing operation — `POST /github/requests`.
+   *
+   * Keyed by the operation, because the page asks two and shows them separately, and a fake that
+   * answered both with one payload could not tell a test which panel it was looking at.
+   *
+   * The defaults are a listing each, because that is the state the section exists for. `exit_code`
+   * is on the row rather than assumed: a non-zero exit arrives as a 200 from this route — `gh` ran
+   * and GitHub said no — and the page draws that differently from a refusal, so it has to be
+   * reachable without one.
+   */
+  githubListings: Record<ListingRead, ReadOutcome>;
+  /**
+   * What `POST /github/requests` refuses with, or `null` to answer.
+   *
+   * The half of this route worth testing hardest. §5.1 asks for no token and no `gh` to be
+   * *explained and not blank*, and those are a 403 and a 503 that only a fake can produce — no
+   * arrangement of the other fields reaches them.
+   */
+  githubReadRefusal: { status: number; code: string; detail: string } | null;
+  /** Every read the shell sent, in order, as the operation it named. */
+  githubReads: { op: string; repo: string }[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -328,6 +362,40 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     ],
     policyRefusal: null,
     policyWrites: [],
+    githubRepo: {
+      state: "known",
+      repo: "duarte/nucleos",
+      remote: "git@github.com:duarte/nucleos.git",
+    },
+    githubListings: {
+      pr_list: readOutcome("pr_list", "#41\tthe queue lands\tfeat/land\tabout 2 hours ago"),
+      run_list: readOutcome("run_list", "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s"),
+    },
+    githubReadRefusal: null,
+    githubReads: [],
+    ...overrides,
+  };
+}
+
+/**
+ * One `gh` invocation's answer, with the fields a test does not care about filled in.
+ *
+ * `stdout` is a tab-separated line because that is what `gh pr list` actually prints — the typed
+ * reads refuse `--json`, so the daemon hands back the CLI's own table and the page renders it. A
+ * fixture shaped like JSON would be testing a wire shape this route cannot produce.
+ */
+export function readOutcome(
+  operation: string,
+  stdout: string,
+  overrides: Partial<ReadOutcome> = {},
+): ReadOutcome {
+  return {
+    status: "ran",
+    operation,
+    exit_code: 0,
+    stdout,
+    // stdout then stderr, which for a successful listing is just stdout again.
+    output_tail: stdout,
     ...overrides,
   };
 }
@@ -635,6 +703,27 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     }
 
     if (init?.method === "POST") {
+      /*
+        The one door both GitHub tools come through, first inside this block because it is the only
+        POST here that is a READ — everything below records a write, and a listing that fell into
+        one of those would be recorded as a change the shell never made.
+
+        Recorded and answered rather than applied to state: nothing on this machine changes when
+        `gh pr list` runs, so there is no row for a refetch to read back. What a test asserts is
+        WHICH operation was sent and against which repository, because that is the mapping this
+        section exists to prove — the repository must be the one the daemon named and never one the
+        page worked out for itself.
+      */
+      if (path === "/github/requests" && typeof init.body === "string") {
+        const sent = JSON.parse(init.body) as { op: { op: ListingRead; repo: string } };
+        state.githubReads.push({ op: sent.op.op, repo: sent.op.repo });
+        if (state.githubReadRefusal !== null) {
+          const { status, code, detail } = state.githubReadRefusal;
+          throw new ApiRefusal(status, code, detail);
+        }
+        return state.githubListings[sent.op.op];
+      }
+
       // The one write the shell can make from the frame. Applied to the state so
       // that the refetch after the mutation reads back what was written.
       if (path === "/autopilot/kill" && typeof init.body === "string") {
@@ -817,6 +906,15 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         throw new ApiRefusal(404, "not_found", "no project by that name");
       }
       return state.record;
+    }
+    // Ahead of `/branches` and the rest only by convention; it collides with none of them. `null`
+    // is the 404 the route makes for a project the roster does not have, and it is the one answer
+    // here that is an error rather than a state — the other five arrive as a 200.
+    if (path.startsWith("/projects/") && path.endsWith("/github-repo")) {
+      if (state.githubRepo === null) {
+        throw new ApiRefusal(404, "not_found", "no project by that name");
+      }
+      return state.githubRepo;
     }
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;

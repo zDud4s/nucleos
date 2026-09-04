@@ -185,6 +185,15 @@ export const keys = {
     githubOps: (projectId: string) => ["projects", projectId, "github-ops"] as const,
     landTargets: (projectId: string) => ["projects", projectId, "land-targets"] as const,
     /**
+     * Which repository on GitHub this project is — `GET /projects/{id}/github-repo`.
+     *
+     * Under the project prefix and beside the three above, because it is a fact about THIS project
+     * and not about the machine: it is read off the project's own root. It is not one of the three
+     * declarations — nothing declares it, git does — which is why it is its own key rather than a
+     * field of one of theirs.
+     */
+    githubRepo: (projectId: string) => ["projects", projectId, "github-repo"] as const,
+    /**
      * Which workflows this project uses, measured against the library right now.
      *
      * Under the project prefix and NOT under `keys.workflows` below, because it is a fact about
@@ -253,6 +262,17 @@ export const keys = {
   github: {
     all: ["github"] as const,
     declarableOps: ["github", "declarable-ops"] as const,
+    /**
+     * What one listing read said about one repository — `POST /github/requests`.
+     *
+     * **Keyed by the repository and not by the project**, which is the whole reason it is here
+     * rather than under `projects`. The answer is a fact about a repository on GitHub, so two
+     * projects rooted at two worktrees of the same repository ask one question and share one
+     * answer — and, more to the point, a declaration write invalidating `keys.projects.all` must
+     * not throw away a listing that cost a network call and cannot have changed because somebody
+     * ticked a checkbox.
+     */
+    listing: (op: string, repo: string) => ["github", "listing", op, repo] as const,
   },
 
   /**

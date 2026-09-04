@@ -260,6 +260,27 @@ pub fn build_router(state: AppState) -> Router {
                 .post(post_project_land_target)
                 .delete(delete_project_land_target),
         )
+        // Which repository on GitHub this project IS — the one fact that stood between the typed
+        // reads and a page able to show a project's remote. `Repo::new` was reachable only from
+        // `ReadOp::from_request`, so the repository was always something the caller named;
+        // `vcs::resolve_repo` answers with a folder on this disk, which is a different question with
+        // a confusingly similar name.
+        //
+        // **Its own route rather than a field on a read this page already makes**, and the two
+        // candidates were real ones. `ProjectSummary` would have cost nothing extra to fetch — the
+        // roster is already on screen — and `GET /projects/{id}/branches` is already a git subprocess
+        // against the same root, which the section below this one already calls. Both were rejected
+        // for the same reason, and it is the reason this route is in no scope table: they are BOTH
+        // in `READ_ONLY_ROUTES`, so hanging the repository off either would disclose it to every
+        // read-only key as a side effect of tidying a round trip. The roster carries a second cost
+        // besides — it is polled every three seconds, and this spawns git, so a fleet of
+        // twenty-five projects would be twenty-five subprocesses a tick to draw a panel one page
+        // reads.
+        //
+        // **In no scope table**, with `the_repository_a_project_points_at_is_in_no_scope_table`
+        // carrying the argument — including the strongest case against it, which is that a
+        // read-only key can already read `.git/config` through `GET /projects/{id}/cat`.
+        .route("/projects/{id}/github-repo", get(get_project_github_repo))
         // The workflow library, and what one project uses out of it.
         //
         // The library is house-wide and hangs off no project — it is one folder on this machine,
@@ -6485,6 +6506,36 @@ async fn get_project_github_ops(
         })
 }
 
+/// Which repository on GitHub this project is.
+///
+/// **The fact the typed reads were missing.** Every `ReadOp` carries a `Repo`, and `Repo::new` was
+/// reachable only from `ReadOp::from_request` — so the repository was always something the CALLER
+/// named, and nothing in this daemon could answer it for a project on the roster. A page that wanted
+/// to show a project's open pull requests had either to invent the mapping itself out of
+/// `GET /projects/detect` and a URL parse, or to show nothing. `github::project_repo` is that answer,
+/// and this is the door onto it.
+///
+/// **A 200 for every state but a project nobody has heard of.** A project with no folder, a folder
+/// that has moved, a folder git does not know, a repository with no `origin` and a remote that is
+/// not GitHub's are five ordinary states and not five failures — §5.1 asks this page to EXPLAIN
+/// rather than go blank, and it can only do that if the five arrive distinguishable. Collapsing them
+/// into one refusal would leave the page saying "something is wrong" about a project whose only
+/// peculiarity is being local-only.
+async fn get_project_github_repo(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::github::ProjectRepo>, StatusCode> {
+    let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+    match crate::github::project_repo(&state.pool, &id, deadline).await {
+        Ok(Some(found)) => Ok(Json(found)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, project_id = %id, "resolving a project's repository failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GithubOpTarget {
@@ -7252,6 +7303,10 @@ async fn get_project_detect(
 /// repository whose `.git` is on a disconnected network share is exactly the case that would
 /// otherwise hold the request open. Missing git facts degrade to `None`, which the page shows as
 /// "not read" rather than as "there is no remote".
+///
+/// `get_project_github_repo` shares it rather than naming a second duration. The two are the same
+/// proposition — local git reads with a person waiting on a page — and two numbers here is how one
+/// of them ends up generous enough to hang the request the other was written to protect.
 const DETECT_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A project this daemon already keeps at this folder, if any.
@@ -19422,6 +19477,104 @@ mod tests {
         // could be relative TO, so resolving it would resolve it against the daemon's own cwd.
         let (_, body) = workflow_call(state, "GET", "/projects/detect?path=.ai", None).await;
         assert_eq!(body["refusal"], "not_absolute");
+    }
+
+    /// The mapping the typed reads were missing: a project id in, `owner/name` out.
+    ///
+    /// Before this route there was no route at all — `Repo::new` was reachable only from
+    /// `ReadOp::from_request`, so the repository a read carried was always something the CALLER
+    /// named, and a page wanting to show a project's own remote had to invent the mapping. That is
+    /// the whole of what this asserts: the daemon now holds it.
+    #[tokio::test]
+    async fn a_project_says_which_repository_on_github_it_is() {
+        let state = test_state().await;
+        let dir = project_with_repo(&state, "alpha", "gate_command: cargo test\n").await;
+        git_in_project(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:owner/name.git"],
+        );
+
+        let (status, body) = workflow_call(state, "GET", "/projects/alpha/github-repo", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "known");
+        assert_eq!(body["repo"], "owner/name");
+        // The URL travels beside the slug, because they answer different questions: one is what a
+        // read is sent, the other is what somebody checks it against when the slug surprises them.
+        assert_eq!(body["remote"], "git@github.com:owner/name.git");
+    }
+
+    /// The five states that are not a repository on GitHub are five different answers.
+    ///
+    /// **This is the assertion §5.1 argues for, one layer below the page.** *«um painel vazio é
+    /// indistinguível de um repositório sem PRs»* — and a route that collapsed these into one
+    /// refusal would make the page's explanation impossible to write, because every one of them
+    /// would arrive as the same word. None of them is an error: a project in `off` mode has had its
+    /// root cleared, a folder can be moved, `set_project_mode` only insists on a repository for
+    /// `active`, a local-only project is a project, and a project on GitLab is a project this app
+    /// has nothing to say about.
+    #[tokio::test]
+    async fn every_reason_a_project_has_no_github_repository_is_its_own_answer() {
+        let state = test_state().await;
+
+        // Registered, never pointed anywhere — `charlie`'s shape, and the state `off` leaves behind.
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', NULL)",
+        )
+        .bind("rootless")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // A folder that was named and is not there. The directory is deleted after registration, so
+        // the row is exactly what a project whose checkout somebody moved looks like.
+        let gone = tempfile::tempdir().unwrap();
+        let gone_path = gone.path().to_path_buf();
+        project_with_rules(&state, "moved", "gate_command: cargo test\n").await;
+        sqlx::query("UPDATE autopilot_state SET project_root = ? WHERE project_id = 'moved'")
+            .bind(gone_path.join("elsewhere").to_string_lossy().to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let _plain = project_with_rules(&state, "plain", "gate_command: cargo test\n").await;
+        let _local = project_with_repo(&state, "local", "gate_command: cargo test\n").await;
+        let elsewhere = project_with_repo(&state, "elsewhere", "gate_command: cargo test\n").await;
+        git_in_project(
+            elsewhere.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.com/owner/name.git",
+            ],
+        );
+
+        for (project, expected) in [
+            ("rootless", "no_root"),
+            ("moved", "root_missing"),
+            ("plain", "not_a_repository"),
+            ("local", "no_remote"),
+            ("elsewhere", "not_github"),
+        ] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                "GET",
+                &format!("/projects/{project}/github-repo"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{project} is a state, not a failure"
+            );
+            assert_eq!(body["state"], expected, "{project}");
+        }
+
+        // And a project the roster has never heard of is the one thing here that IS an error: there
+        // is nothing to describe, so there is no state to name.
+        let (status, _) = workflow_call(state, "GET", "/projects/ghost/github-repo", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// Adopting records a pin and touches nothing in the folder.

@@ -1,7 +1,14 @@
 // §spec alcada-por-projecto
 import { useState } from "react";
-import { isApiRefusal } from "../data/client";
+import type { UseQueryResult } from "@tanstack/react-query";
+import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { useProjectBranches } from "../data/project-git";
+import {
+  useGithubListing,
+  useProjectRepo,
+  type ProjectRepo,
+  type ReadOutcome,
+} from "../data/project-github";
 import {
   declaredRule,
   foldPrefix,
@@ -20,7 +27,7 @@ import {
   type ShellRule,
   type Verdict,
 } from "../data/project-policy";
-import { Quiet, RefusalNote, Section } from "../ui";
+import { Button, Quiet, RefusalNote, Section } from "../ui";
 
 /**
  * "What may this project do without asking?"
@@ -56,7 +63,7 @@ export function ModeGithub({ projectId }: ModeGithubProps) {
       </p>
 
       <Section label="The remote">
-        <Remote />
+        <Remote projectId={projectId} />
       </Section>
 
       <Section label="What runs on its own">
@@ -77,39 +84,261 @@ export function ModeGithub({ projectId }: ModeGithubProps) {
 /* ------------------------------------------------------------ 1. the remote -- */
 
 /**
- * Open pull requests and the last CI runs — explained, because they cannot yet be fetched.
+ * Open pull requests and the last CI runs, read by the daemon with the token from Credential
+ * Manager.
  *
- * §5.1 asks for the typed reads `pr_list` and `run_list`, through the daemon, with the token from
- * Credential Manager, and it names the failure this section must avoid: *«um painel vazio é
- * indistinguível de um repositório sem PRs»*. That rule cuts both ways, and it is why nothing is
- * drawn here rather than a panel that stays empty for a reason nobody can see.
+ * **Nothing in this section may ever be blank, and that is the requirement it is built around.**
+ * §5.1: *«Sem token ou sem `gh` encontrado, explicado e não em branco — um painel vazio é
+ * indistinguível de um repositório sem PRs»*. So there are two questions asked in order and eleven
+ * answers between them, and every one of the ten that is not a listing says what is wrong and, where
+ * there is one, what to do about it.
  *
- * **What is missing is one fact and not one route.** `POST /github/requests` exists, admits the
- * control token this window holds, and runs a read the moment it is asked. Its body is an operation,
- * every read operation carries a `repo` — `owner/name` — and *nothing tells this app which
- * repository a project is*. In the núcleo `Repo::new` is reached from `ReadOp::from_request` alone,
- * so the repository is always something the CALLER names; `vcs::resolve_repo` answers with a folder
- * on disk, which is a different question. `GET /projects/detect` reports a git remote, but it takes
- * a path and belongs to the wizard that adds a project, and chaining it here to parse a URL into a
- * slug would be this app inventing a mapping the daemon does not hold.
+ * **The mapping comes first, and it is the fact this section waited on.** A typed read carries the
+ * repository it reads as `owner/name`, and until `GET /projects/{id}/github-repo` landed nothing in
+ * the daemon could produce one for a project — `Repo::new` was reachable from `ReadOp::from_request`
+ * alone, so the repository was always something the caller named. This page could have chained
+ * `GET /projects/detect` and parsed a URL into a slug; that would have been the app inventing a
+ * mapping the daemon does not hold, and getting it subtly wrong would have shown somebody another
+ * repository's pull requests under their project's name. The daemon holds it now.
  *
- * So the honest sentence is the one below, in the voice §5.1 asks for on a machine with no token or
- * no `gh` found: say what belongs here, and say why it is not here yet.
+ * **What comes back is `gh`'s PROSE and it is rendered as prose.** `--json` is in the núcleo's
+ * `REFUSED_READ_FLAGS` on purpose, and so are `--limit` and `-L`: `github.rs` grades `pr_list` and
+ * `run_list` `ReadsOwn` — the grading that lets a run read them without latching its turn — on the
+ * strength of `gh`'s own thirty-row cap, which it calls *"not a performance detail, it is half of
+ * this grading"*. Parsing this into a sorted table would mean asking for `--json`, which would mean
+ * spending that argument on a layout. What is on screen is what the owner would see at a terminal.
+ *
+ * **Asked once, never polled.** Each listing is a subprocess and a network call, and a three-second
+ * timer would have this window running `gh` for ever to redraw a panel nobody is looking at. The
+ * remote does change without anybody here touching it, though — that is what CI is — so there is one
+ * control that asks again, and it is the only gesture in this section.
  */
-function Remote() {
+function Remote({ projectId }: { projectId: string }) {
+  const mapping = useProjectRepo(projectId);
+  const found = mapping.data;
+  const repo = found?.state === "known" ? found.repo : null;
+  const prs = useGithubListing("pr_list", repo);
+  const runs = useGithubListing("run_list", repo);
+
+  if (mapping.isPending) {
+    return <p className="text-sm text-text-faint">Asking which repository this project is…</p>;
+  }
+
+  // A project the roster has never heard of is the one refusal this read makes, and it is a real
+  // error rather than a state: there is nothing to describe.
+  if (found === undefined) {
+    return isApiRefusal(mapping.error) ? (
+      <RefusalNote refusal={mapping.error} sentences={MAPPING_SENTENCES} />
+    ) : (
+      <Quiet says="the núcleo did not answer which repository this project is">
+        The daemon is reachable or this window would be showing nothing at all, so this is the one
+        read failing rather than the connection. Reopening the page asks again.
+      </Quiet>
+    );
+  }
+
+  if (found.state !== "known") {
+    const why = WHY_NO_REPOSITORY[found.state];
+    return (
+      <Quiet says={why.says}>
+        {why.because}
+        {"root" in found ? (
+          <>
+            {" "}
+            The folder is <span className="font-mono">{found.root}</span>.
+          </>
+        ) : null}
+        {"remote" in found ? (
+          <>
+            {" "}
+            <span className="font-mono">origin</span> is{" "}
+            <span className="font-mono">{found.remote}</span>.
+          </>
+        ) : null}
+      </Quiet>
+    );
+  }
+
+  const asking = prs.isFetching || runs.isFetching;
+
   return (
-    <Quiet says="not wired yet">
-      Open pull requests and the last CI runs belong here, read by the daemon through the typed
-      operations <span className="font-mono">pr_list</span> and{" "}
-      <span className="font-mono">run_list</span> with the token from Credential Manager. Nothing on
-      this machine can ask for them yet: a typed read carries the repository it reads —{" "}
-      <span className="font-mono">owner/name</span> — and no route tells this app which repository a
-      project is. Until one does, this section says so. A panel that guessed would be
-      indistinguishable from a repository with no open pull requests, which is the one thing this
-      section must never look like.
-    </Quiet>
+    <div className="flex flex-col gap-4">
+      <p className="flex flex-wrap items-baseline gap-2 text-sm text-text-muted">
+        <span className="font-mono text-text">{found.repo}</span>
+        {/*
+          The URL beside the slug, because they answer different questions. The slug is what the
+          daemon sends `gh` at; the URL is what somebody checks it against when the slug is not the
+          repository they were expecting — which is the one failure a mapping can have that looks
+          like success.
+        */}
+        <span className="font-mono text-xs text-text-faint">{found.remote}</span>
+        <Button
+          onClick={() => {
+            void prs.refetch();
+            void runs.refetch();
+          }}
+          disabled={asking}
+        >
+          {asking ? "asking GitHub…" : "ask again"}
+        </Button>
+      </p>
+
+      <Listing title="Open pull requests" read={prs} />
+      <Listing title="The last CI runs" read={runs} />
+    </div>
   );
 }
+
+/**
+ * Why this project has no repository on GitHub, in a sentence and a paragraph.
+ *
+ * **Five states and five sentences, because five different things are wrong and four of them are
+ * fixable in four different places.** This is the table §5.1's rule reduces to: a mapping that
+ * answered "no repository" five times would be a panel that is blank with extra steps.
+ *
+ * None of these is an error. A project in `off` mode has had its root cleared, a checkout can be
+ * moved, `set_project_mode` only insists on a repository for `active`, a local-only project is a
+ * project, and a project on GitLab is simply not a question this app answers.
+ */
+const WHY_NO_REPOSITORY: Record<
+  Exclude<ProjectRepo["state"], "known">,
+  { says: string; because: string }
+> = {
+  no_root: {
+    says: "this project has no folder, so there is no remote to read",
+    because:
+      "Switching a project off clears the root it was pointed at — the row stays on the roster and the folder is forgotten. Put it back into shadow or active with a folder, and this section fills itself in.",
+  },
+  root_missing: {
+    says: "the folder this project points at is not there",
+    because:
+      "The núcleo has a root recorded for this project and nothing is at it, which is what a checkout somebody moved or deleted looks like. Nothing here is lost: point the project at where the folder is now.",
+  },
+  not_a_repository: {
+    says: "this project's folder is not a git repository",
+    because:
+      "That is allowed — only active mode insists on a repository, so a project can be watched in a folder git knows nothing about. There is no origin to read, and so nothing on GitHub to show.",
+  },
+  no_remote: {
+    says: "this repository has no origin",
+    because:
+      "A local-only project is a project, and this is what one looks like from here rather than a fault. `git remote add origin …` in that folder is the whole of what this section is waiting for.",
+  },
+  not_github: {
+    says: "this project's origin is not a GitHub repository",
+    because:
+      "The daemon reads github.com and nothing else — its gh is pointed at the public host, so a repository anywhere else is one it could not fetch even if this page asked. There is nothing wrong here; this section just has nothing to say about it.",
+  },
+};
+
+/** The one refusal `GET /projects/{id}/github-repo` makes, in this page's voice. */
+const MAPPING_SENTENCES: Record<string, string> = {
+  not_found: "the núcleo has no project by this name.",
+  internal: "the núcleo hit an error of its own working out which repository this is.",
+};
+
+/**
+ * One listing, or the reason there is not one.
+ *
+ * **Four outcomes and none of them is an empty box.** The daemon refused; `gh` ran and failed; `gh`
+ * ran, succeeded and printed nothing; `gh` printed a listing. The third is the one worth naming: a
+ * repository with no open pull requests and a `gh` that answered with silence look identical in a
+ * panel, which is the sentence §5.1 is built out of, so the empty case says out loud that it is an
+ * answer rather than an absence.
+ *
+ * The text goes in a `pre`. It is a terminal table — columns aligned with spaces — and any element
+ * that reflowed it would turn `gh`'s own formatting into noise.
+ */
+function Listing({ title, read }: { title: string; read: UseQueryResult<ReadOutcome> }) {
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+      <p className="text-xs uppercase tracking-wide text-text-faint">{title}</p>
+      <ListingBody read={read} />
+    </div>
+  );
+}
+
+function ListingBody({ read }: { read: UseQueryResult<ReadOutcome> }) {
+  if (read.isPending) {
+    return <p className="text-xs text-text-faint">Asking GitHub…</p>;
+  }
+
+  if (read.data === undefined) {
+    return isApiRefusal(read.error) ? (
+      <RefusalNote refusal={read.error} sentences={sentencesFor(read.error)} />
+    ) : (
+      <p className="text-xs text-text-muted">
+        The núcleo did not answer this read at all. That is the daemon and not GitHub — asking again
+        is the whole treatment.
+      </p>
+    );
+  }
+
+  const outcome = read.data;
+  // `gh` ran and did not succeed. The núcleo answers 200 for this, and rightly: the request was
+  // fine and GitHub's answer was not. `output_tail` is stdout then stderr, which is where the CLI
+  // says why — a renamed repository, a token without access to it, a network that is down.
+  if (outcome.exit_code !== 0) {
+    const said = outcome.output_tail.trim();
+    return (
+      <div className="flex flex-col gap-1">
+        <p className="text-xs text-text-muted">
+          gh ran and did not succeed{outcome.exit_code === null ? "" : ` (exit ${outcome.exit_code})`}
+          . This is GitHub's answer rather than the núcleo's, and it is printed whole below.
+        </p>
+        {said === "" ? (
+          <p className="text-xs text-text-faint">And it printed nothing at all while failing.</p>
+        ) : (
+          <pre className="overflow-x-auto whitespace-pre font-mono text-xs text-text-muted">
+            {said}
+          </pre>
+        )}
+      </div>
+    );
+  }
+
+  const listed = outcome.stdout.trim();
+  if (listed === "") {
+    const said = outcome.output_tail.trim();
+    return (
+      <p className="text-xs text-text-muted">
+        gh answered and listed nothing. {said === "" ? "" : `It said: ${said}`}
+      </p>
+    );
+  }
+
+  return (
+    <pre className="overflow-x-auto whitespace-pre font-mono text-xs text-text">{listed}</pre>
+  );
+}
+
+/**
+ * What to do about a refusal from `POST /github/requests`, said on top of what the daemon said.
+ *
+ * **Built from the refusal rather than written as a constant, because the daemon's own sentence is
+ * the better half and `RefusalNote` shows only one.** Its fallback order is page copy, then the
+ * shared floor, then the daemon's prose — and the floor has an entry for both statuses this route
+ * uses, so page copy that ignored the detail would replace *"gh is not on this machine's PATH"* with
+ * *"the part of the núcleo this needs is not available"*. So the detail is quoted and the advice is
+ * added to it.
+ *
+ * **The 503 covers two different faults and this does not guess which.** A switched-off pillar and a
+ * missing `gh` are both 503 — the núcleo keeps them apart in words and not in the status — and
+ * sniffing the prose to tell them apart would be a `switch` over sentences, which is the one thing
+ * `client.ts` says never to build. So the advice names both places to look and the daemon's sentence
+ * above it says which.
+ */
+function sentencesFor(refusal: ApiRefusal): Record<string, string> {
+  const said = refusal.detail.trim();
+  const advice = ADVICE[refusal.status];
+  return advice === undefined ? {} : { [refusal.code]: said === "" ? advice : `${said} — ${advice}` };
+}
+
+const ADVICE: Record<number, string> = {
+  403: "the token lives in this machine's Credential Manager and the daemon reads it there at every call, so pasting one and asking again is all this needs",
+  503: "either the pillar is switched off in .ai/github.yaml or gh is not installed where the daemon can find it; the sentence above says which, and both are fixed and then the daemon restarted",
+  504: "GitHub or the network took longer than the núcleo waits; nothing is wrong here that asking again will not settle",
+};
 
 /* ------------------------------------------------ 2. what runs on its own -- */
 

@@ -5,6 +5,7 @@ import {
   DECLARED_ON,
   daemonFetch,
   daemonState,
+  readOutcome,
   renderWithQuery,
   shellRule,
   type DaemonState,
@@ -331,22 +332,239 @@ describe("where the work lands", () => {
 
 describe("the remote", () => {
   /**
-   * §5.1's rule read in the direction it also points: *"um painel vazio é indistinguível de um
-   * repositório sem PRs"*. Nothing serves this section yet — a typed read carries the repository it
-   * reads and no route says which repository a project is — so the honest answer is the explanation
-   * and never a panel that stays empty for a reason nobody can see.
+   * The section, once whatever it is going to say has settled.
+   *
+   * Waiting on the absence of "asking" rather than on the presence of any particular sentence,
+   * because this section has three reads in flight at once — the mapping and two listings — and a
+   * helper that waited for one of them would let a test assert against a panel still loading. The
+   * idle button says "ask again", which does not match; the fetching one says "asking GitHub…",
+   * which does.
+   *
+   * Both loading lines are named rather than matching "asking" alone, because the advice this
+   * section gives about a missing token ends *"asking again is all this needs"* — a looser guard
+   * waits for a sentence that is the settled answer.
    */
-  it("explains itself rather than drawing an empty panel", async () => {
+  async function remote(): Promise<HTMLElement> {
+    const region = await screen.findByRole("region", { name: "The remote" });
+    await waitFor(() =>
+      expect(region.textContent ?? "").not.toMatch(/asking (github|which repository)/i),
+    );
+    return region;
+  }
+
+  /**
+   * The mapping is the fact this section waited on, and this is the assertion that it is used.
+   *
+   * The repository sent to `POST /github/requests` must be the one the daemon named. A page that
+   * worked it out for itself — chaining `GET /projects/detect` and parsing the URL into a slug — is
+   * exactly what was refused, and the failure it would cause is invisible on screen: somebody else's
+   * pull requests, under this project's name, with nothing anywhere saying so.
+   */
+  it("reads the two listings against the repository the núcleo named", async () => {
+    const state = open();
+
+    const section = await remote();
+    expect(section.textContent).toContain("duarte/nucleos");
+    // The URL beside the slug, which is what somebody checks the slug against.
+    expect(section.textContent).toContain("git@github.com:duarte/nucleos.git");
+
+    await waitFor(() => expect(state.githubReads).toHaveLength(2));
+    expect([...state.githubReads].sort((a, b) => a.op.localeCompare(b.op))).toEqual([
+      { op: "pr_list", repo: "duarte/nucleos" },
+      { op: "run_list", repo: "duarte/nucleos" },
+    ]);
+  });
+
+  /**
+   * **`gh`'s prose is rendered and never parsed**, and the assertion is the tab.
+   *
+   * `--json` is in the núcleo's `REFUSED_READ_FLAGS` on purpose, and so are `--limit` and `-L`:
+   * `github.rs` grades these two reads `ReadsOwn` on the strength of `gh`'s own thirty-row cap,
+   * *"not a performance detail, it is half of this grading"*. So there is no structured form of this
+   * answer to build a table out of, and a page that wanted one would have to ask for the flag that
+   * grading depends on being refused. What is on screen is the CLI's own text, in a `pre`, whitespace
+   * intact — asserting the tab survives is asserting nobody split it into cells.
+   */
+  it("renders what gh printed, as gh printed it", async () => {
     open();
 
-    const remote = await screen.findByRole("region", { name: "The remote" });
-    expect(remote.textContent).toContain("not wired yet");
+    const section = await remote();
+    const printed = section.querySelectorAll("pre");
+    expect(printed).toHaveLength(2);
+    expect(printed[0].textContent).toBe("#41\tthe queue lands\tfeat/land\tabout 2 hours ago");
+    expect(printed[1].textContent).toBe(
+      "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s",
+    );
+  });
 
-    fireEvent.click(within(remote).getByRole("button", { name: "why?" }));
-    const why = remote.textContent ?? "";
-    expect(why).toContain("pr_list");
-    expect(why).toContain("owner/name");
-    expect(why).toMatch(/no route tells this app which repository a project is/i);
+  /**
+   * **The assertion §5.1 argues for, five times over.**
+   *
+   * *«Sem token ou sem `gh` encontrado, explicado e não em branco — um painel vazio é indistinguível
+   * de um repositório sem PRs»*. None of these five is an error and none of them is the same as any
+   * other: a project switched off has had its root cleared, a checkout can be moved, only `active`
+   * insists on a repository, a local-only project is a project, and a project on GitLab is not a
+   * question this app answers. A mapping that collapsed them would leave this section with one
+   * sentence for five different things to go and do.
+   *
+   * Asserted as the SENTENCE each state produces and not merely as "some text": a shared "no
+   * repository" line would satisfy a length check while being exactly the failure this forbids.
+   */
+  it.each([
+    ["no_root", /no folder/i, /clears the root/i],
+    ["root_missing", /is not there/i, /moved or deleted/i],
+    ["not_a_repository", /not a git repository/i, /only active mode insists/i],
+    ["no_remote", /no origin/i, /local-only project is a project/i],
+    ["not_github", /not a GitHub repository/i, /github\.com and nothing else/i],
+  ])("explains a project whose remote is %s rather than going blank", async (state, says, why) => {
+    const daemon = open({
+      githubRepo: { state, root: "C:/Projects/thing", remote: "https://gitlab.com/a/b.git" } as never,
+    });
+
+    const section = await remote();
+    expect(section.textContent).toMatch(says);
+
+    fireEvent.click(within(section).getByRole("button", { name: "why?" }));
+    expect(section.textContent).toMatch(why);
+
+    // And nothing was asked of GitHub, because there was nothing to ask it about. A page that sent
+    // a read with an empty repository would get a refusal it would then have to explain instead.
+    expect(daemon.githubReads).toEqual([]);
+  });
+
+  /**
+   * No token stored — §5.1 names this case by hand, and it is a 403 nothing else can produce.
+   *
+   * The daemon's own sentence is the better half here and this page must not replace it: the núcleo
+   * says *where* the credential goes, which is more than any copy written in the shell would. So the
+   * advice is added to it rather than instead of it.
+   */
+  it("explains a missing token instead of showing two empty panels", async () => {
+    open({
+      githubReadRefusal: {
+        status: 403,
+        code: "forbidden",
+        detail: "no github token is stored; run the daemon with --set-github-token",
+      },
+    });
+
+    const section = await remote();
+    expect(section.textContent).toContain("no github token is stored");
+    expect(section.textContent).toMatch(/Credential Manager/i);
+    // Both panels say it. One that stayed blank while the other explained would be the empty panel
+    // this rule forbids, in half the section.
+    expect(section.querySelectorAll(".ui-note-refusal")).toHaveLength(2);
+    expect(section.querySelectorAll("pre")).toHaveLength(0);
+  });
+
+  /**
+   * `gh` not found — §5.1's other named case, and the 503 it arrives as covers two faults.
+   *
+   * A switched-off pillar and a missing CLI are both 503; the núcleo keeps them apart in words and
+   * not in the status. So the page shows the daemon's sentence, which says which, and adds advice
+   * naming both places to look — rather than sniffing the prose to guess, which is the `switch` over
+   * sentences `client.ts` says never to build.
+   */
+  it("explains a gh that is not on the daemon's PATH", async () => {
+    open({
+      githubReadRefusal: {
+        status: 503,
+        code: "unavailable",
+        detail: "gh is not on this machine's PATH",
+      },
+    });
+
+    const section = await remote();
+    expect(section.textContent).toContain("gh is not on this machine's PATH");
+    expect(section.textContent).toMatch(/\.ai\/github\.yaml/);
+  });
+
+  /**
+   * A refusal this page has written no advice for still says what the daemon said.
+   *
+   * The floor under every other case. `RefusalNote` never renders "request failed" — page copy, then
+   * the shared floor, then the daemon's prose — and a status this section has no advice for must
+   * fall through to that rather than to nothing.
+   */
+  it("explains a refusal it has no advice for", async () => {
+    open({
+      githubReadRefusal: {
+        status: 500,
+        code: "internal",
+        detail: "the github task did not finish",
+      },
+    });
+
+    const section = await remote();
+    expect(section.textContent).toMatch(/did not finish|error of its own/i);
+  });
+
+  /**
+   * `gh` ran and GitHub said no — a 200 from the núcleo, and the one failure that is not a refusal.
+   *
+   * The request was fine and the answer was not: a renamed repository, a token without access to it,
+   * a network that is down. `stdout` is empty in that case and `output_tail` is where the CLI said
+   * why, so a panel that drew `stdout` would be blank at precisely the moment there is most to say.
+   */
+  it("shows why gh failed rather than an empty panel", async () => {
+    open({
+      githubListings: {
+        pr_list: readOutcome("pr_list", "", {
+          exit_code: 1,
+          output_tail: "could not resolve to a Repository with the name 'duarte/nucleos'",
+        }),
+        run_list: readOutcome("run_list", "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s"),
+      },
+    });
+
+    const section = await remote();
+    expect(section.textContent).toMatch(/gh ran and did not succeed \(exit 1\)/);
+    expect(section.textContent).toContain("could not resolve to a Repository");
+  });
+
+  /**
+   * A repository with nothing to list says so, which is the sentence §5.1 is built out of.
+   *
+   * *«um painel vazio é indistinguível de um repositório sem PRs»* — read in the direction it also
+   * points. This is the case where the panel is legitimately empty, and it is exactly the case that
+   * must not be drawn as an empty panel, because then nothing on screen separates it from a read
+   * that silently failed.
+   */
+  it("says a listing was empty rather than looking like one that failed", async () => {
+    open({
+      githubListings: {
+        pr_list: readOutcome("pr_list", "", {
+          output_tail: "no open pull requests in duarte/nucleos",
+        }),
+        run_list: readOutcome("run_list", "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s"),
+      },
+    });
+
+    const section = await remote();
+    expect(section.textContent).toMatch(/answered and listed nothing/i);
+    expect(section.textContent).toContain("no open pull requests in duarte/nucleos");
+  });
+
+  /** A project the roster has never heard of is the one refusal the mapping makes. */
+  it("explains a project the núcleo does not have", async () => {
+    open({ githubRepo: null });
+
+    const section = await remote();
+    expect(section.textContent).toMatch(/no project by this name/i);
+  });
+
+  /**
+   * Nothing here is polled — each listing is a subprocess and a network call — so the one gesture in
+   * the section is the one that asks again.
+   */
+  it("asks GitHub again when told to", async () => {
+    const state = open();
+
+    const section = await remote();
+    await waitFor(() => expect(state.githubReads).toHaveLength(2));
+
+    fireEvent.click(within(section).getByRole("button", { name: "ask again" }));
+    await waitFor(() => expect(state.githubReads).toHaveLength(4));
   });
 });
 
