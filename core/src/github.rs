@@ -1547,7 +1547,21 @@ impl Policy {
     /// `digest` has to say what the effective policy IS rather than what happens to be consulted; on
     /// the day `submit` is handed a project, nothing here changes. Until then a project's declared
     /// ACTIONS are recorded and inert, while its declared READS are live through Bash.
-    pub async fn for_project(&self, pool: &sqlx::SqlitePool, project_id: &str) -> Self {
+    ///
+    /// **One visible consequence of merging them, so nobody has to discover it from a graph.** A
+    /// declared action moves the digest — `actions` is always hashed — while changing no verdict
+    /// anywhere, so declaring `pr_create` fragments that project's shadow sample for a grant that
+    /// does nothing yet. It is the honest answer rather than a bug: the configuration genuinely did
+    /// change, and a digest that hid the change would be lying about which policy a row was recorded
+    /// under the moment `submit` learns its project. The cost is bounded to
+    /// `shadow_readiness` counting one more distinct digest for that project.
+    ///
+    /// **PRIVATE, and that is the `enabled` hole closed by construction rather than by comment.**
+    /// `GithubRuntime::policy_for_project` is the only way in, and it is where the switch is read;
+    /// a `pub` constructor here would let a caller outside this module lay a project's rows straight
+    /// onto a policy that a switched-off pillar had already collapsed to `empty()`, which is the one
+    /// thing `enabled: false` exists to prevent. The tests below still reach it, being in-module.
+    async fn for_project(&self, pool: &sqlx::SqlitePool, project_id: &str) -> Self {
         // The SWALLOWING reader, and this is the consumer it was written for. An unreadable table
         // yields no operations, an empty overlay is the machine default, and that is strictly FEWER
         // operations running unasked — the safe direction here. It is the opposite of the shell
@@ -2988,6 +3002,65 @@ mod tests {
         assert_eq!(base.digest().len(), 16);
     }
 
+    /// **The digest's OUTPUT, pinned to literals, because what it labels is already on disk.**
+    ///
+    /// Every other assertion about this function is RELATIVE — two policies hash alike, or they do
+    /// not — and every one of them survives a change to `digest_of` itself, because both sides move
+    /// together. `a_project_that_declared_nothing_is_the_machine_default_exactly` cannot help either,
+    /// for exactly that reason: it compares `for_project`'s answer against the machine's, and a
+    /// rewrite moves the pair. So the property that actually matters here had nothing holding it.
+    ///
+    /// That property is not internal consistency. `policy_digest` is a column in
+    /// `shadow_decisions`, written on every governed tool call, and rows carrying these strings
+    /// exist in live databases. A change that renumbers them orphans the history: `shadow_readiness`
+    /// COUNTS distinct digests per action class, so the same class would suddenly be reported as
+    /// spanning two policies on a machine where nobody changed anything, and
+    /// `READINESS_MIN_REVIEWED` would restart ten reviews of progress toward promotion.
+    ///
+    /// **The third assertion is the one that guards the conditional in `digest_of`.** Drop the
+    /// `if !read_ops.is_empty()` and an empty overlay starts hashing `\nread_ops=` — the machine
+    /// default's own label changes, and so does every row already recorded under it. The fourth
+    /// pins the other half: when there IS a name, the suffix is written, so two genuinely different
+    /// effective policies still get different labels.
+    ///
+    /// Literals rather than a recomputation, deliberately. A test that recomputed FNV-1a here would
+    /// agree with whatever `digest_of` did, which is the failure mode this exists to close.
+    #[tokio::test]
+    async fn the_digest_of_a_known_policy_is_a_known_string() {
+        let pool = test_pool().await;
+
+        // `v1\nreads=\nactions=` — the label a machine with no autonomy has always carried.
+        assert_eq!(Policy::empty().digest(), "ef64af62014226ae");
+
+        let machine = policy_from(Some(
+            "autonomous_reads:\n  - gh run list\n\
+             autonomous_actions:\n  - pr_comment\n",
+        ));
+        // `v1\nreads=gh run list\nactions=pr_comment`
+        assert_eq!(machine.digest(), "9cef55bb486b8280");
+
+        // A project that declared nothing carries the machine's own byte, and that is the claim
+        // about rows already written rather than a claim about two values in this process.
+        assert_eq!(
+            machine.for_project(&pool, "alpha").await.digest(),
+            "9cef55bb486b8280"
+        );
+        assert_eq!(
+            Policy::empty().for_project(&pool, "alpha").await.digest(),
+            "ef64af62014226ae"
+        );
+
+        // And a project that declared something gets a label of its own, suffix and all:
+        // `v1\nreads=gh run list\nactions=pr_comment\nread_ops=pr_list`
+        crate::project_policy::declare_github_op(&pool, "alpha", "pr_list")
+            .await
+            .unwrap();
+        assert_eq!(
+            machine.for_project(&pool, "alpha").await.digest(),
+            "edcfd3d2f1212aab"
+        );
+    }
+
     /// Four failures, four different places to go looking. Collapsing any two of them costs
     /// somebody an hour in the wrong one, which is the argument `health.rs` already makes about
     /// `NotRunning` versus `Missing`.
@@ -3714,8 +3787,16 @@ mod tests {
     /// list widens the BASH door by name, and `submit` — the typed door — reads `runtime.policy`,
     /// the machine default, because `POST /github/requests` carries no project. So a project that
     /// declares every operation it may declare disagrees with the typed door about exactly the same
-    /// eleven. Decision #6 remains the only thing that closes it, and the second arm is what will
-    /// fail, correctly and loudly, on the day the typed door learns which project it is acting for.
+    /// eleven. Decision #6 remains the only thing that closes it.
+    ///
+    /// **And the second arm is a REMINDER, not a tripwire — which this paragraph, of all paragraphs,
+    /// must not get wrong twice.** It was written closing with "what will fail, correctly and loudly,
+    /// on the day the typed door learns which project it is acting for", which is the same species of
+    /// promise the paragraph exists to retract. It will not fail then: the closure below hardcodes
+    /// `widest.action_is_autonomous(...)` and never calls `submit`, so wiring `submit` to a project
+    /// changes nothing here until somebody edits that closure. What the arm does is state today's
+    /// measurement where whoever does that wiring will be standing, with a comment inside the closure
+    /// telling them which line to change. That is worth having and it is not a guard.
     #[tokio::test]
     async fn the_map_names_an_operation_and_does_not_yet_make_the_two_doors_agree() {
         let widest = Policy::from_config(&crate::config::GithubConfig {
@@ -3784,9 +3865,11 @@ mod tests {
         }
         let declared = widest.for_project(&pool, "alpha").await;
         let typed_for_project = |op: &Op| match op {
-            // `submit` reads `runtime.policy` and never this value, which is the whole point of the
-            // paragraph above: written as `widest` deliberately, so that wiring `submit` to the
-            // project changes what this line has to say.
+            // **THIS is the line to change when `submit` learns which project it is acting for**,
+            // and nothing will fail to tell you so — the header says why that is a reminder and not
+            // a guard. `widest` is written deliberately, because `submit` reads `runtime.policy` and
+            // never a project's: swap it for `declared` on that day and the assertion below is the
+            // measurement of how much the gap actually closed.
             Op::Read(_) => true,
             Op::Act(act) => widest.action_is_autonomous(act.kind()),
         };

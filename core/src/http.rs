@@ -6413,6 +6413,15 @@ fn named_op_kind(op_kind: &str) -> Result<(), (StatusCode, Json<serde_json::Valu
 ///
 /// The refusal names the kind AND lists what would have been accepted, because "not a declarable
 /// operation" without the set is a sentence that sends the owner to `github.rs`.
+///
+/// **A declared ACTION is recorded and inert today, and this route accepts it anyway.** The reading
+/// half reaches the classifier through `Policy::for_project`; the acting half is only ever consulted
+/// by `github::submit`, which reads the machine default because `POST /github/requests` carries no
+/// project to look one up by. So `pr_create` here returns 204, is stored, and changes no verdict
+/// until the typed door learns which project it is acting for — `Policy::for_project` carries the
+/// reasoning and the reason it was not taken here. Inert is the safe direction, which is why this
+/// route does not refuse it; what it costs is an owner reading a list of grants that includes one
+/// they did not get, so the page has to SAY so beside it rather than showing the two alike.
 async fn post_project_github_op(
     State(state): State<AppState>,
     Path(id): Path<String>,

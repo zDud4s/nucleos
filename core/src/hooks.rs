@@ -3531,6 +3531,61 @@ mod tests {
         assert_eq!(decide(&app, &asking(silent)).await.decision, "allow");
     }
 
+    /// The GitHub half of the same sentence, on the same branch, and it was pinned by NOTHING until
+    /// this test.
+    ///
+    /// `rooted_decision` returns before the sibling classifier call, so it carries its own copy of
+    /// the wiring — and reverting its `policy` argument to `state.github.policy` left this whole file
+    /// green at `96 passed; 0 failed`. The twin above exists because severing the SHELL rules left
+    /// every other test green; the identical hole sat open beside it for the policy, opened by the
+    /// very commit that wrote the paragraph justifying the wiring. A constructor can be perfect and
+    /// the feature still unreachable, and that is the failure this chunk has now fixed three times.
+    ///
+    /// The pair is the assertion, as it is above. `test_state` ships `GithubRuntime::default()`,
+    /// autonomous in nothing, so the `allow` can only be the project's own row — and the turn naming
+    /// no project asks a person about the identical line.
+    ///
+    /// `asking` and not `pending_approval`, because this branch never parks: a conversation has
+    /// somebody sitting in front of it, so an unrecognised line goes back to them as a question.
+    #[tokio::test]
+    async fn a_rooted_turn_reaches_github_through_its_projects_declared_operations() {
+        let state = test_state().await;
+        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+            .await
+            .unwrap();
+
+        let declared = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        sqlx::query("UPDATE runs SET project_id = 'alpha' WHERE id = ?")
+            .bind(declared)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let no_project = rooted_turn_run(&state, "C:/Projects/nucleos").await;
+        let app = test_router(state.clone());
+
+        let asking = |run_id: i64| {
+            format!(
+                r#"{{"run_id":{run_id},"tool_name":"Bash","tool_input":{{"command":"gh run list -R owner/name"}}}}"#
+            )
+        };
+
+        let decision = decide(&app, &asking(declared)).await;
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(
+            decision.reason,
+            "structural GitHub reads on an autonomy list are allowed"
+        );
+
+        assert_eq!(decide(&app, &asking(no_project)).await.decision, "asking");
+
+        // And the flags still bind here. A rooted turn is the owner working on their own project,
+        // not an exemption from what `--log-failed` brings back.
+        let refused = format!(
+            r#"{{"run_id":{declared},"tool_name":"Bash","tool_input":{{"command":"gh run view --log-failed 1 -R owner/name"}}}}"#
+        );
+        assert_eq!(decide(&app, &refused).await.decision, "asking");
+    }
+
     #[tokio::test]
     async fn git_push_pends_approval_and_terminates_the_run() {
         let state = test_state().await;
