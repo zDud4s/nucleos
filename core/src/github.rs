@@ -66,6 +66,35 @@ pub enum ReadOp {
         repo: Repo,
         id: RunId,
     },
+    /// What a pull request changes, which `gh` answers with the diff itself and not with a list of
+    /// names. So this returns the patch, every line of it written by whoever opened the pull
+    /// request — which on a fork is a stranger with no commit access and no review yet.
+    PrFiles {
+        repo: Repo,
+        number: PrNumber,
+    },
+    /// The comment thread on a pull request. `PrView` returns the description its author wrote;
+    /// this returns everything everybody else wrote underneath it, which is a wider door into the
+    /// turn and not a narrower one.
+    ///
+    /// **One letter from `ActOp::PrComment`, which posts one.** The kinds are `pr_comments` and
+    /// `pr_comment`, they are on opposite sides of the partition, and each `from_request` names the
+    /// other's tool by hand rather than answering "unknown operation" — so the near-miss is a
+    /// sentence saying which tool to use, in both directions.
+    PrComments {
+        repo: Repo,
+        number: PrNumber,
+    },
+    /// The checks reported against a ref, as `gh pr checks` gives them: a name, a state and a link
+    /// per check.
+    ///
+    /// `Branch` for the ref, the same type and the same field spelling `ActOp::WorkflowRun` uses —
+    /// this is `gh`'s argv either way, and a second type for the same guard is how the two come to
+    /// disagree.
+    ChecksForRef {
+        repo: Repo,
+        r#ref: Branch,
+    },
 }
 
 /// An operation that changes something on GitHub's servers.
@@ -154,6 +183,9 @@ impl ReadOp {
             ReadOp::PrView { .. } => "pr_view",
             ReadOp::IssueView { .. } => "issue_view",
             ReadOp::RunLogs { .. } => "run_logs",
+            ReadOp::PrFiles { .. } => "pr_files",
+            ReadOp::PrComments { .. } => "pr_comments",
+            ReadOp::ChecksForRef { .. } => "checks_for_ref",
         }
     }
 
@@ -173,9 +205,33 @@ impl ReadOp {
             | ReadOp::RunStatus { .. }
             | ReadOp::PrList { .. }
             | ReadOp::WorkflowList { .. } => ToolEffect::ReadsOwn,
-            ReadOp::PrView { .. } | ReadOp::IssueView { .. } | ReadOp::RunLogs { .. } => {
-                ToolEffect::ReadsUntrusted
-            }
+            // The three added last are `ReadsUntrusted` for the reason the first three are, and it
+            // is worth saying what the reason is NOT. It is not that the output is long, or
+            // free-form, or unparsed: `RunList` is all three and is `ReadsOwn`. It is authorship.
+            // Everything `RunList`, `RunStatus`, `PrList` and `WorkflowList` return was written by
+            // whoever may already commit to the repository — the owner reading it is reading their
+            // own side. A diff on a pull request, the thread underneath it, and the output of a
+            // check the pull request's own workflow ran are all written by whoever OPENED it, and
+            // opening one takes no permission at all. That is a channel from any GitHub account
+            // into this turn's context, and it is exactly the channel the grading exists to mark.
+            //
+            // `ChecksForRef` is the one that looks structural and is not. The states are GitHub's;
+            // the check NAMES and their summaries come from the workflow files on the head ref,
+            // which on a fork are the contributor's. Grading it on the shape of the table rather
+            // than on who filled the table in is the mistake this comment exists to stop.
+            //
+            // What the grading costs, so that it is chosen and not stumbled into: the turn is
+            // latched. `effect_of_call` reads this through `effect_of_kind`, the answer comes back
+            // fenced by `fence_untrusted`, and `permitted_after_untrusted` refuses every `Acts`
+            // tool for the rest of the turn — `github_act` included. A run that reads the diff
+            // cannot then comment on the pull request. That is the trade, and for text a stranger
+            // chose it is the right way round.
+            ReadOp::PrView { .. }
+            | ReadOp::IssueView { .. }
+            | ReadOp::RunLogs { .. }
+            | ReadOp::PrFiles { .. }
+            | ReadOp::PrComments { .. }
+            | ReadOp::ChecksForRef { .. } => ToolEffect::ReadsUntrusted,
         }
     }
 
@@ -198,6 +254,19 @@ impl ReadOp {
                 [repo_flag(repo), "--log".to_owned()],
                 &[id.as_str()],
             ),
+            ReadOp::PrFiles { repo, number } => {
+                argv(&["pr", "diff"], [repo_flag(repo)], &[number.as_str()])
+            }
+            // `--comments` is a boolean this module writes, like `--log` above: it carries no caller
+            // value, so it may be a bare flag ahead of the terminator.
+            ReadOp::PrComments { repo, number } => argv(
+                &["pr", "view"],
+                [repo_flag(repo), "--comments".to_owned()],
+                &[number.as_str()],
+            ),
+            ReadOp::ChecksForRef { repo, r#ref } => {
+                argv(&["pr", "checks"], [repo_flag(repo)], &[r#ref.as_str()])
+            }
         }
     }
 
@@ -230,8 +299,20 @@ impl ReadOp {
                 number: IssueNumber::new("1").expect("the sample issue number is valid"),
             },
             ReadOp::RunLogs {
-                repo,
+                repo: repo.clone(),
                 id: RunId::new("1").expect("the sample run id is valid"),
+            },
+            ReadOp::PrFiles {
+                repo: repo.clone(),
+                number: PrNumber::new("1").expect("the sample pr number is valid"),
+            },
+            ReadOp::PrComments {
+                repo: repo.clone(),
+                number: PrNumber::new("1").expect("the sample pr number is valid"),
+            },
+            ReadOp::ChecksForRef {
+                repo,
+                r#ref: Branch::new("main").expect("the sample ref is valid"),
             },
         ];
         for operation in &every {
@@ -242,7 +323,10 @@ impl ReadOp {
                 | ReadOp::WorkflowList { .. }
                 | ReadOp::PrView { .. }
                 | ReadOp::IssueView { .. }
-                | ReadOp::RunLogs { .. } => {}
+                | ReadOp::RunLogs { .. }
+                | ReadOp::PrFiles { .. }
+                | ReadOp::PrComments { .. }
+                | ReadOp::ChecksForRef { .. } => {}
             }
         }
         every
@@ -446,9 +530,14 @@ impl Op {
 pub struct ReadRequest {
     pub operation: String,
     pub repo: String,
-    /// A run id for `run_status` and `run_logs`, a number for `pr_view` and `issue_view`, and
-    /// nothing at all for the three listings. One field rather than three, because the model reading
-    /// this has to fill in one thing and choosing which name it is called by is not that thing.
+    /// A run id for `run_status` and `run_logs`, a pull request number for `pr_view`, `pr_files` and
+    /// `pr_comments`, an issue number for `issue_view`, a REF for `checks_for_ref`, and nothing at
+    /// all for the three listings. One field rather than five, because the model reading this has to
+    /// fill in one thing and choosing which name it is called by is not that thing.
+    ///
+    /// `checks_for_ref` is the arm where the name fits worst and the field still earns its keep: the
+    /// alternative is a second optional string that is empty for every other operation, which is how
+    /// a caller ends up filling in neither.
     pub id: Option<String>,
 }
 
@@ -508,6 +597,21 @@ impl ReadOp {
             "issue_view" => Ok(ReadOp::IssueView {
                 repo,
                 number: IssueNumber::new(&required(id, "issue_view", "issue number")?)?,
+            }),
+            "pr_files" => Ok(ReadOp::PrFiles {
+                repo,
+                number: PrNumber::new(&required(id, "pr_files", "pull request number")?)?,
+            }),
+            "pr_comments" => Ok(ReadOp::PrComments {
+                repo,
+                number: PrNumber::new(&required(id, "pr_comments", "pull request number")?)?,
+            }),
+            // The one operation whose `id` is not a number. The field is still `id`, because the
+            // flat parameters exist to give the model ONE thing to fill in — the doc on that field
+            // is where the difference is said, not in a second field nobody would know to use.
+            "checks_for_ref" => Ok(ReadOp::ChecksForRef {
+                repo,
+                r#ref: Branch::new(&required(id, "checks_for_ref", "ref")?)?,
             }),
             // Every acting operation is named here rather than falling into the unknown arm, because
             // a caller told "unknown operation: pr_comment" would think it had misspelled something.
@@ -1940,16 +2044,121 @@ mod tests {
         }
     }
 
-    /// The three reads that carry a stranger's prose are marked, and the three that carry structure
-    /// are not. Getting this backwards is the whole failure the per-operation effect exists to stop.
+    /// The six reads that carry a stranger's words are marked, and the four that carry structure are
+    /// not. Getting this backwards is the whole failure the per-operation effect exists to stop.
+    ///
+    /// The list is written out here rather than derived, and the duplication is the point: `effect`
+    /// is one `match` and a test that read it back would agree with whatever that `match` said. A
+    /// new variant defaults to `ReadsOwn` in the `_` arm below, so an author who grades a stranger's
+    /// text as structure fails here and reads the grading again.
     #[test]
     fn prose_is_untrusted_and_structure_is_not() {
         for op in ReadOp::all() {
             let expected = match op.kind() {
-                "pr_view" | "issue_view" | "run_logs" => ToolEffect::ReadsUntrusted,
+                "pr_view" | "issue_view" | "run_logs" | "pr_files" | "pr_comments"
+                | "checks_for_ref" => ToolEffect::ReadsUntrusted,
                 _ => ToolEffect::ReadsOwn,
             };
             assert_eq!(op.effect(), expected, "{}", op.kind());
+        }
+    }
+
+    /// The three reads added for a stranger's words, each in the shape its grading claims.
+    ///
+    /// It asserts the argv as well as the effect, because the grading is a claim ABOUT the argv: a
+    /// `pr_files` that had quietly become `gh pr view` would still say `ReadsUntrusted` and would no
+    /// longer be reading a diff. And it asserts the effect through `effect_of_kind`, which is the
+    /// route `mcp_tools::effect_of_call` actually takes — the one that latches the turn.
+    #[test]
+    fn the_three_reads_that_carry_a_strangers_words_say_so() {
+        let number = PrNumber::new("42").expect("42 is a pull request number");
+        let expected: [(ReadOp, Vec<&str>); 3] = [
+            (
+                ReadOp::PrFiles {
+                    repo: repo(),
+                    number: number.clone(),
+                },
+                vec!["pr", "diff", "--repo=owner/name", "--", "42"],
+            ),
+            (
+                ReadOp::PrComments {
+                    repo: repo(),
+                    number,
+                },
+                vec!["pr", "view", "--repo=owner/name", "--comments", "--", "42"],
+            ),
+            (
+                ReadOp::ChecksForRef {
+                    repo: repo(),
+                    r#ref: Branch::new("main").expect("main is a ref"),
+                },
+                vec!["pr", "checks", "--repo=owner/name", "--", "main"],
+            ),
+        ];
+
+        for (op, argv) in expected {
+            assert_eq!(op.argv(), argv, "{}", op.kind());
+            assert_eq!(op.effect(), ToolEffect::ReadsUntrusted, "{}", op.kind());
+            assert_eq!(
+                ReadOp::effect_of_kind(op.kind()),
+                Some(ToolEffect::ReadsUntrusted),
+                "{} has to be untrusted on the route effect_of_call takes",
+                op.kind()
+            );
+            // A read is a read: the partition does not bend for the grading.
+            assert!(!ActOp::all().iter().any(|act| act.kind() == op.kind()));
+        }
+
+        // The near-miss, pinned in both directions rather than left to be discovered on a Friday.
+        assert!(
+            ReadOp::from_request(ReadRequest {
+                operation: "pr_comment".to_owned(),
+                repo: "owner/name".to_owned(),
+                id: Some("42".to_owned()),
+            })
+            .expect_err("pr_comment acts")
+            .contains("github_act"),
+            "the acting singular is sent to the acting tool"
+        );
+        assert!(
+            ActOp::from_request(ActRequest {
+                operation: "pr_comments".to_owned(),
+                repo: Some("owner/name".to_owned()),
+                id: Some("42".to_owned()),
+                ..ActRequest::default()
+            })
+            .expect_err("pr_comments only reads")
+            .contains("github_read"),
+            "the reading plural is sent to the reading tool"
+        );
+    }
+
+    /// None of the three is declarable, and that is the decision rather than an oversight.
+    ///
+    /// `READ_CEILING` is what a project may be granted, and it holds only reads of structural shape
+    /// — the constant's own doc refuses `gh pr view` in those words. These three return a stranger's
+    /// text by definition, so admitting them would contradict the sentence that admits anything at
+    /// all. They are reachable the way `pr_view` and `issue_view` are: a run asks for one, gets it,
+    /// and pays the turn's right to act for it.
+    #[test]
+    fn a_stranger_carrying_read_is_reachable_and_not_declarable() {
+        let widest = Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: READ_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            autonomous_actions: Vec::new(),
+        });
+        for op in ReadOp::all()
+            .into_iter()
+            .filter(|op| op.effect() == ToolEffect::ReadsUntrusted)
+        {
+            assert!(
+                !widest.read_is_autonomous(&format!("gh {}", op.argv().join(" "))),
+                "{} returns a stranger's words and may not be autonomous",
+                op.kind()
+            );
         }
     }
 
@@ -1966,8 +2175,14 @@ mod tests {
 
     /// Every caller value is either behind `--` or inside a `--flag=value`. Nothing this module
     /// builds hands `gh` a bare `--flag value` pair carrying a caller's string.
+    ///
+    /// The exceptions are the module's own BOOLEANS, and that is the whole rule they satisfy: a flag
+    /// that takes no value cannot be followed by a caller's string, so it consumes nothing and can
+    /// stand bare. Named one by one rather than waved through by a prefix check — the day a flag
+    /// that DOES take a value is added, the failure should be here and not in a shell.
     #[test]
     fn no_caller_value_reaches_argv_where_it_could_act_as_a_flag() {
+        const OUR_OWN_BOOLEANS: &[&str] = &["--log", "--comments"];
         for op in Op::all() {
             let argv = op.argv();
             let terminator = argv.iter().position(|part| part == "--");
@@ -1978,7 +2193,7 @@ mod tests {
                 assert!(
                     !part.starts_with("--")
                         || part.contains('=')
-                        || part == "--log"
+                        || OUR_OWN_BOOLEANS.contains(&part.as_str())
                         || part == "--",
                     "{} puts {part} on the command line as a bare flag",
                     op.kind()

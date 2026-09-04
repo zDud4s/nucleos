@@ -206,12 +206,14 @@ struct BrowserHandoffParams {
 /// right wire shape and the wrong prompt.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct GithubReadParams {
-    /// One of: run_list, pr_list, workflow_list, run_status, run_logs, pr_view, issue_view.
+    /// One of: run_list, pr_list, workflow_list, run_status, run_logs, pr_view, issue_view,
+    /// pr_files, pr_comments, checks_for_ref.
     operation: String,
     /// The repository, as owner/name.
     repo: String,
-    /// A run id for run_status and run_logs, a number for pr_view and issue_view. The three
-    /// listings take none.
+    /// A run id for run_status and run_logs, a pull request number for pr_view, pr_files and
+    /// pr_comments, an issue number for issue_view, a ref for checks_for_ref. The three listings
+    /// take none.
     id: Option<String>,
 }
 
@@ -1127,10 +1129,11 @@ impl NucleosTools {
 
     #[tool(
         description = "Read something from GitHub through NucleOS. Structural reads — run_list, \
-                       pr_list, workflow_list, run_status — cost the turn nothing. The three that \
-                       return text somebody else wrote — pr_view, issue_view, run_logs — MARK the turn, and \
-                       every acting tool is refused for the rest of it, this one included. That is \
-                       deliberate: read the prose when you need the prose, and do the acting first."
+                       pr_list, workflow_list, run_status — cost the turn nothing. The six that \
+                       return text somebody else wrote — pr_view, issue_view, run_logs, pr_files, \
+                       pr_comments, checks_for_ref — MARK the turn, and every acting tool is \
+                       refused for the rest of it, this one included. That is deliberate: read the \
+                       prose when you need the prose, and do the acting first."
     )]
     async fn github_read(
         &self,
@@ -4023,7 +4026,14 @@ mod tests {
     async fn pr_view_marks_the_turn_and_run_status_does_not() {
         let pool = test_pool().await;
 
-        for operation in ["pr_view", "issue_view", "run_logs"] {
+        for operation in [
+            "pr_view",
+            "issue_view",
+            "run_logs",
+            "pr_files",
+            "pr_comments",
+            "checks_for_ref",
+        ] {
             assert_eq!(
                 effect_of_call(
                     &pool,
@@ -4037,7 +4047,7 @@ mod tests {
             );
         }
 
-        for operation in ["run_status", "run_list", "pr_list"] {
+        for operation in ["run_status", "run_list", "pr_list", "workflow_list"] {
             assert_eq!(
                 effect_of_call(
                     &pool,
