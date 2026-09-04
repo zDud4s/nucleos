@@ -413,18 +413,36 @@ pub async fn pretooluse_decision(
     // lists say what may run at all, not where a path may point, and a run that has left
     // `run_handles` is precisely when losing that project's `deny` would cost the most. One more
     // column on a query that already ran, so the reach costs nothing.
-    let (cwd, mode, project_id) =
-        match sqlx::query_as::<_, (Option<String>, String, Option<String>)>(
-            "SELECT cwd, mode, project_id FROM runs WHERE id = ?",
+    //
+    // `permission_mode` rides along for the same sentence, and it is the SNAPSHOT the turn started
+    // with rather than what the conversation's selector says now: moving the menu while a turn is
+    // running must not change the rules underneath it. NULL means no CLI turn wrote one — every
+    // autopilot run, and every turn the local brain answered — and reads as `Auto`, which is what a
+    // rooted conversation did before the column existed. One more column on a query that already
+    // ran, so the reach costs nothing.
+    let (cwd, mode, project_id, permission) =
+        match sqlx::query_as::<_, (Option<String>, String, Option<String>, Option<String>)>(
+            "SELECT cwd, mode, project_id, permission_mode FROM runs WHERE id = ?",
         )
         .bind(run_id)
         .fetch_optional(&state.pool)
         .await
         {
-            Ok(Some((cwd, mode, project_id))) => {
-                (is_in_flight.then_some(cwd).flatten(), mode, project_id)
-            }
-            Ok(None) => (None, "real".to_owned(), None),
+            Ok(Some((cwd, mode, project_id, permission))) => (
+                is_in_flight.then_some(cwd).flatten(),
+                mode,
+                project_id,
+                permission.as_deref().map_or(
+                    crate::chats::PermissionMode::Auto,
+                    crate::chats::PermissionMode::from_wire,
+                ),
+            ),
+            Ok(None) => (
+                None,
+                "real".to_owned(),
+                None,
+                crate::chats::PermissionMode::Auto,
+            ),
             // `mode` decides WHICH set of rules applies, so an unreadable one cannot resolve to the
             // most permissive of them. `Ok(None)` above can safely default to `real` because the row is
             // genuinely absent — there is no run whose rules we are guessing at. An `Err` is different:
@@ -486,7 +504,8 @@ pub async fn pretooluse_decision(
         // and the branch below would deny every one of those calls — leaving it holding tools it can
         // never use, which is worse than not having them.
         if let Some(root) = rooted_turn(&state, run_id).await {
-            return rooted_decision(&state, &payload, &root, project_id.as_deref()).await;
+            return rooted_decision(&state, &payload, &root, project_id.as_deref(), permission)
+                .await;
         }
         return assistant_decision(&state, &payload).await;
     }
@@ -1132,11 +1151,60 @@ pub(crate) const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and 
 ///
 /// The turn survives either way, which is the property the orchestrator branch was protecting: the
 /// hook never terminates a conversation and never leaves a proposal behind it.
+/// What `bypass` says when it lowers a refusal to a question.
+///
+/// BOTH reasons are rewritten where this is used, not one. `Classification` carries the sentence
+/// twice — on the `Decision` and again at the top — and `downgrade_if_unreadable` already rewrites
+/// both when it makes this same move. Leaving the old one would label the question in the window
+/// "destructive deletion commands are denied", which is the sentence of a refusal that has just
+/// stopped existing.
+const BYPASS_STILL_ASKS: &str =
+    "this conversation does not ask about anything else, and asks about this: it deletes";
+
+/// Which of the classifier's `allow`s survive this rung.
+///
+/// The ladder is the CLI's own, and what separates its steps is not what the classifier DECIDED but
+/// which of its allows a person is willing to have run unasked. The classifier already answers
+/// `allow` for `Edit` and `Write` inside the workspace — they share the `read-local` branch with the
+/// reads — so a rung that left the verdict alone would be `auto` under another name.
+///
+/// **`action_class` and NOT `only_reads`, and this is the biggest practical decision in the file.**
+/// `only_reads` is a list of five TOOLS with `Bash` deliberately outside it, so a `manual` built on
+/// its negation asks about every shell command a turn makes — `ls`, `git status`, `cargo check` —
+/// five to fifteen questions a turn, each one blocking its own hook call against a 45-second window.
+/// That is not what the CLI's own unelevated rung does, and it does not need building: this
+/// classifier already answers `read-local` for a recognised non-mutating shell command. The two
+/// questions are different and `only_reads`' own doc says so — it asks whether a TOOL can write
+/// whatever it is handed, which is the right question for the third-party-text barrier; the class
+/// asks whether THIS action changes anything, which is the right question here.
+///
+/// `WRITE_TOOLS` is subtracted from `manual` for the mirror-image reason: `read-local` covers
+/// ordinary in-workspace writes too, and those are the next rung up, not this one.
+fn allowed_at(
+    permission: crate::chats::PermissionMode,
+    action_class: &str,
+    tool_name: &str,
+) -> bool {
+    match permission {
+        crate::chats::PermissionMode::Manual => {
+            action_class == "read-local" && !crate::classifier::writes_files(tool_name)
+        }
+        crate::chats::PermissionMode::AcceptEdits => action_class == "read-local",
+        // Everything the classifier was willing to allow. `plan` is here and not one rung down
+        // because its restraint comes from the CLI's own flag: a planning turn still reaches for
+        // tools, and those calls arrive here and are governed exactly as `auto`'s are.
+        crate::chats::PermissionMode::Plan
+        | crate::chats::PermissionMode::Auto
+        | crate::chats::PermissionMode::Bypass => true,
+    }
+}
+
 async fn rooted_decision(
     state: &AppState,
     payload: &PreToolUsePayload,
     root: &str,
     project_id: Option<&str>,
+    permission: crate::chats::PermissionMode,
 ) -> Json<Decision> {
     // Corrected in the handler before this is called, so it is the turn that is actually running
     // rather than the one a living process was spawned for.
@@ -1166,7 +1234,7 @@ async fn rooted_decision(
             std::borrow::Cow::Borrowed(&state.github.policy),
         )
     };
-    let classification = rules.downgrade_if_unreadable(crate::classifier::classify(
+    let mut classification = crate::classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         Some(Path::new(root)),
@@ -1180,7 +1248,52 @@ async fn rooted_decision(
         // A rooted turn is a conversation. Somebody asked for it AND is sitting in front of it, so
         // a park costs them ten seconds and buys the strict reading.
         crate::classifier::Unrecognized::AsksAPerson,
-    ));
+    );
+
+    // **`bypass` moves the VERDICT. It does not move the path.**
+    //
+    // Lowering the answer here and letting control fall through is not a style choice against
+    // jumping to `ask_about` from the `deny` return below. That jump would step over the
+    // third-party-text barrier a few lines down — for precisely the family this mode lowers — so a
+    // turn that had read a stranger's words and then reached for `rm -rf` would be ASKED about
+    // instead of refused, and a person could say yes. Falling through goes past the barrier by
+    // construction rather than by somebody remembering to.
+    //
+    // What lowers and what does not comes to one sentence: this mode lowers a refusal about a
+    // command's SHAPE, and never one about where the command POINTS, what somebody DECLARED, or a
+    // fact about the TURN. So `destructive` — the two blind text tests — becomes a question, and
+    // `destructive-outside`, `outside-workspace` and `project-denied` stay refusals. A class this
+    // match has never heard of stays a refusal too: whoever adds a fourth family of `deny` should
+    // not have to know this code exists for it to fail in the safe direction.
+    //
+    // The other half is the rung's whole purpose: what the rules would have ASKED about, this mode
+    // runs. That is what somebody chose when they chose it — no second opinion, no latency, no
+    // model bill — and it is still not silent about the one thing it lowers.
+    if permission == crate::chats::PermissionMode::Bypass {
+        // Read out first: matching on the struct borrows it for every arm, and two of them write
+        // to it.
+        let verdict = classification.decision.decision.clone();
+        match (verdict.as_str(), classification.action_class) {
+            ("deny", "destructive") => {
+                classification.decision.decision = "pending_approval".to_owned();
+                classification.decision.reason = BYPASS_STILL_ASKS.to_owned();
+                classification.reason = BYPASS_STILL_ASKS.to_owned();
+            }
+            ("pending_approval", _) => {
+                classification.decision.decision = "allow".to_owned();
+            }
+            _ => {}
+        }
+    }
+
+    // AFTER the mode, and never before it. This turns an `allow` into a `pending_approval` when the
+    // project's own lists could not be read, and no rung of this ladder lifts that: an unreadable
+    // `deny` list is the "somebody may have declared this" case, which is exactly what `bypass`
+    // above refuses to lower. Run first, its downgrade would be promoted straight back to `allow`
+    // by the arm above — handing bypass the free pass that
+    // `rules_that_cannot_be_read_cost_an_approval_and_never_an_allow` exists to refuse.
+    let classification = rules.downgrade_if_unreadable(classification);
+
     if classification.decision.decision == "deny" {
         return Json(Decision {
             decision: "deny".to_owned(),
@@ -1228,7 +1341,10 @@ async fn rooted_decision(
         }
     }
 
-    if classification.decision.decision == "allow" {
+    // The rung decides which allows survive; everything else falls through to the question below.
+    if classification.decision.decision == "allow"
+        && allowed_at(permission, classification.action_class, &payload.tool_name)
+    {
         return Json(Decision {
             decision: "allow".to_owned(),
             reason: classification.reason,
@@ -3773,7 +3889,13 @@ mod tests {
         );
         let decision = decide(&app, &body).await;
         assert_eq!(decision.decision, "deny");
-        assert_eq!(decision.reason, "destructive deletion commands are denied");
+        // The class this delete answers to is the one about the boundary, not the one about `rm
+        // -rf`'s shape — which is what this test was always demonstrating and what the reason now
+        // says out loud.
+        assert_eq!(
+            decision.reason,
+            "deletions that reach outside the workspace are denied"
+        );
 
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
@@ -4535,6 +4657,10 @@ mod tests {
 
     /// An in-flight turn of a conversation ROOTED in `root` — one continuing a session had in the
     /// IDE. Returns the run id.
+    ///
+    /// Writes NO `permission_mode`, deliberately: every caller of this therefore also pins that a
+    /// run whose column is NULL is governed as `auto`, which is what a rooted conversation did
+    /// before the column existed and what an older row still holds.
     async fn rooted_turn_run(state: &AppState, root: &str) -> i64 {
         let chat_id = crate::chats::create(
             &state.pool,
@@ -4551,6 +4677,367 @@ mod tests {
             .await
             .unwrap();
         run_id
+    }
+
+    /// The same turn, started on a named rung.
+    ///
+    /// The run's own column and not the chat's, which is the whole point of there being two: the
+    /// hook reads what this turn STARTED with, so that moving the selector mid-turn cannot change
+    /// the rules underneath a turn already running.
+    async fn rooted_turn_on(
+        state: &AppState,
+        root: &str,
+        permission: crate::chats::PermissionMode,
+    ) -> i64 {
+        let run_id = rooted_turn_run(state, root).await;
+        sqlx::query("UPDATE runs SET permission_mode = ? WHERE id = ?")
+            .bind(permission.as_str())
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run_id
+    }
+
+    /// The four probes the ladder is measured with, each one a different `action_class`.
+    fn probe(run_id: i64, tool: &str, input: serde_json::Value) -> String {
+        serde_json::json!({ "run_id": run_id, "tool_name": tool, "tool_input": input }).to_string()
+    }
+
+    /// `manual` asks before anything changes, and before nothing else.
+    ///
+    /// The second half is the load-bearing one and it is why this rung is built on `action_class`
+    /// rather than on `only_reads`: that list holds five TOOLS and `Bash` is deliberately outside
+    /// it, so a rung built on its negation asks about `ls`, `git status` and `cargo check` too —
+    /// five to fifteen questions a turn, each blocking its own hook call. `git status` coming back
+    /// `allow` is what says this rung was not built that way.
+    #[tokio::test]
+    async fn manual_asks_before_an_edit_and_never_before_a_read_or_a_status() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await;
+
+        assert_eq!(
+            decide(
+                &app,
+                &probe(run_id, "Read", serde_json::json!({"file_path": "a.rs"}))
+            )
+            .await
+            .decision,
+            "allow",
+            "reading changes nothing"
+        );
+        assert_eq!(
+            decide(
+                &app,
+                &probe(run_id, "Bash", serde_json::json!({"command": "git status"}))
+            )
+            .await
+            .decision,
+            "allow",
+            "a recognised non-mutating command changes nothing either — this is the half that \
+             stops the rung being rebuilt on `only_reads`"
+        );
+        assert_eq!(
+            decide(
+                &app,
+                &probe(
+                    run_id,
+                    "Write",
+                    serde_json::json!({"file_path": "C:/Projects/nucleos/a.rs", "content": "x"})
+                )
+            )
+            .await
+            .decision,
+            "asking",
+            "an edit is exactly what this rung promises to be asked about"
+        );
+    }
+
+    /// `accept_edits` adds the edits and stops there.
+    ///
+    /// The pair is the test. The classifier already answers `allow` for `Edit` and `Write` inside
+    /// the workspace — they share the `read-local` branch with the reads — so a rung that left the
+    /// verdict alone would be `auto` wearing another name, and only the SECOND assertion catches
+    /// that. `git add -A` is `allow`/`vcs-local`: a class `auto` runs and this rung does not.
+    #[tokio::test]
+    async fn accept_edits_adds_the_edits_and_still_asks_about_the_class_above_them() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let editing = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::AcceptEdits,
+        )
+        .await;
+        let auto = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Auto,
+        )
+        .await;
+
+        let write = |run_id| {
+            probe(
+                run_id,
+                "Write",
+                serde_json::json!({"file_path": "C:/Projects/nucleos/a.rs", "content": "x"}),
+            )
+        };
+        let staging = |run_id| probe(run_id, "Bash", serde_json::json!({"command": "git add -A"}));
+
+        assert_eq!(decide(&app, &write(editing)).await.decision, "allow");
+        assert_eq!(
+            decide(&app, &staging(editing)).await.decision,
+            "asking",
+            "a class beyond the edits must still be asked about, or this rung is `auto`"
+        );
+        assert_eq!(
+            decide(&app, &staging(auto)).await.decision,
+            "allow",
+            "and `auto` must run the very thing the rung above asked about, or the pair proves \
+             nothing"
+        );
+    }
+
+    /// `bypass` runs what the rules would have asked about. That is the whole of what it buys.
+    #[tokio::test]
+    async fn bypass_runs_what_the_rules_would_have_asked_about() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let asking = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Auto,
+        )
+        .await;
+        let running = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Bypass,
+        )
+        .await;
+
+        let unrecognised = |run_id| {
+            probe(
+                run_id,
+                "Bash",
+                serde_json::json!({"command": "npm install"}),
+            )
+        };
+
+        assert_eq!(decide(&app, &unrecognised(asking)).await.decision, "asking");
+        assert_eq!(decide(&app, &unrecognised(running)).await.decision, "allow");
+    }
+
+    /// The one thing `bypass` asks about, and it is not a technicality.
+    ///
+    /// `rm -rf target` is the case this whole mode was argued from: 11.8 GB of a stale build
+    /// directory that somebody goes to a terminal to delete by hand, which is what the asking window
+    /// exists to end. The scope is wider than the friendly example, and that is stated rather than
+    /// discovered — ANY `rm -rf` inside the workspace becomes a question here, `rm -rf ./core/src`
+    /// included.
+    #[tokio::test]
+    async fn bypass_still_asks_about_a_delete_inside_the_workspace() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Bypass,
+        )
+        .await;
+
+        for command in ["rm -rf target", "rm -rf ./core/src"] {
+            let decision = decide(
+                &app,
+                &probe(run_id, "Bash", serde_json::json!({"command": command})),
+            )
+            .await;
+            assert_eq!(decision.decision, "asking", "{command}");
+            assert_eq!(
+                decision.reason, BYPASS_STILL_ASKS,
+                "{command}: the question must not be labelled with the refusal it replaced"
+            );
+        }
+    }
+
+    /// What `bypass` never lowers: where a command POINTS, and what somebody DECLARED.
+    ///
+    /// `rm -rf /` is the sharp one. It matches `"rm -rf"` in the blind phrase list too, so a split
+    /// of the destructive family that kept the code's original disjunct order would have labelled it
+    /// `destructive` and let this mode turn it into a question somebody can say yes to. It comes
+    /// back `destructive-outside` because the target is asked about first.
+    ///
+    /// `destructive-outside` is also a class the lowering `match` does not name, so this is the
+    /// assertion that an unnamed `deny` family falls through to a refusal rather than to a widening
+    /// — whoever adds a fourth one does not have to know this code exists for it to fail safely.
+    #[tokio::test]
+    async fn bypass_never_lowers_a_refusal_about_where_a_command_points_or_what_a_project_declared()
+    {
+        let state = test_state().await;
+        crate::project_policy::declare_shell_rule(
+            &state.pool,
+            "alpha",
+            "npm ci",
+            crate::project_policy::Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Bypass,
+        )
+        .await;
+        sqlx::query("UPDATE runs SET project_id = 'alpha' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        for (label, tool, input) in [
+            (
+                "a delete that reaches outside the workspace",
+                "Bash",
+                serde_json::json!({"command": "rm -rf /"}),
+            ),
+            (
+                "a write outside the workspace",
+                "Write",
+                serde_json::json!({"file_path": "C:/Windows/System32/x", "content": "x"}),
+            ),
+            (
+                "a command this project denied",
+                "Bash",
+                serde_json::json!({"command": "npm ci"}),
+            ),
+        ] {
+            assert_eq!(
+                decide(&app, &probe(run_id, tool, input)).await.decision,
+                "deny",
+                "{label}"
+            );
+        }
+    }
+
+    /// The single assertion that separates the correct implementation from the tempting one.
+    ///
+    /// Lowering the verdict and letting control fall through passes the third-party-text barrier by
+    /// construction. Jumping from the `deny` return straight to `ask_about` — which reads like the
+    /// same change and is shorter — steps OVER that barrier, for precisely the family this mode
+    /// lowers: a turn holding a stranger's words would be asked about `rm -rf` instead of refused,
+    /// and a person could say yes.
+    #[tokio::test]
+    async fn bypass_over_a_turn_that_read_third_party_text_is_refused_and_not_asked() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Bypass,
+        )
+        .await;
+        crate::runs::mark_untrusted_context(&state.pool, run_id)
+            .await
+            .unwrap();
+
+        let decision = decide(
+            &app,
+            &probe(
+                run_id,
+                "Bash",
+                serde_json::json!({"command": "rm -rf target"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, UNTRUSTED_CONTEXT_DENY_REASON);
+    }
+
+    /// A refusal stays a refusal on every rung below `bypass` — including `accept_edits`, the one
+    /// most likely to be written as a union of allowed sets laid over the `deny` return.
+    #[tokio::test]
+    async fn the_rungs_below_bypass_leave_a_refusal_a_refusal() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        for permission in [
+            crate::chats::PermissionMode::Manual,
+            crate::chats::PermissionMode::AcceptEdits,
+            crate::chats::PermissionMode::Plan,
+            crate::chats::PermissionMode::Auto,
+        ] {
+            let run_id = rooted_turn_on(&state, "C:/Projects/nucleos", permission).await;
+            assert_eq!(
+                decide(
+                    &app,
+                    &probe(
+                        run_id,
+                        "Bash",
+                        serde_json::json!({"command": "rm -rf target"})
+                    )
+                )
+                .await
+                .decision,
+                "deny",
+                "{permission:?}"
+            );
+        }
+    }
+
+    /// The reason the run carries a column of its own.
+    ///
+    /// The hook reads the turn's SNAPSHOT, not the conversation's current setting. Without that,
+    /// moving the selector while a turn is running would change the rules underneath a turn already
+    /// running — and the hook reads this once per tool call, minutes after the turn began.
+    #[tokio::test]
+    async fn the_hook_reads_the_turns_snapshot_and_not_the_conversations_current_setting() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await;
+
+        // Somebody moves the selector to the widest rung while the turn is mid-answer.
+        let chat_id: String = sqlx::query_scalar("SELECT chat_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        crate::chats::set_permission_mode(
+            &state.pool,
+            &chat_id,
+            crate::chats::PermissionMode::Bypass,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            decide(
+                &app,
+                &probe(
+                    run_id,
+                    "Write",
+                    serde_json::json!({"file_path": "C:/Projects/nucleos/a.rs", "content": "x"})
+                )
+            )
+            .await
+            .decision,
+            "asking",
+            "this turn started on `manual` and finishes on it"
+        );
     }
 
     /// The whole point of the rooted branch: an ordinary orchestrator turn is denied a `Read`, and

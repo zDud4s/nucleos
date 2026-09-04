@@ -2474,6 +2474,50 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             .unwrap_or(crate::chats::PermissionMode::Auto);
         let permission = crate::runner::Permission::for_chat(mode);
 
+        // The turn's SNAPSHOT, written before anything can observe it.
+        //
+        // The read above is a property of the conversation at this instant. The hook reads the same
+        // fact again, once per tool call, minutes later — so it has to be written somewhere a tool
+        // call can find it, and it cannot be the chat's row: moving the selector while a turn is
+        // running would change the rules underneath a turn already running. That is the whole
+        // reason `runs.permission_mode` exists, and what makes it a snapshot rather than a second
+        // copy free to disagree — written once, here, and never read by the selector.
+        //
+        // **The ORDER gives the invariant for free.** This write, then the `RunRequest`, then the
+        // runner. The CLI process does not exist until this row says what it is running under, so
+        // no tool call of a cloud turn can observe a NULL.
+        //
+        // **A failed write refuses the turn.** It does not fall back to `auto`: somebody who chose
+        // `manual` would silently be handed something WIDER than they asked for, and "unknown reads
+        // as auto" is only safe downward. `mint_chat_token` above fails in the same direction and
+        // for the same reason — of the two ways to be wrong here, only one leaves a run acting with
+        // nobody watching.
+        if let Err(error) = sqlx::query("UPDATE runs SET permission_mode = ? WHERE id = ?")
+            .bind(mode.as_str())
+            .bind(id)
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(
+                run_id = id,
+                chat_id = %turn.slot.chat_id,
+                %error,
+                "could not record this turn's permission mode — refusing the turn rather than running it wider than it was asked for"
+            );
+            let failed = sqlx::query(
+                "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(format!(
+                "could not record this turn's permission mode, so it was refused rather than run under a wider one: {error}"
+            ))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await;
+            crate::runs::warn_on_terminal_write_err(&failed, id, "failed");
+            return;
+        }
+
         // Who answers this turn, and how hard they are asked to think. Read HERE, beside `planning`
         // and for its reason: both are properties of the conversation at the moment it answers, and
         // somebody who changed the model while reading the last reply meant this turn and not the
@@ -6889,6 +6933,126 @@ mod tests {
         assert_eq!(
             *fake.last_permission.lock().unwrap(),
             Some(crate::runner::Permission::Plan)
+        );
+    }
+
+    /// The row says what this turn was governed by, which is what the hook reads back.
+    ///
+    /// `accept_edits` rather than `plan`, on purpose: `plan` is also a CLI flag, so a test using it
+    /// could pass on the flag alone and say nothing about the column. This rung and `manual` and
+    /// `auto` are invisible on the command line — they live entirely in what the hook lets through
+    /// — so the column is the only place the fact can be.
+    #[tokio::test]
+    async fn a_cloud_turn_records_the_mode_it_started_with() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "recorded").await;
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "recorded",
+            crate::chats::PermissionMode::AcceptEdits,
+        )
+        .await
+        .unwrap();
+
+        let id = send_message(&state, "recorded", "muda isto", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.as_deref(), Some("accept_edits"));
+    }
+
+    /// A turn the local brain answered records NOTHING, and the NULL is the invariant.
+    ///
+    /// `spawn_local_turn` writes its own INSERT four hundred lines from the cloud one, never builds
+    /// a `RunRequest`, and never fires a `PreToolUse` hook — so there are no permissions to govern
+    /// on that path. Filling the column there would be the easiest possible version of this feature
+    /// to write and the one that does nothing: green tests, and `NULL` on every turn that actually
+    /// runs a CLI. `permission_mode IS NULL` means "no CLI was involved", and this is what keeps
+    /// that true.
+    #[tokio::test]
+    async fn a_turn_the_local_brain_answered_records_no_mode_at_all() {
+        let local = AppState {
+            assistants: Arc::new(FixedAssistants(fake_local_assistant("answered here"))),
+            ..test_state().await
+        };
+        crate::chats::set_brain(&local.pool, "a-local-chat", crate::chats::Brain::Local)
+            .await
+            .unwrap();
+        crate::chats::set_permission_mode(
+            &local.pool,
+            "a-local-chat",
+            crate::chats::PermissionMode::Bypass,
+        )
+        .await
+        .unwrap();
+
+        let id = send_message(&local, "a-local-chat", "olá", Origin::Shell)
+            .await
+            .unwrap();
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&local.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            recorded, None,
+            "the conversation says `bypass` and no CLI is being launched, so the run must say \
+             nothing rather than claim a mode nothing will read"
+        );
+    }
+
+    /// A turn whose mode could not be written down is refused, not run under a wider one.
+    ///
+    /// The degrade is only safe downward. Falling back to `auto` here would hand somebody who chose
+    /// `manual` a turn that edits without asking — and it would do it silently, on the one path
+    /// where nothing else would say so. `mint_chat_token` thirty lines above fails in the same
+    /// direction, and this is the same argument.
+    ///
+    /// The write is broken with a trigger because that is the only honest way to fail exactly this
+    /// statement from outside: the column cannot be dropped without rebuilding `runs`, and breaking
+    /// the table wholesale would fail the turn somewhere earlier and prove nothing about this line.
+    #[tokio::test]
+    async fn a_turn_whose_mode_could_not_be_recorded_is_refused_rather_than_widened() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "unrecordable").await;
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "unrecordable",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER no_permission_mode BEFORE UPDATE OF permission_mode ON runs
+             BEGIN SELECT RAISE(ABORT, 'the column will not take a value today'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let id = send_message(&state, "unrecordable", "faz isso", Origin::Shell)
+            .await
+            .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+
+        assert_eq!(status, "failed");
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            0,
+            "the CLI must not have been launched at all — a run that started is a run that acted"
         );
     }
 
