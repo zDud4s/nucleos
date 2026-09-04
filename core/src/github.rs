@@ -1119,9 +1119,10 @@ impl GhForm {
     /// `gh`'s short `--limit` while `-l` is its short `--label`. Two functions asked to agree about
     /// one command line had better fold case in the same places.
     ///
-    /// **A switch this row does not name is ignored rather than disqualifying.** `gh pr list --json
-    /// body` is `pr_list` here, and what refuses it is `REFUSED_READ_FLAGS`, one question later.
-    /// Naming an operation and judging it are two questions, and this answers only the first.
+    /// **A switch this row does not name does not stop the row from matching.** `gh pr list --state
+    /// open` is `pr_list` here, and so is `gh pr list --json body`: this step asks only which
+    /// operation the words describe. Whether that naming SURVIVES a flag which changes what comes
+    /// back is a second question, and `op_kind_of_gh_command` is where it is asked.
     fn matches(&self, arguments: &[String]) -> bool {
         let Some(rest) = arguments.get(self.subcommand.len()..) else {
             return false;
@@ -1160,29 +1161,37 @@ impl GhForm {
 /// looks alike. That second rule is the one sentence of this map not read off the data, and
 /// `no_caller_value_reaches_argv_where_it_could_act_as_a_flag` is what keeps it true — that test
 /// even spells out the same two booleans, as the list this function computes instead.
-fn gh_forms() -> Vec<GhForm> {
-    Op::all()
-        .iter()
-        .map(|op| {
-            let mut subcommand = Vec::new();
-            let mut switches = Vec::new();
-            for word in op.argv() {
-                if word == "--" {
-                    break;
+///
+/// **Built once.** Nothing calls it yet, but its first caller is the classifier's path, which runs
+/// for every Bash tool call a run makes — and rebuilding sixteen argvs per command line would be a
+/// cost with nothing bought by it. The function is pure and the operations do not change while the
+/// process lives, which is the whole precondition a `OnceLock` needs.
+fn gh_forms() -> &'static [GhForm] {
+    static FORMS: std::sync::OnceLock<Vec<GhForm>> = std::sync::OnceLock::new();
+    FORMS.get_or_init(|| {
+        Op::all()
+            .iter()
+            .map(|op| {
+                let mut subcommand = Vec::new();
+                let mut switches = Vec::new();
+                for word in op.argv() {
+                    if word == "--" {
+                        break;
+                    }
+                    match (word.starts_with('-'), word.contains('=')) {
+                        (true, false) => switches.push(word),
+                        (true, true) => {}
+                        (false, _) => subcommand.push(word),
+                    }
                 }
-                match (word.starts_with('-'), word.contains('=')) {
-                    (true, false) => switches.push(word),
-                    (true, true) => {}
-                    (false, _) => subcommand.push(word),
+                GhForm {
+                    kind: op.kind(),
+                    subcommand,
+                    switches,
                 }
-            }
-            GhForm {
-                kind: op.kind(),
-                subcommand,
-                switches,
-            }
-        })
-        .collect()
+            })
+            .collect()
+    })
 }
 
 /// PURE: which operation a `gh` command line asks for, or `None` for a line no operation builds.
@@ -1205,6 +1214,15 @@ fn gh_forms() -> Vec<GhForm> {
 /// Two of them is what makes the pair a rule rather than an exception, and a prefix table would have
 /// to pick one of each pair and be wrong about the other.
 ///
+/// **And `gh run view` serves a THIRD spelling, which is why the derivation alone is not enough.**
+/// `--log-failed` returns the log of a failed step — a stranger's words — and no `ReadOp` builds it,
+/// so no form names it and nothing in `gh_forms` can see it. Left there, this map would answer
+/// `run_status` to a line that returns log text: a `ReadsOwn` operation, inside `READ_CEILING`, and
+/// one a project may declare. The guard below is what closes that, and it reads
+/// `REFUSED_READ_FLAGS` rather than growing a list of its own — that constant is already the
+/// module's curated answer to "which flags change the KIND of thing that comes back", in its own
+/// words, and a second list would be a second thing to keep in step.
+///
 /// **An allowlist, and by construction rather than by a second table.** `ReadOp` and `ActOp` are
 /// closed sets, so `gh auth token` and `gh secret list` fall outside this map the way they fall
 /// outside `READ_CEILING` — by absence, with nothing here to keep in step with a list of exclusions.
@@ -1220,8 +1238,8 @@ pub fn op_kind_of_gh_command(command: &str) -> Option<&'static str> {
     if !program.eq_ignore_ascii_case("gh") {
         return None;
     }
-    let mut matched: Vec<GhForm> = gh_forms()
-        .into_iter()
+    let mut matched: Vec<&GhForm> = gh_forms()
+        .iter()
         .filter(|form| form.matches(arguments))
         .collect();
     // Longest subcommand first, then the most switches accounted for: `gh run view --log 1` matches
@@ -1236,6 +1254,25 @@ pub fn op_kind_of_gh_command(command: &str) -> Option<&'static str> {
         // Two operations one line could equally be. There are none today — that is what
         // `no_two_operations_wear_the_same_gh_form` says — and on the day there is one, a guess is a
         // worse answer than no answer: whoever calls this map is deciding autonomy with it.
+        return None;
+    }
+    // The same rule one place further: a flag that changes WHAT COMES BACK changes which operation
+    // this is, and a line carrying one the winning form does not itself name is a line this map
+    // cannot honestly name either. `--log-failed` is the case that needs it and the case the
+    // derivation could never find — see the third paragraph above.
+    //
+    // The form's OWN switches are exempt, and that exemption is what keeps `run_logs` nameable by
+    // the very flag that defines it: `--log` is in `REFUSED_READ_FLAGS` because a PREFIX could not
+    // say "`gh run view` without it", which is the problem a name does not have.
+    //
+    // Scanned across the whole line, terminator and all, where `matches` deliberately stops short of
+    // it. The two directions are each right for their own question: naming an operation should err
+    // towards the truth about which one it is, and refusing to name one should err towards no.
+    let carries_a_flag_of_another_operation = REFUSED_READ_FLAGS.iter().any(|flag| {
+        !best.switches.iter().any(|switch| switch == flag)
+            && arguments.iter().any(|word| word_is_flag(word, flag))
+    });
+    if carries_a_flag_of_another_operation {
         return None;
     }
     Some(best.kind)
@@ -1288,11 +1325,23 @@ fn word_is_flag(word: &str, flag: &str) -> bool {
 //   catalogue and says nothing about whether the catalogue is wide enough, and it is that second
 //   question this step turns on. A green suite is not the signal.
 //
-// The day all three hold, the change is small and mostly deletion: `READ_CEILING` and
+// **And until that day, a name from the map is not a grant.** The paragraph above about
+// `REFUSED_READ_FLAGS` ending is true of the DESTINATION and false of every state before it.
+// `Policy::for_project` consumes the map while the Bash door is still open, and in that interim a
+// caller still holds a `gh` line with flags on it — `read_is_autonomous`'s flag check runs AFTER the
+// map and not instead of it. The map's own refused-flag guard covers the flags that change which
+// operation a line is; the rest of that constant, `--limit` above all, is a bound on HOW MUCH a
+// stranger gets to say, and `ReadOp::effect` leans on it by name. Whoever reads this comment while
+// implementing the interim step is the person likeliest to delete the only guard there is.
+//
+// The day all three hold, the change is small and almost entirely deletion: `READ_CEILING` and
 // `REFUSED_READ_FLAGS` go, `read_is_autonomous` goes with them, and `classifier.rs::Segment::
-// GithubRead` has nothing left to classify. That the step is a deletion is the point — it is the
-// proof the two vocabularies really did become one, and until then this comment is a plan and not
-// an achievement.
+// GithubRead` has nothing left to classify. **The map above goes too**, and that is not a loss but
+// the shape of the thing: it exists to read a `gh` command line, and after this step no `gh`
+// command line is being read for autonomy — which is also why its refused-flag guard may not
+// outlive the constant it consults. That the step is a deletion is the point. It is the proof the
+// two vocabularies really did become one, and until then this comment is a plan and not an
+// achievement.
 
 /// What runs without asking.
 ///
@@ -3264,10 +3313,74 @@ mod tests {
         }
     }
 
+    /// **A flag that changes what comes back changes which operation it is.**
+    ///
+    /// `--log-failed` is the case the derivation cannot reach: no `ReadOp` builds it, so no form
+    /// names it, and without the guard `gh run view --log-failed 1` is named `run_status` — a
+    /// `ReadsOwn` operation, inside `READ_CEILING`, and one a project may declare — while returning
+    /// the log of a failed step, which is a stranger's words. The map would be a prefix table with
+    /// respect to exactly the spelling its own doc says a prefix table gets wrong.
+    ///
+    /// `REFUSED_READ_FLAGS` already holds that knowledge, under its own heading: *«The first seven
+    /// change the KIND of thing that comes back»*. So the map reads that list rather than growing a
+    /// second one, and answers `None` — the same rule the tie-break applies, one place further. A
+    /// guess is a worse answer than no answer when the caller is deciding autonomy with it.
+    ///
+    /// The test above covers `gh auth token` and `gh secret list` and not one flag-bearing line,
+    /// which is why this gap was untested as well as unhandled.
+    #[test]
+    fn a_flag_that_changes_what_comes_back_takes_the_name_away() {
+        for command in [
+            // The one that motivated the guard, in all three spellings a person reaches for.
+            "gh run view --log-failed 1",
+            "gh run view 1 --log-failed",
+            "gh run view --log-failed=true 1",
+            // The rest of the constant, on the prefixes the ceiling does admit.
+            "gh run view --jq .jobs 1",
+            "gh pr list --json body",
+            "gh pr list --limit 1000",
+            "gh pr list -L 1000",
+            "gh pr list --search in:body secret",
+            "gh pr list -t {{.body}}",
+        ] {
+            assert_eq!(op_kind_of_gh_command(command), None, "{command:?}");
+        }
+
+        // The flag an operation NAMES is the flag that names it. `--log` is on that constant too,
+        // and `run_logs` is the row that exists to carry it — the exemption is what keeps a refusal
+        // written for prefixes from eating the operation a name can spell.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --log 1"),
+            Some("run_logs")
+        );
+        // `--comments` is not on the constant at all, so the other pair is untouched.
+        assert_eq!(
+            op_kind_of_gh_command("gh pr view --comments 7"),
+            Some("pr_thread")
+        );
+        // A flag that only chooses WHICH takes nothing away, and `-l` is `--label` while `-L` is
+        // `--limit`: the case sensitivity `read_is_autonomous` keeps, kept here for the same reason.
+        for (command, kind) in [
+            ("gh pr list --state open", "pr_list"),
+            ("gh pr list --author octocat", "pr_list"),
+            ("gh pr list -l bug", "pr_list"),
+            ("gh run list --branch main", "run_list"),
+        ] {
+            assert_eq!(op_kind_of_gh_command(command), Some(kind), "{command:?}");
+        }
+    }
+
     /// What makes "the most switches accounted for" a safe way to break a tie: inside one
     /// subcommand no two operations carry the same number of switches, so the winner is never a coin
-    /// toss. Two forms with different subcommands cannot both match a line at all — they differ in
-    /// some word — so this is the only tie there is to rule out.
+    /// toss.
+    ///
+    /// **It rules out one tie and not every tie, and the difference is worth stating rather than
+    /// implied.** `matches` needs the subcommand to be a PREFIX of the line, so two forms whose
+    /// subcommands are of different lengths — a hypothetical `gh api` beside a `gh api graphql` —
+    /// can both match, and this loop walks past that pair on the `continue`. That case is safe
+    /// without being asserted here: the sort's first key is the subcommand's length, so the more
+    /// specific form wins, which is the answer anybody would want. What would NOT be safe is two
+    /// forms of the same shape, and that is the tie this rules out.
     #[test]
     fn no_two_operations_wear_the_same_gh_form() {
         let forms = gh_forms();
