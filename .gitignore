@@ -32,6 +32,11 @@
 # And the same directory under the crate, which is where `CARGO_TARGET_DIR` lands when tests are
 # built from `core/` rather than from the root.
 /core/target-test/
+# A private target directory an autonomous run creates inside its own worktree when the shared one
+# is locked. Unignored, it is 3.9 GB of build output that `git status` lists file by file, and the
+# worktree GC's preservation commit then overflows its ceiling on every pass, for ever (run-900388,
+# 2026-09-02..04: 77 Telegram notices in 38 hours). Any depth on purpose: `core/` builds land there too.
+.cargo-target*/
 /shell/node_modules/
 /shell/dist/
 /shell/src-tauri/target/
