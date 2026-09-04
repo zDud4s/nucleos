@@ -1,3 +1,4 @@
+import { CHAR_W, GAP_X, MIN_W, PAD_X, wrap } from "../canvas/layered";
 import type { Agent } from "../data/agents";
 import type { TeamRunView, TeamView } from "../data/teams";
 
@@ -154,4 +155,168 @@ export function buildRoster(input: RosterInput): RosterModel {
   }
 
   return { nodes };
+}
+
+/* ------------------------------------------------------------------ layout -- */
+
+/**
+ * One height per rank. A person's box holds a name and a line under it; a piece of work holds a
+ * description over two lines, the task it belongs to, and its state.
+ */
+export const LAYER_H: Record<RosterLayer, number> = { 0: 56, 1: 54, 2: 72 };
+
+/** The white band between two ranks. Wide enough that an edge reads as a line and not a join. */
+const ROW_GAP = 46;
+
+/** Above this many characters a line is folded. Two lines at most, then it is clipped. */
+const MAX_CHARS = 30;
+
+export interface RosterBox {
+  id: string;
+  parent: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  lines: string[];
+}
+
+export interface RosterEdge {
+  from: string;
+  to: string;
+  crosses: boolean;
+}
+
+export interface RosterLayout {
+  boxes: RosterBox[];
+  edges: RosterEdge[];
+  width: number;
+  height: number;
+}
+
+/** A label over at most two lines, clipped rather than allowed to grow the box. */
+export function fold(label: string, max = MAX_CHARS): string[] {
+  if (label.length <= max) return [label];
+  // No spaces to break on: this is an identifier, and `layered.ts` already knows where those split.
+  if (!label.includes(" ")) return wrap(label);
+
+  const lines: string[] = [];
+  let line = "";
+  for (const word of label.split(/\s+/)) {
+    if (line === "") line = word;
+    else if (`${line} ${word}`.length <= max) line = `${line} ${word}`;
+    else {
+      lines.push(line);
+      line = word;
+    }
+  }
+  if (line !== "") lines.push(line);
+
+  if (lines.length <= 2) return lines;
+  return [lines[0], `${lines[1].slice(0, max - 1)}…`];
+}
+
+/** One line trimmed to fit rather than folded — the second line of a box is never a third. */
+export function clip(text: string, max = MAX_CHARS): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+const rowY = (layer: RosterLayer): number =>
+  layer === 0 ? 0 : layer === 1 ? LAYER_H[0] + ROW_GAP : LAYER_H[0] + LAYER_H[1] + 2 * ROW_GAP;
+
+/** As wide as the widest thing written in it — `layered.ts`' rule, over this box's own two lines. */
+function boxWidth(lines: string[], said: string): number {
+  const longest = Math.max(...lines.map((line) => line.length), clip(said).length);
+  return Math.max(MIN_W, Math.round(longest * CHAR_W + PAD_X));
+}
+
+/**
+ * Nodes into coordinates: a tree walked down, then across.
+ *
+ * **Not `layered.ts`'s `layout()`**, for the two reasons the spec gives at §5. `rankNodes` would
+ * rank the director's own item onto the specialists' row, because rank there is distance from a
+ * source and this item's parent is the director; and `NODE_H` is one height for every rank, while
+ * a person's box and a piece of work's box are not the same size.
+ *
+ * Two passes, which is all a tree needs. Bottom up, a node's span is the wider of its own box and
+ * its children laid side by side. Top down, each node is handed its span and centred in it, and
+ * its children divide it in order — so a parent always sits over the middle of its children and
+ * nothing can overlap, because no two spans intersect.
+ */
+export function placeRoster(nodes: RosterNode[]): RosterLayout {
+  if (nodes.length === 0) return { boxes: [], edges: [], width: 0, height: 0 };
+
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const children = new Map<string, RosterNode[]>();
+  const roots: RosterNode[] = [];
+  for (const node of nodes) {
+    // A parent nobody kept is a root: the picture still draws, rather than losing the box.
+    if (node.parent === null || !byId.has(node.parent)) {
+      roots.push(node);
+      continue;
+    }
+    const kin = children.get(node.parent);
+    if (kin === undefined) children.set(node.parent, [node]);
+    else kin.push(node);
+  }
+
+  const lines = new Map<string, string[]>();
+  const own = new Map<string, number>();
+  for (const node of nodes) {
+    const folded = fold(node.label);
+    lines.set(node.id, folded);
+    own.set(node.id, boxWidth(folded, node.said));
+  }
+
+  const span = new Map<string, number>();
+  const measure = (node: RosterNode): number => {
+    const kin = children.get(node.id) ?? [];
+    const across =
+      kin.reduce((total, kid) => total + measure(kid), 0) + GAP_X * Math.max(0, kin.length - 1);
+    const width = Math.max(own.get(node.id) ?? MIN_W, across);
+    span.set(node.id, width);
+    return width;
+  };
+  for (const root of roots) measure(root);
+
+  const boxes: RosterBox[] = [];
+  const edges: RosterEdge[] = [];
+
+  const place = (node: RosterNode, left: number): void => {
+    const slot = span.get(node.id) ?? MIN_W;
+    const width = own.get(node.id) ?? MIN_W;
+    boxes.push({
+      id: node.id,
+      parent: node.parent,
+      x: left + (slot - width) / 2,
+      y: rowY(node.layer),
+      width,
+      height: LAYER_H[node.layer],
+      lines: lines.get(node.id) ?? [node.label],
+    });
+
+    const kin = children.get(node.id) ?? [];
+    const across =
+      kin.reduce((total, kid) => total + (span.get(kid.id) ?? MIN_W), 0) +
+      GAP_X * Math.max(0, kin.length - 1);
+    let x = left + (slot - across) / 2;
+    for (const kid of kin) {
+      edges.push({ from: node.id, to: kid.id, crosses: kid.crosses });
+      place(kid, x);
+      x += (span.get(kid.id) ?? MIN_W) + GAP_X;
+    }
+  };
+
+  let x = 0;
+  for (const root of roots) {
+    place(root, x);
+    x += (span.get(root.id) ?? MIN_W) + GAP_X;
+  }
+
+  return {
+    boxes,
+    edges,
+    width: Math.max(...boxes.map((box) => box.x + box.width)),
+    height: Math.max(...boxes.map((box) => box.y + box.height)),
+  };
 }

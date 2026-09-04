@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { buildRoster } from "./roster-graph";
+import { LAYER_H, buildRoster, placeRoster } from "./roster-graph";
+import { MIN_W } from "../canvas/layered";
 import type { Agent } from "../data/agents";
 import type { TeamItem, TeamRunView, TeamView } from "../data/teams";
 
@@ -232,5 +233,133 @@ describe("buildRoster", () => {
     const model = buildRoster({ team: team(), agents: CATALOGUE, teams: [team()], runs: [] });
 
     expect(model.nodes.some((node) => node.layer === 2)).toBe(false);
+  });
+});
+
+/** The Finanças fixture, in full: a director who also works, two specialists, three items. */
+function full() {
+  const marketing = team({
+    id: "marketing",
+    name: "Marketing",
+    director_agent_id: "editor",
+    members: ["editor", "researcher"],
+  });
+  return buildRoster({
+    team: team(),
+    agents: CATALOGUE,
+    teams: [team(), marketing],
+    runs: [
+      run({
+        items: [
+          item(),
+          item({ ordinal: 2, agent_id: "researcher", description: "pull the ledger", run_id: 12 }),
+          item({
+            ordinal: 3,
+            round: 2,
+            agent_id: "controller",
+            description: "match them line by line",
+            state: "working",
+            run_id: 13,
+          }),
+        ],
+      }),
+    ],
+  }).nodes;
+}
+
+describe("placeRoster", () => {
+  it("centres a parent over its children", () => {
+    const nodes = buildRoster({
+      team: team(),
+      agents: CATALOGUE,
+      teams: [team()],
+      runs: [
+        run({ items: [item(), item({ ordinal: 2, description: "reconcile the two", run_id: 12 })] }),
+      ],
+    }).nodes;
+    const placed = placeRoster(nodes);
+
+    const parent = placed.boxes.find((box) => box.id === "member:auditor")!;
+    const kids = placed.boxes.filter((box) => box.parent === "member:auditor");
+    const first = kids[0];
+    const last = kids[kids.length - 1];
+
+    expect(parent.x + parent.width / 2).toBeCloseTo((first.x + last.x + last.width) / 2, 0);
+  });
+
+  it("gives a box the width its own label needs", () => {
+    const nodes = buildRoster({
+      team: team(),
+      agents: CATALOGUE,
+      teams: [team()],
+      runs: [
+        run({ items: [item({ description: "reconcile every line of the August bank export" })] }),
+      ],
+    }).nodes;
+    const placed = placeRoster(nodes);
+
+    expect(placed.boxes.find((box) => box.id.startsWith("item:"))!.width).toBeGreaterThan(MIN_W);
+  });
+
+  it("widens a subtree rather than overlapping three items under one specialist", () => {
+    const nodes = buildRoster({
+      team: team(),
+      agents: CATALOGUE,
+      teams: [team()],
+      runs: [
+        run({
+          items: [
+            item(),
+            item({ ordinal: 2, description: "reconcile the two", run_id: 12 }),
+            item({ ordinal: 3, description: "write the exceptions up", run_id: 13 }),
+          ],
+        }),
+      ],
+    }).nodes;
+    const kids = placeRoster(nodes).boxes.filter((box) => box.parent === "member:auditor");
+
+    expect(kids).toHaveLength(3);
+    for (let i = 1; i < kids.length; i += 1) {
+      expect(kids[i].x).toBeGreaterThanOrEqual(kids[i - 1].x + kids[i - 1].width);
+    }
+  });
+
+  it("gives each rank one row, at that rank's own height", () => {
+    const placed = placeRoster(full());
+    const rows = [...new Set(placed.boxes.map((box) => box.y))].sort((a, b) => a - b);
+
+    expect(rows).toHaveLength(3);
+    expect(
+      placed.boxes.filter((box) => box.y === rows[0]).every((box) => box.height === LAYER_H[0]),
+    ).toBe(true);
+    expect(
+      placed.boxes.filter((box) => box.y === rows[2]).every((box) => box.height === LAYER_H[2]),
+    ).toBe(true);
+  });
+
+  it("marks the director's own item as the one crossing edge", () => {
+    const placed = placeRoster(full());
+    const crossing = placed.edges.filter((edge) => edge.crosses);
+
+    expect(crossing).toHaveLength(1);
+    expect(crossing[0].from).toBe("director:controller");
+    expect(crossing[0].to).toBe("item:run-live-1#3");
+  });
+
+  it("reports a width and a height that hold every box drawn", () => {
+    const placed = placeRoster(full());
+
+    for (const box of placed.boxes) {
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(placed.width);
+      expect(box.y + box.height).toBeLessThanOrEqual(placed.height);
+    }
+  });
+
+  it("places nothing and reports nothing for an empty roster", () => {
+    const placed = placeRoster([]);
+
+    expect(placed.boxes).toEqual([]);
+    expect(placed.width).toBe(0);
   });
 });
