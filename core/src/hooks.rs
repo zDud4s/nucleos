@@ -207,6 +207,13 @@ enum ProjectRules {
 ///
 /// A `static` because that method returns a reference; `Vec::new()` is a `const fn`, so this costs
 /// no allocation and no initialisation.
+///
+/// **And a `const` will not do, which is the half that is easy to try and undo.** A `const` is
+/// inlined as a value at each use site, so `&NO_SHELL_RULES` borrows a temporary; that temporary
+/// lives for `'static` only if rvalue static promotion applies, and promotion refuses any type with
+/// drop glue. `ShellRules` holds two `Vec`s, so it has drop glue, so the borrow is a local and
+/// `declared()` stops compiling with `E0515: cannot return value referencing temporary value`. The
+/// `static` has one address with the program's lifetime and nothing to promote.
 static NO_SHELL_RULES: crate::project_policy::ShellRules = crate::project_policy::ShellRules {
     allow: Vec::new(),
     deny: Vec::new(),

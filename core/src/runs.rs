@@ -2891,17 +2891,25 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // The project is `wt_project_id`, off the worktree this resume is going back into, and it IS
     // the project the hook read off the paused run's own row. Checked rather than assumed, because
     // the two columns are read from different tables: `worktree::record` is the only production
-    // INSERT into `worktrees`, and its `project_id` argument is the same Rust binding that `runs`
-    // was inserted with (`create_run_with`, for `Owner::Run` and `Owner::Item`) or the same
-    // `jobs.project_id` the run's own row was created from (`job.rs`, for `Owner::Job`); no `UPDATE`
-    // of either column exists anywhere, including the migrations; both owner-transfer statements —
-    // the handoff and this resume's own — copy or re-derive `project_id` in the statement that
-    // moves the row; and `runs.id` is `AUTOINCREMENT`, so no stale tree can be adopted by a later
-    // run wearing a reused id. The `recorded_tree_of` fallback reads `runs.project_id` outright.
+    // write to `worktrees`, and its `project_id` argument is the same Rust binding that `runs` was
+    // inserted with (`create_run_with`, for `Owner::Run` and `Owner::Item`) or the same
+    // `jobs.project_id` the run's own row was created from (`job.rs`, for `Owner::Job`); that write
+    // is an UPSERT, and its conflict arm does write both columns — `project_id =
+    // excluded.project_id, project_root = excluded.project_root` — but only ever from the same
+    // caller's binding, so a second `record` for a tree already known re-states the binding rather
+    // than replacing it with a differently-derived one; neither owner-transfer statement — the
+    // handoff and this resume's own — touches `project_id` at all, each setting `owner_id` and
+    // nothing else, which is stronger than copying it; and `runs.id` is `AUTOINCREMENT`, so no stale
+    // tree can be adopted by a later run wearing a reused id. The `recorded_tree_of` fallback reads
+    // `runs.project_id` outright.
     //
-    // **Nothing ENFORCES it** — no foreign key, no `CHECK`. A third caller of `worktree::record`
-    // that resolved its project from `vcs::project_for_worktree` instead of from the caller would
-    // break this silently, and this is the sentence that would then be wrong.
+    // **Nothing ENFORCES it** — no foreign key, no `CHECK` — and that upsert's conflict arm is the
+    // concrete mechanism by which it would break. A third caller of `worktree::record` that resolved
+    // its project from `vcs::project_for_worktree` instead of from the caller would not fail, would
+    // not add a row, and would leave no trace a reader could go looking for: it would silently
+    // rewrite an existing worktree's project, and this is the sentence that would then be wrong.
+    // The arm is also invisible to `grep "UPDATE worktrees"`, which is how the previous version of
+    // this paragraph came to claim that no `UPDATE` of either column existed anywhere.
     //
     // Derived even when the action was queued instead of authorized. The row is excluded from
     // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
