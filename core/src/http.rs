@@ -6055,10 +6055,24 @@ struct ShellRuleDeclaration {
 /// Declares one shell rule, or changes the verdict of one already declared.
 ///
 /// **Idempotent, and not by this handler's arithmetic.** `declare_shell_rule`'s
-/// `ON CONFLICT (project_id, prefix) DO UPDATE SET verdict = excluded.verdict` is what makes a
-/// second POST of the same prefix an edit rather than a second row or a constraint error — the
-/// identity of a rule is the prefix it names, and `declaring_the_same_prefix_again_changes_its_verdict`
-/// pins it one layer down.
+/// `ON CONFLICT (project_id, prefix) DO UPDATE SET verdict = excluded.verdict, note = excluded.note`
+/// is what makes a second POST of the same prefix an EDIT. The identity of a rule is the prefix it
+/// names and the unique index enforces that, so a redeclaration can never become a second row — the
+/// two ways of losing the `DO UPDATE` cost something else instead: no `ON CONFLICT` clause at all is
+/// `UNIQUE constraint failed` and a 500, and `DO NOTHING` — the spelling its two siblings in
+/// `project_policy` use — is worse for being silent, leaving the first verdict standing while the
+/// caller is told 204. `a_declared_shell_rule_comes_back_folded_and_then_goes` pins the edit through
+/// this route; `project_policy::tests::declaring_the_same_prefix_again_changes_its_verdict` pins it
+/// one layer down.
+///
+/// **`note = excluded.note` is the half a caller has to know about.** The clause is a plain
+/// overwrite and not a `COALESCE`, deliberately: `declare_shell_rule` says "this rule is now in this
+/// state", and a note that fell back to the stored one could never be REMOVED. The consequence this
+/// route is the first thing to expose is that **a second POST carrying no `note` writes `NULL` over
+/// an existing one** — so an editor that sends only `prefix` and `verdict` silently discards the
+/// justification. Migration `0128` calls that column "a única defesa contra uma lista que daqui a
+/// seis meses ninguém sabe justificar"; whoever builds the page in a later chunk must send the
+/// existing note back with the verdict, or changing a verdict throws that defence away.
 ///
 /// **The refusal names the prefix, and it has to.** A refusal that does not say what was wrong sends
 /// the owner to read source code to find out which of seven shape guards they tripped.
@@ -19587,17 +19601,7 @@ mod tests {
             assert_eq!(status, StatusCode::NO_CONTENT);
         }
 
-        // Declared again, with the other verdict. `ON CONFLICT ... DO UPDATE` is what makes this an
-        // EDIT: without it the table would hold both answers and the reader would pick one.
-        let (status, _) = reach_request(
-            state.clone(),
-            "POST",
-            "/projects/alpha/shell-rules",
-            Some(serde_json::json!({ "prefix": "bash scripts/gates.sh", "verdict": "allow" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
+        // The fold is visible in what comes back, on the side each rule was declared on.
         let (status, listed) =
             reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -19606,6 +19610,41 @@ mod tests {
             serde_json::json!(["bash scripts/gates.sh"])
         );
         assert_eq!(listed["deny"], serde_json::json!(["remove-item -recurse"]));
+
+        // Declared again with the OTHER verdict, which has to MOVE the prefix from one list to the
+        // other: the identity of a rule is the prefix it names, so changing your mind is an EDIT.
+        //
+        // What `DO UPDATE` prevents is not a second row: the unique index on (project_id, prefix)
+        // cannot hold two, so the two ways of losing it both end somewhere else. With no
+        // `ON CONFLICT` clause at all it is `UNIQUE constraint failed` — loud, and a 500. With
+        // `DO NOTHING`, which is what `declare_github_op` and `declare_land_target` both spell and
+        // therefore what anyone harmonising the three would reach for, it is SILENT: the first
+        // verdict stands, and the caller is told 204 over a change that did not happen. This assert
+        // is the one that catches the silent half, which is why it is written on the side the prefix
+        // has to LEAVE rather than on the side it has to arrive at.
+        //
+        // Asserted through the route rather than only at `project_policy`'s level, because the
+        // handler is the layer that decides what a caller sees when a rule is redeclared.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "bash scripts/gates.sh", "verdict": "deny" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(
+            listed["allow"],
+            serde_json::json!([]),
+            "a redeclared prefix has to LEAVE the side it was on, not sit on both"
+        );
+        assert_eq!(
+            listed["deny"],
+            serde_json::json!(["bash scripts/gates.sh", "remove-item -recurse"])
+        );
 
         // Withdrawn under a THIRD spelling of the same rule, which is the only way to show that the
         // route's lookup and the table's key are computed by the same fold. A `forget` that only
@@ -19621,11 +19660,8 @@ mod tests {
 
         let (_, listed) =
             reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
-        assert_eq!(listed["deny"], serde_json::json!([]));
-        assert_eq!(
-            listed["allow"],
-            serde_json::json!(["bash scripts/gates.sh"])
-        );
+        assert_eq!(listed["allow"], serde_json::json!([]));
+        assert_eq!(listed["deny"], serde_json::json!(["bash scripts/gates.sh"]));
 
         // And withdrawing it a second time is a 404, not a 204. A 204 over a delete that matched
         // nothing is the daemon agreeing a rule is gone while it goes on deciding.

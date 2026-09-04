@@ -2344,7 +2344,7 @@ mod tests {
     /// The hook reads those tables per decision and caches nothing, so a single `allow` row written
     /// through `POST /projects/{id}/shell-rules` binds the very next tool call of every in-flight
     /// run of that project — no restart, no second confirmation, and no moment at which a person is
-    /// shown what widened. A key that could write one is a key that can rewrite its own álçada,
+    /// shown what widened. A key that could write one is a key that can rewrite its own alçada,
     /// which is a strictly larger power than anything a scoped key is sold as buying.
     ///
     /// Asserted as membership rather than through a request, like `POST /projects/{id}/write` and

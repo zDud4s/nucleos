@@ -2891,9 +2891,9 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // The project is `wt_project_id`, off the worktree this resume is going back into, and it IS
     // the project the hook read off the paused run's own row. Checked rather than assumed, because
     // the two columns are read from different tables: `worktree::record` is the only production
-    // write to `worktrees`, and its `project_id` argument is the same Rust binding that `runs` was
-    // inserted with (`create_run_with`, for `Owner::Run` and `Owner::Item`) or the same
-    // `jobs.project_id` the run's own row was created from (`job.rs`, for `Owner::Job`); that write
+    // INSERT into `worktrees`, and its `project_id` argument is the same Rust binding that `runs`
+    // was inserted with (`create_run_with`, for `Owner::Run` and `Owner::Item`) or the same
+    // `jobs.project_id` the run's own row was created from (`job.rs`, for `Owner::Job`); that INSERT
     // is an UPSERT, and its conflict arm does write both columns — `project_id =
     // excluded.project_id, project_root = excluded.project_root` — but only ever from the same
     // caller's binding, so a second `record` for a tree already known re-states the binding rather
