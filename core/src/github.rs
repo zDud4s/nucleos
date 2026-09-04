@@ -46,6 +46,12 @@ pub enum ReadOp {
     PrList {
         repo: Repo,
     },
+    /// `gh workflow list`. It existed in `READ_CEILING` before it existed here, which made the
+    /// ceiling grant a prefix no typed operation could build — and `declarable_github_ops` refused
+    /// it for exactly that reason. The variant is what closes the gap; the ceiling is unchanged.
+    WorkflowList {
+        repo: Repo,
+    },
     /// Returns the body of a PR — text somebody wrote. `ReadsUntrusted`, and this is why the effect
     /// is per operation and not per tool.
     PrView {
@@ -144,6 +150,7 @@ impl ReadOp {
             ReadOp::RunList { .. } => "run_list",
             ReadOp::RunStatus { .. } => "run_status",
             ReadOp::PrList { .. } => "pr_list",
+            ReadOp::WorkflowList { .. } => "workflow_list",
             ReadOp::PrView { .. } => "pr_view",
             ReadOp::IssueView { .. } => "issue_view",
             ReadOp::RunLogs { .. } => "run_logs",
@@ -157,9 +164,15 @@ impl ReadOp {
     /// design accepts on purpose.
     pub fn effect(&self) -> ToolEffect {
         match self {
-            ReadOp::RunList { .. } | ReadOp::RunStatus { .. } | ReadOp::PrList { .. } => {
-                ToolEffect::ReadsOwn
-            }
+            // `WorkflowList` sits with the structural three and not with the prose three, and the
+            // sentence above already decided it: "a list of workflow names" is the example this doc
+            // gives for `ReadsOwn`. What comes back is the repository's own workflow files by name,
+            // id and state — the same shape `RunList` and `PrList` return, chosen by whoever may
+            // commit to the repository rather than by whoever may open a pull request against it.
+            ReadOp::RunList { .. }
+            | ReadOp::RunStatus { .. }
+            | ReadOp::PrList { .. }
+            | ReadOp::WorkflowList { .. } => ToolEffect::ReadsOwn,
             ReadOp::PrView { .. } | ReadOp::IssueView { .. } | ReadOp::RunLogs { .. } => {
                 ToolEffect::ReadsUntrusted
             }
@@ -173,6 +186,7 @@ impl ReadOp {
                 argv(&["run", "view"], [repo_flag(repo)], &[id.as_str()])
             }
             ReadOp::PrList { repo } => argv(&["pr", "list"], [repo_flag(repo)], &[]),
+            ReadOp::WorkflowList { repo } => argv(&["workflow", "list"], [repo_flag(repo)], &[]),
             ReadOp::PrView { repo, number } => {
                 argv(&["pr", "view"], [repo_flag(repo)], &[number.as_str()])
             }
@@ -206,6 +220,7 @@ impl ReadOp {
                 id: RunId::new("1").expect("the sample run id is valid"),
             },
             ReadOp::PrList { repo: repo.clone() },
+            ReadOp::WorkflowList { repo: repo.clone() },
             ReadOp::PrView {
                 repo: repo.clone(),
                 number: PrNumber::new("1").expect("the sample pr number is valid"),
@@ -224,6 +239,7 @@ impl ReadOp {
                 ReadOp::RunList { .. }
                 | ReadOp::RunStatus { .. }
                 | ReadOp::PrList { .. }
+                | ReadOp::WorkflowList { .. }
                 | ReadOp::PrView { .. }
                 | ReadOp::IssueView { .. }
                 | ReadOp::RunLogs { .. } => {}
@@ -431,7 +447,7 @@ pub struct ReadRequest {
     pub operation: String,
     pub repo: String,
     /// A run id for `run_status` and `run_logs`, a number for `pr_view` and `issue_view`, and
-    /// nothing at all for the two listings. One field rather than three, because the model reading
+    /// nothing at all for the three listings. One field rather than three, because the model reading
     /// this has to fill in one thing and choosing which name it is called by is not that thing.
     pub id: Option<String>,
 }
@@ -476,6 +492,7 @@ impl ReadOp {
         match operation.as_str() {
             "run_list" => Ok(ReadOp::RunList { repo }),
             "pr_list" => Ok(ReadOp::PrList { repo }),
+            "workflow_list" => Ok(ReadOp::WorkflowList { repo }),
             "run_status" => Ok(ReadOp::RunStatus {
                 repo,
                 id: RunId::new(&required(id, "run_status", "run id")?)?,
@@ -2476,6 +2493,53 @@ mod tests {
         assert!(
             !ACTION_CEILING.contains(&"api_read"),
             "`api_read` is never eligible for autonomy"
+        );
+    }
+
+    /// The reading ceiling holds to the operations too, and it is the half that had drifted.
+    ///
+    /// `gh workflow list` sat in `READ_CEILING` with no `ReadOp` building it, which is the mirror of
+    /// the failure the test above guards against: a prefix that grants a capability the typed path
+    /// cannot ask for is a line the owner reads as a permission and that permits nothing. The
+    /// direction is ceiling to operation and not the reverse — a `ReadOp` outside the ceiling is
+    /// ordinary (`pr_view` is one, deliberately), a ceiling entry outside the operations is not.
+    #[test]
+    fn every_read_ceiling_prefix_is_built_by_a_real_operation() {
+        let commands: Vec<String> = ReadOp::all()
+            .iter()
+            .map(|op| format!("gh {}", op.argv().join(" ")))
+            .collect();
+        for prefix in READ_CEILING {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.starts_with(&format!("{prefix} "))),
+                "{prefix} is in the ceiling and no ReadOp builds it"
+            );
+        }
+    }
+
+    /// The operation the ceiling had been granting to nobody: structural, and matching its prefix.
+    #[test]
+    fn workflow_list_is_a_structural_read_the_ceiling_already_admitted() {
+        let op = ReadOp::WorkflowList { repo: repo() };
+        assert_eq!(op.kind(), "workflow_list");
+        assert_eq!(op.effect(), ToolEffect::ReadsOwn);
+        assert_eq!(op.argv(), vec!["workflow", "list", "--repo=owner/name"]);
+
+        // The prefix was always there; what is new is that a typed operation reaches it.
+        assert!(READ_CEILING.contains(&"gh workflow list"));
+        let policy = policy_from(Some("autonomous_reads:\n  - gh workflow list\n"));
+        assert!(policy.read_is_autonomous(&format!("gh {}", op.argv().join(" "))));
+
+        // And it is buildable from the flat parameters, or the tool could not ask for it.
+        assert_eq!(
+            ReadOp::from_request(ReadRequest {
+                operation: "workflow_list".to_owned(),
+                repo: "owner/name".to_owned(),
+                id: None,
+            }),
+            Ok(op)
         );
     }
 }

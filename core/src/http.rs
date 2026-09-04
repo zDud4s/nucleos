@@ -6347,10 +6347,12 @@ async fn delete_project_shell_rule(
 /// - **`api_read` is refused.** It is deliberately outside `ACTION_CEILING` — not even
 ///   `.ai/github.yaml` can turn it on — so it is outside this too. A project able to declare it
 ///   would be a way round the ceiling wearing a different route.
-/// - **`workflow_list` is refused, and it is in `READ_CEILING`.** That is the intersection working:
-///   the ceiling names a `gh` prefix for which no `ReadOp` variant exists yet, so there is no
-///   operation to declare. It becomes declarable the moment somebody adds the variant, with nothing
-///   here to remember to update.
+/// - **`run_logs` is refused, and it is a `ReadOp` whose prefix the ceiling admits.** See the
+///   paragraph below: the flag it carries is what refuses it.
+///
+/// `workflow_list` used to be a third: in `READ_CEILING` and undeclarable, because no `ReadOp` built
+/// it. `ReadOp::WorkflowList` made it declarable with nothing here edited, which is what "derived,
+/// never written out" was supposed to buy.
 ///
 /// The reads are matched on the command each op builds rather than on its kind, because
 /// `READ_CEILING` is written in `gh` prefixes and `ACTION_CEILING` in kinds — two vocabularies, and
@@ -20043,10 +20045,13 @@ mod tests {
 
     /// The declarable set is the ops intersected with the ceilings, computed rather than listed.
     ///
-    /// Written as an exact set because the two exclusions that look like bugs are the point:
-    /// `workflow_list` is IN `READ_CEILING` and still out, because no `ReadOp` builds it yet; and
-    /// `run_logs` is a `ReadOp` whose argv carries `--log`, which `REFUSED_READ_FLAGS` refuses in a
-    /// Bash call and refuses here for the same reason.
+    /// Written as an exact set because the exclusion that looks like a bug is the point: `run_logs`
+    /// is a `ReadOp` whose argv carries `--log`, which `REFUSED_READ_FLAGS` refuses in a Bash call
+    /// and refuses here for the same reason.
+    ///
+    /// `workflow_list` is in this list and was not, and it moved without this function being
+    /// touched: the ceiling always named `gh workflow list`, and adding `ReadOp::WorkflowList` was
+    /// the whole change. That is the intersection doing the work it was written to do.
     #[test]
     fn the_declarable_github_ops_are_the_ceilings_intersected_with_the_operations() {
         let mut declarable = declarable_github_ops();
@@ -20060,6 +20065,7 @@ mod tests {
                 "run_list",
                 "run_rerun",
                 "run_status",
+                "workflow_list",
                 "workflow_run",
             ]
         );
@@ -20070,9 +20076,6 @@ mod tests {
             "api_read",
             // Publishes the owner's words under the owner's name; outside `ACTION_CEILING` too.
             "pr_create",
-            // In `READ_CEILING` and still undeclarable: there is no `ReadOp` for it yet. Adding the
-            // variant makes it declarable with nothing here to remember.
-            "workflow_list",
             // Reads a stranger's prose; excluded by `--log` in `REFUSED_READ_FLAGS`.
             "run_logs",
             "pr_view",
@@ -20083,6 +20086,33 @@ mod tests {
                 "{excluded} must not be declarable"
             );
         }
+    }
+
+    /// The ceiling entry that granted nothing now grants an operation, and the route in accepts it.
+    ///
+    /// Both halves matter and only together. That `workflow_list` is in the set says the
+    /// intersection found it; that `POST /projects/{id}/github-ops` takes it says a project can
+    /// actually reach what the owner's ceiling had been offering to nobody.
+    #[tokio::test]
+    async fn workflow_list_is_declarable_now_that_an_operation_builds_it() {
+        assert!(
+            declarable_github_ops().contains(&"workflow_list"),
+            "`gh workflow list` is in `READ_CEILING` and `ReadOp::WorkflowList` builds it"
+        );
+
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/github-ops",
+            Some(serde_json::json!({ "op_kind": "workflow_list" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/github-ops", None).await;
+        assert_eq!(listed, serde_json::json!(["workflow_list"]));
     }
 
     /// Declared, listed, and withdrawn — with the second declaration proving `DO NOTHING`.
@@ -20141,7 +20171,9 @@ mod tests {
         let state = test_state().await;
         project_on_the_roster(&state, "alpha").await;
 
-        for op_kind in ["api_read", "pr_create", "workflow_list", "not_an_op_at_all"] {
+        // `workflow_list` was here while `READ_CEILING` named a prefix no `ReadOp` could build. It
+        // is declarable now, and it moved out of this list rather than out of the ceiling.
+        for op_kind in ["api_read", "pr_create", "run_logs", "not_an_op_at_all"] {
             let (status, refused) = reach_request(
                 state.clone(),
                 "POST",

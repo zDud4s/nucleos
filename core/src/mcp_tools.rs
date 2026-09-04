@@ -206,12 +206,12 @@ struct BrowserHandoffParams {
 /// right wire shape and the wrong prompt.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct GithubReadParams {
-    /// One of: run_list, pr_list, run_status, run_logs, pr_view, issue_view.
+    /// One of: run_list, pr_list, workflow_list, run_status, run_logs, pr_view, issue_view.
     operation: String,
     /// The repository, as owner/name.
     repo: String,
-    /// A run id for run_status and run_logs, a number for pr_view and issue_view. The two listings
-    /// take none.
+    /// A run id for run_status and run_logs, a number for pr_view and issue_view. The three
+    /// listings take none.
     id: Option<String>,
 }
 
@@ -1127,8 +1127,8 @@ impl NucleosTools {
 
     #[tool(
         description = "Read something from GitHub through NucleOS. Structural reads — run_list, \
-                       pr_list, run_status — cost the turn nothing. The three that return text \
-                       somebody else wrote — pr_view, issue_view, run_logs — MARK the turn, and \
+                       pr_list, workflow_list, run_status — cost the turn nothing. The three that \
+                       return text somebody else wrote — pr_view, issue_view, run_logs — MARK the turn, and \
                        every acting tool is refused for the rest of it, this one included. That is \
                        deliberate: read the prose when you need the prose, and do the acting first."
     )]
