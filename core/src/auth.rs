@@ -2336,6 +2336,77 @@ mod tests {
         ));
     }
 
+    /// The reach a project declares for itself is the owner's, and nobody else's.
+    ///
+    /// These nine routes are the only way into the three tables `project_policy.rs` holds: what a
+    /// project's worktrees may run unattended, what the GitHub manager may do on its remote, and
+    /// where a landing may be sent. **They are a live autonomy control, not a configuration edit.**
+    /// The hook reads those tables per decision and caches nothing, so a single `allow` row written
+    /// through `POST /projects/{id}/shell-rules` binds the very next tool call of every in-flight
+    /// run of that project — no restart, no second confirmation, and no moment at which a person is
+    /// shown what widened. A key that could write one is a key that can rewrite its own álçada,
+    /// which is a strictly larger power than anything a scoped key is sold as buying.
+    ///
+    /// Asserted as membership rather than through a request, like `POST /projects/{id}/write` and
+    /// `POST /projects/{id}/commands` above and for the same reason: `permits` is default-deny, so
+    /// these routes are safe TODAY by being in no table. What that does not survive is somebody
+    /// filing the three GETs beside the `/projects/{id}/…` reads that share their URL prefix, which
+    /// would read as tidying up rather than as a decision. This is the test that says no.
+    ///
+    /// **The three scopes below are not decoration, and `Scope::Run` alone would prove nothing.**
+    /// That arm consults no table at all — it is a fixed `match` over two routes — so it would go on
+    /// passing with all nine of these in every table. `ApiTokenLevel::ReadOnly` and
+    /// `ApiTokenLevel::RunCreating` are the two that actually read `READ_ONLY_ROUTES`, which is
+    /// where a tidying hand would put them.
+    #[test]
+    fn a_projects_declared_reach_is_in_no_scope_table() {
+        const DECLARED_REACH: &[(Method, &str)] = &[
+            (Method::GET, "/projects/{id}/shell-rules"),
+            (Method::POST, "/projects/{id}/shell-rules"),
+            (Method::DELETE, "/projects/{id}/shell-rules"),
+            (Method::GET, "/projects/{id}/github-ops"),
+            (Method::POST, "/projects/{id}/github-ops"),
+            (Method::DELETE, "/projects/{id}/github-ops"),
+            (Method::GET, "/projects/{id}/land-targets"),
+            (Method::POST, "/projects/{id}/land-targets"),
+            (Method::DELETE, "/projects/{id}/land-targets"),
+        ];
+
+        for (method, pattern) in DECLARED_REACH {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, method, pattern),
+                "{method} {pattern} decides what a project's runs may do unattended and must stay \
+                 out of every scope table"
+            );
+        }
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            for (method, pattern) in DECLARED_REACH {
+                let path = pattern.replace("{id}", "7");
+                assert!(
+                    !permits(&scope, method, &path),
+                    "{scope:?} must not reach {method} {path}"
+                );
+            }
+        }
+
+        // The reads beside them stay reads. A boundary a reader cannot see is a boundary nobody can
+        // argue with, and seeing it is not permission to cross it.
+        assert!(permits(
+            &Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            &Method::GET,
+            "/projects/7/readings"
+        ));
+    }
+
     /// A project's workflows are the owner's, to read and to change.
     ///
     /// Six routes, all out of every table, and the reads are the half worth arguing for. A

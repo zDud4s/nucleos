@@ -1304,7 +1304,14 @@ fn is_safe_command(command: &str) -> bool {
 /// Every clause only ever REFUSES, so an overlap between them costs a redundant check and a gap
 /// costs an allowed `-exec` - which is why `find_executes_or_writes` sits beside the two flag guards
 /// rather than inside them.
-fn shell_form_is_readable(command: &str) -> bool {
+///
+/// Visible to the crate because `POST /projects/{id}/shell-rules` asks it of a prefix somebody is
+/// about to WRITE DOWN rather than of a command about to run. Every clause here refuses before any
+/// list is consulted, so a declared prefix carrying one of these shapes could never match anything:
+/// storing it would leave the owner holding a rule that silently does nothing, and — for a `deny` —
+/// a refusal that is not one. Asked of the same function the decision asks, so the two cannot come
+/// to disagree about which prefixes are worth having.
+pub(crate) fn shell_form_is_readable(command: &str) -> bool {
     !has_shell_control(command)
         && !command.split_whitespace().any(|token| token == "--fix")
         && !writes_an_output_file(command)

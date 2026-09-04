@@ -206,6 +206,41 @@ pub fn build_router(state: AppState) -> Router {
             "/projects/{id}/commands/{command_id}/run",
             post(post_project_command_run),
         )
+        // The reach this project declares for itself: what its worktrees may run unattended, what
+        // the GitHub manager may do on its remote, and where a landing may be sent.
+        // `project_policy.rs` holds all three tables and says why they are one module; until these
+        // routes there was no way into them but SQL typed by hand.
+        //
+        // **In no table in `auth.rs`, the GETs included, and that absence is the boundary.** These
+        // are not a configuration edit that takes effect at the next start — the hook reads the
+        // shell table per decision and caches nothing, so one `allow` row binds the very next tool
+        // call of every in-flight run of this project. `a_projects_declared_reach_is_in_no_scope_table`
+        // carries the argument, and is what stops the three GETs being filed beside the
+        // `/projects/{id}/…` reads they share a prefix with.
+        //
+        // **The DELETEs carry what they delete in the BODY.** A shell prefix is not a safe path
+        // segment: it contains spaces, slashes and dots, and encoding one into a route only to
+        // decode it again buys nothing — the same reason `POST /contacts/verdict` takes the address
+        // in the body. The other two follow it rather than splitting the shape three ways, since a
+        // branch name carries slashes too.
+        .route(
+            "/projects/{id}/shell-rules",
+            get(get_project_shell_rules)
+                .post(post_project_shell_rule)
+                .delete(delete_project_shell_rule),
+        )
+        .route(
+            "/projects/{id}/github-ops",
+            get(get_project_github_ops)
+                .post(post_project_github_op)
+                .delete(delete_project_github_op),
+        )
+        .route(
+            "/projects/{id}/land-targets",
+            get(get_project_land_targets)
+                .post(post_project_land_target)
+                .delete(delete_project_land_target),
+        )
         // The workflow library, and what one project uses out of it.
         //
         // The library is house-wide and hangs off no project — it is one folder on this machine,
@@ -5969,6 +6004,394 @@ async fn post_project_command_run(
         return Err(refusal(StatusCode::CONFLICT, "already_running"));
     }
     Ok(StatusCode::ACCEPTED)
+}
+
+/* ------------------------------------------ the reach a project declares -- */
+
+/// One project's shell list, split by verdict exactly as `project_policy::ShellRules` holds it.
+///
+/// A `View` and not a fourth `ProjectRules`. There are already two: the struct above, which answers
+/// `GET /projects/{id}/rules` about `.ai/autopilot.yaml`, and `hooks::ProjectRules`, which is an
+/// enum about whether the table could be read at all. A third spelling of that name would tell a
+/// reader nothing about which of the three they are holding.
+///
+/// The prefixes come back FOLDED, because that is how `shell_rules` returns them and how they are
+/// enforced. Serving the typed spelling would show an owner a `Remove-Item` the classifier knows as
+/// `remove-item`, which is the very lie `project_policy::fold_prefix` exists to stop.
+#[derive(serde::Serialize)]
+struct ShellRulesView {
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+/// What this project's worktrees may run without asking, and what they may never run.
+async fn get_project_shell_rules(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ShellRulesView>, StatusCode> {
+    crate::project_policy::shell_rules(&state.pool, &id)
+        .await
+        .map(|rules| {
+            Json(ShellRulesView {
+                allow: rules.allow,
+                deny: rules.deny,
+            })
+        })
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading a project's shell rules failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct ShellRuleDeclaration {
+    prefix: String,
+    verdict: crate::project_policy::Verdict,
+    /// Why, for whoever reads the list next. Never consulted by the classifier.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Declares one shell rule, or changes the verdict of one already declared.
+///
+/// **Idempotent, and not by this handler's arithmetic.** `declare_shell_rule`'s
+/// `ON CONFLICT (project_id, prefix) DO UPDATE SET verdict = excluded.verdict` is what makes a
+/// second POST of the same prefix an edit rather than a second row or a constraint error — the
+/// identity of a rule is the prefix it names, and `declaring_the_same_prefix_again_changes_its_verdict`
+/// pins it one layer down.
+///
+/// **The refusal names the prefix, and it has to.** A refusal that does not say what was wrong sends
+/// the owner to read source code to find out which of seven shape guards they tripped.
+async fn post_project_shell_rule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ShellRuleDeclaration>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let prefix = body.prefix.trim();
+    if prefix.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "empty_prefix",
+                "detail": "a shell rule has to name a prefix",
+            })),
+        ));
+    }
+
+    // The classifier folds and shape-checks BEFORE it compares against any list, so a prefix
+    // carrying a `$( )`, a backtick, a redirect or a separator can never match a command — whatever
+    // is typed, `shell_form_is_readable` has already refused it by the time the lists are consulted.
+    // Storing one would leave the owner holding a rule that silently does nothing, and for a `deny`
+    // that is worse than nothing: a refusal written down and never enforced reads, from the outside,
+    // exactly like an allow.
+    if !crate::classifier::shell_form_is_readable(prefix) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "unmatchable_prefix",
+                "detail": format!(
+                    "`{prefix}` can never match a command: the classifier refuses this shape \
+                     before it consults any list, so the rule would be stored and never enforced"
+                ),
+            })),
+        ));
+    }
+
+    crate::project_policy::declare_shell_rule(
+        &state.pool,
+        &id,
+        prefix,
+        body.verdict,
+        body.note.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, project_id = %id, "declaring a project shell rule failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ShellRuleTarget {
+    prefix: String,
+}
+
+/// Withdraws one shell rule.
+///
+/// **404 when nothing matched, following `delete_errand_rule` and `delete_project_command`.** A 204
+/// over a delete that matched nothing is the daemon agreeing that a rule is gone while it goes on
+/// deciding — and here the direction that costs something is an `allow` the owner believes they
+/// withdrew. `forget_shell_rule` answers `Ok(())` either way, so presence is asked first, through
+/// the same reader the classifier uses.
+///
+/// The comparison is against the FOLDED prefix because that is what the table holds: `declare` and
+/// `forget` both fold, so a rule declared as `Remove-Item  -Recurse` is keyed `remove-item -recurse`
+/// and has to be found under that key or this reports a typo where there is none.
+async fn delete_project_shell_rule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ShellRuleTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let folded = crate::classifier::normalize_command(&body.prefix);
+    let declared = crate::project_policy::shell_rules(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "reading a project's shell rules failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+    if !declared
+        .allow
+        .iter()
+        .chain(declared.deny.iter())
+        .any(|declared| *declared == folded)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "refusal": "no_such_rule",
+                "detail": format!("{id} has declared no rule for `{folded}`"),
+            })),
+        ));
+    }
+
+    crate::project_policy::forget_shell_rule(&state.pool, &id, &body.prefix)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "forgetting a project shell rule failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Every operation kind a project may declare: the ops this núcleo can actually build, narrowed to
+/// what the two compiled ceilings admit.
+///
+/// **Derived, never written out.** The kinds come off `ReadOp::all()` and `ActOp::all()` through
+/// `kind()`, and admissibility is asked of a `Policy` built from `READ_CEILING` and
+/// `ACTION_CEILING` themselves — the same two questions production asks of the owner's file. A
+/// hand-written list here would be a second spelling of a set that already exists in three places,
+/// and a second spelling is how a set drifts.
+///
+/// Two consequences worth stating, because both look like bugs and are not:
+///
+/// - **`api_read` is refused.** It is deliberately outside `ACTION_CEILING` — not even
+///   `.ai/github.yaml` can turn it on — so it is outside this too. A project able to declare it
+///   would be a way round the ceiling wearing a different route.
+/// - **`workflow_list` is refused, and it is in `READ_CEILING`.** That is the intersection working:
+///   the ceiling names a `gh` prefix for which no `ReadOp` variant exists yet, so there is no
+///   operation to declare. It becomes declarable the moment somebody adds the variant, with nothing
+///   here to remember to update.
+///
+/// The reads are matched on the command each op builds rather than on its kind, because
+/// `READ_CEILING` is written in `gh` prefixes and `ACTION_CEILING` in kinds — two vocabularies, and
+/// this asks each of them in its own. It is also what excludes `run_logs`: its argv carries `--log`,
+/// which is in `REFUSED_READ_FLAGS`, so `read_is_autonomous` refuses it exactly as it refuses the
+/// same flag typed into a Bash call.
+fn declarable_github_ops() -> Vec<&'static str> {
+    let ceiling = crate::github::Policy::from_config(&crate::config::GithubConfig {
+        enabled: true,
+        autonomous_reads: crate::github::READ_CEILING
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect(),
+        autonomous_actions: crate::github::ACTION_CEILING
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect(),
+    });
+
+    let reads = crate::github::ReadOp::all();
+    let actions = crate::github::ActOp::all();
+    let mut kinds: Vec<&'static str> = reads
+        .iter()
+        .filter(|operation| {
+            ceiling.read_is_autonomous(&format!("gh {}", operation.argv().join(" ")))
+        })
+        .map(|operation| operation.kind())
+        .collect();
+    kinds.extend(
+        actions
+            .iter()
+            .filter(|operation| ceiling.action_is_autonomous(operation.kind()))
+            .map(|operation| operation.kind()),
+    );
+    kinds
+}
+
+/// What the GitHub manager may do on this project's remote without asking.
+async fn get_project_github_ops(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Vec<String>> {
+    Json(crate::project_policy::github_ops(&state.pool, &id).await)
+}
+
+#[derive(Deserialize)]
+struct GithubOpTarget {
+    op_kind: String,
+}
+
+/// Grants one GitHub operation to this project without asking.
+///
+/// **Idempotent, and not by this handler's arithmetic.** `declare_github_op`'s
+/// `ON CONFLICT (project_id, op_kind) DO NOTHING` is what makes a second POST leave the first row
+/// and its `created_at` alone, rather than raising `UNIQUE constraint failed`;
+/// `github_ops_and_land_targets_round_trip_and_forget` declares `run_list` twice to pin it.
+///
+/// The refusal names the kind AND lists what would have been accepted, because "not a declarable
+/// operation" without the set is a sentence that sends the owner to `github.rs`.
+async fn post_project_github_op(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<GithubOpTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let op_kind = body.op_kind.trim();
+    let declarable = declarable_github_ops();
+    if !declarable.contains(&op_kind) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "undeclarable_op",
+                "detail": format!(
+                    "`{op_kind}` is not an operation a project may declare; the ceilings admit: {}",
+                    declarable.join(", ")
+                ),
+            })),
+        ));
+    }
+
+    crate::project_policy::declare_github_op(&state.pool, &id, op_kind)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "declaring a project github op failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Withdraws one GitHub operation. 404 when it was never declared, for `delete_project_shell_rule`'s
+/// reason — and here the mistaken 204 would be the owner believing an operation had gone back to
+/// asking while it goes on running unattended.
+async fn delete_project_github_op(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<GithubOpTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let op_kind = body.op_kind.trim();
+    if !crate::project_policy::github_ops(&state.pool, &id)
+        .await
+        .iter()
+        .any(|declared| declared == op_kind)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "refusal": "no_such_op",
+                "detail": format!("{id} has not declared `{op_kind}`"),
+            })),
+        ));
+    }
+
+    crate::project_policy::forget_github_op(&state.pool, &id, op_kind)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "forgetting a project github op failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Where a `--land` may be sent in this project, besides `integration_branch`.
+async fn get_project_land_targets(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Vec<String>> {
+    Json(crate::project_policy::land_targets(&state.pool, &id).await)
+}
+
+#[derive(Deserialize)]
+struct LandTargetTarget {
+    branch: String,
+}
+
+/// Opens one more landing target for this project.
+///
+/// **A branch that does not exist yet is ACCEPTED, and that is deliberate — do not "fix" it.**
+/// Existence is checked at the moment of landing, by `land::resolve_target`, which confirms
+/// `refs/heads/<branch>` against the repository and refuses by name when it is gone. Declaring a
+/// target before creating it is a reasonable order to work in — the branch is often made by the very
+/// run that will land into it — and a check here would only be a second, staler copy of one that
+/// already runs at the moment it can be right.
+///
+/// The shape of the name is `Branch::new`'s business, also at landing time, for the reason
+/// `resolve_target` gives: it validates before it asks git, so a name git could not use is refused
+/// as a bad name rather than as a missing branch.
+///
+/// Idempotent by `declare_land_target`'s `ON CONFLICT (project_id, branch) DO NOTHING`, like its
+/// GitHub sibling above.
+async fn post_project_land_target(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<LandTargetTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let branch = body.branch.trim();
+    if branch.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "empty_branch",
+                "detail": "a landing target has to name a branch",
+            })),
+        ));
+    }
+
+    crate::project_policy::declare_land_target(&state.pool, &id, branch)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "declaring a project land target failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Closes one landing target. 404 when it was never open, for `delete_project_shell_rule`'s reason.
+///
+/// `integration_branch` needs no row to stay admissible, so a DELETE naming it answers 404 and takes
+/// nothing away — which is the honest answer: there was no target of that name to close.
+async fn delete_project_land_target(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<LandTargetTarget>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let branch = body.branch.trim();
+    if !crate::project_policy::land_targets(&state.pool, &id)
+        .await
+        .iter()
+        .any(|declared| declared == branch)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "refusal": "no_such_target",
+                "detail": format!("{id} has not declared `{branch}` as a landing target"),
+            })),
+        ));
+    }
+
+    crate::project_policy::forget_land_target(&state.pool, &id, branch)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "forgetting a project land target failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /* ------------------------------------------------------------- workflows -- */
@@ -19111,6 +19534,376 @@ mod tests {
                 .0,
             StatusCode::ACCEPTED
         );
+    }
+
+    /* --------------------------------------- the reach a project declares -- */
+
+    /// One request to the nine, body and all.
+    ///
+    /// One helper for the DELETEs as well as the POSTs, because a DELETE here carries what it
+    /// deletes in the body — a shell prefix is not a safe path segment.
+    async fn reach_request(
+        state: AppState,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = api_token_request(state, method, path, "test-token", body).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Declared, listed on its own side, and withdrawn — with the fold visible in what comes back.
+    ///
+    /// The prefixes are typed mixed-case and double-spaced on purpose. What the route serves is what
+    /// is ENFORCED, and `project_policy::fold_prefix` is the reason those are the same string; a GET
+    /// that echoed the typed spelling would show an owner a `Remove-Item` the classifier knows only
+    /// as `remove-item`.
+    #[tokio::test]
+    async fn a_declared_shell_rule_comes_back_folded_and_then_goes() {
+        let state = test_state().await;
+
+        for body in [
+            serde_json::json!({ "prefix": "bash scripts/gates.sh", "verdict": "allow" }),
+            serde_json::json!({
+                "prefix": "  Remove-Item   -Recurse ",
+                "verdict": "deny",
+                "note": "never from a worktree",
+            }),
+        ] {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+
+        // Declared again, with the other verdict. `ON CONFLICT ... DO UPDATE` is what makes this an
+        // EDIT: without it the table would hold both answers and the reader would pick one.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "bash scripts/gates.sh", "verdict": "allow" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed["allow"],
+            serde_json::json!(["bash scripts/gates.sh"])
+        );
+        assert_eq!(listed["deny"], serde_json::json!(["remove-item -recurse"]));
+
+        // Withdrawn under a THIRD spelling of the same rule, which is the only way to show that the
+        // route's lookup and the table's key are computed by the same fold. A `forget` that only
+        // trimmed would match nothing here and answer 404 over a rule that is plainly there.
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "REMOVE-ITEM  -recurse" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed["deny"], serde_json::json!([]));
+        assert_eq!(
+            listed["allow"],
+            serde_json::json!(["bash scripts/gates.sh"])
+        );
+
+        // And withdrawing it a second time is a 404, not a 204. A 204 over a delete that matched
+        // nothing is the daemon agreeing a rule is gone while it goes on deciding.
+        let (status, refused) = reach_request(
+            state,
+            "DELETE",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "remove-item -recurse" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_rule");
+    }
+
+    /// A prefix the classifier's shape guards refuse is refused HERE, and the refusal says which
+    /// prefix.
+    ///
+    /// Each of these would be stored happily by `declare_shell_rule` and could never match anything:
+    /// `shell_form_is_readable` runs before any list is consulted. A stored `allow` that never fires
+    /// is an annoyance; a stored `deny` that never fires is a refusal the owner believes they wrote
+    /// and nobody is enforcing, which is an allow wearing a refusal's clothes.
+    #[tokio::test]
+    async fn a_prefix_that_could_never_match_is_refused_and_named() {
+        let state = test_state().await;
+
+        for prefix in [
+            "cargo test ; rm -rf /",
+            "git log --output=/tmp/x",
+            "rg --pre ./payload.sh pattern",
+            "find . -exec sh -c 'x' ;",
+        ] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/shell-rules",
+                Some(serde_json::json!({ "prefix": prefix, "verdict": "deny" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{prefix}");
+            assert_eq!(refused["refusal"], "unmatchable_prefix", "{prefix}");
+            assert!(
+                refused["detail"].as_str().unwrap().contains(prefix),
+                "the refusal has to name the prefix, or the owner reads source code to \
+                 find out what was wrong with it: {refused}"
+            );
+        }
+
+        // A blank one is its own sentence rather than the same one.
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "   ", "verdict": "allow" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "empty_prefix");
+
+        // Nothing was stored by any of the five.
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/shell-rules", None).await;
+        assert_eq!(listed["allow"], serde_json::json!([]));
+        assert_eq!(listed["deny"], serde_json::json!([]));
+    }
+
+    /// The declarable set is the ops intersected with the ceilings, computed rather than listed.
+    ///
+    /// Written as an exact set because the two exclusions that look like bugs are the point:
+    /// `workflow_list` is IN `READ_CEILING` and still out, because no `ReadOp` builds it yet; and
+    /// `run_logs` is a `ReadOp` whose argv carries `--log`, which `REFUSED_READ_FLAGS` refuses in a
+    /// Bash call and refuses here for the same reason.
+    #[test]
+    fn the_declarable_github_ops_are_the_ceilings_intersected_with_the_operations() {
+        let mut declarable = declarable_github_ops();
+        declarable.sort_unstable();
+        assert_eq!(
+            declarable,
+            vec![
+                "issue_close",
+                "pr_comment",
+                "pr_list",
+                "run_list",
+                "run_rerun",
+                "run_status",
+                "workflow_run",
+            ]
+        );
+
+        for excluded in [
+            // Decision #7: outside `ACTION_CEILING`, so not even the owner's file can turn it on —
+            // and a project able to declare it would be that ceiling with a different door.
+            "api_read",
+            // Publishes the owner's words under the owner's name; outside `ACTION_CEILING` too.
+            "pr_create",
+            // In `READ_CEILING` and still undeclarable: there is no `ReadOp` for it yet. Adding the
+            // variant makes it declarable with nothing here to remember.
+            "workflow_list",
+            // Reads a stranger's prose; excluded by `--log` in `REFUSED_READ_FLAGS`.
+            "run_logs",
+            "pr_view",
+            "issue_view",
+        ] {
+            assert!(
+                !declarable.contains(&excluded),
+                "{excluded} must not be declarable"
+            );
+        }
+    }
+
+    /// Declared, listed, and withdrawn — with the second declaration proving `DO NOTHING`.
+    #[tokio::test]
+    async fn a_declared_github_op_comes_back_and_then_goes() {
+        let state = test_state().await;
+
+        for _ in 0..2 {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/github-ops",
+                Some(serde_json::json!({ "op_kind": "run_list" })),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "declaring the same op twice is a no-op, not a constraint error"
+            );
+        }
+
+        let (status, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/github-ops", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed, serde_json::json!(["run_list"]));
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/github-ops",
+            Some(serde_json::json!({ "op_kind": "run_list" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/github-ops", None).await;
+        assert_eq!(listed, serde_json::json!([]));
+
+        let (status, refused) = reach_request(
+            state,
+            "DELETE",
+            "/projects/alpha/github-ops",
+            Some(serde_json::json!({ "op_kind": "run_list" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_op");
+    }
+
+    /// An operation the ceilings do not admit is refused, and the refusal names it.
+    #[tokio::test]
+    async fn an_op_outside_the_ceilings_is_refused_and_named() {
+        let state = test_state().await;
+
+        for op_kind in ["api_read", "pr_create", "workflow_list", "not_an_op_at_all"] {
+            let (status, refused) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/github-ops",
+                Some(serde_json::json!({ "op_kind": op_kind })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{op_kind}");
+            assert_eq!(refused["refusal"], "undeclarable_op", "{op_kind}");
+            assert!(
+                refused["detail"].as_str().unwrap().contains(op_kind),
+                "the refusal has to name the op: {refused}"
+            );
+        }
+
+        let (_, listed) = reach_request(state, "GET", "/projects/alpha/github-ops", None).await;
+        assert_eq!(listed, serde_json::json!([]));
+    }
+
+    /// Declared, listed, and withdrawn — for a branch that exists nowhere.
+    ///
+    /// That is the assertion rather than an oversight: existence is `land::resolve_target`'s
+    /// question, asked at the moment of landing against the repository. A project may reasonably
+    /// declare a target before creating it, and this test is what says so.
+    #[tokio::test]
+    async fn a_declared_land_target_comes_back_even_though_no_such_branch_exists() {
+        let state = test_state().await;
+
+        for _ in 0..2 {
+            let (status, _) = reach_request(
+                state.clone(),
+                "POST",
+                "/projects/alpha/land-targets",
+                Some(serde_json::json!({ "branch": "release/2.0" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+
+        let (status, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/land-targets", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed, serde_json::json!(["release/2.0"]));
+
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/land-targets",
+            Some(serde_json::json!({ "branch": "  " })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "empty_branch");
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "DELETE",
+            "/projects/alpha/land-targets",
+            Some(serde_json::json!({ "branch": "release/2.0" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/land-targets", None).await;
+        assert_eq!(listed, serde_json::json!([]));
+
+        let (status, refused) = reach_request(
+            state,
+            "DELETE",
+            "/projects/alpha/land-targets",
+            Some(serde_json::json!({ "branch": "release/2.0" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["refusal"], "no_such_target");
+    }
+
+    /// One project's declared reach is not another's, through the routes as well as in the table.
+    ///
+    /// `project_policy` pins the `WHERE` on all three readers; this pins that the handler passes the
+    /// path's id to them rather than resolving a project some other way.
+    #[tokio::test]
+    async fn the_routes_write_the_project_the_path_names_and_no_other() {
+        let state = test_state().await;
+        reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/shell-rules",
+            Some(serde_json::json!({ "prefix": "cargo run", "verdict": "allow" })),
+        )
+        .await;
+        reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/github-ops",
+            Some(serde_json::json!({ "op_kind": "run_list" })),
+        )
+        .await;
+        reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/land-targets",
+            Some(serde_json::json!({ "branch": "master" })),
+        )
+        .await;
+
+        let (_, rules) =
+            reach_request(state.clone(), "GET", "/projects/beta/shell-rules", None).await;
+        assert_eq!(rules["allow"], serde_json::json!([]));
+        assert_eq!(rules["deny"], serde_json::json!([]));
+        let (_, ops) = reach_request(state.clone(), "GET", "/projects/beta/github-ops", None).await;
+        assert_eq!(ops, serde_json::json!([]));
+        let (_, targets) = reach_request(state, "GET", "/projects/beta/land-targets", None).await;
+        assert_eq!(targets, serde_json::json!([]));
     }
 
     /// `contact_addresses` has been written on every inbound message since it existed and read by
