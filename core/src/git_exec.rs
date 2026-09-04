@@ -786,9 +786,10 @@ fn remaining(deadline: std::time::Instant, what: &str) -> Result<Duration, Outco
 ///
 /// **Named `toplevel` and not `worktree_root`, which is taken and means the opposite end of the
 /// same word.** `worktree::worktree_root(project_root)` answers "where does this project's worktrees
-/// get CREATED" and returns a parent directory; this answers "which working tree am I standing IN"
-/// and returns a checkout. Two functions in one crate under one name, differing only by module, is a
-/// misreading waiting to happen — and it nearly did: the collision surfaced only because a grep for
+/// get CREATED" and returns a directory inside the project by default (a sibling only under a
+/// `NUCLEOS_WORKTREE_ROOT` override that predates this move); this answers "which working tree am I
+/// standing IN" and returns a checkout. Two functions in one crate under one name, differing only by
+/// module, is a misreading waiting to happen — and it nearly did: the collision surfaced only because a grep for
 /// this function's name found the other one in a worktree it had never been written to. `toplevel`
 /// is git's own word for the thing (`--show-toplevel`), so it borrows a name that is already exact.
 ///
@@ -1278,6 +1279,19 @@ async fn create_integration_worktree(
                 output_tail: String::new(),
             })?;
     }
+
+    // Hidden BEFORE `git worktree add` runs, same as `worktree::create_at` — this is the other
+    // creation site, and a tree that cannot be hidden must not exist.
+    crate::worktree::hide_root_if_nested(
+        project_root,
+        &crate::worktree::worktree_root(project_root),
+    )
+    .await
+    .map_err(|error| Outcome::Failed {
+        reason: format!("could not hide the worktree root from git: {error}"),
+        exit_code: None,
+        output_tail: String::new(),
+    })?;
 
     let mut added = add_worktree(project_root, integration, deadline).await?;
     if !added.succeeded() {
