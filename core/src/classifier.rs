@@ -427,12 +427,31 @@ pub fn only_reads(tool_name: &str) -> bool {
 ///
 /// **The contract of `rules`: BORROWED, and the purity paragraph above is the whole reason it is an
 /// argument rather than a read performed in here.** A project's two shell lists live in a table a
-/// person edits while the daemon is running, and going to that table from inside this function would
-/// end the property `runs.rs` relies on: the hook classifies a line at the moment it is attempted
-/// and the resume re-derives the same line later, so a read taken in here would be two reads at two
-/// different moments, and a prefix declared in between would make them disagree about a command
-/// already shown to a person. The caller loads the rules once and hands the SAME ones to both, for
-/// the same reason and under the same rule as `policy`.
+/// person edits while the daemon is running, and a read taken inside this function would make this
+/// function impure — which is the property `runs.rs` leans on when it re-derives a class rather than
+/// carrying one.
+///
+/// **It does NOT mean the two callers hold the same lists, and this paragraph used to claim it did.**
+/// There is no caller that loads them once for both. `hooks.rs` reads at decision time; `runs.rs`
+/// reads again, separately, when the approval is granted — two reads at two moments, exactly the
+/// thing the old sentence named as the danger and presented as avoided. Moving the read OUT of here
+/// relocated it; it did not remove it. `policy` genuinely is one value shared by all three callers,
+/// because it is built once at startup and cannot change; `rules` cannot make that claim, and Task 8
+/// is about to put write routes in front of the table.
+///
+/// What makes the difference acceptable is bounded, and worth having written down rather than
+/// re-derived:
+///
+/// - A class that arrives with `deny` — `project-denied`, `destructive` — can never reach a grant:
+///   `hooks.rs` only consults the grant table for a `pending_approval`.
+/// - A class that arrives with `allow` reaches it only through `ProjectRules::downgrade_if_unreadable`,
+///   and `hooks.rs` gates the grant lookup on the rules having been read at all.
+/// - The rules can only move a command between `unrecognized` and `project-declared`/`project-denied`,
+///   so drift cannot silently turn one GRANTABLE class into another.
+///
+/// The read stays at decision time and uncached regardless — a cached refusal is one that goes on
+/// being lifted for as long as the cache lives. The consequence to know is that declaring a rule
+/// while a proposal sits pending changes the class recorded on the grant that approval mints.
 ///
 /// Its reach is deliberately lopsided, and the asymmetry is the feature. `deny` refuses outright and
 /// beats a compiled permission, because a refusal somebody wrote down is the one thing this must
@@ -515,7 +534,7 @@ pub fn classify(
     // touching the first. Sharing the label made that impossible to express, and the two tests that
     // caught the attempt (`a_jobs_replan_node_gives_up_instead_of_parking_the_job` and its review
     // twin) are the ones to keep in mind: they park a job node on a `for` loop, which is a COMMAND.
-    if !matches!(tool_name, "Bash" | "PowerShell") {
+    if !reads_shell_rules(tool_name) {
         return classification(
             "pending_approval",
             "unrecognized-tool",
@@ -534,6 +553,26 @@ pub fn classify(
         shell_for(tool_name),
         unrecognized,
     )
+}
+
+/// PURE: whether a project's declared shell rules can change this tool's verdict at all.
+///
+/// `classify` consults `rules` in exactly one place — `classify_shell_command`, reached only for
+/// these two tool names — and every branch above returns first: `WRITE_TOOLS`, `READ_LOCAL_TOOLS`,
+/// `SUBAGENT_TOOLS` and the unrecognized-tool answer are all decided without the rules ever being
+/// looked at.
+///
+/// It exists so a caller can decide whether to LOAD them, which is a question `hooks.rs` has to ask
+/// for a reason its own comments give twice: a hook runs in front of every tool call. The read is
+/// cheap; the cost is its failure, which turns every `allow` into an approval prompt — so a
+/// `SQLITE_BUSY` on a table no `Read` could ever consult would park a run on its next file read.
+///
+/// The list is written ONCE and used by both the branch and the callers, for the reason
+/// `matches_command_prefix` and `only_reads` are shared: two spellings of the same list is how they
+/// come to disagree, and here they would disagree silently — the caller skipping a load the
+/// classifier then needed.
+pub fn reads_shell_rules(tool_name: &str) -> bool {
+    matches!(tool_name, "Bash" | "PowerShell")
 }
 
 fn classify_shell_command(

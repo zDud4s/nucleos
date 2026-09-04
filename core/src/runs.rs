@@ -2874,13 +2874,34 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     //
     // The policy AND the project's two shell lists come off the state for that same reason, and
     // they are both parameters of `classify` for it: purity is what makes "the same inputs, so the
-    // same answer" true, and each of the two is an input this caller has to fetch. It is one of
-    // `classify`'s three production callers and all three must be handed the same pair: a resume
+    // same answer" true, and each of the two is an input this caller has to fetch. A resume
     // classifying under an empty policy while the hook classified under the owner's — or under an
     // empty rule set while the hook classified under the project's — would answer differently about
-    // the identical command line, which is exactly the drift the paragraph above rules out. The
-    // rules are this project's, named by `wt_project_id`, which is the same project the hook found
-    // on the paused run's own row.
+    // the identical command line, which is the drift the paragraph above rules out.
+    //
+    // **The two are not the same KIND of argument, and reading them as one would be believing a
+    // guarantee this code does not have.** The policy is built once at startup and handed to all
+    // three of `classify`'s production callers unchanged, so "the same one" is literally true of it.
+    // The rules are a table read TWICE — once by the hook when the command was attempted, once here
+    // when the approval is granted — and a prefix declared between those two moments makes the two
+    // reads differ. Nobody loads them once for both; there is no such caller. `classifier.rs`'s
+    // contract paragraph for `rules` carries the three-point argument for why that is bounded and
+    // acceptable, and the read deliberately stays uncached.
+    //
+    // The project is `wt_project_id`, off the worktree this resume is going back into, and it IS
+    // the project the hook read off the paused run's own row. Checked rather than assumed, because
+    // the two columns are read from different tables: `worktree::record` is the only production
+    // INSERT into `worktrees`, and its `project_id` argument is the same Rust binding that `runs`
+    // was inserted with (`create_run_with`, for `Owner::Run` and `Owner::Item`) or the same
+    // `jobs.project_id` the run's own row was created from (`job.rs`, for `Owner::Job`); no `UPDATE`
+    // of either column exists anywhere, including the migrations; both owner-transfer statements —
+    // the handoff and this resume's own — copy or re-derive `project_id` in the statement that
+    // moves the row; and `runs.id` is `AUTOINCREMENT`, so no stale tree can be adopted by a later
+    // run wearing a reused id. The `recorded_tree_of` fallback reads `runs.project_id` outright.
+    //
+    // **Nothing ENFORCES it** — no foreign key, no `CHECK`. A third caller of `worktree::record`
+    // that resolved its project from `vcs::project_for_worktree` instead of from the caller would
+    // break this silently, and this is the sentence that would then be wrong.
     //
     // Derived even when the action was queued instead of authorized. The row is excluded from
     // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
@@ -5862,6 +5883,81 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             grants_for(&state, resume_id).await,
             1,
             "an action the queue does not take is still the run's to perform, once"
+        );
+    }
+
+    /// **The class this resume records is derived under the project's own rules, not under an empty
+    /// pair.** The class is what a grant is scoped to, so a resume classifying `bash
+    /// scripts/gates.sh core` as `unrecognized` while the hook classified it as `project-declared`
+    /// would hand the run an authorization for a different kind of action than the one the person
+    /// approved.
+    ///
+    /// `bash scripts/gates.sh` and not a git command on purpose: the queue cannot perform it, so
+    /// the approval authorizes the run rather than queueing the action, which is the branch that
+    /// records a class at all. Nothing compiled recognises it either, so `project-declared` can only
+    /// have come from the declared prefix.
+    #[tokio::test]
+    async fn a_resume_records_the_class_this_projects_rules_give() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "bash scripts/gates.sh core").await;
+        crate::project_policy::declare_shell_rule(
+            &state.pool,
+            "proj",
+            "bash scripts/gates.sh",
+            crate::project_policy::Verdict::Allow,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT action_class FROM action_grants WHERE run_id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.as_deref(), Some("project-declared"));
+    }
+
+    /// And rules that cannot be read are recorded as NO class, which is what this path already does
+    /// for input it cannot parse.
+    ///
+    /// Deliberately not the hook's answer to the same failure. The hook is DECIDING and owes the
+    /// safe direction, so it downgrades an allow to an approval prompt; this is LABELLING an action
+    /// a person has already approved, where the only outcomes available are a right label and a
+    /// wrong one — and a wrong one is worse than none, because a grant is scoped to the class.
+    ///
+    /// A classless grant authorizes nothing: `grant_covers_class` matches on the class, and no class
+    /// matches `NULL`. The table is dropped rather than mocked, which is the only honest way to make
+    /// the read fail from outside `project_policy`.
+    #[tokio::test]
+    async fn a_resume_records_no_class_when_the_projects_rules_cannot_be_read() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "bash scripts/gates.sh core").await;
+        sqlx::query("DROP TABLE project_shell_rules")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT action_class FROM action_grants WHERE run_id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, None);
+        assert!(
+            !proposals::grant_covers_class(&state.pool, resume_id, "unrecognized")
+                .await
+                .unwrap()
         );
     }
 
