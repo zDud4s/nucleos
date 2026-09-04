@@ -1413,7 +1413,7 @@ impl Driver {
             // The council's OWN key, never `state.token`. `auth::COUNCIL_ROUTES` is what it reaches.
             env: crate::runs::run_env(&self.token, run_id, None),
             cwd: None,
-            plan_only: false,
+            permission: crate::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: with_tools.then(|| mcp_config_path(&self.id)),
             tool_policy: if with_tools {

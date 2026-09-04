@@ -123,6 +123,84 @@ pub enum ToolPolicy {
     None,
 }
 
+/// Which `--permission-mode` the CLI is launched with, and NOTHING else.
+///
+/// One value where two booleans used to race. `plan_only` and `classifier_governs_tools` could both
+/// be true, so `cli_args` had an `else if` deciding which of them got to write the flag — and the
+/// test that pinned that order (`plan_only_outranks_the_classifier_permission_surface`) said in its
+/// own words that "order is not where a safety property belongs". It is not there any more: a run
+/// that must not act cannot be handed `bypassPermissions` because there is one field and it holds
+/// one value, chosen once, at the call that starts the run.
+///
+/// Deliberately NOT `chats::PermissionMode`, which has five values and is the CONVERSATION's
+/// policy. `Manual` and `Auto` both project onto `Default` here, because what separates them lives
+/// in the `PreToolUse` hook and not on a command line. Keeping the two types apart is what stops
+/// somebody answering one question with the other.
+///
+/// Called `Default` and not `Auto` so nobody has to wonder why an autopilot run carries a
+/// conversation's policy: it is the rung with no elevation, which is what every run that is not a
+/// chat turn wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    /// No elevation: the CLI decides nothing on its own and the hook decides everything.
+    Default,
+    /// Edits in scope go through without asking; everything else still asks.
+    AcceptEdits,
+    /// The run answers with a plan. It is how a run is made unable to act — a catch-up run,
+    /// recovering a schedule the machine slept through, is forced into it precisely because nobody
+    /// chose for it to run NOW.
+    Plan,
+    /// The CLI's permission barrier stands down, on the strength of the classifier taking over.
+    ///
+    /// Only ever built where that classifier is verified present — see
+    /// `autopilot::classifier_hook_is_wired`. Standing this barrier down without the one that
+    /// replaces it leaves a run governed by nothing at all.
+    Bypass,
+}
+
+impl Permission {
+    /// The spelling the CLI accepts, MEASURED rather than chosen.
+    ///
+    /// ```text
+    /// $ claude --version   -> 2.1.260 (Claude Code)
+    /// $ claude --help      -> --permission-mode <mode>  (choices: "acceptEdits", "auto",
+    ///                           "bypassPermissions", "manual", "dontAsk", "plan")
+    /// ```
+    ///
+    /// **`default` is not on that list**, which is why `Default` writes `manual`: the documentation
+    /// calls this rung `default` and the command line does not accept the word. Writing it would
+    /// have failed the start of every run this daemon launches.
+    ///
+    /// **And no mode of this house ever writes `auto`.** That one is the CLI's OWN classifier
+    /// model, a second opinion nobody here reconciled with the classifier this daemon runs; asking
+    /// for both would be paying twice for two judgements. `manual` is exactly "decide nothing, the
+    /// hook decides" — which is the posture we want FROM THE CLI whatever rung the conversation is
+    /// on.
+    pub fn cli_value(self) -> &'static str {
+        match self {
+            Self::Default => "manual",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+            Self::Bypass => "bypassPermissions",
+        }
+    }
+
+    /// Which rung a conversation's policy launches the CLI on.
+    ///
+    /// Lossy on purpose, and the loss is the point: `Manual` and `Auto` are the same command line
+    /// and differ only in what the hook lets through.
+    pub fn for_chat(mode: crate::chats::PermissionMode) -> Self {
+        match mode {
+            crate::chats::PermissionMode::Manual | crate::chats::PermissionMode::Auto => {
+                Self::Default
+            }
+            crate::chats::PermissionMode::AcceptEdits => Self::AcceptEdits,
+            crate::chats::PermissionMode::Plan => Self::Plan,
+            crate::chats::PermissionMode::Bypass => Self::Bypass,
+        }
+    }
+}
+
 /// Every caller-chosen input to one runner invocation.
 ///
 /// This deliberately does not implement `Default`. The old positional signature kept one
@@ -134,7 +212,12 @@ pub struct RunRequest {
     pub prompt: String,
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
-    pub plan_only: bool,
+    /// Which `--permission-mode` this run is launched with.
+    ///
+    /// Chosen once, by the caller that knows what kind of run this is. It replaced a `plan_only`
+    /// boolean that shared the flag with `classifier_governs_tools` and needed an ordering rule
+    /// between them to stay safe.
+    pub permission: Permission,
     pub resume_session_id: Option<String>,
     pub mcp_config: Option<PathBuf>,
     pub tool_policy: ToolPolicy,
@@ -653,15 +736,22 @@ pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
     // prefix-matched, so a stable prefix is what lets back-to-back job nodes hit it. A flag whose
     // position moves with the request would push every token behind it out of the match.
     args.push("--exclude-dynamic-system-prompt-sections".to_string());
-    // `plan_only` first, and `else`, not a second `if`: a plan-only run must be unable to act no
-    // matter what else is true of it, so the two must never both be able to write this flag.
-    if request.plan_only {
-        args.push("--permission-mode".to_string());
-        args.push("plan".to_string());
-    } else if request.classifier_governs_tools {
-        args.push("--permission-mode".to_string());
-        args.push("bypassPermissions".to_string());
-    }
+    // One flag, one value, written for every run. Two booleans used to compete for this line and
+    // an `else if` decided which of them won; the ordering is gone because the choice is made once,
+    // where the run is started, and arrives here already made.
+    //
+    // Unconditional, where the old form wrote nothing for an ordinary run — and "no flag" stopped
+    // being a known state. From v2.1.228 the default start-up mode on Pro/Max/Team plans is `auto`,
+    // the CLI's own classifier model: billed, slower, and refusing things this application cannot
+    // explain to anybody. A `PreToolUse` allow does not skip it. Saying `manual` out loud costs one
+    // changed prompt-cache prefix, once, and buys a behaviour that does not depend on the account's
+    // plan or on a default that can move without notice.
+    //
+    // Still after `--exclude-dynamic-system-prompt-sections` and never before it: that one is
+    // pinned immediately behind `--verbose` so the cache prefix stays stable across back-to-back
+    // job nodes.
+    args.push("--permission-mode".to_string());
+    args.push(request.permission.cli_value().to_string());
     if let Some(path) = &request.mcp_config {
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().into_owned());
@@ -2546,15 +2636,24 @@ impl CommandRunner for CodexCliRunner {
         // Each was accepted and dropped, which is the one outcome a control must never have: the
         // caller is told the run it asked for started, and the record says so too.
         //
-        // `plan_only` is the reason this is a refusal rather than a log line. It is how a run is made
-        // unable to act — a catch-up run, recovering a schedule the machine slept through, is forced
-        // plan-only precisely because nobody chose for it to run NOW. A runner that ignores it turns
-        // a deliberately restrained run into an unrestrained one, in the one case where the operator
-        // was not watching, and leaves nothing behind that says the restraint was lifted.
-        if request.plan_only {
-            return Err(std::io::Error::other(
-                "codex exec cannot honour plan_only: it has no permission mode that withholds action",
-            ));
+        // `Permission` is the reason this is a refusal rather than a log line, and every rung above
+        // `Default` is refused. `Plan` is how a run is made unable to act — a catch-up run,
+        // recovering a schedule the machine slept through, is forced into it precisely because
+        // nobody chose for it to run NOW — so a runner that ignores it turns a deliberately
+        // restrained run into an unrestrained one, in the one case where the operator was not
+        // watching. `Bypass` fails the opposite way and worse: it is the CLI's permission barrier
+        // standing down on the strength of a `PreToolUse` hook, which `codex exec` has no notion of,
+        // so honouring it means running unbarriered where the daemon believes a second barrier took
+        // over. `AcceptEdits` is a per-conversation control a person set in the window, and dropping
+        // it silently leaves the row claiming something the run never had.
+        //
+        // `Default` alone passes, and passes by writing nothing: it is the rung that asks the launch
+        // surface for no elevation at all, which is what `codex exec` already does.
+        if request.permission != Permission::Default {
+            return Err(std::io::Error::other(format!(
+                "codex exec cannot honour Permission::{:?}: it has no permission mode that says this",
+                request.permission
+            )));
         }
         // `mcp_config` is half of a pairing: on the Claude path the file arrives with an
         // `--allowedTools mcp__nucleos__*` that narrows the run to that server alone. Dropping the
@@ -2566,14 +2665,18 @@ impl CommandRunner for CodexCliRunner {
             ));
         }
         // Reachable only if the tool-policy guard above is ever loosened, and refused anyway,
-        // because of which way it fails. This flag says the daemon has stood the CLI's permission
-        // barrier down on the strength of the classifier taking over — and the classifier is a
-        // `PreToolUse` hook, which is a Claude Code mechanism `codex exec` knows nothing about.
+        // because of which way it fails.
+        //
+        // The barrier this used to stand down is `Permission::Bypass`'s to stand down now, and the
+        // guard above refuses that. What is left here is a BELIEF and it is still worth refusing:
+        // this flag says the daemon has decided a `PreToolUse` classifier governs what this run may
+        // call — and `codex exec` knows nothing of that mechanism, so no classifier will run.
         // Dropped silently it would not weaken THIS launch, but it would leave the daemon believing
-        // a run is governed by something that never ran.
+        // a run is governed by something that never ran, which is the state every guard in this
+        // block exists to refuse.
         if request.classifier_governs_tools {
             return Err(std::io::Error::other(
-                "codex exec cannot honour classifier_governs_tools: it has no PreToolUse hook, so nothing would replace the barrier this stands down",
+                "codex exec cannot honour classifier_governs_tools: it has no PreToolUse hook, so nothing would do the governing the daemon believes is happening",
             ));
         }
         // Every per-conversation control this launch surface has no counterpart for, refused in
@@ -2827,7 +2930,7 @@ pub struct FakeCommandRunner {
     pub canned: std::sync::Mutex<Option<RunOutcome>>,
     // Set by Task 4's cancellation/timeout tests to simulate a slow/hung run.
     pub delay: std::sync::Mutex<Option<std::time::Duration>>,
-    pub last_plan_only: std::sync::Mutex<Option<bool>>,
+    pub last_permission: std::sync::Mutex<Option<Permission>>,
     /// The prompt the launch was handed. Recorded because a turn's prompt is not always the text
     /// the person typed — an errand's notebook is prepended to it — so what the CLI actually
     /// received is the only place that injection can be observed.
@@ -3059,7 +3162,7 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_prompt.lock().unwrap() = Some(request.prompt.clone());
         *self.last_images.lock().unwrap() = Some(request.images.clone());
         *self.last_cwd.lock().unwrap() = request.cwd.clone();
-        *self.last_plan_only.lock().unwrap() = Some(request.plan_only);
+        *self.last_permission.lock().unwrap() = Some(request.permission);
         *self.last_resume.lock().unwrap() = request.resume_session_id.clone();
         *self.last_mcp_config.lock().unwrap() = request.mcp_config.clone();
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
@@ -3554,56 +3657,77 @@ mod tests {
         assert!(!not_forked_args.iter().any(|arg| arg == "--fork-session"));
     }
 
-    /// The default matters more than the opt-in here: a request that did not ask for this must not
-    /// carry the flag, or every run in the daemon quietly gets it.
+    /// Every rung writes exactly one flag, and the SPELLINGS are the assertion.
+    ///
+    /// They were measured off the installed CLI (2.1.260), whose choices are `acceptEdits`, `auto`,
+    /// `bypassPermissions`, `manual`, `dontAsk` and `plan`. Two of those are traps this test exists
+    /// to keep shut: `default` is what the documentation calls the unelevated rung and the command
+    /// line does not accept it, so writing it — the obvious thing to do, reading the variant's name
+    /// — would fail the start of every run this daemon launches; and `auto` is the CLI's OWN
+    /// classifier model, a second billed opinion nobody reconciled with the classifier the daemon
+    /// runs.
+    ///
+    /// "No flag at all" is asserted absent for the same reason it stopped being written: from
+    /// v2.1.228 the default start-up mode on Pro/Max/Team plans is `auto`, so silence buys the very
+    /// thing the line above refuses.
     #[test]
-    fn cli_args_stands_the_cli_permission_barrier_down_only_when_asked() {
-        let mut governed = baseline_run_request();
-        governed.classifier_governs_tools = true;
-        let governed_args = cli_args(&governed, "sonnet");
+    fn cli_args_writes_one_measured_permission_spelling_per_rung() {
+        for (permission, expected) in [
+            (Permission::Default, "manual"),
+            (Permission::AcceptEdits, "acceptEdits"),
+            (Permission::Plan, "plan"),
+            (Permission::Bypass, "bypassPermissions"),
+        ] {
+            let mut request = baseline_run_request();
+            request.permission = permission;
+            let args = cli_args(&request, "sonnet");
 
-        let default_args = cli_args(&baseline_run_request(), "sonnet");
-
-        assert!(
-            governed_args.windows(2).any(|pair| pair
-                == [
-                    "--permission-mode".to_string(),
-                    "bypassPermissions".to_string()
-                ]),
-            "a run the classifier governs must say so on the command line: {governed_args:?}"
-        );
-        assert!(
-            !default_args.iter().any(|arg| arg == "--permission-mode"),
-            "an ordinary run must carry no permission mode at all: {default_args:?}"
-        );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--permission-mode".to_string(), expected.to_string()]),
+                "{permission:?} must launch as {expected}: {args:?}"
+            );
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| *arg == "--permission-mode")
+                    .count(),
+                1,
+                "two permission modes on one command line is the CLI's choice, not ours: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "default" || arg == "auto"),
+                "{permission:?} wrote a spelling the CLI does not accept, or its own classifier: {args:?}"
+            );
+        }
     }
 
-    /// A plan-only run is how a run is made unable to act — a catch-up run recovering a schedule the
-    /// machine slept through is forced plan-only precisely because nobody chose for it to run NOW.
-    /// If both flags could write `--permission-mode`, the order would decide whether that restraint
-    /// survives, and order is not where a safety property belongs.
+    /// The safety property, now unrepresentable rather than ordered.
+    ///
+    /// A run that must not act — a catch-up run, recovering a schedule the machine slept through,
+    /// forced into planning precisely because nobody chose for it to run NOW — used to keep that
+    /// restraint by winning an `else if` against `classifier_governs_tools`. The test that pinned
+    /// that order said in its own words that "order is not where a safety property belongs", and it
+    /// was right: there is one field now, it holds one value, and a request carrying the belief that
+    /// the classifier governs cannot ALSO be carrying the flag that stands the barrier down.
+    ///
+    /// The belief itself survives, and this asserts that too: `classifier_governs_tools` still means
+    /// something to `codex_cli_args`' refusal and to whoever reads the row — what it lost is the
+    /// power to write this flag.
     #[test]
-    fn plan_only_outranks_the_classifier_permission_surface() {
-        let mut both = baseline_run_request();
-        both.plan_only = true;
-        both.classifier_governs_tools = true;
-        let args = cli_args(&both, "sonnet");
+    fn a_restrained_run_cannot_also_carry_the_standing_down_flag() {
+        let mut restrained = baseline_run_request();
+        restrained.permission = Permission::Plan;
+        restrained.classifier_governs_tools = true;
+        let args = cli_args(&restrained, "sonnet");
 
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--permission-mode".to_string(), "plan".to_string()]),
-            "plan must win: {args:?}"
+            "plan must survive: {args:?}"
         );
         assert!(
             !args.iter().any(|arg| arg == "bypassPermissions"),
-            "a plan-only run must never also be handed the standing-down flag: {args:?}"
-        );
-        assert_eq!(
-            args.iter()
-                .filter(|arg| *arg == "--permission-mode")
-                .count(),
-            1,
-            "two permission modes on one command line is the CLI's choice, not ours: {args:?}"
+            "a restrained run must never also be handed the standing-down flag: {args:?}"
         );
     }
 
@@ -3794,7 +3918,7 @@ mod tests {
             prompt: "test prompt".to_string(),
             env: Vec::new(),
             cwd: None,
-            plan_only: false,
+            permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
@@ -3919,7 +4043,7 @@ mod tests {
             prompt: prompt.to_string(),
             env: Vec::new(),
             cwd: None,
-            plan_only: false,
+            permission: Permission::Default,
             resume_session_id: None,
             mcp_config: None,
             tool_policy: ToolPolicy::Unrestricted,
@@ -3963,7 +4087,7 @@ mod tests {
                 num_turns: None,
                 compacted: false,
             })),
-            last_plan_only: std::sync::Mutex::new(None),
+            last_permission: std::sync::Mutex::new(None),
             ..Default::default()
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5935,11 +6059,13 @@ mod tests {
     /// is the one outcome a control must never have: the caller was told the run it asked for
     /// started, and the record agreed.
     ///
-    /// `plan_only` is why this is a refusal rather than a warning. It is how a run is made unable to
-    /// act — a catch-up run, recovering a schedule the machine slept through, is forced plan-only
-    /// precisely because nobody chose for it to run now — so a runner that ignores it converts a
-    /// deliberately restrained run into an unrestrained one, in the one case where the operator is
-    /// not watching. `mcp_config` is half of a pairing on the Claude path, where the file arrives
+    /// `permission` is why this is a refusal rather than a warning. `Plan` is how a run is made
+    /// unable to act — a catch-up run, recovering a schedule the machine slept through, is forced
+    /// into it precisely because nobody chose for it to run now — so a runner that ignores it
+    /// converts a deliberately restrained run into an unrestrained one, in the one case where the
+    /// operator is not watching. `Bypass` is refused for the opposite reason and it is the sharper
+    /// of the two: it stands the CLI's permission barrier down on the strength of a `PreToolUse`
+    /// hook this launch surface has never heard of. `mcp_config` is half of a pairing on the Claude path, where the file arrives
     /// with the `--allowedTools` narrowing that keeps the run to that server alone; dropping the flag
     /// drops the narrowing, leaving MORE reachable than was asked for, not less.
     ///
@@ -5959,7 +6085,11 @@ mod tests {
         };
 
         let mut restrained = baseline_run_request();
-        restrained.plan_only = true;
+        restrained.permission = Permission::Plan;
+        // The other direction, and the one that fails open rather than closed: honouring it would
+        // mean running unbarriered where the daemon believes a classifier took over.
+        let mut unbarriered = baseline_run_request();
+        unbarriered.permission = Permission::Bypass;
         let mut narrowed = baseline_run_request();
         narrowed.mcp_config = Some(std::path::PathBuf::from("C:/nucleos/mcp.json"));
         let mut streaming = baseline_run_request();
@@ -5985,7 +6115,8 @@ mod tests {
         barred.denied_tools = vec!["Bash".to_string()];
 
         for (field, request) in [
-            ("plan_only", restrained),
+            ("Permission::Plan", restrained),
+            ("Permission::Bypass", unbarriered),
             ("mcp_config", narrowed),
             ("include_partial_messages", streaming),
             ("effort", thinking),

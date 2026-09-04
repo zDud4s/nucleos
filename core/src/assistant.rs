@@ -99,12 +99,16 @@ struct LiveChat {
     /// so a turn noticing the close has to be able to WAIT briefly for it rather than read whatever
     /// happens to be there.
     stopped_because: tokio::sync::watch::Receiver<Option<String>>,
-    /// Whether the process was started to plan rather than to act, fixed when it was spawned.
+    /// Which rung the process was started on, fixed when it was spawned.
     ///
-    /// `--permission-mode plan` is an argument, so a process started to act cannot be asked to stop
+    /// `--permission-mode` is an argument, so a process started to act cannot be asked to stop
     /// acting — and one started to plan cannot be let loose. Kept so it can be COMPARED, exactly as
     /// `cwd` is: a conversation that changed its mind gets a new process rather than a wrong one.
-    planning: bool,
+    ///
+    /// The whole rung and not a boolean, since `0129`: a conversation can move between five modes,
+    /// and a process spawned on one of them is the wrong process for any of the other four whose
+    /// command line differs.
+    permission: crate::runner::Permission,
     /// Where the process is standing, fixed when it was spawned.
     ///
     /// Kept so it can be COMPARED. A conversation's working directory is resolved per turn — an
@@ -297,7 +301,7 @@ async fn serve_turn(
         // folder wins over the chat's, and a fresh context abandons the session — so a process that no
         // longer matches this turn is not a process this turn may be answered by. It falls through
         // and is dropped, which stops it, and a new one is started to the turn's own shape.
-        let same_ground = live.cwd == request.cwd && live.planning == request.plan_only;
+        let same_ground = live.cwd == request.cwd && live.permission == request.permission;
         let same_conversation = known.is_some() && request.resume_session_id == known;
         if let Some(session_id) = known.filter(|_| same_ground && same_conversation) {
             let _ = session_tx.send(session_id.clone());
@@ -372,7 +376,7 @@ async fn start_live_chat(
     // turn wanting a different directory — or a different mode — can be told this process is the
     // wrong one.
     let started_in = request.cwd.clone();
-    let was_planning = request.plan_only;
+    let was_permission = request.permission;
 
     // stdin IS the channel a later turn arrives on, so a process meant to serve more than one has to
     // take that door whether or not this turn carries anything that could only fit through it.
@@ -463,7 +467,7 @@ async fn start_live_chat(
         session_id: std::sync::Arc::clone(&session_id),
         abort: supervisor.abort_handle(),
         stopped_because,
-        planning: was_planning,
+        permission: was_permission,
         cwd: started_in,
         idle_since: std::time::Instant::now(),
     };
@@ -2458,11 +2462,17 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         let may_live = matches!(tool_policy, crate::runner::ToolPolicy::Unrestricted);
 
         // Read here rather than carried in from the request that started the turn: it is a property
-        // of the conversation at the moment it answers, and somebody who pressed "plan" while
+        // of the conversation at the moment it answers, and somebody who moved the selector while
         // reading the last reply means this turn.
-        let planning = crate::chats::plans_only(&pool, &turn.slot.chat_id)
+        //
+        // `unwrap_or(Auto)` and not a refusal, for the reason the fallback exists at all: `Auto` is
+        // what a rooted conversation has always done, so a row that could not be read behaves the
+        // way it behaved before there was a column. It is the safe direction only downward, which
+        // is why the SNAPSHOT this turn writes cannot use it — see the run's own column.
+        let mode = crate::chats::permission_mode_of(&pool, &turn.slot.chat_id)
             .await
-            .unwrap_or(false);
+            .unwrap_or(crate::chats::PermissionMode::Auto);
+        let permission = crate::runner::Permission::for_chat(mode);
 
         // Who answers this turn, and how hard they are asked to think. Read HERE, beside `planning`
         // and for its reason: both are properties of the conversation at the moment it answers, and
@@ -2499,7 +2509,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // because one quietly given a working directory is one whose relative paths
             // moved.
             cwd,
-            plan_only: planning,
+            permission,
             resume_session_id: resume,
             mcp_config: Some(turn.mcp_path.clone()),
             // Decided by `tool_policy_for`, which is where the rule is written out. The
@@ -6242,7 +6252,7 @@ mod tests {
                 // Nothing to stop, but the field is what stops a real one, so it is not optional.
                 abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 stopped_because,
-                planning: false,
+                permission: crate::runner::Permission::Default,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
             },
@@ -6659,7 +6669,7 @@ mod tests {
             prompt: prompt.to_owned(),
             env: Vec::new(),
             cwd: Some(cwd.to_path_buf()),
-            plan_only: false,
+            permission: crate::runner::Permission::Default,
             resume_session_id: resume,
             mcp_config: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
@@ -6749,7 +6759,7 @@ mod tests {
             session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
             abort: running.abort_handle(),
             stopped_because: tokio::sync::watch::channel(None).1,
-            planning: false,
+            permission: crate::runner::Permission::Default,
             cwd: None,
             idle_since: std::time::Instant::now(),
         };
@@ -6855,11 +6865,12 @@ mod tests {
 
     /// A conversation in planning launches a run that cannot act.
     ///
-    /// `plan_only` has existed since the runs pillar was built and every conversation passed
-    /// `false`. `cli_args` turns it into `--permission-mode plan`, written FIRST and in an `else`,
-    /// so a planning run can never also be handed `bypassPermissions` — which is why the one mode a
-    /// person reaches for before letting an agent near a codebase was reachable by every kind of run
-    /// here except the kind a person is watching.
+    /// Planning has existed since the runs pillar was built and every conversation passed `false`.
+    /// `cli_args` turns the rung into `--permission-mode plan`, and since the fold it is one field
+    /// holding one value — so a planning run cannot also be carrying `bypassPermissions`, by
+    /// construction rather than by an ordering rule. It is the one mode a person reaches for before
+    /// letting an agent near a codebase, and it was reachable by every kind of run here except the
+    /// kind a person is watching.
     #[tokio::test]
     async fn a_conversation_in_planning_launches_a_run_that_cannot_act() {
         let fake = std::sync::Arc::new(FakeCommandRunner::default());
@@ -6875,7 +6886,10 @@ mod tests {
             .unwrap();
         settled_turn(&state.pool, id).await;
 
-        assert_eq!(*fake.last_plan_only.lock().unwrap(), Some(true));
+        assert_eq!(
+            *fake.last_permission.lock().unwrap(),
+            Some(crate::runner::Permission::Plan)
+        );
     }
 
     /// A conversation that changed its mind is not answered by the process it changed it from.
@@ -6909,7 +6923,10 @@ mod tests {
             2,
             "the turn was answered by a process started in the other mode"
         );
-        assert_eq!(*fake.last_plan_only.lock().unwrap(), Some(true));
+        assert_eq!(
+            *fake.last_permission.lock().unwrap(),
+            Some(crate::runner::Permission::Plan)
+        );
     }
 
     /// A conversation with no tools keeps no process, and the reason is not caution.

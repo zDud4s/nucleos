@@ -453,7 +453,7 @@ pub(crate) async fn ask_once(
         // handed a key it has no door for is a key that leaked for no reason.
         env: Vec::new(),
         cwd: None,
-        plan_only: false,
+        permission: crate::runner::Permission::Default,
         resume_session_id: None,
         mcp_config: None,
         // The argument is `local_agent::verdict`'s: a reader that could edit the repository is not
