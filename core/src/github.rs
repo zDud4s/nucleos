@@ -534,9 +534,13 @@ impl Op {
         }
     }
 
-    /// Every operation, for the partition test. Test-only, and said so rather than left to be
-    /// discovered: `clippy --all-targets` computes dead code per target, so an item the tests alone
-    /// use is dead in the bin build.
+    /// Every operation: the union decision #4 puts one list of names over. `gh_forms` derives the
+    /// map from this, and the partition test holds the two halves apart with it.
+    ///
+    /// It stopped being test-only when the map arrived, and the allow stays anyway: the bin build
+    /// reaches this only through `op_kind_of_gh_command`, which is itself waiting for its caller.
+    /// `clippy --all-targets` computes dead code per target, so the day that caller lands is the day
+    /// both allows can go.
     #[allow(dead_code)]
     pub fn all() -> Vec<Self> {
         ReadOp::all()
@@ -1093,6 +1097,161 @@ pub const REFUSED_READ_FLAGS: &[&str] = &[
     "--limit",
 ];
 
+/// One row of the map below: what a `gh` command line has to say in order to BE one operation.
+///
+/// Neither field is written here. Both are read off the operation's own `argv()` — see `gh_forms`.
+#[derive(Debug)]
+struct GhForm {
+    kind: &'static str,
+    /// The literal subcommand words, in order: `["run", "view"]`. This module's, never a caller's.
+    subcommand: Vec<String>,
+    /// The valueless flags this module writes for THIS operation and not for the one it shares a
+    /// subcommand with — the `--log` that makes `gh run view` mean `run_logs`. Empty for most rows.
+    switches: Vec<String>,
+}
+
+impl GhForm {
+    /// PURE: whether the words AFTER `gh` ask for this operation.
+    ///
+    /// The subcommand is compared case-insensitively and the switches are not. That is not an
+    /// inconsistency but the same split `read_is_autonomous` already makes, for the reason it gives:
+    /// it lowercases before comparing a prefix and reads RAW tokens for the flags, because `-L` is
+    /// `gh`'s short `--limit` while `-l` is its short `--label`. Two functions asked to agree about
+    /// one command line had better fold case in the same places.
+    ///
+    /// **A switch this row does not name is ignored rather than disqualifying.** `gh pr list --json
+    /// body` is `pr_list` here, and what refuses it is `REFUSED_READ_FLAGS`, one question later.
+    /// Naming an operation and judging it are two questions, and this answers only the first.
+    fn matches(&self, arguments: &[String]) -> bool {
+        let Some(rest) = arguments.get(self.subcommand.len()..) else {
+            return false;
+        };
+        if !self
+            .subcommand
+            .iter()
+            .zip(arguments)
+            .all(|(part, word)| word.eq_ignore_ascii_case(part))
+        {
+            return false;
+        }
+        // Everything past `--` is a positional, so a `--log` sitting there is a run id and not a
+        // flag. `read_is_autonomous` deliberately does NOT stop at the terminator — for a REFUSAL,
+        // reading the whole line is the conservative direction — and the two are the right way
+        // round: a refusal should err towards no, and this should err towards the truth about which
+        // operation was asked for.
+        let flags: Vec<&String> = rest
+            .iter()
+            .take_while(|word| word.as_str() != "--")
+            .collect();
+        self.switches
+            .iter()
+            .all(|switch| flags.iter().any(|word| word_is_flag(word, switch)))
+    }
+}
+
+/// PURE: the map, derived from the operations instead of written out beside them.
+///
+/// **Two rules turn an argv into a form, and each is an invariant this file already tests.** A word
+/// before the terminator that does not begin with `-` is a subcommand word, because `argv` builds
+/// every argv as subcommand, then flags, then `--`, then positionals — which
+/// `the_terminator_appears_exactly_where_a_positional_does` holds it to. A flag token carrying no
+/// `=` is one of this module's own booleans and therefore says WHICH operation this is; a
+/// `--flag=value` carries a caller's string and says nothing, because every operation's `--repo=`
+/// looks alike. That second rule is the one sentence of this map not read off the data, and
+/// `no_caller_value_reaches_argv_where_it_could_act_as_a_flag` is what keeps it true — that test
+/// even spells out the same two booleans, as the list this function computes instead.
+fn gh_forms() -> Vec<GhForm> {
+    Op::all()
+        .iter()
+        .map(|op| {
+            let mut subcommand = Vec::new();
+            let mut switches = Vec::new();
+            for word in op.argv() {
+                if word == "--" {
+                    break;
+                }
+                match (word.starts_with('-'), word.contains('=')) {
+                    (true, false) => switches.push(word),
+                    (true, true) => {}
+                    (false, _) => subcommand.push(word),
+                }
+            }
+            GhForm {
+                kind: op.kind(),
+                subcommand,
+                switches,
+            }
+        })
+        .collect()
+}
+
+/// PURE: which operation a `gh` command line asks for, or `None` for a line no operation builds.
+///
+/// **This is the map decision #4 moves into the code** —
+/// `.ai/specs/2026-09-03-alcada-por-projecto-design.md`, §1.2 for the defect and §2 for the
+/// decision. The pillar has two doors and each was governed in its own vocabulary: `ACTION_CEILING`
+/// and `action_is_autonomous` speak operation KINDS, `READ_CEILING` and `read_is_autonomous` speak
+/// `gh` PREFIXES. Two vocabularies for one question is how the two doors came to answer it
+/// differently, and the design measured what that costs an owner: a `.ai/github.yaml` without `gh
+/// run view` stops an agent that types it into Bash and hands the same agent the same bytes through
+/// `github_read {op: run_status}`. One list of NAMES can govern both doors only if something can say
+/// which name a command line spells. This says it.
+///
+/// **It is not a prefix table, and `gh run view` is the reason.** That one subcommand serves two
+/// operations this module grades apart — `run_status` is `ReadsOwn`, `run_logs` is `ReadsUntrusted`
+/// — and what separates them is a flag, `--log`, which is why the flag sits in `REFUSED_READ_FLAGS`
+/// and why `declarable_github_ops` refuses `run_logs` while admitting the prefix it shares. `gh pr
+/// view` is the same shape a second time, `pr_view` against `pr_thread`, separated by `--comments`.
+/// Two of them is what makes the pair a rule rather than an exception, and a prefix table would have
+/// to pick one of each pair and be wrong about the other.
+///
+/// **An allowlist, and by construction rather than by a second table.** `ReadOp` and `ActOp` are
+/// closed sets, so `gh auth token` and `gh secret list` fall outside this map the way they fall
+/// outside `READ_CEILING` — by absence, with nothing here to keep in step with a list of exclusions.
+/// It is the argument `READ_CEILING`'s own doc makes for itself, inherited.
+///
+/// Called from nowhere yet. The map is the piece `Policy::for_project` needs before one list of
+/// names can answer both doors, and it lands ahead of it so the test that proves it stays separable
+/// from the change that consumes it.
+#[allow(dead_code)]
+pub fn op_kind_of_gh_command(command: &str) -> Option<&'static str> {
+    let words = crate::classifier::shell_words(command);
+    let (program, arguments) = words.split_first()?;
+    if !program.eq_ignore_ascii_case("gh") {
+        return None;
+    }
+    let mut matched: Vec<GhForm> = gh_forms()
+        .into_iter()
+        .filter(|form| form.matches(arguments))
+        .collect();
+    // Longest subcommand first, then the most switches accounted for: `gh run view --log 1` matches
+    // both rows of the pair, and the row that named `--log` is the row that meant it.
+    matched.sort_by_key(|form| (form.subcommand.len(), form.switches.len()));
+    let best = matched.pop()?;
+    let rank = (best.subcommand.len(), best.switches.len());
+    if matched
+        .last()
+        .is_some_and(|next| (next.subcommand.len(), next.switches.len()) == rank)
+    {
+        // Two operations one line could equally be. There are none today — that is what
+        // `no_two_operations_wear_the_same_gh_form` says — and on the day there is one, a guess is a
+        // worse answer than no answer: whoever calls this map is deciding autonomy with it.
+        return None;
+    }
+    Some(best.kind)
+}
+
+/// PURE: whether this word is `flag`, in either spelling pflag accepts for it.
+///
+/// One function because it is one rule, and it is held in two places that have to agree about the
+/// same command line: `read_is_autonomous` reads it to take autonomy away and `GhForm` reads it to
+/// tell two operations apart. Equality alone would let `--json=body` through, which is one character
+/// of difference between an implementation that works and one that looks like it does — and a second
+/// copy of that character is exactly how the two would come to disagree.
+fn word_is_flag(word: &str, flag: &str) -> bool {
+    word == flag || word.starts_with(&format!("{flag}="))
+}
+
 /// What runs without asking.
 ///
 /// Built once at startup from `.ai/github.yaml` and then immutable: it does no I/O after
@@ -1177,9 +1336,8 @@ impl Policy {
     /// second one that would drift from it. Quotes are stripped by it, so
     /// `--search 'in:body x'` is two tokens and the flag is seen.
     ///
-    /// A refused flag is matched as `tok == flag || tok.starts_with("{flag}=")`. Equality alone
-    /// would let `--json=body` through, and that is one character of difference between an
-    /// implementation that works and one that looks like it does.
+    /// A refused flag is matched by `word_is_flag`, which is that rule and lives beside the map that
+    /// also needs it — see its own doc for why one rule may not have two spellings here.
     ///
     /// **This decides the list and the flags and nothing else.** Whether the line is a single
     /// command at all, whether it redirects, whether it hides a second command behind a separator —
@@ -1193,7 +1351,7 @@ impl Policy {
         if words.iter().any(|word| {
             REFUSED_READ_FLAGS
                 .iter()
-                .any(|flag| word == flag || word.starts_with(&format!("{flag}=")))
+                .any(|flag| word_is_flag(word, flag))
         }) {
             return false;
         }
@@ -2881,6 +3039,211 @@ mod tests {
                     .any(|command| command.starts_with(&format!("{prefix} "))),
                 "{prefix} is in the ceiling and no ReadOp builds it"
             );
+        }
+    }
+
+    /// The `gh` line an operation builds, as somebody would have typed it into Bash.
+    fn gh_line(op: &Op) -> String {
+        format!("gh {}", op.argv().join(" "))
+    }
+
+    /// **Decision #4's test, and the only one that would catch the map drifting from the
+    /// operations.**
+    ///
+    /// One list of NAMES can govern both doors only if a name picks out the SAME operation in each
+    /// vocabulary. So: enable exactly one kind, then ask about every operation twice — once the way
+    /// the typed door asks (is this the kind that is enabled?) and once the way the Bash door would
+    /// have to ask it (does the map name this command line as the kind that is enabled?). The two
+    /// answers have to be the same, for all sixteen operations, sixteen times over.
+    ///
+    /// **What makes this more than a tautology is the pair `gh run view` serves.** A map that named
+    /// both halves `run_status` would answer yes to `run_logs`'s command line while the typed door
+    /// said no, and one cell of this square is where that shows up; `gh pr view` is the same trap a
+    /// second time. It is written as a loop and not as a list of cases on purpose — a case per
+    /// operation is a second place to forget the eleventh operation, which is the drift the whole
+    /// decision exists to stop.
+    ///
+    /// **What it does NOT prove is that the two doors behave alike today.** They do not, and the
+    /// test below measures by how much. This proves the map, which is the piece that was missing.
+    #[test]
+    fn one_name_picks_out_the_same_operation_at_both_doors() {
+        let operations = Op::all();
+        for enabled in operations.iter().map(Op::kind) {
+            for op in &operations {
+                let line = gh_line(op);
+                let typed_door = op.kind() == enabled;
+                let bash_door = op_kind_of_gh_command(&line) == Some(enabled);
+                assert_eq!(
+                    typed_door,
+                    bash_door,
+                    "with {enabled} enabled, the typed door says {typed_door} about {} and the map \
+                     reads {line:?} as {:?}",
+                    op.kind(),
+                    op_kind_of_gh_command(&line)
+                );
+            }
+        }
+    }
+
+    /// What the map does not do, measured rather than promised.
+    ///
+    /// The map names an operation; it does not change who runs it. Under the WIDEST policy a
+    /// `.ai/github.yaml` can express — both ceilings, whole — the two doors still answer differently
+    /// about eleven of the sixteen operations, and this pins which eleven. Reads run typed whatever
+    /// the list says (`submit`: *«A READ never files a proposal, and that is not an omission»*), and
+    /// no action is ever autonomous in Bash because no `ACTION_CEILING` kind has a `READ_CEILING`
+    /// prefix.
+    ///
+    /// Deliberately not fixed here. Task 14 gives `Policy` the single list this map is the other
+    /// half of, and decision #6 — the comment below the map — is where the gap finally closes. This
+    /// test is what will fail, correctly and loudly, on the day either lands.
+    #[test]
+    fn the_map_names_an_operation_and_does_not_yet_make_the_two_doors_agree() {
+        let widest = Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: READ_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            autonomous_actions: ACTION_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+        });
+        let operations = Op::all();
+
+        let in_bash: Vec<&str> = operations
+            .iter()
+            .filter(|op| widest.read_is_autonomous(&gh_line(op)))
+            .map(Op::kind)
+            .collect();
+        assert_eq!(
+            in_bash,
+            ["run_list", "run_status", "pr_list", "workflow_list"],
+            "the Bash door is the four structural reads and nothing else"
+        );
+
+        // The typed door, for the same sixteen, as `submit` decides it.
+        let typed = |op: &Op| match op {
+            Op::Read(_) => true,
+            Op::Act(act) => widest.action_is_autonomous(act.kind()),
+        };
+        let disagreeing: Vec<&str> = operations
+            .iter()
+            .filter(|op| typed(op) != widest.read_is_autonomous(&gh_line(op)))
+            .map(Op::kind)
+            .collect();
+        assert_eq!(
+            disagreeing,
+            [
+                // Reads the ceiling refuses because they carry a stranger's words, and `run_logs`,
+                // which the ceiling would admit by prefix and `--log` takes back.
+                "pr_view",
+                "issue_view",
+                "run_logs",
+                "pr_diff",
+                "pr_thread",
+                "checks_for_ref",
+                // Every action inside `ACTION_CEILING`: autonomous typed, never autonomous in Bash.
+                "workflow_run",
+                "run_rerun",
+                "pr_create",
+                "pr_comment",
+                "issue_close",
+            ],
+            "eleven of sixteen, and `api_read` agrees only because both doors refuse it"
+        );
+    }
+
+    /// The pair that makes the map a map and not a prefix table, asked the way a person types it.
+    #[test]
+    fn one_subcommand_two_operations_and_a_flag_between_them() {
+        assert_eq!(op_kind_of_gh_command("gh run view 123"), Some("run_status"));
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --log 123"),
+            Some("run_logs")
+        );
+        // The flag after the positional, which is where a person actually puts it.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view 123 --log"),
+            Some("run_logs")
+        );
+        // pflag's other spelling for a boolean — the one `REFUSED_READ_FLAGS` had to learn too.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view 123 --log=true"),
+            Some("run_logs")
+        );
+        assert_eq!(op_kind_of_gh_command("gh pr view 7"), Some("pr_view"));
+        assert_eq!(
+            op_kind_of_gh_command("gh pr view --comments 7"),
+            Some("pr_thread")
+        );
+
+        // A flag carrying a caller's value names nothing and takes nothing away, in either spelling.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view -R owner/name 123"),
+            Some("run_status")
+        );
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --repo=owner/name 123"),
+            Some("run_status")
+        );
+        // Case-sensitive about the flag, exactly as `read_is_autonomous` is, and for its reason:
+        // `gh` would not read `--LOG` as `--log` either.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view --LOG 123"),
+            Some("run_status")
+        );
+        // Past the terminator it is a positional and not a flag.
+        assert_eq!(
+            op_kind_of_gh_command("gh run view -- 123"),
+            Some("run_status")
+        );
+    }
+
+    /// The map is an allowlist because the operations are a closed set, so everything else is
+    /// nameless — including the four reads `READ_CEILING`'s doc refuses by name.
+    #[test]
+    fn a_command_no_operation_builds_has_no_name() {
+        for command in [
+            "gh auth token",
+            "gh auth status",
+            "gh secret list",
+            "gh variable list",
+            "gh run download 1",
+            // The whole-word compare `read_is_autonomous` needs a prefix rule for.
+            "gh run listen",
+            "gh runlist",
+            "gh",
+            "git status",
+            "",
+        ] {
+            assert_eq!(op_kind_of_gh_command(command), None, "{command:?}");
+        }
+    }
+
+    /// What makes "the most switches accounted for" a safe way to break a tie: inside one
+    /// subcommand no two operations carry the same number of switches, so the winner is never a coin
+    /// toss. Two forms with different subcommands cannot both match a line at all — they differ in
+    /// some word — so this is the only tie there is to rule out.
+    #[test]
+    fn no_two_operations_wear_the_same_gh_form() {
+        let forms = gh_forms();
+        assert_eq!(forms.len(), Op::all().len(), "one form per operation");
+        for (index, one) in forms.iter().enumerate() {
+            for other in &forms[index + 1..] {
+                if one.subcommand != other.subcommand {
+                    continue;
+                }
+                assert_ne!(
+                    one.switches.len(),
+                    other.switches.len(),
+                    "{} and {} share `gh {}` and nothing tells them apart",
+                    one.kind,
+                    other.kind,
+                    one.subcommand.join(" ")
+                );
+            }
         }
     }
 
