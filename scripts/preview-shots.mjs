@@ -349,6 +349,10 @@ const SHOTS_TO_TAKE = [
      holds round 2's item, so the shot carries the one dashed edge that skips a rank. */
   ["09a-bench-roster", { path: "/teams/financas", tab: "Roster" }],
   ["09b-bench-roster-light", { path: "/teams/financas", tab: "Roster", theme: "light" }],
+  /* The department with nothing running, which is the case the chart is FOR: the structure is
+     drawn whole, and only the work rank is missing. And the one nobody has staffed at all. */
+  ["09c-bench-roster-idle", { path: "/teams/vendas", tab: "Roster" }],
+  ["09d-bench-roster-unstaffed", { path: "/teams/operacoes", tab: "Roster" }],
   ["10-catalogue-dark", { path: "/agents" }],
   ["11-catalogue-light", { path: "/agents", theme: "light" }],
   /* The editor, which is the half of the page that is not on screen at rest —

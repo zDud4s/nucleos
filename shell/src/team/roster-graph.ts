@@ -3,38 +3,54 @@ import type { Agent } from "../data/agents";
 import type { TeamRunView, TeamView } from "../data/teams";
 
 /**
- * A department read as an org chart: who directs, who is on the roster, and what each of them is
- * holding right now.
+ * A department read as an org chart: what it is, who runs it, who is on it, and — when there is
+ * any — what each of them is holding right now.
  *
- * Pure — no React, no DOM, no fetch. The tab that draws it (`Roster.tsx`) is a hundred lines of
- * SVG over what this returns, which is the only way the interesting half of the feature is
- * testable without a browser.
+ * Pure — no React, no DOM, no fetch. The tab that draws it (`Roster.tsx`) is SVG over what this
+ * returns, which is the only way the interesting half of the feature is testable without a browser.
  *
- * **Three layers and not two.** The roster on its own is a membership, and `RosterMatrix.tsx`
- * already settled that a membership reads better as a matrix than as a graph. What earns a graph
- * here is the third layer: work in flight hangs off the person holding it, and that is a relation
- * a matrix has no cell for.
+ * **The structure is the subject; the work is an extra.** The first version of this had three
+ * ranks — director, roster, work in flight — and the work rank was what made it a graph. Measured
+ * against a real idle department (`Vendas`, nothing running) it drew three boxes and the sentence
+ * "nothing in flight", and said nothing at all about how the department is put together. So the
+ * standing facts are ranks of their own and are always drawn: the department with the limits it
+ * runs under, then its director, then its roster. Work in flight is a fourth rank that exists
+ * when there is work and is simply absent when there is not.
+ *
+ * **Why a graph at all, when `RosterMatrix.tsx` decided a roster is a matrix.** That decision was
+ * about the whole house — nine specialists against six departments, a membership, which reads
+ * better as a grid. One department is a containment and not a membership: the department holds a
+ * director, the director holds a roster, a specialist holds work. Containment is a tree, and a
+ * tree is a graph.
  */
 
-export type RosterLayer = 0 | 1 | 2;
+/** 0 the department · 1 its director · 2 its roster · 3 the work in flight. */
+export type RosterLayer = 0 | 1 | 2 | 3;
 
 /**
  * One box.
  *
  * `state` is a `string` and not a union on purpose, for the reason `Work.tsx:253` is written the
  * way it is: the daemon's five item states (`done`, `working`, `planned`, `failed`, `skipped`) are
- * what the drawing has tones and glyphs for, plus the two this module synthesises for people —
- * `directs` for the one at the top and `idle` for everybody else. Anything the daemon adds later
- * arrives here as its own word, renders untoned, and is not silently reported as something else.
+ * what the drawing has tones and glyphs for, plus the three this module synthesises — `holds` for
+ * the department, `directs` for the one at the top and `idle` for everybody else. Anything the
+ * daemon adds later arrives here as its own word, renders untoned, and is not silently reported as
+ * something else.
  *
- * `crosses` is the director's own work: parented on layer 0 and drawn on layer 2, so its edge is
- * the one that skips a rank. It is flagged rather than routed differently — the drawing dashes it.
+ * `said` is the one line under the name. `facts` are the lines under THAT, and only the department
+ * box has any: the limits it runs under are four numbers, and four numbers do not fit on the line
+ * that says how many people are on it.
+ *
+ * `crosses` is work that hangs off something other than the specialist who holds it — the
+ * director's own item, or an item given to somebody who is on no roster. Its edge skips a rank, so
+ * the drawing routes it rather than curving it.
  */
 export interface RosterNode {
   id: string;
   layer: RosterLayer;
   label: string;
   said: string;
+  facts: string[];
   state: string;
   parent: string | null;
   href: string | null;
@@ -53,6 +69,23 @@ export interface RosterInput {
 
 export interface RosterModel {
   nodes: RosterNode[];
+}
+
+/**
+ * The limits a department runs under, over two lines.
+ *
+ * These live in the Charter as form fields, which is where they are CHANGED. This is where they
+ * are read, and a number somebody can only see by opening the form that edits it is a number
+ * nobody checks. `budget_usd` is `null` for a department with no ceiling of its own, and null is
+ * not zero — printing `$0.00` there would say the opposite of what it means.
+ */
+function limitsOf(team: TeamView): string[] {
+  const ceiling =
+    team.budget_usd === null ? "no ceiling of its own" : `$${team.budget_usd.toFixed(2)} ceiling`;
+  return [
+    `${team.max_rounds} rounds · ${team.max_parallel} at a time`,
+    `${ceiling} · ${team.max_open_actions} open actions`,
+  ];
 }
 
 /** What the one at the top is doing, rather than only that it is at the top. */
@@ -92,38 +125,62 @@ export function buildRoster(input: RosterInput): RosterModel {
   const { team, agents, teams, runs } = input;
 
   const catalogue = new Map(agents.map((who) => [who.id, who]));
-  const directorId = team.director_agent_id;
-  const directorNode = `director:${directorId}`;
-  const director = catalogue.get(directorId);
-
+  const teamNode = `team:${team.id}`;
   const newest = [...runs].sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+
+  const roster = team.members.filter((id) => id !== team.director_agent_id);
 
   const nodes: RosterNode[] = [
     {
-      id: directorNode,
+      id: teamNode,
       layer: 0,
-      label: director?.name ?? directorId,
-      said: director === undefined ? "deleted from the catalogue" : directorSaid(newest),
-      state: "directs",
+      label: team.name,
+      said: roster.length === 1 ? "1 on the roster" : `${roster.length} on the roster`,
+      facts: limitsOf(team),
+      state: "holds",
       parent: null,
       href: null,
-      missing: director === undefined,
+      missing: false,
       crosses: false,
     },
   ];
 
-  const roster = new Set(team.members);
-  const members: RosterNode[] = team.members
-    .filter((id) => id !== directorId)
+  /*
+    A department can have no director at all — `Operações` in the preview fixtures is one, created
+    and never staffed. Emitting a nameless box for it was the first version's real defect: the
+    chart drew an empty rectangle where a person should be, which reads as a rendering fault
+    rather than as the fact that nobody has been put in charge. So the rank is simply absent, and
+    the tab says so in words below the chart.
+  */
+  const directorId = team.director_agent_id;
+  const director = directorId === "" ? undefined : catalogue.get(directorId);
+  const directorNode = directorId === "" ? null : `director:${directorId}`;
+  if (directorNode !== null) {
+    nodes.push({
+      id: directorNode,
+      layer: 1,
+      label: director?.name ?? directorId,
+      said: director === undefined ? "deleted from the catalogue" : directorSaid(newest),
+      facts: [],
+      state: "directs",
+      parent: teamNode,
+      href: null,
+      missing: director === undefined,
+      crosses: false,
+    });
+  }
+
+  const members: RosterNode[] = roster
     .map((id) => {
       const who = catalogue.get(id);
       return {
         id: `member:${id}`,
-        layer: 1 as const,
+        layer: 2 as const,
         label: who?.name ?? id,
         said: memberSaid(id, who, team, teams),
+        facts: [],
         state: "idle",
-        parent: directorNode,
+        parent: directorNode ?? teamNode,
         href: null,
         missing: who === undefined,
         crosses: false,
@@ -132,22 +189,27 @@ export function buildRoster(input: RosterInput): RosterModel {
     .sort((a, b) => a.label.localeCompare(b.label));
   nodes.push(...members);
 
+  const held = new Set(roster);
   const work = runs
     .flatMap((run) => run.items.map((item) => ({ run, item })))
     .sort((a, b) => a.run.id.localeCompare(b.run.id) || a.item.ordinal - b.item.ordinal);
 
   for (const { run, item } of work) {
-    // An item held by somebody who is not on this roster hangs off the director for the same
-    // reason the director's own does: the chart has one place to put work with no column of its
-    // own, and pretending it belongs to a specialist who never had it is the worse answer.
-    const onRoster = roster.has(item.agent_id) && item.agent_id !== directorId;
+    /*
+      Work held by somebody who is not on this roster — the director's own, or an item given to an
+      agent since taken off it — hangs off whatever rank above it does exist. The chart has one
+      place to put work with no column of its own, and pretending it belongs to a specialist who
+      never had it is the worse answer.
+    */
+    const onRoster = held.has(item.agent_id);
     nodes.push({
       id: `item:${run.id}#${item.ordinal}`,
-      layer: 2,
+      layer: 3,
       label: item.description,
       said: `round ${item.round} · ${run.request}`,
+      facts: [],
       state: item.state,
-      parent: onRoster ? `member:${item.agent_id}` : directorNode,
+      parent: onRoster ? `member:${item.agent_id}` : (directorNode ?? teamNode),
       href: `/team-runs/${run.id}`,
       missing: false,
       crosses: !onRoster,
@@ -160,14 +222,17 @@ export function buildRoster(input: RosterInput): RosterModel {
 /* ------------------------------------------------------------------ layout -- */
 
 /**
- * One height per rank. A person's box holds a name and a line under it; a piece of work holds a
+ * One height per rank.
+ *
+ * The department carries four lines — its name, how many are on it, and its limits over two — and
+ * is the only rank that does. A person carries a name and a line; a piece of work carries a
  * description over two lines, the task it belongs to, and its state.
  */
-export const LAYER_H: Record<RosterLayer, number> = { 0: 56, 1: 54, 2: 72 };
+export const LAYER_H: Record<RosterLayer, number> = { 0: 88, 1: 56, 2: 54, 3: 72 };
 
 /**
- * The white band between two ranks. Wide enough that an edge reads as a line and not a join,
- * and exported because the drawing routes the director's own edge along the middle of it.
+ * The white band between two ranks. Wide enough that an edge reads as a line and not a join, and
+ * exported because the drawing routes a crossing edge along the middle of it.
  */
 export const ROW_GAP = 46;
 
@@ -224,12 +289,26 @@ export function clip(text: string, max = MAX_CHARS): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
-const rowY = (layer: RosterLayer): number =>
-  layer === 0 ? 0 : layer === 1 ? LAYER_H[0] + ROW_GAP : LAYER_H[0] + LAYER_H[1] + 2 * ROW_GAP;
+const ROWS: RosterLayer[] = [0, 1, 2, 3];
 
-/** As wide as the widest thing written in it — `layered.ts`' rule, over this box's own two lines. */
-function boxWidth(lines: string[], said: string): number {
-  const longest = Math.max(...lines.map((line) => line.length), clip(said).length);
+const rowY = (layer: RosterLayer): number =>
+  ROWS.slice(0, layer).reduce<number>((y, rank) => y + LAYER_H[rank] + ROW_GAP, 0);
+
+/**
+ * As wide as the widest thing written in it — `layered.ts`' rule, over this box's own lines.
+ *
+ * **`facts` are measured whole and `said` is measured clipped**, and the asymmetry is the point.
+ * `said` is somebody's prose — a speciality, a list of departments — and has no upper bound, so it
+ * is trimmed to fit and the box is sized to the trim. `facts` are this module's own sentences
+ * about numbers the daemon holds; measuring them clipped is how the department's limits came out
+ * as `no ceiling of its own · 5 ope…` in a box that had refused to grow to hold them.
+ */
+function boxWidth(lines: string[], said: string, facts: string[]): number {
+  const longest = Math.max(
+    ...lines.map((line) => line.length),
+    clip(said).length,
+    ...facts.map((fact) => fact.length),
+  );
   return Math.max(MIN_W, Math.round(longest * CHAR_W + PAD_X));
 }
 
@@ -239,7 +318,7 @@ function boxWidth(lines: string[], said: string): number {
  * **Not `layered.ts`'s `layout()`**, for the two reasons the spec gives at §5. `rankNodes` would
  * rank the director's own item onto the specialists' row, because rank there is distance from a
  * source and this item's parent is the director; and `NODE_H` is one height for every rank, while
- * a person's box and a piece of work's box are not the same size.
+ * a department's box, a person's box and a piece of work's box are not the same size.
  *
  * Two passes, which is all a tree needs. Bottom up, a node's span is the wider of its own box and
  * its children laid side by side. Top down, each node is handed its span and centred in it, and
@@ -268,7 +347,7 @@ export function placeRoster(nodes: RosterNode[]): RosterLayout {
   for (const node of nodes) {
     const folded = fold(node.label);
     lines.set(node.id, folded);
-    own.set(node.id, boxWidth(folded, node.said));
+    own.set(node.id, boxWidth(folded, node.said, node.facts));
   }
 
   const span = new Map<string, number>();

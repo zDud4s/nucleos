@@ -1354,3 +1354,20 @@
   font-size: var(--text-sm);
   color: var(--text-faint);
 }
+
+/**
+ * The department itself, at the head of its own chart. Heavier than the ranks below it: it is the
+ * thing they belong to, and the limits printed inside it are read here rather than in the Charter,
+ * which is where they are changed.
+ */
+.teams-org-dept .teams-org-box {
+  fill: var(--surface-sunken);
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.teams-org-fact {
+  fill: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}

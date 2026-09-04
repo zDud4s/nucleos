@@ -8,20 +8,32 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { ROW_GAP, buildRoster, clip, placeRoster, type RosterNode } from "./roster-graph";
+import {
+  ROW_GAP,
+  buildRoster,
+  clip,
+  placeRoster,
+  type RosterBox,
+  type RosterNode,
+} from "./roster-graph";
 
 /**
  * `Roster` — the department drawn as its own org chart.
  *
- * The director on top, the specialists under it, and under each of those whatever it is holding
- * right now. Read-only: nothing here writes, and the only thing it can be clicked into is the task
- * a piece of work belongs to.
+ * The department on top with the limits it runs under, its director below that, its roster below
+ * that, and — only when there is any — the work each specialist is holding right now. Read-only:
+ * nothing here writes, and the only thing it can be clicked into is the task a piece of work
+ * belongs to.
  *
- * **Why this is a graph when `RosterMatrix.tsx` decided a roster is a matrix.** That decision was
- * about the whole house — nine specialists against six departments — and it still stands, and the
- * console still draws it. What it left open is the case this tab takes: one department, with the
- * work in flight hanging off the person holding it. That third rank is a relation, not a
- * membership, and a matrix has no cell for it.
+ * **The structure is drawn whether or not anything is running.** The first version made live work
+ * the third and last rank, so an idle department drew three boxes and the sentence "nothing in
+ * flight" — a picture of the absence of work rather than of how the department is put together.
+ * The standing facts now have ranks of their own; work is the rank that comes and goes.
+ *
+ * **Why a graph when `RosterMatrix.tsx` decided a roster is a matrix.** That decision was about
+ * the whole house — a membership across nine specialists and six departments, which reads better
+ * as a grid, and the console still draws it that way. One department is a containment: it holds a
+ * director, who holds a roster, whose members hold work. Containment is a tree.
  *
  * **SVG by hand, and `roster-graph.ts` for everything that is not drawing** — the same division
  * `JobProgressGraph.tsx` makes, and for the same reason: the interesting half is arithmetic, and
@@ -77,8 +89,9 @@ export function Roster({ team, runs }: RosterProps) {
     return <p className="teams-loading">reading the catalogue…</p>;
   }
 
-  const alone = !model.nodes.some((node) => node.layer === 1);
-  const inFlight = model.nodes.some((node) => node.layer === 2);
+  const headless = !model.nodes.some((node) => node.layer === 1);
+  const alone = !model.nodes.some((node) => node.layer === 2);
+  const inFlight = model.nodes.some((node) => node.layer === 3);
   const waiting = live.length > 0 && flight.pending && flight.runs.length === 0;
 
   return (
@@ -86,13 +99,13 @@ export function Roster({ team, runs }: RosterProps) {
       <div className="teams-org-scroll">
         {/*
           `role="group"` and not the `role="img"` the fleet's graph carries. An image's children are
-          presentational, and half the boxes here are links — calling this a picture would take the
-          work out of the accessibility tree along with the way into it.
+          presentational, and the work boxes are links — calling this a picture would take the work
+          out of the accessibility tree along with the way into it.
         */}
         <svg
           className="teams-org-svg"
           role="group"
-          aria-label={`${team.name} — its director, its roster and the work in flight`}
+          aria-label={`${team.name} — how this department is put together`}
           viewBox={`0 0 ${view.width} ${view.height}`}
           width={view.width}
           height={view.height}
@@ -107,14 +120,14 @@ export function Roster({ team, runs }: RosterProps) {
               const x2 = to.x + to.width / 2;
               const y2 = to.y;
               /*
-                The crossing edge is routed and not curved, and this is the one thing in the
-                drawing that was decided by looking at it rather than by reasoning. A bezier from
-                the director to a box two ranks down passes THROUGH the specialists' rank — it
-                went under the `reviewer` box, which paints over it, and came out of its right
-                edge. The picture then said the director's own work belonged to `reviewer`, which
-                is the exact fact this edge exists to deny. So it drops into the gap above the
-                roster, runs across it, and comes down in the crossing item's own column — which
-                has no box in that rank, by construction.
+                A crossing edge is routed and not curved, and this is the one thing in the drawing
+                that was decided by looking at it rather than by reasoning. A bezier from the
+                director to a box two ranks down passes THROUGH the roster rank — it went under
+                the `reviewer` box, which paints over it, and came out of its right edge. The
+                picture then said the director's own work belonged to `reviewer`, which is the
+                exact fact this edge exists to deny. So it drops into the gap above the roster,
+                runs across it, and comes down in the crossing item's own column — which has no box
+                in that rank, by construction.
               */
               const d = edge.crosses
                 ? `M ${x1} ${y1} V ${y1 + ROW_GAP / 2} H ${x2} V ${y2}`
@@ -138,13 +151,23 @@ export function Roster({ team, runs }: RosterProps) {
         </svg>
       </div>
 
-      {alone && (
+      {/*
+        One sentence, not three. A department nobody has staffed is missing a director, a roster
+        AND any work, and saying all three stacks up as noise around a box that already shows an
+        empty department. The most upstream fact is the one that explains the others, and it is
+        the only one worth printing.
+      */}
+      {headless ? (
         <p className="teams-org-empty">
-          no roster yet — this department is a director and nobody else.
+          nobody is in charge of this department yet — it will refuse every task until somebody is.
         </p>
+      ) : alone ? (
+        <p className="teams-org-empty">nobody on the roster yet</p>
+      ) : waiting ? (
+        <p className="teams-org-empty">reading the work…</p>
+      ) : (
+        !inFlight && <p className="teams-org-empty">nothing in flight</p>
       )}
-      {waiting && <p className="teams-org-empty">reading the work…</p>}
-      {!waiting && !inFlight && <p className="teams-org-empty">nothing in flight</p>}
     </div>
   );
 }
@@ -152,24 +175,30 @@ export function Roster({ team, runs }: RosterProps) {
 /**
  * One box, and the one fact it adds to its own name.
  *
- * A person at the top directs; a specialist is what it does, or that the catalogue no longer has
- * it; a piece of work is its state. Those are three different sentences, and each is the one thing
- * somebody would ask about that box — which is why this is not a single field.
+ * A department is how many people are on it; the one at the top directs; a specialist is what it
+ * does, or that the catalogue no longer has it; a piece of work is its state. Those are four
+ * different sentences, and each is the one thing somebody would ask about that box — which is why
+ * this is not a single field.
  */
 function spoken(node: RosterNode): string {
-  return node.layer === 1 ? node.said : node.state;
+  return node.layer === 1 || node.layer === 3 ? node.state : node.said;
 }
 
-interface BoxProps {
-  node: RosterNode;
-  box: { x: number; y: number; width: number; height: number; lines: string[] };
-}
+/** The rank a box belongs to, as a class. Only work carries a state tone. */
+const KIND: Record<number, string> = {
+  0: "teams-org-dept",
+  1: "teams-org-lead",
+  2: "teams-org-who",
+  3: "teams-org-item",
+};
 
-function Box({ node, box }: BoxProps) {
-  const kind =
-    node.layer === 0 ? "teams-org-lead" : node.layer === 1 ? "teams-org-who" : "teams-org-item";
-  const tone = node.layer === 2 ? ` teams-org-${node.state}` : "";
+function Box({ node, box }: { node: RosterNode; box: RosterBox }) {
+  const tone = node.layer === 3 ? ` teams-org-${node.state}` : "";
   const gone = node.missing ? " teams-org-missing" : "";
+
+  /* One formula for four ranks: the name first, then its one line, then whatever else it carries.
+     A box that is two lines of name deep pushes the rest down rather than writing over it. */
+  const said = 20 + (box.lines.length - 1) * 13 + 16;
 
   const body = (
     <>
@@ -185,16 +214,27 @@ function Box({ node, box }: BoxProps) {
           {line}
         </text>
       ))}
-      <text
-        className="teams-org-said"
-        x={box.width / 2}
-        y={node.layer === 2 ? 49 : box.height - 12}
-        textAnchor="middle"
-      >
+      <text className="teams-org-said" x={box.width / 2} y={said} textAnchor="middle">
         {clip(node.said)}
       </text>
-      {node.layer === 2 && (
-        <text className="teams-org-state" x={box.width / 2} y={65} textAnchor="middle">
+      {node.facts.map((fact, index) => (
+        <text
+          className="teams-org-fact"
+          key={fact}
+          x={box.width / 2}
+          y={said + 15 + index * 14}
+          textAnchor="middle"
+        >
+          {fact}
+        </text>
+      ))}
+      {node.layer === 3 && (
+        <text
+          className="teams-org-state"
+          x={box.width / 2}
+          y={box.height - 9}
+          textAnchor="middle"
+        >
           {/* The glyph is decoration; the word beside it is the answer — for anything that does
               not render a glyph, and for anyone who cannot tell the two tones apart. */}
           <tspan className="teams-org-mark" aria-hidden="true">
@@ -208,7 +248,7 @@ function Box({ node, box }: BoxProps) {
 
   return (
     <g
-      className={`teams-org-node ${kind}${tone}${gone}`}
+      className={`teams-org-node ${KIND[node.layer]}${tone}${gone}`}
       transform={`translate(${box.x}, ${box.y})`}
       aria-label={`${node.label} — ${spoken(node)}`}
     >

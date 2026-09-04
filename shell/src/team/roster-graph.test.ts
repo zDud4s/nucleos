@@ -6,11 +6,13 @@ import type { Agent } from "../data/agents";
 import type { TeamItem, TeamRunView, TeamView } from "../data/teams";
 
 /**
- * Table tests over the four shapes a real department takes, written before the tab exists.
+ * Table tests over the shapes a real department takes, written before the tab exists.
  *
- * The case that earns most of them is the director who also works: Finanças' `controller` both
- * directs and holds an item, and a model that quietly drops either fact draws a picture that is
- * wrong in a way nobody looking at it can see.
+ * Two cases earn most of them. The first is the director who also works: Finanças' `controller`
+ * both directs and holds an item, and a model that quietly drops either fact draws a picture that
+ * is wrong in a way nobody looking at it can see. The second is the department with nothing
+ * running, which is the case the first version of this got wrong — the structure has to be whole
+ * whether or not anything is in flight.
  *
  * Nothing here imports the preview's fixtures. A test that read `preview/daemon.ts` would be a
  * test that fails when somebody edits a screenshot.
@@ -98,35 +100,71 @@ function run(overrides: Partial<TeamRunView> = {}): TeamRunView {
   };
 }
 
-describe("buildRoster", () => {
-  it("puts the director on layer 0 and every other member on layer 1", () => {
-    const model = buildRoster({ team: team(), agents: CATALOGUE, teams: [team()], runs: [] });
+/** The structure alone: a real department with a real roster and nothing running. */
+const IDLE = { team: team(), agents: CATALOGUE, teams: [team()], runs: [] };
 
-    expect(model.nodes.filter((node) => node.layer === 0).map((node) => node.label)).toEqual([
-      "controller",
-    ]);
-    expect(model.nodes.filter((node) => node.layer === 1).map((node) => node.label)).toEqual([
-      "Auditor Sénior",
-      "researcher",
-    ]);
+describe("buildRoster", () => {
+  it("puts the department on top, its director under it and the roster under that", () => {
+    const model = buildRoster(IDLE);
+    const rank = (layer: number) =>
+      model.nodes.filter((node) => node.layer === layer).map((node) => node.label);
+
+    expect(rank(0)).toEqual(["Finanças"]);
+    expect(rank(1)).toEqual(["controller"]);
+    expect(rank(2)).toEqual(["Auditor Sénior", "researcher"]);
+  });
+
+  /**
+   * The whole point of the redesign. The limits live in the Charter as form fields; a number
+   * somebody can only see by opening the form that edits it is a number nobody checks.
+   */
+  it("says the limits the department runs under, whether or not anything is running", () => {
+    const model = buildRoster(IDLE);
+    const department = model.nodes.find((node) => node.layer === 0)!;
+
+    expect(department.said).toBe("2 on the roster");
+    expect(department.facts).toEqual(["4 rounds · 2 at a time", "$5.00 ceiling · 5 open actions"]);
+  });
+
+  /** `budget_usd` is null for a department with no ceiling of its own, and null is not zero. */
+  it("says a department has no ceiling of its own rather than printing zero", () => {
+    const model = buildRoster({ ...IDLE, team: team({ budget_usd: null }) });
+
+    expect(model.nodes[0].facts[1]).toBe("no ceiling of its own · 5 open actions");
+  });
+
+  it("counts one on the roster in the singular", () => {
+    const model = buildRoster({ ...IDLE, team: team({ members: ["controller", "auditor"] }) });
+
+    expect(model.nodes[0].said).toBe("1 on the roster");
   });
 
   it("says what the director is doing rather than only that it directs", () => {
-    const model = buildRoster({
-      team: team(),
-      agents: CATALOGUE,
-      teams: [team()],
-      runs: [run({ director_node: "replanning" })],
-    });
+    const model = buildRoster({ ...IDLE, runs: [run({ director_node: "replanning" })] });
 
-    const director = model.nodes.find((node) => node.layer === 0)!;
+    const director = model.nodes.find((node) => node.layer === 1)!;
     expect(director.state).toBe("directs");
     expect(director.said).toBe("replanning");
   });
 
+  /**
+   * A department created and never staffed. The first version drew a nameless box where the
+   * director should be, which reads as a rendering fault rather than as a department nobody has
+   * been put in charge of.
+   */
+  it("draws no director rank at all when nobody has been put in charge", () => {
+    const model = buildRoster({
+      ...IDLE,
+      team: team({ director_agent_id: "", members: ["auditor"] }),
+    });
+
+    expect(model.nodes.some((node) => node.layer === 1)).toBe(false);
+    expect(model.nodes.find((node) => node.id === "member:auditor")!.parent).toBe("team:financas");
+  });
+
   it("hangs an item under the specialist who holds it", () => {
-    const model = buildRoster({ team: team(), agents: CATALOGUE, teams: [team()], runs: [run()] });
-    const work = model.nodes.filter((node) => node.layer === 2);
+    const model = buildRoster({ ...IDLE, runs: [run()] });
+    const work = model.nodes.filter((node) => node.layer === 3);
 
     expect(work).toHaveLength(1);
     expect(work[0].parent).toBe("member:auditor");
@@ -137,12 +175,10 @@ describe("buildRoster", () => {
     expect(work[0].crosses).toBe(false);
   });
 
-  it("keeps a director's own item on layer 2 and marks it as crossing", () => {
+  it("keeps a director's own item on the work rank and marks it as crossing", () => {
     // Finanças as it really is: `controller` directs AND holds round 2's item.
     const model = buildRoster({
-      team: team(),
-      agents: CATALOGUE,
-      teams: [team()],
+      ...IDLE,
       runs: [
         run({
           items: [
@@ -161,18 +197,13 @@ describe("buildRoster", () => {
     });
 
     const own = model.nodes.find((node) => node.label === "match them line by line")!;
-    expect(own.layer).toBe(2);
+    expect(own.layer).toBe(3);
     expect(own.parent).toBe("director:controller");
     expect(own.crosses).toBe(true);
   });
 
   it("marks a member whose agent no longer exists", () => {
-    const model = buildRoster({
-      team: team({ members: ["controller", "ghost"] }),
-      agents: CATALOGUE,
-      teams: [team()],
-      runs: [],
-    });
+    const model = buildRoster({ ...IDLE, team: team({ members: ["controller", "ghost"] }) });
 
     const ghost = model.nodes.find((node) => node.id === "member:ghost")!;
     expect(ghost.missing).toBe(true);
@@ -187,12 +218,7 @@ describe("buildRoster", () => {
       director_agent_id: "editor",
       members: ["editor", "researcher"],
     });
-    const model = buildRoster({
-      team: team(),
-      agents: CATALOGUE,
-      teams: [team(), marketing],
-      runs: [],
-    });
+    const model = buildRoster({ ...IDLE, teams: [team(), marketing] });
 
     expect(model.nodes.find((node) => node.id === "member:researcher")!.said).toBe(
       "also in Marketing",
@@ -201,38 +227,31 @@ describe("buildRoster", () => {
   });
 
   it("gives the same order whatever order the members and runs arrive in", () => {
+    const ledger = item({ agent_id: "researcher", description: "pull the ledger", run_id: 12 });
     const forwards = buildRoster({
+      ...IDLE,
       team: team({ members: ["controller", "auditor", "researcher"] }),
-      agents: CATALOGUE,
-      teams: [team()],
-      runs: [
-        run({ id: "run-a" }),
-        run({
-          id: "run-b",
-          items: [item({ agent_id: "researcher", description: "pull the ledger", run_id: 12 })],
-        }),
-      ],
+      runs: [run({ id: "run-a" }), run({ id: "run-b", items: [ledger] })],
     });
     const backwards = buildRoster({
+      ...IDLE,
       team: team({ members: ["researcher", "auditor", "controller"] }),
-      agents: CATALOGUE,
-      teams: [team()],
-      runs: [
-        run({
-          id: "run-b",
-          items: [item({ agent_id: "researcher", description: "pull the ledger", run_id: 12 })],
-        }),
-        run({ id: "run-a" }),
-      ],
+      runs: [run({ id: "run-b", items: [ledger] }), run({ id: "run-a" })],
     });
 
     expect(backwards.nodes.map((node) => node.id)).toEqual(forwards.nodes.map((node) => node.id));
   });
 
-  it("draws two layers and no third when nothing is in flight", () => {
-    const model = buildRoster({ team: team(), agents: CATALOGUE, teams: [team()], runs: [] });
+  it("draws the structure whole when nothing is in flight, and only omits the work", () => {
+    const model = buildRoster(IDLE);
 
-    expect(model.nodes.some((node) => node.layer === 2)).toBe(false);
+    expect(model.nodes.some((node) => node.layer === 3)).toBe(false);
+    expect(model.nodes.map((node) => node.id)).toEqual([
+      "team:financas",
+      "director:controller",
+      "member:auditor",
+      "member:researcher",
+    ]);
   });
 });
 
@@ -245,8 +264,7 @@ function full() {
     members: ["editor", "researcher"],
   });
   return buildRoster({
-    team: team(),
-    agents: CATALOGUE,
+    ...IDLE,
     teams: [team(), marketing],
     runs: [
       run({
@@ -270,9 +288,7 @@ function full() {
 describe("placeRoster", () => {
   it("centres a parent over its children", () => {
     const nodes = buildRoster({
-      team: team(),
-      agents: CATALOGUE,
-      teams: [team()],
+      ...IDLE,
       runs: [
         run({ items: [item(), item({ ordinal: 2, description: "reconcile the two", run_id: 12 })] }),
       ],
@@ -289,9 +305,7 @@ describe("placeRoster", () => {
 
   it("gives a box the width its own label needs", () => {
     const nodes = buildRoster({
-      team: team(),
-      agents: CATALOGUE,
-      teams: [team()],
+      ...IDLE,
       runs: [
         run({ items: [item({ description: "reconcile every line of the August bank export" })] }),
       ],
@@ -301,11 +315,17 @@ describe("placeRoster", () => {
     expect(placed.boxes.find((box) => box.id.startsWith("item:"))!.width).toBeGreaterThan(MIN_W);
   });
 
+  /** The department box is as wide as its limits line, not as wide as its name. */
+  it("gives the department the width its limits need", () => {
+    const placed = placeRoster(buildRoster(IDLE).nodes);
+    const department = placed.boxes.find((box) => box.id === "team:financas")!;
+
+    expect(department.width).toBeGreaterThan("Finanças".length * 10);
+  });
+
   it("widens a subtree rather than overlapping three items under one specialist", () => {
     const nodes = buildRoster({
-      team: team(),
-      agents: CATALOGUE,
-      teams: [team()],
+      ...IDLE,
       runs: [
         run({
           items: [
@@ -328,13 +348,22 @@ describe("placeRoster", () => {
     const placed = placeRoster(full());
     const rows = [...new Set(placed.boxes.map((box) => box.y))].sort((a, b) => a - b);
 
-    expect(rows).toHaveLength(3);
+    expect(rows).toHaveLength(4);
     expect(
       placed.boxes.filter((box) => box.y === rows[0]).every((box) => box.height === LAYER_H[0]),
     ).toBe(true);
     expect(
-      placed.boxes.filter((box) => box.y === rows[2]).every((box) => box.height === LAYER_H[2]),
+      placed.boxes.filter((box) => box.y === rows[3]).every((box) => box.height === LAYER_H[3]),
     ).toBe(true);
+  });
+
+  /** Three ranks and not two: a department with nothing running still has a shape. */
+  it("still draws three ranks when nothing is in flight", () => {
+    const placed = placeRoster(buildRoster(IDLE).nodes);
+    const rows = [...new Set(placed.boxes.map((box) => box.y))];
+
+    expect(rows).toHaveLength(3);
+    expect(placed.boxes).toHaveLength(4);
   });
 
   it("marks the director's own item as the one crossing edge", () => {

@@ -176,6 +176,35 @@ async function renderRoster(view: TeamView, runs: TeamRun[], seed: TeamRunView =
 }
 
 describe("Roster", () => {
+  /**
+   * The structure is the subject. These two are what the first version of the tab could not do:
+   * an idle department drew three boxes and "nothing in flight", and said nothing about how it is
+   * put together or what it runs under.
+   */
+  it("draws the department itself, with the limits it runs under", async () => {
+    await renderRoster(team(), [listRow()]);
+
+    expect(await screen.findByLabelText("Finanças — 2 on the roster")).toBeTruthy();
+    expect(screen.getByText("4 rounds · 2 at a time")).toBeTruthy();
+    expect(screen.getByText("$5.00 ceiling · 5 open actions")).toBeTruthy();
+  });
+
+  it("draws the whole structure when nothing at all is running", async () => {
+    await renderRoster(team(), []);
+
+    expect(await screen.findByLabelText("Finanças — 2 on the roster")).toBeTruthy();
+    expect(screen.getByLabelText("controller — directs")).toBeTruthy();
+    expect(screen.getByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
+    expect(screen.getByText("nothing in flight")).toBeTruthy();
+  });
+
+  it("says nobody is in charge rather than drawing a nameless box", async () => {
+    await renderRoster(team({ director_agent_id: "", members: ["auditor"] }), []);
+
+    expect(await screen.findByText(/nobody is in charge of this department yet/)).toBeTruthy();
+    expect(screen.getByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
+  });
+
   it("draws the director, the roster and the work in flight", async () => {
     await renderRoster(team(), [listRow()]);
 
