@@ -897,10 +897,32 @@ pub const READ_CEILING: &[&str] = &[
 
 /// The `ActOp` kinds eligible for autonomy. `api_read` is outside it and stays outside.
 ///
-/// `pr_create` is outside too, and for its own reason rather than `api_read`'s: opening a pull request
-/// publishes a title and a body under the owner's name to people who will read them as the owner's
-/// words. That is not undoable by closing it.
-pub const ACTION_CEILING: &[&str] = &["workflow_run", "run_rerun", "pr_comment", "issue_close"];
+/// **`pr_create` is inside, and it publishes to somebody else's server, which is worth saying
+/// plainly rather than leaving to be noticed.** It puts a title and a body under the owner's name
+/// where people will read them as the owner's words, and closing the pull request afterwards does
+/// not unsend that. What makes it admissible anyway is the shape of what it creates: a pull request
+/// is a PROPOSAL addressed to a human, and it merges nothing. The repository is in exactly the state
+/// it was in a moment before, and the next step belongs to a reviewer who has to press something.
+/// That is the same bargain `pr_comment` and `issue_close` already made — public, attributable,
+/// bounded — and `pr_create` is not a larger one for being longer.
+///
+/// It was outside this list while the reasoning stopped at "publishes under the owner's name". That
+/// sentence is true and is also true of `pr_comment`, which was inside; the ceiling was drawing a
+/// line the two sides of which it could not tell apart.
+///
+/// `api_read` is refused by a different test and never by that one. It is not "an action that goes
+/// further" — it is an arbitrary REST call, so its blast radius is not bounded by its name and no
+/// paragraph here can describe what it does. `gh api` deletes a repository with the verb it reads an
+/// issue with. Every other entry here names one operation whose worst case can be written down;
+/// that is the property the list is selecting for, and `api_read` is the one variant that cannot
+/// have it.
+pub const ACTION_CEILING: &[&str] = &[
+    "workflow_run",
+    "run_rerun",
+    "pr_create",
+    "pr_comment",
+    "issue_close",
+];
 
 /// Flags that take autonomy away from a prefix that had it.
 ///
@@ -2493,6 +2515,87 @@ mod tests {
         assert!(
             !ACTION_CEILING.contains(&"api_read"),
             "`api_read` is never eligible for autonomy"
+        );
+    }
+
+    /// Decision #7 as behaviour, and not as a constant that happens to lack a word.
+    ///
+    /// The assertion above says `ACTION_CEILING` does not contain the string `api_read`. That is
+    /// worth having and it is not the claim: the claim is that a `Policy` TOLD to allow `api_read`
+    /// by every route that can build one still refuses. So this asks each route in turn, and asks
+    /// the reading side too, because an operation refused as an action and admitted as a command
+    /// would be the same capability through the other door.
+    ///
+    /// `Policy` has exactly two constructors — `empty` and `from_config` — and only the second can
+    /// be told anything. That is why this is a complete enumeration rather than a sample, and why
+    /// adding a third constructor is a change that has to come back here.
+    #[test]
+    fn api_read_is_never_autonomous_by_any_route_that_can_ask_for_it() {
+        // Route one: the owner's `.ai/github.yaml`, asking for it in both lists and asking beside
+        // entries the ceilings DO admit — so a narrowing that dropped the whole file would satisfy
+        // this by accident and the kept entries prove it did not.
+        let owner = policy_from(Some(
+            "autonomous_reads:\n  - gh api\n  - gh run list\n\
+             autonomous_actions:\n  - api_read\n  - pr_create\n",
+        ));
+        assert_eq!(owner.autonomous_actions(), ["pr_create"]);
+        assert_eq!(owner.autonomous_reads(), ["gh run list"]);
+
+        // Route two: a `GithubConfig` built in code from the ceilings themselves — the widest policy
+        // this codebase can construct, and the one `http::declarable_github_ops` asks in order to
+        // decide what a project may put in `project_github_ops`. A project cannot declare what this
+        // policy refuses, so refusing here is what keeps the per-project table from becoming the
+        // ceiling with a different door on it.
+        let widest = Policy::from_config(&crate::config::GithubConfig {
+            enabled: true,
+            autonomous_reads: READ_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            autonomous_actions: ACTION_CEILING
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+        });
+        assert!(
+            widest
+                .autonomous_actions()
+                .contains(&"pr_create".to_owned())
+        );
+
+        for policy in [Policy::empty(), Policy::default(), owner, widest] {
+            assert!(
+                !policy.action_is_autonomous("api_read"),
+                "api_read is never an autonomous action"
+            );
+            // And not through the reading side either: the argv `ApiRead` actually builds matches no
+            // `READ_CEILING` prefix, so `gh api` is refused as a command exactly as it is refused as
+            // an operation.
+            let argv = ActOp::ApiRead {
+                args: vec!["repos/owner/name".to_owned()],
+            }
+            .argv();
+            assert!(!policy.read_is_autonomous(&format!("gh {}", argv.join(" "))));
+            assert!(!policy.read_is_autonomous("gh api repos/owner/name"));
+        }
+    }
+
+    /// `pr_create` is inside the ceiling; every other route to it is unchanged.
+    ///
+    /// A pull request is a proposal a human still has to act on, which is what puts it beside
+    /// `pr_comment` rather than beside `api_read`. The file may still narrow it away, and the test
+    /// says so: the ceiling decides what MAY be autonomous and the owner decides what is.
+    #[test]
+    fn opening_a_pull_request_is_inside_the_ceiling_and_still_the_owners_choice() {
+        assert!(ACTION_CEILING.contains(&"pr_create"));
+
+        let asked = policy_from(Some("autonomous_actions:\n  - pr_create\n"));
+        assert!(asked.action_is_autonomous("pr_create"));
+
+        let did_not_ask = policy_from(Some("autonomous_actions:\n  - pr_comment\n"));
+        assert!(
+            !did_not_ask.action_is_autonomous("pr_create"),
+            "a ceiling entry the file does not name grants nothing"
         );
     }
 

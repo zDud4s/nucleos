@@ -20061,6 +20061,7 @@ mod tests {
             vec![
                 "issue_close",
                 "pr_comment",
+                "pr_create",
                 "pr_list",
                 "run_list",
                 "run_rerun",
@@ -20072,10 +20073,9 @@ mod tests {
 
         for excluded in [
             // Decision #7: outside `ACTION_CEILING`, so not even the owner's file can turn it on —
-            // and a project able to declare it would be that ceiling with a different door.
+            // and a project able to declare it would be that ceiling with a different door. It is
+            // the only `ActOp` kind excluded, and `github::ACTION_CEILING` argues why.
             "api_read",
-            // Publishes the owner's words under the owner's name; outside `ACTION_CEILING` too.
-            "pr_create",
             // Reads a stranger's prose; excluded by `--log` in `REFUSED_READ_FLAGS`.
             "run_logs",
             "pr_view",
@@ -20171,9 +20171,10 @@ mod tests {
         let state = test_state().await;
         project_on_the_roster(&state, "alpha").await;
 
-        // `workflow_list` was here while `READ_CEILING` named a prefix no `ReadOp` could build. It
-        // is declarable now, and it moved out of this list rather than out of the ceiling.
-        for op_kind in ["api_read", "pr_create", "run_logs", "not_an_op_at_all"] {
+        // `workflow_list` was here while `READ_CEILING` named a prefix no `ReadOp` could build, and
+        // `pr_create` while `ACTION_CEILING` excluded it. Both are declarable now and left this list
+        // rather than the ceilings leaving them; `api_read` is the one that never moves.
+        for op_kind in ["api_read", "pr_view", "run_logs", "not_an_op_at_all"] {
             let (status, refused) = reach_request(
                 state.clone(),
                 "POST",

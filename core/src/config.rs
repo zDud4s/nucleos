@@ -976,7 +976,7 @@ pub struct GithubConfig {
     /// `github::READ_CEILING`; an entry outside it is dropped with a warning.
     pub autonomous_reads: Vec<String>,
     /// `github::ActOp` kinds the núcleo executes without asking. Subset of
-    /// `github::ACTION_CEILING`, which contains neither `raw` nor `pr_create`.
+    /// `github::ACTION_CEILING`, which does not contain `api_read` and never will.
     pub autonomous_actions: Vec<String>,
 }
 
