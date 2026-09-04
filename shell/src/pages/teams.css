@@ -1223,3 +1223,134 @@
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
+
+/* ============================================================== org chart == */
+
+/**
+ * The bench's fifth tab: the department drawn as a director, a roster and the work in flight.
+ *
+ * Drawn as SVG, so these are `fill` and `stroke` rather than `color` and `border` — the same
+ * treatment `jp-` gives the fleet's job graph, in this slice's own prefix.
+ */
+
+.teams-org {
+  margin: 0;
+}
+
+/* The chart is as wide as the department needs. It scrolls in here so the PAGE never does. */
+.teams-org-scroll {
+  overflow-x: auto;
+  padding: var(--space-3) 0;
+}
+
+.teams-org-svg {
+  display: block;
+}
+
+/* An edge is a relationship, not a target: clicks belong to the boxes it joins. */
+.teams-org-edges {
+  pointer-events: none;
+}
+
+.teams-org-edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 1.5;
+}
+
+/* The director's own work — the one edge that skips the specialists' rank entirely. */
+.teams-org-edge-far {
+  stroke: var(--text-faint);
+  stroke-dasharray: 4 4;
+}
+
+/* A state changes on every poll. The box repaints; it must never slide while it does. */
+.teams-org-node .teams-org-box {
+  transition:
+    fill 120ms ease,
+    stroke 120ms ease;
+}
+
+.teams-org-box {
+  fill: var(--surface);
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.teams-org-name {
+  fill: var(--text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.teams-org-said {
+  fill: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+.teams-org-state {
+  fill: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.teams-org-mark {
+  fill: var(--text-faint);
+}
+
+.teams-org-lead .teams-org-box {
+  stroke: var(--tone-active-border);
+  stroke-width: 1.5;
+}
+
+.teams-org-who .teams-org-box {
+  fill: var(--surface);
+}
+
+.teams-org-item .teams-org-box {
+  fill: var(--surface-sunken);
+}
+
+.teams-org-link {
+  cursor: pointer;
+}
+
+.teams-org-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* Somebody the catalogue no longer has. Dashed, because the box is a place that is now empty. */
+.teams-org-missing .teams-org-box {
+  stroke: var(--tone-danger-border);
+  stroke-dasharray: 4 3;
+}
+
+.teams-org-missing .teams-org-name {
+  fill: var(--tone-danger-fg);
+}
+
+.teams-org-done .teams-org-box {
+  stroke: var(--tone-active-border);
+}
+
+.teams-org-working .teams-org-box {
+  fill: var(--tone-active-bg);
+  stroke: var(--tone-active-border);
+}
+
+.teams-org-failed .teams-org-box {
+  stroke: var(--tone-danger-border);
+}
+
+/* Not started and not going to start are both resting states, and neither has a tone. */
+.teams-org-planned .teams-org-box,
+.teams-org-skipped .teams-org-box {
+  stroke-dasharray: 3 3;
+}
+
+.teams-org-empty {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
