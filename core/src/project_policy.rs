@@ -18,17 +18,6 @@
 //! somebody wrote down. So `shell_rules` returns a `Result` and its caller treats the error as
 //! "I cannot say this is safe", which is an approval prompt and never an allow.
 
-// Written here in one piece, wired in over Chunks 2 to 5: nothing outside this module's own tests
-// calls any of it yet. The house idiom for exactly that — `capabilities.rs`, `config.rs`,
-// `assistants.rs` and seventeen others — and it comes off the day the last consumer lands.
-// Without it `cargo clippy --all-targets -- -D warnings`, which `scripts/gates.sh core` runs, is
-// red from this commit until Chunk 5, and every gate run in between reports somebody else's fault.
-//
-// Every item below IS exercised by this module's own tests, which is why the suppression is
-// `not(test)` and not blanket: the lint stays live under the test build, so an item that stops
-// being exercised has to say so rather than hide behind this line.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use sqlx::SqlitePool;
 
 /// What a shell rule says about the prefix it names.
@@ -92,6 +81,20 @@ pub struct ShellRules {
 }
 
 impl ShellRules {
+    /// Whether this project declared nothing at all — both lists empty.
+    ///
+    /// **The one item in this module that only the tests reach**, which is why the suppression is
+    /// here and not over the file. It was over the file from the day the module was written, on the
+    /// promise that it would come off "the day the last consumer lands"; that day was the page, and
+    /// on it exactly one item was still dead. A blanket attribute kept for a single method stops
+    /// being a note about unfinished wiring and becomes a place for the next dead item to hide.
+    ///
+    /// Kept rather than deleted because three assertions read better for it than for
+    /// `allow.is_empty() && deny.is_empty()` spelled twice, and because "declared nothing" is a real
+    /// question this type should be able to answer when a caller finally asks it. `not(test)` rather
+    /// than blanket, for the reason the file-level one gave: the lint stays live under the test
+    /// build, so the day this stops being exercised it has to say so.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.allow.is_empty() && self.deny.is_empty()
     }
@@ -498,9 +501,11 @@ mod tests {
     /// not a formality. The migration's `CHECK (verdict IN ('allow', 'deny'))` should stop such a
     /// row ever being written; this is what happens to one that exists anyway.
     ///
-    /// It is also what keeps `#![cfg_attr(not(test), allow(dead_code))]` honest: that attribute
-    /// leaves the lint live under `cfg(test)`, so an item no test touches is still flagged. Without
-    /// this test `Verdict` is dead under the test build and `clippy -D warnings` is red.
+    /// It is also what keeps `Verdict` reachable at all: nothing outside this module constructs one
+    /// by name, so without this test it is dead under the test build and `clippy -D warnings` is
+    /// red. That used to be a note about the module's file-level `allow(dead_code)`; the attribute
+    /// is gone now that every item but `ShellRules::is_empty` has a production caller, so the
+    /// obligation this test discharges is its own rather than an exception to a blanket.
     #[test]
     fn a_verdict_survives_the_round_trip_and_nothing_else_is_one() {
         for verdict in [Verdict::Allow, Verdict::Deny] {
@@ -565,10 +570,10 @@ mod tests {
         assert_eq!(rules.allow, vec!["bash scripts/gates.sh".to_owned()]);
         assert_eq!(rules.deny, vec!["git push".to_owned()]);
 
-        // And forgetting one takes only that one. Without this call `forget_shell_rule` is the
-        // single one of the nine that no test touches, which under the module's
-        // `#![cfg_attr(not(test), allow(dead_code))]` leaves it dead in the TEST build and turns
-        // `clippy -D warnings` red -- that attribute covers the non-test build only.
+        // And forgetting one takes only that one. `forget_shell_rule` has a production caller now
+        // (the DELETE route), so this call is no longer what keeps it alive -- it is here because
+        // withdrawing exactly one rule and leaving the rest is the behaviour, and nothing else
+        // asserts it.
         assert!(
             forget_shell_rule(&pool, "alpha", "git push").await.unwrap(),
             "a rule that was there reports that it went"
