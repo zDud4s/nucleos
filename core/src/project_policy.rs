@@ -167,6 +167,23 @@ pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRul
 /// see `fold_prefix`. Folding only on the way out would work for the classifier and lie to
 /// everything else: the table, and the page a later chunk builds on it, would go on showing a
 /// `Remove-Item` that is in fact enforced as `remove-item`.
+///
+/// **What was validated before a row got here depends on the verdict, and the asymmetry is the
+/// thing not to tidy up.** `POST /projects/{id}/shell-rules` refuses an `allow` whose prefix fails
+/// `classifier::shell_form_is_readable`, because `classify_segment` demands that same guard BEFORE
+/// `rules.allows` — so a permission of that shape would be stored and could never authorise
+/// anything. A `deny` is not validated, and validating it would be worse than useless:
+/// `rules.denies` answers at the LINE level, ahead of the segment loop and with no shape guard
+/// above it, so a project really does refuse `tail -f`, `sort -o`, `find . -exec` and `curl … | sh`.
+/// Those are precisely the shapes that otherwise stop at `pending_approval` — which makes them the
+/// refusals most worth writing down.
+///
+/// This paragraph lives here rather than in `0128_project_alcada.sql` for a reason worth knowing:
+/// `sqlx::migrate!` checksums a migration's whole file, comments included, so a database that has
+/// already applied `0128` refuses to start if a single word of it changes. Editing it twice to keep
+/// its comments true is what taught us that. A migration's comments must describe what the schema
+/// IS; anything that describes what the code does with it belongs next to the code, where it can be
+/// corrected.
 pub async fn declare_shell_rule(
     pool: &SqlitePool,
     project_id: &str,
