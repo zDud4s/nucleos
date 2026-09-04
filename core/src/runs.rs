@@ -5621,6 +5621,60 @@ council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
         );
     }
 
+    /// A resume after approval still launches with the CLI's permission barrier down.
+    ///
+    /// **This is the regression a careless fold would have introduced**, in a path this change
+    /// declares out of scope and therefore would not have been watching. The decision is derived
+    /// TWICE — once in `create_run_inner` and again here, deliberately re-asked rather than
+    /// inherited because the run being continued may have rewritten the very settings file it reads
+    /// — and folding two booleans into one value at only the first site would have quietly cost
+    /// every resumed run its `bypassPermissions`. What that costs is measured and written down at
+    /// `runner.rs`: an autonomous run in this repository that could not execute `cargo --version`,
+    /// 28 turns and $1.47 for zero files touched.
+    ///
+    /// The pair is the test. Without the hook the rung is `Default`, which is the AND in
+    /// `classifier_governs_tools` doing its job: the barrier only stands down where the thing that
+    /// replaces it is verified present.
+    #[tokio::test]
+    async fn a_resume_after_approval_still_launches_with_the_barrier_down() {
+        for (label, wired, expected) in [
+            (
+                "the tree wires the classifier",
+                true,
+                crate::runner::Permission::Bypass,
+            ),
+            (
+                "the tree does not",
+                false,
+                crate::runner::Permission::Default,
+            ),
+        ] {
+            let (state, runner) =
+                test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+            let (proposal_id, _branch, container) =
+                seed_real_worktree_approval(&state, "cargo build").await;
+            if wired {
+                // The tree the resume is launched INTO, which is the one the re-derivation reads —
+                // not the project root, and not the tree the paused run was started in.
+                crate::autopilot::wire_classifier_hook(&container.path().join("repo")).unwrap();
+            }
+
+            resume_approved_run(&state, proposal_id).await.unwrap();
+
+            for _ in 0..100 {
+                if runner.last_permission.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                *runner.last_permission.lock().unwrap(),
+                Some(expected),
+                "{label}"
+            );
+        }
+    }
+
     /// **Decision (B).** Approving a merge hands it to the queue; it does not hand the run a pass to
     /// perform the merge itself.
     ///
