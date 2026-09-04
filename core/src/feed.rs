@@ -167,6 +167,29 @@ pub async fn list_feed(
     }
 }
 
+/// The newest `kind` row for `run_id` whose summary starts with `summary_prefix`, or `None`.
+///
+/// For a writer that reports the same condition on every pass and needs to ask what it said last
+/// time. It exists because a feed row is a notification the Telegram sidecar forwards unread, so
+/// "don't repeat yourself" has to be decided before the row is written, not filtered afterwards.
+pub async fn latest_summary(
+    pool: &sqlx::SqlitePool,
+    kind: &str,
+    run_id: Option<i64>,
+    summary_prefix: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT summary FROM feed
+         WHERE kind = ? AND run_id IS ? AND summary LIKE ? ESCAPE '\\'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(kind)
+    .bind(run_id)
+    .bind(format!("{}%", escape_like(summary_prefix)))
+    .fetch_optional(pool)
+    .await
+}
+
 /// Aggregated feed across EVERY scope (global NULL rows + all projects), newest-first, honoring `limit`.
 /// Distinct from `list_feed(None)`, which returns only global (`project_id IS NULL`) rows.
 pub async fn list_all(pool: &sqlx::SqlitePool, limit: i64) -> sqlx::Result<Vec<FeedEntry>> {
@@ -279,7 +302,8 @@ pub async fn prune(
 #[cfg(test)]
 mod tests {
     use super::{
-        FeedScope, SearchFilter, append, append_for_errand, list_all, list_feed, prune, search,
+        FeedScope, SearchFilter, append, append_for_errand, latest_summary, list_all, list_feed,
+        prune, search,
     };
 
     /// A search that filters on nothing but the scope, so a scope test is about the scope.
@@ -474,6 +498,46 @@ mod tests {
         );
         assert_eq!(entries[0].run_id, Some(7));
         chrono::DateTime::parse_from_rfc3339(&entries[0].created_at).unwrap();
+    }
+
+    /// The prefix is a Windows worktree path in practice, so the backslashes are the point: they
+    /// must survive the LIKE escaping as literal characters, not turn into the escape itself.
+    #[tokio::test]
+    async fn latest_summary_matches_a_prefix_with_backslashes_and_ignores_other_runs() {
+        let pool = test_pool().await;
+        let prefix = r"failed to remove worktree C:\Projects\nucleos-worktrees\run-1:";
+        let older = format!("{prefix} first failure");
+        let newer = format!("{prefix} second failure");
+        append(&pool, Some("p"), "worktree_gc_failed", &older, Some(1))
+            .await
+            .unwrap();
+        append(&pool, Some("p"), "worktree_gc_failed", &newer, Some(1))
+            .await
+            .unwrap();
+        append(&pool, Some("p"), "worktree_gc_failed", "unrelated", Some(2))
+            .await
+            .unwrap();
+        append(&pool, Some("p"), "worktree_removed", &newer, Some(1))
+            .await
+            .unwrap();
+
+        let found = latest_summary(&pool, "worktree_gc_failed", Some(1), prefix)
+            .await
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(newer.as_str()));
+        assert_eq!(
+            latest_summary(&pool, "worktree_gc_failed", Some(3), prefix)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            latest_summary(&pool, "worktree_gc_failed", None, prefix)
+                .await
+                .unwrap(),
+            None,
+            "a NULL run id must not match rows that have one"
+        );
     }
 
     #[tokio::test]

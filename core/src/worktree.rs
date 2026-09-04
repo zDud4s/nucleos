@@ -1480,8 +1480,29 @@ pub(crate) async fn gc_pass(
                     "worktree directory was already gone; retiring its row"
                 );
             }
+            // A feed row is a Telegram message, and this arm runs every half hour for as long as
+            // the failure lasts. The failure is news once; the same failure again is not, so it
+            // goes to the log instead. The comparison is against the last thing this worktree's
+            // row said — a *different* failure (or the same one after a success in between, which
+            // retires the row) is reported again.
             Err(error) => {
-                let summary = format!("failed to remove worktree {}: {}", worktree.path, error);
+                let prefix = format!("failed to remove worktree {}:", worktree.path);
+                let summary = format!("{prefix} {error}");
+                let already_reported =
+                    feed::latest_summary(pool, "worktree_gc_failed", feed_run_id, &prefix)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|last| last == summary);
+                if already_reported {
+                    tracing::info!(
+                        owner_id = owner.id(),
+                        path = %worktree.path,
+                        %error,
+                        "worktree cleanup failed the same way as last pass; not repeating the feed row"
+                    );
+                    continue;
+                }
                 let _ = feed::append(
                     pool,
                     Some(&worktree.project_id),
@@ -3612,6 +3633,76 @@ mod tests {
             !after.iter().any(|entry| entry.kind == "worktree_gc_failed"),
             "a directory that is already gone is not a failure"
         );
+    }
+
+    /// The feed row IS the Telegram notification, and the GC wrote one per half-hour pass while the
+    /// same worktree failed the same way: 77 notices in 38 hours for run-900388 (2026-09-02..04),
+    /// none of them news after the first. A repeat of the identical failure stays in the log; the
+    /// feed hears about a failure once, and again only when what fails changes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gc_reports_a_repeated_identical_failure_once() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "completed",
+            Some("2026-07-09T00:00:00+00:00"),
+            "2026-07-09T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+        std::fs::write(
+            info.path.join("failure.txt"),
+            "must survive
+",
+        )
+        .expect("write uncommitted work");
+        // The same persistent failure `a_failed_preserve_leaves_the_worktree_alone` uses: signing
+        // through an absent binary makes every preservation commit fail, pass after pass.
+        assert!(git_ok(
+            &info.path,
+            &[
+                OsStr::new("config"),
+                OsStr::new("commit.gpgSign"),
+                OsStr::new("true"),
+            ],
+        ));
+        let missing_signer = root.path().join("missing-gpg.exe");
+        assert!(git_ok(
+            &info.path,
+            &[
+                OsStr::new("config"),
+                OsStr::new("gpg.program"),
+                missing_signer.as_os_str(),
+            ],
+        ));
+        let retention = chrono::Duration::hours(72);
+        let first = timestamp("2026-07-19T00:00:00+00:00");
+
+        gc_pass(&pool, first, retention, &[]).await;
+        gc_pass(&pool, first + chrono::Duration::minutes(30), retention, &[]).await;
+        gc_pass(&pool, first + chrono::Duration::hours(1), retention, &[]).await;
+
+        assert!(
+            info.path.is_dir(),
+            "the worktree must survive a failed preservation"
+        );
+        let failures = crate::feed::list_feed(&pool, Some("project-a"), 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.kind == "worktree_gc_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            1,
+            "three passes failing identically must produce one feed row, not three: {failures:?}"
+        );
+        assert_eq!(failures[0].run_id, Some(run_id));
+        pool.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
