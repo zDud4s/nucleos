@@ -1097,10 +1097,28 @@ fn strip_fd_duplications(command: &str) -> String {
 /// applied to a refusal.
 ///
 /// The case fold is `to_ascii_lowercase`, not `to_lowercase`, so a non-ASCII capital survives it.
-/// That is not a hole while BOTH sides come through this function: the compiled lists are ASCII
-/// source literals, and a command and a declared prefix now get byte-for-byte the same treatment.
-/// Identical treatment is the entire requirement, which is why this is exposed rather than
-/// reimplemented — a second spelling of "fold" is how the two would come to disagree.
+/// **Identical treatment of both sides is NOT what makes that safe**, and the sentence that used to
+/// stand here said it was. Identical treatment only makes the two sides agree on what the fold IS;
+/// what a deny list actually needs is that two spellings the operating system treats as the same
+/// command fold to the same string. Measured: `deny = "çurl"` against `ÇURL http://x` comes back
+/// `("pending_approval", "unrecognized")`, with both sides through this exact function.
+///
+/// It stays as it is for three reasons, and the first is the one that carries the other two:
+///
+/// 1. **A non-ASCII program name is not in the threat model.** Every program this daemon runs and
+///    every entry on the compiled lists is ASCII; `çurl` is not a spelling of a program that exists.
+/// 2. **`to_lowercase` would not close it either.** On Windows the case-insensitivity that makes
+///    two spellings the same command comes from NTFS's uppercase table, not from Unicode simple
+///    casing, and the two are not the same map — so the wider fold buys a different set of misses
+///    rather than no misses.
+/// 3. **Widening it would change the COMPILED path**, which is much larger than the declared one.
+///    This feeds `matches_any_phrase(DESTRUCTIVE_COMMAND_PATTERNS)`, `has_destructive_flags`,
+///    `APPROVAL_COMMAND_PATTERNS`, `is_safe_command` and `shell_form_is_readable` — and
+///    `to_lowercase` can change a string's byte LENGTH (`İ` becomes `i` + U+0307), which is exactly
+///    the shape of change that can move a `starts_with` or a `contains` verdict.
+///
+/// Exposed rather than reimplemented for a reason that survives all three: a second spelling of
+/// "fold" is how the two sides would come to disagree about what the fold even is.
 pub(crate) fn normalize_command(command: &str) -> String {
     command
         .split_whitespace()
@@ -4158,14 +4176,37 @@ mod tests {
         );
     }
 
-    /// Deny still beats allow when a project spelled both in capitals, because both sides reach the
-    /// comparison through the identical fold and the refusal is still consulted first.
+    /// Deny still beats allow when a project spelled both in capitals: both sides reach the
+    /// comparison through the identical fold, and the refusal is consulted ahead of the segment
+    /// loop where the permission is decided.
+    ///
+    /// **The `npm ci` pair is what makes that a claim about precedence rather than about the deny
+    /// alone.** `rules.denies` answers at the LINE level and returns before `classify_segment` is
+    /// ever reached, so the first assertion cannot tell a live allow from an inert one — with only
+    /// it standing here, removing the fold from the allow side of `ShellRules`'s comparison left
+    /// this test green. The third assertion is the same allow on the same command with the refusal
+    /// taken away: it allows there, so in the second it was a permission that LOST rather than one
+    /// that was never read.
+    ///
+    /// `npm ci` and not `ls` for that, because `ls` is on the compiled safe list and would come
+    /// back `read-local` whatever the project declared. Nothing compiled recognises `npm ci`, so
+    /// `project-declared` can only have come from the project's own list.
     #[test]
     fn a_folded_deny_still_beats_a_folded_allow() {
         assert_classification(
             classify_with_rules(&shell_rules(&["LS"], &["Ls -la"]), "ls -la"),
             "deny",
             "project-denied",
+        );
+        assert_classification(
+            classify_with_rules(&shell_rules(&["NPM  CI"], &["Npm ci"]), "npm ci"),
+            "deny",
+            "project-denied",
+        );
+        assert_classification(
+            classify_with_rules(&shell_rules(&["NPM  CI"], &[]), "npm ci"),
+            "allow",
+            "project-declared",
         );
     }
 

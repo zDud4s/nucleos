@@ -2872,34 +2872,55 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
     // attempts the action — the same inputs, so the same answer, with nothing to keep in step.
     // Absent or unparseable input yields no class, and a classless grant authorizes nothing.
     //
-    // The policy comes off the STATE for that same reason. It is one of `classify`'s three
-    // production callers and all three must be handed the same one: a resume classifying under
-    // an empty policy while the hook classified under the owner's would answer differently about
-    // the identical command line, which is exactly the drift the paragraph above rules out.
+    // The policy AND the project's two shell lists come off the state for that same reason, and
+    // they are both parameters of `classify` for it: purity is what makes "the same inputs, so the
+    // same answer" true, and each of the two is an input this caller has to fetch. It is one of
+    // `classify`'s three production callers and all three must be handed the same pair: a resume
+    // classifying under an empty policy while the hook classified under the owner's — or under an
+    // empty rule set while the hook classified under the project's — would answer differently about
+    // the identical command line, which is exactly the drift the paragraph above rules out. The
+    // rules are this project's, named by `wt_project_id`, which is the same project the hook found
+    // on the paused run's own row.
     //
     // Derived even when the action was queued instead of authorized. The row is excluded from
     // authorizing by its `queued_request_id`, not by being classless, and a takeover that recorded
     // no class would be a row that could not say what was taken over.
-    let action_class = proposal
-        .tool_input
-        .as_deref()
-        .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
-        .map(|input| {
-            crate::classifier::classify(
-                &tool_name,
-                &input,
-                Some(std::path::Path::new(&wt_path)),
-                &state.github.policy,
-                // The same empty pair the hook passes, and the pairing is the point rather than a
-                // coincidence: this re-derivation must be handed exactly what the hook was handed,
-                // or the class recorded here is not the class the person was shown.
-                &crate::project_policy::ShellRules::default(),
-                // Labelling an action a person has just approved, not deciding one. The strict
-                // reading keeps the recorded class the same as the one that was shown to them.
-                crate::classifier::Unrecognized::AsksAPerson,
-            )
-            .action_class
-        });
+    let action_class = match crate::project_policy::shell_rules(&state.pool, &wt_project_id).await {
+        Ok(rules) => proposal
+            .tool_input
+            .as_deref()
+            .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+            .map(|input| {
+                crate::classifier::classify(
+                    &tool_name,
+                    &input,
+                    Some(std::path::Path::new(&wt_path)),
+                    &state.github.policy,
+                    &rules,
+                    // Labelling an action a person has just approved, not deciding one. The strict
+                    // reading keeps the recorded class the same as the one that was shown to them.
+                    crate::classifier::Unrecognized::AsksAPerson,
+                )
+                .action_class
+            }),
+        // No class, which is what this path already does for input it cannot parse — and for the
+        // same reason, since the fault is the same one: a label derived from rules that are not
+        // this project's is not this project's label. It is deliberately NOT the hook's answer to
+        // an unreadable read. The hook is DECIDING, so it owes the safe direction and downgrades an
+        // allow to an approval prompt; this is LABELLING an action a person has already approved,
+        // where the only two outcomes available are a right label and a wrong one. A wrong one is
+        // worse than none: a class is what a later grant is scoped to, so a class recorded under
+        // the wrong rules would authorise a set of actions nobody agreed to.
+        Err(error) => {
+            tracing::warn!(
+                run_id = original_run_id,
+                project_id = %wt_project_id,
+                %error,
+                "resume: could not read the project's shell rules — recording no action class"
+            );
+            None
+        }
+    };
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
