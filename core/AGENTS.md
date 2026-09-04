@@ -130,6 +130,8 @@ the contract, not a snapshot.
 | `workflow_graph.rs` | What a workflow's graph is, and what a project changed about it. A module of its own precisely so the property `workflows.rs` claims stays true: install, eject and drift do not know what a node is, and never will. |
 | `seed.rs` | The autopilot's own bundle, written to the library so it can be read back like any other. On disk rather than compiled into the binary, because two sources of graph is the two-engines smell one level down — the canvas would either not show the workflow that runs most often in this app, or show it through a second path that could disagree with the first. |
 
+| `testdb.rs` | The database fixtures the suite shares, and today that is one thing: a chain of migrations stopped part-way. `sqlx::migrate!().run()` applies every migration against empty tables, so the `UPDATE` half of a data migration has always been unreachable by the suite — delete one and nothing goes red. `pool_migrated_through` stops at a version and `apply_migrations_after` finishes the chain, with rows put in the gap between them. Written in `vcs.rs` for `0049` with a note asking that the second module to need them move them somewhere neutral; `0129`'s backfill was the second, and this is that somewhere. `#[cfg(test)]`, so it is compiled out of the daemon entirely. |
+
 
 ## Autopilot extends, it does NOT restructure (spec §3.2 / §9)
 
