@@ -1,3 +1,16 @@
+# Empty workspace table: this package is standalone by the root manifest's own design
+# (see the comment above `exclude = ["shell/src-tauri"]` in the root Cargo.toml), but
+# that exclude is a path RELATIVE to the root manifest, so it only ever covers this
+# exact repo layout. Cargo resolves a package's workspace by walking UP the directory
+# tree looking for an ancestor `[workspace]`; a checkout of this repo nested inside
+# another checkout of it (e.g. a worktree created under
+# `<project_root>/.nucleos/worktrees/`) sits, from cargo's point of view, inside the
+# outer checkout's own workspace, at a path the outer exclude never named and so never
+# excludes. Declaring this table makes the package its own workspace root, so cargo
+# stops walking upward before it ever reaches an ancestor manifest, and it no longer
+# matters what directory structure sits above the checkout.
+[workspace]
+
 [package]
 name = "shell"
 version = "0.1.0"

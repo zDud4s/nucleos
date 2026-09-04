@@ -33,6 +33,21 @@ pub fn worktree_root(project_root: &Path) -> PathBuf {
         return PathBuf::from(root);
     }
 
+    project_root.join(ARTIFACTS_DIR).join("worktrees")
+}
+
+/// Where `worktree_root` used to point, before this default moved inside the project: a SIBLING of
+/// the project root, `<parent>/nucleos-worktrees/<project>`.
+///
+/// Kept, and swept alongside the current default by `orphaned_worktrees`, because a daemon that
+/// created a worktree here before the move is not retroactively told about it — a directory left at
+/// this address must stay collectable for ever, or every tree already sitting there on a real
+/// machine becomes an orphan nothing will ever find.
+///
+/// Deliberately **not** gated on `NUCLEOS_WORKTREE_ROOT`: an override says where a NEW worktree is
+/// created, not where an old one predating the override might still be. Ignoring it here is what
+/// keeps the sweep finding the legacy location under an override too.
+fn legacy_worktree_root(project_root: &Path) -> PathBuf {
     let parent = project_root.parent().unwrap_or_else(|| Path::new(""));
     let project_name = project_root.file_name().unwrap_or_default();
     parent.join("nucleos-worktrees").join(project_name)
@@ -259,6 +274,11 @@ pub async fn create_at(
     let path = root.join(&name);
     tokio::fs::create_dir_all(&root).await?;
 
+    // Hidden BEFORE `git worktree add` runs, and a failure to hide it fails the creation: a tree
+    // that cannot be hidden must not exist. `git_exec::create_integration_worktree` is the other
+    // creation site and carries the same guarantee.
+    hide_root_if_nested(project_root, &root).await?;
+
     let mut command = git();
     command
         .arg("-C")
@@ -394,37 +414,30 @@ pub(crate) async fn catch_up(worktree: &Path, source: &str) -> io::Result<CatchU
 /// make the plan node's only output unwritable, so every job would fail at its first node, always.
 pub const ARTIFACTS_DIR: &str = ".nucleos";
 
-/// Creates a job's artifacts directory and hides it from git, returning its absolute path.
+/// Adds `/ARTIFACTS_DIR/` to `repo_path`'s repository's exclude list, if it is not there already.
 ///
 /// The exclusion goes in `info/exclude`, not the project's `.gitignore`: that file belongs to the
 /// user and the entry would turn up in their diff.
 ///
-/// Excluded rather than merely untracked, because `preserve_uncommitted` runs `git add -A`. Left
-/// visible, the handoff files would ride into the preservation commit — and count against
-/// `DEFAULT_PRESERVATION_BYTE_CEILING`, where going over does not truncate the commit, it blocks
-/// removal of the worktree. A node that commits its own work with `git add -A` would sweep them up
-/// the same way.
-///
 /// It lands in the repository's **common** git directory, which is the one place git reads
 /// `info/exclude` from. A linked worktree has a private git directory of its own, and writing there
 /// looks right and excludes nothing — `info/` is on git's common list, so the per-worktree copy is
-/// never consulted. The design called for "the worktree's `info/exclude`"; this is where that file
-/// actually is. The cost is that the entry is visible to every worktree of the repository including
-/// the user's own checkout, and it is accepted: `.nucleos` is this daemon's own directory name, the
-/// file is per-clone and unversioned, and the alternative is a node committing handoff files onto
-/// the user's branch.
+/// never consulted. The cost is that the entry is visible to every worktree of the repository
+/// including the user's own checkout, and it is accepted: `.nucleos` is this daemon's own directory
+/// name, the file is per-clone and unversioned.
 ///
 /// The entry is anchored (`/.nucleos/`) so a directory of the same name deeper in the tree keeps
 /// showing up in the user's status.
-pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
-    let artifacts = worktree.join(ARTIFACTS_DIR);
-    tokio::fs::create_dir_all(&artifacts).await?;
-
+///
+/// Shared between `prepare_artifacts` (hiding a job's own artifacts directory inside its worktree)
+/// and `hide_root_if_nested` (hiding the worktree root inside the project) — one implementation
+/// rather than two copies that could drift.
+async fn exclude_artifacts_dir(repo_path: &Path) -> io::Result<()> {
     // Asked of git rather than assumed: in a linked worktree `.git` is a file, not a directory, so
-    // `<worktree>/.git/info/exclude` cannot be written to at all.
+    // `<repo_path>/.git/info/exclude` cannot be written to at all.
     let output = git()
         .arg("-C")
-        .arg(worktree)
+        .arg(repo_path)
         .arg("rev-parse")
         .arg("--git-common-dir")
         .output()
@@ -440,7 +453,7 @@ pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
     let git_dir = if reported.is_absolute() {
         reported
     } else {
-        worktree.join(reported)
+        repo_path.join(reported)
     };
 
     let info = git_dir.join("info");
@@ -459,6 +472,43 @@ pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
         tokio::fs::write(&exclude, contents).await?;
     }
 
+    Ok(())
+}
+
+/// Hides `root` from `project_root`'s own git status — but only for the layout where `root` is
+/// `<project_root>/.nucleos/worktrees` (the default `NUCLEOS_WORKTREE_ROOT`). The gate here,
+/// `path_contains(project_root, root)`, only asks whether `root` sits somewhere under
+/// `project_root`; the entry actually written by `exclude_artifacts_dir` is the FIXED anchor
+/// `/.nucleos/`, never derived from `root`'s own path. Point `NUCLEOS_WORKTREE_ROOT` at some
+/// other directory nested under `project_root` — say `<project_root>/somewhere-else` — and
+/// `path_contains` is still true, the same `/.nucleos/` entry gets written, this still returns
+/// `Ok`, and the tree is still NOT hidden: it shows up in `project_root`'s `git status` despite
+/// the success. A `NUCLEOS_WORKTREE_ROOT` outside `project_root` entirely needs no exclusion at
+/// all, and that case IS handled correctly — writing one anyway would touch a project the daemon
+/// does not own the layout of.
+///
+/// Shared between `create_at` and `git_exec::create_integration_worktree`, the two places a
+/// worktree comes into existence: both call this before their own `git worktree add`, and both
+/// fail creation if it errors. Neither that failure path nor an `Ok` here proves the tree ended
+/// up hidden outside the default layout — only that it did for the default one.
+pub(crate) async fn hide_root_if_nested(project_root: &Path, root: &Path) -> io::Result<()> {
+    if path_contains(project_root, root) {
+        exclude_artifacts_dir(project_root).await?;
+    }
+    Ok(())
+}
+
+/// Creates a job's artifacts directory and hides it from git, returning its absolute path.
+///
+/// Excluded rather than merely untracked, because `preserve_uncommitted` runs `git add -A`. Left
+/// visible, the handoff files would ride into the preservation commit — and count against
+/// `DEFAULT_PRESERVATION_BYTE_CEILING`, where going over does not truncate the commit, it blocks
+/// removal of the worktree. A node that commits its own work with `git add -A` would sweep them up
+/// the same way.
+pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
+    let artifacts = worktree.join(ARTIFACTS_DIR);
+    tokio::fs::create_dir_all(&artifacts).await?;
+    exclude_artifacts_dir(worktree).await?;
     Ok(artifacts)
 }
 
@@ -759,8 +809,9 @@ async fn measure_status_paths(
 /// happens to sit inside somebody's repository.
 ///
 /// `git status`, `add` and `commit` all discover the *enclosing* repository when handed a plain
-/// directory. A stray `run-<id>` under a worktree root that itself lives inside a repo — nested
-/// projects, or a `NUCLEOS_WORKTREE_ROOT` pointed somewhere inside one — would therefore make
+/// directory. A stray `run-<id>` under a worktree root that itself lives inside a repo — the
+/// ordinary case now that `worktree_root`'s own default sits inside the project, and also true of
+/// nested projects or a `NUCLEOS_WORKTREE_ROOT` pointed somewhere inside one — would therefore make
 /// preservation stage and commit that repository's unrelated work under the daemon's name.
 ///
 /// Answers `false` only on positive proof: a toplevel that exists and sits strictly above this
@@ -1550,27 +1601,23 @@ fn owner_from_dir_name(name: &str) -> Option<Owner> {
     None
 }
 
-pub async fn orphaned_worktrees(
-    pool: &SqlitePool,
-    project_root: &Path,
+/// The orphans of one candidate root, appended onto `orphans`.
+///
+/// Factored out of `orphaned_worktrees` so the current default and the legacy sibling location are
+/// swept by exactly one body and cannot drift apart. A root that does not exist — the ordinary case
+/// for the legacy location on a daemon that never had one, or for either root before its first
+/// worktree — answers with no entries rather than an error: `orphaned_worktrees` only ever reports
+/// what a directory actually holds.
+async fn orphans_under(
+    root: &Path,
+    live: &std::collections::HashSet<(String, i64)>,
     min_age: Duration,
-) -> sqlx::Result<Vec<PathBuf>> {
-    // Keyed by the full owner pair, not by id alone: run ids and job ids come from different
-    // sequences, so a live `run-7` row would otherwise account for a `job-7` directory and leave it
-    // uncollectable forever.
-    let live: std::collections::HashSet<(String, i64)> =
-        sqlx::query_as("SELECT owner_kind, owner_id FROM worktrees WHERE removed_at IS NULL")
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .collect();
-
-    let root = worktree_root(project_root);
-    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
-        return Ok(Vec::new());
+    orphans: &mut Vec<PathBuf>,
+) {
+    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+        return;
     };
 
-    let mut orphans = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let file_name = entry.file_name();
         let Some(owner) = owner_from_dir_name(&file_name.to_string_lossy()) else {
@@ -1593,6 +1640,38 @@ pub async fn orphaned_worktrees(
 
         orphans.push(entry.path());
     }
+}
+
+pub async fn orphaned_worktrees(
+    pool: &SqlitePool,
+    project_root: &Path,
+    min_age: Duration,
+) -> sqlx::Result<Vec<PathBuf>> {
+    // Keyed by the full owner pair, not by id alone: run ids and job ids come from different
+    // sequences, so a live `run-7` row would otherwise account for a `job-7` directory and leave it
+    // uncollectable forever.
+    let live: std::collections::HashSet<(String, i64)> =
+        sqlx::query_as("SELECT owner_kind, owner_id FROM worktrees WHERE removed_at IS NULL")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+
+    let mut orphans = Vec::new();
+    let root = worktree_root(project_root);
+    orphans_under(&root, &live, min_age, &mut orphans).await;
+
+    // The legacy sibling root predates this task's move of the default inside the project. Swept
+    // unconditionally — not only when `root` is the legacy default — because `NUCLEOS_WORKTREE_ROOT`
+    // says where NEW worktrees are created, not where a tree left by a daemon that predates the
+    // override might still be sitting; a worktree already there before the override was ever set
+    // must stay collectable, override or not. Guarded against `root` only to avoid walking the same
+    // directory twice on the rare host where the two happen to coincide.
+    let legacy = legacy_worktree_root(project_root);
+    if !paths_equal(&legacy, &root) {
+        orphans_under(&legacy, &live, min_age, &mut orphans).await;
+    }
+
     Ok(orphans)
 }
 
@@ -1908,11 +1987,14 @@ mod tests {
             .to_owned()
     }
 
-    fn init_repo() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().expect("create repository tempdir");
-        assert!(git_ok(repo.path(), &[OsStr::new("init")]));
+    /// The git init/config/seed/commit body shared by every fixture repository this module
+    /// builds, extracted so a test that needs its own path (not a fresh `TempDir`) — see
+    /// `an_orphan_at_the_legacy_sibling_root_is_still_collected`, which needs the repository at a
+    /// specific child of a wrapper directory — can still build one without repeating it.
+    fn init_repo_at(path: &Path) {
+        assert!(git_ok(path, &[OsStr::new("init")]));
         assert!(git_ok(
-            repo.path(),
+            path,
             &[
                 OsStr::new("config"),
                 OsStr::new("user.email"),
@@ -1920,19 +2002,24 @@ mod tests {
             ],
         ));
         assert!(git_ok(
-            repo.path(),
+            path,
             &[
                 OsStr::new("config"),
                 OsStr::new("user.name"),
                 OsStr::new("test"),
             ],
         ));
-        std::fs::write(repo.path().join("seed.txt"), "seed\n").expect("write seed file");
-        assert!(git_ok(repo.path(), &[OsStr::new("add"), OsStr::new("-A")]));
+        std::fs::write(path.join("seed.txt"), "seed\n").expect("write seed file");
+        assert!(git_ok(path, &[OsStr::new("add"), OsStr::new("-A")]));
         assert!(git_ok(
-            repo.path(),
+            path,
             &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("seed"),],
         ));
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("create repository tempdir");
+        init_repo_at(repo.path());
         repo
     }
 
@@ -1950,29 +2037,7 @@ mod tests {
 
     fn init_space_free_repo() -> tempfile::TempDir {
         let repo = space_free_tempdir();
-        assert!(git_ok(repo.path(), &[OsStr::new("init")]));
-        assert!(git_ok(
-            repo.path(),
-            &[
-                OsStr::new("config"),
-                OsStr::new("user.email"),
-                OsStr::new("test@x"),
-            ],
-        ));
-        assert!(git_ok(
-            repo.path(),
-            &[
-                OsStr::new("config"),
-                OsStr::new("user.name"),
-                OsStr::new("test"),
-            ],
-        ));
-        std::fs::write(repo.path().join("seed.txt"), "seed\n").expect("write seed file");
-        assert!(git_ok(repo.path(), &[OsStr::new("add"), OsStr::new("-A")]));
-        assert!(git_ok(
-            repo.path(),
-            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("seed"),],
-        ));
+        init_repo_at(repo.path());
         repo
     }
 
@@ -2021,12 +2086,21 @@ mod tests {
         }
     }
 
+    /// The worktree root now lives INSIDE the project, not beside it — `p/.nucleos/worktrees`,
+    /// not `p`'s sibling `nucleos-worktrees/p`. A sibling root is what let a nested worktree ride
+    /// unseen by the project's own git status for as long as this module has existed; moving it
+    /// inside is only safe once creation itself keeps it invisible (see
+    /// `creation_alone_hides_the_worktree_root_from_git` and
+    /// `a_default_worktree_is_invisible_to_the_project_checkout`), but the location itself is
+    /// pinned here, as pure path arithmetic with no filesystem involved.
     #[test]
-    fn worktree_root_derives_sibling_dir() {
+    fn worktree_root_derives_a_directory_inside_the_project() {
         let _lock = env_lock();
         let _env = WorktreeRootEnv::set(None);
         let actual = worktree_root(Path::new(r"C:\work\repo"));
-        let expected = Path::new(r"C:\work\nucleos-worktrees\repo");
+        let expected = Path::new(r"C:\work\repo")
+            .join(ARTIFACTS_DIR)
+            .join("worktrees");
         assert_eq!(
             actual.components().collect::<Vec<_>>(),
             expected.components().collect::<Vec<_>>()
@@ -2039,6 +2113,120 @@ mod tests {
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
         assert_eq!(worktree_root(Path::new(r"C:\work\repo")), root.path());
+    }
+
+    /// The nested default this task is moving `worktree_root` to, pinned above by
+    /// `worktree_root_derives_a_directory_inside_the_project`.
+    ///
+    /// Built through the env override rather than by clearing it: the literal, still-unmodified
+    /// default is the OLD sibling location, which sits beside the repository rather than inside
+    /// it and is therefore invisible to that repository's own `git status` by construction,
+    /// whatever `create` does or does not exclude — a test built on the literal default could
+    /// never fail here, today or after the default moves, and so could never catch a regression
+    /// in the behaviour these two tests exist to pin. The override stands in for exactly the
+    /// path shape the default is moving to.
+    fn simulated_nested_default(project_root: &Path) -> PathBuf {
+        project_root.join(ARTIFACTS_DIR).join("worktrees")
+    }
+
+    /// The central risk this task exists to close: once the worktree root lives inside the
+    /// project, a worktree `git status` can see rides into `preserve_uncommitted`'s `git add -A`,
+    /// overflows `DEFAULT_PRESERVATION_BYTE_CEILING` and then blocks removal of the worktree for
+    /// ever — the exact bug that cost 77 Telegram notices in 38 hours for `.cargo-target*/`.
+    /// `prepare_artifacts` is deliberately never called here: creation alone has to be enough, or
+    /// the worktree sits visible for however long passes before something else hides it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_default_worktree_is_invisible_to_the_project_checkout() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let nested_root = simulated_nested_default(repo.path());
+        let _env = WorktreeRootEnv::set(Some(&nested_root));
+
+        create(repo.path(), Owner::Run(5501))
+            .await
+            .expect("create worktree");
+
+        let status = git_stdout(
+            repo.path(),
+            &[OsStr::new("status"), OsStr::new("--porcelain")],
+        );
+        assert_eq!(
+            status, "",
+            "a worktree root nested inside the project must stay invisible to its own git status"
+        );
+    }
+
+    /// The mechanism behind the previous test, asserted directly: creation alone must anchor an
+    /// exclude entry covering the worktree root in the repository's COMMON git directory — the one
+    /// place git actually reads `info/exclude` from. Never assumed at `<repo>/.git/`: in a linked
+    /// worktree `.git` is a FILE, not a directory, so that path would not even be a directory to
+    /// write into.
+    #[tokio::test(flavor = "current_thread")]
+    async fn creation_alone_hides_the_worktree_root_from_git() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let nested_root = simulated_nested_default(repo.path());
+        let _env = WorktreeRootEnv::set(Some(&nested_root));
+
+        create(repo.path(), Owner::Run(5502))
+            .await
+            .expect("create worktree");
+
+        let common_dir = git_stdout(
+            repo.path(),
+            &[OsStr::new("rev-parse"), OsStr::new("--git-common-dir")],
+        );
+        let common_dir = PathBuf::from(common_dir);
+        let common_dir = if common_dir.is_absolute() {
+            common_dir
+        } else {
+            repo.path().join(common_dir)
+        };
+        let exclude =
+            std::fs::read_to_string(common_dir.join("info").join("exclude")).unwrap_or_default();
+        let entry = format!("/{ARTIFACTS_DIR}/");
+        assert!(
+            exclude.lines().any(|line| line.trim() == entry),
+            "creation alone must anchor an exclude entry covering the worktree root, got: {exclude:?}"
+        );
+    }
+
+    /// A `run-<id>` worktree left at the OLD sibling location by a daemon that predates this
+    /// task's move must still be found by the sweep, or every tree already sitting there on a real
+    /// machine becomes uncollectable for ever the moment the default moves.
+    ///
+    /// The repository is built as a child of one wrapper temp dir (`base/repo`), so the legacy
+    /// root — `<parent>/nucleos-worktrees/<project>` — lands at `base/nucleos-worktrees/repo` and
+    /// dies with the wrapper, rather than beside `core/`, which has confused `select_tests.py`
+    /// before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_orphan_at_the_legacy_sibling_root_is_still_collected() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let base = space_free_tempdir();
+        let repo_path = base.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("create repository directory");
+        init_repo_at(&repo_path);
+
+        // Stands in for the nested default, same as the two tests above: today it is the only
+        // way to make `orphaned_worktrees` look somewhere OTHER than the legacy sibling location
+        // it still uses unmodified — exactly what the eventual default change will do on its own.
+        let nested_root = simulated_nested_default(&repo_path);
+        let _env = WorktreeRootEnv::set(Some(&nested_root));
+
+        let legacy_root = base.path().join("nucleos-worktrees").join("repo");
+        let orphan = legacy_root.join("run-77");
+        std::fs::create_dir_all(&orphan).expect("create legacy orphan directory");
+
+        let orphans = orphaned_worktrees(&pool, &repo_path, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(
+            orphans.contains(&orphan),
+            "an orphan at the legacy sibling root must still be swept, or trees left there \
+             before this task lands become uncollectable for ever"
+        );
     }
 
     /// `core.fsmonitor` is a command string, and git runs it whenever it refreshes the index —

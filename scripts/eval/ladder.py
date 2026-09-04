@@ -78,6 +78,15 @@ LAYERS = ["H0", "H1", "H2", "H3"]
 MODE = {"H0": "real", "H1": "worktree", "H2": "worktree", "H3": "worktree"}
 TERMINAL = ("succeeded", "completed", "failed", "timed_out", "cancelled", "killed", "errored")
 
+# `core/src/worktree.rs::worktree_root()`'s default moved from a SIBLING of the project root
+# (`<parent>/nucleos-worktrees/<project>/run-*`) to INSIDE it (`<project>/.nucleos/worktrees/run-*`,
+# `ARTIFACTS_DIR` + "worktrees" there). Named once so `prepare()` and `score()` below can't drift
+# out of sync with each other the way they drifted out of sync with the daemon: `glob.glob` on the
+# old shape doesn't error when it matches nothing, so `score()` silently scored every worktree-mode
+# layer "no-worktree" instead of scoring it, and `prepare()`'s stale-tree cleanup silently stopped
+# cleaning anything.
+WORKTREES_SUBDIR = ".nucleos/worktrees"
+
 ENV = dict(os.environ)
 ENV.update({
     "RUSTUP_HOME": "C:/Projects/rustup",
@@ -119,9 +128,19 @@ def sh(args, timeout=2400):
 
 
 def prepare(task, layer, tree):
-    for stale in glob.glob(f"{TREES}/nucleos-worktrees/{task}-{layer}"):
-        subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", stale.replace("/", "\\")],
-                       capture_output=True)
+    # Sweep both addresses a worktree-mode cell may have left something at: the legacy sibling
+    # (`nucleos-worktrees/<task>-<layer>`, what a machine that ran the ladder before the daemon's
+    # default moved can still have on disk) and the current one, `<tree>/WORKTREES_SUBDIR`.
+    # `materialize.sh`'s `rm -rf $dest` a few lines below already clears the current address in the
+    # ordinary case, but not when a lock survives it (a build, a still-running daemon holding an exe
+    # open) — the same reason this loop existed for the legacy address in the first place.
+    for stale in (
+        f"{TREES}/nucleos-worktrees/{task}-{layer}",
+        f"{tree}/{WORKTREES_SUBDIR}",
+    ):
+        for hit in glob.glob(stale):
+            subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", hit.replace("/", "\\")],
+                           capture_output=True)
     done = sh([GIT_BASH, "scripts/eval/base.sh", "--task", task, "--dest", tree])
     if done.returncode != 0:
         raise SystemExit(f"base.sh failed for {task}: {done.stderr[-400:]}")
@@ -204,7 +223,13 @@ def watch(project, first_id):
 def score(task, layer, tree, first_id):
     target = tree
     if MODE[layer] == "worktree":
-        found = glob.glob(f"{TREES}/nucleos-worktrees/{task}-{layer}/run-*")
+        # Current address first (`WORKTREES_SUBDIR`, see the constant above), legacy sibling as a
+        # fallback for a tree that predates the daemon's default moving. Before this the glob only
+        # ever matched the legacy shape, so `found` came back empty for every worktree-mode layer —
+        # H1, H2 and H3, three of the ladder's four — and this returned "no-worktree" instead of a
+        # verdict, silently: `glob.glob` does not error on a shape nobody writes to anymore.
+        found = (glob.glob(f"{tree}/{WORKTREES_SUBDIR}/run-*") or
+                 glob.glob(f"{TREES}/nucleos-worktrees/{task}-{layer}/run-*"))
         if not found:
             return "no-worktree"
         target = found[0].replace("\\", "/")

@@ -656,10 +656,11 @@ fn worktree_available_space() -> io::Result<u64> {
 /// How much room is left on the volume that would hold this project's worktrees.
 ///
 /// Takes the project root rather than reading the daemon's own directory, and that is the whole
-/// reason it is a function of its own. `worktree_root` is a SIBLING of each project root, so two
-/// projects can sit on two volumes; a reading taken from wherever the daemon happens to be running
-/// answers about a third. The probe above keeps the old behaviour because a health readout is about
-/// the machine, not about one project.
+/// reason it is a function of its own. `worktree_root` lives INSIDE each project root by default —
+/// `<project>/.nucleos/worktrees`, not a sibling of it — so two projects can still sit on two
+/// volumes; a reading taken from wherever the daemon happens to be running answers about a third.
+/// The probe above keeps the old behaviour because a health readout is about the machine, not about
+/// one project.
 ///
 /// Blocking, and deliberately not wrapped in `spawn_blocking` here: `GetDiskFreeSpaceExW` is a
 /// metadata read against an already-mounted volume, and every caller is either already on a
