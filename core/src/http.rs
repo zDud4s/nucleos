@@ -12483,13 +12483,19 @@ struct ProposeRefinementRequest {
     supersedes: Option<i64>,
 }
 
-/// The owner writing into the layer directly, which is the door that exists today.
+/// The one door into the layer — the owner writing directly, and a run declaring what it learned.
+///
+/// One handler and not two, because the two differ in exactly one fact: whether a run is behind the
+/// request. That fact arrives as a header rather than as a field, so the door cannot be told a lie
+/// about who taught it; everything else about the write is identical, and a second route would be
+/// the same body with a different name on it.
 ///
 /// It still goes through the proposal, rather than inserting an `active` row: the review trail is
 /// what makes the layer safe to have at all, and a second way in that skipped it would be the way
 /// everything eventually got written. The owner simply approves their own in the next call.
 async fn post_refinement(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ProposeRefinementRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let kind = crate::refine::Kind::parse(request.kind.trim()).ok_or((
@@ -12509,7 +12515,12 @@ async fn post_refinement(
         &state.pool,
         crate::refine::Declaration {
             project_id: request.project_id.as_deref(),
-            origin_run_id: None,
+            // Off the header and never off the body: `RUN_ID_HEADER` is set from an environment
+            // variable the run's own tools have nothing able to read or alter, so a run can name
+            // itself and cannot name anybody else. Absent for the owner writing from the app, who
+            // is not a run — which is why the column stays nullable rather than the door demanding
+            // one.
+            origin_run_id: sending_run_id_of(&headers),
             kind,
             title,
             body,
@@ -30112,5 +30123,103 @@ mod tests {
             accepting.asked.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "picking a model must ask can_serve before storing it, not store it unconditionally"
         );
+    }
+
+    /// A run that declares a lesson is recorded as the run that taught it.
+    ///
+    /// `origin_run_id` is what lets a refinement be read against the work that produced it, and the
+    /// door filled it with `None` unconditionally — so every row the layer could ever hold was
+    /// anonymous, and "which run learned this?" was a column nobody could answer. It comes off
+    /// `RUN_ID_HEADER` rather than off the body deliberately: a body field would let any caller
+    /// attribute its own note to somebody else's run, and the header is set from an environment
+    /// variable the run's own tools have nothing able to read or alter.
+    #[tokio::test]
+    async fn a_refinement_declared_by_a_run_records_which_run_taught_it() {
+        let state = test_state().await;
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/refinements")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(crate::daemon_client::RUN_ID_HEADER, "4242")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": "nucleos",
+                            "kind": "memory",
+                            "title": "the suite needs Git's echo on PATH",
+                            "body": "five tests spawn echo as a program, and the only real echo.exe \
+                                     on Windows is Git's",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let refinement_id = json_body(response).await["refinement_id"]
+            .as_i64()
+            .expect("a created refinement answers its own id");
+
+        let origin: Option<i64> =
+            sqlx::query_scalar("SELECT origin_run_id FROM refinements WHERE id = ?")
+                .bind(refinement_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            origin,
+            Some(4242),
+            "the run that declared it must be on the row"
+        );
+    }
+
+    /// The owner writing from the app is not a run, and stays unattributed.
+    ///
+    /// The companion of the test above, and the reason the header is read as an `Option` rather
+    /// than demanded: `POST /refinements` is also the door the owner writes through, where there is
+    /// no run to name. A missing header must leave the column NULL — never fail the write, and
+    /// never invent an id.
+    #[tokio::test]
+    async fn a_refinement_written_by_the_owner_names_no_run() {
+        let state = test_state().await;
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/refinements")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "kind": "prompt",
+                            "title": "commit messages are English here",
+                            "body": "fixed by the owner, and it applies to every project on this \
+                                     machine",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let refinement_id = json_body(response).await["refinement_id"]
+            .as_i64()
+            .expect("a created refinement answers its own id");
+
+        let origin: Option<i64> =
+            sqlx::query_scalar("SELECT origin_run_id FROM refinements WHERE id = ?")
+                .bind(refinement_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(origin, None, "no run declared it, so no run is named");
     }
 }

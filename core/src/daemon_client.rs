@@ -633,6 +633,48 @@ impl DaemonClient {
     /// department may not send email", "you already have five waiting for approval" — and each one
     /// leads somewhere different: rewrite the request, ask for something else, or say plainly in the
     /// deliverable that it could not be done. A bare `403` leads to a retry.
+    /// A turn declares what it learned. It is a proposal, never a fact.
+    ///
+    /// **`origin_run_id` is deliberately not a parameter.** The daemon reads which run is speaking
+    /// off `RUN_ID_HEADER`, which `request` above sets from the run this client was built for — so
+    /// a run can name itself and has no way to name anybody else. A field here would be a field a
+    /// model could fill in, and "which run taught this?" would stop being evidence.
+    ///
+    /// `project_id` is `Option` and travels as JSON `null` when absent, which the door reads as
+    /// machine-wide. Omitting the key entirely would mean the same thing to serde and something
+    /// different to a reader of the wire, so it is sent.
+    pub async fn declare_refinement(
+        &self,
+        project_id: Option<&str>,
+        kind: &str,
+        title: &str,
+        body: &str,
+        reasoning: &str,
+    ) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/refinements")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "kind": kind,
+                "title": title,
+                "body": body,
+                "reasoning": reasoning,
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
     pub async fn propose_action(
         &self,
         kind: &str,
