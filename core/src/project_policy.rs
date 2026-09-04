@@ -194,37 +194,61 @@ pub async fn declare_shell_rule(
 /// exactly the pair `declare_shell_rule`'s `ON CONFLICT` would have matched — the identity of a rule
 /// is the prefix, and only that row goes.
 ///
+/// **`Ok(false)` means there was no such rule**, off `rows_affected`. It is the shape
+/// `project_commands::remove` already uses, and it exists so a caller can tell a delete that
+/// happened from one that matched nothing WITHOUT reading the table first. A route that re-read
+/// instead would answer out of a second query — a race at best, and at worst a presence check
+/// computing the key by a second spelling of the fold, which is the bug `fold_prefix` was written
+/// to close. Answering from the statement that does the work is what makes the two unable to
+/// disagree.
+///
 /// Folds for the same reason `declare_shell_rule` does, and with the SAME function: forget must
-/// compute the same key declare wrote, or the argument matches zero rows and this still returns
-/// `Ok(())` — a no-op wearing the same face as a real delete. A `declare` that folded and a `forget`
-/// that only trimmed would rebuild exactly that bug one level up from where it was first found,
-/// which is why `a_declared_rule_comes_back_on_its_own_side` now round-trips a mixed-case,
-/// double-spaced prefix through both.
+/// compute the same key declare wrote, or the argument matches zero rows — which now SAYS so
+/// instead of wearing the face of a real delete. A `declare` that folded and a `forget` that only
+/// trimmed would rebuild exactly that bug one level up from where it was first found, which is why
+/// `a_declared_rule_comes_back_on_its_own_side` round-trips a mixed-case, double-spaced prefix
+/// through both.
 pub async fn forget_shell_rule(
     pool: &SqlitePool,
     project_id: &str,
     prefix: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     sqlx::query("DELETE FROM project_shell_rules WHERE project_id = ? AND prefix = ?")
         .bind(project_id)
         .bind(fold_prefix(prefix))
         .execute(pool)
         .await
-        .map(|_| ())
+        .map(|done| done.rows_affected() > 0)
         .map_err(|error| format!("could not forget {prefix} for {project_id}: {error}"))
 }
 
-/// The GitHub operations this project runs without asking. `Vec` and not `Result`, unlike
-/// `shell_rules`: an unreadable list here yields nothing, which WITHHOLDS autonomy. That is the
-/// safe direction, and it is the one `narrow` already takes about a malformed entry.
-pub async fn github_ops(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+/// The GitHub operations this project runs without asking, with a read failure still in hand.
+///
+/// **Two callers want opposite things out of one query, which is why there are two functions.** A
+/// DECIDING caller wants the failure swallowed, because an empty list withholds autonomy and that
+/// is the safe direction. A DISPLAYING caller — `GET /projects/{id}/github-ops` — wants it raised,
+/// because to a page whose whole job is showing an owner what their project may do, `[]` is not an
+/// absence of information but a positive claim that nothing is declared. Serving that claim out of
+/// a database error tells the owner something false about their own autonomy, in the one place they
+/// go to check it.
+///
+/// `shell_rules` needs no such pair: it has only ever returned `Result`, because losing a `deny`
+/// is unsafe in either direction. This is that same shape, arrived at from the display half.
+pub async fn try_github_ops(pool: &SqlitePool, project_id: &str) -> Result<Vec<String>, String> {
     sqlx::query_scalar::<_, String>(
         "SELECT op_kind FROM project_github_ops WHERE project_id = ? ORDER BY op_kind",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await
-    .unwrap_or_else(|error| {
+    .map_err(|error| format!("could not read {project_id}'s github ops: {error}"))
+}
+
+/// The deciding half's answer: an unreadable list yields nothing, which WITHHOLDS autonomy — the
+/// safe direction, and the one `narrow` already takes about a malformed entry. See `try_github_ops`
+/// for why both exist.
+pub async fn github_ops(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+    try_github_ops(pool, project_id).await.unwrap_or_else(|error| {
         tracing::warn!(%error, project_id, "github ops: unreadable; this project stays autonomous in nothing");
         Vec::new()
     })
@@ -259,34 +283,47 @@ pub async fn declare_github_op(
 /// Withdraws one operation from the project's autonomous set. After this it goes back to asking —
 /// the safe direction, and the only one a forget can take here.
 ///
+/// `Ok(false)` for an operation that was never declared, for `forget_shell_rule`'s reason. Here it
+/// is load-bearing in a way a re-read could never be: `github_ops` swallows a read failure into an
+/// empty `Vec`, so a caller checking presence through IT would read an unreadable table as "never
+/// declared" and answer 404 while the row stands and the operation goes on running unattended.
+///
 /// Trims like `declare_github_op` does, so the two agree on what a key is — the same asymmetry that
 /// would leave `forget_shell_rule` matching zero rows applies here too.
 pub async fn forget_github_op(
     pool: &SqlitePool,
     project_id: &str,
     op_kind: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     sqlx::query("DELETE FROM project_github_ops WHERE project_id = ? AND op_kind = ?")
         .bind(project_id)
         .bind(op_kind.trim())
         .execute(pool)
         .await
-        .map(|_| ())
+        .map(|done| done.rows_affected() > 0)
         .map_err(|error| format!("could not forget {op_kind} for {project_id}: {error}"))
 }
 
 /// The branches a `--land` may target in this project, besides `integration_branch` — which is
-/// always admissible, table empty or not, and so never has a row of its own here. `Vec` and not
-/// `Result`, for the same reason as `github_ops`: an unreadable table must not open a landing spot
-/// this project never earned.
-pub async fn land_targets(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+/// always admissible, table empty or not, and so never has a row of its own here. With a read
+/// failure still in hand, for the display half; see `try_github_ops` for why the pair exists.
+pub async fn try_land_targets(pool: &SqlitePool, project_id: &str) -> Result<Vec<String>, String> {
     sqlx::query_scalar::<_, String>(
         "SELECT branch FROM project_land_targets WHERE project_id = ? ORDER BY branch",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await
-    .unwrap_or_else(|error| {
+    .map_err(|error| format!("could not read {project_id}'s land targets: {error}"))
+}
+
+/// The deciding half's answer: an unreadable table must not open a landing spot this project never
+/// earned, so it lands nowhere extra. `land::resolve_target` is the caller that wants exactly this,
+/// and its own doc already argues the cost — that a database hiccup is indistinguishable here from
+/// a project that declared nothing, which is why its refusal says what was *recorded* rather than
+/// what the project *admits*.
+pub async fn land_targets(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+    try_land_targets(pool, project_id).await.unwrap_or_else(|error| {
         tracing::warn!(%error, project_id, "land targets: unreadable; this project lands nowhere extra");
         Vec::new()
     })
@@ -319,7 +356,12 @@ pub async fn declare_land_target(
 }
 
 /// Closes one landing target. `integration_branch` needs no row to stay admissible, so this can
-/// never take away the one destination every project already has.
+/// never take away the one destination every project already has — which is also why `Ok(false)`
+/// over the integration branch's own name is the honest answer rather than a missing feature: there
+/// was no target of that name to close.
+///
+/// `Ok(false)` for a branch that was never declared, for `forget_github_op`'s reason, and it matters
+/// here for the same one: `land_targets` swallows a read failure too.
 ///
 /// Trims like `declare_land_target` does, for the same reason as the other two `forget_*`
 /// functions: declare and forget must agree on what a key is.
@@ -327,13 +369,13 @@ pub async fn forget_land_target(
     pool: &SqlitePool,
     project_id: &str,
     branch: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     sqlx::query("DELETE FROM project_land_targets WHERE project_id = ? AND branch = ?")
         .bind(project_id)
         .bind(branch.trim())
         .execute(pool)
         .await
-        .map(|_| ())
+        .map(|done| done.rows_affected() > 0)
         .map_err(|error| format!("could not forget {branch} for {project_id}: {error}"))
 }
 
@@ -454,7 +496,10 @@ mod tests {
         // single one of the nine that no test touches, which under the module's
         // `#![cfg_attr(not(test), allow(dead_code))]` leaves it dead in the TEST build and turns
         // `clippy -D warnings` red -- that attribute covers the non-test build only.
-        forget_shell_rule(&pool, "alpha", "git push").await.unwrap();
+        assert!(
+            forget_shell_rule(&pool, "alpha", "git push").await.unwrap(),
+            "a rule that was there reports that it went"
+        );
         let rules = shell_rules(&pool, "alpha").await.unwrap();
         assert!(rules.deny.is_empty());
         assert_eq!(rules.allow, vec!["bash scripts/gates.sh".to_owned()]);
@@ -595,11 +640,14 @@ mod tests {
             github_ops(&pool, "alpha").await,
             vec!["pr_comment".to_owned(), "run_list".to_owned()]
         );
-        forget_github_op(&pool, "alpha", "run_list").await.unwrap();
+        assert!(forget_github_op(&pool, "alpha", "run_list").await.unwrap());
         assert_eq!(
             github_ops(&pool, "alpha").await,
             vec!["pr_comment".to_owned()]
         );
+        // And again, which is the answer the routes turn into a 404. Asserted here rather than only
+        // through HTTP because this is where `rows_affected` is read.
+        assert!(!forget_github_op(&pool, "alpha", "run_list").await.unwrap());
 
         declare_land_target(&pool, "alpha", "master").await.unwrap();
         // Same idempotency check as `run_list` above, for `declare_land_target`'s own `DO NOTHING`.
@@ -608,8 +656,16 @@ mod tests {
             land_targets(&pool, "alpha").await,
             vec!["master".to_owned()]
         );
-        forget_land_target(&pool, "alpha", "master").await.unwrap();
+        assert!(forget_land_target(&pool, "alpha", "master").await.unwrap());
         assert!(land_targets(&pool, "alpha").await.is_empty());
+        assert!(!forget_land_target(&pool, "alpha", "master").await.unwrap());
+        // The unforgotten rule reports the same way, so `Ok(false)` is about THIS row and not about
+        // the table having gone empty.
+        assert!(
+            !forget_shell_rule(&pool, "alpha", "never declared")
+                .await
+                .unwrap()
+        );
     }
 
     /// `shell_rules`' `None` arm and this module's header both lean on the migration's `CHECK`s

@@ -1306,11 +1306,20 @@ fn is_safe_command(command: &str) -> bool {
 /// rather than inside them.
 ///
 /// Visible to the crate because `POST /projects/{id}/shell-rules` asks it of a prefix somebody is
-/// about to WRITE DOWN rather than of a command about to run. Every clause here refuses before any
-/// list is consulted, so a declared prefix carrying one of these shapes could never match anything:
-/// storing it would leave the owner holding a rule that silently does nothing, and — for a `deny` —
-/// a refusal that is not one. Asked of the same function the decision asks, so the two cannot come
-/// to disagree about which prefixes are worth having.
+/// about to WRITE DOWN rather than of a command about to run — and asks the same function the
+/// decision asks, so the two cannot come to disagree about which prefixes are worth having.
+///
+/// **That route asks it of an `allow` and never of a `deny`, and this doc is the place the
+/// asymmetry has to be right.** These guards sit above `rules.allows` in `classify_segment`, so an
+/// `allow` of a shape refused here could never fire and storing one leaves the owner holding a
+/// permission that does nothing. They sit above NOTHING on the deny side: `classify_shell_command`
+/// consults `rules.denies` at the line level, before the segment loop is entered at all, so a
+/// project's refusal of `tail -f`, `sort -o`, `find . -exec` or `curl … | sh` is enforced — and
+/// those are exactly the shapes this function refuses, which is exactly why they are worth
+/// refusing. A route that guarded the deny side would decline to store the refusals most worth
+/// writing down, and would tell the owner they could never be enforced while the engine enforced
+/// them. Migration `0128` puts it in one line: "Do lado `deny` não há nada a validar — uma recusa a
+/// mais nunca deixou correr nada."
 pub(crate) fn shell_form_is_readable(command: &str) -> bool {
     !has_shell_control(command)
         && !command.split_whitespace().any(|token| token == "--fix")

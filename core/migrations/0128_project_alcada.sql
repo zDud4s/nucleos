@@ -9,10 +9,15 @@ CREATE TABLE project_shell_rules (
   -- Medido como PREFIXO, a forma que `SAFE_COMMAND_PREFIXES` já usa e que
   -- `matches_command_prefix` já sabe comparar. Não é uma linha de shell.
   --
-  -- Nada aqui valida a forma do prefixo na escrita, e esta linha já afirmou o contrário. A guarda
-  -- existe, mas vive no classificador: `shell_form_is_readable` tem de passar ANTES de
-  -- `rules.allows`, e por isso um prefixo malformado do lado `allow` nunca chega a autorizar coisa
-  -- nenhuma. Do lado `deny` não há nada a validar -- uma recusa a mais nunca deixou correr nada.
+  -- A validação da forma do prefixo depende do veredicto, e a assimetria é a coisa a não
+  -- endireitar. Do lado `allow`, `POST /projects/{id}/shell-rules` recusa NA ESCRITA um prefixo que
+  -- não passe `shell_form_is_readable`: o classificador exige essa mesma guarda ANTES de
+  -- `rules.allows`, portanto uma permissão dessa forma ficaria guardada sem nunca chegar a
+  -- autorizar coisa nenhuma. Do lado `deny` não há nada a validar -- uma recusa a mais nunca deixou
+  -- correr nada -- e validar seria pior do que inútil: `rules.denies` responde ao NÍVEL DA LINHA,
+  -- antes do ciclo dos segmentos e sem guarda de forma por cima, portanto um projecto recusa
+  -- mesmo `tail -f`, `sort -o`, `find . -exec` ou `curl ... | sh`. São precisamente as formas que
+  -- de outro modo param em `pending_approval`, ou seja as recusas que mais vale a pena escrever.
   --
   -- Guardado já dobrado por `classifier::normalize_command` (minúsculas ASCII, espaços colapsados),
   -- que é a MESMA dobra aplicada ao comando -- ver `project_policy::fold_prefix`. Um prefixo por
