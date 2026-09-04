@@ -2890,6 +2890,10 @@ pub async fn resume_approved_run(state: &AppState, proposal_id: i64) -> Result<i
                 &input,
                 Some(std::path::Path::new(&wt_path)),
                 &state.github.policy,
+                // The same empty pair the hook passes, and the pairing is the point rather than a
+                // coincidence: this re-derivation must be handed exactly what the hook was handed,
+                // or the class recorded here is not the class the person was shown.
+                &crate::project_policy::ShellRules::default(),
                 // Labelling an action a person has just approved, not deciding one. The strict
                 // reading keeps the recorded class the same as the one that was shown to them.
                 crate::classifier::Unrecognized::AsksAPerson,

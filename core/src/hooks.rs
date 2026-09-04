@@ -344,6 +344,9 @@ pub async fn pretooluse_decision(
         &payload.tool_input,
         cwd.as_deref().map(Path::new),
         &state.github.policy,
+        // Not yet loaded from the run's project: an empty pair declares nothing and so changes no
+        // verdict, which is the only value that is safe to stand here while the lookup is missing.
+        &crate::project_policy::ShellRules::default(),
         unrecognized_policy_for(&state.pool, run_id, &mode).await,
     );
     tracing::info!(
@@ -924,6 +927,8 @@ async fn rooted_decision(
         &payload.tool_input,
         Some(Path::new(root)),
         &state.github.policy,
+        // Not yet loaded from the rooted turn's project; see the sibling call above.
+        &crate::project_policy::ShellRules::default(),
         // A rooted turn is a conversation. Somebody asked for it AND is sitting in front of it, so
         // a park costs them ten seconds and buys the strict reading.
         crate::classifier::Unrecognized::AsksAPerson,
@@ -2928,6 +2933,7 @@ mod tests {
             &tool_input,
             None,
             &crate::github::Policy::empty(),
+            &crate::project_policy::ShellRules::default(),
             classifier::Unrecognized::AsksAPerson,
         );
         assert_eq!(classification.action_class, "unrecognized");
