@@ -60,6 +60,30 @@ impl Verdict {
     }
 }
 
+/// The one fold a declared prefix gets, and it is `classifier::normalize_command` — the SAME
+/// function that folds the command the prefix will be compared against, not a second spelling of it.
+///
+/// **The bug this exists to close.** `ShellRules::allows` already said it reuses the compiled list's
+/// comparison "rather than restating it". It reused the comparison and not the INVARIANT that makes
+/// the comparison correct: every entry in `SAFE_COMMAND_PREFIXES` is a lower-case, single-spaced
+/// source literal, so `matches_command_prefix` never had to fold anything. A `TEXT` column carries
+/// no such invariant. `normalize_command` lower-cases the command and collapses its whitespace, so
+/// an unfolded `Remove-Item`, or a `npm  ci` typed with two spaces, could never match the very thing
+/// it was written down to judge.
+///
+/// The failure was asymmetric in the worst direction. An unfolded `allow` prefix is inert and the
+/// command merely waits for a person — annoying, and safe. An unfolded `deny` prefix is inert too,
+/// and an inert refusal is an ALLOW: `deny = "LS"` measured `("allow", "read-local")` on `ls -la`,
+/// with no prompt and no log line for the owner to find. `Remove-Item` is not a contrived spelling
+/// here either; this daemon ships a `PowerShell` tool and PascalCase is the canonical cmdlet form.
+///
+/// Applied on the way OUT of the table as well as on the way in, because a row can arrive without
+/// passing `declare_shell_rule` at all — an out-of-band write, or a migration older than this rule —
+/// and such a row must not be able to smuggle in a dead refusal.
+fn fold_prefix(prefix: &str) -> String {
+    crate::classifier::normalize_command(prefix)
+}
+
 /// One project's two lists, already split by verdict so the classifier does no filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellRules {
@@ -75,12 +99,25 @@ impl ShellRules {
     /// Measured as a PREFIX, which is `SAFE_COMMAND_PREFIXES`'s form and reuses its comparison
     /// rather than restating it — two spellings of "starts with" is how the compiled list and the
     /// declared one would come to disagree about `bash scripts/gates.shell`.
+    ///
+    /// The prefix is folded HERE as well as at the table's edge, and the repetition is deliberate.
+    /// These fields are `pub`: a `ShellRules` can be built without ever passing `shell_rules`, and
+    /// this is the last place that can still make the comparison right. See `fold_prefix` for what
+    /// went wrong when only the comparison was reused and not the invariant behind it.
     pub fn allows(&self, command: &str) -> bool {
-        crate::classifier::matches_command_prefix(command, &self.allow)
+        Self::matches(command, &self.allow)
     }
 
     pub fn denies(&self, command: &str) -> bool {
-        crate::classifier::matches_command_prefix(command, &self.deny)
+        Self::matches(command, &self.deny)
+    }
+
+    /// One comparison for both verdicts, for the reason `matches_command_prefix` gives for being
+    /// generic: two functions here is how the two lists would drift.
+    fn matches(command: &str, prefixes: &[String]) -> bool {
+        prefixes.iter().any(|prefix| {
+            crate::classifier::matches_command_prefix(command, &[fold_prefix(prefix)])
+        })
     }
 }
 
@@ -97,6 +134,10 @@ pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRul
 
     let mut rules = ShellRules::default();
     for (prefix, verdict) in rows {
+        // Folded before the match rather than in each arm, so no arm can be added later that
+        // forgets to. The unreadable-verdict arm below needs it as much as the other two: the row
+        // it pushes onto `deny` is precisely the one nobody vetted.
+        let prefix = fold_prefix(&prefix);
         match Verdict::from_db_str(&verdict) {
             Some(Verdict::Allow) => rules.allow.push(prefix),
             Some(Verdict::Deny) => rules.deny.push(prefix),
@@ -121,6 +162,11 @@ pub async fn shell_rules(pool: &SqlitePool, project_id: &str) -> Result<ShellRul
 /// `ON CONFLICT (project_id, prefix)` — the pair the unique index names — because the IDENTITY of a
 /// rule is the prefix it names. Without it, changing your mind about a verdict would leave BOTH
 /// answers in the table and the reader would pick one of them.
+///
+/// Stores the FOLDED prefix, not the typed one, so that what is written is what will be enforced —
+/// see `fold_prefix`. Folding only on the way out would work for the classifier and lie to
+/// everything else: the table, and the page a later chunk builds on it, would go on showing a
+/// `Remove-Item` that is in fact enforced as `remove-item`.
 pub async fn declare_shell_rule(
     pool: &SqlitePool,
     project_id: &str,
@@ -135,7 +181,7 @@ pub async fn declare_shell_rule(
          DO UPDATE SET verdict = excluded.verdict, note = excluded.note",
     )
     .bind(project_id)
-    .bind(prefix.trim())
+    .bind(fold_prefix(prefix))
     .bind(verdict.as_db_str())
     .bind(note)
     .execute(pool)
@@ -148,9 +194,12 @@ pub async fn declare_shell_rule(
 /// exactly the pair `declare_shell_rule`'s `ON CONFLICT` would have matched — the identity of a rule
 /// is the prefix, and only that row goes.
 ///
-/// Trims for the same reason `declare_shell_rule` does: forget must compare against the same key
-/// declare wrote, or a padded argument matches zero rows and this still returns `Ok(())` — a no-op
-/// wearing the same face as a real delete.
+/// Folds for the same reason `declare_shell_rule` does, and with the SAME function: forget must
+/// compute the same key declare wrote, or the argument matches zero rows and this still returns
+/// `Ok(())` — a no-op wearing the same face as a real delete. A `declare` that folded and a `forget`
+/// that only trimmed would rebuild exactly that bug one level up from where it was first found,
+/// which is why `a_declared_rule_comes_back_on_its_own_side` now round-trips a mixed-case,
+/// double-spaced prefix through both.
 pub async fn forget_shell_rule(
     pool: &SqlitePool,
     project_id: &str,
@@ -158,7 +207,7 @@ pub async fn forget_shell_rule(
 ) -> Result<(), String> {
     sqlx::query("DELETE FROM project_shell_rules WHERE project_id = ? AND prefix = ?")
         .bind(project_id)
-        .bind(prefix.trim())
+        .bind(fold_prefix(prefix))
         .execute(pool)
         .await
         .map(|_| ())
@@ -423,6 +472,68 @@ mod tests {
             .unwrap();
         let rules = shell_rules(&pool, "alpha").await.unwrap();
         assert!(!rules.allow.contains(&"cargo run".to_owned()));
+
+        // The same agreement, now over the whole fold rather than only the ends. `declare` stores
+        // what `fold_prefix` returns, so what comes back is lower-cased and single-spaced whatever
+        // was typed -- and `forget` has to compute that same key from a DIFFERENT spelling of the
+        // same rule, which is the only way to prove the two fold identically. A `declare` that
+        // folded and a `forget` that only trimmed would match zero rows and still answer `Ok(())`:
+        // the caller believes a refusal was lifted, and it was not.
+        declare_shell_rule(
+            &pool,
+            "alpha",
+            "  Remove-Item   -Recurse ",
+            Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(rules.deny, vec!["remove-item -recurse".to_owned()]);
+        forget_shell_rule(&pool, "alpha", "REMOVE-ITEM  -recurse")
+            .await
+            .unwrap();
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert!(rules.deny.is_empty());
+    }
+
+    /// A row that never passed `declare_shell_rule` -- an out-of-band write, or a migration older
+    /// than the fold -- must still come back enforceable. This is what makes the READ-side fold
+    /// load-bearing rather than belt-and-braces: with only the write side, this row's refusal is
+    /// dead on arrival, and a dead refusal is an allow.
+    ///
+    /// Asserted on the strings `shell_rules` returns rather than on a classification, so it pins the
+    /// fold at this boundary specifically and cannot be satisfied by the comparison folding later.
+    #[tokio::test]
+    async fn a_prefix_written_out_of_band_is_folded_on_the_way_out() {
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO project_shell_rules (project_id, prefix, verdict, created_at)
+             VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind("alpha")
+        .bind("  Remove-Item   -Recurse ")
+        .bind("deny")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO project_shell_rules (project_id, prefix, verdict, created_at)
+             VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind("alpha")
+        .bind("BASH  scripts/gates.sh")
+        .bind("allow")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rules = shell_rules(&pool, "alpha").await.unwrap();
+        assert_eq!(rules.deny, vec!["remove-item -recurse".to_owned()]);
+        assert_eq!(rules.allow, vec!["bash scripts/gates.sh".to_owned()]);
+        // And the folded list judges the command the unfolded one could not.
+        assert!(rules.denies("remove-item -recurse x"));
+        assert!(rules.allows("bash scripts/gates.sh all"));
     }
 
     /// The identity is (project, prefix): declaring the same prefix again EDITS it. Otherwise

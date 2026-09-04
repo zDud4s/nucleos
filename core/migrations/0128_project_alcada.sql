@@ -7,8 +7,17 @@ CREATE TABLE project_shell_rules (
   id         INTEGER PRIMARY KEY,
   project_id TEXT NOT NULL,
   -- Medido como PREFIXO, a forma que `SAFE_COMMAND_PREFIXES` já usa e que
-  -- `matches_command_prefix` já sabe comparar. Não é uma linha de shell: um prefixo que não passe
-  -- `shell_form_is_readable` é recusado na escrita.
+  -- `matches_command_prefix` já sabe comparar. Não é uma linha de shell.
+  --
+  -- Nada aqui valida a forma do prefixo na escrita, e esta linha já afirmou o contrário. A guarda
+  -- existe, mas vive no classificador: `shell_form_is_readable` tem de passar ANTES de
+  -- `rules.allows`, e por isso um prefixo malformado do lado `allow` nunca chega a autorizar coisa
+  -- nenhuma. Do lado `deny` não há nada a validar -- uma recusa a mais nunca deixou correr nada.
+  --
+  -- Guardado já dobrado por `classifier::normalize_command` (minúsculas ASCII, espaços colapsados),
+  -- que é a MESMA dobra aplicada ao comando -- ver `project_policy::fold_prefix`. Um prefixo por
+  -- dobrar nunca podia igualar aquilo que foi escrito para julgar, e do lado `deny` isso era uma
+  -- recusa que deixava correr em silêncio.
   prefix     TEXT NOT NULL CHECK (prefix <> ''),
   -- `allow` ou `deny`. `deny` ganha sempre — ver §4.2.
   --

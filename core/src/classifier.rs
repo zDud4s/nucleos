@@ -559,50 +559,59 @@ fn classify_shell_command(
 
     // A project's refusal outranks an approval PROMPT, and this is the position that makes that
     // true rather than nearly true. `APPROVAL_COMMAND_PATTERNS` matches the whole line just below,
-    // and `command_reader` refuses an unreadable line below that; from underneath either of them a
-    // project's `deny` came back `pending_approval`, which is a prompt a person can approve - and
-    // approving it runs the very line the project wrote down as denied. Measured, not feared: with
-    // `git push` denied, `git push origin main` answered `("pending_approval", "push-merge-deploy")`,
-    // and with `curl` denied, `curl $(whoami)` answered `("pending_approval", "unrecognized")`.
+    // and `command_reader::read` refuses an unreadable line below that; from underneath either of
+    // them a project's `deny` came back `pending_approval`, which is a prompt a person can approve -
+    // and approving it runs the very line the project wrote down as denied. Measured, not feared:
+    // with `git push` denied, `git push origin main` answered
+    // `("pending_approval", "push-merge-deploy")`, and with `curl` denied, `curl $(whoami)` answered
+    // `("pending_approval", "unrecognized")`.
     //
-    // It is the same defect the segment pass was written for one layer down, and the same sentence
-    // answers it: a refusal must not depend on where in a line it appears. That pass USED to sit
-    // just above the segment loop below, which is where a reader of the spec will look for it; it
-    // is here now because here it also outranks the two guards above the loop, and two places
-    // computing one refusal is two places to keep in step.
+    // It is the same defect the old segment pre-pass was written for one layer down, and the same
+    // sentence answers it: A REFUSAL MUST NOT DEPEND ON WHERE IN A LINE IT APPEARS. That pre-pass
+    // used to sit just above the segment loop below, which is where a reader of the spec will look
+    // for it; it is here now because only here does it also outrank the two guards above that loop.
     //
     // BELOW the compiled refusals on purpose. Those are also `deny`, so nothing is lost by letting
     // them answer first, and they answer with a narrower class - `rm -rf /` is worth recording as
     // `destructive` rather than as whatever the project happened to have written down.
     // `a_compiled_refusal_keeps_its_own_class` is what holds this block underneath them.
     //
-    // Two arms because neither covers the other. The whole line catches what the reader cannot
-    // segment at all (`curl $(whoami)` is a `curl`, and normalizing the raw line still sees it);
-    // the segments catch a denied command sitting behind a separator (`ls && git push`), which no
-    // prefix match against the whole line would ever see.
+    // **`command_reader::segments`, not `read`, and that is the whole of the second fix.** The two
+    // entry points answer different questions, and `segments`' own doc draws the line: `read` is for
+    // a caller deciding whether to ALLOW, so a line it cannot parse must stop it; `segments` is for
+    // a caller asking whether a line CONTAINS something, where a line that cannot be parsed in full
+    // is the one most worth scanning anyway. This pass is asking the second question. Built on
+    // `read` it was anchored at position 0 for anything unreadable, so `curl $(whoami)` was refused
+    // and `ls && curl $(whoami)`, `FOO=1 curl $(whoami)` and `ls; curl http://x &` were not - the
+    // very "depends on where in the line it appears" this block exists to end.
+    //
+    // `segments` walks with `parens: true` where `read` uses `parens: false`, so its cut set is a
+    // strict superset and it can only ever over-deny: `curl $(whoami)` comes back as
+    // `["curl $", "whoami"]`, and `curl $` still matches the prefix `curl`. Over-denying is the safe
+    // direction for a refusal, and the same direction `has_destructive_flags` already accepts. The
+    // only miss it could produce is a declared prefix that spans a parenthesis, which is not a
+    // prefix anybody can write.
+    //
+    // A known residual, seen and not fixed: `bash <<EOF\ncurl http://x\nEOF` under `deny = curl`
+    // stays `pending_approval`. Neither reading reaches it, because the walk deliberately skips
+    // heredoc bodies - see `command_reader.rs`, which argues that case on its own terms. It is a
+    // prompt rather than a silent allow, so it fails in the direction that wakes somebody.
     //
     // The empty-list guard is the non-regression, and it is structural rather than argued: a
     // project that declared no refusals cannot enter this block at all, so it cannot change a
-    // verdict here. It also means the second `command_reader::read` is paid only by a project that
-    // has refusals - the read is a string scan with no I/O, and buying this with it is the right
-    // trade. Reading ONCE, higher up, is the version that looks tidier and is wrong: it would move
-    // the `Reading::Unreadable` early return above the approval patterns and relabel lines that
-    // have nothing to do with this feature.
+    // verdict here. Short-circuiting on it also means the second walk of the line is paid only by a
+    // project that has refusals - and it is a string scan with no I/O.
     //
-    // A reading that is not a `Sequence` deliberately does not return from here. Falling through
-    // leaves every existing verdict for a line the reader cannot read exactly as it was.
-    if !rules.deny.is_empty() {
-        if rules.denies(&normalized) {
-            return classification("deny", "project-denied", "this project denies this command");
-        }
-        if let crate::command_reader::Reading::Sequence(segments) =
-            crate::command_reader::read(command, shell)
-            && segments
+    // Both sides of every comparison are folded by `normalize_command`; `project_policy::fold_prefix`
+    // is what guarantees that for the prefix, and says why a prefix that skipped the fold was a
+    // refusal that silently allowed.
+    if !rules.deny.is_empty()
+        && (rules.denies(&normalized)
+            || crate::command_reader::segments(command, shell)
                 .iter()
-                .any(|segment| rules.denies(&normalize_command(&strip_fd_duplications(segment))))
-        {
-            return classification("deny", "project-denied", "this project denies this command");
-        }
+                .any(|piece| rules.denies(&normalize_command(&strip_fd_duplications(piece)))))
+    {
+        return classification("deny", "project-denied", "this project denies this command");
     }
 
     if matches_any_phrase(&normalized, APPROVAL_COMMAND_PATTERNS) {
@@ -1079,7 +1088,20 @@ fn strip_fd_duplications(command: &str) -> String {
     stripped
 }
 
-fn normalize_command(command: &str) -> String {
+/// PURE: the one form every command and every declared prefix is compared in — runs of whitespace
+/// collapsed to a single ASCII space, both ends trimmed, ASCII letters folded to lower case.
+///
+/// It does THAT and nothing else: no quote handling, no path work, no token rewriting, no
+/// tokenization. Worth writing down now that it is `pub(crate)`, because `project_policy` pushes a
+/// person's declared prefix through it — and a fold with a surprise in it would be a surprise
+/// applied to a refusal.
+///
+/// The case fold is `to_ascii_lowercase`, not `to_lowercase`, so a non-ASCII capital survives it.
+/// That is not a hole while BOTH sides come through this function: the compiled lists are ASCII
+/// source literals, and a command and a declared prefix now get byte-for-byte the same treatment.
+/// Identical treatment is the entire requirement, which is why this is exposed rather than
+/// reimplemented — a second spelling of "fold" is how the two would come to disagree.
+pub(crate) fn normalize_command(command: &str) -> String {
     command
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -4053,13 +4075,25 @@ mod tests {
     /// spellings here - and that return is also a `pending_approval` a person can approve, which
     /// would run the `curl` this project denied.
     ///
-    /// This is what the whole-line arm exists for, and the only thing that exercises it that the
-    /// per-segment arm cannot: there are no segments to iterate when the reader refused to make
-    /// any. Normalizing the raw line still sees a `curl` at the front of it.
+    /// **Not front-anchored, and that is the point of the list.** Matching the whole normalized
+    /// line only ever sees a denied command that starts it. Every case below except the first has
+    /// something in front of the `curl` — an assignment, another command, a separator — and each of
+    /// those was `pending_approval` while this pass was built on `command_reader::read`, because an
+    /// unreadable line yields no segments to walk and the whole-line match is anchored at position
+    /// zero. `command_reader::segments` is the reading that never refuses, so the pieces exist to be
+    /// walked even here, and the refusal stops depending on where in the line it appears.
     #[test]
     fn a_project_deny_reaches_a_line_the_reader_cannot_segment() {
         let declared = shell_rules(&[], &["curl"]);
-        for command in ["curl $(whoami)", "curl http://x &"] {
+        for command in [
+            "curl $(whoami)",
+            "FOO=1 curl $(whoami)",
+            "ls && curl $(whoami)",
+            "ls; curl http://x &",
+            "ls && curl http://x &",
+            "echo `date` && curl http://x",
+            "FOO=1 curl http://x &",
+        ] {
             assert_classification(
                 classify_with_rules(&Default::default(), command),
                 "pending_approval",
@@ -4071,6 +4105,68 @@ mod tests {
                 "project-denied",
             );
         }
+    }
+
+    /// A refusal a project wrote down in capitals is still a refusal, and so is one typed with two
+    /// spaces in it.
+    ///
+    /// This is the shape every fixture in this module was missing. `normalize_command` folds the
+    /// COMMAND to lower case and collapses its whitespace; nothing folded the PREFIX, so the list
+    /// was case-insensitive about the thing it judged and case-sensitive about the judgement.
+    /// `deny = "LS"` measured `("allow", "read-local")` on `ls -la` — an agent running, with no
+    /// prompt and nothing in the log, the command the project had written down as refused.
+    ///
+    /// `Remove-Item` is here because it is not a contrived spelling: this daemon ships a
+    /// `PowerShell` tool and PascalCase is the canonical cmdlet form, so the natural way to write
+    /// that refusal was the way that did not work.
+    ///
+    /// The fold that fixes it lives in `project_policy` — at the table's edge and in the comparison
+    /// itself; see `fold_prefix`.
+    #[test]
+    fn a_deny_prefix_in_capitals_is_still_a_refusal() {
+        for (prefix, command) in [
+            ("LS", "ls -la"),
+            ("Cargo Test", "cargo test"),
+            ("Git Diff", "git diff"),
+            ("Remove-Item", "remove-item x"),
+            // Two spaces where the command has one. Same failure, different fold.
+            ("npm  ci", "npm ci"),
+            // And the ends, which is what the old `trim` on the write path used to carry alone.
+            ("  git push  ", "git push origin main"),
+        ] {
+            assert_classification(
+                classify_with_rules(&shell_rules(&[], &[prefix]), command),
+                "deny",
+                "project-denied",
+            );
+        }
+    }
+
+    /// The same fold reaches `allow`, and this is a real widening rather than a tidy-up: an
+    /// uppercase allow prefix used to be silently inert. It failed CLOSED — the command merely
+    /// waited for a person — which is the only reason this half was never noticed, and it is why
+    /// fixing both halves at once is still an improvement in both directions.
+    #[test]
+    fn an_allow_prefix_in_capitals_is_honoured_too() {
+        assert_classification(
+            classify_with_rules(
+                &shell_rules(&["BASH  scripts/gates.sh"], &[]),
+                "bash scripts/gates.sh all",
+            ),
+            "allow",
+            "project-declared",
+        );
+    }
+
+    /// Deny still beats allow when a project spelled both in capitals, because both sides reach the
+    /// comparison through the identical fold and the refusal is still consulted first.
+    #[test]
+    fn a_folded_deny_still_beats_a_folded_allow() {
+        assert_classification(
+            classify_with_rules(&shell_rules(&["LS"], &["Ls -la"]), "ls -la"),
+            "deny",
+            "project-denied",
+        );
     }
 
     /// What holds the project block BELOW the compiled refusals. Both answers are `deny`, so a
