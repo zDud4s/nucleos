@@ -1252,6 +1252,48 @@ fn word_is_flag(word: &str, flag: &str) -> bool {
     word == flag || word.starts_with(&format!("{flag}="))
 }
 
+// **Where the map is going: `gh` in Bash stops being autonomous, and `REFUSED_READ_FLAGS` goes with
+// it.** Decision #6 of `.ai/specs/2026-09-03-alcada-por-projecto-design.md`, written down here as
+// the destination and deliberately not taken.
+//
+// **It is not a refusal.** A `gh` line an agent needs can still be ASKED for: it becomes a
+// `pending_approval` like every other command this house has no opinion about, and a person
+// answers. What ends is the line running with nobody asked, on the strength of a prefix.
+//
+// **`REFUSED_READ_FLAGS` ends with it, because a typed operation has no flags.** That constant
+// exists for exactly one reason, and its own doc says so: a prefix cannot spell "`gh run view`
+// without `--log`", so the flags had to be refused beside the prefix. A NAME spells it —
+// `run_status` and `run_logs` are two entries and the caller picks one — and there is no `--json`
+// for a caller to reach for, because `ReadRequest` has three fields and not one of them is a flag.
+// The paragraph in that constant about short forms that do not remember themselves is a paragraph
+// about a failure mode the typed door does not have.
+//
+// **What has to be true first**, so that whoever reads this can tell whether the moment has arrived
+// instead of deciding that it has:
+//
+// - **The typed read door has to consult the list.** Today it does not — `submit` runs every read
+//   without asking anything, which its own doc states on purpose — so closing Bash now would WIDEN
+//   autonomy rather than narrow it: everything Bash refuses would simply be typed instead, and the
+//   owner's file would go from half an effect to none. This is the first condition and not one
+//   among several.
+// - **The catalogue has to cover what people actually type.** Not "cover `READ_CEILING`" — it
+//   already does, and `every_read_ceiling_prefix_is_built_by_a_real_operation` is what says so. The
+//   evidence lives on the other side: runs that stop and wait for a person on a `gh` line
+//   `op_kind_of_gh_command` cannot name. While those keep arriving the catalogue is short, and the
+//   answer is one more `ReadOp` — the way `WorkflowList`, `PrDiff`, `PrThread` and `ChecksForRef`
+//   each were, one measured gap at a time.
+// - **The tests above have to be measuring something other than themselves.**
+//   `one_name_picks_out_the_same_operation_at_both_doors` feeds the map the lines the operations
+//   build, so it can never discover a line nobody typed. It proves the map is faithful to the
+//   catalogue and says nothing about whether the catalogue is wide enough, and it is that second
+//   question this step turns on. A green suite is not the signal.
+//
+// The day all three hold, the change is small and mostly deletion: `READ_CEILING` and
+// `REFUSED_READ_FLAGS` go, `read_is_autonomous` goes with them, and `classifier.rs::Segment::
+// GithubRead` has nothing left to classify. That the step is a deletion is the point — it is the
+// proof the two vocabularies really did become one, and until then this comment is a plan and not
+// an achievement.
+
 /// What runs without asking.
 ///
 /// Built once at startup from `.ai/github.yaml` and then immutable: it does no I/O after
