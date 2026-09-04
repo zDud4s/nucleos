@@ -26,6 +26,7 @@ import { Charter } from "./Charter";
 import { Decisions } from "./Decisions";
 import { daemonProse } from "./prose";
 import { Work } from "./Work";
+import { Roster } from "./Roster";
 import { Routines } from "./Routines";
 import "../pages/teams.css";
 
@@ -48,6 +49,7 @@ import "../pages/teams.css";
  * | `Work` | `GET /team-runs`, `POST /teams/{id}/runs` | nothing — it reads and it starts |
  * | `Decisions` | `GET /team-actions`, `GET /proposals/recruits`, the approve/reject doors | one decision at a time |
  * | `Routines` | `GET`/`POST /team-triggers`, `DELETE`, `/enable`, `/next` | writes and deletes |
+ * | `Roster` | `GET /agents`, `GET /teams`, `GET /team-runs/{id}` | nothing — it draws the chart |
  * | `Charter` | `PUT /teams/{id}` | one Save, full replace, with a drift guard |
  */
 export function Bench() {
@@ -96,6 +98,7 @@ export function Bench() {
                 waiting for a person — the only one that can be behind. */}
             {waiting > 0 && <Badge tone="pending">{waiting}</Badge>}
           </TabsTrigger>
+          <TabsTrigger value="roster">Roster</TabsTrigger>
           <TabsTrigger value="routines">Routines</TabsTrigger>
           <TabsTrigger value="charter">Charter</TabsTrigger>
         </TabsList>
@@ -107,6 +110,11 @@ export function Bench() {
           {/* Every run in the window, not this department's: the tab needs the
               whole list to map `team_run_id` back to a department. */}
           <Decisions team={detail} runs={allRuns} />
+        </TabsContent>
+        {/* No `forceMount`: Radix unmounting the inactive tab is what keeps the chart from
+            polling every live run of this department while nobody is looking at it. */}
+        <TabsContent value="roster">
+          <Roster team={detail} runs={teamRuns} />
         </TabsContent>
         <TabsContent value="routines">
           <Routines team={detail} rules={teamTriggers} />

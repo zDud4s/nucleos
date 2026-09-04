@@ -1,5 +1,12 @@
 // §spec teams-consola-e-bancada
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import { apiFetch } from "./client";
 import type { AgentRequest } from "./agents";
 import { keys } from "./keys";
@@ -284,13 +291,51 @@ export function useTeamRuns() {
   });
 }
 
-/** One run in full, polled only while it can still change on its own. */
-export function useTeamRun(id: string) {
-  return useQuery({
+/**
+ * One run, and the rule that decides how often it is re-read.
+ *
+ * Extracted so the single reader and the fan-out below cannot drift: two definitions of the same
+ * query are two poll intervals and two cache keys waiting to disagree.
+ */
+export function teamRunQuery(id: string) {
+  return {
     queryKey: keys.teams.run(id),
     queryFn: () => apiFetch<TeamRunView>(`/team-runs/${encodeURIComponent(id)}`),
     refetchInterval: pollWhile<TeamRunView>(POLL.queue, (run) => teamRunIsAlive(run.state)),
-  });
+  };
+}
+
+/** One run in full, polled only while it can still change on its own. */
+export function useTeamRun(id: string) {
+  return useQuery(teamRunQuery(id));
+}
+
+/**
+ * What the fan-out below hands back. Defined at module scope because `useQueries` re-runs
+ * `combine` whenever the function's identity changes, and a fresh closure every render is a fresh
+ * identity.
+ */
+function combineRuns(results: Array<UseQueryResult<TeamRunView>>) {
+  return {
+    runs: results.flatMap((result) => (result.data === undefined ? [] : [result.data])),
+    pending: results.some((result) => result.isPending),
+  };
+}
+
+/**
+ * Every live run of one department, merged.
+ *
+ * `useQueries` and not the row-scoped hook pattern the bench uses elsewhere (`Work.tsx:169`,
+ * `pages/Teams.tsx:239`, `Routines.tsx:172`): those rows draw independently of one another, and
+ * the org chart has to hold every item before it can place a single box. A hook cannot be called
+ * in a loop over a list whose length changes, so this is the honest shape rather than a clever one.
+ *
+ * Bounded by the daemon: `max_live_runs` is validated into `1..=MAX_LIVE_TEAM_RUNS`
+ * (`core/src/team.rs:254`, `core/src/team_trigger.rs:48`), so this is at most four requests — the
+ * same four the Work tab makes, against the same keys, so nothing is fetched twice.
+ */
+export function useLiveTeamRuns(ids: string[]) {
+  return useQueries({ queries: ids.map(teamRunQuery), combine: combineRuns });
 }
 
 /**
