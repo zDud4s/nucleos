@@ -19,6 +19,8 @@ import type { Changed, Worktree } from "../data/project-code";
 import type { ProjectCommand } from "../data/project-commands";
 import type { Claim } from "../data/project-config";
 import type { ProjectFolder, ProjectRecord } from "../data/projects";
+import type { DeclarableOp, ShellRule, Verdict } from "../data/project-policy";
+import { foldPrefix } from "../data/project-policy";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
@@ -218,6 +220,27 @@ export interface DaemonState {
   folderDeleted: { projectId: string; forgetHistory: boolean }[];
   /** What `DELETE /projects/{id}/folder` refuses with, or `null` to accept. */
   folderRefusal: { status: number; code: string; detail: string } | null;
+  /**
+   * The three lists a project declares about itself, and the catalogue the second is picked from.
+   *
+   * Whole rows for the shell rules, because the note and the day a prefix was first declared are on
+   * the row and a fake serving two lists of prefixes could not carry either — which is the shape the
+   * route deliberately stopped having.
+   *
+   * `declarableOps` is machine-wide and takes no project id: the set is compiled into the daemon by
+   * intersecting the operations it can build with two ceilings, so it is the same answer for every
+   * project. The `declarable: false` entries are the half worth keeping in a default — an operation
+   * outside the ceilings is not missing, it exists and nothing on any screen can turn it on, and a
+   * page has to be able to draw that.
+   */
+  shellRules: ShellRule[];
+  githubOps: string[];
+  landTargets: string[];
+  declarableOps: DeclarableOp[];
+  /** What every declaration route refuses with, or `null` to accept. */
+  policyRefusal: { status: number; code: string; detail: string } | null;
+  /** Every declaration the shell sent, in order, as it sent it. */
+  policyWrites: { path: string; method: string; body: Record<string, unknown> | null }[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -287,6 +310,24 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     },
     folderDeleted: [],
     folderRefusal: null,
+    shellRules: [],
+    githubOps: [],
+    landTargets: [],
+    /*
+      A stand-in and not a copy of the real catalogue: that one is derived in `github.rs` by
+      intersecting the built operations with two compiled ceilings, and a second spelling of it here
+      would be exactly the drift `GET /github/declarable-ops` exists to end. `api_read` is in it by
+      name because it is the standing example of the `false` case.
+    */
+    declarableOps: [
+      { kind: "pr_list", half: "read", declarable: true },
+      { kind: "run_list", half: "read", declarable: true },
+      { kind: "run_logs", half: "read", declarable: false },
+      { kind: "pr_comment", half: "action", declarable: true },
+      { kind: "api_read", half: "action", declarable: false },
+    ],
+    policyRefusal: null,
+    policyWrites: [],
     ...overrides,
   };
 }
@@ -489,6 +530,27 @@ export function proposal(overrides: Partial<Proposal> = {}): Proposal {
 }
 
 /**
+ * The day a shell rule this fake stores was first declared.
+ *
+ * A fixed day rather than "now", and one that is plainly not today, because the caption beside a
+ * rule says `declared` and never `edited`: a test that could not tell the two apart could not catch
+ * a page that re-dated a rule when its verdict was flipped.
+ *
+ * The daemon's own spelling — `datetime('now')`, UTC, space-separated, and NOT RFC 3339.
+ */
+export const DECLARED_ON = "2026-03-14 09:41:00";
+
+/** `ORDER BY prefix`, which is the order the route serves its rows in. */
+function byPrefix(left: ShellRule, right: ShellRule): number {
+  return left.prefix < right.prefix ? -1 : left.prefix > right.prefix ? 1 : 0;
+}
+
+/** One declared shell rule, whole, with the fields a test does not care about filled in. */
+export function shellRule(overrides: Partial<ShellRule> = {}): ShellRule {
+  return { prefix: "npm ci", verdict: "allow", note: null, created_at: DECLARED_ON, ...overrides };
+}
+
+/**
  * A stand-in for the núcleo's JSON routes, over mutable state.
  *
  * A responder rather than a pile of `mockResolvedValueOnce`: the shell polls,
@@ -497,6 +559,81 @@ export function proposal(overrides: Partial<Proposal> = {}): Proposal {
  */
 export function daemonFetch(state: DaemonState): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
+    /*
+      The declaration routes, all ten, in one block at the very top.
+
+      Ahead of everything else because the bare `DELETE /projects/{id}` further down matches any
+      path under `/projects/`, and a `DELETE .../shell-rules` falling into it would delete the
+      PROJECT — a fake that removed the row a test is watching while reporting success is the worst
+      kind of green.
+
+      Stateful, because the assertion that matters is a write and then a read: a 204 proves the
+      request was well formed, and what is under test is whether the list the shell shows afterwards
+      is the list the daemon is now enforcing.
+    */
+    const policy = /^\/projects\/([^/]+)\/(shell-rules|github-ops|land-targets)$/.exec(path);
+    if (path === "/github/declarable-ops") return state.declarableOps;
+    if (policy !== null) {
+      const method = init?.method ?? "GET";
+      const table = policy[2];
+      const body =
+        typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+
+      if (method === "GET") {
+        if (table === "shell-rules") return [...state.shellRules].sort(byPrefix);
+        if (table === "github-ops") return [...state.githubOps].sort();
+        return [...state.landTargets].sort();
+      }
+
+      state.policyWrites.push({ path, method, body });
+      if (state.policyRefusal !== null) {
+        const { status, code, detail } = state.policyRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+
+      if (table === "shell-rules") {
+        // The núcleo folds on the way in, so the fake does too: a prefix is identified by its
+        // folded spelling and by nothing else.
+        const prefix = foldPrefix(String(body?.prefix ?? ""));
+        if (method === "DELETE") {
+          state.shellRules = state.shellRules.filter((rule) => rule.prefix !== prefix);
+          return undefined;
+        }
+        const already = state.shellRules.find((rule) => rule.prefix === prefix);
+        const written: ShellRule = {
+          prefix,
+          verdict: body?.verdict as Verdict,
+          // `note = excluded.note`, and NOT a merge — whatever arrived is now the note, `null`
+          // included. That is the trap the `Note` union exists to make a caller choose out loud.
+          note: (body?.note as string | null | undefined) ?? null,
+          // Absent from the `DO UPDATE` in the núcleo, so a redeclaration keeps the day the prefix
+          // was first written down.
+          created_at: already?.created_at ?? DECLARED_ON,
+        };
+        state.shellRules = [
+          ...state.shellRules.filter((rule) => rule.prefix !== prefix),
+          written,
+        ];
+        return undefined;
+      }
+
+      if (table === "github-ops") {
+        const kind = String(body?.op_kind ?? "");
+        state.githubOps =
+          method === "DELETE"
+            ? state.githubOps.filter((op) => op !== kind)
+            : [...state.githubOps.filter((op) => op !== kind), kind];
+        return undefined;
+      }
+
+      const branch = String(body?.branch ?? "");
+      state.landTargets =
+        method === "DELETE"
+          ? state.landTargets.filter((target) => target !== branch)
+          : [...state.landTargets.filter((target) => target !== branch), branch];
+      return undefined;
+    }
+
     if (init?.method === "POST") {
       // The one write the shell can make from the frame. Applied to the state so
       // that the refetch after the mutation reads back what was written.

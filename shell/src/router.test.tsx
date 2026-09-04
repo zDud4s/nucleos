@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import { NAV_PATHS } from "./app/nav";
 import { PAGES, createAppRouter } from "./router";
 import { Bench } from "./team/Bench";
@@ -111,6 +111,44 @@ describe("the app router", () => {
 
     expect(paths).toContain("/projects/$projectId/$view");
     expect(paths).toContain("/projects/$projectId/inspect/$view");
+  });
+
+  /**
+   * The fifth mode, reached by its own segment.
+   *
+   * `/projects/$projectId/$view` takes any word, so nothing in `router.tsx` had to change for this
+   * — which is exactly why it wants an assertion here. `Workspace` answers an unrecognised mode
+   * with `state` rather than a dead end, so a `github` that was never added to `MODES` would leave
+   * this route resolving, the shell rendering, and the State mode on screen under a URL that says
+   * otherwise. Nothing would be red.
+   *
+   * Asserted through the whole app rather than by mounting `Workspace`: the tab strip, the segment
+   * and the page have to agree, and a component test cannot see the router that carries them.
+   */
+  it("draws the GitHub mode at /projects/$projectId/github", async () => {
+    const { router } = await renderApp({ initialPath: "/projects/nucleos/github" });
+
+    expect(router.state.location.pathname).toBe("/projects/nucleos/github");
+    // The mode's own sections, which no other mode has — and not the tab, which is on screen
+    // whichever mode is open.
+    expect(await screen.findByRole("region", { name: "What runs on its own" })).toBeDefined();
+    expect(screen.getByRole("region", { name: "What the worktrees may run" })).toBeDefined();
+    // State is the fallback an unrecognised segment lands on, so its absence is what proves the
+    // segment was recognised.
+    expect(screen.queryByRole("region", { name: "Readings" })).toBeNull();
+  });
+
+  it("offers the fifth mode in the tab strip, beside the four that were there", async () => {
+    await renderApp({ initialPath: "/projects/nucleos/state" });
+
+    const modes = await screen.findByRole("navigation", { name: "Project modes" });
+    const links = within(modes).getAllByRole("link");
+
+    // Five and not four. Read by position rather than by name because two of the tabs carry a
+    // count beside their label once the query behind them has answered.
+    expect(links).toHaveLength(5);
+    expect(links[4].textContent).toContain("GitHub");
+    expect(links[4].getAttribute("href")).toBe("/projects/nucleos/github");
   });
 
   it("opens on Home", async () => {
