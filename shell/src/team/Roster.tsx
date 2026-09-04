@@ -8,7 +8,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { buildRoster, clip, placeRoster, type RosterNode } from "./roster-graph";
+import { ROW_GAP, buildRoster, clip, placeRoster, type RosterNode } from "./roster-graph";
 
 /**
  * `Roster` — the department drawn as its own org chart.
@@ -106,11 +106,24 @@ export function Roster({ team, runs }: RosterProps) {
               const y1 = from.y + from.height;
               const x2 = to.x + to.width / 2;
               const y2 = to.y;
+              /*
+                The crossing edge is routed and not curved, and this is the one thing in the
+                drawing that was decided by looking at it rather than by reasoning. A bezier from
+                the director to a box two ranks down passes THROUGH the specialists' rank — it
+                went under the `reviewer` box, which paints over it, and came out of its right
+                edge. The picture then said the director's own work belonged to `reviewer`, which
+                is the exact fact this edge exists to deny. So it drops into the gap above the
+                roster, runs across it, and comes down in the crossing item's own column — which
+                has no box in that rank, by construction.
+              */
+              const d = edge.crosses
+                ? `M ${x1} ${y1} V ${y1 + ROW_GAP / 2} H ${x2} V ${y2}`
+                : `M ${x1} ${y1} C ${x1} ${y1 + 22}, ${x2} ${y2 - 22}, ${x2} ${y2}`;
               return (
                 <path
                   key={`${edge.from}->${edge.to}`}
                   className={edge.crosses ? "teams-org-edge teams-org-edge-far" : "teams-org-edge"}
-                  d={`M ${x1} ${y1} C ${x1} ${y1 + 22}, ${x2} ${y2 - 22}, ${x2} ${y2}`}
+                  d={d}
                 />
               );
             })}

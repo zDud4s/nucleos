@@ -111,7 +111,17 @@ function run(overrides: Partial<TeamRunView> = {}): TeamRunView {
     root_id: "run-live-1",
     depth: 0,
     cost_usd: 1.24,
-    items: [item()],
+    items: [
+      item(),
+      item({
+        ordinal: 3,
+        round: 2,
+        agent_id: "controller",
+        description: "match them line by line",
+        state: "working",
+        run_id: 13,
+      }),
+    ],
     ...overrides,
   };
 }
@@ -200,6 +210,16 @@ describe("Roster", () => {
     await renderRoster(team({ members: ["controller", "ghost"] }), []);
 
     expect(await screen.findByLabelText("ghost — deleted from the catalogue")).toBeTruthy();
+  });
+
+  it("routes the director's own edge around the roster rather than through it", async () => {
+    const { container } = await renderRoster(team(), [listRow()]);
+    await screen.findByLabelText("match them line by line — working");
+
+    const crossing = container.querySelector(".teams-org-edge-far");
+    // Orthogonal, not a curve. A bezier from rank 0 to rank 2 passes under a specialist's box and
+    // reappears at its edge, which reads as that specialist holding the director's own work.
+    expect(crossing?.getAttribute("d")).toMatch(/^M [\d.]+ [\d.]+ V [\d.]+ H [\d.]+ V [\d.]+$/);
   });
 
   it("does not move a box when only a state changes", async () => {

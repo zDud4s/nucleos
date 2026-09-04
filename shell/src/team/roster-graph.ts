@@ -165,8 +165,11 @@ export function buildRoster(input: RosterInput): RosterModel {
  */
 export const LAYER_H: Record<RosterLayer, number> = { 0: 56, 1: 54, 2: 72 };
 
-/** The white band between two ranks. Wide enough that an edge reads as a line and not a join. */
-const ROW_GAP = 46;
+/**
+ * The white band between two ranks. Wide enough that an edge reads as a line and not a join,
+ * and exported because the drawing routes the director's own edge along the middle of it.
+ */
+export const ROW_GAP = 46;
 
 /** Above this many characters a line is folded. Two lines at most, then it is clipped. */
 const MAX_CHARS = 30;
