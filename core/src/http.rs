@@ -20076,8 +20076,14 @@ mod tests {
             // and a project able to declare it would be that ceiling with a different door. It is
             // the only `ActOp` kind excluded, and `github::ACTION_CEILING` argues why.
             "api_read",
-            // Reads a stranger's prose; excluded by `--log` in `REFUSED_READ_FLAGS`.
+            // Two reasons, and they were under one label until a reviewer split them. `run_logs`
+            // matches `gh run view`, which IS in `READ_CEILING`, and loses on the `--log` its argv
+            // carries — the `REFUSED_READ_FLAGS` half of the read ceiling doing its half.
             "run_logs",
+            // These two lose earlier and more simply: `gh pr view` and `gh issue view` are not in
+            // `READ_CEILING` at all, so no flag analysis is ever reached. Same outcome, different
+            // constant, and a comment that blamed `--log` for all three would send whoever changes
+            // one of them to the wrong list.
             "pr_view",
             "issue_view",
         ] {

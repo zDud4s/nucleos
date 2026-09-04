@@ -66,22 +66,33 @@ pub enum ReadOp {
         repo: Repo,
         id: RunId,
     },
-    /// What a pull request changes, which `gh` answers with the diff itself and not with a list of
-    /// names. So this returns the patch, every line of it written by whoever opened the pull
-    /// request — which on a fork is a stranger with no commit access and no review yet.
-    PrFiles {
+    /// The patch a pull request proposes, as `gh pr diff` gives it: every changed line, written by
+    /// whoever opened the pull request, which anyone with a GitHub account may do.
+    ///
+    /// **It was called `pr_files` for one commit, and the name was the defect.** A caller's whole
+    /// interface to this operation is the kind string — the model reading the tool description never
+    /// sees this paragraph — and `pr_files` promises a list of names. What arrives is unbounded
+    /// attacker-authored text, clipped to the LAST 256 KiB by `clip`, so a hostile pull request can
+    /// sit its payload at the tail and push everything before it out of the window. A name that
+    /// under-describes its own blast radius is worse here than anywhere else in this enum, because
+    /// the thing it under-describes is the injection channel.
+    PrDiff {
         repo: Repo,
         number: PrNumber,
     },
-    /// The comment thread on a pull request. `PrView` returns the description its author wrote;
-    /// this returns everything everybody else wrote underneath it, which is a wider door into the
-    /// turn and not a narrower one.
+    /// The comment thread on a pull request. `PrView` returns the description its author wrote; this
+    /// returns everything everybody else wrote underneath it, which is a wider door into the turn
+    /// and not a narrower one.
     ///
-    /// **One letter from `ActOp::PrComment`, which posts one.** The kinds are `pr_comments` and
-    /// `pr_comment`, they are on opposite sides of the partition, and each `from_request` names the
-    /// other's tool by hand rather than answering "unknown operation" — so the near-miss is a
-    /// sentence saying which tool to use, in both directions.
-    PrComments {
+    /// **`pr_thread` and not `pr_comments`, and the reason is a refusal message rather than a
+    /// compare.** Every kind comparison in this module is `==`, so the plural was mechanically safe
+    /// beside `ActOp::PrComment`; what it was not safe from is a person. `POST
+    /// /projects/{id}/github-ops` refuses an undeclarable kind by listing the declarable ones, so
+    /// somebody reaching for this READ was refused and handed a list whose nearest entry was
+    /// `pr_comment` — the operation that POSTS under the owner's name, and that runs without asking
+    /// the moment it is declared. A refusal that nudges across the partition is worse than no
+    /// refusal, and the fix belongs in the name and not in the message.
+    PrThread {
         repo: Repo,
         number: PrNumber,
     },
@@ -183,8 +194,8 @@ impl ReadOp {
             ReadOp::PrView { .. } => "pr_view",
             ReadOp::IssueView { .. } => "issue_view",
             ReadOp::RunLogs { .. } => "run_logs",
-            ReadOp::PrFiles { .. } => "pr_files",
-            ReadOp::PrComments { .. } => "pr_comments",
+            ReadOp::PrDiff { .. } => "pr_diff",
+            ReadOp::PrThread { .. } => "pr_thread",
             ReadOp::ChecksForRef { .. } => "checks_for_ref",
         }
     }
@@ -194,43 +205,59 @@ impl ReadOp {
     /// Structure — a status, a conclusion, a list of workflow names — is `ReadsOwn`. Prose somebody
     /// wrote is `ReadsUntrusted`, and it burns the turn's right to act, which is the trade the
     /// design accepts on purpose.
+    ///
+    /// "Structure" and "prose" are the shorthand and not the rule. Three of the four `ReadsOwn`
+    /// reads do carry stranger-chosen words; what keeps them on that side is how few and how
+    /// short-shaped, and the first comment in the body is where that is set out. Grade a new
+    /// variant against that comment, never against this sentence.
     pub fn effect(&self) -> ToolEffect {
         match self {
-            // `WorkflowList` sits with the structural three and not with the prose three, and the
-            // sentence above already decided it: "a list of workflow names" is the example this doc
-            // gives for `ReadsOwn`. What comes back is the repository's own workflow files by name,
-            // id and state — the same shape `RunList` and `PrList` return, chosen by whoever may
-            // commit to the repository rather than by whoever may open a pull request against it.
+            // **`ReadsOwn` here does NOT mean "no stranger wrote any of this".** Saying it did would
+            // be the most convenient rule to state and it is false, so it is worth killing before
+            // somebody grades a seventh read by it. `gh pr list` returns titles, author logins and
+            // head branch names chosen by anybody with a GitHub account; `gh run list` and `gh run
+            // view` show a run's display title, which for a `pull_request`-triggered run IS the pull
+            // request's title. Three of these four already carry a stranger's words. This same file
+            // says so 800 lines down, in the sentence that refuses `--limit`: `gh pr list` is called
+            // "an injection channel" there, in those words.
+            //
+            // What actually separates the two arms is how much of a stranger's text can arrive and
+            // in what shape. `ReadsOwn` is a deliberate, narrow tolerance: a stranger reaches these
+            // four only through short fixed-shape fields — one title, one login, one branch name per
+            // row — in a listing whose row count `gh` caps at thirty and which `REFUSED_READ_FLAGS`
+            // refuses to let a caller raise. That cap is not a performance detail, it is half of
+            // this grading, which is why `--limit` and its `-L` spelling are refused rather than
+            // capped. `WorkflowList` is the one with no tolerance to spend: workflow files live on
+            // the repository's own branches, so it is committer-authored outright.
             ReadOp::RunList { .. }
             | ReadOp::RunStatus { .. }
             | ReadOp::PrList { .. }
             | ReadOp::WorkflowList { .. } => ToolEffect::ReadsOwn,
-            // The three added last are `ReadsUntrusted` for the reason the first three are, and it
-            // is worth saying what the reason is NOT. It is not that the output is long, or
-            // free-form, or unparsed: `RunList` is all three and is `ReadsOwn`. It is authorship.
-            // Everything `RunList`, `RunStatus`, `PrList` and `WorkflowList` return was written by
-            // whoever may already commit to the repository — the owner reading it is reading their
-            // own side. A diff on a pull request, the thread underneath it, and the output of a
-            // check the pull request's own workflow ran are all written by whoever OPENED it, and
-            // opening one takes no permission at all. That is a channel from any GitHub account
-            // into this turn's context, and it is exactly the channel the grading exists to mark.
+            // And the arm below is where that tolerance is gone. Not because the output is long, or
+            // free-form, or unparsed — `RunList` is all three — but because a stranger authors it
+            // WHOLE and at a length nothing bounds: a patch, a thread, a check's summary. There is
+            // no fixed-shape field to point at and no row cap to lean on, so the only honest answer
+            // is that the turn has read somebody else's words.
             //
-            // `ChecksForRef` is the one that looks structural and is not. The states are GitHub's;
-            // the check NAMES and their summaries come from the workflow files on the head ref,
-            // which on a fork are the contributor's. Grading it on the shape of the table rather
-            // than on who filled the table in is the mistake this comment exists to stop.
+            // `ChecksForRef` is the one that looks structural and is not, and the mechanism is worth
+            // getting right because the obvious version of it is wrong. It is NOT that a fork's
+            // workflow file runs: for `pull_request` events GitHub takes the workflow from the BASE
+            // ref, which is the whole point of that event. It is that a check's name, its summary
+            // and its details URL are free text written by whatever produced the check — any GitHub
+            // App holding `checks:write` on the repository, and any workflow running on a same-repo
+            // pull request branch. The states are GitHub's; the prose beside them is not.
             //
             // What the grading costs, so that it is chosen and not stumbled into: the turn is
             // latched. `effect_of_call` reads this through `effect_of_kind`, the answer comes back
-            // fenced by `fence_untrusted`, and `permitted_after_untrusted` refuses every `Acts`
-            // tool for the rest of the turn — `github_act` included. A run that reads the diff
-            // cannot then comment on the pull request. That is the trade, and for text a stranger
-            // chose it is the right way round.
+            // fenced by `fence_untrusted`, and `permitted_after_untrusted` refuses every `Acts` tool
+            // for the rest of the turn — `github_act` included, and on the cloud path as well as the
+            // local one. A run that reads the diff cannot then comment on the pull request. That is
+            // the trade, and for text a stranger chose it is the right way round.
             ReadOp::PrView { .. }
             | ReadOp::IssueView { .. }
             | ReadOp::RunLogs { .. }
-            | ReadOp::PrFiles { .. }
-            | ReadOp::PrComments { .. }
+            | ReadOp::PrDiff { .. }
+            | ReadOp::PrThread { .. }
             | ReadOp::ChecksForRef { .. } => ToolEffect::ReadsUntrusted,
         }
     }
@@ -254,12 +281,12 @@ impl ReadOp {
                 [repo_flag(repo), "--log".to_owned()],
                 &[id.as_str()],
             ),
-            ReadOp::PrFiles { repo, number } => {
+            ReadOp::PrDiff { repo, number } => {
                 argv(&["pr", "diff"], [repo_flag(repo)], &[number.as_str()])
             }
             // `--comments` is a boolean this module writes, like `--log` above: it carries no caller
             // value, so it may be a bare flag ahead of the terminator.
-            ReadOp::PrComments { repo, number } => argv(
+            ReadOp::PrThread { repo, number } => argv(
                 &["pr", "view"],
                 [repo_flag(repo), "--comments".to_owned()],
                 &[number.as_str()],
@@ -302,11 +329,11 @@ impl ReadOp {
                 repo: repo.clone(),
                 id: RunId::new("1").expect("the sample run id is valid"),
             },
-            ReadOp::PrFiles {
+            ReadOp::PrDiff {
                 repo: repo.clone(),
                 number: PrNumber::new("1").expect("the sample pr number is valid"),
             },
-            ReadOp::PrComments {
+            ReadOp::PrThread {
                 repo: repo.clone(),
                 number: PrNumber::new("1").expect("the sample pr number is valid"),
             },
@@ -324,8 +351,8 @@ impl ReadOp {
                 | ReadOp::PrView { .. }
                 | ReadOp::IssueView { .. }
                 | ReadOp::RunLogs { .. }
-                | ReadOp::PrFiles { .. }
-                | ReadOp::PrComments { .. }
+                | ReadOp::PrDiff { .. }
+                | ReadOp::PrThread { .. }
                 | ReadOp::ChecksForRef { .. } => {}
             }
         }
@@ -530,8 +557,8 @@ impl Op {
 pub struct ReadRequest {
     pub operation: String,
     pub repo: String,
-    /// A run id for `run_status` and `run_logs`, a pull request number for `pr_view`, `pr_files` and
-    /// `pr_comments`, an issue number for `issue_view`, a REF for `checks_for_ref`, and nothing at
+    /// A run id for `run_status` and `run_logs`, a pull request number for `pr_view`, `pr_diff` and
+    /// `pr_thread`, an issue number for `issue_view`, a REF for `checks_for_ref`, and nothing at
     /// all for the three listings. One field rather than five, because the model reading this has to
     /// fill in one thing and choosing which name it is called by is not that thing.
     ///
@@ -598,13 +625,13 @@ impl ReadOp {
                 repo,
                 number: IssueNumber::new(&required(id, "issue_view", "issue number")?)?,
             }),
-            "pr_files" => Ok(ReadOp::PrFiles {
+            "pr_diff" => Ok(ReadOp::PrDiff {
                 repo,
-                number: PrNumber::new(&required(id, "pr_files", "pull request number")?)?,
+                number: PrNumber::new(&required(id, "pr_diff", "pull request number")?)?,
             }),
-            "pr_comments" => Ok(ReadOp::PrComments {
+            "pr_thread" => Ok(ReadOp::PrThread {
                 repo,
-                number: PrNumber::new(&required(id, "pr_comments", "pull request number")?)?,
+                number: PrNumber::new(&required(id, "pr_thread", "pull request number")?)?,
             }),
             // The one operation whose `id` is not a number. The field is still `id`, because the
             // flat parameters exist to give the model ONE thing to fill in — the doc on that field
@@ -1045,7 +1072,9 @@ pub const ACTION_CEILING: &[&str] = &[
 ///   injection channel, HOW MANY is the payload. `gh pr list --limit 1000` is a thousand
 ///   stranger-chosen titles in a call that marks nothing, against `gh`'s default of thirty.
 ///   Refusing the flag rather than capping it is deliberate — a cap would mean reading a flag's
-///   VALUE, and this comparison reads tokens.
+///   VALUE, and this comparison reads tokens. **`ReadOp::effect` leans on this entry**: `PrList` is
+///   `ReadsOwn` because a stranger reaches it through thirty short fields and no further, so the
+///   day `--limit` stops being refused is the day that grading stops being true.
 ///
 /// **Every entry has two spellings and the second one does not remember itself.** `-q`, `-t` and
 /// `-L` are the short forms of `--jq`, `--template` and `--limit`, and `-L` was added a review after
@@ -2055,7 +2084,7 @@ mod tests {
     fn prose_is_untrusted_and_structure_is_not() {
         for op in ReadOp::all() {
             let expected = match op.kind() {
-                "pr_view" | "issue_view" | "run_logs" | "pr_files" | "pr_comments"
+                "pr_view" | "issue_view" | "run_logs" | "pr_diff" | "pr_thread"
                 | "checks_for_ref" => ToolEffect::ReadsUntrusted,
                 _ => ToolEffect::ReadsOwn,
             };
@@ -2066,7 +2095,7 @@ mod tests {
     /// The three reads added for a stranger's words, each in the shape its grading claims.
     ///
     /// It asserts the argv as well as the effect, because the grading is a claim ABOUT the argv: a
-    /// `pr_files` that had quietly become `gh pr view` would still say `ReadsUntrusted` and would no
+    /// `pr_diff` that had quietly become `gh pr view` would still say `ReadsUntrusted` and would no
     /// longer be reading a diff. And it asserts the effect through `effect_of_kind`, which is the
     /// route `mcp_tools::effect_of_call` actually takes — the one that latches the turn.
     #[test]
@@ -2074,14 +2103,14 @@ mod tests {
         let number = PrNumber::new("42").expect("42 is a pull request number");
         let expected: [(ReadOp, Vec<&str>); 3] = [
             (
-                ReadOp::PrFiles {
+                ReadOp::PrDiff {
                     repo: repo(),
                     number: number.clone(),
                 },
                 vec!["pr", "diff", "--repo=owner/name", "--", "42"],
             ),
             (
-                ReadOp::PrComments {
+                ReadOp::PrThread {
                     repo: repo(),
                     number,
                 },
@@ -2109,7 +2138,10 @@ mod tests {
             assert!(!ActOp::all().iter().any(|act| act.kind() == op.kind()));
         }
 
-        // The near-miss, pinned in both directions rather than left to be discovered on a Friday.
+        // Reading the thread and posting to it are different operations on different sides of the
+        // partition, and each tool sends the other's kind to the right place rather than answering
+        // "unknown operation". This is what the names `pr_thread` and `pr_comment` are for; it was
+        // `pr_comments` and `pr_comment` for one commit, which is one letter to carry a boundary on.
         assert!(
             ReadOp::from_request(ReadRequest {
                 operation: "pr_comment".to_owned(),
@@ -2118,19 +2150,34 @@ mod tests {
             })
             .expect_err("pr_comment acts")
             .contains("github_act"),
-            "the acting singular is sent to the acting tool"
+            "posting a comment is sent to the acting tool"
         );
         assert!(
             ActOp::from_request(ActRequest {
-                operation: "pr_comments".to_owned(),
+                operation: "pr_thread".to_owned(),
                 repo: Some("owner/name".to_owned()),
                 id: Some("42".to_owned()),
                 ..ActRequest::default()
             })
-            .expect_err("pr_comments only reads")
+            .expect_err("pr_thread only reads")
             .contains("github_read"),
-            "the reading plural is sent to the reading tool"
+            "reading the thread is sent to the reading tool"
         );
+
+        // And the two withdrawn names are gone rather than aliased. An operation that answered to
+        // its old string would be the rename undone in the one place a caller can reach.
+        for withdrawn in ["pr_files", "pr_comments"] {
+            assert!(
+                ReadOp::from_request(ReadRequest {
+                    operation: withdrawn.to_owned(),
+                    repo: "owner/name".to_owned(),
+                    id: Some("42".to_owned()),
+                })
+                .expect_err("a withdrawn name is not an operation")
+                .contains("unknown read operation"),
+                "{withdrawn} may not still resolve"
+            );
+        }
     }
 
     /// None of the three is declarable, and that is the decision rather than an oversight.
