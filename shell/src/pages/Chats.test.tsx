@@ -1978,11 +1978,16 @@ describe("Chats - what it may do without asking", () => {
     expect(await screen.findByRole("button", { name: /^Permissions: Plan/ })).toBeTruthy();
   });
 
-  // The arrangement, and not the pixels: voice in one corner, send in the other, the rung beside
-  // send. It is asserted because it is invisible to every other test here -- move the microphone
-  // back down beside the send button and all 179 of them stay green while the box goes back to
-  // reading as one undifferentiated row of controls.
-  it("keeps voice out of the settings row and the rung next to send", async () => {
+  // The arrangement, and not the pixels: voice in the corner of the line being typed on, send in
+  // the other corner, the rung beside send. Asserted because it is invisible to every other test
+  // here -- move the microphone back down beside send and all 179 of them stay green while the box
+  // goes back to reading as one undifferentiated row of controls.
+  //
+  // The line membership is half the assertion and not decoration. The microphone had a row of its
+  // own for one commit, which put it in the right corner and cost every composer that row's height
+  // whether or not anybody ever talked; "not in the settings row" was true of that arrangement too.
+
+  it("keeps voice on the typing line and the rung next to send", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
         "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
@@ -1993,8 +1998,13 @@ describe("Chats - what it may do without asking", () => {
     const settings = container.querySelector(
       ".chats-composer-actions",
     ) as HTMLElement;
+    const line = container.querySelector(".chats-composer-line") as HTMLElement;
     const voice = await screen.findByRole("button", { name: /^Talk$/ });
     expect(settings.contains(voice)).toBe(false);
+    expect(line.contains(voice)).toBe(true);
+    expect(line.contains(screen.getByRole("textbox", { name: /message/i }))).toBe(
+      true,
+    );
 
     const rung = await screen.findByRole("button", { name: /^Permissions:/ });
     const send = screen.getByRole("button", { name: "Send" });
