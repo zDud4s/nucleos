@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/brand/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>dashboard-sidebar — lab</title>
+    <!-- The same nonce channel `index.html` carries; see src/lib/style-nonce.ts. -->
+    <style></style>
+  </head>
+
+  <!--
+    A fourth entry, alongside `index.html`, `preview.html` and `csp-gate.html`, built into
+    `dist-lab/` by `lab.vite.config.mjs` and never by the app's own build. `dist/` is embedded into
+    the Tauri binary by `tauri::generate_context!()` at compile time and must hold the app and
+    nothing else, and `vite build` takes only the inputs its config names — so a file the app's
+    config does not name cannot end up in the binary.
+
+    Nothing under `src/` imports anything in `src/lab/`, so none of this reaches the app's bundle
+    either, by the same rule `preview.html` states for `src/preview/`.
+
+    Two ways to open it:
+      npm run dev                    → http://localhost:1420/sidebar-lab.html
+      npx vite build --config lab.vite.config.mjs   → dist-lab/, which is what the class audit in
+                                                      src/lab/prompt-design.css was measured from.
+
+    This is scaffolding for deciding whether to adopt a component. If the answer is yes, the
+    component moves to `src/ui/vendor/` and `src/lab/` is deleted; if it is no, `src/lab/` is
+    deleted. Either way it does not survive the decision.
+  -->
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/lab/main.tsx"></script>
+  </body>
+</html>
