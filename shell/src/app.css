@@ -436,9 +436,9 @@
   min-height: 0;
   overflow-y: auto;
   /* Asking for `overflow-y` alone computes `overflow-x` to `auto`, which makes this a horizontal
-     scroll container with nothing in it to scroll — and a touchpad's sideways drift then drags the
-     whole rail and springs it back. See `html` in `base.css`. */
-  overscroll-behavior-x: none;
+     scroll container with nothing in it to scroll — and a touchpad's sideways drift used to drag
+     the whole rail and spring it back. Nothing to declare here any more: the `*` rule in
+     `base.css` now refuses that on both axes, for this region and the seventeen others. */
   padding: var(--space-3) var(--space-2);
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);

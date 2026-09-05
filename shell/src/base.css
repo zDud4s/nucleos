@@ -22,25 +22,41 @@
   margin: 0;
 }
 
+/**
+ * Nothing in this app moves because a hand kept pushing after it stopped.
+ *
+ * A touchpad reports one gesture on two axes, and a scroll up is never purely up: the sideways
+ * component is small, constant, and involuntary. The browser answered it with an elastic drag —
+ * the region slid, then sprang back on release — which is a web convention borrowed from a
+ * back-gesture this window does not have. Reading a conversation, it means the column shifts
+ * under the line you are on for as long as you keep scrolling.
+ *
+ * **The vertical axis was left alone at first**, on the argument that a bounce at the end of a
+ * list is how a scroll says it has reached the end. That was wrong in this window, and the owner
+ * reported it as what it looks like rather than as what it means: a gap opening above or below
+ * the content, which reads as layout that moved, not as feedback. A desktop pane that ends should
+ * simply stop.
+ *
+ * `none` and not `contain`: `contain` stops a gesture reaching an ANCESTOR and leaves the
+ * element's own bounce, which is the whole of what is complained about here. The price is that a
+ * gesture no longer chains either — a list that reaches its end stops instead of scrolling the
+ * page behind it. In a window whose panes are full-height and scroll independently, that is the
+ * behaviour of the two that surprises people less.
+ *
+ * On `*` and not on `html`, because `html` is not what scrolls: `.app-shell` is
+ * `height: 100vh; overflow: hidden` and the app has eighteen scrolling regions inside it, each an
+ * element that would bounce on its own. Zero specificity, so anything that needs to say otherwise
+ * still can — `body[data-scroll-locked]` at the end of this file does.
+ */
+* {
+  overscroll-behavior: none;
+}
+
 html {
-  /* The webview's own ground shows through during load and behind overscroll;
-     painting it here keeps a white flash out of a dark app. */
+  /* The webview's own ground shows through during load; painting it here keeps a
+     white flash out of a dark app. */
   background: var(--bg);
   -webkit-text-size-adjust: 100%;
-  /**
-   * Nothing in this app moves sideways because a hand did.
-   *
-   * A touchpad reports one gesture on two axes, and a scroll up is never purely up: the sideways
-   * component is small, constant, and involuntary. The browser answered it with an elastic drag —
-   * the page slid, then sprang back on release — which is a web convention borrowed from a
-   * back-gesture this window does not have. Reading a conversation, it means the column shifts
-   * under the line you are on for as long as you keep scrolling.
-   *
-   * `none` and not `contain`: `contain` only stops the gesture reaching an ANCESTOR, and the drag
-   * complained about was the element's own. It is the horizontal axis only — vertical overscroll
-   * is how a scroll says it has reached the end, and that is worth keeping.
-   */
-  overscroll-behavior-x: none;
   /* Reserved so that locking the page behind an overlay does not shift the
      layout sideways by the width of a scrollbar. See the scroll-lock block at
      the end of this file for why that compensation cannot come from the

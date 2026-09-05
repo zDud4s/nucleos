@@ -1,7 +1,8 @@
 import { Outlet } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
 import { untriagedCount, useMailQueue } from "../data/mail";
-import { useHealth, useProjects, useProposals } from "../data/system";
+import { POLL } from "../data/poll";
+import { useProjects, useProposals, useSystemHealth, wantsAttention } from "../data/system";
 import { unreadTotal } from "../lib/turns";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
@@ -33,7 +34,26 @@ export function AppShell() {
  * the log with failures nobody can act on.
  */
 function Frame() {
-  const health = useHealth();
+  /**
+   * Whether anything in the machine wants looking at, for the rail's one dot.
+   *
+   * This used to read `useHealth()` — the gate's own liveness check — and ask
+   * whether it was `false`. It could not be: `ConnectionGate` wraps this whole
+   * component and lets it render only when that query has answered `true`, so
+   * the expression was provably false on every frame the rail has ever drawn.
+   * The dot was machinery that could not fire, tested and all.
+   *
+   * The subsystem readout is the reading that CAN say something: it is the
+   * daemon's own aggregate over sqlite, the CLI binary, the credential manager,
+   * the worktree disk, five sidecars and the transcriber. Which of its four
+   * statuses counts as trouble is `wantsAttention`'s to say, in the file that
+   * owns the type, where a test holds it.
+   *
+   * Asked at the slow cadence, since the rail only needs to know whether to point
+   * at System — and the System page itself asks fast while somebody is reading
+   * it, off the same cache entry.
+   */
+  const health = useSystemHealth(POLL.slow);
   /**
    * `GET /proposals` is `list_pending` in the núcleo — the route serves the
    * queue, not the archive — so its length *is* the badge. Filtering by status
@@ -83,7 +103,7 @@ function Frame() {
           mode: project.mode,
           pending: project.open_proposals,
         }))}
-        systemAlert={health.data === false}
+        systemAlert={wantsAttention(health.data)}
       >
         {/*
           The connection line used to be here, and it was removed on 2026-09-05
