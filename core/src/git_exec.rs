@@ -170,6 +170,16 @@ impl CommandResult {
 /// once, which is survivable precisely because the tree-kill above now reaches the ssh. Forcing
 /// `BatchMode=yes` would fix that case and clobber any `core.sshCommand` the user configured, which
 /// is a trade for whoever has the failing key to make, not this module.
+/// The environment variable that says "the queue is doing this", read by `.githooks/`.
+///
+/// **A convention between two halves of this repository, and never a security boundary.** Anything
+/// that can run git can also set an environment variable, so this stops nobody who means to get
+/// past it. What it stops is the case that actually happened: a client performing a queue operation
+/// because nothing told it not to. The gate that governs an agent is
+/// `hooks::session_git_decision`; this is the second layer, and it exists because a client-side
+/// hook is only ever as good as the harness that loads it, while a git hook runs whatever ran git.
+pub const QUEUE_MARKER: &str = "NUCLEOS_QUEUE_EXEC";
+
 pub async fn run_git(
     repo: &Path,
     args: &[&OsStr],
@@ -181,6 +191,12 @@ pub async fn run_git(
         .arg(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Marks every git process the queue itself runs, so `.githooks/` can tell the queue's own
+        // merge from one made by hand. Set at the single place every git process in this crate goes
+        // through, for the reason the spawn counter below is: a marker the caller sets beside its own
+        // call is one a refactor moving that call leaves behind — and a queue operation the hook
+        // cannot recognise is a queue that refuses itself.
+        .env(QUEUE_MARKER, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
