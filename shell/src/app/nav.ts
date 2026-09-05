@@ -11,7 +11,37 @@
  * It is also the single list of routes: `router.tsx` builds one route per entry
  * here, so a page cannot be added to the app without appearing in the sidebar,
  * and cannot appear in the sidebar without being reachable.
+ *
+ * The one import is `lucide-react`, for the icon each row draws. A component
+ * reference is not a render — nothing here returns JSX, and the table tests
+ * still read this module without mounting anything — and putting the icon
+ * beside the label is what makes it impossible to add a page that arrives in
+ * the rail with no mark on it.
  */
+import {
+  Activity,
+  Bot,
+  Boxes,
+  Calendar,
+  Compass,
+  Contact,
+  Files,
+  FolderKanban,
+  Gauge,
+  Globe,
+  GraduationCap,
+  Hourglass,
+  LayoutDashboard,
+  ListChecks,
+  Mail,
+  MessagesSquare,
+  Mic,
+  Rss,
+  Scale,
+  SlidersHorizontal,
+  Users,
+  type LucideIcon,
+} from "lucide-react";
 
 /**
  * The groups of the rail, in reading order.
@@ -40,14 +70,23 @@ export interface NavItem {
   /** The route path. Exactly one route is built per item. */
   path: string;
   /**
-   * A two-letter monogram for the icon-collapsed rail.
+   * The mark beside the label, and the whole of the row when the rail is
+   * collapsed to icons.
    *
-   * Spelled out rather than derived from the label because four items start
-   * with C — Chats, Council, Contacts, Calendar — and a rail that shows the
-   * same letter four times is worse than no rail. Letters rather than an icon
-   * font: the CSP forbids remote assets, and glyphs read the same at any zoom.
+   * This replaced a two-letter monogram on 2026-09-05. The monogram was chosen
+   * against an *icon font*, and the argument was the CSP: remote assets are
+   * forbidden, so a font that arrives over the network cannot be used. Lucide
+   * is not that — it compiles to inline SVG in the bundle, fetches nothing, and
+   * scales at any zoom for the same reason letters did. The other half of the
+   * argument — four items start with C, so derived monograms collide — is not
+   * an argument for letters, it is an argument against *deriving*, and this
+   * field is spelled out one row at a time exactly as `glyph` was.
+   *
+   * Required, and typed as the component rather than as a name: a row that
+   * reaches the rail with nothing to draw is a compile error here rather than a
+   * blank column on screen.
    */
-  glyph: string;
+  icon: LucideIcon;
   badge?: NavBadge;
   /**
    * Why this item cannot do anything yet, when that is a fact about the
@@ -102,19 +141,19 @@ export const NAV: NavGroup[] = [
     id: "operate",
     label: "Operate",
     items: [
-      { id: "home", label: "Home", path: "/", glyph: "Ho" },
-      { id: "fleet", label: "Fleet", path: "/fleet", glyph: "Fl" },
-      { id: "autopilot", label: "Autopilot", path: "/autopilot", glyph: "Ap" },
-      { id: "waiting", label: "Waiting", path: "/waiting", glyph: "Wt", badge: "proposals" },
-      { id: "runs", label: "Runs", path: "/runs", glyph: "Ru" },
-      { id: "feed", label: "Feed", path: "/feed", glyph: "Fd" },
+      { id: "home", label: "Home", path: "/", icon: LayoutDashboard },
+      { id: "fleet", label: "Fleet", path: "/fleet", icon: Boxes },
+      { id: "autopilot", label: "Autopilot", path: "/autopilot", icon: Gauge },
+      { id: "waiting", label: "Waiting", path: "/waiting", icon: Hourglass, badge: "proposals" },
+      { id: "runs", label: "Runs", path: "/runs", icon: Activity },
+      { id: "feed", label: "Feed", path: "/feed", icon: Rss },
       /**
        * Under Operate and not under Work, although it is the closest thing the
        * app has to a document: what the agent has been told is a fact about the
        * machine's current behaviour, not a thing you and it are doing together.
        * It sits after Projects because a lesson is scoped to one.
        */
-      { id: "learned", label: "Learned", path: "/learned", glyph: "Ln" },
+      { id: "learned", label: "Learned", path: "/learned", icon: GraduationCap },
     ],
   },
   /**
@@ -144,31 +183,31 @@ export const NAV: NavGroup[] = [
   {
     id: "projects",
     label: "Projects",
-    items: [{ id: "projects", label: "All projects", path: "/projects", glyph: "Pj" }],
+    items: [{ id: "projects", label: "All projects", path: "/projects", icon: FolderKanban }],
     roster: true,
   },
   {
     id: "work",
     label: "Work",
     items: [
-      { id: "chats", label: "Chats", path: "/chats", glyph: "Ch", badge: "chats" },
-      { id: "errands", label: "Errands", path: "/errands", glyph: "Er" },
-      { id: "teams", label: "Teams", path: "/teams", glyph: "Tm" },
-      { id: "agents", label: "Agents", path: "/agents", glyph: "Ag" },
-      { id: "council", label: "Council", path: "/council", glyph: "Cn" },
+      { id: "chats", label: "Chats", path: "/chats", icon: MessagesSquare, badge: "chats" },
+      { id: "errands", label: "Errands", path: "/errands", icon: ListChecks },
+      { id: "teams", label: "Teams", path: "/teams", icon: Users },
+      { id: "agents", label: "Agents", path: "/agents", icon: Bot },
+      { id: "council", label: "Council", path: "/council", icon: Scale },
     ],
   },
   {
     id: "pillars",
     label: "Pillars",
     items: [
-      { id: "mail", label: "Mail", path: "/mail", glyph: "Ml", badge: "mail" },
-      { id: "contacts", label: "Contacts", path: "/contacts", glyph: "Ct" },
-      { id: "calendar", label: "Calendar", path: "/calendar", glyph: "Cl" },
-      { id: "voice", label: "Voice", path: "/voice", glyph: "Vo" },
-      { id: "web", label: "Web", path: "/web", glyph: "We" },
-      { id: "browser", label: "Browser", path: "/browser", glyph: "Br" },
-      { id: "files", label: "Files", path: "/files", glyph: "Fi" },
+      { id: "mail", label: "Mail", path: "/mail", icon: Mail, badge: "mail" },
+      { id: "contacts", label: "Contacts", path: "/contacts", icon: Contact },
+      { id: "calendar", label: "Calendar", path: "/calendar", icon: Calendar },
+      { id: "voice", label: "Voice", path: "/voice", icon: Mic },
+      { id: "web", label: "Web", path: "/web", icon: Globe },
+      { id: "browser", label: "Browser", path: "/browser", icon: Compass },
+      { id: "files", label: "Files", path: "/files", icon: Files },
     ],
   },
 ];
@@ -184,7 +223,7 @@ export const SYSTEM_ITEM: NavItem = {
   id: "system",
   label: "System",
   path: "/system",
-  glyph: "Sy",
+  icon: SlidersHorizontal,
 };
 
 /** Every item in the sidebar, groups flattened, System last. */

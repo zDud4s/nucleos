@@ -4,9 +4,7 @@ import { untriagedCount, useMailQueue } from "../data/mail";
 import { useHealth, useProjects, useProposals } from "../data/system";
 import { unreadTotal } from "../lib/turns";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
-import { BudgetLine } from "./BudgetLine";
 import { ConnectionGate } from "./ConnectionGate";
-import { ConnectionStatus } from "./ConnectionStatus";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
 import { Sidebar } from "./Sidebar";
@@ -87,16 +85,42 @@ function Frame() {
         }))}
         systemAlert={health.data === false}
       >
-        <ConnectionStatus />
-        <BudgetLine />
         {/*
-          Above the kill switch and never below it. The switch is the one control
-          that must be reachable without aiming, from every page, and inserting
-          anything under it would move it off the bottom edge people already know
-          — the drawer is somewhere you choose to go, which is a lower claim on
-          the footer than the emergency stop has.
+          The connection line used to be here, and it was removed on 2026-09-05
+          because it could only ever say one thing.
+
+          `ConnectionGate` wraps this whole component and `read()` returns
+          "through" only when `health.data === true`; every other reading —
+          connecting, unreachable, unauthorised — replaces the entire window with
+          a takeover. So by the time the rail is on screen the daemon is
+          answering by construction, and a status line inside it was a green dot
+          that had no second state to show. The two states worth seeing are shown
+          where they take over the screen, which is where somebody can act on
+          them.
+        */}
+        {/*
+          Two destinations, then the stop, and nothing else.
+
+          The budget line was the third thing here and came out on 2026-09-05 on
+          the owner's call. Unlike the connection line above it, it was not dead —
+          it said something true — it was just not worth a permanent row: the
+          figure is already on Home, Fleet, Autopilot, System and a project's
+          Estado mode, all of which are places somebody goes to think about
+          spending. A rail is for getting somewhere and for stopping the machine.
+
+          The drawer is above the kill switch and never below it. The switch is
+          the one control that must be reachable without aiming, from every page,
+          and inserting anything under it would move it off the bottom edge
+          people already know — the drawer is somewhere you choose to go, which
+          is a lower claim on the footer than the emergency stop has.
         */}
         <NotificationsDrawer />
+        {/*
+          The break this footer actually has. Everything above it is somewhere to
+          go or something to read; below it is the one control that stops the
+          machine, and it gets the width and the distance that says so.
+        */}
+        <hr className="nav-rule" />
         <KillSwitchControl />
       </Sidebar>
       <main className="app-main">

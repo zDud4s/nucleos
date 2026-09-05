@@ -71,38 +71,336 @@
 .nav {
   display: grid;
   grid-template-rows: auto 1fr auto;
+  /*
+    `minmax(0, 1fr)` and not the implicit `auto`, which is the difference between
+    a rail 56px wide and a rail 56px wide with 115px of content hanging out of it
+    over the page.
+
+    An `auto` track floors at the min-content of its widest item, and a grid item
+    is not allowed to shrink below that even when the container has a definite
+    width. The widest item is the footer: the kill switch's label does not wrap,
+    so `Kill switch` set the floor for the whole rail and the collapsed state
+    measured 115px against a declared 56. Every row, every group and the roster
+    drew across the page beside it.
+
+    Measured on 2026-09-05 by removing one footer child at a time: with the
+    brand hidden the track stayed at 115, without the kill switch it fell to 72,
+    without the footer to 56. So the floor was never the brand's — this predates
+    the switcher, and `minmax(0, …)` is what lets the track honour the width the
+    rail actually declares.
+  */
+  grid-template-columns: minmax(0, 1fr);
+  /* Named because the motion section needs the shut width too — it pins the
+     rail's three children to it so that nothing inside travels while the rail
+     itself is sliding between the two. */
+  --nav-shut: 3.5rem;
+  /**
+   * The line every mark in the rail stands on, and the reason the three below
+   * exist: the middle of the rail at its shut width, less the 1px border.
+   *
+   * It is ONE line in both states, which is the whole point. The rail used to
+   * left-align its marks when open and centre them when shut, and those are two
+   * different columns 3.5px apart — small enough to look like a rendering
+   * artefact and large enough to see, so opening the rail ended with every icon
+   * in it twitching sideways. Nothing about a change of width says the marks
+   * should move, so now they do not: the row pays whatever padding puts its mark
+   * on the line, and the line does not depend on how wide the rail currently is.
+   */
+  --nav-axis: calc((var(--nav-shut) - 1px) / 2);
+  /* What a row pads so its 16px mark lands on the axis, given the 8px the
+     scrolling region and the footer have already inset it. */
+  --nav-inset: calc(var(--nav-axis) - var(--space-2) - 0.5rem);
+  /* The same arithmetic for the 32px brand mark, which stands on the same line
+     as the 16px ones — a centre line is about centres, not about edges. */
+  --nav-mark-inset: calc(var(--nav-axis) - var(--space-2) - 1rem);
   width: 15rem;
   height: 100vh;
   border-right: 1px solid var(--border);
   background: var(--surface);
 }
 
-.nav-collapsed {
-  width: 3.5rem;
+/**
+ * The shut width, and why it is not `.nav-collapsed`.
+ *
+ * Two classes, because the rail's width and the rail's layout stop agreeing for
+ * 240ms every time somebody closes it. `nav-narrow` is the width and it changes
+ * the moment you click; `nav-collapsed` is the icons-only layout and, on the way
+ * in, it waits for the slide to finish (`Sidebar.tsx` puts it on at
+ * `transitionend`). That lag is the whole reason the close reads as a drawer
+ * shutting: the labels are still in the flow, each clipped by its own row, so
+ * they are covered as the rail narrows rather than switched off in front of you.
+ *
+ * Opening needs no lag — the layout comes back at once and the widening uncovers
+ * it — so the two classes are only ever out of step in one direction.
+ */
+.nav-narrow {
+  width: var(--nav-shut);
+}
+
+/**
+ * No mark in the rail may be squeezed, and `base.css` squeezes all of them.
+ *
+ * That stylesheet caps every image and svg in the app at `max-width: 100%`, which
+ * is right for content and wrong for a mark with a declared size: the cap is
+ * measured against whatever box the mark happens to sit in, and the rail spends
+ * 240ms making those boxes narrower. `flex: none` does not save them — it governs
+ * flex sizing, and `max-width` is applied after it.
+ *
+ * All three of these were found by measuring rather than by looking, and each was
+ * a different symptom of the same line:
+ *
+ *  - `.nav-switch-mark` was drawn at 23px instead of 32 once the rail was shut,
+ *    which also put it 2.25px off the axis, because a shrunken box does not sit
+ *    where its full-size self would.
+ *  - `.app-kill-icon` lost 1.5px to the button's asymmetric padding and landed
+ *    0.75px off.
+ *  - `.nav-icon` inside `All projects` — the one row that reserves 28px for a
+ *    chevron — was crushed to **exactly zero** at rail widths below about 80px.
+ *    It vanished for the length of the slide and came back when the icons-only
+ *    layout arrived, which read as that one icon blinking at the end of every
+ *    collapse.
+ *
+ * One rule rather than three, because it is one bug: a mark in this rail is
+ * whatever size it says it is.
+ */
+.nav-icon,
+.nav-switch-mark,
+.nav-collapse-icon,
+.nav-disclose-icon,
+.app-notify-glyph,
+.app-kill-icon {
+  max-width: none;
 }
 
 .nav-brand {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-2) var(--space-2);
+  /* The other row with a control at its trailing edge, and the same question to
+     answer about it — see `nav-row` under `.nav-disclose-icon`. */
+  container: nav-row / inline-size;
+}
+
+/* ----------------------------------------------------- nav: the switcher -- */
+
+/**
+ * The project switcher, where the wordmark used to be.
+ *
+ * `position: relative` is what the menu hangs off, and it is the reason this is
+ * a wrapper rather than the button alone: an absolutely positioned panel
+ * anchored to a flex child would follow the button's width, which shrinks as the
+ * name does.
+ */
+.nav-switch {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.nav-switch-button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  /* Left inset apart, and smaller than the rest: the mark is 32px against the
+     rows' 16px, so it needs less padding to put its centre on the same axis.
+     It stood 4.5px off the icon column open and on it shut, which made the
+     largest thing in the rail the most obvious thing to twitch. */
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--nav-mark-inset);
+  border: none;
+  border-radius: var(--radius-lg);
+  /* The name and the note are clipped by the closing rail rather than spilling
+     over the page while it narrows. Safe to clip here and not on `.nav-switch`,
+     which is what the menu hangs off — a panel clipped to the rail's width would
+     be a column of first letters. */
+  overflow: hidden;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.nav-switch-button:hover {
+  background: var(--surface-raised);
+}
+
+.nav-switch-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/*
+  The mark at the 32px the paste's monogram tile occupied, so swapping one for
+  the other moves nothing else on the row. No plate behind it and no radius: the
+  asset is a cyan light on transparency and carries its own glow, and a filled
+  square around it would read as a tile with a picture in it rather than as a
+  mark.
+*/
+.nav-switch-mark {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  /* The `max-width` cap that used to be undone here is now undone for every mark
+     in the rail at once — see the block under `.nav-narrow`, where the same line
+     turned out to be squeezing three different marks. */
+  object-fit: contain;
+}
+
+.nav-switch-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.nav-switch-name {
+  overflow: hidden;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: 1;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-switch-note {
+  overflow: hidden;
+  font-size: var(--text-xs);
+  line-height: 1;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-switch-chevron {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  margin-left: auto;
+  color: var(--text-faint);
+}
+
+.nav-switch-button:hover .nav-switch-chevron {
+  color: var(--text);
+}
+
+/* At icon width the name, the note and the chevron all go; the mark is the button. */
+.nav-collapsed .nav-switch-text,
+.nav-collapsed .nav-switch-chevron {
+  display: none;
+}
+
+/*
+  Nothing to declare at this width any more, and that is the fix rather than an
+  omission: this used to say `justify-content: center`, which centred the mark
+  against whatever the rail was currently wide — one column open, another shut,
+  and a swing between the two while it slid. The mark's own left inset puts it on
+  the axis, and an inset does not care how wide the rail is.
+
+  What has not changed is the height: the mark is 32px in both states and the box
+  around it 48px in both, so nothing below the brand row moves when the rail
+  changes width.
+*/
+
+/**
+ * The open list.
+ *
+ * Wider than the rail on purpose when the rail is collapsed — `min-width` beats
+ * `width: 100%` there — because a menu clipped to 56px would be a column of
+ * first letters, which is not a choice anybody can make.
+ */
+.nav-switch-menu {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  min-width: 12rem;
+  margin: 0;
+  padding: var(--space-1);
+  list-style: none;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+
+.nav-switch-item {
+  display: flex;
+  align-items: center;
   gap: var(--space-2);
-  padding: var(--space-4) var(--space-3);
+  padding: var(--space-2) var(--space-2);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav-switch-item:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.nav-switch-item:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* Where you already are. The same accent the rail's current row uses, so "here"
+   looks like one thing in both places rather than two. */
+.nav-switch-item[aria-current] {
+  background: var(--accent-quiet);
+  color: var(--accent);
+  font-weight: var(--weight-medium);
+}
+
+/* One fixed slot, whatever goes in it, so every label starts on the same x.
+   A ragged left edge is what makes a list of five read as two lists. */
+.nav-switch-lead {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+}
+
+.nav-switch-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+  The mark again, at the size a mode dot occupies. 16px and not 32: it stands in
+  for a 6px dot, and a tile that size would make the núcleo's row twice the
+  height of every project under it.
+*/
+.nav-switch-mini {
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+
+/* The núcleo is not a project, and the rule says where the list of them starts. */
+.nav-switch-brand {
+  padding-bottom: var(--space-1);
+  margin-bottom: var(--space-1);
   border-bottom: 1px solid var(--border);
 }
 
-.nav-wordmark {
-  font-family: var(--font-display);
-  font-size: var(--text-md);
-  font-weight: var(--weight-bold);
-  letter-spacing: var(--tracking-wide);
-  color: var(--accent);
-  white-space: nowrap;
-  overflow: hidden;
+.nav-switch-plus {
+  width: 0.875rem;
+  height: 0.875rem;
 }
 
-.nav-collapsed .nav-wordmark {
-  /* The mark goes, the toggle stays — a rail with no way back out is a trap. */
-  display: none;
+.nav-switch-new {
+  color: var(--text-faint);
 }
 
 .nav-collapse {
@@ -121,9 +419,15 @@
   color: var(--text);
 }
 
-.nav-collapsed .nav-brand {
-  justify-content: center;
+.nav-collapse-icon {
+  display: block;
+  width: 1rem;
+  height: 1rem;
 }
+
+/* One control, and no centring: the collapse arrow is not rendered at this width
+   — the mark itself is the way back out — so the switcher is the row's only
+   child and it already stands where the axis puts it. */
 
 /* The list, and the only part of the rail that scrolls. Faded at the cut like every
    other scrolling column — on a short window the rail ran out mid-destination, and a
@@ -138,6 +442,26 @@
   padding: var(--space-3) var(--space-2);
   mask-image: var(--scroll-fade);
   -webkit-mask-image: var(--scroll-fade);
+  /*
+    No scrollbar, and the fade above is what replaces it.
+
+    Worth being exact about, because hiding a scrollbar is how the pasted design
+    lost eight destinations: it hid the bar AND had nothing else to say there was
+    more list. Here the mask cuts the last row mid-height at the fold, which is
+    the oldest signal there is for "this continues" and the one this rail already
+    used. The region is still scrollable by wheel, by touch, by keyboard and by
+    the arrow keys the rail binds — only the furniture is gone.
+
+    It also buys back the width. A classic scrollbar is ~15px of the 40px inside
+    a collapsed rail, and it takes that from the right, which pushed every icon
+    five pixels left of the centre it was supposed to sit on. The two complaints
+    were one complaint.
+  */
+  scrollbar-width: none;
+}
+
+.nav-scroll::-webkit-scrollbar {
+  display: none;
 }
 
 .nav-group + .nav-group {
@@ -145,7 +469,9 @@
 }
 
 .nav-group-label {
-  padding: 0 var(--space-3) var(--space-2);
+  /* The same left inset the rows have, so the heading sits over its list rather
+     than beside it. */
+  padding: 0 var(--space-2) var(--space-1);
   font-family: var(--font-body);
   font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
@@ -154,15 +480,53 @@
   color: var(--text-faint);
 }
 
+/**
+ * At 56px the word goes and its box stays.
+ *
+ * The visually-hidden pattern this used to use took the heading out of the flow
+ * as well, which closed the gap between groups and moved every row under it — so
+ * collapsing the rail did not just narrow it, it re-laid it out. `text-indent`
+ * pushes the word off its own line instead: the heading keeps its height, the
+ * groups keep their rhythm, and it stays in the accessibility tree, where the
+ * groups still name themselves.
+ */
 .nav-collapsed .nav-group-label {
-  /* Kept in the accessibility tree — the groups still name themselves to a
-     screen reader — but there is no room for the word at 56px. */
-  position: absolute;
-  width: 1px;
-  height: 1px;
   overflow: hidden;
-  clip-path: inset(50%);
+  text-indent: -100vw;
   white-space: nowrap;
+}
+
+/**
+ * And the break the word used to make, drawn.
+ *
+ * Open, a group is announced by its heading; collapsed, that heading is a box
+ * with no ink in it and the only thing left saying "a group ended here" is 33px
+ * of nothing — a gap the eye reads as slack rather than as a boundary.
+ *
+ * The gap itself is not the problem and is deliberately not touched: it is the
+ * group's 16px margin plus the heading's own 17px, and closing either would move
+ * every row below it, so the rail would not merely narrow when it collapses — it
+ * would re-lay itself out, which is the one thing this whole state is built not
+ * to do. The mark is a `background-image` for the same reason: a border or a rule
+ * element would add a pixel of height, and a pixel is a pixel.
+ *
+ * 20px of hairline, centred on the same axis as every mark in the rail, at the
+ * group's top edge — which is where the margin ends, so it lands in the middle of
+ * the space rather than against the row above or below it. `.nav-rule` in the
+ * footer is the same hairline in the same token: the rail says "break" one way.
+ *
+ * Every group, the first one included. That was a `+` sibling rule at first, on
+ * the argument that nothing precedes the first group but the brand and a line
+ * under a logo is a header border rather than a separator — but the gap under
+ * the mark is the widest one in the collapsed rail, and leaving the only unmarked
+ * gap at the widest one made it read as the slack the marks were added to
+ * explain. Same distance, same mark, one rule.
+ */
+.nav-collapsed .nav-group {
+  background-image: linear-gradient(var(--border), var(--border));
+  background-repeat: no-repeat;
+  background-position: center top;
+  background-size: 1.25rem 1px;
 }
 
 .nav-list {
@@ -174,16 +538,168 @@
   list-style: none;
 }
 
-.nav-item {
+/**
+ * A row that owns a list under it: `All projects` and the roster.
+ *
+ * The `<li>` is the row AND the list; `.nav-rowhead` is the row alone, and it is
+ * the one the chevron is positioned against. That distinction is not pedantry —
+ * anchored to the `<li>`, `top: 50%` centred the chevron in row-plus-list and put
+ * it four rows down, on top of another project's badge.
+ *
+ * `position: relative` rather than a flex sibling, so the chevron sits over the
+ * row's own right edge: the whole row must stay clickable, because the word is a
+ * destination and the chevron is only the disclosure.
+ */
+.nav-rowhead {
+  position: relative;
+  /* A row with a control pinned to its trailing edge — see `nav-row` under
+     `.nav-disclose-icon`, which is where the width question is answered. */
+  container: nav-row / inline-size;
+}
+
+/* The room the chevron sits in, taken from the label rather than overlapping it —
+   and only while there is a chevron, which is a question of width. See the
+   container query under `.nav-disclose-icon`. */
+@container nav-row (min-width: 4.5rem) {
+  .nav-rowhead > .nav-item {
+    padding-right: 1.75rem;
+  }
+}
+
+.nav-disclose {
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.nav-disclose:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.nav-disclose-icon {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+/**
+ * Trailing controls, drawn only where they fit.
+ *
+ * Two rows in the rail carry a control at their trailing edge — `All projects`
+ * its chevron, the brand row its collapse arrow — and both are pinned rather than
+ * laid out, so neither gives way when the row runs out of width. Measured in a
+ * 39px row: the chevron lands at x=20 and the mark it covers is at x=19.5. For
+ * the whole of a collapse each of them sat on top of an icon and then vanished,
+ * which is what read as those two marks blinking.
+ *
+ * A width question answered by width, and not by the icons-only class: that class
+ * arrives at the END of the close and is gone at the START of the open, so either
+ * way there is a stretch where the rail is too narrow and the control would still
+ * be drawn. One named container — `nav-row`, "a row with something pinned to its
+ * end" — covers both rows, both directions, and the shut state.
+ *
+ * 4.5rem is where they would start to touch, with room to spare: the brand mark
+ * ends 43.5px from the rail's left edge and a trailing control is 24px against
+ * the row's right, so 59.5px of row is the collision point and 72px keeps clear
+ * of it. Late in the close, deliberately — a control that vanishes while there is
+ * still obvious room for it is its own kind of twitch.
+ *
+ * `display: none` and not a hidden box, so a control nobody can see is not in the
+ * tab order either.
+ */
+@container nav-row (max-width: 4.5rem) {
+  .nav-disclose,
+  .nav-collapse {
+    display: none;
+  }
+}
+
+/* One icon in two positions rather than two icons: the mark that means "there is
+   more under here" and the mark that means "and it is open" are the same mark,
+   turned. */
+.nav-disclose-open {
+  transform: rotate(90deg);
+}
+
+/**
+ * The disclosed list.
+ *
+ * No indent, and that is deliberate: the monogram column already says these rows
+ * are projects, and indenting them would move their marks off the one x every
+ * other row in the rail shares — which at icon width is the whole layout.
+ */
+.nav-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 1px 0 0;
+  list-style: none;
+}
+
+/**
+ * One destination.
+ *
+ * The metrics are the pasted design's — 7px of vertical padding, a 6px radius,
+ * a 10px gap to a 16px mark, 13px type — and they cost nothing to adopt because
+ * `tokens.css` already spells `--text-sm` as 13px and `--radius-md` as 6px. The
+ * one number written raw is the gap, which has no token: 10px sits between
+ * `--space-2` and `--space-3`, and rounding it either way visibly changes where
+ * every label in the rail begins.
+ *
+ * A row is ~32px rather than the ~36px it was, which is 26 rows × 4px of list
+ * given back — the reason the shorter row matters at all here.
+ */
+.nav-item {
+  display: flex;
+  /*
+    The anchor the collapsed badge is positioned against. Without it that badge's
+    `position: absolute` resolved against the viewport and the count dot landed
+    at the far right edge of the window — measured at x=1408 in a 1440px window,
+    a thousand pixels from the row it belonged to. Also predates this rewrite.
+  */
+  position: relative;
+  align-items: center;
+  gap: 10px;
+  /*
+    A row is 34px whether or not it has a word in it.
+
+    `min-height` and an explicit `line-height` together, and both are load
+    bearing: open, the row is the 20px line box plus 14px of padding; collapsed
+    the label is gone and the tallest thing left is a 16px icon, which would make
+    the row 30px and slide the whole list up by four pixels a row. Twenty-five
+    rows of that is a hundred pixels of travel under the pointer for a change
+    that was supposed to be about width.
+  */
+  min-height: 2.125rem;
+  /* The inset that puts this row's mark on the rail's axis — the same padding in
+     both states, which is what stops the marks moving sideways when the rail
+     changes width. See `--nav-axis`. */
+  padding: 7px var(--nav-inset);
+  line-height: 1.25rem;
   border-radius: var(--radius-md);
+  /* The "you are here" bar is a real element at the left edge (see nav: motion),
+     and this is what rounds its corners into the row's own. */
+  overflow: hidden;
   color: var(--text-muted);
   font-size: var(--text-sm);
   text-decoration: none;
   white-space: nowrap;
+  transition:
+    background-color var(--nav-quick) var(--nav-ease),
+    color var(--nav-quick) var(--nav-ease);
 }
 
 .nav-item:hover {
@@ -195,10 +711,12 @@
  * The page you are on. A left bar rather than a fill alone: the fill is easy to
  * lose against a hover, and the bar reads at the edge of vision as "you are
  * here" without competing with the state tones further down the rail.
+ *
+ * The bar itself is drawn in the motion section at the end of this file — it used
+ * to be `box-shadow: inset 2px 0 0`, and a shadow has no geometry to grow from.
  */
 .nav-item-active {
   background: var(--accent-quiet);
-  box-shadow: inset 2px 0 0 var(--accent);
   color: var(--text);
   font-weight: var(--weight-medium);
 }
@@ -215,9 +733,36 @@
   opacity: 0.5;
 }
 
+/**
+ * The mark, for every row that comes from the nav table.
+ *
+ * 16px and `stroke-width: 1.5` are the pasted design's, and the icons are
+ * lucide's, compiled into the bundle as inline SVG. That last part is what
+ * makes them allowed here at all: the CSP forbids remote assets, which is the
+ * argument that put two-letter monograms in this slot in the first place, and
+ * an icon that fetches nothing is not the thing that argument was against.
+ */
+.nav-icon {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  color: var(--text-faint);
+}
+
+.nav-item:hover .nav-icon {
+  color: var(--text);
+}
+
+/**
+ * The roster's exception, in the same box.
+ *
+ * A project has no icon of its own — its identity is its name — so it keeps the
+ * two letters, sized to land inside the 16px the icons occupy so that every
+ * label in the rail still starts on the same x.
+ */
 .nav-glyph {
   flex: none;
-  width: 1.5rem;
+  width: 1rem;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   letter-spacing: 0;
@@ -225,7 +770,8 @@
   color: var(--text-faint);
 }
 
-.nav-item-active .nav-glyph {
+.nav-item-active .nav-glyph,
+.nav-item-active .nav-icon {
   color: var(--accent);
 }
 
@@ -234,6 +780,44 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/**
+ * A row at icon width is the mark, centred, and two corner marks.
+ *
+ * With the label hidden the row still carried its gaps, its mode dot and its
+ * count inline, and 40px of content box could not hold them: a project's
+ * monogram was clipped to one letter with two dots crowding it. So the row
+ * centres on the mark alone and the two things that are not the mark move to
+ * opposite corners — the count top right, where it already went, and the mode
+ * top left.
+ */
+.nav-collapsed .nav-item {
+  /*
+    No centring and no padding change: the label and both corner marks leave the
+    flow at this width, so the mark is the only thing left in the row and the
+    row's own inset has already put it on the axis.
+    `gap` still has to go — the System dot does not leave the flow, and ten pixels
+    of it in a 16px content box would push the mark off the line.
+  */
+  gap: 0;
+}
+
+.nav-collapsed .nav-mode {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  margin: 0;
+}
+
+/*
+  Nothing here about the chevron or the room it takes any more: both are a
+  question of how wide the row is, not of which class the rail is wearing, and a
+  container query answers that in the middle of the slide as well as at the ends
+  of it. What is unchanged is the consequence for the list — it keeps whatever
+  state it was left in, because the collapsed rail is a shortcut for a rail you
+  already arranged, the same rule the switcher follows when it stops being a
+  switcher.
+*/
 
 .nav-collapsed .nav-label {
   /* Visually hidden, not removed: the link keeps its accessible name, and the
@@ -254,8 +838,12 @@
  * the badge and the page it sends you to agree.
  */
 .nav-badge {
+  display: flex;
   flex: none;
+  align-items: center;
+  justify-content: center;
   min-width: 1.25rem;
+  height: 1.25rem;
   padding: 0 var(--space-1);
   border-radius: var(--radius-pill);
   background: var(--tone-pending-bg);
@@ -268,7 +856,11 @@
 
 .nav-collapsed .nav-badge {
   /* At icon width there is no room beside the glyph, so the count becomes a
-     mark in the corner. The number is still in the accessible name. */
+     mark in the corner. The number is still in the accessible name. `block`
+     restates what the expanded rule turned into a flex box: `text-indent` is
+     what pushes the digits off screen, and it does not apply to a flex
+     container's items. */
+  display: block;
   position: absolute;
   right: var(--space-1);
   min-width: 0;
@@ -279,6 +871,16 @@
   height: 0.4rem;
   padding: 0;
   background: var(--tone-pending-fg);
+}
+
+/* The alert dot goes to the same corner the count goes to, and for the same
+   reason: in the flow it would sit beside the mark, and a 16px content box has
+   room for the mark and nothing else. No row carries both, so they cannot
+   collide over the corner. */
+.nav-collapsed .nav-dot {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
 }
 
 /* Something in System wants looking at. A dot, with a word behind it for
@@ -333,101 +935,23 @@
   border-top: 1px solid var(--border);
 }
 
-/* ------------------------------------------------------------ connection -- */
 
-.app-connection {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 0 var(--space-3);
-  font-size: var(--text-xs);
-  color: var(--text-muted);
+/**
+ * The stop's two sentences lose their words and keep their boxes.
+ *
+ * `display: none` and the visually-hidden pattern both take an element out of
+ * the flow, which moved the button up the screen as the rail narrowed. `width: 0`
+ * with the text indented off its own line keeps the line box — which is what the
+ * height is made of — and keeps the words in the accessibility tree, where they
+ * were already doing the real work. No magic numbers: the same text produces the
+ * same box, so the two states cannot drift apart when the type scale changes.
+ */
+.nav-collapsed .app-kill-state,
+.nav-collapsed .app-kill-unread {
+  width: 0;
+  overflow: hidden;
+  text-indent: -100vw;
   white-space: nowrap;
-  overflow: hidden;
-}
-
-.app-connection-dot {
-  flex: none;
-  width: 0.45rem;
-  height: 0.45rem;
-  border-radius: var(--radius-pill);
-  background: currentcolor;
-}
-
-/* Three readings, three colours — and three different words, which are what
-   actually carry the meaning. `checking` is not `down`. */
-.app-connection-up {
-  color: var(--tone-active-fg);
-}
-
-.app-connection-down {
-  color: var(--tone-danger-fg);
-}
-
-.app-connection-checking {
-  color: var(--text-faint);
-}
-
-.app-connection-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.nav-collapsed .app-connection-text {
-  display: none;
-}
-
-.nav-collapsed .app-connection {
-  justify-content: center;
-  padding: 0;
-}
-
-/* ---------------------------------------------------------------- budget -- */
-
-.app-budget {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-  padding: 0 var(--space-3);
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-}
-
-.app-budget-figure {
-  font-family: var(--font-mono);
-  letter-spacing: 0;
-  color: var(--text);
-}
-
-.app-budget-scope {
-  color: var(--text-faint);
-}
-
-/* Nothing has been read yet, which is not the same as nothing has been spent. */
-.app-budget-unread .app-budget-figure {
-  color: var(--text-faint);
-}
-
-/* A ceiling is holding work. Warm, not alarming — a rule fired, nothing broke. */
-.app-budget-paused .app-budget-figure {
-  color: var(--tone-paused-fg);
-}
-
-.app-budget-reason {
-  flex-basis: 100%;
-  color: var(--tone-paused-fg);
-}
-
-.nav-collapsed .app-budget-scope,
-.nav-collapsed .app-budget-reason {
-  display: none;
-}
-
-.nav-collapsed .app-budget {
-  justify-content: center;
-  padding: 0;
-  font-size: 0.6rem;
 }
 
 /* ----------------------------------------------------------------- kill -- */
@@ -436,7 +960,10 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: 0 var(--space-2);
+  /* No inset of its own. It used to hold the stop 8px in from the rows above it,
+     which made the one control that must be hit without aiming the narrowest
+     thing in the rail — and gave it a left edge that agreed with nothing. */
+  padding: 0;
 }
 
 /* The button is the width of the rail: this is the control you must be able to
@@ -459,9 +986,55 @@
   color: var(--text-faint);
 }
 
-.nav-collapsed .app-kill-state,
-.nav-collapsed .app-kill-unread {
-  display: none;
+/**
+ * The stop, shaped like the rows it sits under.
+ *
+ * **One line, always, and clipped rather than reflowed.** `Kill switch` does not
+ * fit in 56px: left to wrap it became `Kil / swit` on two lines, the button grew
+ * taller, and — because the footer is a column — everything above it moved. That
+ * is bad enough at rest and worse in motion, since the rail passes through every
+ * width between the two on its way to being shut. `nowrap` and `overflow: hidden`
+ * make the words behave like every label above them: covered by the closing rail
+ * rather than re-laid out by it.
+ *
+ * **Content to the left, not centred**, and the padding is what puts the mark on
+ * `--nav-axis` — one pixel less than a row pays, because a row has no border and
+ * this has one. Centred, the mark drifted with the button's width and, once the
+ * words were clipped, was itself clipped: centred overflow spills equally at both
+ * ends, so the first thing to go would have been the mark. Left-aligned it stands
+ * on the same line as System and the drawer, and the footer reads as one column.
+ *
+ * `font-size: 0` once the rail is shut, and not `display: none` on the words:
+ * they are the button's accessible name, and the `title` beside them — "Stop
+ * everything autonomous, now" — is what the pointer gets. The mark survives it by
+ * being sized in `rem` rather than in `em`.
+ *
+ * The `min-height` is declared for BOTH states rather than only the shut one, and
+ * that is the point: a height derived from a font metric was 31.07px open and
+ * whatever `font-size: 0` left behind closed. Two round pixels of deliberate
+ * height beat two accidental ones that happen to agree today.
+ */
+.app-kill .ui-button {
+  justify-content: flex-start;
+  min-height: 2.125rem;
+  padding-inline: calc(var(--nav-inset) - 1px) var(--space-3);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* The same 16px line the rail's destinations are drawn in, so the stop is the
+   last mark in the column rather than a different kind of thing. */
+.app-kill-icon {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+}
+
+/* The words go and nothing else changes: the mark is the first item in a
+   left-aligned row, so a zero-width label after it moves nothing. The gap can
+   stay for the same reason — it is trailing space, not space in front. */
+.nav-collapsed .app-kill .ui-button {
+  font-size: 0;
 }
 
 /* --------------------------------------------------- notifications drawer -- */
@@ -474,13 +1047,21 @@
  * design system's button is for *doing* something, and opening a panel to read
  * is not an action on the machine.
  */
+/* Shaped like a `nav-item`, and now measured like one too: the same 10px gap and
+   the same 7px/8px padding, so the mark, the word and the count sit on exactly
+   the columns every destination above them uses. */
 .app-notify {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: 10px;
   width: 100%;
-  padding: var(--space-2) var(--space-3);
+  min-height: 2.125rem;
+  padding: 7px var(--nav-inset);
   border: none;
+  /* Its word and its count are clipped by the closing rail, exactly as a row's
+     label is — without this they would spill out over the page while the rail
+     narrowed past the width they need. */
+  overflow: hidden;
   border-radius: var(--radius-md);
   background: none;
   color: var(--text-muted);
@@ -496,13 +1077,12 @@
   color: var(--text);
 }
 
+/* The same 16px box `.nav-icon` occupies, so this row's mark lines up with every
+   destination above it rather than sitting on its own inset. */
 .app-notify-glyph {
   flex: none;
-  width: 1.5rem;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: 0;
-  text-align: center;
+  width: 1rem;
+  height: 1rem;
   color: var(--text-faint);
 }
 
@@ -513,19 +1093,52 @@
 }
 
 .nav-collapsed .app-notify-label {
-  /* Visually hidden, not removed: the control keeps its accessible name, which
-     is where the count lives anyway. */
-  position: absolute;
-  width: 1px;
-  height: 1px;
+  /* Clipped rather than lifted out of the flow: the control keeps its accessible
+     name, which is where the count lives anyway, AND its line box, which is what
+     stops the row from changing height with the rail's width. */
+  width: 0;
   overflow: hidden;
-  clip-path: inset(50%);
+  text-indent: -100vw;
   white-space: nowrap;
+  /*
+    `flex: none` is the line that actually centres the bell, and `width: 0` alone
+    was not enough: the base rule is `flex: 1 1 auto`, so the label grew back into
+    every pixel the bell left over — measured at 23px inside a 40px row, which put
+    the bell twelve pixels left of the centre line every other mark sits on. A
+    zero-width box that grows is not a zero-width box.
+  */
+  flex: none;
 }
 
 .nav-collapsed .app-notify {
-  justify-content: center;
-  padding: var(--space-2) 0;
+  position: relative;
+  /* No gap, for the reason the rows above have none: the label beside the bell
+     is zero wide here, so ten pixels of gap is ten pixels of nothing between the
+     bell and the axis its inset put it on. */
+  gap: 0;
+}
+
+/**
+ * The count becomes a corner mark, exactly as the nav badge does one row up.
+ *
+ * Left in the flow it was a 20px pill sharing 40px with the bell, so "centred"
+ * put the pair in the middle and the bell itself off to the left of every icon
+ * above it — the one mark in the rail that did not sit on the centre line. Out
+ * of the flow, the bell is alone in the row and lands where the others land, and
+ * the number is still in the control's accessible name, which is where it was
+ * always doing the work.
+ */
+.nav-collapsed .app-notify-count {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  min-width: 0;
+  width: 0.4rem;
+  height: 0.4rem;
+  padding: 0;
+  overflow: hidden;
+  text-indent: -100vw;
+  background: var(--tone-pending-fg);
 }
 
 /**
@@ -675,6 +1288,254 @@
   color: var(--text);
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
+}
+
+/* ---------------------------------------------------------- nav: motion -- */
+
+/**
+ * Every moving thing in the rail, in one block, and the argument for each.
+ *
+ * Kept together rather than scattered through the sections above because motion
+ * is a budget, not a property: the question is never "should this transition"
+ * but "is this one of the few things in the rail allowed to move", and that is
+ * only answerable with the whole list in front of you. The rest of the app has
+ * no animation at all — four transitions in twenty-five stylesheets — and this
+ * rail is deliberately not the place that changes.
+ *
+ * `.impeccable.md` calls the product's manner "silêncio operacional": quiet when
+ * everything is fine, loud only in proportion to what is wrong. So nothing here
+ * loops, nothing pulses for attention, nothing announces itself. Motion is spent
+ * on exactly three jobs:
+ *
+ *   1. **Something appeared.** A menu, a list of projects, a summons. Things
+ *      that pop into existence read as a redraw; things that arrive read as an
+ *      answer to what you just did.
+ *   2. **Something turned.** A chevron that rotates says the state changed and
+ *      which way, in the one control whose whole job is that state.
+ *   3. **Something is under the pointer.** Colour, on the existing 140ms.
+ *
+ *   4. **The rail itself changing width.** One slide, and nothing else moving
+ *      with it — see `.nav { transition: width }` below for what was tried and
+ *      thrown away.
+ *
+ * Durations are the three the rail needs and no more — 140ms for feedback, 220ms
+ * for something that arrives, 240ms for the slide — on one easing curve. `ease-out-quart` decelerates
+ * the way a thrown object does; no bounce and no elastic anywhere, which in a
+ * console read for eight hours would be a joke told twice.
+ *
+ * `prefers-reduced-motion` is already answered for the whole app in `base.css`,
+ * where a `*` rule cuts every duration to 0.01ms, pseudo-elements included. So
+ * every keyframe below is off for anyone who asked for that, and duplicating the
+ * media query here would only create a second place to forget.
+ */
+.nav {
+  --nav-ease: cubic-bezier(0.25, 1, 0.5, 1);
+  --nav-quick: 140ms;
+  --nav-settle: 220ms;
+  --nav-slide: 240ms;
+}
+
+/**
+ * The rail sliding between its two widths — the only thing that moves, and the
+ * whole of what the gesture is.
+ *
+ * The width is a layout property and animating one is normally a mistake. This is
+ * the app's own split, one axis, once, at a click: `.app-shell` is `auto 1fr`, so
+ * the page beside it follows continuously instead of jumping, and the alternative
+ * is the rail's largest gesture happening in a single frame.
+ *
+ * **Nothing fades, and nothing crosses the rail.** Both were tried and both were
+ * wrong, in ways worth recording because they are the obvious things to reach for:
+ *
+ *  - A fade over the change — the contents dipping to 45% and back — reads as the
+ *    rail *blinking*. There is no missing information to cover up, so the dip is
+ *    pure flicker on a surface somebody looks at all day.
+ *  - Interpolating the width while the icons-only layout was already applied sent
+ *    every mark on a trip: the rules that make that layout used to centre each
+ *    mark against the container, so a rail frozen at 150px put the first icon at
+ *    **x=74**, against 27.5 at either end. The marks now stand on `--nav-axis` in
+ *    both states and centre against nothing, which is what makes a plain slide
+ *    correct — and is also why the same 3.5px no longer twitches at the end of it.
+ *
+ * What is left is a rail that gets narrower, with its contents where they already
+ * were. The labels are covered rather than switched off, because the icons-only
+ * layout arrives only once the slide has finished — see `.nav-narrow`.
+ *
+ * The slide does not run on mount: a transition needs a change, and the width the
+ * rail is born at is not one.
+ */
+.nav {
+  transition: width var(--nav-slide) var(--nav-ease);
+}
+
+/* A panel that arrives from under the button that opened it. 4px, because the
+   distance is a hint about where it came from and not a journey. */
+@keyframes nav-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+.nav-switch-menu {
+  animation: nav-menu-in var(--nav-quick) var(--nav-ease);
+}
+
+/**
+ * The roster, unfolding.
+ *
+ * The one place in the rail that gets a stagger, and it earns it: this is a list
+ * somebody just asked to see, it is short, and the 30ms cascade is what makes it
+ * read as one list opening rather than four rows appearing at once. Capped at the
+ * fifth row — a fleet of fifteen projects must not spend half a second unrolling,
+ * and past the fifth the delay stops growing.
+ *
+ * `backwards` is load-bearing: without it a row with a delay is drawn at full
+ * opacity until its turn comes, which is the flash the animation exists to avoid.
+ *
+ * Only on the way in. The rows leave by leaving the DOM — the rail's arrow walk
+ * reads the document, so a closed list may not linger in it — and an exit is
+ * meant to be faster than its entrance anyway. Zero is the limit of faster.
+ */
+@keyframes nav-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+
+.nav-sub > li {
+  animation: nav-row-in var(--nav-quick) var(--nav-ease) backwards;
+}
+
+.nav-sub > li:nth-child(2) {
+  animation-delay: 30ms;
+}
+
+.nav-sub > li:nth-child(3) {
+  animation-delay: 60ms;
+}
+
+.nav-sub > li:nth-child(4) {
+  animation-delay: 90ms;
+}
+
+.nav-sub > li:nth-child(n + 5) {
+  animation-delay: 120ms;
+}
+
+/* Both chevrons turn rather than swap. The switcher's points down and flips to
+   face the panel it opened; the roster's lies on its side and stands up. Same
+   curve, same 140ms, because they mean the same thing in two places. */
+.nav-switch-chevron,
+.nav-disclose-icon {
+  transition: transform var(--nav-quick) var(--nav-ease);
+}
+
+.nav-switch-button[aria-expanded="true"] .nav-switch-chevron {
+  transform: rotate(180deg);
+}
+
+/**
+ * "You are here", drawn rather than cast.
+ *
+ * This was `box-shadow: inset 2px 0 0`, which cannot be animated: a shadow has
+ * no geometry to scale. The bar is now a real 2px element in the same place,
+ * clipped by the row's own radius — visually the line that was already there —
+ * and it grows from its middle when the row becomes current.
+ *
+ * Why it is worth animating at all: the rail's answer to "where am I" moves from
+ * one row to another on every navigation, and a mark that simply teleports makes
+ * the reader find it again. One that grows into place is caught by the eye
+ * without being looked for.
+ */
+@keyframes nav-here {
+  from {
+    opacity: 0;
+    transform: scaleY(0.3);
+  }
+}
+
+.nav-item-active::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: var(--accent);
+  animation: nav-here var(--nav-settle) var(--nav-ease);
+}
+
+/**
+ * A summons arriving.
+ *
+ * The count is not animated — a number that changes from 3 to 4 has not arrived,
+ * it has grown — but the badge's first appearance is, because that is the moment
+ * something started waiting for you. The element only mounts when the count goes
+ * from nothing to something, so this plays exactly once per summons and never on
+ * a poll tick.
+ */
+@keyframes nav-badge-in {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+}
+
+.nav-badge,
+.nav-dot {
+  animation: nav-badge-in var(--nav-settle) var(--nav-ease);
+}
+
+/**
+ * The same mark taking its corner, and the reason this keyframe is a copy.
+ *
+ * A count cannot travel from the end of a row to the corner of it — it is a pill
+ * with a number in one state and a 6px dot in the other, and there is no
+ * interpolation between those. What it did instead was pop: for the length of the
+ * slide it is clipped by a row too narrow to hold it, so it is not on screen at
+ * all, and then the icons-only layout put it in the corner in a single frame.
+ *
+ * So it arrives rather than appears, on the same fade and scale a new summons
+ * gets. The keyframes are duplicated because the NAME is the mechanism: an
+ * animation restarts when the animation property changes, and reusing
+ * `nav-badge-in` here would change nothing and play nothing.
+ *
+ * Opening restarts it too, in the other direction, and that is harmless — the
+ * mark spends those frames clipped by a row that is still narrow, so the fade is
+ * over by the time there is room to see it.
+ */
+@keyframes nav-corner-in {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+}
+
+.nav-collapsed .nav-badge,
+.nav-collapsed .nav-dot,
+.nav-collapsed .app-notify-count {
+  animation: nav-corner-in var(--nav-settle) var(--nav-ease);
+}
+
+/* Collapsed, the mark IS the button, and nothing else in the rail says so. A
+   sixth of a scale under the pointer is the whole tooltip. */
+.nav-switch-mark {
+  transition: transform var(--nav-quick) var(--nav-ease);
+}
+
+.nav-collapsed .nav-switch-button:hover .nav-switch-mark {
+  transform: scale(1.06);
+}
+
+/* The rest is the pointer, on the rail's own timing: the marks that take colour
+   on hover, and the two controls that take a surface. */
+.nav-icon,
+.nav-glyph,
+.nav-switch-item,
+.nav-disclose {
+  transition:
+    background-color var(--nav-quick) var(--nav-ease),
+    color var(--nav-quick) var(--nav-ease);
 }
 
 /* -------------------------------------------------------------- takeover -- */

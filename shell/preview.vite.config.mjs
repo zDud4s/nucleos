@@ -25,6 +25,14 @@ export default defineConfig(async (env) => {
         // The one `invoke` on the read path. Aliased rather than patched: it is
         // a named import resolved at build time, so there is no global to reach.
         "@tauri-apps/api/core": fileURLToPath(new URL("./src/preview/tauri.ts", import.meta.url)),
+        // And the events beside it. Three pages call `listen()` from an effect —
+        // Voice, Files, and the chat conversation — and outside Tauri that
+        // throws inside a passive effect, which React's boundary turns into
+        // "Something went wrong!" over the whole window. Both halves of the
+        // bridge have to be stubbed or the preview photographs an apology.
+        "@tauri-apps/api/event": fileURLToPath(
+          new URL("./src/preview/tauri-event.ts", import.meta.url),
+        ),
       },
     },
     build: {

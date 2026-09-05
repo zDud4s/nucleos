@@ -1,3 +1,4 @@
+import { OctagonX, Play } from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import { useKillSwitch, useSetKillSwitch } from "../data/system";
 import { Button, ConfirmButton, ErrorNote, RefusalNote } from "../ui";
@@ -36,9 +37,31 @@ export function KillSwitchControl() {
           <p className="app-kill-state" role="status">
             kill switch engaged — nothing autonomous starts
           </p>
+          {/*
+            A drawn mark rather than `intent="go"`, and the swap is the whole of
+            the fix: `intent` renders its direction as a text glyph — `▸` and `■`
+            from `ui.css` — which is right in the middle of a page and wrong here,
+            because at 56px the glyph IS the button and a Unicode square on a red
+            slab reads as a font that failed to load. `label` takes a `ReactNode`,
+            so the rail can hand its own mark in without the design system
+            growing a variant for one control.
+
+            The variant stays `danger`: releasing the stop is still the dangerous
+            half, and the mark says which way it points, not how much it costs.
+          */}
           <ConfirmButton
-            label="Release kill switch"
-            confirmLabel="Really release — work resumes"
+            label={
+              <>
+                <Play className="app-kill-icon" strokeWidth={1.5} aria-hidden="true" />
+                Release kill switch
+              </>
+            }
+            confirmLabel={
+              <>
+                <Play className="app-kill-icon" strokeWidth={1.5} aria-hidden="true" />
+                Really release — work resumes
+              </>
+            }
             variant="danger"
             onConfirm={() => set.mutate(false)}
             disabled={set.isPending}
@@ -47,11 +70,17 @@ export function KillSwitchControl() {
       ) : (
         <Button
           variant="danger-solid"
-          intent="stop"
           onClick={() => set.mutate(true)}
           disabled={set.isPending}
           title="Stop everything autonomous, now"
         >
+          {/*
+            The octagon is the one mark nobody has to be taught, and it is the
+            same 16px lucide line the rest of the rail is drawn in — so collapsed,
+            where the words are sized away, the stop still belongs to the column
+            of marks above it instead of sitting in it as a foreign glyph.
+          */}
+          <OctagonX className="app-kill-icon" strokeWidth={1.5} aria-hidden="true" />
           Kill switch
         </Button>
       )}
