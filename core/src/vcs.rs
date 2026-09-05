@@ -968,6 +968,118 @@ pub fn branch_delete_from_command(command: &str) -> Option<Op> {
     })
 }
 
+/// Global git flags that swallow the token after them, so a verb scan does not read their VALUE as
+/// the subcommand. `ask_daemon.py` has carried this list since it was written; the daemon did not,
+/// and the asymmetry was a hole rather than a tidiness problem — `git -C <path> merge <branch>` put
+/// `<path>` where the verb scan looks, matched no arm, and was ALLOWED by a function whose whole
+/// job is to refuse that merge.
+const GIT_FLAGS_WITH_VALUES: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+];
+
+/// `git merge` spellings that write nothing another session can see, and so stay this route's
+/// business to leave alone.
+///
+/// `--squash` stages instead of merging and `--no-commit` stops before the ref moves; `--abort`,
+/// `--continue` and `--quit` operate on a merge already in progress, which is state local to the
+/// caller's own worktree. `--ff-only` is the one that moves a shared ref and is listed anyway,
+/// because leaving it passing was a decision taken deliberately and recorded — it is the spelling
+/// that refuses rather than destroys when it cannot fast-forward. Revisiting it is a separate
+/// question from closing the default, and folding the two would hide the second inside the first.
+const MERGE_CALLER_LOCAL: &[&str] = &[
+    "--squash",
+    "--no-commit",
+    "--abort",
+    "--continue",
+    "--quit",
+    "--ff-only",
+];
+
+/// `git rebase` spellings that only touch a rebase already in progress, or only read it.
+const REBASE_CALLER_LOCAL: &[&str] = &[
+    "--abort",
+    "--skip",
+    "--quit",
+    "--continue",
+    "--edit-todo",
+    "--show-current-patch",
+];
+
+/// `git tag` flags that create or destroy a ref under `refs/tags/`.
+const TAG_WRITE_FLAGS: &[&str] = &[
+    "-a",
+    "-s",
+    "-d",
+    "-f",
+    "-m",
+    "-F",
+    "-u",
+    "--annotate",
+    "--sign",
+    "--delete",
+    "--force",
+    "--message",
+    "--file",
+    "--local-user",
+];
+
+/// `git tag` flags that only ever list. `git tag` with none of either is the listing too.
+const TAG_LIST_FLAGS: &[&str] = &[
+    "-l",
+    "-n",
+    "-i",
+    "--list",
+    "--contains",
+    "--no-contains",
+    "--points-at",
+    "--merged",
+    "--no-merged",
+    "--sort",
+    "--format",
+    "--column",
+    "--ignore-case",
+];
+
+/// PURE: whether any of `flags` appears in `tokens`, as a whole token or as `--flag=value`.
+///
+/// Exact token equality rather than a prefix test, and case-sensitive, for the reason
+/// `branch_delete_from_command` spells out: the flags that decide these questions differ from their
+/// dangerous twins by case alone (`-d` and `-D`) or by a suffix. The `--flag=value` arm is there
+/// because `--sort=x` and `--message=x` are the same flags written the other way, and a reader that
+/// saw only the spaced form would call a tag creation a listing.
+fn carries(tokens: &[&str], flags: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        flags.iter().any(|flag| {
+            *token == *flag
+                || (flag.starts_with("--")
+                    && token.starts_with(flag)
+                    && token.as_bytes().get(flag.len()) == Some(&b'='))
+        })
+    })
+}
+
+/// PURE: whether a `git tag` spelling the parser declined would still write a ref.
+///
+/// The listing spellings were never this queue's business and must keep working — bare `git tag`,
+/// and every `-l`/`--list` form. What is left names a tag to create or delete, and `refs/tags/` is
+/// fetched by every other session.
+fn tag_command_writes(args: &[&str]) -> bool {
+    if carries(args, TAG_WRITE_FLAGS) {
+        return true;
+    }
+    if carries(args, TAG_LIST_FLAGS) {
+        return false;
+    }
+    // A name with no flag is the lightweight tag `tag_from_command` declined on shape alone
+    // (`git tag v1 <sha>`, whose `at` must be a branch). No name at all is the listing.
+    args.iter().any(|token| !token.starts_with('-'))
+}
+
 /// PURE: why a command the parsers declined must still not be run by hand, or `None`.
 ///
 /// **"Declined by the queue" and "fine to run directly" are not the same sentence, and treating
@@ -1010,13 +1122,27 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
     if program != "git" && program != "git.exe" {
         return None;
     }
-    let verb = tokens
-        .get(1..)?
-        .iter()
-        .find(|candidate| !candidate.starts_with('-'))
-        .map(|candidate| candidate.to_ascii_lowercase());
+    // Skipping the VALUE of a global flag, not merely the flag. `find(|t| !t.starts_with('-'))`
+    // reads `git -C <path> merge <branch>` as the verb `<path>`, which matches no arm below and
+    // was therefore allowed — the same fail-open this function exists to close, one token earlier.
+    let mut rest = 1;
+    let verb = loop {
+        let candidate = tokens.get(rest)?;
+        if GIT_FLAGS_WITH_VALUES.contains(candidate) {
+            rest += 2;
+            continue;
+        }
+        if candidate.starts_with('-') {
+            rest += 1;
+            continue;
+        }
+        break candidate.to_ascii_lowercase();
+    };
+    // Everything after the verb. Anchored here rather than at a fixed index so the flag checks
+    // below read `git -C <path> merge --squash` the same way they read `git merge --squash`.
+    let args = tokens.get(rest + 1..).unwrap_or(&[]);
 
-    match verb.as_deref()? {
+    match verb.as_str() {
         "push" => Some(
             // The pointer to `--land` lives here because this is where a finishing agent arrives.
             // "Deliver this work" and "push it somewhere" are the same thought to most callers, and
@@ -1037,10 +1163,63 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
         // `-D` only. `-d` reached a parser and never arrives here, and the difference is the whole
         // reason deletion is offerable at all: `-d` asks git to refuse when the branch holds commits
         // nothing else reaches, and `-D` asks git to stop answering that.
-        "branch" if tokens.contains(&"-D") => Some(
+        // `-d -f` and `--delete --force` are `-D` written the long way, and git treats them as the
+        // same request. Listing only the short spelling refused the careless form and admitted the
+        // deliberate one.
+        "branch"
+            if args.contains(&"-D")
+                || (carries(args, &["-d", "--delete"]) && carries(args, &["-f", "--force"])) =>
+        {
+            Some(
             "`-D` deletes a branch whose commits may be reachable from nowhere else, and it is the \
              spelling that asks git not to check. The queue performs `git branch -d <branch>`, where \
              git's own refusal is the safety."
+                .to_owned(),
+            )
+        }
+        // **What the queue's parsers could not read is refused by default from here down.**
+        //
+        // The opposite default is what let this route's worst case through, and it was measured
+        // after the fact rather than imagined: `merge_from_command` reads three exact token shapes,
+        // the merge a person actually writes carries `-m "..."`, and a shape no parser recognised
+        // left this function as `None` and was ALLOWED. An editor session ran
+        // `git merge --no-ff <branch> -m "..."`; the hook fired, the daemon was asked, and the
+        // daemon said yes. Nothing was broken — the guard answered the question it was asked, and
+        // the question had a hole in it.
+        //
+        // So the arms below invert it for the four remaining queue verbs: the listed spellings are
+        // the exceptions, and anything unlisted is refused. A spelling nobody anticipated now fails
+        // closed, which is the direction this route already argues for everywhere else.
+        "merge" if !carries(args, MERGE_CALLER_LOCAL) => Some(
+            "a merge moves the branch you are standing on, and other sessions hold it — but this \
+             spelling is not one the queue can perform. It queues `git merge <branch>` and `git \
+             merge --no-ff <branch>`, and nothing carrying a message: the queue writes its own \
+             (`merge <source> into <target>`), so accepting `-m` would drop yours in silence and \
+             still report success. To deliver this branch, `nucleos-core --land` asks the queue to \
+             merge it into the branch the project is on, in order."
+                .to_owned(),
+        ),
+        "rebase" if !carries(args, REBASE_CALLER_LOCAL) => Some(
+            "a rebase rewrites the branch you are standing on, which other sessions may already \
+             hold, and the queue performs `git rebase <onto>` only. `-i` wants an editor nobody is \
+             sitting at, `--onto` names a third ref the queue's two-field row cannot hold, and \
+             bare `git rebase` replays onto an upstream configured in a repository the daemon does \
+             not control."
+                .to_owned(),
+        ),
+        "fetch" if !carries(args, &["--dry-run"]) => Some(
+            "a fetch writes the remote-tracking refs every other session reads, and this spelling \
+             is not one the queue can perform. It queues `git fetch <remote>` exactly — `--all` \
+             fetches from remotes nobody named, `--prune` deletes tracking refs, and `--tags` \
+             pulls in a namespace the refspec deliberately leaves out."
+                .to_owned(),
+        ),
+        "tag" if tag_command_writes(args) => Some(
+            "a tag writes a ref under `refs/tags/`, which every other session fetches, and this \
+             spelling is not one the queue can perform. It queues the lightweight `git tag <name>` \
+             and `git tag <name> <branch>`; `-a` and `-s` need a message, and a message is a \
+             quoted shell argument these parsers exist to never read. Listing spellings are \
+             untouched."
                 .to_owned(),
         ),
         _ => None,
@@ -3192,6 +3371,103 @@ mod tests {
             "git merge --no-ff feature other",
         ] {
             assert_eq!(merge_from_command(command, "master"), None, "{command}");
+        }
+    }
+
+    /// **The merge that reached master without touching the queue, and the class it belongs to.**
+    ///
+    /// Not a hypothetical: `35ec73a` is in the history, written by an editor session that ran
+    /// `git merge --no-ff <branch> -m "..."`. Every layer above worked — the PreToolUse hook fired,
+    /// its filter matched the verb, the daemon was asked. `merge_from_command` reads three exact
+    /// token shapes and a message is not in any of them, so the parsers declined; and declining used
+    /// to mean falling out of `unqueueable_but_shared` as `None`, which the gate reads as ALLOW.
+    ///
+    /// The queue cannot perform this spelling and should not pretend to: `compute_merge` writes its
+    /// own message, so a parser that accepted `-m` would drop the caller's and still report success.
+    /// Refusing is the honest answer, and the message says which spelling is queueable.
+    #[test]
+    fn a_merge_spelling_the_queue_cannot_perform_is_refused_rather_than_allowed() {
+        let escaped = concat!(
+            "git merge --no-ff feat/organograma-do-departamento ",
+            r#"-m "merge feat/organograma-do-departamento into master""#
+        );
+        assert!(
+            unqueueable_but_shared(escaped).is_some(),
+            "the spelling that actually escaped must be refused"
+        );
+
+        for command in [
+            "git merge --no-ff feature -m msg",
+            "git merge feature -m msg",
+            "git merge feature --no-edit",
+            "git merge --strategy=ours feature",
+            // The verb scan used to read `<path>` here and match no arm at all. `ask_daemon.py` has
+            // skipped these flags' values since it was written; this side had not.
+            "git -C /somewhere merge --no-ff feature -m msg",
+            "git --git-dir /somewhere/.git merge feature -m msg",
+        ] {
+            assert!(unqueueable_but_shared(command).is_some(), "{command}");
+        }
+
+        // Writes nothing another session can see, so it stays this route's business to leave alone.
+        // `--ff-only` is here because leaving it passing was a recorded decision, not an oversight.
+        for command in [
+            "git merge --squash feature",
+            "git merge --abort",
+            "git merge --continue",
+            "git merge --quit",
+            "git merge --no-commit feature",
+            "git merge --ff-only feature",
+        ] {
+            assert_eq!(unqueueable_but_shared(command), None, "{command}");
+        }
+    }
+
+    /// The same inversion for the three verbs that were open in exactly the same way, and the
+    /// read-only spellings that must survive it. A gate that refused `git tag` — the listing — would
+    /// stop a session at its second command, which is the failure mode this file argues against as
+    /// hard as it argues against the hole.
+    #[test]
+    fn the_other_queue_verbs_fail_closed_while_their_read_only_spellings_do_not() {
+        for command in [
+            "git fetch --all",
+            "git fetch --prune",
+            "git fetch origin master",
+            "git fetch",
+            "git rebase -i master",
+            "git rebase --onto master feature",
+            "git rebase",
+            "git tag -a v1 -m release",
+            "git tag --delete v1",
+            "git tag -f v1",
+            "git tag v1 --force",
+            // `-d -f` and `--delete --force` are `-D` written the long way.
+            "git branch -d -f feature",
+            "git branch --delete --force feature",
+            "git branch -D feature",
+        ] {
+            assert!(unqueueable_but_shared(command).is_some(), "{command}");
+        }
+
+        for command in [
+            "git fetch --dry-run origin",
+            "git rebase --abort",
+            "git rebase --skip",
+            "git rebase --continue",
+            "git tag",
+            "git tag -l",
+            r#"git tag --list "v1.*""#,
+            "git tag --sort=-creatordate",
+            "git branch",
+            "git branch --list",
+            "git branch -a",
+            "git status",
+            "git log --oneline",
+            "cargo test",
+            // A mention is not a command: the segment must BEGIN with git.
+            "echo git merge --no-ff feature -m msg",
+        ] {
+            assert_eq!(unqueueable_but_shared(command), None, "{command}");
         }
     }
 
