@@ -13,9 +13,6 @@ dist
 dist-csp-gate
 # The preview's bundle, for the same reason.
 dist-preview
-# The sidebar lab's bundle, for the same reason. Built only to measure which of a
-# pasted component's classes this app's Tailwind actually emits — see src/lab/.
-dist-lab
 dist-ssr
 *.local
 
