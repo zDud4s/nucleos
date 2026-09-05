@@ -1801,12 +1801,13 @@ function PermissionMenu({ chatId }: { chatId: string }) {
             const unreachable = rung.needsTools && !tools;
             return (
               <DropdownMenuRadioItem
+                className="chats-permission-item"
                 key={rung.mode}
                 value={rung.mode}
                 disabled={unreachable}
               >
-                {rung.label}
-                <span className="chats-tool-why">
+                <span className="chats-permission-name">{rung.label}</span>
+                <span className="chats-permission-why">
                   {unreachable ? barred : rung.why}
                 </span>
               </DropdownMenuRadioItem>
@@ -5163,55 +5164,74 @@ function Composer({
           visible "Message" label went with the frame; the textarea has carried its own `aria-label`
           all along, so the accessible name is exactly what it was. */}
       <div className="chats-composer-box">
-        <textarea
-          className="chats-composer-text"
-          placeholder="Say something…"
-          ref={box}
-          // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
-          // anything that made you save it to a file first would be a step nobody takes.
-          onPaste={(event) => {
-            const pictures = Array.from(event.clipboardData.files).filter(
-              isPicture,
-            );
-            if (pictures.length === 0) return;
-            // Only when there IS a picture: a plain text paste must stay a text paste.
-            event.preventDefault();
-            void attach(pictures);
-          }}
-          /* The floor, not the size. `field-sizing: content` grows the box from here; this is what
-             it falls back to where that is unsupported. */
-          rows={1}
-          aria-label="Message"
-          value={text}
-          onChange={(event) => {
-            setText(event.target.value);
-            setCaret(event.target.selectionStart);
-            setDismissed(null);
-            setHighlight(0);
-          }}
-          // The caret moves without the text changing — arrows, a click, Home. What is being typed
-          // is read from where the caret IS, so every one of those has to be heard or the list goes
-          // stale against a position it no longer describes.
-          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
-          // Enter sends and Shift+Enter breaks the line, because that is what every chat anybody
-          // has ever used does — and a textarea does the opposite by default, so the habit costs a
-          // reach for the mouse on every single message.
-          //
-          // While a list is open those same keys belong to it. Not a special case bolted on: a list
-          // under the caret owns the arrows and the Enter for as long as it is showing, which is
-          // what every editor does and what the hand already expects.
-          onKeyDown={(event) => {
-            if (listTookTheKey(event, choices, highlight, setHighlight)) return;
-            if (open && event.key === "Escape") {
+        {/* Voice at the top right, away from send at the bottom right. They were neighbours in one
+            row, and they are the two controls in this box that both mean "begin" — one by talking,
+            one by sending — so a hand reaching for one was a hand next to the other.
+
+            **On the line being typed on, as its sibling.** It had a row of its own first, and that
+            row was height every composer paid for whether or not anybody ever talked. The corner is
+            reachable without spending it: the button and the textarea share one flex line, the
+            textarea takes what is left, and `align-items: flex-start` keeps the button at the top
+            as the text grows down past it.
+
+            Which also settles the objection that produced the extra row. This button GROWS when it
+            is recording, gaining the phase label, so a corner held by `position: absolute` would
+            have to reserve room for a width it only sometimes has — reserve for the small state and
+            it covers the text mid-sentence, reserve for the large one and there is a hole in the box
+            whenever nobody is talking. A flex sibling reserves nothing and overlaps nothing: when it
+            grows, the textarea gives up the width. */}
+        <div className="chats-composer-line">
+          <textarea
+            className="chats-composer-text"
+            placeholder="Say something…"
+            ref={box}
+            // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
+            // anything that made you save it to a file first would be a step nobody takes.
+            onPaste={(event) => {
+              const pictures = Array.from(event.clipboardData.files).filter(
+                isPicture,
+              );
+              if (pictures.length === 0) return;
+              // Only when there IS a picture: a plain text paste must stay a text paste.
               event.preventDefault();
-              setDismissed(live(command) ?? live(mention));
-              return;
-            }
-            if (event.key !== "Enter" || event.shiftKey) return;
-            event.preventDefault();
-            say();
-          }}
-        />
+              void attach(pictures);
+            }}
+            /* The floor, not the size. `field-sizing: content` grows the box from here; this is what
+               it falls back to where that is unsupported. */
+            rows={1}
+            aria-label="Message"
+            value={text}
+            onChange={(event) => {
+              setText(event.target.value);
+              setCaret(event.target.selectionStart);
+              setDismissed(null);
+              setHighlight(0);
+            }}
+            // The caret moves without the text changing — arrows, a click, Home. What is being typed
+            // is read from where the caret IS, so every one of those has to be heard or the list goes
+            // stale against a position it no longer describes.
+            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            // Enter sends and Shift+Enter breaks the line, because that is what every chat anybody
+            // has ever used does — and a textarea does the opposite by default, so the habit costs a
+            // reach for the mouse on every single message.
+            //
+            // While a list is open those same keys belong to it. Not a special case bolted on: a list
+            // under the caret owns the arrows and the Enter for as long as it is showing, which is
+            // what every editor does and what the hand already expects.
+            onKeyDown={(event) => {
+              if (listTookTheKey(event, choices, highlight, setHighlight)) return;
+              if (open && event.key === "Escape") {
+                event.preventDefault();
+                setDismissed(live(command) ?? live(mention));
+                return;
+              }
+              if (event.key !== "Enter" || event.shiftKey) return;
+              event.preventDefault();
+              say();
+            }}
+          />
+          <HandsFreeToggle voice={voice} />
+        </div>
         {/* The controls belong to the words being typed, so they live in the box with them — which
             is the one structure every reference for this page shares. They used to be scattered:
             the model and plan-only behind a `⋯` at the top of the page, the attach button in a
@@ -5243,9 +5263,10 @@ function Composer({
               effort={chat.effort}
             />
           )}
-          <PermissionMenu chatId={chatId} />
-          <HandsFreeToggle voice={voice} />
           <span className="chats-composer-gap" />
+          {/* Last before send, because it is the answer most likely to be changed in the moment of
+              sending — "actually, plan this one" — and the hand is already on that corner. */}
+          <PermissionMenu chatId={chatId} />
           <button
             type="submit"
             className="chats-send"
@@ -5265,9 +5286,11 @@ function Composer({
 /**
  * Talking to this chat instead of typing to it.
  *
- * Lives beside the model and the plan-only toggle rather than in the Voice tab, because it belongs
- * to a CONVERSATION and the Voice tab has none: a spoken turn has to name the chat it joins, and
- * `core/src/voice.rs` refuses one that does not rather than guessing. The Voice tab still owns the
+ * Lives in the composer rather than in the Voice tab, because it belongs to a CONVERSATION and the
+ * Voice tab has none: a spoken turn has to name the chat it joins, and `core/src/voice.rs` refuses
+ * one that does not rather than guessing. In the box's top right corner, on the line being typed on,
+ * and no longer in the row of message settings below -- what it starts is a turn, not a setting for
+ * one. The Voice tab still owns the
  * chord that toggles this, for the unrelated reason that registering hotkeys is indivisible.
  *
  * Split from its own status line because the two want different places. The control belongs with the

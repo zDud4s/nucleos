@@ -1,0 +1,188 @@
+/**
+ * The other half of the comparison: what the paste was DRAWN against.
+ *
+ * `tailwind.css` clears `--color-*`, `--font-*`, `--shadow-*` and `--radius-*`
+ * before refilling them from `tokens.css`, and says why: "a component pasted
+ * from a registry that reaches for `text-violet-400` or `shadow-2xl` compiles to
+ * *nothing*, and the decoration shows up at build time instead of in review".
+ * That is working exactly as designed. It also means a raw paste rendered in
+ * this app is not a picture of the paste — it is a picture of the paste with
+ * pieces missing, and judging the design from it would be judging the wrong
+ * thing.
+ *
+ * So this file fills the holes back in, scoped to `.prompt-design`, and only
+ * inside the lab. Two mechanisms, and the split is the interesting part:
+ *
+ * **Colour comes back by moving the tokens, not by writing colours.** Every
+ * shadcn-shaped name in `tailwind.css` is `@theme inline` — it emits
+ * `var(--solid)`, not a resolved value — so redefining `--solid` on a wrapper
+ * re-themes everything under it without a single utility being overridden. That
+ * is the same property the light theme is built on, used one level down.
+ *
+ * **Everything else comes back as plain rules**, because a cleared namespace is
+ * a class that generated no CSS at all: there is nothing to re-point, only a
+ * hole to fill. Those rules are unlayered on purpose — unlayered beats every
+ * `@layer`, so they land on top of `utilities` without a specificity war.
+ *
+ * The list below is therefore also the audit, and it was MEASURED rather than
+ * guessed: the lab was built once without this file, every one of the 195 class
+ * tokens in `dashboard-sidebar.tsx` was looked for in the emitted stylesheet,
+ * and exactly nine of them were absent —
+ *
+ *     animate-in  fade-in  zoom-in-95      (tw-animate-css is not installed)
+ *     font-sans                            (--font-* is display / body / mono)
+ *     rounded-xl                           (--radius-* stops at lg)
+ *     shadow-xs  shadow-sm  shadow-xl  shadow-2xl
+ *                                          (--shadow-* is raise / float / overlay)
+ *
+ * The other 186 compile, `font-mono` and `bg-primary` among them. So the damage
+ * is narrow and nameable, which is the useful result: adopting this component is
+ * nine decisions, not a rewrite.
+ */
+
+.prompt-design {
+  /* ------------------------------------------------ shadcn neutral, dark -- */
+  /*
+    The registry's own palette, at the token names `tailwind.css` points the
+    shadcn aliases at. `--bg` and not `--color-background`: the latter is
+    defined as `var(--bg)`, so overriding it here would be overriding the
+    indirection and leaving the value where it was.
+
+    Dark first and light under the media query, matching `tokens.css`'s
+    arrangement rather than shadcn's, so the two panels of the lab always
+    change theme together.
+  */
+  --bg: oklch(0.145 0 0);
+  --surface: oklch(0.205 0 0);
+  --surface-raised: oklch(0.269 0 0);
+  --text: oklch(0.985 0 0);
+  --text-muted: oklch(0.708 0 0);
+  --border: oklch(1 0 0 / 12%);
+  --solid: oklch(0.922 0 0);
+  --solid-ink: oklch(0.205 0 0);
+
+  /*
+    The body font the paste asks for by `font-sans` — set on the wrapper as
+    well as on the utility, because `font-sans` sits on the rail only and the
+    dashboard beside it would otherwise inherit this app's General Sans.
+  */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  .prompt-design {
+    --bg: oklch(1 0 0);
+    --surface: oklch(1 0 0);
+    --surface-raised: oklch(1 0 0);
+    --text: oklch(0.145 0 0);
+    --text-muted: oklch(0.556 0 0);
+    --border: oklch(0.922 0 0);
+    --solid: oklch(0.205 0 0);
+    --solid-ink: oklch(0.985 0 0);
+  }
+}
+
+/* -------------------------------------------------------------- fonts -- */
+
+/*
+  `font-sans` generates nothing: `--font-*` is cleared and refilled as
+  `--font-display` / `--font-body` / `--font-mono`, and `sans` is not among them.
+*/
+.prompt-design .font-sans {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/*
+  `font-mono`, unlike its neighbour, DOES generate — `tailwind.css` keeps
+  `--font-mono` and points it at Spline Sans Mono. So this is an override rather
+  than a hole being filled, and it is here for one reason: the shortcut chips
+  (⌘K, ⌘,) are the only mono in the paste, and showing them in this app's face
+  in the panel that is supposed to be a picture of the ORIGINAL would quietly
+  put a project decision inside the control.
+*/
+.prompt-design .font-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* ------------------------------------------------------------- radii -- */
+/*
+  `tokens.css` defines sm / md / lg / pill. The paste asks for `rounded-xl` on
+  the window, the two stat cards, the panel and the search dialog — five of the
+  most visible corners on the page, all of them square in the right-hand panel.
+*/
+
+.prompt-design .rounded-xl {
+  border-radius: 0.75rem;
+}
+
+/* ----------------------------------------------------------- shadows -- */
+/*
+  `--shadow-*` is cleared and refilled as `shadow-raise` / `shadow-float` /
+  `shadow-overlay`, so every size-named shadow in the paste compiled to nothing:
+  the workspace monogram, the window, the stat cards, the shortcut chips, the
+  workspace menu and the search dialog. Tailwind's own defaults, restored.
+*/
+
+.prompt-design .shadow-xs {
+  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+
+.prompt-design .shadow-sm {
+  box-shadow:
+    0 1px 3px 0 rgb(0 0 0 / 0.1),
+    0 1px 2px -1px rgb(0 0 0 / 0.1);
+}
+
+.prompt-design .shadow-xl {
+  box-shadow:
+    0 20px 25px -5px rgb(0 0 0 / 0.1),
+    0 8px 10px -6px rgb(0 0 0 / 0.1);
+}
+
+.prompt-design .shadow-2xl {
+  box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+}
+
+/* --------------------------------------------------------- entrances -- */
+/*
+  `animate-in fade-in zoom-in-95` is `tw-animate-css` (formerly
+  `tailwindcss-animate`), which this project does not install — so these three
+  classes are inert in BOTH panels, not just the right one. The workspace menu
+  and the search dialog therefore appear with a hard cut wherever they are
+  rendered.
+
+  Reimplemented here rather than added to `package.json`: a dependency is a
+  decision about the app, and the lab exists to inform that decision, not to
+  make it. One keyframe, two custom properties for its start values, which is
+  the whole of what the paste actually uses.
+*/
+
+@keyframes lab-enter {
+  from {
+    opacity: var(--lab-enter-opacity, 1);
+    transform: scale(var(--lab-enter-scale, 1));
+  }
+}
+
+.prompt-design .animate-in {
+  animation-name: lab-enter;
+  animation-duration: 150ms;
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  animation-fill-mode: both;
+}
+
+.prompt-design .fade-in {
+  --lab-enter-opacity: 0;
+}
+
+.prompt-design .zoom-in-95 {
+  --lab-enter-scale: 0.95;
+}
+
+.prompt-design .animate-in.duration-100 {
+  animation-duration: 100ms;
+}
+
+.prompt-design .animate-in.duration-200 {
+  animation-duration: 200ms;
+}

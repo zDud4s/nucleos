@@ -1659,13 +1659,37 @@
   gap: var(--space-1);
 }
 
+/* The line being typed on, plus the one control that starts a turn without the send button.
+   One flex line and not two rows: a row of its own put the microphone in the corner at the cost of
+   its full height in every composer, talked into or not.
+
+   `flex-start` and not `center`, so the button stays at the TOP right as the textarea grows down
+   through its eighteen rems -- centred, it would ride down the side of a long message and end up
+   beside nothing in particular.
+
+   The two declarations on the textarea are what make it share rather than take. `flex: 1` overrides
+   the `width: 100%` it carries for the other door, where it is not a flex item and needs it;
+   `min-width: 0` is the flex floor, without which a long unbroken word sets the minimum width and
+   pushes the button clean out of the box. This rule went missing for one revision and that is
+   exactly what happened: an unstyled block wrapper, a full-width textarea, and no microphone
+   anywhere. No test here can catch it -- the suite renders without stylesheets. */
+.chats-composer-line {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.chats-composer-line > .chats-composer-text {
+  flex: 1;
+  min-width: 0;
+}
+
 /* ------------------------------------------------------------- hands free -- */
 
-/* Sits with the other things you set about a message, and is shaped like them: the proportions
-   `.chats-planning` used to carry, because a toggle that looked different from the controls beside
-   it would read as belonging to something else. That class is gone; these numbers are what it left
-   behind, and they are kept rather than re-derived so this row does not drift away from its
-   neighbours. */
+/* Shaped like the controls it used to sit beside: the proportions `.chats-planning` carried, kept
+   rather than re-derived. It has moved to the top of the box and they stayed at the bottom, so this
+   is no longer a rule about matching a neighbour -- it is about the box reading as one family from
+   corner to corner. */
 .chats-handsfree {
   display: inline-flex;
   align-items: center;
@@ -1730,8 +1754,7 @@
  * bordered control at the foot of a text box competes with the text.
  */
 .chats-tool,
-.chats-attach,
-.chats-planning {
+.chats-attach {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
@@ -1751,8 +1774,7 @@
 }
 
 .chats-tool:hover:not(:disabled),
-.chats-attach:hover,
-.chats-planning:hover {
+.chats-attach:hover {
   background: var(--surface-raised);
   color: var(--text);
 }
@@ -1762,61 +1784,17 @@
 }
 
 .chats-tool:focus-visible,
-.chats-attach:focus-within,
-.chats-planning:focus-within {
+.chats-attach:focus-within {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
-/**
- * The one control in the family that is a real form element, and the only one the
- * platform insists on drawing itself.
- *
- * Left alone it painted a filled white square on a near-black composer — the single
- * brightest object on the page, spent on the least important control on it.
- * `accent-color` alone does not fix that: it tints the box only once it is CHECKED,
- * and the unchecked state is the one that is on screen all day.
- *
- * So it is drawn here, out of the same three tokens as everything else in the row, and
- * it stays an `<input type="checkbox">` throughout — the keyboard, the label's click
- * target and the screen reader all keep working because nothing was replaced, only
- * repainted.
- */
-.chats-planning input[type="checkbox"] {
-  appearance: none;
-  -webkit-appearance: none;
-  display: inline-grid;
-  place-content: center;
-  width: 0.8125rem;
-  height: 0.8125rem;
-  margin: 0;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  cursor: pointer;
-}
-
-.chats-planning input[type="checkbox"]:checked {
-  border-color: var(--accent);
-  background: var(--accent);
-}
-
-/* The tick, drawn rather than typed: a `content` glyph would take the font's own
-   idea of a checkmark, which differs per platform and does not centre. */
-.chats-planning input[type="checkbox"]:checked::after {
-  content: "";
-  width: 0.4375rem;
-  height: 0.25rem;
-  border: 1.5px solid var(--accent-ink);
-  border-top: none;
-  border-right: none;
-  transform: translateY(-1px) rotate(-45deg);
-}
-
-.chats-planning input[type="checkbox"]:disabled {
-  cursor: default;
-  opacity: 0.5;
-}
+/* The checkbox this family used to contain was a real form element, and the only control here the
+   platform insisted on drawing itself -- it took nine rules to stop it painting a filled white
+   square on a near-black composer. It is gone with `.chats-planning`, and so are they. What
+   replaced it is a `.chats-tool` menu like the two beside it, which the platform draws nothing of.
+   Kept as a sentence rather than as nine dead rules: the next control in here that is a real input
+   will need the same work, and this says so without pretending to still be doing it. */
 
 .chats-tool-caret {
   width: 0.75rem;
@@ -1826,6 +1804,41 @@
 .chats-tool-icon {
   width: 1rem;
   height: 1rem;
+}
+
+/* A rung and the sentence under it, stacked rather than laid side by side.
+   `.chats-tool-why` -- which this used -- is built for a short VALUE at the end of
+   a line ("no ceiling", "2 more"), and these are whole sentences: on one line they
+   pushed the menu wide and the five names stopped being scannable. The name is what
+   you pick from, so it gets the row and the weight; the sentence explains it and
+   goes under, quieter and smaller.
+
+   Unlayered on purpose, and this is what makes it work at all: the vendor item
+   arrives as `flex items-center gap-2`, and those are Tailwind utilities, which
+   `main.tsx` argues live in a cascade layer and so "can never quietly outrank a
+   stylesheet that has not been migrated yet". Grid here beats flex there without a
+   single `!important`.
+
+   The indicator span keeps its own `position: absolute`, so it stays beside the
+   name rather than drifting to the middle of a two-line row. */
+.chats-permission-item {
+  display: grid;
+  align-items: start;
+  gap: 0;
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-2);
+}
+
+.chats-permission-name {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.chats-permission-why {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
 }
 
 /* Why an option cannot be taken, said in the menu next to it rather than as a

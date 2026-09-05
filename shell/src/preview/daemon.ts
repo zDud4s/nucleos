@@ -1317,6 +1317,85 @@ const SPECS: string[] = [
  * answer the app is built to render, unlike a 500, which would put the whole
  * window into a connection state and hide the thing being looked at.
  */
+/**
+ * One conversation, so the composer can be photographed.
+ *
+ * The composer is the densest object in this app -- a text line, a microphone, four menus and a
+ * send button inside one border -- and until now it was the one surface no shot covered. It is also
+ * the surface where jsdom is least use: `Chats.test.tsx` renders every one of these controls and
+ * asserts on all of them, and cannot see that a wrapper lost its rule and dropped the microphone
+ * out of the box. That defect shipped and was found by a person looking at the screen.
+ *
+ * Rooted in a project and with tools, because that is the state where every rung of the permission
+ * menu is reachable -- an unrooted conversation greys three of them and would photograph as a
+ * control half out of order.
+ */
+const CHAT_ID = "c-preview";
+
+export const CHATS = [
+  {
+    chat_id: CHAT_ID,
+    title: "the permission rungs",
+    brain: "cloud",
+    model: null,
+    effort: null,
+    fallback_model: null,
+    extra_dirs: [],
+    turn_budget_usd: null,
+    agents: [],
+    system_prompt: null,
+    denied_tools: [],
+    cleared_after_run_id: null,
+    context_window: 140000,
+    created_at: "2026-08-24T09:00:00Z",
+    cwd: "C:/Projects/nucleos",
+    ide_session_id: null,
+    first_message: "o que muda entre os cinco degraus?",
+    last_activity: "2026-08-24T09:05:00Z",
+    waiting: 0,
+  },
+];
+
+export const CHAT_TURNS = [
+  {
+    id: 1,
+    asked: "o que muda entre os cinco degraus?",
+    answer:
+      "Manual pergunta por tudo o que muda alguma coisa. Edit automatically adianta as edições. " +
+      "Plan responde com um plano. Auto corre o que as regras reconhecem. Bypass não pergunta.",
+    error: null,
+    status: "completed",
+    cost_usd: 0.02,
+    answered_by: "cloud",
+    session_id: "s-preview",
+    created_at: "2026-08-24T09:05:00Z",
+    did: [],
+    images: [],
+    thought: [],
+    thought_tokens: null,
+    context_fill: null,
+    context_window: 140000,
+    compacted: false,
+    relayed_from_chat_id: null,
+    relayed_from_title: null,
+    relayed_to: [],
+  },
+];
+
+export const CHAT_MODELS = {
+  choices: [
+    { id: "sonnet", label: "Sonnet 5", brain: "cloud", efforts: [] },
+    {
+      id: "opus",
+      label: "Opus 5",
+      brain: "cloud",
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+    },
+  ],
+  configured: "sonnet",
+  efforts: ["low", "medium", "high", "xhigh", "max"],
+};
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -1636,6 +1715,25 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (/^\/projects\/[^/]+\/map$/.test(route)) return MAP;
   /* An object with a list inside it, so the empty-list default cannot stand in. */
   if (/^\/projects\/[^/]+\/map\/silenced$/.test(route)) return { rows: [], total: 0 };
+
+  if (path === "/assistant/chats") return CHATS;
+  if (path === "/assistant/models") return CHAT_MODELS;
+  if (path === "/assistant/ide-sessions") return [];
+  /* The project block, and the permission rung with it. `tools: true` so the menu photographs with
+     all five reachable -- see the note on `CHATS`. */
+  if (path === `/assistant/chats/${CHAT_ID}/project`) {
+    return {
+      cwd: "C:/Projects/nucleos",
+      tools: true,
+      session: "s-preview",
+      permission_mode: "auto",
+    };
+  }
+  /* Before the `?before=` reader below it, and matched on the route rather than the whole path so
+     the first page and a scroll-back both answer. */
+  if (splitQuery(path)[0] === `/assistant/chats/${CHAT_ID}`) {
+    return { turns: CHAT_TURNS, more: false };
+  }
 
   if (path === "/teams") return TEAMS;
   if (path === "/team-runs") return RUNS;
