@@ -323,11 +323,25 @@ export interface HealthReadout {
  * `worktree_disk`, `echo_sidecar`, `telegram_sidecar`, `email_sidecar`,
  * `web_sidecar`, `browser_sidecar`, `voice_transcriber` (`health.rs:142-183`).
  */
-export function useSystemHealth() {
+export function useSystemHealth(refetchInterval: number = POLL.fast) {
   return useQuery({
     queryKey: keys.system.health,
     queryFn: () => apiFetch<HealthReadout>("/health/readout"),
-    refetchInterval: POLL.fast,
+    /**
+     * How often, and why it is an argument rather than a constant.
+     *
+     * This readout is not a cheap one — it probes ten subsystems and has its own
+     * timeout — so who is watching it decides how often it is worth asking. The
+     * System page wants the live figure and takes the default; the rail wants
+     * only to know whether to draw a dot, and asks slowly.
+     *
+     * Same query key, so both share one cache entry, and TanStack schedules a
+     * refetch for every active observer's own interval — which means the fast
+     * one wins exactly while somebody is on the page that asked for it, and the
+     * slow one is what the app costs the rest of the time. Nothing to reconcile
+     * and nothing to turn off on the way out.
+     */
+    refetchInterval,
   });
 }
 
@@ -350,6 +364,26 @@ export function useSidecars() {
  */
 export function isAggregateTimeout(readout: HealthReadout): boolean {
   return readout.subsystems.length === 1 && readout.subsystems[0].name === "aggregate";
+}
+
+/**
+ * Is this a reading somebody should go and look at?
+ *
+ * A named function rather than a comparison inside the rail, because it decides
+ * what the word "alert" means for the whole app and that is worth stating once,
+ * in the file that owns the type, where a test can hold it.
+ *
+ * `down` and `degraded`, and deliberately not `disabled`: a subsystem nobody
+ * configured is not a fault, and drawing a dot for one would teach people that
+ * the dot means nothing. That is the same rule the rail's dimmed rows already
+ * follow — present, plainly not ready, and not an emergency.
+ *
+ * `undefined` is `false`, and that is the honest-absence rule rather than
+ * optimism: nothing has answered yet, so there is nothing to report. A dot drawn
+ * before the first answer would be a claim nobody measured.
+ */
+export function wantsAttention(readout: HealthReadout | undefined): boolean {
+  return readout?.status === "down" || readout?.status === "degraded";
 }
 
 /* ----------------------------------------------------------------- backups -- */

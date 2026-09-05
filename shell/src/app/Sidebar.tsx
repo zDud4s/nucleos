@@ -428,7 +428,13 @@ export interface SidebarProps {
    * there are.
    */
   projects?: ProjectNavEntry[];
-  /** The daemon is anything but ok; System gets a dot. */
+  /**
+   * Something in the machine wants looking at; System gets a dot.
+   *
+   * A boolean and not the readout itself, because the rail draws a dot and has
+   * no business deciding what counts as trouble — `AppShell` reads the daemon's
+   * subsystem aggregate and answers that question there, where the query lives.
+   */
   systemAlert?: boolean;
   /**
    * The pinned footer — connection line, budget, kill switch.
