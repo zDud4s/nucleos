@@ -353,6 +353,12 @@ const SHOTS_TO_TAKE = [
      drawn whole, and only the work rank is missing. And the one nobody has staffed at all. */
   ["09c-bench-roster-idle", { path: "/teams/vendas", tab: "Roster" }],
   ["09d-bench-roster-unstaffed", { path: "/teams/operacoes", tab: "Roster" }],
+  /* The composer, which is the densest object in the app and was the last one no shot covered.
+     Both themes because the controls inside it carry no border and live on `--text-faint`: whether
+     they are legible at all is a contrast question, and a contrast question is exactly what a dark
+     shot alone cannot answer. */
+  ["09e-chat-composer", { path: "/chats/c-preview" }],
+  ["09f-chat-composer-light", { path: "/chats/c-preview", theme: "light" }],
   ["10-catalogue-dark", { path: "/agents" }],
   ["11-catalogue-light", { path: "/agents", theme: "light" }],
   /* The editor, which is the half of the page that is not on screen at rest —
