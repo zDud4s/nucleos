@@ -3173,12 +3173,16 @@ function ChatHelpers({
       // handed, and a helper called "reviewer " is one nothing can call by that name.
       {
         chatId,
+        // Spread FIRST, then trim the three that need it. Naming every field by hand builds a NEW
+        // object that happens to agree with the draft, and it agrees only for the fields that
+        // existed the day it was written: `HelperDraft` is `Subagent` and nothing else, so any
+        // property the draft holds belongs on the wire, and a new OPTIONAL field on `Subagent`
+        // would type-check its way through a hand-written list while never being sent.
         agents: draft.map((helper) => ({
+          ...helper,
           name: helper.name.trim(),
           description: helper.description.trim(),
           prompt: helper.prompt.trim(),
-          model: helper.model,
-          effort: helper.effort,
         })),
       },
       { onSuccess: () => onOpenChange(false) },

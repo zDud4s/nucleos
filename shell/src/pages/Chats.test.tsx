@@ -1686,6 +1686,66 @@ describe("Chats - the helpers a conversation may hand work to", () => {
     });
   });
 
+  it("keeps a field this build of the form knows nothing about", async () => {
+    // THE TRAP: `save()` used to name every field of a helper by hand, so what reached the daemon
+    // was a NEW object that agreed with the draft only for the fields that existed the day it was
+    // written. Add an optional field to `Subagent` and it is dropped in silence — TypeScript has
+    // nothing to say, because an object literal missing an optional field is a perfectly good
+    // `Subagent`. A test that edits a KNOWN field cannot catch this; it passes against exactly the
+    // code that loses the next one.
+    //
+    // `reasoning` is what such a field would be on the day it is added: no part of this editor
+    // reads it, writes it or renders it, so nothing but a spread can carry it from the daemon back
+    // to the daemon. Asserted by parsing rather than against a `JSON.stringify`, because what is
+    // being fixed is that a field SURVIVES, and pinning the key order would fail this test for a
+    // reason it is not about.
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({
+            chat_id: "c-1",
+            agents: [
+              {
+                name: "reviewer",
+                description: "d",
+                prompt: "p",
+                reasoning: "high",
+              },
+            ] as unknown as ChatSummary["agents"],
+          }),
+        ],
+        { "c-1": [] },
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openHelpers();
+
+    fireEvent.change(await screen.findByLabelText("When to use it"), {
+      target: { value: "d, revised" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      const patch = daemon.apiFetch.mock.calls.find(
+        ([url, init]) => url === "/assistant/chats/c-1" && init?.method === "PATCH",
+      );
+      expect(patch).toBeDefined();
+      expect(JSON.parse(patch![1].body)).toEqual({
+        agents: [
+          {
+            name: "reviewer",
+            description: "d, revised",
+            prompt: "p",
+            reasoning: "high",
+            model: null,
+            effort: null,
+          },
+        ],
+      });
+    });
+  });
+
   it("says why a helper would be refused, in place, before anything is sent", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
