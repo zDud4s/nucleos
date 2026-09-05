@@ -1112,6 +1112,7 @@ export function useStartConversation() {
     mutationFn: async ({
       model,
       effort,
+      permissionMode,
       text,
       images,
       continueSession,
@@ -1130,6 +1131,15 @@ export function useStartConversation() {
        * would be a second way to do one thing.
        */
       continueSession?: string;
+      /**
+       * What the conversation may do without asking, from its first message.
+       *
+       * On the opening call for the model's reason — there is nothing to PATCH until it returns —
+       * and it matters more here than it does for the model: without it the only way to reach a
+       * rung is to send one message on `auto` and change it afterwards, which is one message too
+       * late for `plan`, the rung people reach for BEFORE letting an agent near a codebase.
+       */
+      permissionMode?: PermissionMode;
     }) => {
       // The model travels on the opening call rather than as a PATCH afterwards.
       // There is no conversation to PATCH until this returns, and correcting one a
@@ -1137,7 +1147,12 @@ export function useStartConversation() {
       // carries the brain, which the daemon derives from the choice.
       const opened = await apiFetch<{ chat_id: string }>("/assistant/chats", {
         method: "POST",
-        body: JSON.stringify({ model, effort, continue_session: continueSession }),
+        body: JSON.stringify({
+          model,
+          effort,
+          permission_mode: permissionMode,
+          continue_session: continueSession,
+        }),
       });
       await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",

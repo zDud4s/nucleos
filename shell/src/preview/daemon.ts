@@ -704,6 +704,7 @@ function rules(overrides: Partial<ProjectRules>): ProjectRules {
     rules_error: null,
     gate_command: null,
     gate_before_publish: false,
+    judge: { state: "default" },
     schedules: [],
     repo_triggers: [],
     wip_limit: null,

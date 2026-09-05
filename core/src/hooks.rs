@@ -1276,20 +1276,17 @@ async fn judge_for(
     state: &AppState,
     project_id: Option<&str>,
 ) -> Option<std::sync::Arc<crate::local_agent::LocalAssistant>> {
-    let configured: Option<(Option<String>, Option<String>)> = match project_id {
-        Some(project_id) => {
-            sqlx::query_as("SELECT brain, model FROM project_judge WHERE project_id = ?")
-                .bind(project_id)
-                .fetch_optional(&state.pool)
-                .await
-                .unwrap_or(None)
-        }
-        None => None,
+    // A turn with no project cannot have a judge NAMED for it, and gets the default rather than
+    // nothing: `auto` means the same thing wherever it is switched on. The read itself lives in
+    // `project_policy`, with the other three answers to "what may this project do without asking".
+    let configured = match project_id {
+        Some(project_id) => crate::project_policy::judge(&state.pool, project_id).await,
+        None => crate::project_policy::Judge::Default,
     };
     let (brain, model) = match configured {
-        Some((None, _)) => return None,
-        Some((Some(brain), model)) => (crate::chats::Brain::from_wire(&brain), model),
-        None => (crate::chats::Brain::Local, None),
+        crate::project_policy::Judge::Off => return None,
+        crate::project_policy::Judge::Named { brain, model } => (brain, model),
+        crate::project_policy::Judge::Default => (crate::chats::Brain::Local, None),
     };
     match state.assistants.assistant_for(brain, model.as_deref()) {
         Ok(assistant) => Some(assistant),

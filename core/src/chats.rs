@@ -273,21 +273,57 @@ where
 /// and mean nothing apart: a row carrying one session's directory and another's id would resume a
 /// conversation somewhere it was never had, which the CLI does not refuse — it quietly starts a new
 /// session instead. Taking the pair as one value is what makes that pairing unable to be wrong.
+/// `#[cfg(test)]` because that is what it now is, and the compiler said so before anybody did.
+///
+/// Production has exactly one caller and it names a rung, so the moment `create_chat` moved to
+/// `create_on` this became dead code outside the tests — 105 of which use it and mean `Auto`.
+/// Deleting it would have written that word 105 times; leaving it `pub` would have left a second
+/// door into the table, open, with nothing behind it. Naming it a test helper is the true statement
+/// of the two.
+#[cfg(test)]
 pub async fn create(
     pool: &SqlitePool,
     brain: Brain,
     picked_up: Option<&crate::sessions::IdeSession>,
 ) -> sqlx::Result<String> {
+    create_on(pool, brain, picked_up, PermissionMode::Auto).await
+}
+
+/// The same, for a caller that knows which rung the conversation opens on.
+///
+/// **A sibling rather than a fourth parameter on `create`, and the reason is arithmetic**: `create`
+/// has 105 call sites and all but one of them are tests that mean `Auto`. Threading the rung
+/// through every one of them would say the same thing a hundred times and bury the single caller
+/// that says something else. `create` delegating is that sentence written once.
+///
+/// **Written INTO the row and not set afterwards, which is the whole point of this existing.** The
+/// front door already carries the model and the effort on its opening call, for the reason its own
+/// field documents -- there is nothing to PATCH until the call returns. Those two can be applied a
+/// step later and are: `create_chat` logs a failure and lets the conversation open on the
+/// configured model, because a preference that did not take is a preference, and the conversation
+/// is still usable. The rung cannot be treated that way. A `plan` that failed to write would open
+/// the conversation on `auto`, which is WIDER than what was asked for, and a permission that
+/// widens itself when a write fails is the one failure this feature must not have. `assistant.rs`
+/// refuses a whole turn over the same question -- see
+/// `a_turn_whose_mode_could_not_be_recorded_is_refused_rather_than_widened` -- and this is the
+/// other half of it: born with the row, so there is no window in which the two disagree.
+pub async fn create_on(
+    pool: &SqlitePool,
+    brain: Brain,
+    picked_up: Option<&crate::sessions::IdeSession>,
+    mode: PermissionMode,
+) -> sqlx::Result<String> {
     let chat_id = crate::auth::generate_uuid_v4();
     sqlx::query(
-        "INSERT INTO chats (chat_id, title, brain, created_at, cwd, ide_session_id)
-         VALUES (?, NULL, ?, ?, ?, ?)",
+        "INSERT INTO chats (chat_id, title, brain, created_at, cwd, ide_session_id, permission_mode)
+         VALUES (?, NULL, ?, ?, ?, ?, ?)",
     )
     .bind(&chat_id)
     .bind(brain.as_str())
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(picked_up.map(|session| session.cwd.as_str()))
     .bind(picked_up.map(|session| session.session_id.as_str()))
+    .bind(mode.as_str())
     .execute(pool)
     .await?;
     Ok(chat_id)
