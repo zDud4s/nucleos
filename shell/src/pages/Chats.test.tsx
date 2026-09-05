@@ -1978,6 +1978,33 @@ describe("Chats - what it may do without asking", () => {
     expect(await screen.findByRole("button", { name: /^Permissions: Plan/ })).toBeTruthy();
   });
 
+  // The arrangement, and not the pixels: voice in one corner, send in the other, the rung beside
+  // send. It is asserted because it is invisible to every other test here -- move the microphone
+  // back down beside the send button and all 179 of them stay green while the box goes back to
+  // reading as one undifferentiated row of controls.
+  it("keeps voice out of the settings row and the rung next to send", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    const { container } = await renderChats("/chats/c-1");
+
+    const settings = container.querySelector(
+      ".chats-composer-actions",
+    ) as HTMLElement;
+    const voice = await screen.findByRole("button", { name: /^Talk$/ });
+    expect(settings.contains(voice)).toBe(false);
+
+    const rung = await screen.findByRole("button", { name: /^Permissions:/ });
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(settings.contains(rung)).toBe(true);
+    expect(settings.contains(send)).toBe(true);
+    expect(
+      rung.compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   // The owner's decision, and the reason the menu opens at all rather than being greyed whole: a
   // disabled control with no explanation is a dead end, and one of the two reasons — an unwired
   // hook — is a button away in the panel above.
