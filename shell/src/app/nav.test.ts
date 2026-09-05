@@ -138,12 +138,14 @@ describe("the nav table", () => {
     expect(NAV_PATHS).toContain("/");
   });
 
-  it("gives every item a distinct glyph, so the collapsed rail is readable", () => {
-    // Four items start with C — Chats, Council, Contacts, Calendar — so a rail
-    // that derived its monograms from the labels would show the same mark four
-    // times.
-    const glyphs = NAV_ITEMS.map((item) => item.glyph);
-    expect(new Set(glyphs).size).toBe(glyphs.length);
+  it("gives every item a distinct icon, so the collapsed rail is readable", () => {
+    // The collapsed rail is the icon and nothing else, so two rows sharing a
+    // mark are two rows nobody can tell apart at 56px. This is the same test
+    // the two-letter monograms had before 2026-09-05 and it is kept for the
+    // same reason: the failure it catches is a *reused* mark, which reviewing a
+    // diff of twenty-one one-line entries reliably misses.
+    const icons = NAV_ITEMS.map((item) => item.icon);
+    expect(new Set(icons).size).toBe(icons.length);
   });
 
   it("names the slice that brings each page", () => {

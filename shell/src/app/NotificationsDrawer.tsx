@@ -1,5 +1,6 @@
 // §spec mapa-do-projeto
 import { useEffect, useRef, useState } from "react";
+import { Bell } from "lucide-react";
 import {
   isHeld,
   useRecentFeed,
@@ -85,9 +86,14 @@ export function NotificationsDrawer() {
         }
         onClick={() => setOpen((current) => !current)}
       >
-        <span className="app-notify-glyph" aria-hidden="true">
-          Nt
-        </span>
+        {/*
+          A mark, like every row above it. This control is shaped like a
+          `nav-item` on purpose — it sits in the rail and reads as one more place
+          to go — and when the rail's rows swapped their two-letter monograms for
+          lucide icons this was the one row left spelling `Nt`, which read as a
+          row that had lost its icon rather than as a row with a different kind.
+        */}
+        <Bell className="app-notify-glyph" strokeWidth={1.5} aria-hidden="true" />
         <span className="app-notify-label">Notifications</span>
         {held.length > 0 && (
           <span className="app-notify-count" aria-hidden="true">

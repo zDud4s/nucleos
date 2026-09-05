@@ -10,7 +10,8 @@ import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { PendingNotification } from "../data/feed";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
-import type { BudgetView, ProjectSummary } from "../data/system";
+import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary } from "../data/system";
+import type { VoiceConfigView } from "../data/voice";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 
 /**
@@ -1474,6 +1475,85 @@ export function answer(path: string, init?: RequestInit): unknown {
       return Date.parse(occurrence.ends_at) > from && starts < to;
     });
   }
+  /*
+    The whole daemon's health, and the reason the System page could not be
+    photographed at all: `headlineFor` reads `readout.subsystems.filter(...)`
+    unguarded, so the empty-list default this file gives everything else was a
+    crash — `Cannot read properties of undefined (reading 'length')` — and the
+    page came back as the router's apology instead of a page. Same failure as
+    `/concurrency` and the State readings above, and the third of its kind.
+
+    In the daemon's own subsystem order (`health.rs:142-183`), never sorted, and
+    deliberately not a clean bill: one sidecar is down, one is degraded and two
+    are switched off, because `disabled` and `down` are different sentences and
+    a preview of ten green rows can photograph neither. The aggregate agrees
+    with the rows — `degraded`, not `ok`, because something is.
+  */
+  if (path === "/health/readout") {
+    return {
+      status: "degraded",
+      subsystems: [
+        { name: "sqlite_pool", status: "ok" },
+        { name: "cli_binary", status: "ok" },
+        { name: "credential_manager", status: "ok" },
+        { name: "worktree_disk", status: "degraded", reason: "low-disk-space" },
+        { name: "echo_sidecar", status: "ok" },
+        { name: "telegram_sidecar", status: "disabled", reason: "not-configured" },
+        { name: "email_sidecar", status: "ok" },
+        { name: "web_sidecar", status: "ok" },
+        { name: "browser_sidecar", status: "down", reason: "not-running" },
+        { name: "voice_transcriber", status: "disabled", reason: "not-configured" },
+      ],
+    } satisfies HealthReadout;
+  }
+
+  /*
+    What the voice pillar is configured to do, and the second half of the same
+    story as `/health/readout` above: the Voice page reads `data.hints.length`
+    unguarded, so the empty-list default crashed it — and the crash was hidden
+    behind a louder one, because `listen()` from `@tauri-apps/api/event` was
+    throwing first until that module got a stub next to `tauri.ts`. Two faults
+    in a row on one page is exactly how a preview goes unlooked-at.
+
+    Armed, with a cleanup model, because the interesting picture is the page
+    that CAN record: unarmed it draws one sentence and stops. The hints are the
+    daemon's own vocabulary list, which is the field that made this necessary.
+  */
+  if (path === "/voice/config") {
+    return {
+      armed: true,
+      hints: ["NucleOS", "núcleo", "worktree", "autopilot", "sidecar"],
+      cleanup_prompt: "Tidy the transcript. Keep the words; drop the ums.",
+      cleanup_model: "local/whisper-cleanup",
+      retain_dictations_days: 30,
+      hotkey: "Ctrl+Shift+D",
+      memo_hotkey: "Ctrl+Shift+M",
+      conversation_hotkey: "",
+      /* Reads but does not speak: the half-configured machine is a real state
+         and the one a single `armed` flag would hide. */
+      speaks: false,
+      max_capture_seconds: 120,
+      max_body_bytes: 8 * 1024 * 1024,
+    } satisfies VoiceConfigView;
+  }
+
+  /*
+    Whether the stop is engaged, and the fourth fixture gap of the same shape.
+
+    Unanswered, `kill.data` was `[]`, `[].engaged` was `undefined`, and the rail
+    drew "state unread" under the kill switch on every page for ever — which is a
+    real state of the app (the first poll has not landed, or that route failed)
+    being shown permanently because the preview never answered. It reads as a
+    defect in the footer, and the owner reasonably asked why it was there.
+
+    `false` — not engaged — because that is the state the rest of the fixtures
+    describe: a núcleo with jobs running and proposals waiting is not a stopped
+    one, and a preview that said otherwise would contradict every other page.
+  */
+  if (path === "/autopilot/kill" && init?.method === undefined) {
+    return { engaged: false } satisfies KillSwitchState;
+  }
+
   if (path === "/calendar/busy") return { busy: true };
   if (path === "/calendar/config") return CALENDAR_CONFIG;
   if (path === "/notifications/pending") return HELD;

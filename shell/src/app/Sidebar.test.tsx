@@ -199,6 +199,193 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /expand the sidebar/i })).toBeDefined();
   });
 
+  /**
+   * The switcher above the scroll.
+   *
+   * It exists because reaching a project from anywhere else costs a list and a
+   * choice — the cost that promoted Projects to a group, and that the
+   * conditional roster gave back everywhere outside the projects area. These
+   * six are what stops it becoming decoration.
+   */
+  describe("project switcher", () => {
+    const roster = [
+      { id: "alpha", mode: "shadow" as const, pending: 0 },
+      { id: "bravo", mode: "active" as const, pending: 0 },
+    ];
+
+    it("names the núcleo away from a project, and the project inside one", async () => {
+      const away = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+      expect(screen.getByRole("button", { name: /^NucleOS/ })).toBeTruthy();
+      away.unmount();
+
+      await renderWithRouter(<Sidebar projects={roster} />, {
+        initialPath: "/projects/bravo/workflows",
+      });
+      // Any of the three modes, like the rail's own rows: somebody reading
+      // Workflows has not left the project.
+      expect(screen.getByRole("button", { name: /^bravo/ })).toBeTruthy();
+    });
+
+    it("offers the núcleo, every project, and the way to a new one", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+
+      const button = screen.getByRole("button", { name: /switch project/i });
+      expect(button.getAttribute("aria-expanded")).toBe("false");
+      fireEvent.click(button);
+      expect(button.getAttribute("aria-expanded")).toBe("true");
+
+      // Home, and it is reached by name rather than by "go back": the núcleo is
+      // not a project, so it is not one of the choices being compared.
+      expect(screen.getByRole("link", { name: "NucleOS" }).getAttribute("href")).toBe("/");
+      expect(screen.getByRole("link", { name: "alpha, shadow" }).getAttribute("href")).toContain(
+        "/projects/alpha/state",
+      );
+      expect(screen.getByRole("link", { name: "New project" }).getAttribute("href")).toContain(
+        "/projects/new",
+      );
+    });
+
+    it("says each project's mode out loud, since the menu only draws a dot", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+      fireEvent.click(screen.getByRole("button", { name: /switch project/i }));
+
+      // The owner asked for the state not to take space on screen, and a colour
+      // that nobody can hear is a state only some readers get. The word costs
+      // nothing in speech.
+      expect(screen.getByRole("link", { name: "bravo, active" })).toBeTruthy();
+    });
+
+    it("marks the destination you are already on", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects/alpha/state" });
+      fireEvent.click(screen.getByRole("button", { name: /switch project/i }));
+
+      // `page`, the same word the rail's own rows use: the router marks the
+      // link whose path it is on with that value anyway, and a switcher that
+      // said `true` would announce the same row differently depending on which
+      // of a project's three modes you were reading.
+      expect(screen.getByRole("link", { name: "alpha, shadow" }).getAttribute("aria-current")).toBe(
+        "page",
+      );
+      expect(screen.getByRole("link", { name: "bravo, active" }).getAttribute("aria-current")).toBeNull();
+    });
+
+    it("closes on Escape and hands focus back to the button", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+
+      const button = screen.getByRole("button", { name: /switch project/i });
+      fireEvent.click(button);
+      const first = screen.getByRole("link", { name: "NucleOS" });
+      first.focus();
+      fireEvent.keyDown(first, { key: "Escape" });
+
+      // A menu that closes and drops focus on the body leaves a keyboard reader
+      // at the top of the page, which is worse than where they opened it from.
+      expect(screen.queryByRole("link", { name: "NucleOS" })).toBeNull();
+      expect(document.activeElement).toBe(button);
+    });
+
+    it("keeps its rows out of the rail's own arrow-key walk", async () => {
+      const { container } = await renderWithRouter(<Sidebar projects={roster} />, {
+        initialPath: "/feed",
+      });
+      const before = container.querySelectorAll("[data-nav-path]").length;
+
+      fireEvent.click(screen.getByRole("button", { name: /switch project/i }));
+
+      // An open menu has its own up-and-down. Rows that also walked the rail
+      // behind it would leave focus somewhere the reader cannot see.
+      expect(container.querySelectorAll("[data-nav-path]").length).toBe(before);
+
+      const alpha = screen.getByRole("link", { name: "alpha, shadow" });
+      alpha.focus();
+      fireEvent.keyDown(alpha, { key: "ArrowDown" });
+      expect(document.activeElement).toBe(screen.getByRole("link", { name: "bravo, active" }));
+    });
+  });
+
+  /**
+   * The dropdown on `All projects`.
+   *
+   * The route used to decide the roster on its own, which meant somebody working
+   * out of the Feed could not see their projects at all and somebody who never
+   * wanted them had to. The chevron makes that answer theirs — and these five
+   * are what keep it from taking the destination away in exchange.
+   */
+  describe("the projects dropdown", () => {
+    const roster = [
+      { id: "alpha", mode: "shadow" as const, pending: 0 },
+      { id: "bravo", mode: "active" as const, pending: 0 },
+    ];
+
+    it("opens the roster from a page that would not have shown it", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+      // The rail's own rows are named by the word on them — the switcher's
+      // "alpha, shadow" is the menu's naming, and these are not those rows.
+      expect(screen.queryByRole("link", { name: "alpha" })).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Show the project list" }));
+
+      expect(screen.getByRole("link", { name: "alpha" })).toBeTruthy();
+    });
+
+    it("shuts it inside the projects area, where the route had opened it", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
+      expect(screen.getByRole("link", { name: "alpha" })).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("button", { name: "Hide the project list" }));
+
+      expect(screen.queryByRole("link", { name: "alpha" })).toBeNull();
+    });
+
+    /**
+     * The answer is the reader's from then on, on every page. A dropdown that
+     * re-decided itself the moment you navigated would not be a control, it
+     * would be a hint.
+     */
+    it("keeps the answer it was given, and stops following the route", async () => {
+      const first = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
+      fireEvent.click(screen.getByRole("button", { name: "Hide the project list" }));
+      first.unmount();
+
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
+
+      // The route says open. The reader said shut, and the reader was last.
+      expect(screen.queryByRole("link", { name: "alpha" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Show the project list" }).getAttribute("aria-expanded")).toBe(
+        "false",
+      );
+    });
+
+    /**
+     * The word is still a page. The chevron was added to open a list, not to
+     * spend the one row that answers a question no single workspace can.
+     */
+    it("leaves All projects a link, and offers nothing to open before the roster answers", async () => {
+      const { unmount } = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+      expect(screen.getByRole("link", { name: "All projects" }).getAttribute("href")).toBe("/projects");
+      unmount();
+
+      await renderWithRouter(<Sidebar />, { initialPath: "/projects" });
+      // `undefined` is "the daemon has not spoken", and a disclosure that opens
+      // onto nothing is an affordance that lies.
+      expect(screen.queryByRole("button", { name: /project list/ })).toBeNull();
+      expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+    });
+
+    it("takes the shut rows out of the rail's arrow walk, rather than hiding them in it", async () => {
+      const { container } = await renderWithRouter(<Sidebar projects={roster} />, {
+        initialPath: "/projects",
+      });
+      const open = container.querySelectorAll("[data-nav-path]").length;
+
+      fireEvent.click(screen.getByRole("button", { name: "Hide the project list" }));
+
+      // Two rows fewer in the DOM, not two rows hidden in it: the walk reads the
+      // document, and `hidden` rows would send focus somewhere invisible.
+      expect(container.querySelectorAll("[data-nav-path]").length).toBe(open - roster.length);
+    });
+  });
+
   it("puts a dot on System when the daemon is not ok", async () => {
     const { unmount } = await renderWithRouter(<Sidebar />);
     expect(screen.getByRole("link", { name: "System" })).toBeDefined();
