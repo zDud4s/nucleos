@@ -1801,12 +1801,13 @@ function PermissionMenu({ chatId }: { chatId: string }) {
             const unreachable = rung.needsTools && !tools;
             return (
               <DropdownMenuRadioItem
+                className="chats-permission-item"
                 key={rung.mode}
                 value={rung.mode}
                 disabled={unreachable}
               >
-                {rung.label}
-                <span className="chats-tool-why">
+                <span className="chats-permission-name">{rung.label}</span>
+                <span className="chats-permission-why">
                   {unreachable ? barred : rung.why}
                 </span>
               </DropdownMenuRadioItem>
@@ -5163,6 +5164,19 @@ function Composer({
           visible "Message" label went with the frame; the textarea has carried its own `aria-label`
           all along, so the accessible name is exactly what it was. */}
       <div className="chats-composer-box">
+        {/* Voice at the top right, away from send at the bottom right. They were neighbours in one
+            row, and they are the two controls in this box that both mean "begin" — one by talking,
+            one by sending — so a hand reaching for one was a hand next to the other.
+
+            A row of its own rather than a button parked in the corner with `position: absolute`.
+            The reason is the ON state: this button GROWS when it is recording, gaining the phase
+            label, and an absolute one would have to reserve room for a width it only sometimes
+            has -- reserve for the small state and it covers the text mid-sentence, reserve for the
+            large one and there is a hole in the box whenever nobody is talking. A row cannot
+            overlap what it is a row above. */}
+        <div className="chats-composer-top">
+          <HandsFreeToggle voice={voice} />
+        </div>
         <textarea
           className="chats-composer-text"
           placeholder="Say something…"
@@ -5243,9 +5257,10 @@ function Composer({
               effort={chat.effort}
             />
           )}
-          <PermissionMenu chatId={chatId} />
-          <HandsFreeToggle voice={voice} />
           <span className="chats-composer-gap" />
+          {/* Last before send, because it is the answer most likely to be changed in the moment of
+              sending — "actually, plan this one" — and the hand is already on that corner. */}
+          <PermissionMenu chatId={chatId} />
           <button
             type="submit"
             className="chats-send"
@@ -5265,9 +5280,10 @@ function Composer({
 /**
  * Talking to this chat instead of typing to it.
  *
- * Lives beside the model and the plan-only toggle rather than in the Voice tab, because it belongs
- * to a CONVERSATION and the Voice tab has none: a spoken turn has to name the chat it joins, and
- * `core/src/voice.rs` refuses one that does not rather than guessing. The Voice tab still owns the
+ * Lives in the composer rather than in the Voice tab, because it belongs to a CONVERSATION and the
+ * Voice tab has none: a spoken turn has to name the chat it joins, and `core/src/voice.rs` refuses
+ * one that does not rather than guessing. In the box's top right corner and no longer in the row of
+ * message settings below -- what it starts is a turn, not a setting for one. The Voice tab still owns the
  * chord that toggles this, for the unrelated reason that registering hotkeys is indivisible.
  *
  * Split from its own status line because the two want different places. The control belongs with the
