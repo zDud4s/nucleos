@@ -195,9 +195,32 @@ export function Chats() {
    *
    * State and not a route, because there is nothing to route TO: an editor session is a file on
    * this machine, not a conversation this app has opened, and it has no id here until somebody
-   * picks it up. Cleared the moment one is — by then it is a chat with a URL of its own.
+   * picks it up.
+   *
+   * **It outranks the route, so everything that opens a conversation has to clear it.** That is
+   * `openingAChat` below, and it is not a nicety: this is the only thing on the page whose value
+   * decides what the right-hand column draws, and the column's other input is the URL. Being state
+   * rather than a route means a `<Link>` cannot clear it on the way past — so the two disagreed,
+   * and the disagreement was invisible in the worst way. The URL changed, the row lit up as
+   * current, and the editor session stayed on screen: a conversation you had just pressed simply
+   * would not open.
+   *
+   * Two exits, and both are needed. One is a session BECOMING a chat — by then it has a URL of its
+   * own. The other is a chat being opened instead, which is the one that was missing.
    */
   const [pickingUp, setPickingUp] = useState<string | null>(null);
+  /**
+   * Every way a conversation gets opened runs through here, and there are three: a row in the list,
+   * a conversation in the palette, and a turn found by searching.
+   *
+   * One function rather than three `setPickingUp(null)` calls, because the thing being stated is an
+   * invariant — *the editor preview does not survive opening a conversation* — and an invariant
+   * spelled three times is one somebody adds a fourth caller beside without noticing.
+   *
+   * It does not navigate. The list's rows are real `<Link>`s and should stay that way: middle-click
+   * and copy-link are worth more than the symmetry of routing everything through one handler.
+   */
+  const openingAChat = () => setPickingUp(null);
   /**
    * A turn picked out of a search, waiting for its conversation to be on screen.
    *
@@ -297,6 +320,7 @@ export function Chats() {
         onFound={(chatId, turnId) =>
           setFound({ chatId, turnId, at: Date.now() })
         }
+        onOpenChat={openingAChat}
       />
 
       <div
@@ -315,6 +339,7 @@ export function Chats() {
               selectedLive={selectedLive}
               pickingUp={pickingUp}
               onPickUp={setPickingUp}
+              onOpenChat={openingAChat}
               onNew={() => {
                 setPickingUp(null);
                 void navigate({ to: "/chats" });
@@ -396,12 +421,15 @@ function ConversationPalette({
   open,
   onOpenChange,
   onFound,
+  onOpenChat,
 }: {
   rows: ChatSummary[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** A turn somebody picked out of a search, to be scrolled to once its conversation opens. */
   onFound: (chatId: string, turnId: number) => void;
+  /** See `openingAChat`. Both of this palette's exits open a conversation. */
+  onOpenChat: () => void;
 }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
@@ -451,6 +479,7 @@ function ConversationPalette({
                 value={`chat-${row.chat_id}`}
                 onSelect={() => {
                   onOpenChange(false);
+                  onOpenChat();
                   void navigate({ to: `/chats/${row.chat_id}` });
                 }}
               >
@@ -477,6 +506,7 @@ function ConversationPalette({
                 value={`said-${hit.turn_id}`}
                 onSelect={() => {
                   onOpenChange(false);
+                  onOpenChat();
                   void navigate({ to: `/chats/${hit.chat_id}` });
                   onFound(hit.chat_id, hit.turn_id);
                 }}
@@ -561,6 +591,7 @@ function ChatListPanel({
   selectedLive,
   pickingUp,
   onPickUp,
+  onOpenChat,
   onNew,
 }: {
   rows: ChatSummary[];
@@ -569,6 +600,8 @@ function ChatListPanel({
   selectedLive: boolean;
   pickingUp: string | null;
   onPickUp: (sessionId: string) => void;
+  /** Told before the `<Link>` navigates, so the editor preview does not outlive the press. */
+  onOpenChat: () => void;
   onNew: () => void;
 }) {
   // Watched, because one of these may be being typed into in the editor while it is on screen here.
@@ -625,6 +658,7 @@ function ChatListPanel({
                         row={entry.chat}
                         active={entry.chat.chat_id === selected}
                         live={entry.chat.chat_id === selected && selectedLive}
+                        onOpen={onOpenChat}
                       />
                     ) : (
                       <EditorRow
@@ -730,10 +764,13 @@ function ChatRow({
   row,
   active,
   live,
+  onOpen,
 }: {
   row: ChatSummary;
   active: boolean;
   live: boolean;
+  /** See `openingAChat`. Pressing a row is one of the three ways a conversation gets opened. */
+  onOpen: () => void;
 }) {
   // A conversation with no name AND nothing said in it has no name to show. Drawing "New
   // conversation" made a dozen of them into a dozen identical rows; saying what is true of them
@@ -746,6 +783,10 @@ function ChatRow({
         to={`/chats/${row.chat_id}`}
         aria-label={chatRowLabel(row, live)}
         aria-current={active ? "page" : undefined}
+        /* Beside the navigation and not instead of it: the `<Link>` still does the routing, this
+           only takes the editor preview down on the way. Pressing the row you are ALREADY on has
+           to work too — that is the case an effect watching the id would sleep through. */
+        onClick={onOpen}
       >
         {/* The name, and only the name.
             The row used to carry the title, a coloured badge for the model, the working directory
@@ -950,11 +991,16 @@ function EditorDetail({
         /* The `@` note, corrected for this one case: there IS a folder — it is the one the session
            was had in — and what is missing is a conversation here to ask about it. */
         noFolderNote={`this conversation is not open here yet — say something to carry it on, and an @ will name the files in ${chosen.cwd}`}
-        onSay={(model, effort, text, images) =>
+        /* The one door that can answer this before the conversation exists. `chosen.tools` is the
+           same question the turn itself asks, already answered for this session — see
+           `OfferedSession`. */
+        tools={chosen.tools}
+        onSay={(model, effort, mode, text, images) =>
           start.mutate(
             {
               model: model ?? undefined,
               effort: effort ?? undefined,
+              permissionMode: mode,
               continueSession: chosen.session_id,
               text,
               images,
@@ -1309,11 +1355,12 @@ function NothingOpen() {
         </h2>
         <StartBox
           pending={start.isPending}
-          onSay={(model, effort, text, images) =>
+          onSay={(model, effort, mode, text, images) =>
             start.mutate(
               {
                 model: model ?? undefined,
                 effort: effort ?? undefined,
+                permissionMode: mode,
                 text,
                 images,
               },
@@ -1357,11 +1404,13 @@ function StartBox({
   placeholder = "Say something…",
   standing = "front",
   noFolderNote = "this conversation has no folder yet — open it, point it at a project, and an @ will name its files",
+  tools = false,
 }: {
   pending: boolean;
   onSay: (
     model: string | null,
     effort: string | null,
+    mode: PermissionMode,
     text: string,
     images: Attachment[],
   ) => void;
@@ -1378,6 +1427,16 @@ function StartBox({
   standing?: "front" | "thread";
   /** What to say when an `@` cannot be answered here. See the call in `EditorDetail`. */
   noFolderNote?: string;
+  /**
+   * Whether the conversation this opens would get `Bash`, `Read` and `Write`.
+   *
+   * Passed in rather than read here, because the two doors know different things: an editor
+   * session has been asked the question already and carries the answer, and the front door has no
+   * directory yet to ask about. Absent means no, which greys the three rungs that are only about
+   * what a hook lets through and leaves `Plan` and `Auto`, both of which mean something with no
+   * tools at all.
+   */
+  tools?: boolean;
 }) {
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
@@ -1385,6 +1444,7 @@ function StartBox({
   const [highlight, setHighlight] = useState(0);
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
+  const [mode, setMode] = useState<PermissionMode>("auto");
   const [attached, setAttached] = useState<Attachment[]>([]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const sayable = text.trim() !== "" && !pending;
@@ -1431,7 +1491,7 @@ function StartBox({
 
   const say = () => {
     if (!sayable) return;
-    onSay(model, effort, text.trim(), attached);
+    onSay(model, effort, mode, text.trim(), attached);
   };
 
   return (
@@ -1543,6 +1603,24 @@ function StartBox({
             onPick={setEffort}
           />
           <span className="chats-composer-gap" />
+          {/* Here and not only in the conversation's own composer, which is where it went first and
+              was the wrong half of the app: a session carried on from the editor is not a chat
+              until its first message opens one, so until now the only way to reach a rung was to
+              send a message on `auto` and change it afterwards -- which is exactly one message too
+              late for the rung anybody reaches for. It travels on the opening call for the reason
+              the model does, and is written into the row rather than after it for a reason the
+              model does not have: see `chats::create_on`. */}
+          <PermissionPicker
+            mode={mode}
+            onPick={setMode}
+            tools={tools}
+            barred={
+              tools
+                ? ""
+                : "not until this conversation has a folder with the classifier hook wired"
+            }
+            disabled={pending}
+          />
           <button
             type="submit"
             className="chats-send"
@@ -1765,17 +1843,21 @@ const PERMISSION_RUNGS: {
  * say which of the two reasons applies, and one of them — an unwired hook — is a button away in the
  * panel above.
  */
-function PermissionMenu({ chatId }: { chatId: string }) {
-  const project = useChatProject(chatId);
-  const set = useSetPermissionMode(chatId);
-  const mode = project.data?.permission_mode ?? "auto";
-  const tools = project.data?.tools ?? false;
-  /* Two different absences, and only one of them is actionable — which is why `cwd` travels beside
-     `tools` at all. */
-  const barred =
-    project.data?.cwd == null
-      ? "this conversation has no project directory"
-      : "the classifier hook is not wired in this project";
+function PermissionPicker({
+  mode,
+  onPick,
+  tools,
+  barred,
+  disabled,
+}: {
+  mode: PermissionMode;
+  onPick: (mode: PermissionMode) => void;
+  /** Whether this conversation's turns get `Bash`, `Read` and `Write` at all. */
+  tools: boolean;
+  /** What to say on the rungs `tools` puts out of reach. */
+  barred: string;
+  disabled: boolean;
+}) {
   const shown =
     PERMISSION_RUNGS.find((rung) => rung.mode === mode)?.label ?? "Auto";
 
@@ -1786,7 +1868,7 @@ function PermissionMenu({ chatId }: { chatId: string }) {
         /* Spelled out: the visible text is a mode's NAME, and a control whose whole accessible name
            is "Manual" announces a fact rather than something you can press. */
         aria-label={`Permissions: ${shown} — change what this conversation may do without asking`}
-        disabled={project.data === undefined || set.isPending}
+        disabled={disabled}
       >
         {shown}
         <ChevronDown className="chats-tool-caret" aria-hidden="true" />
@@ -1795,7 +1877,7 @@ function PermissionMenu({ chatId }: { chatId: string }) {
         <DropdownMenuLabel>What it may do without asking</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={mode}
-          onValueChange={(picked) => set.mutate(picked as PermissionMode)}
+          onValueChange={(picked) => onPick(picked as PermissionMode)}
         >
           {PERMISSION_RUNGS.map((rung) => {
             const unreachable = rung.needsTools && !tools;
@@ -1816,6 +1898,35 @@ function PermissionMenu({ chatId }: { chatId: string }) {
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+/**
+ * The rung of a conversation that EXISTS, read from the daemon and written back to it.
+ *
+ * Split from the picker above because the other door has no conversation to read: a session being
+ * carried on from the editor is not a chat until its first message is sent, so its rung is local
+ * state on the way into `POST /assistant/chats` rather than a PATCH. Same control, two lifetimes,
+ * and the split is what stops the front door growing a fake `chatId` to satisfy a hook.
+ */
+function PermissionMenu({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+  const set = useSetPermissionMode(chatId);
+  /* Two different absences, and only one of them is actionable — which is why `cwd` travels beside
+     `tools` at all. */
+  const barred =
+    project.data?.cwd == null
+      ? "this conversation has no project directory"
+      : "the classifier hook is not wired in this project";
+
+  return (
+    <PermissionPicker
+      mode={project.data?.permission_mode ?? "auto"}
+      onPick={(picked) => set.mutate(picked)}
+      tools={project.data?.tools ?? false}
+      barred={barred}
+      disabled={project.data === undefined || set.isPending}
+    />
   );
 }
 

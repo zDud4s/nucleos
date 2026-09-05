@@ -73,12 +73,70 @@ export interface ProjectRules {
    * second copy of it in the window is a copy that will eventually disagree.
    */
   gate_before_publish: boolean;
+  /** Who answers an approval a conversation on `auto` would otherwise put to a person. */
+  judge: JudgeState;
   schedules: ScheduleView[];
   repo_triggers: RepoTriggerView[];
   /** The effective ceiling. `null` means the brake is **off**, which is not a ceiling of zero. */
   wip_limit: number | null;
   open_proposals: number;
   queue_full: boolean;
+}
+
+/**
+ * The three states a project's judge can be in.
+ *
+ * Tagged and not two nullable fields, because `{ brain: null }` cannot tell "nobody has chosen"
+ * from "somebody chose nobody" — and those two must not be collapsed: the first should follow the
+ * default wherever it moves, the second is a decision that has to survive it.
+ */
+export type JudgeState =
+  | { state: "default" }
+  | { state: "off" }
+  | { state: "named"; brain: "local" | "openrouter"; model: string | null };
+
+/** What `POST /projects/{id}/judge` accepts. A null brain switches the judge off. */
+export interface JudgeChange {
+  projectId: string;
+  brain: "local" | "openrouter" | null;
+  model: string | null;
+}
+
+/**
+ * Names this project's judge, or switches it off.
+ *
+ * The DELETE is a second hook rather than a `null` through this one, matching the two doors the
+ * daemon opens: naming nobody and withdrawing the choice are different acts, and a single writer
+ * would have to carry the difference as null-versus-missing.
+ */
+export function useSetJudge() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ projectId, brain, model }: JudgeChange) =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/judge`, {
+        method: "POST",
+        body: JSON.stringify({ brain, model }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
+}
+
+/** Puts the project back on the default judge. 404 when it was already on it. */
+export function useClearJudge() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (projectId: string) =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/judge`, {
+        method: "DELETE",
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
 }
 
 /** One directory entry, as `inspect::Entry` serialises. */

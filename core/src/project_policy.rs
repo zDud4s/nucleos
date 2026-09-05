@@ -9,8 +9,14 @@
 //! the same first word, and the filename is the only place the difference can be stated before
 //! somebody opens the wrong one.
 //!
-//! One module for three tables because the three answer ONE question — what may this project do
-//! without asking — and splitting them would put the same `project_id` resolution in three places.
+//! One module for four tables because the four answer ONE question — what may this project do
+//! without asking — and splitting them would put the same `project_id` resolution in four places.
+//!
+//! The fourth is the judge, and it is the only one that does not name an OPERATION. The other three
+//! say what may be done; this one says WHO may say yes when a conversation on `auto` would
+//! otherwise stop and ask a person. Same question, answered one step further back — which is why it
+//! belongs here and not beside the conversation settings, where the mode that consults it lives: a
+//! judge is a property of the codebase being worked in, not of the chat window open on it.
 //!
 //! **Every read here fails in the safe direction, and the direction is not the same for all
 //! three.** An unreadable GitHub list or land-target list yields nothing, which withholds autonomy
@@ -431,6 +437,113 @@ pub async fn declare_land_target(
     .map_err(|error| format!("could not declare {branch} for {project_id}: {error}"))
 }
 
+/* --------------------------------------------------------------------------------- the judge -- */
+
+/// Who answers an approval when a conversation on `auto` would otherwise ask a person.
+///
+/// **Three states, and a nullable column is what makes them tellable apart.** No row at all is the
+/// ordinary case and means the local brain with whatever model it is configured for — every project
+/// has that without anybody deciding anything. A row naming no brain is somebody having decided the
+/// opposite on purpose: nothing answers but a person. A row naming one is a choice.
+///
+/// Two states would have collapsed the first and second, and the collapse is not cosmetic: it is
+/// the difference between "nobody has thought about this" and "somebody thought about it and said
+/// no", and only the second should survive a change to what the default is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Judge {
+    /// No row. The local brain, on the model it is already configured with.
+    Default,
+    /// A row naming no brain. Every question goes to the person.
+    Off,
+    /// A row naming one. `model` absent means that brain's own configured model.
+    Named {
+        brain: crate::chats::Brain,
+        model: Option<String>,
+    },
+}
+
+/// Reads the judge, and fails toward asking a person.
+///
+/// **`Off` and not `Default` on an error**, which is the opposite of what this code did when the
+/// judge first shipped: it read the row with `.unwrap_or(None)`, so an unreadable table became "no
+/// row", and "no row" is the state that GRANTS an automatic approver. A database that cannot be
+/// read would have quietly handed out a yes-man. This module's own header says every read here
+/// fails in the safe direction; for this table the safe direction is nobody.
+///
+/// Note which way that cuts and which way it does not. Failing to `Off` withholds autonomy — the
+/// person is asked, the turn waits, nothing is approved that would not have been. It cannot cost an
+/// approval somebody wrote down, because the thing it withholds is an approval nobody wrote down.
+pub async fn judge(pool: &SqlitePool, project_id: &str) -> Judge {
+    let row: Result<Option<(Option<String>, Option<String>)>, _> =
+        sqlx::query_as("SELECT brain, model FROM project_judge WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await;
+    match row {
+        Ok(None) => Judge::Default,
+        Ok(Some((None, _))) => Judge::Off,
+        Ok(Some((Some(brain), model))) => Judge::Named {
+            brain: crate::chats::Brain::from_wire(&brain),
+            model,
+        },
+        Err(error) => {
+            tracing::warn!(%error, %project_id, "reading the judge failed; the person will be asked");
+            Judge::Off
+        }
+    }
+}
+
+/// Names this project's judge, or switches it off.
+///
+/// `None` for the brain is the switch-off, and it is a row rather than the absence of one — see
+/// `Judge`. The model travels with the brain and is dropped when there is none, so a switched-off
+/// judge cannot keep a stale model to be resurrected by a later half-edit.
+///
+/// `Brain::Cloud` is refused here rather than left to the CHECK constraint. The constraint would
+/// reject it too, but as a database error the caller has to translate — and the reason is worth one
+/// sentence in the one place somebody will read it: the cloud route answers through the CLI, and a
+/// CLI launched to answer a hook would re-enter that very hook.
+pub async fn declare_judge(
+    pool: &SqlitePool,
+    project_id: &str,
+    brain: Option<crate::chats::Brain>,
+    model: Option<&str>,
+) -> Result<(), String> {
+    if brain == Some(crate::chats::Brain::Cloud) {
+        return Err(
+            "the cloud route answers through the CLI, and a CLI launched to answer a hook would              re-enter that hook — a judge has to be local or openrouter"
+                .to_owned(),
+        );
+    }
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    sqlx::query(
+        "INSERT INTO project_judge (project_id, brain, model, created_at)
+         VALUES (?, ?, ?, datetime('now'))
+         ON CONFLICT (project_id)
+         DO UPDATE SET brain = excluded.brain, model = excluded.model",
+    )
+    .bind(project_id)
+    .bind(brain.map(crate::chats::Brain::as_str))
+    .bind(if brain.is_none() { None } else { model })
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("could not name a judge for {project_id}: {error}"))
+}
+
+/// Takes the row away, putting the project back on the default.
+///
+/// `Ok(false)` when there was none — a project that never named a judge is already on the default,
+/// and saying so is more honest than inventing a deletion.
+pub async fn clear_judge(pool: &SqlitePool, project_id: &str) -> Result<bool, String> {
+    sqlx::query("DELETE FROM project_judge WHERE project_id = ?")
+        .bind(project_id)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() > 0)
+        .map_err(|error| format!("could not clear the judge for {project_id}: {error}"))
+}
+
 /// Closes one landing target. `integration_branch` needs no row to stay admissible, so this can
 /// never take away the one destination every project already has — which is also why `Ok(false)`
 /// over the integration branch's own name is the honest answer rather than a missing feature: there
@@ -458,6 +571,106 @@ pub async fn forget_land_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn judged_pool() -> sqlx::SqlitePool {
+        let pool = crate::testdb::pool_migrated_through(0).await;
+        crate::testdb::apply_migrations_after(&pool, 0).await;
+        pool
+    }
+
+    /// The three states are distinguishable, and the middle one only exists because a column can be
+    /// null. Written as a walk rather than three tests because the point is that they DIFFER.
+    #[tokio::test]
+    async fn a_project_can_have_a_judge_named_switched_off_or_left_alone() {
+        let pool = judged_pool().await;
+
+        assert_eq!(judge(&pool, "nucleos").await, Judge::Default);
+
+        declare_judge(
+            &pool,
+            "nucleos",
+            Some(crate::chats::Brain::Local),
+            Some("qwen3"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            judge(&pool, "nucleos").await,
+            Judge::Named {
+                brain: crate::chats::Brain::Local,
+                model: Some("qwen3".to_owned()),
+            }
+        );
+
+        // The row is replaced, not added to: one judge per project, and a second naming is a change
+        // of mind rather than a second opinion.
+        declare_judge(
+            &pool,
+            "nucleos",
+            Some(crate::chats::Brain::OpenRouter),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            judge(&pool, "nucleos").await,
+            Judge::Named {
+                brain: crate::chats::Brain::OpenRouter,
+                model: None,
+            }
+        );
+
+        declare_judge(&pool, "nucleos", None, Some("qwen3"))
+            .await
+            .unwrap();
+        assert_eq!(
+            judge(&pool, "nucleos").await,
+            Judge::Off,
+            "a switched-off judge keeps no model to be resurrected by a later half-edit"
+        );
+
+        assert!(clear_judge(&pool, "nucleos").await.unwrap());
+        assert_eq!(judge(&pool, "nucleos").await, Judge::Default);
+        assert!(
+            !clear_judge(&pool, "nucleos").await.unwrap(),
+            "a project already on the default has no row to take away"
+        );
+    }
+
+    /// **The security half.** A read that fails must not hand out a judge.
+    ///
+    /// This is what the code did when the judge first shipped: `.unwrap_or(None)` turned an
+    /// unreadable table into "no row", and no row is the state that GRANTS the default local
+    /// approver. A database somebody could not read would have quietly appointed a yes-man.
+    ///
+    /// A pool stopped before `0129` is the real shape of that failure -- `project_judge` genuinely
+    /// does not exist -- rather than a mock that returns an error nobody has to believe in.
+    #[tokio::test]
+    async fn a_judge_that_cannot_be_read_is_nobody_rather_than_the_default() {
+        let pool = crate::testdb::pool_migrated_through(128).await;
+
+        assert_eq!(
+            judge(&pool, "nucleos").await,
+            Judge::Off,
+            "withholding a judge costs an approval nobody wrote down; granting one costs the person"
+        );
+    }
+
+    /// `cloud` is refused where the reason for refusing it can be given.
+    ///
+    /// The CHECK constraint would reject it too, and as a database error the caller would have to
+    /// translate — so this fails earlier and says why, in the words somebody reading the refusal
+    /// needs: a CLI launched to answer a hook re-enters that hook.
+    #[tokio::test]
+    async fn the_cloud_route_cannot_be_a_judge_because_it_would_re_enter_the_hook() {
+        let pool = judged_pool().await;
+
+        let refused = declare_judge(&pool, "nucleos", Some(crate::chats::Brain::Cloud), None)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("re-enter"), "{refused}");
+        assert_eq!(judge(&pool, "nucleos").await, Judge::Default);
+    }
 
     fn rules(allow: &[&str], deny: &[&str]) -> ShellRules {
         ShellRules {

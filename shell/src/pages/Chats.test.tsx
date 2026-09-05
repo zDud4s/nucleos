@@ -1153,12 +1153,61 @@ describe("Chats - choosing a model", () => {
 
     // On the opening call and not as a PATCH afterwards: there is no conversation to PATCH until
     // this returns, and correcting one a round trip later is visible — and wrong if it fails.
+    // The rung rides along on every opening call, `auto` included: it is what the column would have
+    // defaulted to anyway, and saying it costs nothing next to a wire that sometimes omits it.
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats", {
         method: "POST",
-        body: JSON.stringify({ model: "fable" }),
+        body: JSON.stringify({ model: "fable", permission_mode: "auto" }),
       });
     });
+  });
+
+  // The gap this closes: the rung lived only in a conversation's own composer, and an editor
+  // session is not a conversation until its first message opens one. So the only way to reach
+  // `plan` was to send a message on `auto` and change it afterwards — one message too late for the
+  // rung anybody reaches for BEFORE letting an agent near a codebase.
+  it("carries the rung into the first message too, from the door that has no conversation yet", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+
+    await renderChats("/chats");
+    await openPermissionMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /Plan/ }));
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats", {
+        method: "POST",
+        body: JSON.stringify({ permission_mode: "plan" }),
+      });
+    });
+  });
+
+  // The front door has no folder yet, so the three rungs that are only about what a hook lets
+  // through have nothing to be about. `Plan` and `Auto` still mean something with no tools at all —
+  // one is a flag the CLI is launched with, the other is what every conversation already holds.
+  it("offers only the two rungs that mean something without a folder", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+
+    await renderChats("/chats");
+    await openPermissionMenu();
+
+    const reachable = (name: RegExp) => {
+      const row = screen.getByRole("menuitemradio", { name });
+      return (
+        row.getAttribute("aria-disabled") !== "true" &&
+        row.getAttribute("data-disabled") === null
+      );
+    };
+
+    expect(reachable(/Plan/)).toBe(true);
+    expect(reachable(/Auto/)).toBe(true);
+    expect(reachable(/Manual/)).toBe(false);
+    expect(reachable(/Edit automatically/)).toBe(false);
+    expect(reachable(/Bypass permissions/)).toBe(false);
   });
 });
 
@@ -2578,6 +2627,44 @@ async function withEditorSessions(sessions: IdeSession[], said: Record<string, C
 }
 
 describe("the editor's sessions, in the same list as the rest", () => {
+  // The bug, in the sequence somebody hit it in: open a conversation, look at an editor session,
+  // then go back. The URL changes and the row lights up as current, and the pane keeps showing the
+  // editor session — because what the pane draws is decided by a piece of state the list sets and
+  // no navigation clears, and that state outranks the route.
+  //
+  // Going back to the SAME conversation is the half a `useEffect` on the id would miss, so it is
+  // the half asserted here.
+  it("comes back to the conversation after an editor session was looked at", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", first_message: "o que ficou por fazer" })],
+        { "c-1": [turnRow({ id: 1, asked: "o que ficou por fazer", answer: "aqui estou" })] },
+        {
+          ideSessions: [ideSession()],
+          said: {
+            "sess-1": {
+              cut: false,
+              said: [{ by_owner: true, text: "arranja o parser de datas", aside: false }],
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+    expect(await screen.findByText("aqui estou")).toBeTruthy();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /arranja o parser de datas/i }),
+    );
+    expect(
+      await screen.findByPlaceholderText("Carry on where you left off…"),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("link", { name: /o que ficou por fazer/i }));
+
+    expect(await screen.findByText("aqui estou")).toBeTruthy();
+  });
+
   it("lists them beside the conversations this app opened, not behind a door", async () => {
     await withEditorSessions([ideSession()]);
 

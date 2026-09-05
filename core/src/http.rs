@@ -177,6 +177,14 @@ pub fn build_router(state: AppState) -> Router {
         // that could name the decisions could name the ones whose answer it liked.
         .route("/projects/{id}/map/triage", post(post_project_map_triage))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
+        // Two doors and not one PUT with a nullable field, because the three states are not a value
+        // and its absence: naming nobody is a decision, and taking the row away is withdrawing one.
+        // A single writer would have had to spell the difference as null-versus-missing, which is
+        // the distinction JSON is worst at carrying.
+        .route(
+            "/projects/{id}/judge",
+            post(post_project_judge).delete(delete_project_judge),
+        )
         .route("/projects/{id}/ls", get(get_project_ls))
         .route("/projects/{id}/cat", get(get_project_cat))
         .route("/projects/{id}/grep", get(get_project_grep))
@@ -3208,6 +3216,8 @@ struct ProjectRules {
     /// moment entirely — and a brake nobody can see through this route is one nobody thinks to
     /// check when a landing takes twenty minutes.
     gate_before_publish: bool,
+    /// Who answers an approval a conversation on `auto` would otherwise put to a person.
+    judge: JudgeView,
     schedules: Vec<ScheduleView>,
     repo_triggers: Vec<RepoTriggerView>,
     /// The effective open-proposal ceiling: the project's own, else the global default. `null` means
@@ -3335,6 +3345,10 @@ async fn get_project_rules(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Read before the struct takes `id`, which is what the borrow checker was pointing at and is
+    // also the clearer order: every other field here is gathered above.
+    let judge: JudgeView = crate::project_policy::judge(&state.pool, &id).await.into();
+
     Ok(Json(ProjectRules {
         project_id: id,
         project_root,
@@ -3342,6 +3356,7 @@ async fn get_project_rules(
         rules_error,
         gate_command: loaded.gate_command.clone(),
         gate_before_publish: loaded.gate_before_publish,
+        judge,
         schedules,
         repo_triggers,
         wip_limit,
@@ -9717,6 +9732,19 @@ struct CreateChatRequest {
     model: Option<String>,
     /// How hard it is asked to think, on the same footing.
     effort: Option<String>,
+    /// What the conversation may do without asking, from its first message.
+    ///
+    /// Here for the same reason `model` is -- the front door has nothing to PATCH yet -- and,
+    /// unlike `model`, it is written INTO the row rather than applied a step later. A rung that
+    /// failed to take would leave the conversation on `auto`, which is wider than what was asked
+    /// for; see `chats::create_on`.
+    ///
+    /// Absent means `auto`, which is the column's own default and what every conversation opened
+    /// before this field existed already holds. A spelling outside the five fails the request
+    /// rather than falling back, on the PATCH's reasoning: the reader's leniency exists for rows
+    /// written before the column did, and applying it to a request would let a typo widen what a
+    /// conversation may do.
+    permission_mode: Option<crate::chats::PermissionMode>,
     /// Who answers when the chosen model is unavailable, as choice ids in the order to try them.
     #[serde(default)]
     fallback_model: Vec<String>,
@@ -9752,6 +9780,106 @@ struct OfferedSession {
     /// by restating the rule here. A second opinion about this would be a window promising tools
     /// the turn then does not get.
     tools: bool,
+}
+
+/// The judge as the window reads it.
+///
+/// Tagged rather than flattened into two nullable fields, because the three states are what this
+/// type is FOR and `{"brain": null}` cannot tell "nobody has chosen" from "somebody chose nobody" —
+/// which is the whole distinction `project_policy::Judge` exists to keep.
+#[derive(serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum JudgeView {
+    /// No row. The local brain, on the model it is already configured with.
+    Default,
+    /// Somebody switched it off. Every question goes to a person.
+    Off,
+    /// Somebody named one.
+    Named {
+        brain: String,
+        model: Option<String>,
+    },
+}
+
+impl From<crate::project_policy::Judge> for JudgeView {
+    fn from(judge: crate::project_policy::Judge) -> Self {
+        match judge {
+            crate::project_policy::Judge::Default => Self::Default,
+            crate::project_policy::Judge::Off => Self::Off,
+            crate::project_policy::Judge::Named { brain, model } => Self::Named {
+                brain: brain.as_str().to_owned(),
+                model,
+            },
+        }
+    }
+}
+
+/// What `POST /projects/{id}/judge` accepts. A null brain switches the judge off.
+#[derive(serde::Deserialize)]
+struct JudgeRequest {
+    /// `local` or `openrouter`. Null means nobody answers but a person.
+    brain: Option<String>,
+    /// Which model, when a brain is named. Null means that brain's configured one.
+    model: Option<String>,
+}
+
+/// Names this project's judge, or switches it off.
+///
+/// The refusal for `cloud` comes back from `declare_judge` rather than being restated here: the
+/// reason is about what a cloud brain IS — it answers through the CLI, and a CLI launched to answer
+/// a hook would re-enter that hook — and a second copy of that sentence in the routing layer is a
+/// second copy free to drift from the first.
+async fn post_project_judge(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<JudgeRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    project_is_on_the_roster(&state, &id).await?;
+
+    let brain = match body.brain.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(named) => Some(crate::chats::Brain::from_wire(named)),
+    };
+    if let Some(model) = body.model.as_deref() {
+        within_length("model", model)?;
+    }
+
+    crate::project_policy::declare_judge(&state.pool, &id, brain, body.model.as_deref())
+        .await
+        .map_err(|why| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "refusal": "unusable_judge", "detail": why })),
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Puts the project back on the default judge.
+///
+/// 404 when there was no row, off the DELETE's own `rows_affected` — the same shape
+/// `delete_project_land_target` uses, and the same honesty: a project that never named a judge is
+/// already on the default, and reporting a deletion that did not happen would be a lie the window
+/// would draw as a change.
+async fn delete_project_judge(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    project_is_on_the_roster(&state, &id).await?;
+
+    let cleared = crate::project_policy::clear_judge(&state.pool, &id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "clearing a project judge failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+
+    if cleared {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(refusal(StatusCode::NOT_FOUND, "no_judge"))
+    }
 }
 
 /// The conversations already had in the IDE that this daemon could continue.
@@ -9950,12 +10078,18 @@ async fn create_chat(
         }
     };
 
-    let chat_id = crate::chats::create(&state.pool, brain, continued.as_ref())
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "opening a chat failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let chat_id = crate::chats::create_on(
+        &state.pool,
+        brain,
+        continued.as_ref(),
+        body.permission_mode
+            .unwrap_or(crate::chats::PermissionMode::Auto),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "opening a chat failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // After the row exists rather than as arguments to `create`, which takes the facts a
     // conversation cannot be opened without. These two are preferences: a conversation with neither
@@ -21885,6 +22019,89 @@ mod tests {
             .collect();
         // A conversation you can open and have not yet used: it is listed before it has one turn.
         assert!(ids.contains(&chat_id.as_str()));
+    }
+
+    /// The rung a conversation opens on comes in on the opening call, and an absent one is `auto`.
+    ///
+    /// **The front door is the only place `plan` can be asked for in time.** A session carried on
+    /// from the editor is not a chat until its first message opens one, so before this the only
+    /// route to a rung was to send a message on `auto` and change it afterwards -- one message too
+    /// late for the rung people reach for BEFORE letting an agent near a codebase.
+    ///
+    /// The pair is the test. Without the field the conversation still opens, and it opens on `auto`
+    /// -- so an assertion on `plan` alone would pass just as well against a handler that dropped
+    /// the field on the floor and let the column default answer.
+    #[tokio::test]
+    async fn a_conversation_opens_on_the_rung_it_was_asked_for() {
+        for (body, expected) in [
+            (
+                r#"{"permission_mode":"plan"}"#,
+                crate::chats::PermissionMode::Plan,
+            ),
+            (r#"{}"#, crate::chats::PermissionMode::Auto),
+        ] {
+            let state = test_state().await;
+            let created = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/assistant/chats")
+                        .header("Authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let chat_id = json_body(created).await["chat_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                crate::chats::permission_mode_of(&state.pool, &chat_id)
+                    .await
+                    .unwrap(),
+                expected,
+                "opening body was {body}"
+            );
+        }
+    }
+
+    /// A spelling outside the five fails the request rather than falling back to `auto`.
+    ///
+    /// The reader is lenient on purpose -- rows written before the column existed have to read as
+    /// something -- and applying that leniency to a REQUEST would let a typo widen what a
+    /// conversation may do. Nothing is opened: the refusal comes from deserialisation, before the
+    /// handler runs at all.
+    #[tokio::test]
+    async fn a_rung_nobody_can_spell_opens_no_conversation() {
+        let state = test_state().await;
+        // Counted before and after rather than asserted at zero: `test_state` seeds a conversation
+        // of its own, and an absolute count would be measuring the fixture instead of the request.
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let refused = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"permission_mode":"bypasss"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "a refused spelling opened a conversation");
     }
 
     /// A chat opened with no `brain` at all is a cloud chat, matching the column default and every

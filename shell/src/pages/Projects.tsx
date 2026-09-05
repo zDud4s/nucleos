@@ -19,6 +19,8 @@ import {
   useProjectGrep,
   useProjectLs,
   useProjectRules,
+  useClearJudge,
+  useSetJudge,
   useSetWipLimit,
   type AutonomyRule,
   type Concern,
@@ -839,6 +841,7 @@ function RulesView({
       <RulesFileState rules={rules.data} />
       <Autonomy rules={rules.data} />
       <GatePanel command={rules.data.gate_command} beforePublish={rules.data.gate_before_publish} />
+      <JudgePanel projectId={projectId} rules={rules.data} />
       <WipPanel projectId={projectId} rules={rules.data} />
     </>
   );
@@ -1145,6 +1148,80 @@ function GatePanel({ command, beforePublish }: { command: string | null; beforeP
             : "Merges do not wait for it: the queue publishes without measuring the tree the two branches make together."}
         </p>
       )}
+    </Panel>
+  );
+}
+
+/**
+ * Who answers for a conversation on `auto`.
+ *
+ * A project-level answer to a per-conversation question, and that is deliberate: the rung belongs
+ * to the chat window, but WHO may say yes on your behalf belongs to the codebase being worked in.
+ * A judge you trust on a scratch repository is not one you want on the thing that pays the rent.
+ *
+ * **Three states, and the middle one is the reason this is not a checkbox.** The default is the
+ * local brain — every project has it without anybody deciding anything, and it should follow the
+ * default wherever the default moves. Switched off is somebody having decided the opposite ON
+ * PURPOSE, and it has to survive a change to what the default is. A two-state control would fuse
+ * them and quietly re-enable a judge somebody had turned off.
+ *
+ * Naming a specific model is deliberately not offered here yet. The daemon takes one — `POST` this
+ * route with a `model` and it is stored — but a picker needs the model list filtered to the two
+ * routes that can judge, and offering a text field for it would invite a spelling the daemon
+ * accepts and then cannot serve. The three states are the decision; the model is a refinement.
+ */
+function JudgePanel({ projectId, rules }: { projectId: string; rules: ProjectRules }) {
+  const name = useSetJudge();
+  const clear = useClearJudge();
+  const busy = name.isPending || clear.isPending;
+
+  return (
+    <Panel title="Judge">
+      <p className="pj-note">
+        A conversation on <strong>Auto</strong> stops and asks about anything its rules do not
+        recognise. A judge is what answers those in your place — a local model, given the command
+        and nothing else, inside the same window you would have had to answer in.
+      </p>
+
+      <p className="pj-wip-state">
+        {rules.judge.state === "default" ? (
+          <>
+            The <strong>local</strong> brain answers, on whatever model it is configured with.
+            Nobody has chosen otherwise for this project.
+          </>
+        ) : rules.judge.state === "off" ? (
+          <>
+            <strong>Nobody</strong> answers but you. Every question a conversation on Auto raises
+            here waits for a person.
+          </>
+        ) : (
+          <>
+            The <strong>{rules.judge.brain}</strong> brain answers
+            {rules.judge.model === null ? (
+              <>, on its configured model.</>
+            ) : (
+              <>
+                , on <code className="pj-gate">{rules.judge.model}</code>.
+              </>
+            )}
+          </>
+        )}
+      </p>
+
+      <div className="pj-actions">
+        <Button
+          disabled={busy || rules.judge.state === "off"}
+          onClick={() => name.mutate({ projectId, brain: null, model: null })}
+        >
+          Nobody but me
+        </Button>
+        <Button
+          disabled={busy || rules.judge.state === "default"}
+          onClick={() => clear.mutate(projectId)}
+        >
+          Back to the default
+        </Button>
+      </div>
     </Panel>
   );
 }

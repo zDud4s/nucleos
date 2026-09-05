@@ -42,6 +42,7 @@ function rules(overrides: Partial<ProjectRules> = {}): ProjectRules {
     rules_error: null,
     gate_command: "cargo test -p nucleos-core",
     gate_before_publish: false,
+    judge: { state: "default" },
     schedules: [],
     repo_triggers: [],
     wip_limit: null,
@@ -282,6 +283,62 @@ describe("Projects - a rules file that cannot be read", () => {
     // The gitignored file is absent in every worktree and every fresh clone, so
     // it must not raise an alarm.
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("Projects - who answers for a conversation on Auto", () => {
+  // Three states and not two, and the middle one is the whole reason: "nobody has chosen" must
+  // follow the default wherever it moves, and "somebody chose nobody" must survive it. A control
+  // that fused them would quietly re-enable a judge somebody had turned off.
+  it("tells the default apart from a judge somebody switched off", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
+    await renderProjects("/projects/alpha/rules");
+    expect(await screen.findByText(/Nobody has chosen otherwise/)).toBeDefined();
+
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "off" } }) }));
+    await renderProjects("/projects/alpha/rules");
+    expect(await screen.findByText(/waits for a person/)).toBeDefined();
+  });
+
+  it("names the model when one was named, and says which brain either way", async () => {
+    answerWith(
+      projectsWorld({
+        rules: rules({
+          judge: { state: "named", brain: "openrouter", model: "qwen3" },
+        }),
+      }),
+    );
+
+    await renderProjects("/projects/alpha/rules");
+
+    const panel = (await screen.findByText("Judge")).closest("section") as HTMLElement;
+    expect(panel.textContent).toContain("openrouter");
+    expect(panel.textContent).toContain("qwen3");
+  });
+
+  // Two doors on the daemon, so two buttons — and each is dead where it would change nothing,
+  // which is what stops "Back to the default" reading as a way to switch the judge off.
+  it("offers only the move that would change something", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    const off = await screen.findByRole("button", { name: "Nobody but me" });
+    const back = screen.getByRole("button", { name: "Back to the default" });
+    expect((off as HTMLButtonElement).disabled).toBe(false);
+    expect((back as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(off);
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/projects/alpha/judge",
+      );
+      expect(sent?.[1]).toMatchObject({ method: "POST" });
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({
+        brain: null,
+        model: null,
+      });
+    });
   });
 });
 
