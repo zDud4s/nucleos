@@ -52,6 +52,24 @@ function rules(overrides: Partial<ProjectRules> = {}): ProjectRules {
   };
 }
 
+/**
+ * The daemon's model menu, as the judge picker reads it.
+ *
+ * A cloud row is on it deliberately: "the picker does not offer cloud" asserts nothing if the
+ * fixture never carried a cloud model to leave out. `gemma3` is local and not pulled, which is the
+ * one row that is listed and not selectable.
+ */
+const MODELS = {
+  choices: [
+    { id: "sonnet", label: "Sonnet", brain: "cloud", efforts: [] },
+    { id: "qwen3", label: "Qwen 3", brain: "local", efforts: [], installed: true },
+    { id: "gemma3", label: "Gemma 3", brain: "local", efforts: [], installed: false },
+    { id: "kimi-k2", label: "Kimi K2", brain: "openrouter", efforts: [] },
+  ],
+  configured: "sonnet",
+  efforts: ["low", "high"],
+};
+
 /* ----------------------------------------------------------- the daemon -- */
 
 interface ProjectsWorld {
@@ -101,6 +119,7 @@ function projectsFetch(world: ProjectsWorld): (path: string, init?: RequestInit)
       return undefined;
     }
 
+    if (path === "/assistant/models") return MODELS;
     if (path === "/projects") return world.projects;
     if (path === "/autopilot/kill") return shared.kill;
     if (path === "/autopilot/budget") return shared.budget;
@@ -286,6 +305,20 @@ describe("Projects - a rules file that cannot be read", () => {
   });
 });
 
+/**
+ * The judge control, with its menu already on it.
+ *
+ * The control exists before the menu does — it is drawn with the two rows that name no model, and
+ * `GET /assistant/models` is a second query that lands a tick later. Every assertion below is about
+ * what is on the list, so reading it the moment the control is found would read it empty and pass
+ * or fail for the wrong reason.
+ */
+async function judgeChooser(): Promise<HTMLSelectElement> {
+  const chooser = (await screen.findByLabelText("Who answers")) as HTMLSelectElement;
+  await waitFor(() => expect(chooser.querySelector("optgroup")).not.toBeNull());
+  return chooser;
+}
+
 describe("Projects - who answers for a conversation on Auto", () => {
   // Three states and not two, and the middle one is the whole reason: "nobody has chosen" must
   // follow the default wherever it moves, and "somebody chose nobody" must survive it. A control
@@ -316,18 +349,53 @@ describe("Projects - who answers for a conversation on Auto", () => {
     expect(panel.textContent).toContain("qwen3");
   });
 
-  // Two doors on the daemon, so two buttons — and each is dead where it would change nothing,
-  // which is what stops "Back to the default" reading as a way to switch the judge off.
-  it("offers only the move that would change something", async () => {
+  // The whole state space on one list, because every row is a different answer to one question.
+  // Two of them are not models at all, and they are what stops this being a model picker that
+  // cannot say "nobody".
+  it("puts the default, nobody, and every model that could judge on one list", async () => {
     answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
     await renderProjects("/projects/alpha/rules");
 
-    const off = await screen.findByRole("button", { name: "Nobody but me" });
-    const back = screen.getByRole("button", { name: "Back to the default" });
-    expect((off as HTMLButtonElement).disabled).toBe(false);
-    expect((back as HTMLButtonElement).disabled).toBe(true);
+    const chooser = await judgeChooser();
+    expect(chooser.value).toBe("default");
 
-    fireEvent.click(off);
+    const offered = [...chooser.options].map((option) => option.value);
+    expect(offered).toContain("default");
+    expect(offered).toContain("off");
+    expect(offered).toContain("qwen3");
+    expect(offered).toContain("kimi-k2");
+    // The cloud route answers through the CLI, and a CLI launched to answer a hook would re-enter
+    // it. The daemon refuses it; this is the half that stops anybody having to find that out.
+    expect(offered).not.toContain("sonnet");
+  });
+
+  // The brain travels out of the row that named the model, never out of a second control — which
+  // is the disagreement the daemon now refuses at the door.
+  it("sends the route beside the model it came from", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    fireEvent.change(await judgeChooser(), { target: { value: "kimi-k2" } });
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/projects/alpha/judge",
+      );
+      expect(sent?.[1]).toMatchObject({ method: "POST" });
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({
+        brain: "openrouter",
+        model: "kimi-k2",
+      });
+    });
+  });
+
+  // Two doors on the daemon and one control over them: naming nobody is a POST, withdrawing the
+  // choice is a DELETE, and the difference is not null-versus-missing on one route.
+  it("switches the judge off through the write", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    fireEvent.change(await judgeChooser(), { target: { value: "off" } });
 
     await waitFor(() => {
       const sent = daemon.apiFetch.mock.calls.find(
@@ -339,6 +407,71 @@ describe("Projects - who answers for a conversation on Auto", () => {
         model: null,
       });
     });
+  });
+
+  it("puts it back on the default through the delete", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "off" } }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    fireEvent.change(await judgeChooser(), { target: { value: "default" } });
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) =>
+          String(call[0]) === "/projects/alpha/judge" &&
+          (call[1] as RequestInit)?.method === "DELETE",
+      );
+      expect(sent).toBeDefined();
+    });
+  });
+
+  /* A select whose value is absent from its options shows the FIRST option. Without a row of its
+     own, a judge the menu can no longer name — Ollama stopped, a hosted key withdrawn, a name
+     taken out of the file — would be drawn as the default: the panel claiming nobody had chosen
+     while the daemon holds a choice. */
+  it("keeps a judge the menu can no longer name visible instead of redrawing it as the default", async () => {
+    answerWith(
+      projectsWorld({
+        rules: rules({ judge: { state: "named", brain: "local", model: "a-model-since-removed" } }),
+      }),
+    );
+    await renderProjects("/projects/alpha/rules");
+
+    const chooser = await judgeChooser();
+    expect(chooser.value).toBe("a-model-since-removed");
+    expect(chooser.selectedOptions[0].textContent).toContain("not on the menu now");
+  });
+
+  /* And "not on the menu" is a claim about a menu, so it waits for one. With the daemon
+     unreachable every model is missing from an empty list, and the panel must not spend that whole
+     time telling somebody their perfectly good judge is gone. */
+  it("does not call a judge missing while it has no menu to have missed it from", async () => {
+    const world = projectsWorld({
+      rules: rules({ judge: { state: "named", brain: "local", model: "qwen3" } }),
+    });
+    answerWith(world);
+    const served = daemon.apiFetch.getMockImplementation()!;
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/assistant/models" ? Promise.reject(new Error("no daemon")) : served(path, init),
+    );
+
+    await renderProjects("/projects/alpha/rules");
+
+    const chooser = (await screen.findByLabelText("Who answers")) as HTMLSelectElement;
+    await waitFor(() => expect(chooser.value).toBe("qwen3"));
+    expect(chooser.selectedOptions[0].textContent).toBe("qwen3");
+  });
+
+  /* A local model this machine has not pulled cannot answer anything. Listed rather than hidden —
+     seeing it is how somebody learns it can be had — and not selectable. */
+  it("lists a local model this machine has not downloaded without offering it", async () => {
+    answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
+    await renderProjects("/projects/alpha/rules");
+
+    const chooser = await judgeChooser();
+    const absent = [...chooser.options].find((option) => option.value === "gemma3");
+    expect(absent?.disabled).toBe(true);
+    expect(absent?.textContent).toContain("not downloaded");
   });
 });
 

@@ -442,6 +442,14 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* A menu, not a typed field: the mono face `.pj-field-input` sets is for a value somebody
+   composes character by character, and every row of this one is a sentence. `max-width` is wider
+   than the number field and narrower than a path, because the longest row here is a model label. */
+.pj-field-select {
+  max-width: 26rem;
+  font-family: var(--font-sans);
+}
+
 .pj-field-input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
