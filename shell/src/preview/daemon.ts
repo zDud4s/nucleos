@@ -1383,6 +1383,17 @@ export const CHAT_TURNS = [
   },
 ];
 
+/*
+  Two routes and not one, because two pickers read this list and the second one only exists for the
+  half the first barely uses. The chat window draws the whole menu; the judge picker on the
+  inspector's rules view draws the LOCAL and HOSTED rows and nothing else — a cloud judge would
+  answer through the CLI, and a CLI launched to answer a hook would re-enter it. A cloud-only
+  fixture photographs that control with an empty menu, which is a real state and the least
+  informative one to look at.
+
+  `gemma3` is deliberately not installed: it is the one row that is listed and not selectable, and
+  a shot is the only place that distinction is visible at all.
+*/
 export const CHAT_MODELS = {
   choices: [
     { id: "sonnet", label: "Sonnet 5", brain: "cloud", efforts: [] },
@@ -1392,6 +1403,9 @@ export const CHAT_MODELS = {
       brain: "cloud",
       efforts: ["low", "medium", "high", "xhigh", "max"],
     },
+    { id: "qwen3:8b", label: "Qwen 3 8B", brain: "local", efforts: [], installed: true },
+    { id: "gemma3:12b", label: "Gemma 3 12B", brain: "local", efforts: [], installed: false },
+    { id: "moonshotai/kimi-k2", label: "Kimi K2", brain: "openrouter", efforts: [] },
   ],
   configured: "sonnet",
   efforts: ["low", "medium", "high", "xhigh", "max"],

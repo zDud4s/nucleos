@@ -30,6 +30,7 @@ import {
   type ProjectView,
   type RuleState,
 } from "../data/projects";
+import { useAssistantModels, type ModelChoice } from "../data/chats";
 import { useProjects } from "../data/system";
 import {
   Badge,
@@ -1165,63 +1166,157 @@ function GatePanel({ command, beforePublish }: { command: string | null; beforeP
  * PURPOSE, and it has to survive a change to what the default is. A two-state control would fuse
  * them and quietly re-enable a judge somebody had turned off.
  *
- * Naming a specific model is deliberately not offered here yet. The daemon takes one — `POST` this
- * route with a `model` and it is stored — but a picker needs the model list filtered to the two
- * routes that can judge, and offering a text field for it would invite a spelling the daemon
- * accepts and then cannot serve. The three states are the decision; the model is a refinement.
+ * **One control and not a picker beside two buttons.** Every state this panel can reach is a
+ * different answer to one question, so they belong on one list; two buttons plus a menu would let
+ * somebody name a model and switch the judge off in the same gesture, and leave the panel to
+ * decide which of the two they meant.
+ *
+ * The menu is the daemon's own — `GET /assistant/models`, the same read the chat window's picker
+ * draws — narrowed to the two routes that can judge. `cloud` is absent because it answers through
+ * the CLI, and a CLI launched to answer a hook would re-enter that hook; the daemon refuses it
+ * either way, and this is the half that stops anybody having to find that out.
+ *
+ * **A model that declares no tool calling is not marked here, unlike in the chat picker.** A judge
+ * is shown a request and a call and answers with one word; it is handed no tools and would have
+ * nowhere to use them. `installed` is the mark that matters instead: a local model this machine has
+ * not pulled cannot answer anything, so it is listed — seeing it is how somebody learns it can be
+ * had — and not selectable.
  */
 function JudgePanel({ projectId, rules }: { projectId: string; rules: ProjectRules }) {
   const name = useSetJudge();
   const clear = useClearJudge();
+  const models = useAssistantModels();
   const busy = name.isPending || clear.isPending;
+
+  const judge = rules.judge;
+  /* Narrowed by a predicate rather than a bare filter, so the route travels to `JudgeChange` as
+     the two words that type accepts. `Brain` has a third — the one this list exists to leave out. */
+  const judges = (models.data?.choices ?? []).filter(
+    (choice): choice is ModelChoice & { brain: "local" | "openrouter" } =>
+      choice.brain === "local" || choice.brain === "openrouter",
+  );
+
+  /* What the control is showing now. The two states that name no model are their own values; a
+     named judge is shown by its model. */
+  const current =
+    judge.state === "default"
+      ? "default"
+      : judge.state === "off"
+        ? "off"
+        : (judge.model ?? `${judge.brain}:configured`);
+
+  /* A state this menu cannot name gets a row of its own rather than being silently redrawn as
+     something else — a select whose value is absent from its options shows the FIRST option, which
+     here would be a panel claiming the default while the daemon holds a judge. Two ways to reach
+     one: a brain named with no model (the daemon takes it; this control never sends it), and a
+     model that was on the menu when it was chosen and is not on it now — Ollama stopped, a hosted
+     key withdrawn, a name removed from the file. */
+  const orphan =
+    judge.state === "named" && !judges.some((choice) => choice.id === current)
+      ? judge.model === null
+        ? `The ${judge.brain} brain, on its configured model`
+        : /* "Not on the menu" is a claim about the menu, so it waits for one. Until this query
+             answers — and if it never does, because the daemon went away — every model is missing
+             from an empty list, and saying so about a perfectly good one would be a lie the panel
+             tells for as long as the daemon is unreachable. */
+          models.data !== undefined
+          ? `${judge.model} — not on the menu now`
+          : judge.model
+      : null;
+
+  function move(value: string) {
+    if (value === "default") {
+      clear.mutate(projectId);
+      return;
+    }
+    if (value === "off") {
+      name.mutate({ projectId, brain: null, model: null });
+      return;
+    }
+    const choice = judges.find((row) => row.id === value);
+    /* The brain travels WITH the model, out of the row that named both. Sending the model alone
+       and letting the daemon infer would be a second place that mapping lives; sending a brain the
+       person picked separately is how the two come to disagree, which the daemon now refuses. */
+    if (choice) name.mutate({ projectId, brain: choice.brain, model: choice.id });
+  }
 
   return (
     <Panel title="Judge">
       <p className="pj-note">
         A conversation on <strong>Auto</strong> stops and asks about anything its rules do not
-        recognise. A judge is what answers those in your place — a local model, given the command
-        and nothing else, inside the same window you would have had to answer in.
+        recognise. A judge is what answers those in your place — a model, given the command and
+        nothing else, inside the same window you would have had to answer in.
       </p>
 
       <p className="pj-wip-state">
-        {rules.judge.state === "default" ? (
+        {judge.state === "default" ? (
           <>
             The <strong>local</strong> brain answers, on whatever model it is configured with.
             Nobody has chosen otherwise for this project.
           </>
-        ) : rules.judge.state === "off" ? (
+        ) : judge.state === "off" ? (
           <>
             <strong>Nobody</strong> answers but you. Every question a conversation on Auto raises
             here waits for a person.
           </>
         ) : (
           <>
-            The <strong>{rules.judge.brain}</strong> brain answers
-            {rules.judge.model === null ? (
+            The <strong>{judge.brain}</strong> brain answers
+            {judge.model === null ? (
               <>, on its configured model.</>
             ) : (
               <>
-                , on <code className="pj-gate">{rules.judge.model}</code>.
+                , on <code className="pj-gate">{judge.model}</code>.
               </>
             )}
           </>
         )}
       </p>
 
-      <div className="pj-actions">
-        <Button
-          disabled={busy || rules.judge.state === "off"}
-          onClick={() => name.mutate({ projectId, brain: null, model: null })}
+      <div className="pj-form">
+        <label className="pj-field-label" htmlFor="pj-judge">
+          Who answers
+        </label>
+        <select
+          id="pj-judge"
+          className="pj-field-input pj-field-select"
+          value={current}
+          disabled={busy}
+          onChange={(event) => move(event.target.value)}
         >
-          Nobody but me
-        </Button>
-        <Button
-          disabled={busy || rules.judge.state === "default"}
-          onClick={() => clear.mutate(projectId)}
-        >
-          Back to the default
-        </Button>
+          {orphan !== null && <option value={current}>{orphan}</option>}
+          <option value="default">The default — the local brain, on its configured model</option>
+          <option value="off">Nobody but me</option>
+          {(["local", "openrouter"] as const).map((route) => {
+            const rows = judges.filter((choice) => choice.brain === route);
+            if (rows.length === 0) return null;
+            return (
+              <optgroup key={route} label={route === "local" ? "Local" : "OpenRouter"}>
+                {rows.map((choice) => (
+                  <option key={choice.id} value={choice.id} disabled={choice.installed === false}>
+                    {choice.label}
+                    {choice.installed === false ? " — not downloaded" : ""}
+                  </option>
+                ))}
+              </optgroup>
+            );
+          })}
+        </select>
       </div>
+
+      {/* The daemon's own sentence, not one written here. It knows which model and which route,
+          and the two refusals somebody actually meets — a hosted model with no key stored, a local
+          one this machine cannot serve — are facts about this machine that no copy in the window
+          could keep current. */}
+      {name.isError &&
+        (isApiRefusal(name.error) ? (
+          <RefusalNote refusal={name.error} />
+        ) : (
+          <ErrorNote>the núcleo did not answer — the judge is unchanged</ErrorNote>
+        ))}
+      {clear.isError && !isApiRefusal(clear.error) && (
+        <ErrorNote>the núcleo did not answer — the judge is unchanged</ErrorNote>
+      )}
     </Panel>
   );
 }

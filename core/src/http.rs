@@ -9820,15 +9820,34 @@ struct JudgeRequest {
     /// `local` or `openrouter`. Null means nobody answers but a person.
     brain: Option<String>,
     /// Which model, when a brain is named. Null means that brain's configured one.
+    ///
+    /// A choice id from `GET /assistant/models`, checked against that list and against the brain
+    /// beside it — the same menu `patch_chat` validates a pinned model against, and for a sharper
+    /// version of the same reason. There a wrong name costs a turn that dies at spawn, which is
+    /// visible. Here it costs nothing visible at all: an unservable judge is indistinguishable
+    /// from no judge, so the mistake would present as the feature simply not working.
     model: Option<String>,
 }
 
 /// Names this project's judge, or switches it off.
 ///
-/// The refusal for `cloud` comes back from `declare_judge` rather than being restated here: the
-/// reason is about what a cloud brain IS — it answers through the CLI, and a CLI launched to answer
-/// a hook would re-enter that hook — and a second copy of that sentence in the routing layer is a
-/// second copy free to drift from the first.
+/// **Both halves of the request are checked against something real, and that is what makes a picker
+/// safe to build on this route.** Until this check existed the route took any brain spelling and
+/// any model string under 4 KiB, and stored them. Neither failure was loud: an unservable model
+/// makes `assistant_for` refuse, `judge_for` return `None`, and the person be asked — which is the
+/// SAME behaviour as having no judge at all. So somebody who mistyped a model name would configure
+/// a judge, see the panel say a judge was configured, and never once be answered by it.
+///
+/// The brain arm is subtler and is why it is not a two-line match. `Brain::from_wire` folds
+/// anything it cannot parse to `Cloud` — documented, deliberate, and safe for a column default —
+/// and `declare_judge` refuses `Cloud` with a sentence about the CLI re-entering this hook. Fold a
+/// typo through both and somebody who wrote `lokal` is told, truthfully and uselessly, about the
+/// cloud route. A word this daemon has no route for is refused as that; `cloud` is passed through
+/// to `declare_judge`, which owns the reason it cannot judge.
+///
+/// The refusal for `cloud` therefore still comes back from `declare_judge` rather than being
+/// restated here: the reason is about what a cloud brain IS, and a second copy of that sentence in
+/// the routing layer is a second copy free to drift from the first.
 async fn post_project_judge(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -9838,22 +9857,67 @@ async fn post_project_judge(
 
     let brain = match body.brain.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(named) => Some(crate::chats::Brain::from_wire(named)),
+        Some(named) => {
+            let route = crate::chats::Brain::from_wire(named);
+            if route == crate::chats::Brain::Cloud && named != crate::chats::Brain::Cloud.as_str() {
+                return Err(unusable_judge(format!(
+                    "`{named}` is not a route this daemon has; a judge is `local` or `openrouter`"
+                )));
+            }
+            Some(route)
+        }
     };
+
     if let Some(model) = body.model.as_deref() {
         within_length("model", model)?;
     }
+    // Blank is nothing, not a name. The column already means "that brain's configured model" when
+    // it is NULL, and storing an empty string would be a second spelling of the same state that
+    // only `assistant_for` would ever discover was not one.
+    let model = body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
 
-    crate::project_policy::declare_judge(&state.pool, &id, brain, body.model.as_deref())
+    // Only when a brain was named. `brain: null` is the switch-off, and `declare_judge` drops the
+    // model beside it — so a model there is not a judge's model and has nothing to be checked
+    // against.
+    if let (Some(named), Some(model)) = (brain, model) {
+        match chosen_brain(&state, model).await {
+            Ok(route) if route == named => {}
+            Ok(route) => {
+                return Err(unusable_judge(format!(
+                    "`{model}` is answered by the {} route, not {}",
+                    route.as_str(),
+                    named.as_str()
+                )));
+            }
+            Err(BrainRefusal::UnknownModel) => {
+                return Err(unusable_judge(format!(
+                    "nothing on this daemon's model menu is called `{model}`"
+                )));
+            }
+            // `can_serve`'s own words, carried through rather than summarised — it is the layer that
+            // knows WHY, and the two cases that reach here are the ordinary ones: a local model
+            // this machine has not pulled, and a hosted model named with no key stored.
+            Err(BrainRefusal::CannotServe(why)) => return Err(unusable_judge(why)),
+        }
+    }
+
+    crate::project_policy::declare_judge(&state.pool, &id, brain, model)
         .await
-        .map_err(|why| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({ "refusal": "unusable_judge", "detail": why })),
-            )
-        })?;
+        .map_err(unusable_judge)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The one refusal this route gives, so its three callers cannot spell the code three ways.
+fn unusable_judge(detail: String) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "refusal": "unusable_judge", "detail": detail })),
+    )
 }
 
 /// Puts the project back on the default judge.
@@ -21017,6 +21081,143 @@ mod tests {
         assert_eq!(refused["refusal"], "no_such_target");
     }
 
+    /// A judge is named against the same menu the picker draws, and a model from another route is
+    /// refused at the door.
+    ///
+    /// **Why this one is refused rather than shrugged at, when a bad model name elsewhere is not.**
+    /// Every other way of getting a model wrong in this daemon is loud. A conversation pinned to a
+    /// name nobody offers dies at spawn, on the next message, with a refusal somebody reads. A
+    /// judge cannot fail that way: `assistant_for` refuses, `judge_for` answers `None`, and the
+    /// person is asked — which is character for character what happens when no judge was ever
+    /// configured. The mistake would present as the feature quietly not existing, on a panel that
+    /// says a judge is configured. The door is the only place it can be seen.
+    ///
+    /// The route-disagreement case is the one a picker cannot make and a script can: `brain` and
+    /// `model` are two fields and nothing but this check stops them naming different routes.
+    #[tokio::test]
+    async fn a_judge_is_named_against_the_menu_and_a_model_from_another_route_is_refused() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        // `sonnet` is real and is answered by the cloud route, so this is not "no such model" — it
+        // is two fields disagreeing, and the refusal has to say which one is wrong.
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/judge",
+            Some(serde_json::json!({ "brain": "local", "model": "sonnet" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "unusable_judge");
+        let detail = refused["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("cloud") && detail.contains("local"),
+            "{detail}"
+        );
+
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/judge",
+            Some(serde_json::json!({ "brain": "local", "model": "qwen-3-turbo-max" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            refused["detail"]
+                .as_str()
+                .unwrap()
+                .contains("qwen-3-turbo-max"),
+            "the refusal has to name the model nobody offers: {refused}"
+        );
+
+        assert_eq!(
+            crate::project_policy::judge(&state.pool, "alpha").await,
+            crate::project_policy::Judge::Default,
+            "a refused naming must leave the project on the default, not half-written"
+        );
+
+        // Blank is not a name. The column already means "that brain's configured model" when it is
+        // NULL, so an empty string would be a second spelling of one state.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/judge",
+            Some(serde_json::json!({ "brain": "local", "model": "   " })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::project_policy::judge(&state.pool, "alpha").await,
+            crate::project_policy::Judge::Named {
+                brain: crate::chats::Brain::Local,
+                model: None,
+            }
+        );
+    }
+
+    /// A word this daemon has no route for is refused AS that, and not as the cloud route's problem.
+    ///
+    /// `Brain::from_wire` folds everything it cannot parse to `Cloud` — deliberate, and right for a
+    /// column default — and `declare_judge` refuses `Cloud` because that route answers through the
+    /// CLI and a CLI launched to answer a hook would re-enter it. Fold a typo through both and
+    /// somebody who wrote `lokal` is handed a true sentence about a route they never named. Both
+    /// halves are asserted here, because the test is that the two spellings get DIFFERENT answers.
+    #[tokio::test]
+    async fn a_brain_nobody_can_spell_is_refused_as_a_typo_and_not_as_the_cloud_route() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/judge",
+            Some(serde_json::json!({ "brain": "lokal" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let typo = refused["detail"].as_str().unwrap();
+        assert!(typo.contains("lokal"), "{typo}");
+        assert!(
+            !typo.contains("re-enter"),
+            "the typo was answered with the cloud route's reason: {typo}"
+        );
+
+        let (status, refused) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/judge",
+            Some(serde_json::json!({ "brain": "cloud" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            refused["detail"].as_str().unwrap().contains("re-enter"),
+            "the route that genuinely cannot judge keeps its own reason: {refused}"
+        );
+
+        assert_eq!(
+            crate::project_policy::judge(&state.pool, "alpha").await,
+            crate::project_policy::Judge::Default,
+        );
+
+        // The switch-off is checked against nothing, because it names nothing: `declare_judge`
+        // drops the model beside a null brain, so a model there is not a judge's model.
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/judge",
+            Some(serde_json::json!({ "brain": null, "model": "whatever-this-is" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::project_policy::judge(&state.pool, "alpha").await,
+            crate::project_policy::Judge::Off,
+        );
+    }
+
     /// A project this daemon has never heard of is refused by every write, and named.
     ///
     /// The state it closes: a typo'd id used to answer 204 and then serve the rule back through the
@@ -21058,6 +21259,12 @@ mod tests {
                 "/projects/ghost/land-targets",
                 serde_json::json!({ "branch": "master" }),
             ),
+            (
+                "POST",
+                "/projects/ghost/judge",
+                serde_json::json!({ "brain": "local" }),
+            ),
+            ("DELETE", "/projects/ghost/judge", serde_json::json!({})),
         ] {
             let (status, refused) = reach_request(state.clone(), method, path, Some(body)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
